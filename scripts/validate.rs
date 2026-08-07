@@ -5,133 +5,43 @@
 //! This source code is licensed under the BSD-style license found in the
 //! LICENSE file in the root directory of this source tree.
 //!
-//! validate.rs — PHASE 1 thin, typed wrapper that drives the CI validation
-//! lanes by calling `safe-ci-dag-runner` **as a library** (an in-process typed
-//! call, NOT a subprocess).
+//! validate.rs — Hermit's validation driver.
 //!
-//! # What this is (and is not) yet
+//! This is THE driver. `validate.sh` is a five-line shim that `exec`s this file;
+//! there is no second implementation. The shim exists only so that `validate.sh`
+//! remains a valid entrypoint name at every commit, which is what lets `git
+//! bisect`, `ci-hub`, and historical replay invoke one command across the
+//! refactor boundary. A shim is a STABLE NAME, not a second version.
 //!
-//! The long-term goal is to DELETE the 4000-line `validate.sh` bash orchestrator
-//! and replace it with a thin Rust entrypoint over the DAG runner. That full
-//! migration — porting the ~60 non-DAG gates and repointing `make validate` — is
-//! PHASE 2. This file is PHASE 1: an ADDITIVE new entrypoint that runs the
-//! DAG-lane profiles (`ci/dag/<profile>.json`) through the typed library and
-//! establishes the ledger / boxing / typed-classification foundation. It does
-//! not delete `validate.sh` and does not yet repoint `make validate`.
+//! # Contract
 //!
-//! # Why a library call, not a subprocess
+//! * **Everything runs as a `safe-ci-dag-runner` node.** Preflight, the manifest
+//!   gate, every CI-lane node, and every compatibility probe. The driver makes
+//!   exactly one kind of call — `run_dag_boxed_ordered` — and never spawns a gate
+//!   itself. See `lib/validate_plan.rs` for why that rule is load-bearing and for
+//!   the measured evidence that an undeclared node is unboxed.
+//! * **Boxing is fail-closed.** Default path re-execs into a transient
+//!   `systemd --user` scope; if two-level cgroup-v2 boxing cannot be established
+//!   the driver exits 3 rather than running unboxed.
+//! * **Per-node output is live.** Verbosity is floored at 2 so the runner streams
+//!   each node's `[tag]`-prefixed stdout/stderr as it happens. You should never be
+//!   looking at a silent terminal wondering which node is running.
+//! * **Every claim carries its conditions.** One ledger write point emits the
+//!   profile, the executed/skipped/failed counts, commit anchoring, the tree hash,
+//!   the toolchain, and the absolute durable log path together, so a downstream
+//!   reader can never pair a bare `pass` with inferred coverage.
+//! * **`HERMIT_DIR` is a USER-facing setting.** Validation never writes there.
+//!   Run state goes to `target/validation/`, durable logs to `ignored/validate/`.
 //!
-//! Calling `run_dag_boxed_ordered` directly gives us TYPED results
-//! (`RunResult`/`StepOutcome`) instead of scraped text. Every decision this
-//! wrapper makes — process exit code, per-node cost table, ledger `result`, and
-//! failure classification — is derived STRUCTURALLY from typed fields
-//! (`RunResult.ok`, `StepOutcome.ok`/`returncode`/`reason`/`aborted`). We never
-//! grep stdout to decide anything. `StepOutcome.reason` is produced by the
-//! library's own `step_failure_reason`, which already classifies
-//! oom/timeout/cpu_timeout/signal, so classification is not re-implemented here.
+//! # CLI
 //!
-//! # Boxing is the primary purpose — fail closed by default
-//!
-//! cgroup-v2 two-level boxing is the reason the DAG runner exists. This wrapper
-//! reproduces the library's own `resolve_cgroups` policy exactly: by DEFAULT it
-//! re-execs into a transient `systemd --user` scope (the "systemd --user scope
-//! producer path") and, if boxing still cannot be established, exits 3. Passing
-//! `--allow-cgroup-failure` downgrades to an UNBOXED run with a loud warning.
-//! This is not a bypass; it is the same fail-closed contract the CLI enforces.
-//!
-//! # Ledger schema-transition design constraint — VERSION-AWARE ACCEPTANCE
-//!
-//! The ledger PRODUCER travels with the branch: an in-flight PR carries its own
-//! (possibly older) copy of this file, so a PR emits records in ITS producer's
-//! schema, not whatever `main` currently writes. As of this writing 57 of 74
-//! open PRs predate `bfb0a9ef` and therefore emit an OLDER schema. A consumer
-//! that hard-rejects an older-but-valid version breaks every one of them at once
-//! — which is exactly the live incident this design must prevent: a consumer
-//! tightened AHEAD of its producers and began rejecting 254 of 255 ledger rows
-//! fleet-wide, forcing a hermit-validate pause. Tightening a reader before the
-//! producers emit the newly-required shape is the same failure mode as deleting
-//! a producer before its replacement covers every gate.
-//!
-//! The durable cure is VERSION-AWARE ACCEPTANCE (chosen over a time-boxed grace
-//! period or a forced fleet-wide rebase, because only version-awareness survives
-//! a THIRD tightening). Its contract, which any future bump MUST preserve:
-//!
-//!   1. THE WRITER STAMPS A SCHEMA VERSION and ALWAYS emits its
-//!      selection-accounting fields (`schema_version` + `executed_nodes` +
-//!      `skipped_nodes` + `profile`) with REAL values on every run. A record is
-//!      never emitted with these fields omitted or zero-filled. Crucially the
-//!      NODE-count fields are NOT named `executed_tests`/`filtered_tests`: those
-//!      libtest-count names are reserved for a real per-test count, so a
-//!      schema<5 consumer never reads a DAG-node count as a test count.
-//!   2. THE READER ACCEPTS OLDER VALID VERSIONS instead of hard-rejecting them:
-//!      it dispatches on `schema_version`, reads every field via a
-//!      get-with-default, and treats an older-but-valid record as valid.
-//!   3. DEFINED DEFAULT/DERIVATION FOR EACH NEW REQUIRED FIELD. Any field a new
-//!      schema treats as required must have a well-defined value for records an
-//!      OLDER producer wrote without it (a static default or a derivation from
-//!      fields that already exist). A bump that cannot supply such a default
-//!      would retroactively invalidate green receipts from open PRs and is
-//!      therefore disallowed.
-//!
-//! Concretely: this producer writes `schema_version: 3` and ALWAYS emits the
-//! selection-accounting fields `profile`, `executed_nodes`, and `skipped_nodes`
-//! (plus `commit`/`commit_anchored`/`tree_dirty` for commit anchoring). Because
-//! the qualification travels WITH the value (all written at the single
-//! ledger-write point below), a downstream reader can never pair a bare `pass`
-//! with inferred coverage.
-//!
-//! ## What `executed_nodes` / `skipped_nodes` MEAN for a DAG-lane run
-//!
-//! The unit of execution in a DAG lane is the NODE (gate) — each node runs one
-//! command (a build, a `cargo test` target, a harness). The typed `RunResult`
-//! exposes NODE outcomes and resource metrics, not individual cargo-test-case
-//! counts (the runner surfaces only the last output line as `summary`, not a
-//! parsed per-test count). So this producer binds:
-//!   * `executed_nodes` = number of gates that actually RAN (`outcomes.len()`),
-//!   * `skipped_nodes`  = number of gates SKIPPED because a dependency failed
-//!                        (`skipped.len()`; a full green run has zero).
-//! These are genuine NODE counts from typed fields, never fabricated or
-//! zero-filled. They are DELIBERATELY NOT named `executed_tests`/`filtered_tests`
-//! (the libtest-count field names a schema<5 consumer keys `is_clean_full_pass`
-//! on): a validate.rs receipt must NEVER be mistakable for a qualifying full-TEST
-//! pass just because it ran ~47 DAG nodes. Real libtest-count parsing is Phase 2;
-//! the counted+coverage receipt is minted by `finalize_receipt.py --scan`.
-//!
-//! ## The `coverage` object (node-ran, informational, shape-exact)
-//!
-//! This producer DOES emit a `coverage` object, in the consumer's exact
-//! `CoverageRow` shape. Two things make that safe rather than a fake-green risk:
-//!
-//!   1. It is NODE-RAN granularity — which planned `test.*` DAG nodes ran —
-//!      derived from typed gate outcomes. `zero_executed_nodes` is therefore
-//!      ALWAYS empty and means "not determinable at this granularity", never
-//!      "verified none": a node that ran while executing zero test cases is only
-//!      visible in the log banners, which is `finalize_receipt.py --scan`'s job.
-//!   2. The coverage clause of the landing predicate fires only at
-//!      `schema_version >= 5`, and this producer stays at 3 — where a row that
-//!      carries no `executed_tests` can never qualify as a landing green at all.
-//!      So the object is informational here and authoritative only after `--scan`
-//!      re-mints the row.
-//!
-//! Shape-exactness is the load-bearing part. `HistoryRow.coverage` is a typed
-//! `#[serde(default)] Option<CoverageRow>`: the default supplies `None` only for
-//! an ABSENT key. A present-but-wrong-shaped `coverage` is a hard serde error on
-//! the whole row, and the reader then drops that entire row into a `skipped`
-//! counter nobody reads — so a malformed coverage object makes a green receipt
-//! VANISH, which is strictly worse than omitting it. Any change to these fields
-//! must round-trip through the real `CoverageRow`.
-//!
-//! # Usage
-//!
-//! ```text
-//! ./scripts/validate.rs <profile> [-j N] [-v] [--allow-cgroup-failure]
-//!                       [--perf-dir DIR] [-k|--keep-going] [--dag-file PATH]
-//! ```
-//!
-//! `<profile>` selects `ci/dag/<profile>.json` (portable | privileged, or any
-//! other `ci/dag/*.json` present). `--dag-file PATH` (or the `RUN_DAG_FILE_OVERRIDE`
-//! env, mirroring `ci/run-dag.sh`) runs an exact DAG file instead, keeping the
-//! profile label for the ledger.
+//! The flag surface is `validate.sh`'s, verbatim, because the shim forwards `"$@"`
+//! untouched and because in-tree callers already depend on it — notably
+//! `ci/dag/portable.json`'s `test.strict_compat` node, which invokes
+//! `./validate.sh --portable-strict-compat-only`, plus
+//! `.github/workflows/validation-levels.yml`, three `Makefile` targets, and
+//! `hermit-cli/tests/{analyze,rr_suite}.rs`. Changing the surface would have
+//! required touching all of them in the same change.
 //!
 //! ```cargo
 //! [dependencies]
@@ -143,6 +53,13 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+#[path = "lib/validate_corpus.rs"]
+mod validate_corpus;
+
+#[path = "lib/validate_plan.rs"]
+mod validate_plan;
+
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -155,273 +72,530 @@ use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::cgroup::reexec_in_scope;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
-use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
-/// Ledger schema this producer emits. See the schema-transition constraint in
-/// the module doc comment before changing this.
-///
-/// Kept at 3 DELIBERATELY. validate.rs emits NODE-granularity fields
-/// (`executed_nodes`/`skipped_nodes`) and NOT the libtest-count fields
-/// (`executed_tests`/`filtered_tests`), precisely so a schema<5 consumer's
-/// `counts_present` branch (`is_clean_full_pass`) can never mistake a
-/// validate.rs receipt for a qualifying full-TEST pass — the DAG-node count
-/// (~47) would otherwise be read as "47 tests executed". The authoritative
-/// counted+coverage receipt is minted by `finalize_receipt.py --scan` off the
-/// durable log; Phase 2 will add real libtest-count parsing here.
-///
-/// Bumping to schema 5 would be WRONG: schema>=5 triggers a per-node coverage
-/// contract this Phase-1 wrapper cannot satisfy. The `producer:"validate.rs"`
-/// field already disambiguates this row for a version-aware reader.
-const LEDGER_SCHEMA_VERSION: i64 = 3;
+use validate_plan::CompatMode;
 
-/// Producer identity recorded in each ledger row, so a backward-tolerant reader
-/// can tell a validate.rs receipt from a validate.sh one without inference.
+/// Ledger schema this producer emits.
+///
+/// 4 matches what `validate.sh` wrote, field for field, so the parent aggregator,
+/// `ci-hub/validate/*`, and the merge gate keep reading one schema across the
+/// refactor. Deliberately NOT bumped as part of the port: changing the driver and
+/// the record shape in one step would make a consumer regression indistinguishable
+/// from a port regression.
+const LEDGER_SCHEMA_VERSION: i64 = 4;
+
+/// Recorded in each row so a version-aware reader can tell which driver produced
+/// it without inference.
 const LEDGER_PRODUCER: &str = "validate.rs";
 
-/// Env var that names an explicit ledger file (highest precedence). Matches the
-/// override `validate.sh` honors so both producers can share one ledger.
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
-
-/// Env var naming the dev-hermit parent workspace (second precedence).
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 
-/// Checkout-local default ledger file (third precedence). This is the landmine
-/// fix: a STANDALONE checkout with neither env set previously produced no
-/// receipt at all; now it always writes here so a green claim has evidence.
-const LOCAL_LEDGER_BASENAME: &str = ".hermit-validate-ledger.jsonl";
-
-/// Env override for an exact DAG file, mirroring `ci/run-dag.sh`.
-const DAG_FILE_OVERRIDE_ENV: &str = "RUN_DAG_FILE_OVERRIDE";
-
-/// Profile-store dir env, mirroring the runner's own default resolution.
-const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
-
-/// The meta-profile that subsumes the GitHub-authoritative validation surface:
-/// bootstrap preflight + the manifest gate + BOTH the portable and privileged
-/// DAG lanes in one boxed, self-teed run. See `run_meta_profile`.
-const FULL_PROFILE: &str = "full";
-
-/// `validate.sh --portable-only` (`run_portable_only_suite`, validate.sh:4183):
-/// the always-on preflight + the manifest gate + the portable DAG lane ONLY.
+/// In-repo ledger directory. One append-only JSONL SHARD per (team, machine).
 ///
-/// This is NOT the same thing as the bare `portable` profile, and the distinction
-/// is load-bearing: bare `portable` resolves `ci/dag/portable.json` and runs the
-/// runner once with NO preflight and NO manifest gate, so it is strictly weaker.
-/// Naming the two separately keeps `./scripts/validate.rs portable-only`
-/// gate-for-gate identical to `./validate.sh --portable-only` instead of quietly
-/// dropping two gates behind a similar-looking name.
-const PORTABLE_ONLY_PROFILE: &str = "portable-only";
+/// Sharding is what makes the ledger committable. A single shared file would
+/// conflict on every concurrent append across machines; one file per
+/// (team, short-machine) means each writer owns its own file, appends never
+/// collide, and a reader UNIONS the shards locally. Rows are IMMUTABLE — a
+/// correction appends a new row carrying `corrects: <record_id>` rather than
+/// editing history, so the ledger stays append-only and auditable.
+const LEDGER_DIR: &str = "ci/validate-ledger";
 
-/// `validate.sh --privileged-only` (`run_privileged_validation`, validate.sh:4381):
-/// preflight + manifest + the privileged DAG lane ONLY. Same distinction from the
-/// bare `privileged` profile as above.
-const PRIVILEGED_ONLY_PROFILE: &str = "privileged-only";
+/// Fleet/team identity component of the shard name. Overridable so a different
+/// team's runs land in a different shard rather than interleaving.
+const LEDGER_TEAM_ENV: &str = "VALIDATE_LEDGER_TEAM";
+const LEDGER_TEAM_DEFAULT: &str = "local";
 
-/// Resolve a meta-profile name to the ordered DAG lanes it runs, or `None` when
-/// the name is an ordinary single-DAG-file profile (`ci/dag/<name>.json`).
-///
-/// Every meta-profile shares the same shape — the two always-on preflight gates,
-/// the manifest gate, then its lanes — so the lane list is the ONLY thing that
-/// varies between them. Keeping that the single point of difference is what makes
-/// "did a gate get dropped?" answerable by reading one table.
-fn meta_profile_lanes(profile: &str) -> Option<&'static [&'static str]> {
-    match profile {
-        FULL_PROFILE => Some(&["portable", "privileged"]),
-        PORTABLE_ONLY_PROFILE => Some(&["portable"]),
-        PRIVILEGED_ONLY_PROFILE => Some(&["privileged"]),
-        _ => None,
+// --------------------------------------------------------------------------- args
+
+/// Validation level, mirroring `VALIDATION_LEVEL`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    Quick,
+    PortableOnly,
+    Full,
+    Super,
+}
+
+impl Level {
+    fn parse(s: &str) -> Option<Level> {
+        match s {
+            "quick" => Some(Level::Quick),
+            "portable-only" => Some(Level::PortableOnly),
+            "full" => Some(Level::Full),
+            "super" => Some(Level::Super),
+            _ => None,
+        }
     }
-}
-
-// --------------------------------------------------------------------------- unified gate outcome
-
-/// A single gate outcome, unified across the two kinds of work a `full` run does:
-///   * an out-of-process preflight/bootstrap gate (submodule init, reverie pin,
-///     manifest) run as a subprocess, and
-///   * an in-process DAG NODE executed by `safe-ci-dag-runner` (a `StepOutcome`).
-///
-/// Collapsing both into one type lets the ledger, the cost table, and the verdict
-/// treat every gate identically and STRUCTURALLY (never by scraping text), so a
-/// silently-dropped gate cannot hide behind a different code path.
-#[derive(Clone)]
-struct GateOutcome {
-    tag: String,
-    ok: bool,
-    returncode: Option<i64>,
-    reason: String,
-    aborted: bool,
-    duration_s: f64,
-}
-
-impl From<&StepOutcome> for GateOutcome {
-    fn from(o: &StepOutcome) -> Self {
-        GateOutcome {
-            tag: o.tag.clone(),
-            ok: o.ok,
-            returncode: o.returncode,
-            reason: o.reason.clone(),
-            aborted: o.aborted,
-            duration_s: o.duration_s,
+    fn name(self) -> &'static str {
+        match self {
+            Level::Quick => "quick",
+            Level::PortableOnly => "portable-only",
+            Level::Full => "full",
+            Level::Super => "super",
         }
     }
 }
 
-// --------------------------------------------------------------------------- args
+/// A focused mode runs exactly one matrix/lane and exits. At most one may be
+/// active, and none may combine with an explicit level — the same two-way
+/// exclusion `validate.sh` enforces (validate.sh:360-367).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Focused {
+    StrictCompat,
+    PortableStrictCompat,
+    RrCompat,
+    SabreCompat,
+    E9patchCompat,
+    LiteinstCompat,
+    QemuL2,
+    PrivilegedOnly,
+    Only { lane: String, nodes: String },
+    Selective { shallow: bool },
+}
+
+impl Focused {
+    /// The `VALIDATION_PROFILE` string recorded in the ledger, matching
+    /// validate.sh:381-392 so history for a profile stays continuous.
+    fn profile(&self) -> String {
+        match self {
+            Focused::StrictCompat => "strict-compat-only".into(),
+            Focused::PortableStrictCompat => "portable-strict-compat-only".into(),
+            Focused::RrCompat => "rr-compat-only".into(),
+            Focused::SabreCompat => "sabre-compat-only".into(),
+            Focused::E9patchCompat => "e9patch-compat-only".into(),
+            Focused::LiteinstCompat => "liteinst-compat-only".into(),
+            Focused::QemuL2 => "qemu-l2-only".into(),
+            Focused::PrivilegedOnly => "privileged-only".into(),
+            Focused::Only { lane, .. } => format!("only-{lane}"),
+            Focused::Selective { .. } => "selective".into(),
+        }
+    }
+    /// `--all/--full-run` refuses to combine with any focused mode; this is the
+    /// name used in that refusal message.
+    fn cli_name(&self) -> &'static str {
+        match self {
+            Focused::StrictCompat => "strict-compat-only",
+            Focused::PortableStrictCompat => "portable-strict-compat-only",
+            Focused::RrCompat => "rr-compat-only",
+            Focused::SabreCompat => "sabre-compat-only",
+            Focused::E9patchCompat => "e9patch-compat-only",
+            Focused::LiteinstCompat => "liteinst-compat-only",
+            Focused::QemuL2 => "qemu-l2-only",
+            Focused::PrivilegedOnly => "privileged-only",
+            Focused::Only { .. } => "only",
+            Focused::Selective { shallow } => {
+                if *shallow {
+                    "shallow-select"
+                } else {
+                    "selective"
+                }
+            }
+        }
+    }
+}
 
 struct Args {
-    profile: String,
-    dag_file: Option<String>,
+    level: Level,
+    level_explicit: bool,
+    focused: Option<Focused>,
+    force_full: bool,
+    baseline: Option<String>,
+    run_on_dirty_tree: bool,
+    ignore_cache: bool,
+    label_pr: bool,
+    verbose: bool,
     jobs: Option<i64>,
-    verbosity: i64,
     keep_going: bool,
     allow_cgroup_failure: bool,
-    perf_dir: Option<String>,
+    merge_lanes: bool,
+    self_test: bool,
+    show_plan: bool,
 }
 
 fn usage() -> &'static str {
-    "usage: validate.rs <profile> [options]\n\
+    "Usage: ./validate.sh [LEVEL] [OPTIONS]        (validate.sh execs scripts/validate.rs)\n\
      \n\
-     PHASE 1 typed wrapper: run a CI validation lane as a safe-ci-dag-runner DAG,\n\
-     in-process (library call, not a subprocess), boxed by default.\n\
+     Run Hermit's local validation suite. Every gate executes as a boxed\n\
+     safe-ci-dag-runner DAG node; nothing runs outside the runner.\n\
      \n\
-     <profile>                a META-profile, or a lane name selecting ci/dag/<name>.json\n\
-     \x20                        meta-profiles (preflight + manifest + lanes, subsuming\n\
-     \x20                        the matching validate.sh level, gate for gate):\n\
-     \x20                          full            portable + privileged  (run_full_suite)\n\
-     \x20                          portable-only   portable               (--portable-only)\n\
-     \x20                          privileged-only privileged             (--privileged-only)\n\
-     \x20                        lane names (bare DAG file, NO preflight, NO manifest —\n\
-     \x20                        strictly weaker than the same-named meta-profile):\n\
-     \x20                          portable, privileged, ...\n\
-     -j N                     scheduler width (default: host_cpus/8, floor 2, cap 16)\n\
-     -v                       increase verbosity (repeatable)\n\
-     -k, --keep-going         do not eager-exit on the first failure\n\
-     --allow-cgroup-failure   downgrade to an UNBOXED run instead of failing closed\n\
-     --perf-dir DIR           forward per-step profile rows to DIR\n\
-     --dag-file PATH          run this exact DAG file (keeps <profile> as the label);\n\
-     \x20                        also settable via RUN_DAG_FILE_OVERRIDE\n\
-     -h, --help               print this help and exit"
+     Levels:\n\
+     \x20 quick            Core ptrace run/verify/record smoke tests; no alternate backends.\n\
+     \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
+     \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
+     \x20 full             quick plus the complete suite and DBI/KVM gates (default).\n\
+     \x20 super            Repeat stress probes under moderate oversubscription.\n\
+     \x20 --quick          Alias for the quick level.\n\
+     \x20 --portable       Alias for the portable-only level.\n\
+     \n\
+     Focused gates (run one matrix/lane and exit):\n\
+     \x20 --strict-compat-only          Run the blocking L2 app matrix.\n\
+     \x20 --portable-strict-compat-only Portable L2 matrix with bounded diagnostics.\n\
+     \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
+     \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
+     \x20 --e9patch-compat-only         Gate core + installed e9patch L2 apps.\n\
+     \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
+     \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
+     \x20 --portable-only               No PMU/CPUID hardware required.\n\
+     \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
+     \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps).\n\
+     \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
+     \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
+     \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
+     \x20 --all, --full-run             Assert the COMPLETE suite explicitly.\n\
+     \n\
+     Other options:\n\
+     \x20 --verbose        Extra per-gate detail (per-node output is always streamed).\n\
+     \x20 --run-on-dirty-tree  Escape hatch; AGENTS SHOULD NOT USE THIS.\n\
+     \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
+     \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
+     \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
+     \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
+     \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
+     \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
+     \x20 --merge-lanes    EXPERIMENT: fuse the portable and privileged lanes into one\n\
+     \x20                  DAG so they overlap instead of running back to back.\n\
+     \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
+     \x20 --self-test      Run the driver's inert policy/quoting brackets and exit.\n\
+     \x20 -h, --help       Show this help and exit.\n\
+     \n\
+     Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
+     VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL, CI_DAG_JOBS,\n\
+     HERMIT_VALIDATE_LEDGER, PR_NUMBER."
 }
 
-/// Parse argv. Returns `Err(code)` for a usage error (2) or a handled `--help` (0).
+fn env_flag(name: &str, want: &str) -> bool {
+    std::env::var(name).map(|v| v == want).unwrap_or(false)
+}
+
 fn parse_args() -> Result<Args, u8> {
-    let mut profile: Option<String> = None;
-    let mut dag_file: Option<String> = std::env::var(DAG_FILE_OVERRIDE_ENV).ok().filter(|s| !s.is_empty());
-    let mut jobs: Option<i64> = None;
-    let mut verbosity: i64 = 0;
-    let mut keep_going = false;
-    let mut allow_cgroup_failure = false;
-    let mut perf_dir: Option<String> = None;
+    let mut level = Level::Full;
+    let mut level_explicit = false;
+    if let Ok(v) = std::env::var("VALIDATE_LEVEL") {
+        if !v.is_empty() {
+            match Level::parse(&v) {
+                Some(l) => {
+                    level = l;
+                    level_explicit = true;
+                }
+                None => {
+                    eprintln!("validate: invalid VALIDATE_LEVEL: {v}");
+                    return Err(2);
+                }
+            }
+        }
+    }
+    let mut focused: Vec<Focused> = Vec::new();
+    let mut args = Args {
+        level,
+        level_explicit,
+        focused: None,
+        force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
+        baseline: None,
+        run_on_dirty_tree: env_flag("VALIDATE_RUN_ON_DIRTY_TREE", "1"),
+        ignore_cache: env_flag("VALIDATE_IGNORE_CACHE", "1"),
+        label_pr: !env_flag("VALIDATE_LABEL_PR", "0"),
+        verbose: env_flag("VALIDATE_VERBOSE", "1"),
+        jobs: None,
+        keep_going: false,
+        allow_cgroup_failure: false,
+        merge_lanes: false,
+        self_test: false,
+        show_plan: false,
+    };
+    let mut shallow = false;
+    let mut selective = false;
+    let mut show_plan = false;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
+    let set_level = |args: &mut Args, l: Level| -> Result<(), u8> {
+        if args.level_explicit {
+            eprintln!("validate: choose only one validation level");
+            return Err(2);
+        }
+        args.level = l;
+        args.level_explicit = true;
+        Ok(())
+    };
     while i < argv.len() {
-        let a = &argv[i];
-        match a.as_str() {
+        let a = argv[i].as_str();
+        match a {
+            "quick" | "portable-only" | "full" | "super" => {
+                set_level(&mut args, Level::parse(a).unwrap())?
+            }
+            "--quick" => set_level(&mut args, Level::Quick)?,
+            "--portable" | "--portable-only" => set_level(&mut args, Level::PortableOnly)?,
+            "--strict-compat-only" => focused.push(Focused::StrictCompat),
+            "--portable-strict-compat-only" => focused.push(Focused::PortableStrictCompat),
+            "--rr-compat-only" => focused.push(Focused::RrCompat),
+            "--sabre-compat-only" => focused.push(Focused::SabreCompat),
+            "--e9patch-compat-only" => focused.push(Focused::E9patchCompat),
+            "--liteinst-compat-only" => focused.push(Focused::LiteinstCompat),
+            "--qemu-l2-only" => focused.push(Focused::QemuL2),
+            "--privileged-only" => focused.push(Focused::PrivilegedOnly),
+            // Recognized but NOT ported. These are accepted so the failure is a
+            // clear refusal rather than "unknown argument" — in-tree callers
+            // (scripts/progress-report.sh, the progress-rubric skill) pass them,
+            // and an unknown-argument exit would read as a CLI regression rather
+            // than as the unported feature it is.
+            "--envelope-only" => {
+                eprintln!("validate: --envelope-only is not ported to the Rust driver yet.");
+                eprintln!("  The working-envelope measurement still lives in validate.sh; this");
+                eprintln!("  driver will not report a different measurement under its name.");
+                return Err(2);
+            }
+            "--envelope-compare" => {
+                eprintln!("validate: --envelope-compare is not ported to the Rust driver yet.");
+                return Err(2);
+            }
+            "--show-plan" => show_plan = true,
+            "--selective" | "--since-green" => selective = true,
+            "--shallow-select" => {
+                selective = true;
+                shallow = true;
+            }
+            "--all" | "--full-run" => args.force_full = true,
+            "--run-on-dirty-tree" => args.run_on_dirty_tree = true,
+            "--ignore-cache" => args.ignore_cache = true,
+            "--label-pr" => args.label_pr = true,
+            "--no-label-pr" => args.label_pr = false,
+            "--verbose" => args.verbose = true,
+            "--merge-lanes" => args.merge_lanes = true,
+            "--self-test" => args.self_test = true,
+            "-k" | "--keep-going" => args.keep_going = true,
+            "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+            "--baseline" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() => args.baseline = Some(v.clone()),
+                    _ => {
+                        eprintln!("validate: --baseline needs a SHA");
+                        return Err(2);
+                    }
+                }
+            }
+            "-j" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(n) if n > 0 => args.jobs = Some(n),
+                    _ => {
+                        eprintln!("validate: -j needs a positive integer");
+                        return Err(2);
+                    }
+                }
+            }
+            "--only" => {
+                let lane = argv.get(i + 1).cloned().unwrap_or_default();
+                let nodes = argv.get(i + 2).cloned().unwrap_or_default();
+                if lane.is_empty() || nodes.is_empty() {
+                    eprintln!("validate: --only needs <lane> <group.job>[,<group.job>...]");
+                    eprintln!("          e.g. ./validate.sh --only portable test.sabre_examples");
+                    return Err(2);
+                }
+                focused.push(Focused::Only { lane, nodes });
+                i += 2;
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Err(0);
             }
-            "-v" => verbosity += 1,
-            "-k" | "--keep-going" => keep_going = true,
-            "--allow-cgroup-failure" => allow_cgroup_failure = true,
-            "-j" => {
-                i += 1;
-                let v = argv.get(i).ok_or_else(|| {
-                    eprintln!("validate.rs: -j requires an argument");
-                    2u8
-                })?;
-                jobs = Some(v.parse::<i64>().map_err(|_| {
-                    eprintln!("validate.rs: -j argument must be an integer, got {v:?}");
-                    2u8
-                })?);
-            }
-            "--perf-dir" => {
-                i += 1;
-                perf_dir = Some(
-                    argv.get(i)
-                        .ok_or_else(|| {
-                            eprintln!("validate.rs: --perf-dir requires an argument");
-                            2u8
-                        })?
-                        .clone(),
-                );
-            }
-            "--dag-file" => {
-                i += 1;
-                dag_file = Some(
-                    argv.get(i)
-                        .ok_or_else(|| {
-                            eprintln!("validate.rs: --dag-file requires an argument");
-                            2u8
-                        })?
-                        .clone(),
-                );
-            }
-            other if other.starts_with('-') => {
-                eprintln!("validate.rs: unknown option {other:?}");
-                eprintln!("{}", usage());
-                return Err(2);
-            }
             other => {
-                if profile.is_some() {
-                    eprintln!("validate.rs: unexpected extra positional argument {other:?}");
-                    return Err(2);
-                }
-                profile = Some(other.to_string());
+                eprintln!("validate: unknown argument: {other} (try --help)");
+                return Err(2);
             }
         }
         i += 1;
     }
-
-    let profile = profile.ok_or_else(|| {
-        eprintln!("validate.rs: missing required <profile> argument");
-        eprintln!("{}", usage());
-        2u8
-    })?;
-
-    Ok(Args {
-        profile,
-        dag_file,
-        jobs,
-        verbosity,
-        keep_going,
-        allow_cgroup_failure,
-        perf_dir,
-    })
+    if selective {
+        focused.push(Focused::Selective { shallow });
+    }
+    if focused.len() > 1 {
+        eprintln!("validate: choose only one focused validation mode");
+        return Err(2);
+    }
+    if args.level_explicit && !focused.is_empty() {
+        eprintln!("validate: validation levels cannot be combined with focused validation modes");
+        return Err(2);
+    }
+    args.show_plan = show_plan;
+    args.focused = focused.pop();
+    // `--privileged-only` and `--portable-only` are spelled as focused flags but
+    // one of them is a LEVEL in validate.sh. Preserve that: --portable-only sets
+    // the level, --privileged-only stays focused (validate.sh:169,189).
+    if !force_full_policy_allows(
+        args.force_full,
+        args.level,
+        args.focused.as_ref().map(|f| f.cli_name()),
+    ) {
+        eprintln!(
+            "validate: --all/--full-run requires level full and forbids every focused or selective mode"
+        );
+        return Err(2);
+    }
+    if shallow && args.baseline.is_some() {
+        eprintln!("validate: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline");
+        return Err(2);
+    }
+    Ok(args)
 }
 
-// --------------------------------------------------------------------------- jobs default
+/// `force_full_policy_allows` (validate.sh:299): `--all` asserts the COMPLETE
+/// suite, so it accepts only the unfocused `full` level.
+fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str>) -> bool {
+    !force_full || (level == Level::Full && focused.is_none())
+}
 
-/// Default scheduler width, honoring the SAME shared runtime authority
-/// validate.sh uses so both producers pick identical widths on the same host.
+/// Inert brackets for the policy predicate and the shell quoter.
 ///
-/// Precedence mirrors validate.sh:606-635 (the `VALIDATION_DAG_JOBS`
-/// derivation), which is the shared spec:
-///   * `${CI_DAG_JOBS:-$CI_DAG_JOBS_DEFAULT}` — an explicitly-set `CI_DAG_JOBS`
-///     env var is the override and is used EXACTLY, with NO clamp (validate.sh
-///     clamps only the *default*, never the override; it only requires the
-///     override be a positive integer, else it exits 2).
-///   * otherwise the host-adaptive default `CI_DAG_JOBS_DEFAULT = host_cpus/8`,
-///     floored at 2 and capped at 16 (validate.sh:628-630).
+/// These cannot launch a run or authorize a receipt — they only prove the
+/// predicate refuses every non-qualifying case AND accepts the one qualifying
+/// case, so it is not vacuously true. `validate.sh` ran the equivalent brackets
+/// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
+/// so the cost is not paid on the hot path.
+fn self_test() -> Result<(), String> {
+    // Positive: the one qualifying case must be ACCEPTED (guards against a
+    // predicate that refuses everything and looks correct).
+    if !force_full_policy_allows(true, Level::Full, None) {
+        return Err("force-full: full/unfocused must be allowed".into());
+    }
+    if !force_full_policy_allows(false, Level::Quick, Some("rr-compat-only")) {
+        return Err("force-full: inactive flag must allow anything".into());
+    }
+    // Negative: every non-full level and every focused mode must be REFUSED.
+    for l in [Level::Quick, Level::PortableOnly, Level::Super] {
+        if force_full_policy_allows(true, l, None) {
+            return Err(format!("force-full: level {} must be refused", l.name()));
+        }
+    }
+    for m in [
+        "envelope-only",
+        "strict-compat-only",
+        "portable-strict-compat-only",
+        "rr-compat-only",
+        "sabre-compat-only",
+        "e9patch-compat-only",
+        "liteinst-compat-only",
+        "qemu-l2-only",
+        "privileged-only",
+        "only",
+        "selective",
+        "shallow-select",
+    ] {
+        if force_full_policy_allows(true, Level::Full, Some(m)) {
+            return Err(format!("force-full: focused mode {m} must be refused"));
+        }
+    }
+    // Shell quoting: a corpus argv element must survive round-tripping through
+    // `bash -c` byte-for-byte. A silent mangling here would change what the guest
+    // runs while every count still looked right.
+    for probe in [
+        "plain",
+        "with space",
+        "single'quote",
+        "$(command sub)",
+        "back`tick`",
+        "new\nline",
+        r#"double"quote"#,
+        "a;b|c&d",
+        "",
+    ] {
+        let quoted = validate_plan::shell_quote(probe);
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!("printf '%s' {quoted}"))
+            .output()
+            .map_err(|e| format!("shell-quote bracket: cannot run bash: {e}"))?;
+        let got = String::from_utf8_lossy(&out.stdout);
+        if got != probe {
+            return Err(format!("shell-quote bracket: {probe:?} round-tripped as {got:?}"));
+        }
+    }
+    // Corpus tables must still match the counts the bash declared. This is the
+    // drift guard for a MECHANICALLY EXTRACTED table: if someone edits a corpus
+    // JSON without moving the corresponding ratchet, or vice versa, the extraction
+    // has silently diverged from the numbers the gates are judged against.
+    if validate_corpus::RR_PASSING_LABELS.len() != validate_corpus::RR_COMPAT_EXPECTED {
+        return Err(format!(
+            "R/R label set has {} rows, expected {}",
+            validate_corpus::RR_PASSING_LABELS.len(),
+            validate_corpus::RR_COMPAT_EXPECTED
+        ));
+    }
+    let root = repo_root();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: "/nonexistent",
+        real_compat_fixtures: "/nonexistent",
+        validation_tmp_dir: "/nonexistent",
+        shell_build_dir: "/nonexistent",
+    };
+    let count = |m: &str| -> Result<usize, String> {
+        validate_corpus::load(&root, m, &paths).map(|r| r.len())
+    };
+    // Exact: these two matched their declared totals at extraction time, and that
+    // exact agreement is the evidence the extraction was faithful.
+    let strict = count("strict")?;
+    if strict != validate_corpus::STRICT_COMPAT_TOTAL {
+        return Err(format!(
+            "strict corpus has {strict} rows, STRICT_COMPAT_TOTAL is {}",
+            validate_corpus::STRICT_COMPAT_TOTAL
+        ));
+    }
+    let sabre = count("sabre")?;
+    if sabre != validate_corpus::SABRE_COMPAT_TOTAL {
+        return Err(format!(
+            "sabre corpus has {sabre} rows, SABRE_COMPAT_TOTAL is {}",
+            validate_corpus::SABRE_COMPAT_TOTAL
+        ));
+    }
+    // rr admits a superset and is filtered to the measured-passing labels; what
+    // must hold is that every passing label is actually present to be measured.
+    let rr_rows = validate_corpus::load(&root, "rr", &paths)?;
+    let present: BTreeSet<&str> = rr_rows.iter().map(|r| r.label.as_str()).collect();
+    let missing: Vec<&&str> = validate_corpus::RR_PASSING_LABELS
+        .iter()
+        .filter(|l| !present.contains(**l))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} R/R passing label(s) are absent from the rr corpus and could never be measured: {missing:?}",
+            missing.len()
+        ));
+    }
+    // e9patch admits a superset of its gated total (rows gate only when the
+    // program is installed), so the invariant is >=, not ==.
+    let e9 = count("e9patch")?;
+    if e9 < validate_corpus::E9PATCH_COMPAT_TOTAL {
+        return Err(format!(
+            "e9patch corpus has {e9} rows, below E9PATCH_COMPAT_TOTAL {}",
+            validate_corpus::E9PATCH_COMPAT_TOTAL
+        ));
+    }
+    println!(
+        "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
+        rr_rows.len(),
+        validate_corpus::RR_COMPAT_EXPECTED
+    );
+    Ok(())
+}
+
+// --------------------------------------------------------------------------- jobs
+
+/// Default scheduler width, honoring the same runtime authority `validate.sh`
+/// used (validate.sh:692-716) so both pick identical widths on the same host:
+/// an explicit `CI_DAG_JOBS` is used EXACTLY (no clamp); otherwise the
+/// host-adaptive `host_cpus/8`, floored at 2 and capped at 16.
 ///
-/// Called from exactly one site (main), only when `-j` was not supplied — so an
-/// explicit `-j` (also unclamped, like the env override) still wins over both.
-///
-/// FOLLOW-UP: fully extracting this width rule into safe-ci-dag-runner so the
-/// three consumers (validate.sh, run-dag.sh, validate.rs) call one function is
-/// Phase 2; for now this reads the same `CI_DAG_JOBS` runtime authority.
+/// The cap is measurement-backed, not a guess: on this 316-CPU box the portable
+/// DAG measured CPU/wall ~2.6x at -j2 versus ~21.8x at -j16, and becomes
+/// critical-path-bound near width 16. The same file also runs on GitHub's ~4-CPU
+/// portable runner, where a flat 16 would schedule many multi-GiB nodes at once
+/// and OOM a job that -j2 kept green.
 fn default_jobs() -> i64 {
-    // CI_DAG_JOBS override: used EXACTLY (no clamp), matching validate.sh's
-    // `${CI_DAG_JOBS:-...}`. An empty value is treated as unset (the `:-` form).
-    // validate.sh rejects a set-but-invalid value with exit 2; here we can only
-    // return an i64, so an unparseable/non-positive value falls back to the
-    // default (deviation noted in the commit message).
     if let Ok(v) = std::env::var("CI_DAG_JOBS") {
         if !v.is_empty() {
             if let Ok(n) = v.parse::<i64>() {
@@ -429,59 +603,47 @@ fn default_jobs() -> i64 {
                     return n;
                 }
             }
-            eprintln!(
-                "validate.rs: warning: CI_DAG_JOBS={v:?} is not a positive integer; \
-                 falling back to the host-adaptive default (validate.sh would exit 2)."
-            );
+            eprintln!("validate: CI_DAG_JOBS={v:?} is not a positive integer; using the host-adaptive default");
         }
     }
-    let host_cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as i64)
-        .unwrap_or(1);
-    (host_cpus / 8).clamp(2, 16)
+    let host = std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1);
+    (host / 8).clamp(2, 16)
 }
 
 // --------------------------------------------------------------------------- boxing
 
-/// Establish the two-level cgroup-v2 boxing that is the runner's PRIMARY purpose,
-/// mirroring the library's private `cli::resolve_cgroups`. Returns the manager to
-/// use (`None` = intentional UNBOXED run) or `Err(exit_code)` the caller returns.
-/// On the default path this re-execs into a transient `systemd --user` scope and
-/// never returns on success.
+/// Establish two-level cgroup-v2 boxing, mirroring the runner's own
+/// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
+/// run) or `Err(exit_code)`. On the default path this re-execs into a transient
+/// `systemd --user` scope and does not return on success.
 fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
     if is_in_scope() {
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
             eprintln!(
-                "validate.rs: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step \
-                 memory/CPU caps + setsid-proof teardown)."
+                "validate: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU \
+                 caps + setsid-proof teardown)."
             );
             return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
         }
         if allow_failure {
-            eprintln!(
-                "validate.rs: warning: inside a scope but per-step cgroup setup failed; \
-                 running best-effort UNBOXED (--allow-cgroup-failure)."
-            );
+            eprintln!("validate: WARNING: per-step cgroup setup failed; running UNBOXED (--allow-cgroup-failure).");
             return Ok(None);
         }
         eprintln!(
-            "validate.rs: ERROR: inside a managed scope but per-step cgroups could not be \
-             set up; re-run with --allow-cgroup-failure to run UNBOXED."
+            "validate: ERROR: inside a managed scope but per-step cgroups could not be set up; \
+             re-run with --allow-cgroup-failure to run UNBOXED."
         );
         return Err(3);
     }
     if allow_failure {
         eprintln!(
-            "validate.rs: warning: cgroup boxing not established (--allow-cgroup-failure); \
-             running UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
+            "validate: WARNING: cgroup boxing not established (--allow-cgroup-failure); running \
+             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
         );
         return Ok(None);
     }
-    // Default: boxing is required -> re-exec into a transient systemd --user scope.
-    // On success this never returns (exec replaces the process); a return means
-    // boxing is unavailable.
     let reexeced_or_skipped = reexec_in_scope(None, None);
     let detail = if reexeced_or_skipped {
         "boxing was skipped (e.g. CI without a systemd --user scope)"
@@ -489,30 +651,22 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         "cgroup-v2 + a working systemd --user scope are unavailable"
     };
     eprintln!(
-        "validate.rs: ERROR: cgroup boxing could not be established: {detail}. Cgroup \
-         resource boxing is this tool's primary purpose; re-run with --allow-cgroup-failure \
-         to run UNBOXED."
+        "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
+         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
     );
     Err(3)
 }
 
-// --------------------------------------------------------------------------- durable log (self-tee)
+// --------------------------------------------------------------------------- durable log
 
-/// A live self-tee: everything this process writes to fd 1 / fd 2 is duplicated
-/// into a durable, absolute log file AND still shown on the original terminal.
+/// A live self-tee: everything written to fd 1/2 is duplicated into a durable
+/// absolute log AND still shown on the terminal.
 ///
-/// WHY validate.rs tees ITS OWN log (owner directive, "option C"): the
-/// authoritative counted+coverage receipt is minted by `finalize_receipt.py
-/// --scan`, which reads the `log_file` recorded in the ledger row and parses the
-/// libtest banners out of it. A STANDALONE `./scripts/validate.rs` launched with
-/// no `ci-hub validate-run` systemd unit around it has NO durable sink — it would
-/// run, pass, and leave no receipt, which is indistinguishable from never having
-/// run (the same defect class as `--cgroups` silently running nothing). Teeing
-/// here makes the RECEIPT PATH INDEPENDENT OF THE LAUNCH PATH: the log exists
-/// whether the run was launched by `validate-run`, by `make validate`, or by a
-/// bare `./scripts/validate.rs`. It is deliberately NOT deferred to the runner
-/// library or to `start_unit.py`, either of which would leave the standalone case
-/// broken.
+/// The receipt path must not depend on the launch path. A bare
+/// `./scripts/validate.rs` with no `ci-hub validate-run` unit around it would
+/// otherwise run, pass, and leave nothing on disk — indistinguishable from never
+/// having run. Teeing here means the log exists whether the run came from
+/// `validate-run`, `make validate`, or a bare invocation.
 struct DurableLog {
     path: PathBuf,
     tee: std::process::Child,
@@ -521,14 +675,11 @@ struct DurableLog {
 }
 
 impl DurableLog {
-    /// Flush our buffered output, restore the original fds so any later message
-    /// goes to the terminal, close the tee's write ends, and reap it.
     fn finish(mut self) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        // Restoring fds 1 and 2 replaces the pipe write-ends, dropping the last
-        // references to the pipe so `tee` observes EOF and exits.
+        // Restoring fds 1/2 drops the last pipe write-ends, so tee sees EOF.
         unsafe {
             libc::dup2(self.orig_stdout, 1);
             libc::dup2(self.orig_stderr, 2);
@@ -539,46 +690,35 @@ impl DurableLog {
     }
 }
 
-/// Resolve the durable log path: `<parent|repo-root>/ignored/validate/` holds
-/// machine-local run logs (an ignored dir, never committed). The name carries the
-/// profile, a short SHA, and a timestamp so concurrent runs never collide. The
-/// path is ALWAYS ABSOLUTE — `verify_receipt.sh` (the merge gate) requires the
-/// recorded `durable_log_file` to start with `/`.
+/// Durable log path. Always ABSOLUTE — `verify_receipt.sh` (the merge gate)
+/// requires the recorded path to start with `/`. Never under `HERMIT_DIR`: that
+/// is a user-facing setting and validation must not write there.
 fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
-    let dir = if let Ok(parent) = std::env::var(PARENT_ENV) {
-        if !parent.is_empty() {
-            PathBuf::from(parent).join("ignored").join("validate")
-        } else {
-            root.join("ignored").join("validate")
-        }
-    } else {
-        root.join("ignored").join("validate")
+    let dir = match std::env::var(PARENT_ENV) {
+        Ok(p) if !p.is_empty() => PathBuf::from(p).join("ignored").join("validate"),
+        _ => root.join("ignored").join("validate"),
     };
     let sha12: String = sha.chars().take(12).collect();
     let ts = utc_now().replace([':', '-'], "");
-    dir.join(format!("validate-rs-{profile}-{sha12}-{ts}.log"))
+    dir.join(format!("validate-{profile}-{sha12}-{ts}.log"))
 }
 
-/// Establish the self-tee. FAIL-CLOSED: on any failure to create the directory,
-/// spawn `tee`, or redirect the fds, returns `Err(exit_code)` so the caller exits
-/// LOUDLY rather than running without a durable receipt. Must be called AFTER
-/// `resolve_cgroups` (which re-execs on the default path), so the tee is set up
-/// exactly once, in the final boxed process — never inherited across the re-exec.
+/// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
+/// running without a durable receipt. Must be called AFTER `resolve_cgroups`
+/// (which re-execs), so the tee is set up once, in the final boxed process.
 fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog, u8> {
     use std::os::unix::io::AsRawFd;
     let path = durable_log_path(root, profile, sha);
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!(
-                "validate.rs: ERROR: cannot create durable-log dir {}: {e}. A run with no \
-                 durable receipt is a silent no-result; refusing to proceed.",
+                "validate: ERROR: cannot create durable-log dir {}: {e}. A run with no durable \
+                 receipt is a silent no-result; refusing to proceed.",
                 dir.display()
             );
             return Err(4);
         }
     }
-    // Spawn `tee -a <log>` BEFORE redirecting our fds so tee inherits the real
-    // terminal as its stdout (output still shows live), and appends to the file.
     let mut tee = match Command::new("tee")
         .arg("-a")
         .arg(&path)
@@ -588,277 +728,92 @@ fn setup_durable_log(root: &Path, profile: &str, sha: &str) -> Result<DurableLog
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "validate.rs: ERROR: cannot spawn `tee` for the durable log {}: {e}. \
-                 Refusing to run without a durable receipt.",
+                "validate: ERROR: cannot spawn `tee` for {}: {e}. Refusing to run without a \
+                 durable receipt.",
                 path.display()
             );
             return Err(4);
         }
     };
-    // Save the originals, then point fd 1 and fd 2 at the tee's stdin pipe.
     let (orig_stdout, orig_stderr, ok) = unsafe {
         let so = libc::dup(1);
         let se = libc::dup(2);
         let pipe_fd = tee.stdin.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
-        let ok = so >= 0 && se >= 0 && pipe_fd >= 0 && libc::dup2(pipe_fd, 1) >= 0 && libc::dup2(pipe_fd, 2) >= 0;
+        let ok = so >= 0
+            && se >= 0
+            && pipe_fd >= 0
+            && libc::dup2(pipe_fd, 1) >= 0
+            && libc::dup2(pipe_fd, 2) >= 0;
         (so, se, ok)
     };
     if !ok {
-        eprintln!("validate.rs: ERROR: could not redirect stdout/stderr into the durable log.");
+        eprintln!("validate: ERROR: could not redirect stdout/stderr into the durable log.");
         let _ = tee.kill();
         return Err(4);
     }
-    // dup2 gave fds 1 and 2 independent duplicates of the pipe write-end; drop the
-    // ChildStdin so the pipe has exactly two write-ends (fd 1 and fd 2), which
-    // `finish` closes to signal EOF to tee.
     drop(tee.stdin.take());
-    eprintln!("validate.rs: durable log: {}", path.display());
-    Ok(DurableLog {
-        path,
-        tee,
-        orig_stdout,
-        orig_stderr,
-    })
+    eprintln!("validate: durable log: {}", path.display());
+    Ok(DurableLog { path, tee, orig_stdout, orig_stderr })
 }
 
-// --------------------------------------------------------------------------- subprocess gates
+// --------------------------------------------------------------------------- git / host
 
-/// Run one out-of-process preflight/bootstrap gate (submodule init, reverie pin,
-/// manifest) as a subprocess, inheriting our (teed, boxed) fds so its output
-/// lands in the durable log. The verdict is STRUCTURAL: `ok` is the exit status,
-/// `returncode` the raw code, mirroring how the library classifies a `StepOutcome`
-/// so both gate kinds flow through one ledger/cost path.
-fn run_subprocess_gate(tag: &str, cwd: &Path, program: &str, args: &[&str]) -> GateOutcome {
-    eprintln!("\n[{tag}] $ {program} {}", args.join(" "));
-    let start = std::time::Instant::now();
-    let status = Command::new(program).args(args).current_dir(cwd).status();
-    let duration_s = start.elapsed().as_secs_f64();
-    match status {
-        Ok(st) => {
-            let rc = st.code().map(|c| c as i64).or_else(|| {
-                use std::os::unix::process::ExitStatusExt;
-                st.signal().map(|s| -(s as i64))
-            });
-            let ok = st.success();
-            let reason = if ok {
-                String::new()
-            } else if let Some(c) = st.code() {
-                format!("exit {c}")
-            } else {
-                use std::os::unix::process::ExitStatusExt;
-                format!("signal {}", st.signal().unwrap_or(0))
-            };
-            eprintln!("[{tag}] {} ({:.1}s)", if ok { "PASS" } else { "FAIL" }, duration_s);
-            GateOutcome {
-                tag: tag.to_string(),
-                ok,
-                returncode: rc,
-                reason,
-                aborted: false,
-                duration_s,
-            }
-        }
-        Err(e) => {
-            eprintln!("[{tag}] FAIL could not spawn {program:?}: {e}");
-            GateOutcome {
-                tag: tag.to_string(),
-                ok: false,
-                returncode: None,
-                reason: format!("spawn error: {e}"),
-                aborted: false,
-                duration_s,
-            }
-        }
+fn sh(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
-}
-
-// --------------------------------------------------------------------------- full meta-profile
-
-/// Run ONE DAG lane in-process via the library and return its gates as the
-/// unified `GateOutcome`, the skipped node names, wall seconds, and the library's
-/// own structural `RunResult.ok` verdict. Node tags are lane-prefixed so the
-/// ledger and cost table stay unambiguous across the two lanes.
-fn run_dag_lane(
-    root: &Path,
-    lane: &str,
-    jobs: i64,
-    keep_going: bool,
-    verbosity: i64,
-    cgroups: BoxedCgroups,
-) -> Result<(Vec<GateOutcome>, Vec<String>, f64, bool), u8> {
-    let dag_path = root.join("ci").join("dag").join(format!("{lane}.json"));
-    let dag_text = std::fs::read_to_string(&dag_path).map_err(|e| {
-        eprintln!("validate.rs: cannot read {}: {e}", dag_path.display());
-        2u8
-    })?;
-    let cfg = dag_from_json(&dag_text).map_err(|e| {
-        eprintln!("validate.rs: invalid DAG {}: {e}", dag_path.display());
-        2u8
-    })?;
-    eprintln!("\n[{lane} CI DAG lane] $ safe-ci-dag-runner {} -j {jobs}", dag_path.display());
-    let result = run_dag_boxed_ordered(&cfg, jobs, keep_going, verbosity, cgroups, None, None);
-    let gates: Vec<GateOutcome> = result
-        .outcomes
-        .iter()
-        .map(|o| {
-            let mut g = GateOutcome::from(o);
-            g.tag = format!("{lane}:{}", o.tag);
-            g
-        })
-        .collect();
-    let skipped: Vec<String> = result.skipped.iter().map(|s| format!("{lane}:{s}")).collect();
-    Ok((gates, skipped, result.wall_s, result.ok))
-}
-
-/// Run a meta-profile: the honest Rust subsumption of the validate.sh suite
-/// functions that are built out of `run_ci_manifest_lane` (validate.sh:4174).
-///
-/// Every one of them has the identical shape, so this is one implementation
-/// parameterised by `lanes`:
-///
-/// | profile | validate.sh | lanes |
-/// | --- | --- | --- |
-/// | `full` | `run_full_suite` :4399 | portable, privileged |
-/// | `portable-only` | `run_portable_only_suite` :4183 | portable |
-/// | `privileged-only` | `run_privileged_validation` :4381 | privileged |
-///
-/// Shared by all three: the two always-on preflight gates with validate.sh's
-/// fail-fast (:4537), then the centralized manifest gate. validate.sh invokes the
-/// manifest command once PER LANE; a multi-lane profile runs the identical
-/// command twice, so it is deduped to one gate here. The gate still RUNS — it is
-/// not dropped — and the dedup is recorded so a reviewer can see the count change
-/// from 6 observed `run_check` calls to 5 distinct gates and know why.
-///
-/// Verbosity is forced to >=2 so the runner streams each node's `[tag]`-prefixed
-/// output and terminal PASS/FAIL into the (teed) log, which
-/// `finalize_receipt.py --scan` parses to mint the counted+coverage schema-5
-/// receipt.
-///
-/// Returns (all gates, all skipped, total wall seconds, overall_ok).
-fn run_meta_profile(
-    root: &Path,
-    lanes: &[&str],
-    jobs: i64,
-    keep_going: bool,
-    verbosity: i64,
-    cgroups: BoxedCgroups,
-) -> (Vec<GateOutcome>, Vec<String>, f64, bool) {
-    let verbosity = verbosity.max(2);
-    let with_proxy = has_cmd("with-proxy");
-    let mut gates: Vec<GateOutcome> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    let mut wall = 0.0_f64;
-
-    // Preflight gate 1: submodule init (validate.sh:4533 / initialize_repository_submodules).
-    let g = if with_proxy {
-        run_subprocess_gate(
-            "Initialize repository submodules",
-            root,
-            "with-proxy",
-            &["git", "submodule", "update", "--init", "--recursive"],
-        )
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
     } else {
-        run_subprocess_gate(
-            "Initialize repository submodules",
-            root,
-            "git",
-            &["submodule", "update", "--init", "--recursive"],
-        )
-    };
-    wall += g.duration_s;
-    let pre1_ok = g.ok;
-    gates.push(g);
-
-    // Preflight gate 2: reverie pin consistency (validate.sh:4536).
-    let pin = "./scripts/check-reverie-pin.rs";
-    let g = if with_proxy {
-        run_subprocess_gate("Reverie pin consistency", root, "with-proxy", &[pin])
-    } else {
-        run_subprocess_gate("Reverie pin consistency", root, pin, &[])
-    };
-    wall += g.duration_s;
-    let pre2_ok = g.ok;
-    gates.push(g);
-
-    // Fail-fast: do NOT run heavy lanes if preflight failed (validate.sh:4537).
-    if !pre1_ok || !pre2_ok {
-        eprintln!("validate.rs: preflight gate failed; skipping DAG lanes (matches validate.sh fail-fast).");
-        return (gates, skipped, wall, false);
-    }
-
-    // Manifest gate (validate.sh:4178). Runs once (validate.sh runs the identical
-    // command per lane; deduped here — the gate runs, it is not dropped).
-    let g = run_subprocess_gate(
-        "Centralized test manifest and inventory",
-        root,
-        "./ci/test_harness.sh",
-        &["validate"],
-    );
-    wall += g.duration_s;
-    let manifest_ok = g.ok;
-    gates.push(g);
-
-    let mut overall_ok = manifest_ok;
-    for lane in lanes {
-        match run_dag_lane(root, lane, jobs, keep_going, verbosity, cgroups.clone()) {
-            Ok((lg, ls, lw, lok)) => {
-                gates.extend(lg);
-                skipped.extend(ls);
-                wall += lw;
-                overall_ok = overall_ok && lok;
-            }
-            Err(_) => {
-                overall_ok = false;
-            }
-        }
-    }
-    (gates, skipped, wall, overall_ok)
-}
-
-// --------------------------------------------------------------------------- planned test-node set
-
-/// The `test.*` nodes of one resolved DAG, as un-prefixed `group.job` tags.
-///
-/// `finalize_receipt.py` derives its planned set the same way (the `test.*` nodes
-/// of `ci/dag/{portable,privileged}.json` at the commit), so the names emitted
-/// here must be un-prefixed to line up with it. Lane-prefixed gate tags
-/// (`portable:test.unit`) are normalised back with `strip_lane_prefix`.
-fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
-    cfg.steps
-        .iter()
-        .map(|s| s.tag())
-        .filter(|t| t.starts_with("test."))
-        .collect()
-}
-
-/// Union of the `test.*` nodes across `lanes`. A lane whose DAG cannot be read or
-/// parsed contributes nothing and is reported: silently shrinking the PLANNED set
-/// would make coverage look satisfied precisely when we know least about it.
-fn planned_test_nodes_for_lanes(root: &Path, lanes: &[&str]) -> BTreeSet<String> {
-    let mut planned = BTreeSet::new();
-    for lane in lanes {
-        let path = root.join("ci").join("dag").join(format!("{lane}.json"));
-        match std::fs::read_to_string(&path).ok().as_deref().map(dag_from_json) {
-            Some(Ok(cfg)) => planned.extend(test_nodes_of(&cfg)),
-            _ => eprintln!(
-                "validate.rs: warning: could not derive planned test nodes from {}",
-                path.display()
-            ),
-        }
-    }
-    planned
-}
-
-/// Strip the `lane:` prefix a meta-profile puts on its gate tags, yielding the
-/// bare `group.job` DAG tag.
-fn strip_lane_prefix(tag: &str) -> &str {
-    match tag.rsplit_once(':') {
-        Some((_, bare)) => bare,
-        None => tag,
+        Some(s)
     }
 }
 
-/// Mirror validate.sh's `command -v <name>` availability probe.
+fn git_sha() -> String {
+    sh("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+}
+
+/// Content-addressed identity of exactly what validate builds and tests: the root
+/// tree object. It hashes tracked file content AND submodule gitlink SHAs, but not
+/// commit metadata — so a rebase or amend that leaves content byte-identical
+/// yields the SAME tree. This, not the commit SHA, is the result-cache key.
+fn git_tree() -> String {
+    sh("git", &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|| "unknown".into())
+}
+
+fn repo_root() -> PathBuf {
+    sh("git", &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// True when the tree differs from HEAD in ANY way (staged or not).
+fn tree_dirty() -> bool {
+    sh("git", &["status", "--porcelain"]).is_some()
+}
+
+/// True when the WORKING TREE proper carries changes `git add` would capture.
+/// This drives the hard gate, because staging or committing is the caller's
+/// escape from it.
+fn worktree_dirty() -> bool {
+    let unstaged = Command::new("git")
+        .args(["diff", "--quiet"])
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+    unstaged || sh("git", &["ls-files", "--others", "--exclude-standard"]).is_some()
+}
+
+fn utc_now() -> String {
+    sh("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_else(|| "unknown".into())
+}
+
+fn epoch_now() -> i64 {
+    sh("date", &["+%s"]).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
 fn has_cmd(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
@@ -867,56 +822,809 @@ fn has_cmd(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-// --------------------------------------------------------------------------- git / ledger
+/// Locate the dev-hermit parent by walking up for a `.gitmodules` whose `hermit`
+/// submodule path is `hermit` (validate.sh:19).
+fn find_parent(root: &Path) -> Option<PathBuf> {
+    let mut cur = root.to_path_buf();
+    loop {
+        if cur.join(".gitmodules").is_file() {
+            if let Some(p) = sh(
+                "git",
+                &[
+                    "-C",
+                    cur.to_str()?,
+                    "config",
+                    "-f",
+                    ".gitmodules",
+                    "--get",
+                    "submodule.hermit.path",
+                ],
+            ) {
+                if p == "hermit" {
+                    return Some(cur);
+                }
+            }
+        }
+        if !cur.pop() || cur.as_os_str().is_empty() {
+            return None;
+        }
+    }
+}
 
-fn git_sha() -> String {
-    match Command::new("git").args(["rev-parse", "HEAD"]).output() {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                "unknown".to_string()
+/// `validation_slot_name` (validate.sh:37): which worktree slot this checkout is.
+fn slot_name(root: &Path, parent: Option<&Path>) -> String {
+    let Some(parent) = parent else { return "standalone".into() };
+    let Ok(rel) = root.strip_prefix(parent) else { return "standalone".into() };
+    let rel = rel.to_string_lossy();
+    if rel == "hermit" {
+        return "primary".into();
+    }
+    if let Some(rest) = rel.strip_prefix("worktrees/") {
+        if let Some((slot, _)) = rest.split_once('/') {
+            return slot.to_string();
+        }
+    }
+    "standalone".into()
+}
+
+/// Classify the build-cache state BEFORE anything is built. Warm vs cold target/
+/// dominates wall time, so the estimate and the ledger both record it.
+fn cache_state(root: &Path) -> &'static str {
+    let debug = root.join("target/debug/hermit").exists();
+    let release = root.join("target/release/hermit").exists();
+    match (debug, release) {
+        (true, true) => "warm",
+        (true, false) | (false, true) => "partial",
+        (false, false) => "cold",
+    }
+}
+
+// --------------------------------------------------------------------------- rebase freshness
+
+/// Refuse to validate a head that is behind its upstream.
+///
+/// Owner directive: "ALWAYS rebase before validate; admission control should
+/// ERROR if the base is out of date." The reason is not tidiness — a receipt is
+/// keyed to a SHA, and while a stale head waits, `main` advances and the receipt
+/// stops describing anything landable. Validating a stale base spends the
+/// box-exclusive validate slot producing evidence that is already invalid.
+///
+/// Only ERRORS when the local `origin/main` ref genuinely contains commits this
+/// head lacks. It does NOT fetch (that would make an offline run fail for a
+/// network reason) and it does not fire when the ref is absent — an unknown base
+/// is reported as unknown, never silently treated as fresh.
+fn rebase_freshness(force: bool) -> Result<String, String> {
+    if sh("git", &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]).is_none() {
+        return Ok("base: origin/main not present locally; freshness UNKNOWN (not asserted)".into());
+    }
+    let counts = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
+        .unwrap_or_else(|| "0\t0".into());
+    let mut it = counts.split_whitespace();
+    let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if behind == 0 {
+        return Ok(format!("base: up to date with origin/main (ahead {ahead}, behind 0)"));
+    }
+    let msg = format!(
+        "HEAD is {behind} commit(s) BEHIND origin/main (ahead {ahead}).\n  \
+         A receipt minted here is keyed to a SHA that main has already moved past, so it cannot \
+         authorize a landing and will have to be rebuilt after the rebase it is missing.\n  \
+         Rebase first:  git rebase origin/main\n  \
+         To validate a deliberately stale base anyway, pass --run-on-dirty-tree."
+    );
+    if force {
+        Ok(format!("base: STALE, {behind} behind origin/main — forced past the freshness gate"))
+    } else {
+        Err(msg)
+    }
+}
+
+// --------------------------------------------------------------------------- plan
+
+/// What the driver will execute, plus the accounting the ledger needs.
+struct Plan {
+    cfg: DagConfig,
+    /// Second DAG run for a two-lane profile when lanes are NOT fused. Keeping
+    /// them sequential is the faithful reproduction of `run_full_suite`, which
+    /// runs `run_ci_manifest_lane portable` then `... privileged`.
+    second: Option<DagConfig>,
+    profile: String,
+    selection_mode: &'static str,
+    /// `test.*` nodes the profile PLANNED to run, for the coverage record.
+    planned_test_nodes: BTreeSet<String>,
+    /// Set when this profile is a compatibility matrix, so the ratchet and the
+    /// per-program summary are evaluated afterwards.
+    compat: Option<CompatMode>,
+    /// True only for a complete `full` plan, authorizing `gates_expected` to be
+    /// derived from what ran (validate.sh:718).
+    suite_complete: bool,
+}
+
+fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
+    cfg.steps
+        .iter()
+        .map(|s| s.tag())
+        .filter(|t| t.starts_with("test.") || t.contains(":test."))
+        .collect()
+}
+
+/// Build the execution plan for the selected level/mode.
+fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+    let with_proxy = has_cmd("with-proxy");
+    let pre = validate_plan::preflight_nodes(with_proxy);
+    let gate = "gate.manifest";
+
+    // Focused compatibility matrices.
+    let compat_mode = match &args.focused {
+        Some(Focused::StrictCompat) => Some(CompatMode::Strict),
+        Some(Focused::PortableStrictCompat) => Some(CompatMode::PortableStrict),
+        Some(Focused::SabreCompat) => Some(CompatMode::Sabre),
+        Some(Focused::E9patchCompat) => Some(CompatMode::E9patch),
+        Some(Focused::RrCompat) => Some(CompatMode::Rr),
+        _ => None,
+    };
+    if let Some(mode) = compat_mode {
+        let hermit_bin = std::env::var("STRICT_COMPAT_HERMIT_BIN")
+            .unwrap_or_else(|_| root.join("target/release/hermit").to_string_lossy().into());
+        let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
+        let nsswitch = tmp.join("e9patch-nsswitch.conf");
+        let shell_build = tmp.join("shell-build");
+        let paths = validate_corpus::CorpusPaths {
+            root_dir: &root.to_string_lossy(),
+            real_compat_fixtures: &fixtures.to_string_lossy(),
+            validation_tmp_dir: &tmp.to_string_lossy(),
+            shell_build_dir: &shell_build.to_string_lossy(),
+        };
+        let mut steps = pre;
+        // The corpus needs a release Hermit and the functional fixtures; both are
+        // DAG nodes so they are boxed and timed like everything else.
+        steps.push(build_release_hermit_node(gate, &hermit_bin));
+        steps.push(prepare_fixtures_node("compatprep.fixtures", &fixtures));
+        if mode == CompatMode::E9patch {
+            steps.push(nsswitch_fixture_node(&nsswitch));
+        }
+        steps.extend(validate_plan::compat_nodes(
+            root,
+            mode,
+            &hermit_bin,
+            &nsswitch.to_string_lossy(),
+            &paths,
+            Some("compatprep.fixtures"),
+        )?);
+        let profile = args.focused.as_ref().unwrap().profile();
+        let cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
+        return Ok(Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            second: None,
+            profile,
+            selection_mode: "full",
+            compat: Some(mode),
+            suite_complete: false,
+        });
+    }
+
+    // Focused single-shard mode: run one already-built DAG shard, no deps.
+    if let Some(Focused::Only { lane, nodes }) = &args.focused {
+        let mut steps = pre;
+        steps.push(shard_node(gate, lane, nodes));
+        let cfg = validate_plan::config_from(steps, "single DAG shard");
+        return Ok(Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            second: None,
+            profile: args.focused.as_ref().unwrap().profile(),
+            selection_mode: "only",
+            compat: None,
+            suite_complete: false,
+        });
+    }
+
+    // Focused liteinst matrix (validate.sh:4815): three ordered gates.
+    if matches!(args.focused, Some(Focused::LiteinstCompat)) {
+        let mut steps = pre;
+        steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit for LiteInst compatibility",
+            "cargo build --release --locked -p hermit --features third-party-backends".into(),
+            vec![gate.to_string()], 1200, 3600, 16 * 1024 * 1024 * 1024));
+        steps.push(step_with_caps("liteinst", "runtime", "Release LiteInst runtime",
+            "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build".into(),
+            vec!["liteinst.hermit_release".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+        steps.push(step_with_caps("liteinst", "strict", "Portable CI liteinst_strict",
+            "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit cargo test -p hermit --features third-party-backends --test liteinst_advanced -- --test-threads=1".into(),
+            vec!["liteinst.runtime".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+        let cfg = validate_plan::config_from(steps, "liteinst compatibility");
+        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
+            profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
+            compat: None, suite_complete: false });
+    }
+
+    // Focused QEMU L2 boot (validate.sh:4860). Heavyweight; two ordered gates.
+    if matches!(args.focused, Some(Focused::QemuL2)) {
+        let mut steps = pre;
+        steps.push(step_with_caps("qemu", "hermit_release", "Release Hermit for QEMU L2",
+            "cargo build --release -p hermit --features third-party-backends".into(),
+            vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024));
+        steps.push(step_with_caps("qemu", "strict_l2_boot", "QEMU strict L2 boot (heavyweight)",
+            "./tests/qemu-boot/strict_l2_test.sh".into(),
+            vec!["qemu.hermit_release".into()], 1500, 3000, 16 * 1024 * 1024 * 1024));
+        let cfg = validate_plan::config_from(steps, "QEMU L2 boot");
+        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
+            profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
+            compat: None, suite_complete: false });
+    }
+
+    // `quick` is NOT "the portable lane" — it is seven specific smoke gates
+    // (validate.sh:4583). Mapping it onto a lane would run a different, much
+    // larger thing under the same name.
+    if args.level == Level::Quick && args.focused.is_none() {
+        let hermit = "target/debug/hermit";
+        let marker = "hermit-validation-smoke";
+        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let mut steps = pre;
+        let mut add = |job: &str, desc: &str, cmd: String, dep: &str, t: i64, mem: i64| {
+            steps.push(step_with_caps("quick", job, desc, cmd, vec![dep.to_string()], t, t * 2, mem));
+        };
+        add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), gate, 3600, 16 * 1024 * 1024 * 1024);
+        add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), "quick.build", 600, 4 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), "quick.build", 1800, 8 * 1024 * 1024 * 1024);
+        add("detcore_unit", "Detcore core unit tests", "cargo test -p hermit-detcore --lib".into(), "quick.build", 1800, 8 * 1024 * 1024 * 1024);
+        add("run_smoke", "Hermit run smoke test",
+            format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
+            "quick.build", 120, 4 * 1024 * 1024 * 1024);
+        add("verify_smoke", "Hermit verify-mode smoke test",
+            format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
+            "quick.build", 120, 4 * 1024 * 1024 * 1024);
+        add("record_replay_smoke", "Hermit record/replay smoke test",
+            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
+            "quick.build", 180, 4 * 1024 * 1024 * 1024);
+        let cfg = validate_plan::config_from(steps, "quick smoke suite");
+        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
+            profile: "quick".into(), selection_mode: "full", compat: None, suite_complete: false });
+    }
+
+    // REFUSE rather than silently substitute. `super` (the 20x stress repetition
+    // suite) and the `--envelope-*` measurement modes are NOT ported yet. Falling
+    // through to a lane would run something ELSE under the requested name and
+    // report it as success — a wrong answer is worse than a refusal.
+    if args.level == Level::Super && args.focused.is_none() {
+        return Err(
+            "the `super` stress suite is not ported to the Rust driver yet, and this driver will \
+             not silently run a different profile in its place. Use validate.sh's super suite \
+             until it lands (tracked in the PR as the remaining port work)."
+                .into(),
+        );
+    }
+
+    // Lane-based profiles.
+    let lanes: Vec<&str> = match (&args.focused, args.level) {
+        (Some(Focused::PrivilegedOnly), _) => vec!["privileged"],
+        // --selective's documented FAIL-SAFE is to run the complete portable
+        // lane on any doubt; node-level selection is not ported, so it always
+        // takes the safe branch and says so, rather than quietly running fewer
+        // tests than the selector proved safe to omit.
+        (Some(Focused::Selective { .. }), _) => {
+            eprintln!(
+                "validate: node-level selection is not ported; running the FULL portable lane \
+                 (--selective's documented fail-safe branch)."
+            );
+            vec!["portable"]
+        }
+        (None, Level::PortableOnly) => vec!["portable"],
+        (None, Level::Full) => vec!["portable", "privileged"],
+        (_, _) => {
+            return Err(format!(
+                "no plan is defined for level={:?} focused={:?}; refusing to substitute another profile",
+                args.level, args.focused
+            ))
+        }
+    };
+    let profile = match &args.focused {
+        Some(f) => f.profile(),
+        None => args.level.name().to_string(),
+    };
+    let selection_mode = match &args.focused {
+        Some(Focused::Selective { .. }) => "selective",
+        Some(Focused::Only { .. }) => "only",
+        _ => "full",
+    };
+
+    if lanes.len() == 2 && !args.merge_lanes {
+        // Faithful reproduction of run_full_suite: portable lane, then privileged.
+        let mut a = pre.clone();
+        a.extend(validate_plan::lane_nodes(root, lanes[0], "", gate)?);
+        let mut b = validate_plan::lane_nodes(root, lanes[1], "", gate)?;
+        // The second run repeats preflight-free; its nodes hang off nothing.
+        for s in b.iter_mut() {
+            s.deps.retain(|d| d != gate);
+        }
+        let cfg_a = validate_plan::config_from(a, "portable lane");
+        let cfg_b = validate_plan::config_from(b, "privileged lane");
+        let mut planned = test_nodes_of(&cfg_a);
+        planned.extend(test_nodes_of(&cfg_b));
+        return Ok(Plan {
+            cfg: cfg_a,
+            second: Some(cfg_b),
+            profile,
+            selection_mode,
+            planned_test_nodes: planned,
+            compat: None,
+            suite_complete: args.level == Level::Full && args.focused.is_none(),
+        });
+    }
+
+    let mut steps = pre;
+    for lane in &lanes {
+        let prefix = if lanes.len() > 1 { format!("{lane}-") } else { String::new() };
+        steps.extend(validate_plan::lane_nodes(root, lane, &prefix, gate)?);
+    }
+    // Fusing lanes can duplicate identical work (both lanes ship check.reverie_pin
+    // and e2e.metadata with byte-identical commands). Drop the later duplicate and
+    // repoint its dependents, so the fused DAG does not pay for the same node
+    // twice — the dedup is recorded rather than silent.
+    let removed = dedupe_identical(&mut steps);
+    if !removed.is_empty() {
+        eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
+    }
+    let cfg = validate_plan::config_from(steps, "fused lanes");
+    Ok(Plan {
+        planned_test_nodes: test_nodes_of(&cfg),
+        cfg,
+        second: None,
+        profile,
+        selection_mode,
+        compat: None,
+        suite_complete: args.level == Level::Full && args.focused.is_none(),
+    })
+}
+
+/// Remove later steps whose (job, cmd) exactly matches an earlier step's, and
+/// repoint every dependency onto the survivor. Returns the removed tags.
+fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<String> {
+    let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut remap: BTreeMap<String, String> = BTreeMap::new();
+    let mut keep = Vec::with_capacity(steps.len());
+    let mut removed = Vec::new();
+    for s in steps.drain(..) {
+        let key = (s.job.clone(), s.cmd.clone());
+        match seen.get(&key) {
+            Some(surv) => {
+                remap.insert(s.tag(), surv.clone());
+                removed.push(s.tag());
+            }
+            None => {
+                seen.insert(key, s.tag());
+                keep.push(s);
+            }
+        }
+    }
+    for s in keep.iter_mut() {
+        for d in s.deps.iter_mut() {
+            if let Some(t) = remap.get(d) {
+                *d = t.clone();
+            }
+        }
+        s.deps.sort();
+        s.deps.dedup();
+    }
+    *steps = keep;
+    removed
+}
+
+fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model::Step {
+    let default = bin.ends_with("target/release/hermit");
+    let cmd = if default {
+        "cargo build --release -p hermit --features third-party-backends".to_string()
+    } else {
+        // A caller-supplied binary is reused rather than rebuilt, but it must
+        // exist: silently proceeding with a missing binary would fail every row
+        // for a reason that has nothing to do with compatibility.
+        format!("test -x {}", validate_plan::shell_quote(bin))
+    };
+    step_with_caps("compatprep", "hermit_release", "Release Hermit for compatibility", cmd, vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024)
+}
+
+fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
+    step_with_caps(
+        "compatprep",
+        "fixtures",
+        "Functional compatibility fixtures",
+        format!(
+            "./tests/compat/prepare_real_compat_fixtures.sh {}",
+            validate_plan::shell_quote(&fixtures.to_string_lossy())
+        ),
+        vec!["compatprep.hermit_release".to_string()],
+        900,
+        900,
+        4 * 1024 * 1024 * 1024,
+    )
+}
+
+/// `require_e9patch_artifacts`' files-only NSS fixture (validate.sh:4095): keeps
+/// host identity-daemon races out of the e9patch L2 measurement.
+fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
+    let entries = [
+        "aliases", "automount", "ethers", "group", "gshadow", "hosts", "initgroups", "netgroup",
+        "netmasks", "networks", "passwd", "protocols", "publickey", "rpc", "services", "shadow",
+    ]
+    .iter()
+    .map(|k| format!("{k}: files"))
+    .collect::<Vec<_>>()
+    .join("\\n");
+    step_with_caps(
+        "compatprep",
+        "nsswitch",
+        "e9patch files-only NSS fixture",
+        format!(
+            "mkdir -p $(dirname {p}) && printf '{entries}\\n' > {p}",
+            p = validate_plan::shell_quote(&path.to_string_lossy())
+        ),
+        vec![],
+        60,
+        30,
+        512 * 1024 * 1024,
+    )
+}
+
+fn shard_node(gate: &str, lane: &str, nodes: &str) -> safe_ci_dag_runner::model::Step {
+    step_with_caps(
+        "shard",
+        &validate_plan::sanitize_job(&format!("{lane}_{}", nodes.replace([',', '.'], "_"))),
+        &format!("DAG shard {lane}:{nodes}"),
+        format!(
+            "./ci/run-node.sh {} {}",
+            validate_plan::shell_quote(lane),
+            validate_plan::shell_quote(nodes)
+        ),
+        vec![gate.to_string()],
+        7200,
+        7200,
+        16 * 1024 * 1024 * 1024,
+    )
+}
+
+fn step_with_caps(
+    group: &str,
+    job: &str,
+    desc: &str,
+    cmd: String,
+    deps: Vec<String>,
+    timeout: i64,
+    cpu_timeout: i64,
+    mem: i64,
+) -> safe_ci_dag_runner::model::Step {
+    safe_ci_dag_runner::model::Step {
+        group: group.into(),
+        job: job.into(),
+        desc: desc.into(),
+        description: String::new(),
+        cmd,
+        deps,
+        env: BTreeMap::new(),
+        hint: safe_ci_dag_runner::model::ResourceHint {
+            rss_baseline_bytes: Some(mem),
+            hard_mem_max_bytes: Some(mem),
+            ..Default::default()
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout,
+        cpu_timeout,
+        jobs_flag: None,
+    }
+}
+
+// --------------------------------------------------------------------------- reporting
+
+/// Per-node cost table, built entirely from typed `StepOutcome` fields.
+fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
+    println!("\n=== per-node cost (safe-ci-dag-runner) ===");
+    println!("{:<44} {:>9}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
+    println!("{}", "-".repeat(84));
+    let mut total = 0.0_f64;
+    for o in outcomes {
+        total += o.duration_s;
+        let status = if o.ok {
+            "ok"
+        } else if o.aborted {
+            "ABORTED"
+        } else {
+            "FAIL"
+        };
+        let detail = if !o.reason.is_empty() {
+            o.reason.clone()
+        } else if let Some(rc) = o.returncode {
+            if rc < 0 {
+                format!("signal {}", -rc)
             } else {
-                s
+                format!("rc {rc}")
+            }
+        } else {
+            String::new()
+        };
+        println!("{:<44} {:>9.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
+    }
+    println!("{}", "-".repeat(84));
+    println!("{:<44} {:>9.2}  (sum of node wall)", "TOTAL", total);
+    if !skipped.is_empty() {
+        println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
+    }
+}
+
+/// Per-program compatibility summary, built from typed node outcomes rather than
+/// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
+fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
+    let known = validate_corpus::known_failclosed();
+    let diag = validate_corpus::portable_diagnostic();
+    let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut passed = 0usize;
+    let mut measured = 0usize;
+    let mut blocking_failures: Vec<String> = Vec::new();
+    for o in outcomes {
+        let Some(label) = o.tag.strip_prefix("compat.") else { continue };
+        let cat = validate_corpus::category_of(label);
+        let e = per_cat.entry(cat).or_insert((0, 0));
+        e.1 += 1;
+        measured += 1;
+        if o.ok {
+            e.0 += 1;
+            passed += 1;
+            if mode == CompatMode::Strict && known.contains_key(label) {
+                println!("  WARN {label} unexpectedly passed fail-closed --strict; drop it from the known-failure table");
+            }
+        } else if mode == CompatMode::Strict && known.contains_key(label) {
+            println!("  WARN {label} known fail-closed under --strict ({}; nonblocking)", known[label]);
+        } else if mode == CompatMode::PortableStrict && diag.contains_key(label) {
+            println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
+        } else {
+            blocking_failures.push(label.to_string());
+        }
+    }
+    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.assurance());
+    println!("{:<22} | {:>8} | {:>9}", "Category", "Programs", "passing");
+    println!("{}", "-".repeat(46));
+    for cat in validate_corpus::CATEGORIES {
+        if let Some((p, m)) = per_cat.get(cat) {
+            println!("{cat:<22} | {m:>8} | {:>9}", format!("{p}/{m}"));
+        }
+    }
+    println!("{}", "-".repeat(46));
+    println!("{:<22} | {measured:>8} | {:>9}", "TOTAL", format!("{passed}/{measured}"));
+    println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
+    if mode == CompatMode::Rr {
+        // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
+        // that silently drops five known divergences reads as full coverage.
+        let excluded = validate_corpus::rr_known_failures();
+        println!(
+            "R/R ratchet excludes {} program(s) measured to diverge on replay:",
+            excluded.len()
+        );
+        for (label, why) in &excluded {
+            println!("  - {label}: {why}");
+        }
+    }
+    (passed, measured, blocking_failures)
+}
+
+fn human_duration(secs: f64) -> String {
+    let x = secs.round() as i64;
+    let (h, m, s) = (x / 3600, (x % 3600) / 60, x % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+// --------------------------------------------------------------------------- interruption
+
+/// Set from a signal handler when the operator stops the run.
+static INTERRUPTED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_stop_signal(sig: i32) {
+    // Async-signal-safe: a relaxed atomic store and nothing else.
+    INTERRUPTED.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install SIGINT/SIGTERM/SIGHUP handlers so an operator stop is DISTINGUISHABLE
+/// from a run that finished.
+///
+/// **The ledger records every COMPLETE run — and a timeout IS complete.**
+/// A gate that blew its wall or CPU budget produced a real, reproducible result
+/// about the tree: it is written, and `timed_out_nodes` says so. An operator
+/// pressing Ctrl-C learned nothing about the product, so it is a NO-RESULT and
+/// no row is appended at all. Recording interrupts would salt the ledger with
+/// rows whose `fail` means "someone stopped it", and every consumer that counts
+/// reds — the drain report, the flake classifier, the newest-green frontier —
+/// would have to learn to subtract them.
+///
+/// This is a deliberate change from `validate.sh`, which appended a row with
+/// `result: no_result` on a stop. That row was never useful and had to be
+/// filtered by every reader; not writing it is strictly simpler.
+fn install_stop_handlers() {
+    unsafe {
+        libc::signal(libc::SIGINT, on_stop_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_stop_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_stop_signal as *const () as libc::sighandler_t);
+    }
+}
+
+fn interrupted_by() -> Option<&'static str> {
+    match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGHUP => Some("SIGHUP"),
+        _ => Some("signal"),
+    }
+}
+
+/// Nodes the runner reported as killed by their wall or CPU budget. The runner's
+/// own `step_failure_reason` produces these strings, so this reads its typed
+/// classification rather than re-deriving one.
+fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
+    outcomes
+        .iter()
+        .filter(|o| {
+            let r = o.reason.to_ascii_lowercase();
+            r.contains("timeout") || r.contains("timed out")
+        })
+        .map(|o| o.tag.clone())
+        .collect()
+}
+
+// --------------------------------------------------------------------------- ledger
+
+struct LedgerCtx {
+    started_at: String,
+    host: String,
+    toolchain: String,
+    slot: String,
+    cwd: String,
+    profile: String,
+    selection_mode: String,
+    cache_state: String,
+    commit: String,
+    tree: String,
+    git_ahead: i64,
+    git_behind: i64,
+    commit_anchored: bool,
+    tree_dirty: bool,
+    dag_jobs: i64,
+}
+
+/// Write one JSONL ledger record.
+///
+/// Every qualification is written HERE, at the single write point, so no
+/// downstream reader can pair a bare `pass` with inferred coverage. Field names
+/// and schema match what `validate.sh` wrote, so the parent aggregator and the
+/// merge gate keep reading one shape across the port.
+#[allow(clippy::too_many_arguments)]
+fn write_ledger(
+    ledger: &Path,
+    ctx: &LedgerCtx,
+    outcomes: &[StepOutcome],
+    skipped: &[String],
+    wall_s: f64,
+    exit_code: u8,
+    log_file: &str,
+    suite_complete: bool,
+    coverage: serde_json::Value,
+) {
+    let gates_run = outcomes.len();
+    let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+    let result = if exit_code == 0 && failures == 0 { "pass" } else { "fail" };
+    let timed_out = timed_out_nodes(outcomes);
+    // Stable per-row identity. Corrections never edit a row; they append a new
+    // one carrying `corrects: <this id>`, which is what keeps the shard
+    // append-only and safe to union across machines.
+    let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
+    let gates_expected = if ctx.profile == "full" && suite_complete {
+        serde_json::json!(gates_run)
+    } else {
+        serde_json::Value::Null
+    };
+    let gates: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "name": o.tag,
+                "result": if o.ok { "pass" } else { "fail" },
+                "exit_code": o.returncode,
+                "reason": o.reason,
+                "aborted": o.aborted,
+                "real_seconds": o.duration_s,
+            })
+        })
+        .collect();
+    let record = serde_json::json!({
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "producer": LEDGER_PRODUCER,
+        // Immutable-row identity. `corrects` is null here; a correcting row
+        // repeats this shape with `corrects` set to the id it supersedes.
+        "record_id": record_id,
+        "corrects": serde_json::Value::Null,
+        "started_at": ctx.started_at,
+        "finished_at": utc_now(),
+        "host": ctx.host,
+        "toolchain": ctx.toolchain,
+        "slot": ctx.slot,
+        "cwd": ctx.cwd,
+        "profile": ctx.profile,
+        "selection_mode": ctx.selection_mode,
+        "cache_state": ctx.cache_state,
+        "commit": ctx.commit,
+        "tree": ctx.tree,
+        "git_ahead": ctx.git_ahead,
+        "git_behind": ctx.git_behind,
+        "commit_anchored": ctx.commit_anchored,
+        "tree_dirty": ctx.tree_dirty,
+        "result": result,
+        "raw_result": result,
+        "exit_code": exit_code,
+        "checks": gates_run,
+        "failures": failures,
+        "dag_jobs": ctx.dag_jobs,
+        "gates_run": gates_run,
+        "gates_expected": gates_expected,
+        "skipped_nodes": skipped.len(),
+        // A timeout is a RESULT, so it is recorded rather than dropped, and it is
+        // named so a reader can separate "the tree is broken" from "a gate blew
+        // its budget". Operator interrupts never reach this function at all.
+        "timed_out_nodes": timed_out,
+        // NODE counts, deliberately NOT named executed_tests/filtered_tests: a
+        // schema<5 consumer keys is_clean_full_pass on those libtest-count names,
+        // and a ~47-NODE DAG run must never be readable as a 47-TEST pass. The
+        // counted receipt is minted by finalize_receipt.py --scan off the log.
+        "executed_nodes": gates_run,
+        "real_seconds": wall_s,
+        "log_file": log_file,
+        "coverage": coverage,
+        "gates": gates,
+    });
+    if let Some(dir) = ledger.parent() {
+        if !dir.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
+                return;
             }
         }
-        _ => "unknown".to_string(),
     }
-}
-
-/// True when the working tree differs from HEAD in ANY way (porcelain non-empty).
-/// Drives commit anchoring: a record is only faithfully attributable to a SHA
-/// when the tree exactly matches that HEAD.
-fn tree_dirty() -> bool {
-    match Command::new("git").args(["status", "--porcelain"]).output() {
-        Ok(o) if o.status.success() => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        // Outside a git repo or on error: not dirty, just "not anchored".
-        _ => false,
-    }
-}
-
-/// Repo root via `git rev-parse --show-toplevel`, so profile/DAG paths resolve
-/// no matter the caller's cwd. Falls back to the current dir.
-fn repo_root() -> PathBuf {
-    match Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() {
-                return PathBuf::from(s);
+    use std::io::Write;
+    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
+    match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display());
+            } else {
+                eprintln!("validate: ledger record appended to {}", ledger.display());
+                warn_if_unreadable_ledger(ledger);
             }
         }
-        _ => {}
+        Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Resolve the ledger file with a defined precedence that is NEVER empty (the
-/// standalone-checkout landmine fix):
-///   1. `$HERMIT_VALIDATE_LEDGER` — explicit file.
-///   2. `$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl` — parent workspace.
-///   3. `<repo_root>/.hermit-validate-ledger.jsonl` — checkout-local default.
+/// SHORT hostname, never an FQDN.
+///
+/// The shard name is part of a committed path, and an FQDN would leak internal
+/// domain structure into the repository as well as making the same machine
+/// produce different shard names depending on how DNS resolved that day. `hostname
+/// -s` is the short form; anything with a dot is truncated at the first label as a
+/// belt-and-braces guard in case `-s` is unavailable.
+fn short_hostname() -> String {
+    let raw = sh("hostname", &["-s"])
+        .or_else(|| sh("hostname", &[]))
+        .unwrap_or_else(|| "unknown".into());
+    raw.split('.').next().unwrap_or("unknown").to_string()
+}
+
+/// Resolve the ledger shard. Precedence:
+///   1. `$HERMIT_VALIDATE_LEDGER` — explicit file (existing consumers rely on it).
+///   2. `$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl` — the parent
+///      workspace ledger `ci-hub` already aggregates.
+///   3. The in-repo per-(team, machine) shard.
 fn ledger_path(root: &Path) -> PathBuf {
     if let Ok(explicit) = std::env::var(LEDGER_ENV) {
         if !explicit.is_empty() {
@@ -925,16 +1633,16 @@ fn ledger_path(root: &Path) -> PathBuf {
     }
     if let Ok(parent) = std::env::var(PARENT_ENV) {
         if !parent.is_empty() {
-            return PathBuf::from(parent)
-                .join("ignored")
-                .join("validate-run-ledger.jsonl");
+            return PathBuf::from(parent).join("ignored").join("validate-run-ledger.jsonl");
         }
     }
-    // The env var being unset does NOT mean there is no parent -- far more often it means a run
-    // inside a dev-hermit slot that simply did not export it. Measured 2026-08-08: 111 real rows
-    // sat in two slots' `.hermit-validate-ledger.jsonl` for exactly that reason, and
-    // `ci-hub validate-status` could not see one of them. So look for the parent before falling
-    // back, because a discoverable parent makes the fallback a bug rather than a choice.
+    // Carried forward from main f65f74462 during the rebase. The env var being
+    // unset does NOT mean there is no parent -- far more often it means a run
+    // inside a dev-hermit slot that simply did not export it. Measured
+    // 2026-08-08: 111 real rows sat in two slots' checkout-local ledgers for
+    // exactly that reason, and `ci-hub validate-status` could not see one of
+    // them. So look for the parent before falling back, because a discoverable
+    // parent makes the fallback a bug rather than a choice.
     if let Some(found) = discover_parent_ledger(root) {
         eprintln!(
             "validate.rs: {PARENT_ENV} is unset; recording to the DISCOVERED parent ledger {}",
@@ -942,15 +1650,26 @@ fn ledger_path(root: &Path) -> PathBuf {
         );
         return found;
     }
-    root.join(LOCAL_LEDGER_BASENAME)
+    let team = std::env::var(LEDGER_TEAM_ENV)
+        .ok()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| LEDGER_TEAM_DEFAULT.to_string());
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+            .collect::<String>()
+    };
+    root.join(LEDGER_DIR)
+        .join(format!("{}.{}.jsonl", sanitize(&team), sanitize(&short_hostname())))
 }
 
-/// Walk up from `root` for a dev-hermit parent workspace that already has a run ledger.
+/// Walk up from `root` for a dev-hermit parent workspace that already has a run
+/// ledger. Carried forward from main f65f74462 unchanged.
 ///
-/// Deliberately keyed on the ledger FILE existing, not on a directory name: the point is to find
-/// the location a reader actually queries, and a `ignored/` directory with no ledger in it is not
-/// that. Returns `None` for a genuinely standalone checkout, which is the only case the
-/// checkout-local fallback is meant to serve.
+/// Deliberately keyed on the ledger FILE existing, not on a directory name: the
+/// point is to find the location a reader actually queries, and an `ignored/`
+/// directory with no ledger in it is not that. Returns `None` for a genuinely
+/// standalone checkout, which is the only case the in-repo shard is meant to serve.
 fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
     let mut dir = root.parent();
     while let Some(candidate) = dir {
@@ -965,16 +1684,27 @@ fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
 
 /// Say plainly that a row is not going anywhere a reader will look.
 ///
-/// A writer that SUCCEEDS into a location no consumer reads reports success and attests nothing --
-/// the same shape as a `locally-validated` label with no backing run. This does not fail the run,
-/// because a standalone checkout must still be able to validate; it makes the invisibility
-/// impossible to miss, so "silent success" stops being the failure mode.
+/// A writer that SUCCEEDS into a location no consumer reads reports success and
+/// attests nothing -- the same shape as a `locally-validated` label with no
+/// backing run. This does not fail the run, because a standalone checkout must
+/// still be able to validate; it makes the invisibility impossible to miss, so
+/// "silent success" stops being the failure mode.
+///
+/// REBASE NOTE (main f65f74462 -> this branch): upstream keyed this on the
+/// checkout-local ledger BASENAME. This branch replaced that single file with the
+/// per-(team, machine) shard under `LEDGER_DIR`, so the predicate is re-expressed
+/// against the shard directory. Copying the upstream basename test verbatim would
+/// have made the warning permanently unreachable — the silent-write it exists to
+/// expose is exactly the shard case.
 fn warn_if_unreadable_ledger(ledger: &Path) {
-    if ledger.file_name().and_then(|n| n.to_str()) != Some(LOCAL_LEDGER_BASENAME) {
+    // `Path::ends_with` matches whole components, so this is the shard directory
+    // test and not a string prefix. Keyed on the directory rather than on `root`
+    // so the writer needs no extra parameter threaded through it.
+    if !ledger.parent().map(|d| d.ends_with(LEDGER_DIR)).unwrap_or(false) {
         return;
     }
     eprintln!(
-        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL ledger {}, which NO reader \
+        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL shard {}, which NO reader \
          queries -- `ci-hub validate-status` will report NOT-VALIDATED for this commit even though \
          the run passed. Set {PARENT_ENV} to the dev-hermit workspace (or {LEDGER_ENV} to an \
          explicit file) if this row is meant to count.",
@@ -982,443 +1712,282 @@ fn warn_if_unreadable_ledger(ledger: &Path) {
     );
 }
 
-fn utc_now() -> String {
-    match Command::new("date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => "unknown".to_string(),
-    }
-}
-
-/// Write one JSONL ledger record. Every qualification (profile/executed_nodes/
-/// skipped_nodes, commit anchoring, per-gate reason) is written HERE, at the
-/// single ledger-write point, so no downstream reader can pair a bare `pass`
-/// with inferred coverage.
-#[allow(clippy::too_many_arguments)]
-fn write_ledger_record(
-    ledger: &Path,
-    started_at: &str,
-    finished_at: &str,
-    profile: &str,
-    gates: &[GateOutcome],
-    skipped: &[String],
-    wall_s: f64,
-    overall_ok: bool,
-    log_file: Option<&str>,
-    exit_code: u8,
-    commit: &str,
-    tree_is_dirty: bool,
-    selection_mode: &str,
-    planned_test_nodes: &BTreeSet<String>,
-) {
-    // DAG-lane semantics: the gate (NODE) is the unit of execution, NOT a libtest
-    // test case. See the module doc comment. These are DAG-node counts:
-    //   executed_nodes = DAG nodes (gates) that actually RAN;
-    //   skipped_nodes  = DAG nodes skipped because a dependency failed.
-    // They are deliberately NOT named executed_tests/filtered_tests, so a
-    // schema<5 consumer never mistakes a node count for a libtest test count.
-    let executed_nodes = gates.len();
-    let skipped_nodes = skipped.len();
-    // Genuine, non-aborted failures — the honest failure count.
-    let failures = gates.iter().filter(|o| !o.ok && !o.aborted).count();
-    let commit_anchored = commit != "unknown" && !tree_is_dirty;
-    let overall = if overall_ok && failures == 0 {
-        "pass"
-    } else {
-        "fail"
-    };
-
-    let host = Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Per-node coverage, in the EXACT `CoverageRow` shape the consumer defines
-    // (ci-hub/lib/records.rs:204 — planned_test_nodes:u64, executed_test_nodes:u64,
-    // zero_executed_nodes:[String], absent_nodes:[String]).
-    //
-    // Shape-exactness is not cosmetic. `HistoryRow.coverage` is a TYPED
-    // `#[serde(default)] Option<CoverageRow>`: `serde(default)` supplies `None`
-    // only when the key is ABSENT. A key that is present with the WRONG shape is a
-    // hard serde error on the whole row, and `parse_ledger` then drops that entire
-    // row into a `skipped` counter nobody reads — so a malformed coverage object
-    // makes a green receipt VANISH rather than merely lose its coverage. Emitting
-    // an int where a `Vec<String>` is expected is the specific way to trigger it.
-    //
-    // What these values mean HERE (and what they deliberately do not claim):
-    // this is NODE-RAN granularity, derived from typed gate outcomes. It is not
-    // libtest-banner granularity, so `zero_executed_nodes` is always empty — a node
-    // that ran but executed zero test cases is only detectable by parsing the log
-    // banners, which is `finalize_receipt.py --scan`'s job, not something this
-    // producer can honestly assert at runtime. The empty list therefore means
-    // "not determinable here", NOT "verified none". That is safe because the
-    // coverage clause of the landing predicate fires only at schema_version >= 5
-    // (validate_status.rs:173) and this producer stays at 3, where a row carrying
-    // no `executed_tests` can never qualify as a landing green in the first place
-    // (qualifying_receipt.rs:136). The authoritative counted+coverage row is minted
-    // by finalize_receipt.py --scan off the durable log.
-    let executed_test_nodes: BTreeSet<String> = gates
-        .iter()
-        .filter(|g| !g.aborted)
-        .map(|g| strip_lane_prefix(&g.tag).to_string())
-        .filter(|t| planned_test_nodes.contains(t))
-        .collect();
-    let absent_nodes: Vec<&String> = planned_test_nodes
-        .iter()
-        .filter(|t| !executed_test_nodes.contains(*t))
-        .collect();
-    let coverage = serde_json::json!({
-        "planned_test_nodes": planned_test_nodes.len(),
-        "executed_test_nodes": executed_test_nodes.len(),
-        // Always empty: see the note above — not determinable at NODE granularity.
-        "zero_executed_nodes": Vec::<String>::new(),
-        "absent_nodes": absent_nodes,
-    });
-
-    let gates_json: Vec<serde_json::Value> = gates
-        .iter()
-        .map(|o| {
-            serde_json::json!({
-                "name": o.tag,
-                "result": if o.ok { "pass" } else { "fail" },
-                "returncode": o.returncode,
-                "reason": o.reason,
-                "aborted": o.aborted,
-                "real_seconds": o.duration_s,
-            })
-        })
-        .collect();
-
-    let record = serde_json::json!({
-        "schema_version": LEDGER_SCHEMA_VERSION,
-        "producer": LEDGER_PRODUCER,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "host": host,
-        // Selection accounting. These are NODE-granularity counts, deliberately
-        // NOT named executed_tests/filtered_tests: emitting node values under the
-        // libtest-count field names would let a schema<5 consumer's counts_present
-        // branch (is_clean_full_pass) read a ~47-NODE DAG run as a 47-TEST full
-        // pass. Fail-closed: no libtest-count-named field is written here. The
-        // authoritative counted+coverage receipt is minted by
-        // finalize_receipt.py --scan off the durable log; producer="validate.rs"
-        // already disambiguates this row.
-        "profile": profile,
-        "executed_nodes": executed_nodes,
-        "skipped_nodes": skipped_nodes,
-        "selection_mode": selection_mode,
-        // Self-describing partialness (Blocker 4): a single-profile Phase-1
-        // DAG-lane run is never the full multi-lane validate; a full-coverage
-        // landing receipt requires both portable and privileged lanes plus the
-        // non-DAG gates that validate.sh still owns. So this is always false here.
-        "full_coverage": false,
-        // Commit anchoring.
-        "commit": commit,
-        "commit_anchored": commit_anchored,
-        "tree_dirty": tree_is_dirty,
-        // Verdict.
-        "result": overall,
-        "exit_code": exit_code,
-        "failures": failures,
-        "real_seconds": wall_s,
-        // Absolute path to this run's durable self-teed log. finalize_receipt.py
-        // --scan reads this to mint the counted schema-5 receipt; verify_receipt.sh
-        // (merge gate) requires it to exist and start with '/'.
-        "log_file": log_file,
-        // Node-ran coverage in the consumer's exact CoverageRow shape (see above).
-        "coverage": coverage,
-        "gates": gates_json,
-    });
-
-    if let Some(dir) = ledger.parent() {
-        if !dir.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!(
-                    "validate.rs: warning: could not create ledger dir {}: {e}",
-                    dir.display()
-                );
-                return;
-            }
-        }
-    }
-
-    use std::io::Write;
-    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ledger)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                eprintln!(
-                    "validate.rs: warning: could not append ledger {}: {e}",
-                    ledger.display()
-                );
-            } else {
-                eprintln!("validate.rs: ledger record appended to {}", ledger.display());
-                warn_if_unreadable_ledger(ledger);
-            }
-        }
-        Err(e) => eprintln!(
-            "validate.rs: warning: could not open ledger {}: {e}",
-            ledger.display()
-        ),
-    }
-}
-
-// --------------------------------------------------------------------------- reporting
-
-/// The headline feature: a readable per-node cost table built entirely from typed
-/// `StepOutcome` fields (never scraped text).
-fn print_cost_table(outcomes: &[GateOutcome], skipped: &[String]) {
-    println!("\n=== per-node cost (safe-ci-dag-runner) ===");
-    println!("{:<40} {:>10}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
-    println!("{}", "-".repeat(80));
-    let mut total = 0.0_f64;
-    for o in outcomes {
-        total += o.duration_s;
-        let status = if o.ok {
-            "ok"
-        } else if o.aborted {
-            "ABORTED"
-        } else {
-            "FAIL"
-        };
-        // Prefer the library-derived reason; fall back to the typed returncode.
-        let detail = if !o.reason.is_empty() {
-            o.reason.clone()
-        } else if let Some(rc) = o.returncode {
-            if rc < 0 {
-                format!("signal {}", -rc)
-            } else {
-                format!("rc {rc}")
-            }
-        } else {
-            String::new()
-        };
-        println!("{:<40} {:>10.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
-    }
-    println!("{}", "-".repeat(80));
-    println!("{:<40} {:>10.2}  (sum of node wall)", "TOTAL", total);
-    if !skipped.is_empty() {
-        println!(
-            "\nskipped (dependency failed, never ran): {}",
-            skipped.join(", ")
-        );
-    }
-}
-
 // --------------------------------------------------------------------------- main
 
 fn main() -> ExitCode {
-    // FIRST thing, before any output: tolerate a downstream reader closing the
-    // pipe early (the typed cure for the SIGPIPE-text-grep landmine).
     rust_script_prelude::init();
+    install_stop_handlers();
 
     let args = match parse_args() {
         Ok(a) => a,
         Err(code) => return ExitCode::from(code),
     };
 
-    let root = repo_root();
-
-    // A meta-profile is NOT a single DAG file: it subsumes one of validate.sh's
-    // run_ci_manifest_lane-built suites (preflight gates + manifest + its lanes).
-    // Any other profile — or an explicit --dag-file override — resolves to a single
-    // ci/dag/<name>.json and runs the runner once. An explicit --dag-file always
-    // wins, so `--dag-file X full` stays an exact single-DAG run.
-    let meta_lanes = if args.dag_file.is_none() {
-        meta_profile_lanes(&args.profile)
-    } else {
-        None
-    };
-    let is_full = meta_lanes.is_some();
-
-    // Resolve/validate the single DAG file up front (only for the single-lane path);
-    // a meta-profile has no ci/dag/<profile>.json and this would spuriously error.
-    let cfg = if is_full {
-        None
-    } else {
-        // explicit --dag-file / RUN_DAG_FILE_OVERRIDE wins, else ci/dag/<profile>.json.
-        let dag_path: PathBuf = match &args.dag_file {
-            Some(p) => PathBuf::from(p),
-            None => root.join("ci").join("dag").join(format!("{}.json", args.profile)),
+    if args.self_test {
+        return match self_test() {
+            Ok(()) => {
+                println!("validate: self-test OK (force-full policy brackets, shell quoting, corpus counts)");
+                ExitCode::from(0)
+            }
+            Err(e) => {
+                eprintln!("validate: SELF-TEST FAILED: {e}");
+                ExitCode::from(2)
+            }
         };
-        if !dag_path.is_file() {
-            eprintln!(
-                "validate.rs: no such DAG file: {} (profile {:?})",
-                dag_path.display(),
-                args.profile
-            );
+    }
+
+    let root = repo_root();
+    if std::env::set_current_dir(&root).is_err() {
+        eprintln!("validate: cannot cd to repo root {}", root.display());
+        return ExitCode::from(2);
+    }
+    let parent = find_parent(&root);
+
+    // Dirty-tree gate, BEFORE any state is created, so a refusal leaves nothing
+    // behind. A result validated against uncommitted changes describes a tree
+    // that exists nowhere in history and cannot be reproduced or compared.
+    let wt_dirty = worktree_dirty();
+    if wt_dirty && !args.run_on_dirty_tree {
+        eprintln!("validate: refusing to run on a dirty working tree.");
+        eprintln!("  HEAD {} has uncommitted working-tree changes, so a record anchored to it", git_sha());
+        eprintln!("  would describe a tree that exists nowhere in history. Commit (preferred), or");
+        eprintln!("  stage the WIP with 'git add', then re-run. To force an explicitly unanchored");
+        eprintln!("  run pass --run-on-dirty-tree (agents must not).");
+        let _ = Command::new("git").args(["status", "--short"]).status();
+        return ExitCode::from(2);
+    }
+
+    // Rebase-freshness gate. Mechanically enforced, not advisory.
+    match rebase_freshness(args.run_on_dirty_tree) {
+        Ok(msg) => eprintln!("validate: {msg}"),
+        Err(msg) => {
+            eprintln!("validate: refusing to validate a stale base.\n  {msg}");
             return ExitCode::from(2);
         }
-        let dag_text = match std::fs::read_to_string(&dag_path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("validate.rs: cannot read {}: {e}", dag_path.display());
-                return ExitCode::from(2);
-            }
-        };
-        match dag_from_json(&dag_text) {
-            Ok(c) => Some((c, dag_path)),
-            Err(e) => {
-                eprintln!("validate.rs: invalid DAG {}: {e}", dag_path.display());
-                return ExitCode::from(2);
-            }
+    }
+
+    // Run state lives under target/, never under HERMIT_DIR (a user setting).
+    let tmp = root.join("target/validation").join(format!("run-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&tmp) {
+        eprintln!("validate: cannot create {}: {e}", tmp.display());
+        return ExitCode::from(2);
+    }
+
+    let plan = match build_plan(&root, &args, &tmp) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("validate: cannot build the execution plan: {e}");
+            return ExitCode::from(2);
         }
     };
 
-    // Fail-closed boxing. On the default path this re-execs into a transient
-    // systemd --user scope and never returns on success; the code below runs in
-    // the boxed re-exec.
+    // Fail-closed caps audit. A node without declared caps would run UNBOXED
+    // while the driver still printed "boxing ACTIVE" — a green verifying less
+    // than it claims. Refuse rather than run.
+    let mut undeclared = validate_plan::undeclared_nodes(&plan.cfg);
+    if let Some(second) = &plan.second {
+        undeclared.extend(validate_plan::undeclared_nodes(second));
+    }
+    if !undeclared.is_empty() {
+        eprintln!(
+            "validate: ERROR: {} node(s) lack declared resource caps and would run UNBOXED: {}",
+            undeclared.len(),
+            undeclared.join(", ")
+        );
+        eprintln!("  Declare timeout + cpu_timeout + a memory hint for each; see scripts/lib/validate_plan.rs.");
+        return ExitCode::from(3);
+    }
+
+    // Print the plan and exit. This makes "what will actually run, and under what
+    // caps" reviewable without spending a validate slot — and it is how the
+    // declared-caps claim above can be checked by eye rather than trusted.
+    if args.show_plan {
+        let mut all: Vec<&DagConfig> = vec![&plan.cfg];
+        if let Some(s) = &plan.second {
+            all.push(s);
+        }
+        println!("profile: {}  selection: {}", plan.profile, plan.selection_mode);
+        for (i, cfg) in all.iter().enumerate() {
+            println!("\n--- DAG {} of {} ({}) : {} node(s)", i + 1, all.len(), cfg.description, cfg.steps.len());
+            println!("{:<40} {:>7} {:>7} {:>8}  {}", "node", "wall_s", "cpu_s", "mem", "deps");
+            for s in &cfg.steps {
+                let cpu = if s.cpu_timeout > 0 { s.cpu_timeout } else { cfg.default_step_cpu_timeout };
+                let mem = s.hint.hard_mem_max_bytes.or(s.hint.rss_baseline_bytes).unwrap_or(0);
+                println!(
+                    "{:<40} {:>7} {:>7} {:>7}M  {}",
+                    s.tag(), s.timeout, cpu, mem / (1024 * 1024), s.deps.join(",")
+                );
+            }
+        }
+        let total: usize = all.iter().map(|c| c.steps.len()).sum();
+        println!("\ntotal boxed nodes: {total}; all have declared wall+cpu+memory caps (audited above).");
+        return ExitCode::from(0);
+    }
+
     let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
         Ok(c) => c,
         Err(code) => return ExitCode::from(code),
     };
 
-    // Self-tee a durable log AFTER the boxing re-exec, so a standalone
-    // `./scripts/validate.rs` (no systemd unit, no ci-hub launcher) still leaves a
-    // receipt-quality log on disk. The RECEIPT PATH is thus independent of the
-    // LAUNCH PATH: without this, a green standalone run leaves no trace, which is
-    // indistinguishable from never having run. Fail-closed: exits 4 on any failure.
-    let durable = match setup_durable_log(&root, &args.profile, &git_sha()) {
+    let commit = git_sha();
+    let durable = match setup_durable_log(&root, &plan.profile, &commit) {
         Ok(d) => d,
         Err(code) => return ExitCode::from(code),
     };
 
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
+    let started_epoch = epoch_now();
+    let cache = cache_state(&root);
+    let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
 
-    // Run the gates. `full` fans out to the subsumption; everything else runs the
-    // single resolved DAG once (and forwards per-step perf rows, which only the
-    // single-lane path produces via the typed RunResult).
-    #[allow(clippy::type_complexity)]
-    let (gates, skipped, wall, ok, selection_mode, planned): (
-        Vec<GateOutcome>,
-        Vec<String>,
-        f64,
-        bool,
-        &str,
-        BTreeSet<String>,
-    ) = if let Some(lanes) = meta_lanes {
-        eprintln!(
-            "validate.rs: running meta-profile {:?} (preflight + manifest + lanes {}) at -j {jobs}",
-            args.profile,
-            lanes.join(", ")
+    println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
+    println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
+    println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
+    println!("Plan: {node_count} boxed DAG node(s){}", if plan.second.is_some() { " across 2 sequential lanes" } else { "" });
+
+    // Verbosity floored at 2: the runner streams each node's tagged output, so
+    // the operator always sees which node is running. Never blind.
+    let verbosity = if args.verbose { 3 } else { 2 };
+
+    let mut outcomes: Vec<StepOutcome> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut ok = true;
+
+    let r = run_dag_boxed_ordered(&plan.cfg, jobs, args.keep_going, verbosity, cgroups.clone(), None, None);
+    outcomes.extend(r.outcomes.iter().cloned());
+    skipped.extend(r.skipped.iter().cloned());
+    ok = ok && r.ok;
+
+    if let Some(second) = &plan.second {
+        if ok || args.keep_going {
+            let r2 = run_dag_boxed_ordered(second, jobs, args.keep_going, verbosity, cgroups.clone(), None, None);
+            outcomes.extend(r2.outcomes.iter().cloned());
+            skipped.extend(r2.skipped.iter().cloned());
+            ok = ok && r2.ok;
+        } else {
+            eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
+        }
+    }
+
+    let wall = (epoch_now() - started_epoch) as f64;
+    print_cost_table(&outcomes, &skipped);
+
+    // Operator stop => NO-RESULT => no ledger row. A timeout, by contrast, is a
+    // completed run and falls through to the normal write below. See
+    // `install_stop_handlers` for why an interrupt row is worse than no row.
+    if let Some(sig) = interrupted_by() {
+        println!(
+            "\n⏹ Validation interrupted by {sig} after {} — recording NO ledger row.",
+            human_duration(wall)
         );
-        let planned = planned_test_nodes_for_lanes(&root, lanes);
-        let (g, s, w, o) =
-            run_meta_profile(&root, lanes, jobs, args.keep_going, args.verbosity, cgroups);
-        // selection_mode mirrors validate.sh: a level (full / portable-only /
-        // privileged-only) runs its whole configured plan, so the SELECTION is
-        // full; it is the PROFILE that records how narrow the plan was. Only
-        // --selective / --only narrow the selection itself.
-        (g, s, w, o, "full", planned)
-    } else {
-            let (cfg, dag_path) = cfg.expect("single-lane path always resolves a cfg");
-            eprintln!(
-                "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
-                args.profile,
-                dag_path.display()
-            );
-            let result = run_dag_boxed_ordered(
-                &cfg,
-                jobs,
-                args.keep_going,
-                args.verbosity,
-                cgroups,
-                None,
-                None,
-            );
+        println!(
+            "   An interrupt learned nothing about the tree, so it is not a result. \
+             {} node(s) had completed; partial output is in the durable log.",
+            outcomes.len()
+        );
+        println!("   durable log: {}", durable.path.display());
+        let _ = std::fs::remove_dir_all(&tmp);
+        durable.finish();
+        return ExitCode::from(130);
+    }
 
-            // Forward per-step profile rows only when a profile dir is configured
-            // (--perf-dir or the env), mirroring the runner's own opt-in.
-            let profile_dir = args
-                .perf_dir
-                .clone()
-                .or_else(|| std::env::var(PROFILE_DIR_ENV).ok().filter(|s| !s.is_empty()));
-            if let Some(dir) = profile_dir {
-                let sha = git_sha();
-                append_step_profiles(
-                    Path::new(&dir),
-                    &result.step_profile_rows,
-                    &sha,
-                    jobs,
-                    None,
-                    "unverified",
-                    LEDGER_PRODUCER,
-                );
-                eprintln!(
-                    "validate.rs: forwarded {} step profile row(s) to {dir}",
-                    result.step_profile_rows.len()
-                );
-            }
-
-            let gates: Vec<GateOutcome> =
-                result.outcomes.iter().map(GateOutcome::from).collect();
-            let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
-            // Planned set for a single-lane run is that lane's own test.* nodes.
-            let planned = test_nodes_of(&cfg);
-            (
-                gates,
-                result.skipped.clone(),
-                result.wall_s,
-                result.ok,
-                selection_mode,
-                planned,
-            )
+    // Compatibility ratchet, evaluated from typed outcomes.
+    let mut compat_blocking = 0usize;
+    if let Some(mode) = plan.compat {
+        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        compat_blocking = blocking.len();
+        let floor = match mode {
+            CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
+            CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
+            _ => None,
         };
+        if let Some(f) = floor {
+            if passed < f {
+                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.assurance());
+                ok = false;
+            } else {
+                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.assurance());
+            }
+        }
+        if !blocking.is_empty() {
+            println!("❌ {} blocking failures ({}): {}", mode.assurance(), blocking.len(), blocking.join(", "));
+        }
+    }
 
-    let finished_at = utc_now();
+    let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+    // A compat run's verdict is the RATCHET, not the raw node count: known
+    // fail-closed rows and bounded portable diagnostics are nonblocking by
+    // policy, so they must not turn the run red on their own.
+    let effective_failures = if plan.compat.is_some() { compat_blocking } else { failures };
+    let exit_code: u8 = if ok && effective_failures == 0 { 0 } else { 1 };
 
-    // Structural verdict — never text-grep. A genuine, non-aborted failing gate is
-    // the honest failure; `ok` is the library/subsumption's own no-failure verdict.
-    let failures = gates.iter().filter(|o| !o.ok && !o.aborted).count();
-    let exit_code: u8 = if ok && failures == 0 { 0 } else { 1 };
+    // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
+    // zero_executed_nodes is always empty and means "not determinable here", not
+    // "verified none" — a node that ran while executing zero test cases is only
+    // visible in the log banners, which is finalize_receipt.py --scan's job.
+    let executed: BTreeSet<String> = outcomes
+        .iter()
+        .filter(|o| !o.aborted)
+        .map(|o| o.tag.clone())
+        .filter(|t| plan.planned_test_nodes.contains(t))
+        .collect();
+    let absent: Vec<&String> = plan.planned_test_nodes.iter().filter(|t| !executed.contains(*t)).collect();
+    let coverage = serde_json::json!({
+        "planned_test_nodes": plan.planned_test_nodes.len(),
+        "executed_test_nodes": executed.len(),
+        "zero_executed_nodes": Vec::<String>::new(),
+        "absent_nodes": absent,
+    });
 
-    print_cost_table(&gates, &skipped);
+    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
+        .unwrap_or_else(|| "0 0".into());
+    let mut ba = behind_ahead.split_whitespace();
+    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dirty_now = tree_dirty();
 
-    // Ledger — always writes (checkout-local default when no env override), at the
-    // single write point that carries every qualification with the value, including
-    // the absolute durable log path for finalize_receipt.py --scan / verify_receipt.sh.
-    let commit = git_sha();
-    let dirty = tree_dirty();
-    let log_path = durable.path.clone();
-    write_ledger_record(
+    let ctx = LedgerCtx {
+        started_at,
+        host: sh("hostname", &["-s"]).unwrap_or_else(|| "unknown".into()),
+        toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
+        slot: slot_name(&root, parent.as_deref()),
+        cwd: root.to_string_lossy().into(),
+        profile: plan.profile.clone(),
+        selection_mode: plan.selection_mode.into(),
+        cache_state: cache.into(),
+        commit: commit.clone(),
+        tree: git_tree(),
+        git_ahead,
+        git_behind,
+        commit_anchored: commit != "unknown" && !dirty_now,
+        tree_dirty: dirty_now,
+        dag_jobs: jobs,
+    };
+    write_ledger(
         &ledger_path(&root),
-        &started_at,
-        &finished_at,
-        &args.profile,
-        &gates,
+        &ctx,
+        &outcomes,
         &skipped,
         wall,
-        ok,
-        log_path.to_str(),
         exit_code,
-        &commit,
-        dirty,
-        selection_mode,
-        &planned,
+        &durable.path.to_string_lossy(),
+        plan.suite_complete,
+        coverage,
     );
 
-    let verdict = if exit_code == 0 { "PASS" } else { "FAIL" };
-    eprintln!(
-        "validate.rs: {verdict} - {} executed, {failures} failed, {} skipped in {:.1}s",
-        gates.len(),
+    let marker = if exit_code == 0 { "✅" } else { "❌" };
+    println!(
+        "{marker} {} — {} node(s) executed, {failures} failed, {} skipped in {} at -j {jobs}",
+        if exit_code == 0 { "PASS" } else { "FAIL" },
+        outcomes.len(),
         skipped.len(),
-        wall
+        human_duration(wall)
     );
+    println!("   durable log: {}", durable.path.display());
 
-    // Flush + restore fds + reap the tee BEFORE returning, so the durable log is
-    // complete on disk when the process exits.
+    let _ = std::fs::remove_dir_all(&tmp);
     durable.finish();
-
     ExitCode::from(exit_code)
 }
