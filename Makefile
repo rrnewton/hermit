@@ -15,7 +15,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules check-skill-discovery validate lint \
+	install-build-tools check-submodules check-skill-discovery validate validate-plan \
+	validate-self-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -73,15 +74,20 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # against validate.sh and merely COPIES it to a file named `validate` instead of
 # running validation. .PHONY + this recipe overrides that implicit rule.
 #
-# `make validate` now runs the Rust driver's `full` profile, which subsumes
-# validate.sh's run_full_suite (the two preflight gates + centralized manifest +
-# BOTH the portable and privileged CI DAG lanes) by calling safe-ci-dag-runner as
-# a library, and self-tees a durable receipt log so the receipt path is
-# independent of the launch path. validate.sh is retained (NOT deleted): the
-# per-backend compat-only targets below still invoke it, and DAG nodes call back
-# into it for the compat corpora. Pass extra flags via ARGS (e.g. ARGS="-j 8").
-validate: check-submodules ## Run the full validation suite via the Rust driver (subsumes validate.sh run_full_suite; pass flags via ARGS)
-	./scripts/validate.rs full $(ARGS)
+# `make validate` runs the Rust driver directly. It is a REAL shortcut for the
+# default full profile — not a wrapper that re-derives one — and it is the same
+# entrypoint `./validate.sh` reaches, so the two cannot drift. Every gate runs as
+# a boxed safe-ci-dag-runner node and the driver self-tees a durable receipt log,
+# so the receipt exists whether the run came from here, from validate.sh, or from
+# `ci-hub validate-run`. Pass extra flags via ARGS (e.g. ARGS="-j 8").
+validate: check-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
+	./scripts/validate.rs $(ARGS)
+
+validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
+	./scripts/validate.rs --show-plan $(ARGS)
+
+validate-self-test: ## Run the validate driver's inert policy/quoting/corpus brackets
+	./scripts/validate.rs --self-test
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
 	./scripts/check-skill-discovery.rs
@@ -214,7 +220,7 @@ check-submodules: checkout-all ## Verify every pinned submodule is checked out a
 #   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
 #     scoped to one backend with `run_matrix.py --backend <backend>`, exactly
 #     as validate.sh's full "Real backend compatibility matrix" gate invokes it.
-#   * SaBRe / LiteInst / e9patch          -> validate.sh's focused
+#   * SaBRe / LiteInst / e9patch          -> the driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
@@ -228,10 +234,10 @@ validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
-	./validate.sh --sabre-compat-only
+	./scripts/validate.rs --sabre-compat-only
 
 validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./validate.sh --liteinst-compat-only
+	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
-	./validate.sh --e9patch-compat-only
+	./scripts/validate.rs --e9patch-compat-only
