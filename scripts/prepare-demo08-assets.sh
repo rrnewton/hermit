@@ -118,8 +118,12 @@ calibrate_crash_seed() {
   # calibration there is an acceptable, and announced, degradation.
   local -a box=("$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib
     --cpu-budget "$((CALIBRATION_TIMEOUT * 4))")
+  # Probe with the EXACT flag set the seed loop uses. A probe that differs from the call it
+  # stands for is itself a proxy: a bare `--cpu-budget N -- true` boxes successfully on a
+  # GitHub-managed runner where the real `--passthrough --label` invocation exits 3, so it
+  # reported "boxing available" for a call shape that could not box.
   set +e
-  "$ROOT/scripts/hermit-box-run" --cpu-budget 10 -- true >/dev/null 2>&1
+  "${box[@]}" -- true >/dev/null 2>&1
   local box_rc=$?
   set -e
   if [ "$box_rc" -eq 3 ]; then
