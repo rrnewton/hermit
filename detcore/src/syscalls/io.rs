@@ -1067,9 +1067,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollPwait,
     ) -> Result<i64, Error> {
-        let dettid = guest.thread_state().dettid;
-        resource_request(guest, Resources::new(dettid)).await; // empty request
-        Ok(self.record_or_replay(guest, call).await?)
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1850): This used to unconditionally inject the raw
+        // call and wait for it to return. With an infinite timeout under
+        // `--sequentialize-threads` that DEADLOCKS the whole guest: the calling
+        // task holds the scheduler turn while blocked in the kernel, and the
+        // only task that could ever satisfy the wait is sitting in the run queue
+        // waiting for a turn that never comes. Observed as `cmake` configure
+        // hanging forever at zero CPU with a grandchild frozen mid-`openat`;
+        // hermit's own scheduler log ends at `COMMIT turn N, dettid <parent>`
+        // injecting `epoll_pwait(..., -1, NULL, 8)` with `queue len 2`.
+        //
+        // glibc implements `epoll_wait(2)` as `epoll_pwait` with a NULL
+        // sigmask, so ordinary programs never reached `handle_epoll_wait`,
+        // which has always handled this correctly. With a NULL sigmask the two
+        // are semantically identical, so route them together.
+        //
+        // A NON-NULL sigmask keeps the previous behavior: its whole purpose is
+        // to swap the signal mask atomically for the duration of the wait, and
+        // a timeout-0 polling loop cannot reproduce that atomicity. Such calls
+        // remain able to block the scheduler; that is a known remaining gap
+        // rather than something this change silently pretends to fix.
+        if call.sigmask().is_some() {
+            let dettid = guest.thread_state().dettid;
+            resource_request(guest, Resources::new(dettid)).await; // empty request
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        if self.cfg.recordreplay_modes && call.timeout() == 0 {
+            // Cannot block, but still yield a scheduler turn so a polling thread
+            // cannot monopolize the guest between preemptions.
+            resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
+            Ok(self.record_or_replay(guest, call).await?)
+        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            Ok(self
+                .record_or_replay_blocking(guest, Syscall::EpollPwait(call))
+                .await?)
+        } else {
+            self.handle_internal_epoll_pwait(guest, call).await
+        }
+    }
+
+    /// Handle a guest-internal `epoll_pwait` (NULL sigmask) that can be fully
+    /// determinized. Mirrors `handle_internal_epoll_wait`.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1850)
+    pub async fn handle_internal_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        let timeout_millis = call.timeout();
+        if timeout_millis == 0 {
+            Ok(guest.inject(call).await?) // Already non-blocking.
+        } else {
+            let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
+            let mut rsrc = Resources::new(guest.thread_state().dettid);
+            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+            rsrc.fyi("epoll_pwait");
+            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+        }
     }
 
     /// epoll_pwait2 syscall (MAYHANG).

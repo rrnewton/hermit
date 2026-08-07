@@ -761,6 +761,35 @@ impl TimeoutableSyscall for reverie::syscalls::EpollWait {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1850): `epoll_pwait` was the one member of the
+// poll/epoll family with no nonblocking form, even though `Ppoll` -- the
+// sigmask variant of `poll` -- has had one all along. glibc implements
+// `epoll_wait(2)` by issuing `epoll_pwait` with a NULL sigmask, so ordinary
+// programs never reach the `EpollWait` impl above; they land on the
+// unhandled path. With a NULL sigmask the two calls are semantically
+// identical, so the nonblocking form is the same: timeout 0, EINTR, and a
+// 0 (no events) timeout return.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::EpollPwait {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        _guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        (self.with_timeout(0), None)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::EpollPwait {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
 async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
 ) -> (Addr<'stack, Timespec>, <G::Stack as Stack>::StackGuard) {
