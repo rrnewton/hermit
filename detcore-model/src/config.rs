@@ -103,7 +103,7 @@ pub struct Config {
 
     /// The execution backend does not present the initial process stack
     /// (argc/argv/envp) at the post-exec hook, so `hash_guest_env` cannot read
-    /// the guest environment there. Under DBI the post-exec tool hook fires from
+    /// the guest environment there. Under DBT the post-exec tool hook fires from
     /// the first syscall event -- after the dynamic loader and libc startup have
     /// run -- so `%rsp` is a deep call frame rather than the entry-point `argc`
     /// pointer; walking argv/envp from it would either fault (a raw SIGSEGV under
@@ -478,17 +478,17 @@ pub struct Config {
 
     /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
-    #[clap(long, value_name = "turn_N")]
+    #[clap(long, value_name = "turn_N", hide = true)]
     pub stop_after_turn: Option<u64>,
 
     /// **Internal:** debugging option to stop execution after a scheduler loop iteration (non-negative integer).
     /// This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
-    #[clap(long, value_name = "iter_N")]
+    #[clap(long, value_name = "iter_N", hide = true)]
     pub stop_after_iter: Option<u64>,
 
     /// **Internal:** Debugging option to treat all sockets as mysterious external, nondeterministic
-    /// entities, rather than container-internal and determinstically scheduled.
-    #[clap(long)]
+    /// entities, rather than container-internal and deterministically scheduled.
+    #[clap(long, hide = true)]
     pub debug_externalize_sockets: bool,
 
     /// **Internal:** Debugging option to change how futexes are implemented, either precisely modeled
@@ -497,7 +497,8 @@ pub struct Config {
     #[clap(
         long,
         value_name = "precise|polling|external",
-        default_value = "precise"
+        default_value = "precise",
+        hide = true
     )]
     pub debug_futex_mode: BlockingMode,
 
@@ -552,7 +553,7 @@ pub struct Config {
     pub memory: u64,
 
     /// Configure extra interrupt points based on thread id and rcb counter. Detcore will raise a precise
-    /// timer for this RCB whenever it detects that current current thread timeslice intercects any of the
+    /// timer for this RCB whenever it detects that the current thread's timeslice intersects any of the
     /// interrupt points specified
     #[clap(long, value_name = "tid:rcbs", value_parser = try_parse_numbers_with_colon)]
     pub interrupt_at: Vec<(DetTid, u64)>,

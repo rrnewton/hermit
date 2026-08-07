@@ -14,13 +14,19 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .DEFAULT_GOAL := build
 
-.PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
+.PHONY: build build-full install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules check-skill-discovery validate validate-plan \
 	validate-self-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
-build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
-	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
+build: prune-stale-release check-submodules ## Build the lean development binary (ptrace/kvm/liteinst)
+	$(CARGO) build --locked -p hermit
+	./scripts/stage-liteinst-runtime.sh dev \
+		"$(CURDIR)/target/debug/libreverie_liteinst.so" \
+		"$(CURDIR)/target/liteinst-runtime-build-7951770"
+
+build-full: prune-stale-release install-deps ## Build the optimized binary and every backend resource
+	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p hermit --features third-party-backends
 
 # `install-deps` is the "install everything this repo needs to build" entrypoint,
@@ -29,7 +35,7 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
+install-deps: install-hooks check-build-tools check-submodules ## Build and stage all third-party backend runtimes and plugins
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbt -p detcore-sabre -p hermit-install
 
@@ -42,6 +48,9 @@ install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
 	$(CARGO) build --release --locked -p hermit
+	./scripts/stage-liteinst-runtime.sh release \
+		"$(CURDIR)/target/release/libreverie_liteinst.so" \
+		"$(CURDIR)/target/liteinst-runtime-build-7951770"
 
 # `make build` produces target/debug/hermit but never rebuilds an existing
 # target/release/hermit. A release binary left over from an earlier
@@ -190,7 +199,7 @@ install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the
 			echo "warning: no supported package manager (apt-get/dnf/yum) found; install cmake + a C/C++ compiler manually" >&2; \
 		fi
 
-checkout-all: check-build-tools ## Initialize every pinned submodule before builds and validation
+checkout-all: ## Initialize every pinned submodule without installing host packages
 	@$(SUBMODULE_GIT) submodule update --init --recursive
 
 check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
@@ -221,7 +230,7 @@ validate-kvm: check-submodules ## Run ONLY the KVM backend parity corpus (needs 
 	cargo build -p hermit
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend kvm --probe-gaps --require-backend
 
-validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-party-backends feature)
+validate-dbt: check-build-tools check-submodules ## Run ONLY the DBT backend parity corpus (third-party-backends feature)
 	cargo build -p hermit --features third-party-backends
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
 

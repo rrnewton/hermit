@@ -418,6 +418,37 @@ fn run_strict_flag_is_accepted_and_runs() {
 }
 
 #[test]
+fn public_help_is_plain_language_and_hides_internal_debug_options() {
+    let top = hermit(&["--help"]);
+    assert_success(&top, &["--help"]);
+    let top = stdout(&top);
+    assert!(
+        top.contains("content-addressed store"),
+        "unexpected help:\n{top}"
+    );
+    assert!(
+        top.contains("Analyze passing and failing runs"),
+        "unexpected help:\n{top}"
+    );
+
+    let run = hermit(&["run", "--help"]);
+    assert_success(&run, &["run", "--help"]);
+    let run = stdout(&run);
+    for leaked in [
+        "**Internal:**",
+        "--stop-after-turn",
+        "--stop-after-iter",
+        "--debug-externalize-sockets",
+        "--debug-futex-mode",
+    ] {
+        assert!(
+            !run.contains(leaked),
+            "public help leaked {leaked:?}:\n{run}"
+        );
+    }
+}
+
+#[test]
 fn verify_verbose_requires_verify() {
     let args = ["run", "--verify-verbose", "--", "/bin/true"];
     let output = hermit(&args);
