@@ -108,6 +108,25 @@ calibrate_crash_seed() {
   [ -x "$HERMIT_RELEASE" ] || fail "release Hermit is unavailable: $HERMIT_RELEASE"
 
   mkdir -p "$artifacts"
+
+  # Boxing is fail-closed: hermit-box-run exits 3, having run nothing, when cgroup-v2 /
+  # systemd --user scope is unavailable. On a GitHub-managed runner that is the normal case,
+  # and it made all 64 calibration seeds no-ops in under a second. Probe once and degrade
+  # loudly rather than silently searching a space we never actually enter. The boxing exists
+  # to stop a setsid/double-fork escapee leaking a burned core on the shared dev box; on an
+  # ephemeral CI VM the per-seed wall `timeout` plus VM teardown covers that, so an unboxed
+  # calibration there is an acceptable, and announced, degradation.
+  local -a box=("$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib
+    --cpu-budget "$((CALIBRATION_TIMEOUT * 4))")
+  set +e
+  "$ROOT/scripts/hermit-box-run" --cpu-budget 10 -- true >/dev/null 2>&1
+  local box_rc=$?
+  set -e
+  if [ "$box_rc" -eq 3 ]; then
+    echo "WARNING: cgroup boxing unavailable here (hermit-box-run exit 3); calibrating UNBOXED." >&2
+    box+=(--allow-cgroup-failure)
+  fi
+
   echo "Calibrating a deterministic crashing seed for fixture ${fixture:0:12}" \
     "(up to $CALIBRATION_SEEDS seeds, ${CALIBRATION_TIMEOUT}s each)..."
   for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
@@ -118,8 +137,7 @@ calibrate_crash_seed() {
     # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
     # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
     # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
-    "$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib \
-      --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
+    "${box[@]}" -- \
       timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
       --chaos --sched-seed "$seed" --no-virtualize-cpuid \
       -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
