@@ -27,6 +27,7 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -67,6 +68,60 @@ fn slug(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut directories = vec![manifest_root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", directory.display())))
+        {
+            let entry = entry.unwrap_or_else(|e| fail(format!("cannot read directory entry: {e}")));
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|e| fail(format!("cannot inspect {}: {e}", path.display())));
+            let is_toml = path.extension().is_some_and(|ext| ext == "toml");
+            if file_type.is_symlink() && is_toml {
+                let relative = path.strip_prefix(manifest_root).unwrap_or(&path);
+                fail(format!(
+                    "{}: manifest documents must be regular files, not symlinks",
+                    relative.display()
+                ));
+            }
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() && is_toml {
+                let relative = path
+                    .strip_prefix(manifest_root)
+                    .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+                if relative.components().count() > 2 {
+                    fail(format!(
+                        "{}: manifest shards must be exactly one directory below manifests/",
+                        relative.display()
+                    ));
+                }
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn expected_bucket(manifest_root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(manifest_root)
+        .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+    match relative.components().count() {
+        1 => path.file_stem(),
+        2 => path.parent().and_then(Path::file_name),
+        _ => None,
+    }
+    .and_then(|value| value.to_str())
+    .unwrap_or_else(|| fail(format!("manifest has an invalid path: {}", path.display())))
+    .to_owned()
 }
 
 fn string_array(value: Option<&Value>, context: &str) -> Vec<String> {
@@ -359,26 +414,12 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut paths = fs::read_dir(&manifests)
-        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect::<Vec<_>>();
-    paths.sort();
+    let paths = discover_manifest_paths(&manifests);
 
-    let mut files = 0usize;
-    let mut commands = 0usize;
+    let mut commands_by_bucket: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut documents = 0usize;
     for path in paths {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| {
-                fail(format!(
-                    "manifest has a non-UTF-8 file name: {}",
-                    path.display()
-                ))
-            });
+        let expected_bucket = expected_bucket(&manifests, &path);
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
@@ -395,9 +436,9 @@ fn main() -> ExitCode {
             .get("bucket")
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail(format!("{}: missing `bucket`", path.display())));
-        if bucket != stem {
+        if bucket != expected_bucket {
             fail(format!(
-                "{}: bucket `{bucket}` must match file stem `{stem}`",
+                "{}: bucket `{bucket}` must match `{expected_bucket}`",
                 path.display()
             ));
         }
@@ -405,11 +446,18 @@ fn main() -> ExitCode {
             .get("test")
             .and_then(Value::as_array)
             .unwrap_or_else(|| fail(format!("{}: missing [[test]] entries", path.display())));
-        let mut lines = Vec::new();
         for test in tests {
-            lines.extend(commands_for_test(test, bucket));
+            commands_by_bucket
+                .entry(bucket.to_owned())
+                .or_default()
+                .extend(commands_for_test(test, bucket));
         }
-        let destination = output.join(format!("{stem}.txt"));
+        documents += 1;
+    }
+
+    let mut commands = 0usize;
+    for (bucket, lines) in &commands_by_bucket {
+        let destination = output.join(format!("{bucket}.txt"));
         let body = if lines.is_empty() {
             String::new()
         } else {
@@ -425,10 +473,12 @@ fn main() -> ExitCode {
                 .display(),
             lines.len()
         );
-        files += 1;
         commands += lines.len();
     }
 
-    println!("generated {commands} commands across {files} bucket files");
+    println!(
+        "generated {commands} commands across {} bucket files from {documents} manifest documents",
+        commands_by_bucket.len()
+    );
     ExitCode::SUCCESS
 }

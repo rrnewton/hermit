@@ -56,7 +56,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 DEFAULT_REPO = "rrnewton/hermit"
 DEFERRED_LABEL = "matrix-asymmetric-tests-deferred"
-INVENTORY = "tests/e2e/manifests/inventory/test-files.json"
+CURRENT_INVENTORY = "tests/e2e/manifests/inventory/explicit-test-files.json"
+LEGACY_INVENTORY = "tests/e2e/manifests/inventory/test-files.json"
+INVENTORIES = (CURRENT_INVENTORY, LEGACY_INVENTORY)
 SYMMETRY_BASELINE = "ci/matrix-symmetry-baseline.json"
 BACKEND_TOKENS = {"ptrace", "dbi", "dynamorio", "kvm", "sabre", "e9patch"}
 
@@ -255,18 +257,36 @@ def _backend_private(entry: dict) -> bool:
     )
 
 
-def _inventory_entries(value: dict | None) -> dict[str, dict]:
+def _inventory_entries(value: dict | None, inventory_path: str) -> dict[str, dict]:
     if value is None:
         return {}
     files = value.get("files")
     if not isinstance(files, list):
-        raise SplitError(f"{INVENTORY}: expected a files array")
+        raise SplitError(f"{inventory_path}: expected a files array")
     result = {}
     for entry in files:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-            raise SplitError(f"{INVENTORY}: malformed entry")
+            raise SplitError(f"{inventory_path}: malformed entry")
         result[entry["path"]] = entry
     return result
+
+
+def _inventory_entry(
+    path: str,
+    before: dict[str, dict[str, dict]],
+    after: dict[str, dict[str, dict]],
+) -> dict | None:
+    for views in (after, before):
+        matches = [views[inventory][path] for inventory in INVENTORIES if path in views[inventory]]
+        if not matches:
+            continue
+        canonical = {json.dumps(entry, sort_keys=True) for entry in matches}
+        if len(canonical) != 1:
+            raise SplitError(
+                f"inventory authorities disagree for {path}: {list(INVENTORIES)}"
+            )
+        return matches[0]
+    return None
 
 
 def _path_patch(repo: Path, base: str, head: str, paths: Iterable[str]) -> bytes:
@@ -290,15 +310,25 @@ def partition_changes(
     repo: Path, base: str, head: str, changes: tuple[Change, ...]
 ) -> Partition:
     by_path = {change.path: change for change in changes}
-    inventory_before = _inventory_entries(_show_json(repo, base, INVENTORY))
-    inventory_after = _inventory_entries(_show_json(repo, head, INVENTORY))
+    inventory_before = {
+        inventory: _inventory_entries(_show_json(repo, base, inventory), inventory)
+        for inventory in INVENTORIES
+    }
+    inventory_after = {
+        inventory: _inventory_entries(_show_json(repo, head, inventory), inventory)
+        for inventory in INVENTORIES
+    }
     quarantine = {
         change.path
         for change in changes
         if change.path.startswith("tests/backend-parity/")
     }
     for change in changes:
-        entry = inventory_after.get(change.path) or inventory_before.get(change.path)
+        entry = _inventory_entry(
+            change.path,
+            inventory_before,
+            inventory_after,
+        )
         if entry is not None and _backend_private(entry):
             quarantine.add(change.path)
     if any(by_path[path].status == "D" for path in quarantine):
@@ -315,7 +345,7 @@ def partition_changes(
         path = change.path
         if path in quarantine or not path.startswith("tests/"):
             continue
-        if path == INVENTORY or path.startswith("tests/e2e/manifests/"):
+        if path in INVENTORIES or path.startswith("tests/e2e/manifests/"):
             continue
         name = Path(path).name
         stem = Path(path).stem
@@ -326,17 +356,21 @@ def partition_changes(
                 )
             quarantine.add(path)
 
-    if INVENTORY in by_path:
+    for inventory in INVENTORIES:
+        if inventory not in by_path:
+            continue
+        before_entries = inventory_before[inventory]
+        after_entries = inventory_after[inventory]
         entry_paths = {
             path
-            for path in inventory_before.keys() | inventory_after.keys()
-            if inventory_before.get(path) != inventory_after.get(path)
+            for path in before_entries.keys() | after_entries.keys()
+            if before_entries.get(path) != after_entries.get(path)
         }
         if not entry_paths:
-            raise SplitError(f"{INVENTORY} changed without semantic entry changes")
+            raise SplitError(f"{inventory} changed without semantic entry changes")
         unrelated = []
         for path in sorted(entry_paths):
-            entry = inventory_after.get(path) or inventory_before.get(path) or {}
+            entry = after_entries.get(path) or before_entries.get(path) or {}
             if path in quarantine or _backend_private(entry):
                 if path in by_path:
                     quarantine.add(path)
@@ -344,9 +378,9 @@ def partition_changes(
                 unrelated.append(path)
         if unrelated:
             raise SplitError(
-                f"{INVENTORY} mixes asymmetric debt with unrelated entries: {unrelated}"
+                f"{inventory} mixes asymmetric debt with unrelated entries: {unrelated}"
             )
-        quarantine.add(INVENTORY)
+        quarantine.add(inventory)
 
     if SYMMETRY_BASELINE in by_path:
         quarantine.add(SYMMETRY_BASELINE)
@@ -809,7 +843,7 @@ def plan_one(
     return result
 
 
-def self_test() -> int:
+def _self_test_inventory_authority(inventory_path: str) -> None:
     with tempfile.TemporaryDirectory(prefix="split-asymmetric-self-test-") as tmp:
         repo = Path(tmp)
         _run(["git", "init", "-q", "-b", "main"], cwd=repo)
@@ -820,7 +854,9 @@ def self_test() -> int:
         (repo / "tests/e2e/manifests/inventory").mkdir(parents=True)
         (repo / "src/lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
         (repo / "tests/backend-parity/matrix.tsv").write_text("test_name\tptrace\n")
-        (repo / INVENTORY).write_text(json.dumps({"schema": 2, "files": []}) + "\n")
+        (repo / inventory_path).write_text(
+            json.dumps({"schema": 2, "files": []}) + "\n"
+        )
         _run(["git", "add", "."], cwd=repo)
         _run(["git", "commit", "-q", "-m", "base"], cwd=repo)
         base = _git_text(repo, "rev-parse", "HEAD")
@@ -842,7 +878,7 @@ def self_test() -> int:
                 }
             ],
         }
-        (repo / INVENTORY).write_text(json.dumps(inventory, indent=2) + "\n")
+        (repo / inventory_path).write_text(json.dumps(inventory, indent=2) + "\n")
         _run(["git", "add", "."], cwd=repo)
         _run(["git", "commit", "-q", "-m", "mixed change"], cwd=repo)
         head = _git_text(repo, "rev-parse", "HEAD")
@@ -850,7 +886,7 @@ def self_test() -> int:
         partition = partition_changes(repo, base, head, changes)
         assert [item.path for item in partition.code] == ["src/lib.rs"]
         assert {item.path for item in partition.tests} == {
-            INVENTORY,
+            inventory_path,
             "tests/backend-parity/matrix.tsv",
             fixture,
         }
@@ -905,7 +941,7 @@ def self_test() -> int:
             _git_text(
                 repo, "diff", "--name-only", base, objects.test_commit
             ).splitlines()
-        ) == {INVENTORY, "tests/backend-parity/matrix.tsv", fixture}
+        ) == {inventory_path, "tests/backend-parity/matrix.tsv", fixture}
 
         (repo / fixture).unlink()
         _run(["git", "add", "-u"], cwd=repo)
@@ -917,7 +953,15 @@ def self_test() -> int:
             assert "deletions are cleanup" in str(error)
         else:
             raise AssertionError("backend-private deletion did not fail closed")
-    print("PASS: splitter assigns every hunk once and reproduces the source tree")
+
+
+def self_test() -> int:
+    for inventory_path in INVENTORIES:
+        _self_test_inventory_authority(inventory_path)
+    print(
+        "PASS: splitter supports current and legacy inventories, assigns every "
+        "hunk once, and reproduces the source tree"
+    )
     return 0
 
 

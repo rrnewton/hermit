@@ -290,22 +290,67 @@ struct Manifests {
     tests: Vec<(String, Value)>,
 }
 
+fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut directories = vec![manifest_root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)
+            .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", directory.display())))
+        {
+            let entry = entry.unwrap_or_else(|e| fail(format!("cannot read directory entry: {e}")));
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|e| fail(format!("cannot inspect {}: {e}", path.display())));
+            let is_toml = path.extension().is_some_and(|ext| ext == "toml");
+            if file_type.is_symlink() && is_toml {
+                let relative = path.strip_prefix(manifest_root).unwrap_or(&path);
+                fail(format!(
+                    "{}: manifest documents must be regular files, not symlinks",
+                    relative.display()
+                ));
+            }
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() && is_toml {
+                let relative = path
+                    .strip_prefix(manifest_root)
+                    .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+                if relative.components().count() > 2 {
+                    fail(format!(
+                        "{}: manifest shards must be exactly one directory below manifests/",
+                        relative.display()
+                    ));
+                }
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+fn expected_bucket(manifest_root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(manifest_root)
+        .unwrap_or_else(|_| fail(format!("manifest escaped root: {}", path.display())));
+    match relative.components().count() {
+        1 => path.file_stem(),
+        2 => path.parent().and_then(Path::file_name),
+        _ => None,
+    }
+    .and_then(|value| value.to_str())
+    .unwrap_or_else(|| fail(format!("manifest has an invalid path: {}", path.display())))
+    .to_owned()
+}
+
 fn load_manifests(root: &Path) -> Manifests {
     let dir = root.join("tests/e2e/manifests");
-    let mut paths = fs::read_dir(&dir)
-        .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", dir.display())))
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect::<Vec<_>>();
-    paths.sort();
+    let paths = discover_manifest_paths(&dir);
 
     let mut tests = Vec::new();
     for path in paths {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| fail(format!("non-UTF-8 manifest name: {}", path.display())));
+        let expected_bucket = expected_bucket(&dir, &path);
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
@@ -323,9 +368,9 @@ fn load_manifests(root: &Path) -> Manifests {
             .and_then(Value::as_str)
             .unwrap_or_else(|| fail(format!("{}: missing `bucket`", path.display())))
             .to_owned();
-        if bucket != stem {
+        if bucket != expected_bucket {
             fail(format!(
-                "{}: bucket `{bucket}` must match file stem `{stem}`",
+                "{}: bucket `{bucket}` must match `{expected_bucket}`",
                 path.display()
             ));
         }
