@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 6144323. The portable wrapper
+# The calibration below is valid only for Reverie 038e9939. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6144323c5dab8b521278fce206f8774360c2b05f ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6144323c5dab8b521278fce206f8774360c2b05f" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
     return 2
 fi
 
