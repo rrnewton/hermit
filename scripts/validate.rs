@@ -674,10 +674,10 @@ fn self_test() -> Result<(), String> {
 fn self_output_bracket() -> Result<(), String> {
     // MUST be excused (validate's own output, in every shape a caller emits).
     let excused = [
-        (" M ci/validate-ledger/local.devbig014.jsonl", "porcelain, modified, leading space intact"),
-        ("M ci/validate-ledger/local.devbig014.jsonl", "porcelain whose leading space a trim ate"),
+        (" M ci/validate-ledger/local.example-host.jsonl", "porcelain, modified, leading space intact"),
+        ("M ci/validate-ledger/local.example-host.jsonl", "porcelain whose leading space a trim ate"),
         ("?? ci/validate-ledger/local.other.jsonl", "porcelain, untracked shard"),
-        ("ci/validate-ledger/local.devbig014.jsonl", "bare path (git diff --name-only)"),
+        ("ci/validate-ledger/local.example-host.jsonl", "bare path (git diff --name-only)"),
         ("ignored/validate/validate-full-abc-1.log", "bare path, durable log"),
         (" M \"ci/validate-ledger/has space.jsonl\"", "porcelain, quoted path"),
         ("R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl", "rename within the ledger dir"),
