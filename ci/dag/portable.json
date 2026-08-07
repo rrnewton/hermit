@@ -14,6 +14,14 @@
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
+      "group": "check", "job": "agent_utils_pin",
+      "desc": "Require Hermit's agent-utils gitlink to equal latest rrnewton/agent-utils:main",
+      "cmd": "./ci/run-agent-utils-pin-check.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "skill_discovery",
       "desc": "Verify Claude and stock Codex discover the same safe product skills",
       "cmd": "mkdir -p target/ci && RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-skill-discovery.rs -o target/ci/check-skill-discovery && target/ci/check-skill-discovery",

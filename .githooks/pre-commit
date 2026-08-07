@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Reverie pin, pre-commit. THIS IS NOT A HARD BLOCKER ON PIN CURRENCY.
+# Dependency pins, pre-commit. Two independently owned authorities: Reverie and
+# agent-utils. Each has its own checker and its own attributable error.
+#
+# Reverie: THIS IS NOT A HARD BLOCKER ON PIN CURRENCY.
 #
 # It used to be, and it refused commits touching zero Cargo files. Owner ruling
 # 2026-08-08: enforcement belongs to CI (check.reverie_pin, ancestry +
@@ -21,6 +24,7 @@
 set -u
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
 checker="$root/ci/run-reverie-pin-check.sh"
+agent_utils_checker="$root/ci/run-agent-utils-pin-check.sh"
 
 if [[ ! -f "$checker" ]]; then
   echo "REVERIE PIN LINT: checker missing at $checker -- BLOCKED" >&2
@@ -45,6 +49,12 @@ advisory_status=0
 if [[ $advisory_status -eq 1 ]]; then
   exit 1
 fi
+
+if [[ ! -f "$agent_utils_checker" ]]; then
+  echo "AGENT-UTILS PIN LINT: checker missing at $agent_utils_checker -- BLOCKED" >&2
+  exit 1
+fi
+"${proxy[@]}" "$agent_utils_checker" --repo "$root" || exit 1
 
 # Also guard the nested-workspace lockfile against pin drift once its checker is
 # present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.

@@ -96,7 +96,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, dependency pins, nested lockfiles)
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
@@ -117,6 +117,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
+	$(SUBMODULE_PROXY) ./ci/run-agent-utils-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 help: ## Show this help (the list of make targets)
