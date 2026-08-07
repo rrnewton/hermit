@@ -136,6 +136,15 @@ assets, or the sweep tooling; unrelated parent changes do not pay this cost.
 Every triggered red is a P0 demo regression: the workflow names the exact
 commit, annotates the run, preserves per-demo logs, and stays failed.
 
+Demo 8 seed calibration writes `ignored/demo08-run/calibration.tsv` plus one
+retained output per attempted seed. Each row records the seed, whether the
+`print_copied_inodes` progress-thread path engaged, whether ASAN reported the
+planted heap use-after-free, the exit status, and the output path. The summary
+always states `engagement=N/M` and `uaf_hits=H/M`. A cached crash seed is
+replayed and must supply 1/1 engagement evidence; it is never trusted merely
+because the cache file exists. Zero engagement is a refused `NO-RESULT`, not a
+clean sweep.
+
 Run each demo individually so its output and result remain easy to inspect:
 
 ```bash
