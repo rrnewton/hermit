@@ -160,6 +160,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
+        direct_vvar_access_policy: default_config.direct_vvar_access_policy,
         virtualize_metadata: false,
         virtualize_cpuid: true,
         cpuid_virtualized_by_backend: false,

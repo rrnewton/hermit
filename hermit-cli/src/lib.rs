@@ -631,6 +631,19 @@ impl Backend {
         }
     }
 
+    /// Returns the direct-vvar policy for this execution path.
+    ///
+    /// This match is intentionally exhaustive: adding a backend cannot silently inherit a
+    /// policy that was chosen for a different address-space construction.
+    pub const fn direct_vvar_access_policy(self) -> detcore::DirectVvarAccessPolicy {
+        match self {
+            Self::Ptrace | Self::Dbi | Self::Liteinst | Self::Sabre | Self::E9patch => {
+                detcore::DirectVvarAccessPolicy::Refuse
+            }
+            Self::Kvm => detcore::DirectVvarAccessPolicy::Absent,
+        }
+    }
+
     /// Returns backends whose Hermit integration prerequisites are met.
     ///
     /// Some integrations use CLI launch adapters rather than direct
@@ -1518,6 +1531,7 @@ pub fn run_with_backend(
 /// dispatch seams use this exact policy instead of cloning backend flags.
 #[doc(hidden)]
 pub fn normalize_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+    config.direct_vvar_access_policy = backend.direct_vvar_access_policy();
     config.discover_live_file_metadata = backend == Backend::Sabre;
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
@@ -2048,6 +2062,31 @@ mod tests {
                 .max_timeslice
                 .is_some()
         );
+    }
+
+    #[test]
+    fn every_backend_has_an_explicit_direct_vvar_policy() {
+        assert_eq!(Backend::ALL.len(), 6);
+        for backend in Backend::ALL {
+            let configured = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                configured.direct_vvar_access_policy,
+                backend.direct_vvar_access_policy(),
+                "{} bypassed direct-vvar policy selection",
+                backend.as_str()
+            );
+            if backend == Backend::Kvm {
+                assert_eq!(
+                    configured.direct_vvar_access_policy,
+                    detcore::DirectVvarAccessPolicy::Absent
+                );
+            } else {
+                assert_eq!(
+                    configured.direct_vvar_access_policy,
+                    detcore::DirectVvarAccessPolicy::Refuse
+                );
+            }
+        }
     }
 
     #[test]

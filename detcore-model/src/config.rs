@@ -31,12 +31,31 @@ const fn default_true() -> bool {
     true
 }
 
+/// Backend policy for guest reads from Linux's kernel-populated vvar mappings.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectVvarAccessPolicy {
+    /// Make every vvar mapping inaccessible before guest code can read it.
+    #[default]
+    Refuse,
+    /// The backend's guest address-space construction contains no vvar mapping.
+    Absent,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
     /// Disable virtual/logical time. Note that virtual time is required for virtual metadata.
     #[clap(long = "no-virtualize-time", action = clap::ArgAction::SetFalse)]
     pub virtualize_time: bool,
+
+    /// Policy that prevents direct vvar reads from bypassing virtual clock syscalls.
+    ///
+    /// This is a backend capability, not a user-selectable clock-resolution control.
+    /// Neither policy changes, rounds, freezes, or resets Detcore's continuous time.
+    #[serde(default)]
+    #[clap(skip)]
+    pub direct_vvar_access_policy: DirectVvarAccessPolicy,
 
     /// Disable virtual cpuid
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
@@ -1158,6 +1177,10 @@ mod tests {
     #[test]
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
+        assert_eq!(
+            config.direct_vvar_access_policy,
+            DirectVvarAccessPolicy::Refuse
+        );
         assert!(!config.backend_reports_physical_process_exits);
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
