@@ -232,6 +232,56 @@ pub fn score(outcomes: &[StepOutcome], reps: i64, commit: &str) -> serde_json::V
     })
 }
 
+/// Serialize the vector in `validate.sh`'s EXACT key order.
+///
+/// `serde_json`'s default map is a `BTreeMap`, so a plain `to_string` sorts the
+/// keys alphabetically and emits `{"commit":...` where the bash emitted
+/// `{"l1_pass":...`. Consumers parse rather than pattern-match, so the ordering
+/// is not load-bearing today — but the bash's `printf` order IS the documented
+/// shape, and quietly reordering a published artifact is the kind of drift this
+/// port exists to avoid.
+///
+/// (Separately: `scripts/progress-report.sh:103` greps the LOG for
+/// `^\{"l1_pass"`, which has never matched because `run_envelope` prints the JSON
+/// with a two-space indent. That consumer already falls back to reading
+/// `$ENVELOPE_JSON`, which is why the layout below is preserved as-is rather than
+/// "fixed" here.)
+pub fn to_ordered_json(v: &serde_json::Value) -> String {
+    let n = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+    let probes: Vec<String> = v
+        .get("probes")
+        .and_then(|p| p.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let g = |k: &str| r.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
+                    format!(
+                        r#"{{"probe":"{}","l1":{},"l2":{},"l3":{},"l4":{},"rr":{}}}"#,
+                        r.get("probe").and_then(|x| x.as_str()).unwrap_or(""),
+                        g("l1"),
+                        g("l2"),
+                        g("l3"),
+                        g("l4"),
+                        g("rr")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        r#"{{"l1_pass":{},"l2_pass":{},"l3_pass":{},"l4_pass":{},"rr_pass":{},"total":{},"commit":"{}","l4_reps":{},"probes":[{}]}}"#,
+        n("l1_pass"),
+        n("l2_pass"),
+        n("l3_pass"),
+        n("l4_pass"),
+        n("rr_pass"),
+        n("total"),
+        v.get("commit").and_then(|c| c.as_str()).unwrap_or("unknown"),
+        n("l4_reps"),
+        probes.join(",")
+    )
+}
+
 /// Reproduce `run_envelope`'s human summary, byte-for-byte in layout.
 ///
 /// The two-space indent on the JSON line is `validate.sh`'s
@@ -251,7 +301,7 @@ pub fn print_summary(v: &serde_json::Value, reps: i64, json_file: &Path) {
     println!("  rr  record/replay end-to-end                     : {}/{total}", g("rr_pass"));
     println!("  total e2e probes                                 : {total}");
     println!("  JSON: {}", json_file.display());
-    println!("  {}", serde_json::to_string(v).unwrap_or_default());
+    println!("  {}", to_ordered_json(v));
 }
 
 /// Compare against a baseline; any count that DECREASED is a regression.
@@ -343,7 +393,22 @@ pub fn self_test() -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("self-test: {e}"))?;
     let equal = dir.join("equal.json");
     let higher = dir.join("higher.json");
-    std::fs::write(&equal, serde_json::to_string(&full).unwrap()).map_err(|e| format!("self-test: {e}"))?;
+    // The ordered serializer must round-trip: if it dropped or renamed a key,
+    // an "equal" baseline would read as 0 and every count would look improved.
+    let ordered = to_ordered_json(&full);
+    if !ordered.starts_with(r#"{"l1_pass":"#) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("envelope JSON must start with l1_pass (validate.sh order), got {ordered:.40}"));
+    }
+    let round: serde_json::Value = serde_json::from_str(&ordered)
+        .map_err(|e| format!("envelope JSON is not valid JSON: {e}"))?;
+    for k in ["l1_pass", "l2_pass", "l3_pass", "l4_pass", "rr_pass", "total", "commit", "l4_reps", "probes"] {
+        if round.get(k).is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(format!("envelope JSON lost key {k}"));
+        }
+    }
+    std::fs::write(&equal, &ordered).map_err(|e| format!("self-test: {e}"))?;
     std::fs::write(&higher, r#"{"l1_pass":99,"l2_pass":0,"l3_pass":0,"l4_pass":0,"rr_pass":0,"total":0}"#)
         .map_err(|e| format!("self-test: {e}"))?;
     let mut accepted = 0usize;
