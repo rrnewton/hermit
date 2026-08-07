@@ -55,7 +55,7 @@ if ! gcc -fsanitize=address -o "$TMP/asan-probe" -xc - >/dev/null 2>&1 <<<'int m
     echo "  and a sweep whose failure path is unproven must not be reported as clean." >&2
     exit 1
   fi
-  asan_ld=(-L"$asan_dir" -Wl,-rpath,"$asan_dir")
+  asan_ld=(-L"$asan_dir" "-Wl,-rpath,$asan_dir")
   echo "note: ASAN runtime resolved to $asan_dir"
 fi
 
