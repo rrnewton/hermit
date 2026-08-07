@@ -15,6 +15,13 @@
       "test": "backend-parity-c/personality-domain"
     },
     {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/short-io-split-identity"
+    },
+    {
       "backend": "dbi",
       "category": "c-programs",
       "lane": "portable",
