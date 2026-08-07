@@ -34,7 +34,7 @@ readonly DAG_DIR
 function usage {
     cat <<'USAGE'
 Usage:
-  ci/test_harness.sh validate
+  ci/test_harness.sh validate [--lane portable|privileged]
   ci/test_harness.sh plan [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh build [filters]
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
@@ -61,6 +61,10 @@ The run command defaults to all CI-enabled, non-occasional cells in both lanes.
 Naked controls are meta-CI checks and run only when explicitly selected.
 Every selected required cell emits one JSONL record. Verification runs use the
 required INFO level, but diagnostics stay outside the guest-observation hash.
+
+The validate command runs the validate.sh stop-signal fixture by default and
+for the portable lane. The privileged lane skips that portable fixture so its
+hardware DAG retains the audited critical-path bound.
 USAGE
 }
 
@@ -211,6 +215,14 @@ function audit_test_footprints {
     cargo run --quiet -p hermit-manifest-plan \
         --bin generate-test-footprints -- --check ||
         die "ci/test-footprints.json is stale relative to Cargo metadata, the portable DAG, or footprint policy"
+}
+
+function validate_stop_signal_paths {
+    if [[ -z $LANE_FILTER || $LANE_FILTER == portable ]]; then
+        python3 "$ROOT_DIR/scripts/test_validate_stop_paths.py"
+    else
+        echo "SKIP: validate.sh stop-signal fixture is owned by the portable lane"
+    fi
 }
 
 function function_body {
@@ -366,10 +378,13 @@ function audit_ci_correspondence {
 
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
-        jq -e '
+        jq -e --arg lane "$lane" '
             .steps | type == "array" and length > 0
             and (map(.group + "." + .job) | unique | length) == length
             and all(.[]; (.cmd | type == "string" and length > 0))
+            and ([.[] | select(.group == "e2e" and .job == "metadata")
+                  | select(.cmd == ("./ci/test_harness.sh validate --lane " + $lane))]
+                 | length == 1)
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
@@ -415,7 +430,10 @@ function audit_ci_correspondence {
     current_plan="$scratch/current-plan.json"
     expected_plan="$scratch/expected-plan.json"
     all_buckets="$scratch/manifest-buckets.json"
-    emit_required_plan | jq -sS 'sort_by(.category,.test,.mode,.backend)' >"$current_plan"
+    # CI correspondence is a whole-plan invariant even when a lane-qualified
+    # metadata node invokes validate. Do not let that node's execution filter
+    # shrink the denominator being audited.
+    emit_required_plan "" | jq -sS 'sort_by(.category,.test,.mode,.backend)' >"$current_plan"
     jq -S '.cells | sort_by(.category,.test,.mode,.backend)' "$EXPECTED_PLAN" >"$expected_plan"
     if ! diff -u "$expected_plan" "$current_plan"; then
         rm -rf "$scratch"
@@ -528,11 +546,11 @@ function validate_dag_correspondence {
 
         # --- (2) e2e run-nodes must correspond to the planned cells. ---
         # The e2e.metadata gate node (which runs this very `validate`) must exist.
-        jq -e '[.steps[]
+        jq -e --arg lane "$lane" '[.steps[]
                 | select(.group == "e2e" and .job == "metadata"
-                         and (.cmd | test("test_harness\\.sh validate")))]
+                         and .cmd == ("./ci/test_harness.sh validate --lane " + $lane))]
                | length == 1' >/dev/null <"$dag" ||
-            die "ci/dag/$lane.json: missing e2e.metadata node running 'test_harness.sh validate'"
+            die "ci/dag/$lane.json: e2e.metadata must run exactly 'test_harness.sh validate --lane $lane'"
 
         # Every e2e run-node must target this lane.
         local wrong_lane
@@ -636,11 +654,12 @@ function parse_options {
 }
 
 function emit_required_plan {
+    local lane_filter=${1-$LANE_FILTER}
     local test
     for test in "${TESTS[@]}"; do
         metadata_json "$test"
     done | jq -c \
-        --arg lane_filter "$LANE_FILTER" \
+        --arg lane_filter "$lane_filter" \
         --arg mode_filter "$MODE_FILTER" \
         --arg backend_filter "$BACKEND_FILTER" \
         --arg category_filter "$CATEGORY_FILTER" \
@@ -1206,6 +1225,7 @@ case "$subcommand" in
         audit_test_footprints
         audit_inventory
         audit_ci_correspondence
+        validate_stop_signal_paths
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         validate_dag_correspondence

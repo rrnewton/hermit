@@ -72,10 +72,10 @@
     },
     {
       "group": "e2e", "job": "metadata",
-      "desc": "Validate E2E metadata, generated test footprints, and required-cell plan",
-      "cmd": "./ci/test_harness.sh validate",
+      "desc": "Validate E2E metadata, stop-signal handling, generated test footprints, and required-cell plan",
+      "cmd": "./ci/test_harness.sh validate --lane portable",
       "timeout": 60,
-      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 268435456,
+      "hint": {"est_duration_s": 20, "rss_baseline_bytes": 268435456,
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
