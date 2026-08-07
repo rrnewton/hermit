@@ -5,6 +5,20 @@
       "category": "applications",
       "lane": "portable",
       "mode": "verify",
+      "test": "applications/c-toolchain-workflow"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "applications/git-repository-workflow"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
+      "mode": "verify",
       "test": "applications/timed-progress-bar"
     },
     {
