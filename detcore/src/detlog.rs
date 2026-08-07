@@ -116,6 +116,22 @@ pub fn forwarding_enabled() -> bool {
     FORWARDER.get().is_some()
 }
 
+/// Returns whether deterministic INFO records have an observable sink.
+///
+/// Out-of-process tools such as SaBRe install a forwarder without a tracing
+/// subscriber, so tracing's INFO gate alone is not the DETLOG condition.
+#[doc(hidden)]
+pub fn info_observable() -> bool {
+    info_observable_from(
+        tracing::enabled!(tracing::Level::INFO),
+        forwarding_enabled(),
+    )
+}
+
+fn info_observable_from(tracing_info_enabled: bool, forwarder_installed: bool) -> bool {
+    tracing_info_enabled || forwarder_installed
+}
+
 /// Emits one deterministic record through tracing and the process-local sink.
 #[doc(hidden)]
 pub fn emit_forwarded(message: fmt::Arguments<'_>) {
@@ -149,6 +165,14 @@ macro_rules! detlog_debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn info_observability_brackets_both_detlog_sinks() {
+        assert!(!info_observable_from(false, false));
+        assert!(info_observable_from(true, false));
+        assert!(info_observable_from(false, true));
+        assert!(info_observable_from(true, true));
+    }
 
     #[test]
     fn test_detlog() {
