@@ -102,12 +102,20 @@
 //! ```text
 //! ./scripts/validate.rs <profile> [-j N] [-v] [--allow-cgroup-failure]
 //!                       [--perf-dir DIR] [-k|--keep-going] [--dag-file PATH]
+//!                       [--historical-debug]
 //! ```
 //!
 //! `<profile>` selects `ci/dag/<profile>.json` (portable | privileged, or any
 //! other `ci/dag/*.json` present). `--dag-file PATH` (or the `RUN_DAG_FILE_OVERRIDE`
 //! env, mirroring `ci/run-dag.sh`) runs an exact DAG file instead, keeping the
 //! profile label for the ledger.
+//!
+//! `--historical-debug` is the deliberately NON-QUALIFYING path for running a
+//! profile at an old commit. It is always boxed, always sequential (`-j 1`),
+//! and stamps the ledger row with both `selection_mode="historical-debug"` (a
+//! value the shared landing predicate refuses) and an explicit evidence class.
+//! It does not weaken or route around `ci-hub validate-run`'s correct refusal
+//! of historical heads.
 //!
 //! ```cargo
 //! [dependencies]
@@ -175,6 +183,12 @@ const DAG_FILE_OVERRIDE_ENV: &str = "RUN_DAG_FILE_OVERRIDE";
 /// Profile-store dir env, mirroring the runner's own default resolution.
 const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
 
+/// Marker set only by `scripts/historical-debug-validate` after it has entered
+/// ci-hub's box-exclusive validate/bench lock. Historical work must never run
+/// concurrently with qualifying validation.
+const HISTORICAL_PRODUCER_ENV: &str = "CI_HUB_HISTORICAL_DEBUG_PRODUCER";
+const HISTORICAL_PRODUCER: &str = "validate-lock-bench-v1";
+
 // --------------------------------------------------------------------------- args
 
 struct Args {
@@ -185,6 +199,7 @@ struct Args {
     keep_going: bool,
     allow_cgroup_failure: bool,
     perf_dir: Option<String>,
+    historical_debug: bool,
 }
 
 fn usage() -> &'static str {
@@ -201,6 +216,8 @@ fn usage() -> &'static str {
      --perf-dir DIR           forward per-step profile rows to DIR\n\
      --dag-file PATH          run this exact DAG file (keeps <profile> as the label);\n\
      \x20                        also settable via RUN_DAG_FILE_OVERRIDE\n\
+     --historical-debug       write typed NON-QUALIFYING historical evidence;\n\
+     \x20                        forces -j 1 and requires cgroup boxing\n\
      -h, --help               print this help and exit"
 }
 
@@ -213,6 +230,7 @@ fn parse_args() -> Result<Args, u8> {
     let mut keep_going = false;
     let mut allow_cgroup_failure = false;
     let mut perf_dir: Option<String> = None;
+    let mut historical_debug = false;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -226,6 +244,7 @@ fn parse_args() -> Result<Args, u8> {
             "-v" => verbosity += 1,
             "-k" | "--keep-going" => keep_going = true,
             "--allow-cgroup-failure" => allow_cgroup_failure = true,
+            "--historical-debug" => historical_debug = true,
             "-j" => {
                 i += 1;
                 let v = argv.get(i).ok_or_else(|| {
@@ -281,6 +300,32 @@ fn parse_args() -> Result<Args, u8> {
         2u8
     })?;
 
+    if historical_debug {
+        if allow_cgroup_failure {
+            eprintln!(
+                "validate.rs: --historical-debug requires cgroup boxing; \
+                 --allow-cgroup-failure is forbidden"
+            );
+            return Err(2);
+        }
+        match jobs {
+            Some(1) | None => jobs = Some(1),
+            Some(width) => {
+                eprintln!(
+                    "validate.rs: --historical-debug is sequential and requires -j 1, got -j {width}"
+                );
+                return Err(2);
+            }
+        }
+        if std::env::var(HISTORICAL_PRODUCER_ENV).as_deref() != Ok(HISTORICAL_PRODUCER) {
+            eprintln!(
+                "validate.rs: direct --historical-debug invocation is disabled; use \
+                 ./scripts/historical-debug-validate so ci-hub serializes the run"
+            );
+            return Err(2);
+        }
+    }
+
     Ok(Args {
         profile,
         dag_file,
@@ -289,6 +334,7 @@ fn parse_args() -> Result<Args, u8> {
         keep_going,
         allow_cgroup_failure,
         perf_dir,
+        historical_debug,
     })
 }
 
@@ -483,6 +529,7 @@ fn write_ledger_record(
     commit: &str,
     tree_is_dirty: bool,
     selection_mode: &str,
+    historical_debug: bool,
 ) {
     // DAG-lane semantics: the gate (NODE) is the unit of execution, NOT a libtest
     // test case. See the module doc comment. These are DAG-node counts:
@@ -529,9 +576,26 @@ fn write_ledger_record(
         })
         .collect();
 
+    let evidence_class = if historical_debug {
+        "historical-debug"
+    } else {
+        "validation-lane"
+    };
+    let non_qualifying_reason = if historical_debug {
+        "historical-debug"
+    } else {
+        "partial-validation-lane"
+    };
+
     let record = serde_json::json!({
         "schema_version": LEDGER_SCHEMA_VERSION,
         "producer": LEDGER_PRODUCER,
+        // This producer never mints landing evidence. The historical mode has
+        // its own explicit class, while selection_mode below is the
+        // load-bearing value consumed by the shared qualifying predicate.
+        "evidence_class": evidence_class,
+        "landing_eligible": false,
+        "non_qualifying_reason": non_qualifying_reason,
         "started_at": started_at,
         "finished_at": finished_at,
         "host": host,
@@ -695,11 +759,20 @@ fn main() -> ExitCode {
 
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
-    eprintln!(
-        "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
-        args.profile,
-        dag_path.display()
-    );
+    if args.historical_debug {
+        eprintln!(
+            "validate.rs: running historical-debug profile {:?} (DAG {}) at -j 1; \
+             evidence is NON-QUALIFYING and cannot authorize landing",
+            args.profile,
+            dag_path.display()
+        );
+    } else {
+        eprintln!(
+            "validate.rs: running profile {:?} (DAG {}) at -j {jobs}",
+            args.profile,
+            dag_path.display()
+        );
+    }
 
     let result = run_dag_boxed_ordered(
         &cfg,
@@ -748,7 +821,13 @@ fn main() -> ExitCode {
     // the single write point that carries every qualification with the value.
     let commit = git_sha();
     let dirty = tree_dirty();
-    let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
+    let selection_mode = if args.historical_debug {
+        "historical-debug"
+    } else if args.dag_file.is_some() {
+        "override"
+    } else {
+        "full"
+    };
     write_ledger_record(
         &ledger_path(&root),
         &started_at,
@@ -759,6 +838,7 @@ fn main() -> ExitCode {
         &commit,
         dirty,
         selection_mode,
+        args.historical_debug,
     );
 
     let verdict = if exit_code == 0 { "PASS" } else { "FAIL" };
