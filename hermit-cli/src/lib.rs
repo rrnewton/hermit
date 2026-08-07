@@ -1341,6 +1341,7 @@ async fn run_kvm(
 }
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBI guest execution.
+#[cfg(feature = "dbi")]
 fn dbi_coordinator_connect_failed(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionAborted
 }
@@ -2381,6 +2382,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dbi")]
     fn dbi_retries_only_a_pre_guest_coordinator_failure() {
         let failure = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
         assert!(super::dbi_coordinator_connect_failed(&failure));
