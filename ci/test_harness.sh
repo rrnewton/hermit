@@ -384,15 +384,43 @@ function assert_privileged_diagnostics {
         die "GitHub occasional KVM diagnostics must publish structured results"
 }
 
-function assert_validate_entrypoint {
-    local lane=$1 function_name=$2 expected=$3
-    local body
-    body=$(function_body "$function_name" "$ROOT_DIR/validate.sh")
-    [[ -n $body ]] || die "validate.sh function is missing: $function_name"
-    [[ $(grep -Ec "^[[:space:]]*run_ci_manifest_lane $lane([[:space:]]|$)" <<<"$body") == 1 ]] ||
-        die "validate.sh $function_name must call run_ci_manifest_lane $lane exactly once"
-    grep -Fqx "$expected" <<<"$body" ||
-        die "validate.sh $function_name command diverged from the audited entrypoint"
+# The validation driver is scripts/validate.rs; validate.sh is a pass-through
+# shim that only keeps the ENTRYPOINT NAME valid across the bash->Rust refactor,
+# so `git bisect`, ci-hub, historical replay, and ci/dag/portable.json's
+# `test.strict_compat` re-entry all keep working with one command.
+#
+# These assertions replace the former `assert_validate_entrypoint` audits over
+# bash function bodies. The property audited is unchanged and is the one that
+# matters: a validate profile's node set comes from the AUDITED DAG FILES and
+# from nowhere else, so no local path can quietly run a different or smaller
+# suite than the one CI runs.
+function assert_validate_driver_entrypoint {
+    local shim="$ROOT_DIR/validate.sh"
+    local plan_src="$ROOT_DIR/scripts/lib/validate_plan.rs"
+    local driver="$ROOT_DIR/scripts/validate.rs"
+
+    [[ -x $shim && -x $driver ]] ||
+        die "validate.sh and scripts/validate.rs must both be executable entrypoints"
+    # A shim, not a second implementation: exactly one non-comment, non-blank line.
+    [[ $(grep -Ecv '^[[:space:]]*(#|$)' "$shim") == 1 ]] ||
+        die "validate.sh must remain a shim: it may contain exactly one executable line"
+    grep -Fqx 'exec "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/validate.rs" "$@"' "$shim" ||
+        die "validate.sh must exec scripts/validate.rs and forward every argument untouched"
+    # ONE place resolves a lane's node set, and it is the audited DAG file.
+    [[ $(grep -Fc 'root.join("ci").join("dag").join(format!("{lane}.json"))' "$plan_src") == 1 ]] ||
+        die "the validate driver must resolve every CI lane from exactly one place: ci/dag/<lane>.json"
+    # And the profile->lane table names both audited lanes, once each, with the
+    # full profile delegating to BOTH.
+    [[ $(grep -Fxc '        (Some(Focused::PrivilegedOnly), _) => vec!["privileged"],' "$driver") == 1 ]] ||
+        die "validate --privileged-only must delegate to the audited privileged DAG"
+    [[ $(grep -Fxc '        (None, Level::PortableOnly) => vec!["portable"],' "$driver") == 1 ]] ||
+        die "validate --portable-only must delegate to the audited portable DAG"
+    [[ $(grep -Fxc '        (None, Level::Full) => vec!["portable", "privileged"],' "$driver") == 1 ]] ||
+        die "the default full validation must delegate to BOTH audited DAGs"
+    # No substitute profile: an unplannable request refuses rather than silently
+    # running a different gate set under the requested name.
+    grep -Fq 'refusing to substitute another profile' "$driver" ||
+        die "the validate driver must refuse an unplannable profile, never substitute one"
 }
 
 # Keep the latest-Reverie invariant attached to every testing evidence path.
@@ -438,8 +466,16 @@ $direct_references"
         die "pre-commit hook must use the canonical Reverie-pin launcher"
     [[ $(grep -Fxc '"${proxy[@]}" "$checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
         die "pre-commit hook must bind the launcher to the exact repository"
-    [[ $(grep -Fc '"$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 2 ]] ||
-        die "both validate Reverie-pin gates must use the exact-repository launcher"
+    # The validate driver's Reverie-pin preflight node. It builds the command
+    # string, so the audited literal is the format template — which still pins
+    # both halves of the property: the canonical launcher, bound to an explicit
+    # `--repo` rather than to whatever directory the node inherits.
+    [[ $(grep -Fc '{proxy}{root}/ci/run-reverie-pin-check.sh --repo {root}' \
+        "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
+        die "the validate Reverie-pin gate must use the exact-repository launcher"
+    ! grep -F 'run-reverie-pin-check.sh' "$ROOT_DIR/scripts/lib/validate_plan.rs" |
+        grep -Fqv -- '--repo' ||
+        die "every validate Reverie-pin invocation must bind --repo; found an unbound one"
     [[ $(grep -Fxc '    "$root_dir/ci/run-reverie-pin-check.sh" --repo "$root_dir" --print-pin' "$liteinst_stage") == 1 ]] ||
         die "LiteInst staging must obtain its cache pin through the exact-repository launcher"
 
@@ -626,8 +662,13 @@ EOF
             die "rust-script-free LiteInst staging did not install the fixture runtime"
     )
 
-    [[ $(grep -Fc 'run_check "Reverie dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate.sh must execute the latest-Reverie gate exactly once"
+    # Exactly one Reverie-pin gate in the validate driver's plan, and every lane
+    # node waits on it: the archival pin is proved current BEFORE anything is
+    # built or tested, on every profile.
+    [[ $(grep -Fc '"Reverie pin consistency",' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
+        die "the validate driver must plan the latest-Reverie gate exactly once"
+    [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
+        die "the validate manifest gate must depend on the latest-Reverie gate"
     [[ $(grep -Fc 'REVERIE_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
         die "validate.sh receipt cleanup must fail closed when the pin gate was bypassed"
     [[ $(grep -Fc '\"reverie_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
@@ -948,24 +989,7 @@ function audit_ci_correspondence {
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
         'timeout --foreground --kill-after=10s 360s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
-    # shellcheck disable=SC2016
-    assert_validate_entrypoint portable run_portable_only_suite \
-        '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
-    # shellcheck disable=SC2016
-    assert_validate_entrypoint privileged run_privileged_validation \
-        '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
-    # The default full validation must delegate to both audited DAGs too.
-    # shellcheck disable=SC2016
-    assert_validate_entrypoint portable run_full_suite \
-        '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
-    # shellcheck disable=SC2016
-    assert_validate_entrypoint privileged run_full_suite \
-        '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
-    local runner_body
-    runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
-    # shellcheck disable=SC2016
-    [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
-        die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
+    assert_validate_driver_entrypoint
 
     # This validation command contains real concurrent rustc probes. Keep both
     # lane copies on the measured 30s workload class and the same 60s cap so a

@@ -240,8 +240,14 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
 /// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
 /// that fail-fast structurally — a failed dependency SKIPS its dependents, which
 /// the runner reports as `skipped` rather than as passes.
-pub fn preflight_nodes(with_proxy: bool) -> Vec<Step> {
+pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     let proxy = if with_proxy { "with-proxy " } else { "" };
+    // The Reverie-pin launcher is bound to THIS repository explicitly, never left
+    // to whatever directory the node happens to start in. `ci/test_harness.sh`'s
+    // `assert_reverie_pin_enforcement` audits that binding, because "it will be
+    // the right repo because cwd is right" is an inference, not an observation —
+    // and the archival pin is not a testing exemption.
+    let root = shell_quote(&root.to_string_lossy());
     vec![
         node(
             "pre",
@@ -262,7 +268,7 @@ pub fn preflight_nodes(with_proxy: bool) -> Vec<Step> {
             "pre",
             "reverie_pin",
             "Reverie pin consistency",
-            format!("{proxy}./ci/run-reverie-pin-check.sh"),
+            format!("{proxy}{root}/ci/run-reverie-pin-check.sh --repo {root}"),
             vec!["pre.submodules".to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
