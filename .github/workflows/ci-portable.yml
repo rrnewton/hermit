@@ -928,7 +928,35 @@ jobs:
     permissions:
       actions: write
     steps:
+      # DO NOT DELETE WHEN A RE-RUN IS STILL POSSIBLE. The build artifacts are
+      # named `hermit-debug-${run_id}` -- run id only, no run ATTEMPT (unlike the
+      # parity tarballs below, which already carry `${runAttempt}`). "Re-run
+      # failed jobs" reuses the successful build job's result WITHOUT
+      # re-executing it, so nothing re-uploads those names; the re-run depends
+      # entirely on the previous attempt's artifacts still existing. Deleting
+      # them under `if: always()` therefore made every such re-run fail at
+      # `Download debug prebuilt tree` with
+      #   Unable to download artifact(s): Artifact not found for name: hermit-debug-<run_id>
+      # and that single miss cascades into "Verify completeness, checksums, and
+      # archive paths" and "Require every portable DAG job to succeed", so it
+      # presents as a multi-job RED on a run whose product tests all passed.
+      # Observed on run 30975093747 attempt 4: 32 of 34 jobs green, failing only
+      # this way.
+      #
+      # Gate on the consumers instead. When every consumer succeeded there is
+      # nothing left to re-run and deleting is safe; when any failed or was
+      # cancelled, keep the artifacts so the re-run can find them. They are
+      # still short-lived -- GitHub expires them on the repository retention
+      # policy -- so this trades a bounded amount of storage on already-red runs
+      # for re-runs that can actually succeed.
+      - name: Skip deletion because a re-run may still need these artifacts
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "A consumer did not succeed; keeping the prebuilt artifacts so"
+          echo "'Re-run failed jobs' can download them. They expire on the"
+          echo "repository retention policy."
       - name: Delete short-lived build artifacts
+        if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
         uses: actions/github-script@v7
         with:
           script: |
