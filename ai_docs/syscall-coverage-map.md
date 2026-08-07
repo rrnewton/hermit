@@ -12,21 +12,21 @@ counted.
 
 | Classification | Count | Share of 382 |
 | --- | ---: | ---: |
-| DETERMINIZED | 69 | 18.1% |
+| DETERMINIZED | 71 | 18.6% |
 | PASSTHROUGH | 19 | 5.0% |
 | BLOCKED | 3 | 0.8% |
-| MISSING | 291 | 76.2% |
+| MISSING | 289 | 75.7% |
 
-"DETERMINIZED" includes partial models. Of those 69 entries, only
+"DETERMINIZED" includes partial models. Of those 71 entries, only
 `getrandom` and `getcpu` are unconditional full replacements of their
 nondeterministic outputs. Six more have complete deterministic output/effect
 only in the relevant configured mode: `alarm`, `pause`,
 `clock_gettime`, `clock_getres`, `time`, and `sched_yield`. The other
-61 are partial models that still use the host kernel, cover only some commands
+63 are partial models that still use the host kernel, cover only some commands
 or file-descriptor types, or depend on a stable filesystem/network environment.
 
-Release `hermit run` subscribes to 78 syscall numbers. That set comprises the
-69 determinized entries, six explicit passthroughs, and three blocked entries.
+Release `hermit run` subscribes to 80 syscall numbers. That set comprises the
+71 determinized entries, six explicit passthroughs, and three blocked entries.
 Normal CLI defaults enable scheduling, deterministic I/O, time virtualization,
 and metadata virtualization, so all conditional subscription groups are active
 unless the user opts out. A debug build instead uses `Subscription::all()`.
@@ -35,7 +35,7 @@ The largest correctness issue is fail-open coverage. In an optimized run, an
 unsubscribed syscall never reaches `handle_syscall_event`; it executes in the
 kernel without Detcore's prehook, scheduler, logical-time update, statistics, or
 unsupported-syscall check. Consequently
-`--panic-on-unsupported-syscalls` does not detect the 291 missing release
+`--panic-on-unsupported-syscalls` does not detect the 289 missing release
 entries. It only affects an unsupported syscall that some subscriber already
 caused Reverie to trap.
 
@@ -87,7 +87,7 @@ it.
 | --- | --- | --- |
 | Randomness and CPU | `getrandom`, `getcpu`, affinity calls | Random bytes and CPU/node output are synthesized. Affinity is only a CPU0 facade; the setter does not retain requested state. |
 | Time and sleep | four clock/time queries, `alarm`, `pause`, `nanosleep`, `clock_nanosleep`, `sched_yield` | Queries use logical time and basic waits use the scheduler. Clock IDs/flags and opt-out modes make sleep handling partial. |
-| Threads/processes | clone family, `futex`, `wait4`, exits, exec family, `getpgid`, `getpgrp`, `setsid` | Thread scheduling and blocking are coordinated, and the root guest establishes a positive namespace-visible process group before it executes. PIDs/TIDs remain native. Precise futex handles only WAIT/WAKE bitset families; other operations panic. |
+| Threads/processes | clone family, `futex`, `wait4`, exits, exec family, `getpgid`, `getpgrp`, `setsid` | Thread scheduling and blocking are coordinated. Process-group queries replace Linux's namespace-visible zero with a stable positive identity without changing `setpgid`/`setsid` kernel semantics. PIDs/TIDs remain native. Precise futex handles only WAIT/WAKE bitset families; other operations panic. |
 | Files and metadata | open/read/write/close, stat family, directory reads, timestamp calls, FD duplication | Resource and FD models cover common paths. Filesystem contents/errors remain external; metadata replaces only selected fields; many namespace mutations and I/O variants are missing. |
 | Descriptor objects | socket creation, pipes, eventfd/signalfd/timerfd/memfd/userfaultfd creation | Creation and FD flags/types are tracked. Most later control operations are not modeled, so `close_range`, timer arming, ioctl, and many descriptor families can desynchronize state. |
 | Polling/network | `poll`, `epoll_wait`, accept/connect/recvfrom/bind | Internal blocking is converted to deterministic polling where implemented. Network content is external, `epoll_pwait` forwards, and common sibling APIs are missing. |
@@ -299,7 +299,7 @@ header.
 | 108 | `getegid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 109 | `setpgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 110 | `getppid` | MISSING | none | none | Native parent PID is exposed. |
-| 111 | `getpgrp` | DETERMINIZED | always | partial | Queries kernel process-group state after the root guest establishes a positive namespace-visible group; non-positive results are rejected. |
+| 111 | `getpgrp` | DETERMINIZED | always | partial | Preserves positive kernel process-group state and maps Linux's namespace-visible zero for an inherited outside-namespace group to a stable positive identity. |
 | 112 | `setsid` | DETERMINIZED | always | partial | Host call plus daemon lifecycle tracking; native session/PID values remain. |
 | 113 | `setreuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 114 | `setregid` | MISSING | none | none | No Detcore-specific release coverage. |
@@ -309,7 +309,7 @@ header.
 | 118 | `getresuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 119 | `setresgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 120 | `getresgid` | MISSING | none | none | No Detcore-specific release coverage. |
-| 121 | `getpgid` | DETERMINIZED | always | partial | Queries kernel process-group state after the root guest establishes a positive namespace-visible group; explicit PID lookup and Linux errors remain kernel-provided. |
+| 121 | `getpgid` | DETERMINIZED | always | partial | Current-process queries share the `getpgrp` identity path; explicit non-self lookup and Linux errors remain kernel/backend-provided. Namespace-visible zero maps to a stable positive identity. |
 | 122 | `setfsuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 123 | `setfsgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 124 | `getsid` | MISSING | none | none | No Detcore-specific release coverage. |

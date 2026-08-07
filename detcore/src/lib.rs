@@ -1304,7 +1304,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
         } else if guest.is_root_thread() {
-            self.normalize_initial_process_group(guest).await?;
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
