@@ -94,6 +94,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getdents
         | Sysno::getdents64
         // AUTONOMOUS-BOT-IMPLEMENTED
+        | Sysno::getpgid
+        | Sysno::getpgrp
+        // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-892): Query logical interval-timer state.
         | Sysno::getitimer
         | Sysno::getrandom
@@ -656,8 +659,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        | Sysno::getpgid
-        | Sysno::getpgrp
         | Sysno::getppid
         | Sysno::getsid
         | Sysno::gettid
@@ -1291,9 +1292,16 @@ mod tests {
         //
         // #1549 moved the six credential-query syscalls (getuid, geteuid,
         // getgid, getegid, getresuid, getresgid) from PassThrough to
-        // Determinized, so the census shifts 6 from column 1 to column 0
-        // (283/89 -> 289/83). The total is unchanged and is re-asserted below.
-        assert_eq!(counts, [289, 83, 1]);
+        // Determinized, so the census shifted 6 from column 1 to column 0
+        // (283/89 -> 289/83).
+        //
+        // This change then moves getpgid/getpgrp the same way, a further 2
+        // (289/83 -> 291/81). The total is unchanged and is re-asserted below.
+        // DERIVED, NOT COPIED: both moves are counted from the classification
+        // table in this file rather than carried from either branch's stale
+        // literal -- the two edits were authored independently and each side's
+        // number predates the other.
+        assert_eq!(counts, [291, 81, 1]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1355,6 +1363,9 @@ mod tests {
             classify_syscall(Sysno::times),
             SyscallClassification::Determinized
         );
+        for sysno in [Sysno::getpgid, Sysno::getpgrp] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+        }
         // BATCH 51: these previously fail-closed --strict; now determinized.
         for sysno in [
             Sysno::flock,
@@ -1469,8 +1480,6 @@ mod tests {
             Sysno::getppid,
             Sysno::getxattr,
             Sysno::lchown,
-            Sysno::getpgid,
-            Sysno::getpgrp,
             Sysno::getsid,
             Sysno::setpgid,
             Sysno::lgetxattr,

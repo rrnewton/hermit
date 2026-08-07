@@ -45,6 +45,20 @@ const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 const SECCOMP_GET_NOTIF_SIZES: u32 = 3;
 const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
 
+const INITIAL_NAMESPACE_PROCESS_GROUP: i64 = 1;
+
+fn virtualize_process_group_identity(pgid: i64) -> Result<i64, Errno> {
+    match pgid {
+        0 => Ok(INITIAL_NAMESPACE_PROCESS_GROUP),
+        value if value > 0 => Ok(value),
+        _ => Err(Errno::EIO),
+    }
+}
+
+fn is_current_process_group_query(requested_pid: i64, current_pid: i64) -> bool {
+    requested_pid == 0 || requested_pid == current_pid
+}
+
 fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
     if op > SECCOMP_GET_NOTIF_SIZES {
         return Err(Errno::EINVAL);
@@ -624,6 +638,45 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(n as i64)
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-1933): Review zero-only process-group identity
+    // virtualization and the self-query alias used for backend parity.
+    /// Preserve positive kernel process-group identities, but replace Linux's
+    /// namespace-visible zero (an inherited group whose leader is outside the
+    /// namespace) with the stable identity of the namespace's initial group.
+    /// This query-only mapping deliberately leaves setpgid and setsid kernel
+    /// state and error semantics untouched.
+    pub async fn handle_getpgid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getpgid,
+    ) -> Result<i64, Error> {
+        // The pinned Reverie Getpgid wrapper retains the raw pid argument but
+        // does not expose a typed getter for it.
+        let requested_pid = syscalls::SyscallArgs::from(call).arg0 as libc::pid_t as i64;
+        let current_pid = guest.inject(syscalls::Getpid::new()).await?;
+        let pgid = if is_current_process_group_query(requested_pid, current_pid) {
+            // getpgrp is exactly getpgid(0). Using the alias for both zero and
+            // the current pid also covers backends that implement only getpgrp.
+            guest.inject(syscalls::Getpgrp::new()).await?
+        } else {
+            // Preserve explicit non-self lookup and kernel/backend errors.
+            guest.inject(call).await?
+        };
+        Ok(virtualize_process_group_identity(pgid)?)
+    }
+
+    /// getpgrp alias of getpgid(0), with the same positive identity invariant.
+    pub async fn handle_getpgrp<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Getpgrp,
+    ) -> Result<i64, Error> {
+        Ok(virtualize_process_group_identity(
+            guest.inject(call).await?,
+        )?)
+    }
+
     /// setsid system call
     pub async fn handle_setsid<G: Guest<Self>>(
         &self,
@@ -800,6 +853,22 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_identity_must_be_positive() {
+        assert_eq!(virtualize_process_group_identity(3), Ok(3));
+        assert_eq!(virtualize_process_group_identity(1), Ok(1));
+        assert_eq!(virtualize_process_group_identity(0), Ok(1));
+        assert_eq!(virtualize_process_group_identity(-1), Err(Errno::EIO));
+    }
+
+    #[test]
+    fn getpgid_self_queries_use_the_getpgrp_alias() {
+        assert!(is_current_process_group_query(0, 37));
+        assert!(is_current_process_group_query(37, 37));
+        assert!(!is_current_process_group_query(38, 37));
+        assert!(!is_current_process_group_query(-1, 37));
+    }
 
     #[test]
     fn prctl_support_covers_deterministic_controls() {

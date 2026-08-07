@@ -27,11 +27,9 @@
  * below is a path it does NOT cover: procfs text, wait-status, execve, pgid,
  * and a control-flow branch.
  *
- * UNVALIDATED OBSERVATION, pinned deliberately: under hermit `getpgid(0)`
- * returns 0, where the host returns a real pgid. 0 is not a valid process
- * group, so this looks like a virtualization gap rather than a virtualized
- * value. It is printed here so the fixture CATCHES A CHANGE to it -- that is
- * not an assertion that 0 is correct. See the task note; it needs its own fix.
+ * Process-group identity has its own correctness oracle: the value must be
+ * positive, stable across repeated calls, identical through the getpgrp()
+ * alias, and identical when getpgid names the current process explicitly.
  *
  * Deliberately covered here, because each is a distinct leak path:
  *   - getpid / gettid / getppid / getpgid on the main thread
@@ -87,6 +85,9 @@ int main(void) {
     pid_t tid = sys_gettid();
     pid_t ppid = getppid();
     pid_t pgid = getpgid(0);
+    pid_t pgid_repeat = getpgid(0);
+    pid_t pgrp = getpgrp();
+    pid_t pgid_by_pid = getpgid(pid);
     pid_t stat_pid = procfs_self_pid();
 
     printf("main.getpid=%d\n", (int)pid);
@@ -94,6 +95,17 @@ int main(void) {
     printf("main.getppid=%d\n", (int)ppid);
     printf("main.getpgid=%d\n", (int)pgid);
     printf("procfs.stat_pid=%d\n", (int)stat_pid);
+
+    if (pgid <= 0 || pgid_repeat != pgid || pgrp != pgid ||
+        pgid_by_pid != pgid) {
+        fprintf(stderr,
+                "invalid process-group identity: pgid=%d repeat=%d "
+                "getpgrp=%d by-pid=%d self=%d\n",
+                (int)pgid, (int)pgid_repeat, (int)pgrp, (int)pgid_by_pid,
+                (int)pid);
+        return 1;
+    }
+    printf("branch.process_group_identity=yes\n");
 
     /* CONTRACT: the main thread's tid equals its pid, and procfs agrees with
        the syscall. Branch on the comparisons so a mismatch changes control
