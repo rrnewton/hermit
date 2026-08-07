@@ -46,6 +46,14 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "relaxation_flags",
+      "desc": "Every determinism-relaxing CLI flag is classified (set derived from source at check time)",
+      "cmd": "./ci/run-relaxation-flag-check.sh --self-test && ./ci/run-relaxation-flag-check.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "script_sigpipe",
       "desc": "Standalone scripts exit cleanly on downstream SIGPIPE (prog | head)",
       "cmd": "./scripts/check-script-sigpipe.sh",
