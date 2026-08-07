@@ -1352,7 +1352,7 @@ function assert_agent_utils_pin_enforcement {
         git -C "$ROOT_DIR" grep -Il -F 'scripts/check-agent-utils-pin.rs' -- . |
             LC_ALL=C sort
     )
-    expected_direct_references=$'ci/run-agent-utils-pin-check.sh\nci/test_harness.sh\nscripts/check-agent-utils-pin.rs'
+    expected_direct_references=$'ci/run-agent-utils-pin-check.sh\nci/test_harness.sh'
     [[ $direct_references == "$expected_direct_references" ]] ||
         die "direct agent-utils-pin source references differ from the trusted allowlist:
 $direct_references"
