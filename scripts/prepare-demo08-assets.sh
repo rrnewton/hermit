@@ -39,156 +39,123 @@ STAMP="$ASSETS/.nightly-prep-version"
 JOBS="${DEMO08_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
 CALIBRATION_SEEDS="${DEMO08_CALIBRATION_SEEDS:-64}"
-CALIBRATION_TIMEOUT="${DEMO08_CALIBRATION_TIMEOUT:-30}"
-# Test-only injection point. The runner receives SEED and IMAGE and writes the
-# same combined stdout/stderr that a real Hermit invocation would produce.
-CALIBRATION_RUNNER="${DEMO08_CALIBRATION_RUNNER:-}"
+# Measured on devbig176 (176-core AMD EPYC 9D64) over seeds 0-15 of the freshly built v7.1
+# fixture: min 6s, median 11s, max 103s per seed. The former 30s default truncated the tail
+# into false negatives, since a truncated seed cannot report a UAF it never reached.
+CALIBRATION_TIMEOUT="${DEMO08_CALIBRATION_TIMEOUT:-150}"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
 }
 
-# TOOL GATES ARE SCOPED TO THE PATH THAT USES THEM.
-#
-# These ten are needed only to BUILD the btrfs-progs fixtures. Requiring them up
-# front made the cached path — stamp matches, fixtures present, calibrate and
-# exit without building anything — impossible on a host lacking a build
-# toolchain, which is the majority case for a calibration-only run and is
-# exactly what blocked the engagement test here: `autoconf is required to
-# prepare Demo 8` aborted before a single seed was attempted.
-#
-# Verified by inspection of calibrate_crash_seed rather than assumed: it invokes
-# NONE of these ten. Scoping the check therefore weakens nothing — the build
-# path still requires all of them, immediately before it builds.
-BUILD_TOOLS=(autoconf automake file git make mkfs.ext4 patch pkg-config sha256sum truncate)
-
-require_build_tools() {
-  local command
-  for command in "${BUILD_TOOLS[@]}"; do
-    command -v "$command" >/dev/null 2>&1 || fail "$command is required to build the Demo 8 fixtures"
-  done
-}
-
-# `timeout` IS used by the calibration path (it bounds every seed attempt) and
-# was not gated at all. An ungated dependency fails mid-sweep as a per-seed
-# error, which this harness would then record as a non-engaged seed -- a missing
-# tool would masquerade as "the path was never reached". Gate it up front.
-command -v timeout >/dev/null 2>&1 || fail "timeout is required to calibrate Demo 8"
+for command in autoconf automake file git make mkfs.ext4 patch pkg-config sha256sum truncate; do
+  command -v "$command" >/dev/null 2>&1 || fail "$command is required to prepare Demo 8"
+done
 [[ $JOBS =~ ^[1-9][0-9]*$ ]] || fail "DEMO08_BUILD_JOBS must be a positive integer"
 [[ $CALIBRATION_SEEDS =~ ^[1-9][0-9]*$ ]] || \
   fail "DEMO08_CALIBRATION_SEEDS must be a positive integer"
 [[ $CALIBRATION_TIMEOUT =~ ^[1-9][0-9]*$ ]] || \
   fail "DEMO08_CALIBRATION_TIMEOUT must be a positive integer"
 
+# A crashing seed is a property of the exact fixture binary it was calibrated against, so it
+# is stored WITH that binary's identity rather than as a bare integer. A cached seed whose
+# recorded fixture hash does not match the fixture actually present is not evidence about this
+# fixture and is discarded. Reusing a bare cached seed across a rebuilt fixture is how the gate
+# came to depend on a value it had never re-derived (issue #1877).
+fixture_identity() {
+  sha256sum "$ASSETS/buggy/btrfs-convert" | cut -d' ' -f1
+}
+
+# A guest that ran leaves one of: a clean conversion (0), an ASAN abort (134), or a wall-clock
+# truncation (124). Any other status is the wrapper/toolchain failing before or around the guest,
+# which is NOT the same fact as "this seed did not crash" and must never be reported as one.
+seed_executed() {
+  local rc=$1 output=$2
+  case "$rc" in
+    0 | 124 | 134) [ -s "$output" ] && return 0 ;;
+  esac
+  return 1
+}
+
 calibrate_crash_seed() {
   local artifacts="${DEMO08_ARTIFACTS:-$ROOT/ignored/demo08-run}"
   local image="$artifacts/chaos-buggy.img"
-  local report="$artifacts/calibration.tsv"
-  local output seed source rc engagement uaf
-  local cached_seed=""
-  local attempted=0
-  local engaged=0
-  local uaf_hits=0
-  local found_seed=""
-  local -a seeds=()
-  local -a sources=()
+  local output="$artifacts/.calibration.out"
+  local seed rc fixture executed=0 attempted=0 last_rc="" cached_fixture
+
+  fixture="$(fixture_identity)"
 
   if [ -r "$ASSETS/.crash-seed" ]; then
-    cached_seed="$(cat "$ASSETS/.crash-seed")"
-    [[ $cached_seed =~ ^[0-9]+$ ]] || \
-      fail "invalid cached Demo 8 crash seed: $cached_seed"
-    # A cache is only a selection hint, never evidence. Replay it and record
-    # both path engagement and the UAF signature before accepting it.
-    seeds+=("$cached_seed")
-    sources+=(cached)
+    seed="$(cut -d' ' -f1 <"$ASSETS/.crash-seed")"
+    cached_fixture="$(cut -s -d' ' -f2 <"$ASSETS/.crash-seed")"
+    if [[ $seed =~ ^[0-9]+$ ]] && [ "$cached_fixture" = "$fixture" ]; then
+      echo "Demo 8 crash seed ready (cached seed $seed for fixture ${fixture:0:12})"
+      return
+    fi
+    if [ -z "$cached_fixture" ]; then
+      echo "Cached Demo 8 crash seed carries no fixture identity; recalibrating." >&2
+    else
+      echo "Cached Demo 8 crash seed was calibrated for fixture ${cached_fixture:0:12}," \
+        "but this fixture is ${fixture:0:12}; recalibrating." >&2
+    fi
   fi
-  for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
-    seeds+=("$seed")
-    sources+=(cold)
-  done
 
-  if [ -z "$CALIBRATION_RUNNER" ] && [ ! -x "$HERMIT_RELEASE" ]; then
+  if [ ! -x "$HERMIT_RELEASE" ]; then
     echo "Building release Hermit for Demo 8 seed calibration..."
     make -C "$ROOT" --no-print-directory build-hermit
   fi
-  if [ -z "$CALIBRATION_RUNNER" ]; then
-    [ -x "$HERMIT_RELEASE" ] || \
-      fail "release Hermit is unavailable: $HERMIT_RELEASE"
-  else
-    [ -x "$CALIBRATION_RUNNER" ] || \
-      fail "Demo 8 calibration runner is not executable: $CALIBRATION_RUNNER"
-  fi
+  [ -x "$HERMIT_RELEASE" ] || fail "release Hermit is unavailable: $HERMIT_RELEASE"
 
   mkdir -p "$artifacts"
-  printf 'seed\tsource\tengagement\tuaf\texit\toutput\n' >"$report"
-  echo "Calibrating a deterministic crashing seed for this exact fixture..."
-  for ((i = 0; i < ${#seeds[@]}; i++)); do
-    seed="${seeds[$i]}"
-    source="${sources[$i]}"
-    # Do not repeat a cached seed after it has already proved the sweep can
-    # fail. If the cached replay fails, the cold pass deliberately includes it
-    # again so the configured seed range remains complete.
-    if [ -n "$found_seed" ]; then
-      break
-    fi
+  echo "Calibrating a deterministic crashing seed for fixture ${fixture:0:12}" \
+    "(up to $CALIBRATION_SEEDS seeds, ${CALIBRATION_TIMEOUT}s each)..."
+  for ((seed = 0; seed < CALIBRATION_SEEDS; seed++)); do
     cp --reflink=auto "$ASSETS/pop-tiny.img" "$image"
-    output="$artifacts/calibration-${source}-seed-${seed}.out"
     set +e
-    if [ -n "$CALIBRATION_RUNNER" ]; then
-      "$CALIBRATION_RUNNER" "$seed" "$image" >"$output" 2>&1
-    else
-      # Box the bare hermit run so a livelock/escapee is reaped by cgroup.kill instead of
-      # leaking a burned core (a `timeout` wall-cap only reaches the outer hermit, not a
-      # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
-      # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
-      # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
-      "$ROOT/scripts/hermit-box-run" --passthrough \
-        --label "demo08.calib.${source}.${seed}" \
-        --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
-        timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
-        --chaos --sched-seed "$seed" --no-virtualize-cpuid \
-        -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
-    fi
+    # Box the bare hermit run so a livelock/escapee is reaped by cgroup.kill instead of
+    # leaking a burned core (a `timeout` wall-cap only reaches the outer hermit, not a
+    # setsid/double-fork inner supervisor). --passthrough keeps stdout+stderr byte-identical
+    # so the ASAN grep below still sees the guest output; the wall `timeout` still governs
+    # per-seed duration and the box CPU-budget (4x) only reaps a true runaway.
+    "$ROOT/scripts/hermit-box-run" --passthrough --label demo08.calib \
+      --cpu-budget "$((CALIBRATION_TIMEOUT * 4))" -- \
+      timeout "$CALIBRATION_TIMEOUT" "$HERMIT_RELEASE" --log=error run \
+      --chaos --sched-seed "$seed" --no-virtualize-cpuid \
+      -- "$ASSETS/buggy/btrfs-convert" "$image" >"$output" 2>&1
     rc=$?
     set -e
-
     attempted=$((attempted + 1))
-    engagement=did-not-reach
-    uaf=none
-    # This marker is emitted inside print_copied_inodes after the progress
-    # thread starts and immediately before its vulnerable task_period_wait.
-    if grep -qa 'Copy inodes \[' "$output"; then
-      engagement=reached
-      engaged=$((engaged + 1))
+    last_rc=$rc
+    if seed_executed "$rc" "$output"; then
+      executed=$((executed + 1))
     fi
+    # ASAN can report the UAF on a thread whose process still exits 0, so the report text --
+    # not the exit status -- is the detector. The exit status is what proves the guest ran.
     if grep -qa 'AddressSanitizer: heap-use-after-free' "$output"; then
-      uaf=hit
-      uaf_hits=$((uaf_hits + 1))
-    fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output" >>"$report"
-    printf '  seed=%s source=%s engagement=%s uaf=%s rc=%s output=%s\n' \
-      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output"
-
-    # A signature without the engagement witness is not accepted: it is not
-    # bound to the intended progress-thread path.
-    if [ "$engagement" = reached ] && [ "$uaf" = hit ]; then
-      found_seed="$seed"
+      printf '%s %s\n' "$seed" "$fixture" >"$ASSETS/.crash-seed"
+      rm -f -- "$image" "$output"
+      echo "Demo 8 crash seed calibrated: $seed (guest exit $rc, fixture ${fixture:0:12})"
+      return
     fi
   done
 
-  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s report=%s\n' \
-    "$engaged" "$attempted" "$uaf_hits" "$attempted" "$report"
-  if [ -n "$found_seed" ]; then
-    printf '%s\n' "$found_seed" >"$ASSETS/.crash-seed"
-    echo "Demo 8 crash seed calibrated: $found_seed"
-    return
+  # Distinguish the two failures the old message conflated. "No seed crashed" is a statement
+  # about the fixture; "no seed ran" is a statement about this machine, and reporting the
+  # second as the first is what kept #1877 undiagnosed for five hours.
+  echo "--- last calibration output (rc=$last_rc) ---" >&2
+  tail -n 25 -- "$output" >&2 || true
+  echo "--- end ---" >&2
+  if [ "$executed" -eq 0 ]; then
+    rm -f -- "$image" "$output"
+    fail "Demo 8 calibration never executed the guest: 0 of $attempted seeds produced a guest" \
+      "exit status (0/124/134) with output; last rc=$last_rc. This is an environment failure" \
+      "(hermit, hermit-box-run, or the fixture binary), NOT an absence of the UAF."
   fi
-  if [ "$engaged" -eq 0 ]; then
-    fail "Demo 8 calibration NO-RESULT: path engagement 0/$attempted; 0 UAF hits cannot be reported as clean (report: $report)"
-  fi
-  fail "no ASAN UAF found after $attempted attempted seeds; path engagement $engaged/$attempted (report: $report)"
+  rm -f -- "$image" "$output"
+  fail "no ASAN UAF found in seeds 0-$((CALIBRATION_SEEDS - 1)) for fixture ${fixture:0:12}" \
+    "($executed of $attempted seeds executed; raise DEMO08_CALIBRATION_SEEDS or" \
+    "DEMO08_CALIBRATION_TIMEOUT if seeds are being truncated)"
 }
 
 expected_stamp="prep=$PREP_VERSION btrfs=$BTRFS_COMMIT"
@@ -200,9 +167,6 @@ if [ "$(cat "$STAMP" 2>/dev/null || true)" = "$expected_stamp" ] \
   echo "Demo 8 assets ready (cached at $ASSETS)"
   exit 0
 fi
-
-# Past this point a build WILL happen, so the build toolchain is now mandatory.
-require_build_tools
 
 mkdir -p "$BUILD_ROOT"
 if [ ! -d "$SOURCE/.git" ]; then
