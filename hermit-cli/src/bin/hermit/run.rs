@@ -795,7 +795,7 @@ fn backend_defaults_to_ptrace() {
 fn backend_values_parse_and_round_trip() {
     for (value, expected) in [
         ("ptrace", Backend::Ptrace),
-        ("dbi", Backend::Dbi),
+        ("dbt", Backend::Dbt),
         ("liteinst", Backend::Liteinst),
         ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
@@ -808,6 +808,28 @@ fn backend_values_parse_and_round_trip() {
         let normalized = format!(" --backend={value} -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
+}
+
+#[test]
+fn dbi_is_accepted_as_a_deprecated_alias_for_dbt() {
+    // Both directions, because either alone proves nothing: `dbt` must be the
+    // canonical spelling that round-trips, and `dbi` must still PARSE so that
+    // existing invocations, scripts and the committed CI DAG keep working --
+    // while normalising to `dbt` on output rather than round-tripping, which is
+    // what makes it an alias rather than a second name.
+    let mut canonical = RunOpts::parse_from(["fakehermit", "--backend", "dbt", "fakeprog"]);
+    canonical.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(canonical.selected_backend(), Backend::Dbt);
+    assert_eq!(format!("{}", canonical), " --backend=dbt -- fakeprog");
+
+    let mut alias = RunOpts::parse_from(["fakehermit", "--backend", "dbi", "fakeprog"]);
+    alias.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(alias.selected_backend(), Backend::Dbt);
+    assert_eq!(
+        format!("{}", alias),
+        " --backend=dbt -- fakeprog",
+        "the deprecated `dbi` spelling must normalise to `dbt` on output"
+    );
 }
 
 #[test]
@@ -1359,7 +1381,7 @@ fn dbi_backend_disables_uts_assumption() {
     // FQDN. Regression guard for DBI uname parity with the ptrace backend.
     let mut opts = RunOpts::parse_from(["fakehermit", "--backend=dbi", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.selected_backend(), Backend::Dbi);
+    assert_eq!(opts.selected_backend(), Backend::Dbt);
     assert!(!opts.no_namespace);
     assert!(!opts.det_opts.det_config.has_uts_namespace);
 }
@@ -1880,7 +1902,7 @@ impl RunOpts {
             | Backend::Sabre
             | Backend::Kvm
             | Backend::E9patch => {}
-            Backend::Dbi => {
+            Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
                 return super::backends::run_dbi(
                     &self.program,
@@ -1928,7 +1950,7 @@ impl RunOpts {
             Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
                 reverie_ptrace::is_perf_supported()
             }
-            Backend::Dbi | Backend::Sabre | Backend::Kvm => true,
+            Backend::Dbt | Backend::Sabre | Backend::Kvm => true,
         };
         self.validate_args_with_perf_support(perf_supported)
     }
@@ -1981,7 +2003,7 @@ impl RunOpts {
         // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
         // with a deterministic `EPERM` on every backend, so this never masks a
         // hostname the guest legitimately set.
-        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbi);
+        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbt);
         config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
 
         if self.no_namespace {
