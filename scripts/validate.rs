@@ -68,6 +68,9 @@ mod validate_plan;
 #[path = "lib/validate_receipt.rs"]
 mod validate_receipt;
 
+#[path = "lib/validate_runtime.rs"]
+mod validate_runtime;
+
 #[path = "lib/validate_super.rs"]
 mod validate_super;
 
@@ -635,6 +638,7 @@ fn self_test() -> Result<(), String> {
         validate_envelope::self_test()?,
         validate_history::self_test()?,
         validate_receipt::self_test()?,
+        validate_runtime::self_test()?,
     ] {
         println!("  {line}");
     }
@@ -2294,6 +2298,175 @@ fn interrupted_by() -> Option<&'static str> {
     }
 }
 
+// --------------------------------------------------------------- lane execution
+
+/// One lane's terminal state after any environmental retries.
+struct LaneResult {
+    outcomes: Vec<StepOutcome>,
+    skipped: Vec<String>,
+    ok: bool,
+    /// How many retry ROUNDS this lane needed; recorded in the ledger so a green
+    /// that only survived because the host was retried is never mistaken for a
+    /// green that passed first time.
+    env_retries: usize,
+}
+
+/// Read the durable log once it has stopped growing.
+///
+/// The driver tees its own stdout/stderr through a `tee` child, so a node's
+/// `----- detail -----` region reaches the file slightly after the runner emits
+/// it. Classifying a failure from a half-written region would misread a genuine
+/// product red as "nothing environmental found" — the safe direction, but a
+/// silently ineffective mechanism. Flushing and waiting for a stable size makes
+/// the read deterministic enough to bind a verdict to.
+fn read_log_settled(path: &Path) -> String {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    let size = || std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut last = size();
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = size();
+        if now > 0 && now == last {
+            break;
+        }
+        last = now;
+    }
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
+///
+/// This is `run_check_with_timeout`'s retry loop (validate.sh:2119) moved to DAG
+/// granularity. A host FS-permission denial (BPFJailer banner, or a banner-less
+/// `EPERM` leaked to `cc1`/`cmake`/`ld`), a `fwdproxy` egress failure, or a
+/// vendored third-party (DynamoRIO/elfutils) build flake kills a build or test
+/// subprocess for reasons that have nothing to do with the tree under test. Left
+/// alone it masquerades as a product failure; the whole point of this loop is
+/// that it must not.
+///
+/// Three properties are preserved from the bash, deliberately:
+///
+/// * **The classification reads the FAILING NODE's own output**, extracted from
+///   the runner's `[tag] ----- detail -----` region, not a whole-log tail. A jail
+///   banner printed by a different concurrent node cannot excuse a real red.
+/// * **Retries are bounded** (`VALIDATE_ENV_BLOCK_RETRIES`, default 2 => 3
+///   attempts). A *persistent* breakage — a bad Reverie pin, a genuinely missing
+///   header — fails every attempt and still leaves the run RED. It is never
+///   silently greened, only relabelled from "test failure" to "environmental".
+/// * **Nodes that never ran because the blocked node failed are retried with
+///   it.** In the bash the retry happened INSIDE the gate, so downstream never
+///   got skipped; reproducing that here means the retry DAG carries the skipped
+///   and aborted nodes too, with dependencies restricted to the retry set.
+fn run_lane_with_env_retries(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    log_path: &Path,
+) -> LaneResult {
+    let max = validate_runtime::env_block_max_retries();
+    let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
+    let mut by_tag: BTreeMap<String, StepOutcome> =
+        first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
+    let mut skipped = first.skipped.clone();
+    let mut env_retries = 0usize;
+
+    while env_retries < max {
+        let failed: Vec<&StepOutcome> = by_tag.values().filter(|o| !o.ok && !o.aborted).collect();
+        if failed.is_empty() {
+            break;
+        }
+        let log = read_log_settled(log_path);
+        if log.is_empty() {
+            eprintln!(
+                "validate: WARNING: the durable log is unreadable, so {} failed node(s) cannot be \
+                 classified as environmental; NOT retrying (an unclassifiable red stays RED).",
+                failed.len()
+            );
+            break;
+        }
+        let blocked: Vec<(String, &'static str)> = failed
+            .iter()
+            .filter_map(|o| {
+                validate_runtime::extract_node_detail(&log, &o.tag)
+                    .and_then(|d| validate_runtime::environmental_block_class(&d))
+                    .map(|c| (o.tag.clone(), c))
+            })
+            .collect();
+        if blocked.is_empty() {
+            break;
+        }
+        env_retries += 1;
+        for (tag, class) in &blocked {
+            println!(
+                "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
+                 failure — retrying (attempt {env_retries}/{max})"
+            );
+        }
+        // The retry set: the blocked nodes, plus everything that never ran (or was
+        // aborted) because of them.
+        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
+        keep.extend(skipped.iter().cloned());
+        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
+        let steps: Vec<safe_ci_dag_runner::model::Step> = cfg
+            .steps
+            .iter()
+            .filter(|s| keep.contains(&s.tag()))
+            .map(|s| {
+                let mut s = s.clone();
+                // Dependencies already satisfied by the first pass are dropped;
+                // edges INSIDE the retry set are preserved so a re-run dependency
+                // still gates its dependents.
+                s.deps.retain(|d| keep.contains(d));
+                s
+            })
+            .collect();
+        if steps.is_empty() {
+            break;
+        }
+        let mut retry_cfg = cfg.clone();
+        retry_cfg.description =
+            format!("{} — environmental retry {env_retries}/{max}", cfg.description);
+        retry_cfg.steps = steps;
+        let again =
+            run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        for o in &again.outcomes {
+            if !by_tag.contains_key(&o.tag) {
+                order.push(o.tag.clone());
+            }
+            by_tag.insert(o.tag.clone(), o.clone());
+        }
+        skipped = again.skipped.clone();
+    }
+
+    // Retries exhausted with an environmental block still standing is a RED, but
+    // one whose cause is named. The verdict is unchanged; only its label is.
+    if env_retries == max && by_tag.values().any(|o| !o.ok && !o.aborted) {
+        let log = read_log_settled(log_path);
+        for o in by_tag.values().filter(|o| !o.ok && !o.aborted) {
+            if let Some(class) = validate_runtime::extract_node_detail(&log, &o.tag)
+                .and_then(|d| validate_runtime::environmental_block_class(&d))
+            {
+                println!(
+                    "🧱 {}: ENVIRONMENTAL BLOCK ({class}) after {} attempt(s) — validate could not \
+                     complete this node; this is NOT a test failure, and it is still a RED.",
+                    o.tag,
+                    max + 1
+                );
+            }
+        }
+    }
+
+    let outcomes: Vec<StepOutcome> =
+        order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
+    let ok = outcomes.iter().all(|o| o.ok || o.aborted);
+    LaneResult { outcomes, skipped, ok, env_retries }
+}
+
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
 /// own `step_failure_reason` produces these strings, so this reads its typed
 /// classification rather than re-deriving one.
@@ -2326,6 +2499,21 @@ struct LedgerCtx {
     commit_anchored: bool,
     tree_dirty: bool,
     dag_jobs: i64,
+    /// Peak number of OTHER top-level validates that were provably live AND
+    /// burning CPU beside this run. `None` means UNKNOWN (never 0-by-default): a
+    /// bare run with no registry is not proven exclusive.
+    concurrent_validates: Option<i64>,
+    /// How that number was established, so a reader never has to guess whether a
+    /// `0` is "measured exclusive" or "nobody looked".
+    concurrency_proof: Option<&'static str>,
+    /// `INT` / `TERM` / `HUP` when an operator stopped the run.
+    interruption: Option<String>,
+    /// Whole-run CPU seconds (self + reaped children), the same pair printed in
+    /// the summary line.
+    cpu_user: f64,
+    cpu_sys: f64,
+    /// Retry ROUNDS spent on environmental blocks; `0` for a clean first pass.
+    env_block_retries: i64,
 }
 
 /// Write one JSONL ledger record.
@@ -2621,6 +2809,13 @@ struct RunSummary {
     jobs: Option<i64>,
     log: Option<PathBuf>,
     ledger: Option<PathBuf>,
+    /// `(wall, user, sys)` seconds for the WHOLE invocation, measured once at the
+    /// single cleanup point so the ledger row and the printed summary carry
+    /// byte-identical numbers (validate.sh:1855 made the same guarantee, and for
+    /// the same reason: two independently-sampled "totals" that disagree make the
+    /// receipt unciteable). `None` on a path that stopped before cleanup; `main`
+    /// then measures live rather than printing nothing.
+    cpu_wall: Option<(f64, f64, f64)>,
 }
 
 impl RunSummary {
@@ -2638,6 +2833,7 @@ impl RunSummary {
             jobs: None,
             log: None,
             ledger: None,
+            cpu_wall: None,
         }
     }
     /// Admission control declined. `what` names the gate, `why` the reason.
@@ -2649,7 +2845,10 @@ impl RunSummary {
 }
 
 /// The ONE summary renderer. Called from exactly one place.
-fn print_run_summary(s: &RunSummary) {
+///
+/// `started` is the process's own start instant, used only when a path stopped
+/// before cleanup could take the authoritative measurement.
+fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     if s.verdict == Verdict::Help {
         return;
     }
@@ -2686,16 +2885,33 @@ fn print_run_summary(s: &RunSummary) {
     if let Some(p) = &s.ledger {
         println!("   ledger: {}", p.display());
     }
+    // ALWAYS printed, on success, failure, refusal, timeout and interruption
+    // alike (validate.sh:1751). Wall alone cannot tell a busy run from a wedged
+    // one; CPU (user+sys, this process plus every child it reaped) against wall
+    // can, and that ratio is how the 53-minute pre-gate wedge was identified on
+    // 2026-08-07 — the wall clock said "still going", the ratio said "waiting".
+    let (wall, user, sys) = s
+        .cpu_wall
+        .unwrap_or_else(|| {
+            let (u, sy) = validate_runtime::process_cpu_seconds();
+            (started.elapsed().as_secs_f64(), u, sy)
+        });
+    let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    println!(
+        "   {}",
+        validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
+    );
 }
 
 fn main() -> ExitCode {
     rust_script_prelude::init();
     install_stop_handlers();
+    let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
     let summary = run(&mut durable);
-    print_run_summary(&summary);
+    print_run_summary(&summary, started);
     if let Some(d) = durable.take() {
         d.finish();
     }
@@ -2753,12 +2969,108 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
     let parent = find_parent(&root);
+    // The profile name is needed by the admission gates below, which run BEFORE
+    // the plan exists. It is derived exactly as `build_plan` derives it, so the
+    // lock record and the ledger row can never disagree about what was running.
+    let profile_name =
+        args.focused.as_ref().map(|f| f.profile()).unwrap_or_else(|| level_name.clone());
+
+    // ---- re-entrancy (validate.sh:460) ---------------------------------------
+    //
+    // `ci/dag/portable.json`'s `test.strict_compat` node runs
+    // `./validate.sh --portable-strict-compat-only`, so re-entry is a DESIGNED
+    // path. What must never happen is a full driver inside a full driver: it pays
+    // the whole preamble twice, appends a SECOND ledger row, and can publish a
+    // SECOND receipt for one logical run. A nested FOCUSED invocation is a
+    // PAYLOAD — the outer run owns the ledger, receipt, cache, lock and
+    // concurrency accounting; a nested non-focused level is refused outright.
+    let nesting = validate_runtime::detect_nesting();
+    if let Some(stale) = nesting.stale_marker {
+        eprintln!(
+            "validate: ignoring a STALE {} marker naming pid {stale}: that pid is not an ancestor \
+             of this process, so this is a TOP-LEVEL run. (Treating the bare env var as proof of \
+             nesting would refuse every legitimate full run in a shell that once exported it.)",
+            validate_runtime::ACTIVE_ENV
+        );
+    }
+    // Claim the marker for our own children AFTER reading it, so diagnostics name
+    // the run we are nested inside rather than ourselves.
+    validate_runtime::claim_active_marker();
+    if nesting.nested && args.focused.is_none() {
+        let outer = nesting.outer_pid.unwrap_or(-1);
+        eprintln!(
+            "validate: refusing to re-enter a full validation level from inside validate (outer \
+             pid {outer}); nested invocations may only run a focused mode."
+        );
+        return RunSummary::refused(
+            2,
+            &profile_name,
+            "the re-entrancy guard",
+            vec![
+                format!("this process is a descendant of validate pid {outer}, which is already driving a run"),
+                "a full suite inside a full suite would pay the whole preamble twice, append a \
+                 SECOND ledger row, and could publish a SECOND receipt for one logical run"
+                    .into(),
+                "nested invocations may run ONE focused mode as a payload; the outer run owns the \
+                 ledger, receipt, cache and concurrency accounting"
+                    .into(),
+            ],
+        );
+    }
+
+    // ---- stop-path test seam (validate.sh:1899) ------------------------------
+    //
+    // Placed before every admission gate on purpose: this fixture exists to
+    // exercise the REAL signal traps and the REAL ledger writer without starting
+    // a product build, so making it depend on the checkout's cleanliness or
+    // freshness would turn `scripts/test_validate_stop_paths.py` into a test of
+    // this tree's state instead of the stop paths. It deliberately does NOT take
+    // the invocation lock: it never runs a gate, and a leaked fixture must never
+    // wedge a real run.
+    if validate_runtime::stop_test_requested() {
+        return stop_test_seam(&root, &profile_name, parent.as_deref());
+    }
+
+    // ---- concurrent invocation (validate.sh:492) -----------------------------
+    //
+    // A second validate in the SAME checkout is unambiguously wrong: both drive
+    // one `target/` tree and one ledger. Refuse LOUDLY and IMMEDIATELY, naming
+    // the holder — never wait, and never let two interleave. Scope is
+    // PER-CHECKOUT; box-wide exclusivity belongs to `ci-hub validate-lock`, and
+    // duplicating it here would give the fleet two admission controllers that can
+    // disagree. `--show-plan` executes nothing, so it is not a second driver and
+    // does not contend.
+    let _invocation_lock;
+    if !nesting.nested && !args.show_plan {
+        match validate_runtime::acquire_invocation_lock(&root, &profile_name, &git_sha()) {
+            validate_runtime::LockOutcome::Acquired(l) => _invocation_lock = Some(l),
+            validate_runtime::LockOutcome::Busy(why) => {
+                eprintln!("validate: REFUSED — {}", why[0]);
+                for line in why.iter().skip(1) {
+                    eprintln!("  {line}");
+                }
+                return RunSummary::refused(3, &profile_name, "the per-checkout invocation lock", why);
+            }
+            validate_runtime::LockOutcome::Unavailable(e) => {
+                // Fail OPEN here, deliberately: refusing every run because a lock
+                // file could not be created would be a larger outage than the
+                // concurrency it guards, and the condition is stated rather than
+                // swallowed.
+                eprintln!("validate: WARNING: per-checkout invocation lock unavailable ({e}); proceeding UNGUARDED.");
+                _invocation_lock = None;
+            }
+        }
+    } else {
+        _invocation_lock = None;
+    }
 
     // Dirty-tree gate, BEFORE any state is created, so a refusal leaves nothing
     // behind. A result validated against uncommitted changes describes a tree
     // that exists nowhere in history and cannot be reproduced or compared.
+    // Skipped for a nested payload: the outer run already made this judgement
+    // about the same checkout, and a second answer could only disagree.
     let wt_dirty = worktree_dirty();
-    if wt_dirty && !args.run_on_dirty_tree {
+    if !nesting.nested && wt_dirty && !args.run_on_dirty_tree {
         eprintln!("validate: refusing to run on a dirty working tree.");
         eprintln!("  HEAD {} has uncommitted working-tree changes, so a record anchored to it", git_sha());
         eprintln!("  would describe a tree that exists nowhere in history. Commit (preferred), or");
@@ -2780,8 +3092,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Rebase-freshness gate. Mechanically enforced, not advisory.
-    match rebase_freshness(args.run_on_dirty_tree) {
+    // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
+    // payload inherits the outer run's verdict on the very same checkout; it also
+    // must not spend a network round trip inside a budgeted DAG node.
+    match rebase_freshness(args.run_on_dirty_tree || nesting.nested) {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
@@ -2924,7 +3238,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         host: &host,
         toolchain: &toolchain,
     };
-    if !args.ignore_cache && plan.cacheable && !wt_dirty && !tree_dirty() && plan.selection_mode == "full" {
+    // A nested payload never consults the cache: the outer run already did, and a
+    // payload that "hit" would report a green for a lane it never ran.
+    if !nesting.nested
+        && !args.ignore_cache
+        && plan.cacheable
+        && !wt_dirty
+        && !tree_dirty()
+        && plan.selection_mode == "full"
+    {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
             println!("# ============================================================");
             println!("# validate CACHE HIT for tree {tree}");
@@ -3015,6 +3337,45 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // without borrowing the live tee handle.
     let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
 
+    // ---- box-wide concurrency observation (validate.sh:1499) -----------------
+    //
+    // PORTED CORRECTED, NOT VERBATIM. The bash counted process-group EXISTENCE
+    // (`ps -eo pgid=,args=` matching `validate\.sh`), so a parked stop-test
+    // fixture counted identically to a 22-core validate. That is not a modelling
+    // nicety: measured on this box 2026-08-07 the six live `validate.sh` process
+    // groups were ALL orphaned fixtures at CPU/wall ~0.00, and the shipped ledger
+    // carries `concurrent_validates` up to 20 as a result.
+    //
+    // Here a peer must clear two observable bars: it REGISTERED itself as a
+    // top-level driver (so nested payloads and fixtures are excluded by
+    // construction, not by filtering), its registration flock is still held (so
+    // liveness is the kernel's answer, not a pid guess), and its process tree
+    // BURNED CPU between two samples. A running peak is kept for the whole run
+    // because a point-in-time probe misses a peer that starts and ends in the
+    // middle.
+    let registry = validate_runtime::registry_dir(parent.as_deref());
+    let run_record = if nesting.nested {
+        None
+    } else {
+        validate_runtime::register_run(&registry, &plan.profile, &root)
+    };
+    let monitor = if nesting.nested {
+        None
+    } else {
+        Some(validate_runtime::ConcurrencyMonitor::start(
+            registry.clone(),
+            std::time::Duration::from_secs(2),
+        ))
+    };
+    if nesting.nested {
+        println!(
+            "Nested validate (payload of outer pid {}): focused mode {} only; the outer run owns \
+             the ledger, receipt, cache, invocation lock and concurrency accounting.",
+            nesting.outer_pid.unwrap_or(-1),
+            plan.profile
+        );
+    }
+
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
     let started_epoch = epoch_now();
@@ -3050,18 +3411,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut ok = true;
+    let mut env_retries = 0usize;
 
-    let r = run_dag_boxed_ordered(&plan.cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    let mut lane = |cfg: &DagConfig| -> LaneResult {
+        run_lane_with_env_retries(cfg, jobs, keep_going, verbosity, cgroups.clone(), &log_path)
+    };
+
+    let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
+    env_retries += r.env_retries;
 
     if let Some(second) = &plan.second {
         if ok || keep_going {
-            let r2 = run_dag_boxed_ordered(second, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+            let r2 = lane(second);
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
+            env_retries += r2.env_retries;
         } else {
             eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
         }
