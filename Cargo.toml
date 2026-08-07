@@ -41,3 +41,27 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# LOCAL-ONLY BUILD OVERRIDE -- DO NOT COMMIT.
+# Redirects every reverie crate to the coordinated reverie #377 child checkout
+# (feat/e9patch-hybridptrace-lifecycle-owner @ 4a42194) so the ptrace-free
+# e9patch backend builds against the unlanded HybridPtrace lifecycle owner and
+# the `install_tool`/`run_direct_with_preload`/`COORDINATOR_ENV` API. The whole
+# reverie surface is repointed together to keep a single `reverie-core` in the
+# graph. The committed manifests stay pinned at the current workspace reverie
+# rev; the coordinator bumps every reverie pin + parent gitlink to the landed
+# #377 SHA when the patching cluster lands.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "../reverie/reverie" }
+reverie-syscalls = { path = "../reverie/reverie-syscalls" }
+reverie-memory = { path = "../reverie/reverie-memory" }
+reverie-rpc-transport = { path = "../reverie/reverie-rpc-transport" }
+reverie-process = { path = "../reverie/reverie-process" }
+reverie-util = { path = "../reverie/reverie-util" }
+reverie-ptrace = { path = "../reverie/reverie-ptrace" }
+reverie-preload = { path = "../reverie/reverie-preload" }
+reverie-e9patch = { path = "../reverie/reverie-e9patch" }
+reverie-dbi = { path = "../reverie/reverie-dbi" }
+reverie-kvm = { path = "../reverie/reverie-kvm" }
+reverie-liteinst = { path = "../reverie/reverie-liteinst" }
+reverie-sabre = { path = "../reverie/experimental/reverie-sabre" }
