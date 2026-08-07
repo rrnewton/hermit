@@ -198,6 +198,7 @@ use crate::resources::ResourceID;
 use crate::syscall_classification::SyscallClassification;
 use crate::syscall_classification::classify_syscall;
 use crate::syscall_classification::is_credential_identity_noop_syscall;
+use crate::syscall_classification::is_ownership_change_noop_syscall;
 use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_host_security_identity_probe_syscall;
@@ -1766,6 +1767,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // across --verify and record/replay.
             SyscallClassification::Determinized
                 if is_credential_identity_noop_syscall(call.number()) =>
+            {
+                Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#1849): The file-ownership mutation family
+            // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
+            // identity that the credential query (#1549) and credential set
+            // (#787) families already implement. A real root process's chown
+            // succeeds for any uid, so 0 is the value the virtual identity must
+            // observe; forwarding instead returned the errno of whatever host
+            // identity the backend happened to run under (EPERM with no user
+            // namespace, EINVAL for an unmapped uid inside a one-uid map, and
+            // backend-dependent for in-process backends). Never forwarded to the
+            // host, so it is backend-independent and bitwise-identical across
+            // --verify and record/replay. Detcore does not model per-file
+            // ownership, so this is not observable through a later stat; see
+            // is_ownership_change_noop_syscall for the semantic boundary.
+            SyscallClassification::Determinized
+                if is_ownership_change_noop_syscall(call.number()) =>
             {
                 Ok(0)
             }
