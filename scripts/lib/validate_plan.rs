@@ -466,13 +466,112 @@ pub fn sanitize_job(label: &str) -> String {
 
 /// Assemble a `DagConfig` from steps, applying the profile-level CPU-time default
 /// that the shipped lane JSON does not carry.
-pub fn config_from(steps: Vec<Step>, description: &str) -> DagConfig {
-    let mut cfg = DagConfig { steps, ..Default::default() };
+/// Load a lane's FULL `DagConfig` -- not just its steps.
+///
+/// `lane_nodes` returns steps because the fusion path rewrites their tags, but a
+/// DAG file is more than a bag of steps: `resource_caps`, `default_step_timeout`,
+/// `mem_cap_factor`, `mem_cap_floor_bytes` and `outer_mem_safety_factor` are all
+/// top-level, and every one of them silently reverts to `DagConfig::default()` if
+/// the caller rebuilds the config instead of carrying it.
+pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
+    let path = root.join("ci").join("dag").join(format!("{lane}.json"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))
+}
+
+/// Assemble a `DagConfig`, CARRYING every top-level field from `base`.
+///
+/// # Why this takes a base at all
+///
+/// It used to be `DagConfig { steps, ..Default::default() }`, which loaded a DAG
+/// file, kept its steps, and threw its configuration away. That is not a
+/// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
+/// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 1,
+/// manifest_guest: 4}`; dropping them left `res_free` evaluating
+/// `unwrap_or(0) >= 1` for the 16 steps demanding `hermit_guest` and the 13
+/// demanding `manifest_guest`, so none could ever be admitted. The scheduler's
+/// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with
+/// work neither runnable nor accounted it slept at 50 ms forever -- no error, no
+/// exit, 21 of ~58 nodes done.
+///
+/// `resource_caps` failed LOUDLY (a visible hang). The quieter one matters more:
+/// `default_step_timeout` is 600 s in portable and 120 s in privileged, and
+/// reverted to `DEFAULT_STEP_TIMEOUT` (1800 s) -- every step's wall cap loosened
+/// 3x and 15x respectively, with nothing to see. `mem_cap_factor`,
+/// `mem_cap_floor_bytes` and `outer_mem_safety_factor` happen to equal their
+/// defaults today, so they would have broken the first time anyone tuned them.
+///
+/// Hence: carry the base wholesale, and let [`assert_config_carried`] prove it.
+pub fn config_from_base(base: &DagConfig, steps: Vec<Step>, description: &str) -> DagConfig {
+    let mut cfg = base.clone();
+    cfg.steps = steps;
     cfg.description = description.to_string();
-    // Close the measured 0/55 cpu_timeout gap for shipped lane nodes. A node that
-    // declares its own cpu_timeout still wins (effective_cpu_timeout).
+    // The one DELIBERATE divergence: shipped lane nodes declare cpu_timeout on
+    // 0 of 55, so supply a load-immune default. A node's own cpu_timeout still
+    // wins via effective_cpu_timeout. Recorded here so the audit can exempt it.
     cfg.default_step_cpu_timeout = LANE_DEFAULT_CPU_TIMEOUT_S;
     cfg
+}
+
+/// Synthesised plans that have no source DAG file (compat, quick, envelope, ...).
+pub fn config_from(steps: Vec<Step>, description: &str) -> DagConfig {
+    config_from_base(&DagConfig::default(), steps, description)
+}
+
+/// Field-by-field proof that `derived` carried `base`'s configuration.
+///
+/// Enumerated deliberately rather than derived from a `PartialEq`: a new
+/// `DagConfig` field must force a decision here instead of silently defaulting,
+/// which is the exact failure this function exists to prevent. `steps` and
+/// `description` are expected to differ; `default_step_cpu_timeout` is the one
+/// documented divergence above.
+pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<(), String> {
+    let mut bad: Vec<String> = Vec::new();
+    if base.resource_caps != derived.resource_caps {
+        bad.push(format!("resource_caps {:?} != {:?}", base.resource_caps, derived.resource_caps));
+    }
+    if base.mem_cap_factor != derived.mem_cap_factor {
+        bad.push(format!("mem_cap_factor {} != {}", base.mem_cap_factor, derived.mem_cap_factor));
+    }
+    if base.mem_cap_floor_bytes != derived.mem_cap_floor_bytes {
+        bad.push(format!("mem_cap_floor_bytes {} != {}", base.mem_cap_floor_bytes, derived.mem_cap_floor_bytes));
+    }
+    if base.outer_mem_safety_factor != derived.outer_mem_safety_factor {
+        bad.push(format!("outer_mem_safety_factor {} != {}", base.outer_mem_safety_factor, derived.outer_mem_safety_factor));
+    }
+    if base.default_step_timeout != derived.default_step_timeout {
+        bad.push(format!("default_step_timeout {} != {}", base.default_step_timeout, derived.default_step_timeout));
+    }
+    if base.default_jobs_flag != derived.default_jobs_flag {
+        bad.push(format!("default_jobs_flag {:?} != {:?}", base.default_jobs_flag, derived.default_jobs_flag));
+    }
+    if base.default_step_mem_cap_bytes != derived.default_step_mem_cap_bytes {
+        bad.push(format!("default_step_mem_cap_bytes {:?} != {:?}", base.default_step_mem_cap_bytes, derived.default_step_mem_cap_bytes));
+    }
+    if base.default_step_cpu_count != derived.default_step_cpu_count {
+        bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
+    }
+    if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
+}
+
+/// FAIL CLOSED on capacity that can never be granted.
+///
+/// A step demanding a resource the config does not cap is unschedulable FOREVER,
+/// and the scheduler expresses that as an infinite 50 ms sleep rather than an
+/// error. Refusing up front converts a silent 14-minute hang into a named
+/// refusal before a single node runs.
+pub fn ungrantable_resources(cfg: &DagConfig) -> Vec<String> {
+    let mut bad = Vec::new();
+    for s in &cfg.steps {
+        for (r, n) in &s.hint.resources {
+            let cap = cfg.resource_caps.get(r).copied().unwrap_or(0);
+            if cap < *n {
+                bad.push(format!("{} demands {r}={n} but resource_caps grants {cap}", s.tag()));
+            }
+        }
+    }
+    bad
 }
 
 /// Fail-closed audit: every node in a plan must declare a wall timeout, a CPU
