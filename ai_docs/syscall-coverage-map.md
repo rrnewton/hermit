@@ -87,7 +87,7 @@ it.
 | --- | --- | --- |
 | Randomness and CPU | `getrandom`, `getcpu`, affinity calls | Random bytes and CPU/node output are synthesized. Affinity is only a CPU0 facade; the setter does not retain requested state. |
 | Time and sleep | four clock/time queries, `alarm`, `pause`, `nanosleep`, `clock_nanosleep`, `sched_yield` | Queries use logical time and basic waits use the scheduler. Clock IDs/flags and opt-out modes make sleep handling partial. |
-| Threads/processes | clone family, `futex`, `wait4`, exits, exec family, `setsid` | Thread scheduling and blocking are coordinated, but PIDs/TIDs are native. Precise futex handles only WAIT/WAKE bitset families; other operations panic. |
+| Threads/processes | clone family, `futex`, `wait4`, exits, exec family, `getpgid`, `getpgrp`, `setsid` | Thread scheduling and blocking are coordinated, and the root guest establishes a positive namespace-visible process group before it executes. PIDs/TIDs remain native. Precise futex handles only WAIT/WAKE bitset families; other operations panic. |
 | Files and metadata | open/read/write/close, stat family, directory reads, timestamp calls, FD duplication | Resource and FD models cover common paths. Filesystem contents/errors remain external; metadata replaces only selected fields; many namespace mutations and I/O variants are missing. |
 | Descriptor objects | socket creation, pipes, eventfd/signalfd/timerfd/memfd/userfaultfd creation | Creation and FD flags/types are tracked. Most later control operations are not modeled, so `close_range`, timer arming, ioctl, and many descriptor families can desynchronize state. |
 | Polling/network | `poll`, `epoll_wait`, accept/connect/recvfrom/bind | Internal blocking is converted to deterministic polling where implemented. Network content is external, `epoll_pwait` forwards, and common sibling APIs are missing. |
@@ -299,7 +299,7 @@ header.
 | 108 | `getegid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 109 | `setpgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 110 | `getppid` | MISSING | none | none | Native parent PID is exposed. |
-| 111 | `getpgrp` | MISSING | none | none | No Detcore-specific release coverage. |
+| 111 | `getpgrp` | DETERMINIZED | always | partial | Queries kernel process-group state after the root guest establishes a positive namespace-visible group; non-positive results are rejected. |
 | 112 | `setsid` | DETERMINIZED | always | partial | Host call plus daemon lifecycle tracking; native session/PID values remain. |
 | 113 | `setreuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 114 | `setregid` | MISSING | none | none | No Detcore-specific release coverage. |
@@ -309,7 +309,7 @@ header.
 | 118 | `getresuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 119 | `setresgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 120 | `getresgid` | MISSING | none | none | No Detcore-specific release coverage. |
-| 121 | `getpgid` | MISSING | none | none | No Detcore-specific release coverage. |
+| 121 | `getpgid` | DETERMINIZED | always | partial | Queries kernel process-group state after the root guest establishes a positive namespace-visible group; explicit PID lookup and Linux errors remain kernel-provided. |
 | 122 | `setfsuid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 123 | `setfsgid` | MISSING | none | none | No Detcore-specific release coverage. |
 | 124 | `getsid` | MISSING | none | none | No Detcore-specific release coverage. |
