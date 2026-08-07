@@ -18,7 +18,7 @@ L1 (`hermit run --strict`):
 | Backend | Passing pairs | Parity vs ptrace |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
-| DBT | 26/28 | 93% |
+| DBT | 27/28 | 96% |
 | KVM | 23/28 | 82% |
 
 L2 (`hermit run --strict --verify`):
@@ -39,13 +39,12 @@ column is therefore capped at `guest`, never `detlog`. See the L2 subsection
 below for the two contracts that hold at L1 but not L2.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 27/28 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBT path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
-file-mutation contracts, plus deterministic memory-advice and
-memory-layout behavior. It is an explicit gap on the file-metadata row (see
-below). It also deterministically refuses io_uring and listmount,
+file-mutation and file-metadata contracts, plus deterministic memory-advice and
+memory-layout behavior. It also deterministically refuses io_uring and listmount,
 verifies that epoll remains available as a fallback, and refuses process-memory
 reads and writes with deterministic `EPERM`. The wait contract covers deterministic
 `wait4`/`waitid` results, at least one SIGCHLD handler delivery (standard signals
@@ -69,14 +68,11 @@ links, reads, and removes temporary files without exposing backend-specific meta
 The file-metadata row checks positional I/O, ownership and access operations,
 hard and symbolic links, path/fd/symlink extended attributes, a shared file
 mapping, readahead, and range synchronization. It permits documented filesystem
-policy failures for extended attributes but not an unimplemented syscall. DBT is
-an explicit gap on this row: it forwards `fchown` to the real kernel, so once
-credential queries are determinized to virtual-root identity `0` (PR #1549) the
-guest's `fchown(fd, 0, 0)` becomes an unprivileged chown-to-root and returns
-`EPERM`, while ptrace remaps it through the user namespace. `fchown` is not
-correctly implemented under DBT, and asserting against a half-implemented syscall
-could pass by accident and prove nothing, so the DBT cell is a declared gap until
-DBT determinizes `fchown`.
+policy failures for extended attributes but not an unimplemented syscall. DBT
+keeps the guest-visible virtual-root identity `0` and translates ownership calls
+to the launcher's effective uid/gid only at the injected-kernel boundary. This
+matches ptrace's `CLONE_NEWUSER` root mapping without exposing host credentials
+to the guest.
 The io_uring fallback row requires all three io_uring entry points to return
 deterministic `ENOSYS`, then checks that `epoll_create1` still succeeds.
 The listmount row requires deterministic `ENOSYS` even when the host kernel
@@ -117,7 +113,7 @@ is not reached.
 | `exit_status` | pass / detlog | pass / detlog | pass / guest |
 | `file_read` | pass / detlog | pass / detlog | pass / guest |
 | `file_mutation` | pass / detlog | pass / detlog | pass / guest |
-| `file_metadata` | pass / detlog | gap / gap | pass / guest |
+| `file_metadata` | pass / detlog | pass / detlog | pass / guest |
 | `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
 | `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
 | `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
@@ -202,24 +198,24 @@ it cannot — the guest prints absolute addresses (`multiple %p %p %p`), which a
 translator necessarily shifts.
 
 Do not add a cross-backend fixture that asserts anonymous-mmap addresses, either
-absolute **or relative**. It is unreachable for DBI, and the reason is
+absolute **or relative**. It is unreachable for DBT, and the reason is
 structural rather than a bug to fix:
 
 * DynamoRIO's runtime makes the guest-visible address space **185 VMAs instead
   of 25**, which changes where the kernel's top-down allocator puts the
   **guest's own** mappings.
 * This is *not* translator allocations interleaving with the guest's. Measured:
-  under DBI four successive anonymous mmaps of 1+2+3+4 pages occupy a span of
+  under DBT four successive anonymous mmaps of 1+2+3+4 pages occupy a span of
   **exactly the 10 pages requested, coalesced into one VMA, with zero DynamoRIO
   allocations inside it**. The ptrace arm needs 14 pages for the same 10,
-  because of glibc loader slack. DBI packs *tighter*, not looser.
+  because of glibc loader slack. DBT packs *tighter*, not looser.
 * It is therefore also not a separability problem. DR's allocations are
   separable by provenance (`dr_memory_is_dr_internal`, `dr_query_memory_ex`);
   perfect separability would not move the guest's own mappings by one byte.
   Attribution and placement are different properties.
 * There is no stable ptrace layout to match in any case. Varying the guest's
   allocation prefix by 0–8 pages produces **nine distinct ptrace layouts and one
-  DBI layout**, and at a 7-page prefix the two backends are byte-identical.
+  DBT layout**, and at a 7-page prefix the two backends are byte-identical.
   Native itself shows a 1–2% tail on the same measurement.
 
 What **is** a parity contract, and does hold on every backend measured: pointer

@@ -394,16 +394,6 @@ def case_catalog(
 # New cases are green contracts by default.  Only stable, diagnosed exceptions
 # belong here; live pass/fail evidence is written to the outer scorecard.
 L1_GAPS = {
-    ("dbt", "file_metadata"): (
-        "PR #1549 determinizes credential queries (getuid/getgid/getresuid/"
-        "getresgid) to virtual-root identity 0; DBT forwards fchown(fd,0,0) to "
-        "the real kernel with no CLONE_NEWUSER uid map, so the guest performs an "
-        "unprivileged chown-to-root and gets EPERM, whereas ptrace remaps it "
-        "through the user namespace. fchown is not correctly implemented under "
-        "DBT, and an assertion against a half-implemented syscall could pass by "
-        "accident and prove nothing; declared a gap until DBT determinizes "
-        "fchown (see the determinize_fchown_under_dbt TODO)"
-    ),
     ("dbt", "pthread_lifecycle"): (
         "Portable release DynamoRIO can stall or exit during native pthread "
         "startup before Detcore readiness"
@@ -414,11 +404,6 @@ L1_GAPS = {
     ),
 }
 L2_GAPS = {
-    ("dbt", "file_metadata"): (
-        "Inherited from the L1 DBT file_metadata gap: the fchown EPERM aborts "
-        "the guest before any --verify double-run, so no L2 determinism witness "
-        "can be produced"
-    ),
     ("dbt", "exit_status"): (
         "hermit --verify runs the DBT guest only once when the first run exits "
         "non-zero (--verify-allow both), so the double-run DETLOG comparison "
