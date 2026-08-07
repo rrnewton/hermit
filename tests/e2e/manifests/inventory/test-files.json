@@ -1736,6 +1736,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/determinism-stress/pid_tid_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true)",
+      "why": "tests/e2e/determinism-stress/pid_tid_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (verify/ptrace ci=true): Contract fixture pinning pid/tid virtualization identity on the paths determinism-stress-c/pid-tid does not cover -- the /proc/self/stat pid text, the pid returned by wait(), a fork/exec tree spanning execve, getpgid, and a control-flow branch on a pid comparison so a divergence changes output shape rather than a digit."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/determinism-stress/pipe_chain.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false)",
       "why": "tests/e2e/determinism-stress/pipe_chain.c is owned by ci/test_harness.sh via tests/e2e/manifests/determinism-stress-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

@@ -1885,6 +1885,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Wait4(s) => self.handle_wait4(guest, s).await,
                 Syscall::Waitid(s) => self.handle_waitid(guest, s).await,
 
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                Syscall::Getpgid(s) => self.handle_getpgid(guest, s).await,
+                Syscall::Getpgrp(s) => self.handle_getpgrp(guest, s).await,
                 Syscall::Setsid(s) => self.handle_setsid(guest, s).await,
                 Syscall::Gettimeofday(s) => {
                     if virtualize_time {
