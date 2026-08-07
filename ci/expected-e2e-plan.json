@@ -569,6 +569,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pid-tid-identity"
+    },
+    {
+      "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
