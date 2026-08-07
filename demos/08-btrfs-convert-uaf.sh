@@ -95,7 +95,18 @@ fi
 if [ -n "${DEMO08_CRASH_SEED:-}" ]; then
   CRASH_SEED="$DEMO08_CRASH_SEED"
 elif [ -r "$ASSETS/.crash-seed" ]; then
-  CRASH_SEED="$(cat "$ASSETS/.crash-seed")"
+  # Format is `<seed> <fixture-sha256>`: a crashing schedule is a property of the exact
+  # fixture binary, so the seed is refused when it was calibrated against a different one
+  # rather than silently used (see scripts/prepare-demo08-assets.sh and issue #1877).
+  CRASH_SEED="$(cut -d' ' -f1 <"$ASSETS/.crash-seed")"
+  SEED_FIXTURE="$(cut -s -d' ' -f2 <"$ASSETS/.crash-seed")"
+  HAVE_FIXTURE="$(sha256sum "$ASSETS/buggy/btrfs-convert" | cut -d' ' -f1)"
+  if [ -n "$SEED_FIXTURE" ] && [ "$SEED_FIXTURE" != "$HAVE_FIXTURE" ]; then
+    echo "error: Demo 8 crash seed $CRASH_SEED was calibrated for fixture" \
+      "${SEED_FIXTURE:0:12}, but the fixture present is ${HAVE_FIXTURE:0:12}." \
+      "Re-run scripts/prepare-demo08-assets.sh to recalibrate." >&2
+    exit 2
+  fi
 else
   # Backwards-compatible seed for the original hand-built checked-in demo
   # fixture. Nightly-generated fixtures persist their calibrated seed above.
