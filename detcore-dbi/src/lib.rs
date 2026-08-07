@@ -371,6 +371,8 @@ struct Runtime {
     global: GlobalState,
     tool: OnceLock<Detcore>,
     next_child_ordinal: AtomicU64,
+    host_uid: u32,
+    host_gid: u32,
 }
 
 struct ThreadRuntime {
@@ -419,6 +421,7 @@ static TOTAL_BRANCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 static MEMORY_HASH: AtomicU64 = AtomicU64::new(FNV_OFFSET);
+static NATIVE_SYSCALL_INVOKER: OnceLock<SyscallInvoker> = OnceLock::new();
 
 fn current_runtime() -> Arc<Runtime> {
     Arc::clone(
@@ -863,6 +866,12 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
                 global,
                 tool: OnceLock::new(),
                 next_child_ordinal: AtomicU64::new(1),
+                // Ptrace's root-mapped user namespace translates guest uid/gid
+                // zero to the launcher's effective host identity at the kernel
+                // boundary. DBI has no such namespace, so retain the same
+                // mapping explicitly for ownership-changing syscalls.
+                host_uid: unsafe { libc::geteuid() },
+                host_gid: unsafe { libc::getegid() },
             }));
         }
         Arc::clone(slot.as_ref().expect("Detcore DBI runtime was initialized"))
@@ -1266,6 +1275,69 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
+/// Maps Detcore's virtual-root ownership arguments to DBI's host identity.
+///
+/// The shared Detcore policy and the guest continue to observe uid/gid zero.
+/// Only an injected or deferred kernel call is translated, matching the
+/// observable behavior of ptrace's `CLONE_NEWUSER` root mapping. `-1` and
+/// nonzero ownership arguments retain their native pass-through meaning.
+fn translate_virtual_root_ownership(syscall: Syscall, host_uid: u32, host_gid: u32) -> Syscall {
+    let (sysno, mut args) = syscall.into_parts();
+    let (uid, gid) = match sysno {
+        Sysno::chown | Sysno::fchown | Sysno::lchown => (&mut args.arg1, &mut args.arg2),
+        Sysno::fchownat => (&mut args.arg2, &mut args.arg3),
+        _ => return Syscall::from_raw(sysno, args),
+    };
+
+    if *uid == 0 {
+        *uid = host_uid as usize;
+    }
+    if *gid == 0 {
+        *gid = host_gid as usize;
+    }
+    Syscall::from_raw(sysno, args)
+}
+
+/// Applies the virtual-root mapping at `DbiGuest::inject`, immediately before
+/// Reverie's native callback executes the syscall as the application.
+///
+/// # Safety
+///
+/// `args` must point to the six live syscall arguments for this invocation.
+unsafe extern "C" fn invoke_syscall_with_virtual_root_mapping(
+    context: usize,
+    sysnum: i64,
+    args: *const u64,
+) -> i64 {
+    let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
+    let syscall = Syscall::from_raw(
+        Sysno::from(sysnum as i32),
+        SyscallArgs::new(
+            raw_args[0] as usize,
+            raw_args[1] as usize,
+            raw_args[2] as usize,
+            raw_args[3] as usize,
+            raw_args[4] as usize,
+            raw_args[5] as usize,
+        ),
+    );
+    let runtime = current_runtime();
+    let (sysno, mapped) =
+        translate_virtual_root_ownership(syscall, runtime.host_uid, runtime.host_gid).into_parts();
+    let mapped = [
+        mapped.arg0 as u64,
+        mapped.arg1 as u64,
+        mapped.arg2 as u64,
+        mapped.arg3 as u64,
+        mapped.arg4 as u64,
+        mapped.arg5 as u64,
+    ];
+    let invoke_syscall = NATIVE_SYSCALL_INVOKER
+        .get()
+        .expect("DBI native syscall invoker was not registered");
+    unsafe { invoke_syscall(context, sysno.id() as i64, mapped.as_ptr()) }
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -1477,6 +1549,11 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     let getrandom_prng = getrandom_probe
         .filter(|probe| probe.writable < probe.requested)
         .map(|probe| (probe, thread.state.prng.clone()));
+    let registered_invoker = NATIVE_SYSCALL_INVOKER.get_or_init(|| invoke_syscall);
+    assert_eq!(
+        *registered_invoker as usize, invoke_syscall as usize,
+        "DBI native syscall invoker changed during one runtime"
+    );
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1057): Review production fault-safe DBI backtraces.
     // Preserve DynamoRIO's fault containment when Detcore asks DbiGuest for a
@@ -1493,7 +1570,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
         &runtime.global,
         &runtime.config,
         syscall,
-        invoke_syscall,
+        invoke_syscall_with_virtual_root_mapping,
         read_registers,
         write_registers,
         read_memory,
@@ -1519,6 +1596,8 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
             1
         }
         Ok(DbiSyscallOutcome::ExecuteOriginal(syscall)) => {
+            let syscall =
+                translate_virtual_root_ownership(syscall, runtime.host_uid, runtime.host_gid);
             unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
             2
         }
@@ -1569,6 +1648,59 @@ pub unsafe extern "C" fn reverie_dbi_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn syscall_args(sysno: Sysno, values: [usize; 6]) -> SyscallArgs {
+        translate_virtual_root_ownership(
+            Syscall::from_raw(
+                sysno,
+                SyscallArgs::new(
+                    values[0], values[1], values[2], values[3], values[4], values[5],
+                ),
+            ),
+            212_630,
+            100,
+        )
+        .into_parts()
+        .1
+    }
+
+    #[test]
+    fn virtual_root_ownership_maps_at_the_deferred_kernel_boundary() {
+        for sysno in [Sysno::chown, Sysno::fchown, Sysno::lchown] {
+            let args = syscall_args(sysno, [7, 0, 0, 10, 11, 12]);
+            assert_eq!(args.arg0, 7);
+            assert_eq!(args.arg1, 212_630);
+            assert_eq!(args.arg2, 100);
+            assert_eq!([args.arg3, args.arg4, args.arg5], [10, 11, 12]);
+        }
+
+        let args = syscall_args(Sysno::fchownat, [libc::AT_FDCWD as usize, 7, 0, 0, 0, 12]);
+        assert_eq!(args.arg0, libc::AT_FDCWD as usize);
+        assert_eq!(args.arg1, 7);
+        assert_eq!(args.arg2, 212_630);
+        assert_eq!(args.arg3, 100);
+        assert_eq!([args.arg4, args.arg5], [0, 12]);
+    }
+
+    #[test]
+    fn ownership_translation_preserves_sentinels_nonzero_ids_and_other_syscalls() {
+        let unchanged = syscall_args(Sysno::fchown, [7, u32::MAX as usize, 42, 10, 11, 12]);
+        assert_eq!(unchanged.arg1, u32::MAX as usize);
+        assert_eq!(unchanged.arg2, 42);
+
+        let unrelated = syscall_args(Sysno::read, [7, 0, 0, 10, 11, 12]);
+        assert_eq!(
+            [
+                unrelated.arg0,
+                unrelated.arg1,
+                unrelated.arg2,
+                unrelated.arg3,
+                unrelated.arg4,
+                unrelated.arg5,
+            ],
+            [7, 0, 0, 10, 11, 12]
+        );
+    }
 
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {
