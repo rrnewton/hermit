@@ -1473,7 +1473,7 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
 /// Build the execution plan for the selected level/mode.
 fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     let with_proxy = has_cmd("with-proxy");
-    let pre = validate_plan::preflight_nodes(with_proxy);
+    let pre = validate_plan::preflight_nodes(root, with_proxy);
     let gate = "gate.manifest";
 
     // Focused compatibility matrices.
