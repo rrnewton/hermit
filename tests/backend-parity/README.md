@@ -142,7 +142,8 @@ is not reached.
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
-time, queries `ioprio_get` (fixed virtual default 0), and issues a
+time, verifies that `ioprio_set` round-trips through `ioprio_get`, checks that
+both calls reject nonexistent process, group, and user targets with `ESRCH`, and issues a
 `sched_setattr` requesting `SCHED_DEADLINE`. That last call returns `EPERM`
 outside Hermit (real-time scheduling needs privilege), but Detcore accepts it
 as a deterministic no-op because it replaces the Linux scheduler with its own,

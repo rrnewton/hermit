@@ -1254,6 +1254,13 @@ pub struct ThreadState<T> {
     /// Resource limits shared by threads and copied when a new process forks.
     pub(crate) resource_limits: Arc<Mutex<ResourceLimits>>,
 
+    /// Guest-visible I/O priority. Linux I/O scheduling is inert under Detcore,
+    /// but successful `ioprio_set` calls must remain observable to later
+    /// `ioprio_get` calls. Tasks created with `CLONE_IO` share the virtual value;
+    /// every other clone inherits an independent snapshot.
+    #[serde(default)]
+    pub(crate) io_priority: Arc<Mutex<libc::c_int>>,
+
     /// Logical CPU accounting shared by all threads in this process.
     pub(crate) process_cpu_time: Arc<Mutex<ProcessCpuTime>>,
 
@@ -1359,6 +1366,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("file_metadata", &self.file_metadata)
             .field("posix_timers", &self.posix_timers)
             .field("resource_limits", &self.resource_limits)
+            .field("io_priority", &self.io_priority)
             .field("process_cpu_time", &self.process_cpu_time)
             .field("prng", &self.prng)
             .field("chaos_prng", &self.chaos_prng)
@@ -1611,6 +1619,7 @@ impl<T> ThreadState<T> {
             discover_live_file_metadata: cfg.discover_live_file_metadata,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
+            io_priority: Arc::new(Mutex::new(0)),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             parent_process_cpu_time: None,
