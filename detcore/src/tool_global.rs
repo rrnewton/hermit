@@ -165,7 +165,7 @@ impl InodePool {
     fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
-                let new = self.next_inode;
+                let new = DetInode::from_deterministic(self.next_inode);
                 self.next_inode += 1;
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(
