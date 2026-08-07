@@ -669,10 +669,20 @@ EOF
         die "the validate driver must plan the latest-Reverie gate exactly once"
     [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
         die "the validate manifest gate must depend on the latest-Reverie gate"
-    [[ $(grep -Fc 'REVERIE_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate.sh receipt cleanup must fail closed when the pin gate was bypassed"
-    [[ $(grep -Fc '\"reverie_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate.sh receipts must state whether the latest-Reverie gate passed"
+    # The driver must refuse a passing receipt on any path that did not actually
+    # run the pin gate -- a structural "the DAG makes it impossible" argument is
+    # not an observation of the run that is about to be certified.
+    [[ $(grep -Fc 'let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);' \
+        "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "the validate driver must observe the pin gate passing before emitting a receipt"
+    [[ $(grep -Fc 'if exit_code == 0 && !pin_gate_passed {' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "validate receipt production must fail closed when the pin gate was bypassed"
+    [[ $(grep -Fc 'const PIN_GATE_TAG: &str = "pre.reverie_pin";' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "the validate pin-gate tag must be single-sourced"
+    [[ $(grep -Fc '"reverie_pin_current": ctx.reverie_pin_current,' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "validate receipts must state whether the latest-Reverie gate passed"
+    [[ $(grep -Fc 'reverie_pin_current: pin_gate_passed,' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "the recorded latest-Reverie state must come from the OBSERVED gate outcome"
 
     local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
     [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
