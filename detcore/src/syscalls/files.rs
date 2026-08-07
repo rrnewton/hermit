@@ -1386,6 +1386,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let canonical_request = len != 0
             && checked_page_aligned_len(len).is_some()
             && flags.contains(MapFlags::MAP_ANONYMOUS)
+            // MAP_GROWSDOWN has a kernel-managed expansion area below the returned interval.
+            // MAP_HUGETLB alignment depends on the selected huge-page size. Until the address
+            // model represents those larger dynamic extents, preserve Linux placement instead
+            // of forcing either through the 4 KiB canonical allocator.
+            && !flags.intersects(MapFlags::MAP_GROWSDOWN | MapFlags::MAP_HUGETLB)
             && !fixed;
         let canonical_address = if canonical_request {
             match guest
@@ -1433,6 +1438,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .release_mmap_address_reservation(expected, len);
+            let wrong_address =
+                Addr::from_raw(start).ok_or_else(|| Error::Errno(Errno::EOPNOTSUPP))?;
+            guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Some(wrong_address))
+                        .with_len(len),
+                ))
+                .await?;
             return Err(Errno::EOPNOTSUPP.into());
         }
 
@@ -1474,58 +1488,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
         let old_len = call.old_len();
         let new_len = call.new_len();
-        let flags = call.flags();
-        let may_move = flags & libc::MREMAP_MAYMOVE as usize != 0;
-        let fixed = flags & libc::MREMAP_FIXED as usize != 0;
-        let dont_unmap = flags & libc::MREMAP_DONTUNMAP as usize != 0;
-        let canonical_address = if (new_len > old_len || dont_unmap)
-            && checked_page_aligned_len(new_len).is_some()
-            && may_move
-            && !fixed
-        {
-            match guest
-                .thread_state()
-                .reserve_anonymous_mmap_address(new_len, false)
-            {
-                Some(start) => Some(start),
-                None => return Err(Errno::ENOMEM.into()),
-            }
-        } else {
-            None
-        };
-        let injected_call = match canonical_address {
-            Some(start) => {
-                let address = AddrMut::from_raw(start)
-                    .expect("the canonical anonymous mmap arena excludes the null page");
-                call.with_flags(flags | libc::MREMAP_MAYMOVE as usize | libc::MREMAP_FIXED as usize)
-                    .with_new_addr(Some(address))
-            }
-            None => call,
-        };
-        let result = match self.record_or_replay(guest, injected_call).await {
-            Ok(result) => result,
-            Err(errno) => {
-                if let Some(start) = canonical_address {
-                    guest
-                        .thread_state()
-                        .release_mmap_address_reservation(start, new_len);
-                }
-                return Err(errno.into());
-            }
-        };
+        let result = self.record_or_replay(guest, call).await?;
         let new_start =
             usize::try_from(result).expect("a successful mremap must return an address");
-        if let Some(expected) = canonical_address
-            && new_start != expected
-        {
-            guest
-                .thread_state()
-                .release_mmap_address_reservation(expected, new_len);
-            return Err(Errno::EOPNOTSUPP.into());
-        }
         guest
             .thread_state()
-            .remap_memory(old_start, old_len, new_start, new_len, dont_unmap);
+            .remap_memory(old_start, old_len, new_start, new_len);
         Ok(result)
     }
 

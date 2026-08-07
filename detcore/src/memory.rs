@@ -190,11 +190,18 @@ impl MemoryMetadata {
         if len == 0 {
             return;
         }
+        Self::unmap_tracked_ranges(&mut self.address_mappings, start, len);
+    }
+
+    fn unmap_tracked_ranges(
+        ranges: &mut BTreeMap<usize, usize>,
+        start: usize,
+        len: usize,
+    ) {
         let end = start
             .checked_add(len)
             .expect("a successful memory range operation must fit in the address space");
-        let overlapping = self
-            .address_mappings
+        let overlapping = ranges
             .range(..end)
             .filter_map(|(&mapping_start, &mapping_len)| {
                 let mapping_end = mapping_start
@@ -205,13 +212,12 @@ impl MemoryMetadata {
             .collect::<Vec<_>>();
 
         for (mapping_start, mapping_end) in overlapping {
-            self.address_mappings.remove(&mapping_start);
+            ranges.remove(&mapping_start);
             if mapping_start < start {
-                self.address_mappings
-                    .insert(mapping_start, start - mapping_start);
+                ranges.insert(mapping_start, start - mapping_start);
             }
             if mapping_end > end {
-                self.address_mappings.insert(end, mapping_end - end);
+                ranges.insert(end, mapping_end - end);
             }
         }
     }
@@ -315,7 +321,6 @@ impl MemoryMetadata {
         old_len: usize,
         new_start: usize,
         new_len: usize,
-        preserve_source: bool,
     ) {
         let old_len = page_aligned_len(old_len);
         let new_len = page_aligned_len(new_len);
@@ -330,10 +335,7 @@ impl MemoryMetadata {
                 (mapping.end(mapping_start) >= old_end)
                     .then_some((mapping.object, mapping.offset_at(mapping_start, old_start)))
             });
-
-        if !preserve_source {
-            self.unmap(old_start, old_len);
-        }
+        self.unmap(old_start, old_len);
         self.unmap(new_start, new_len);
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
@@ -416,7 +418,7 @@ mod tests {
 
         mappings.map_anonymous(mm(10), 0x5000, 0x1000);
         let before_remap = mappings.futex_id(mm(10), 0x5010);
-        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, false);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000);
         assert_eq!(
             before_remap,
             mappings.futex_id(mm(10), 0x9010),
@@ -531,13 +533,4 @@ mod tests {
         assert_eq!(mappings.reserve_anonymous_address(too_large, false), None);
     }
 
-    #[test]
-    fn dontunmap_remap_preserves_both_shared_aliases() {
-        let mut mappings = MemoryMetadata::new();
-        mappings.map_anonymous(mm(10), 0x1000, PAGE_SIZE);
-        let original = mappings.futex_id(mm(10), 0x1010);
-        mappings.remap(0x1000, PAGE_SIZE, 0x9000, PAGE_SIZE, true);
-        assert_eq!(mappings.futex_id(mm(10), 0x1010), original);
-        assert_eq!(mappings.futex_id(mm(10), 0x9010), original);
-    }
 }

@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,22 +19,21 @@
 
 enum { MAPPING_COUNT = 4 };
 
-int main(int argc, char** argv) {
-  int perturb_third = argc == 2 && strcmp(argv[1], "perturb-third") == 0;
-  if (argc > 2 || (argc == 2 && !perturb_third)) {
-    fprintf(stderr, "usage: %s [perturb-third]\n", argv[0]);
-    return 2;
-  }
+static size_t page_size(void) {
   long raw_page_size = sysconf(_SC_PAGESIZE);
   if (raw_page_size <= 0) {
     perror("sysconf");
-    return 1;
+    exit(1);
   }
-  size_t page_size = (size_t)raw_page_size;
+  return (size_t)raw_page_size;
+}
+
+static int run_layout(int perturb_third) {
+  size_t page = page_size();
   void* mappings[MAPPING_COUNT];
 
   for (size_t index = 0; index < MAPPING_COUNT; ++index) {
-    size_t length = (index + 1) * page_size;
+    size_t length = (index + 1) * page;
     mappings[index] = mmap(
         NULL,
         length,
@@ -56,8 +56,8 @@ int main(int argc, char** argv) {
    * exact comparator to report 3/4 matches and index 2 as the difference.
    */
   if (perturb_third) {
-    void* moved = mremap(
-        mappings[2], 3 * page_size, 4 * page_size, MREMAP_MAYMOVE);
+    void* moved =
+        mremap(mappings[2], 3 * page, 4 * page, MREMAP_MAYMOVE);
     if (moved == MAP_FAILED) {
       perror("mremap");
       return 1;
@@ -71,4 +71,155 @@ int main(int argc, char** argv) {
   }
   putchar('\n');
   return 0;
+}
+
+static int run_growdown(void) {
+  size_t page = page_size();
+  unsigned char* mapping = mmap(
+      NULL,
+      page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN,
+      -1,
+      0);
+  if (mapping == MAP_FAILED) {
+    perror("growdown mmap");
+    return 1;
+  }
+  mapping[0] = 0x31;
+  volatile unsigned char* expanded = mapping - page;
+  *expanded = 0x7a;
+  if (mapping[0] != 0x31 || *expanded != 0x7a) {
+    fprintf(stderr, "growdown expansion lost data\n");
+    return 1;
+  }
+  puts("growdown-expansion-ok");
+  return 0;
+}
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+
+static int try_hugetlb(int extra_flags, const char* label) {
+  size_t huge_size = 2 * 1024 * 1024;
+  errno = 0;
+  void* mapping = mmap(
+      NULL,
+      huge_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | extra_flags,
+      -1,
+      0);
+  if (mapping == MAP_FAILED) {
+    if (errno == EINVAL) {
+      fprintf(stderr, "%s hugetlb request was converted to EINVAL\n", label);
+      return 1;
+    }
+    return 0;
+  }
+  if (extra_flags == MAP_HUGE_2MB && (uintptr_t)mapping % huge_size != 0) {
+    fprintf(stderr, "explicit 2MiB hugetlb mapping is misaligned: %p\n", mapping);
+    return 1;
+  }
+  if (munmap(mapping, huge_size) != 0) {
+    perror("hugetlb munmap");
+    return 1;
+  }
+  return 0;
+}
+
+static int run_hugetlb(void) {
+  if (try_hugetlb(0, "default") != 0 ||
+      try_hugetlb(MAP_HUGE_2MB, "explicit-2MiB") != 0) {
+    return 1;
+  }
+  puts("hugetlb-semantics-preserved");
+  return 0;
+}
+
+static int run_untracked_collision(void) {
+  size_t page = page_size();
+  unsigned char* probe = mmap(
+      NULL,
+      page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (probe == MAP_FAILED || munmap(probe, page) != 0) {
+    perror("canonical probe mmap");
+    return 1;
+  }
+  unsigned char* growdown = probe;
+  void* mapped = mmap(
+      growdown,
+      page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_FIXED_NOREPLACE,
+      -1,
+      0);
+  if (mapped != growdown) {
+    perror("fixed growdown mmap");
+    return 1;
+  }
+  growdown[0] = 0x41;
+  volatile unsigned char* hidden = growdown - page;
+  *hidden = 0x52;
+
+  unsigned char* source = mmap(
+      (void*)UINT64_C(0x300000000000),
+      page,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+      -1,
+      0);
+  if (source == MAP_FAILED) {
+    perror("mremap source mmap");
+    return 1;
+  }
+  source[0] = 0x63;
+  errno = 0;
+  void* moved = mremap(source, page, 2 * page, MREMAP_MAYMOVE);
+  if (moved != MAP_FAILED || errno != EEXIST) {
+    fprintf(
+        stderr,
+        "untracked collision was not refused: moved=%p errno=%d\n",
+        moved,
+        errno);
+    return 1;
+  }
+  if (source[0] != 0x63 || *hidden != 0x52 || growdown[0] != 0x41) {
+    fprintf(stderr, "collision refusal clobbered a live mapping\n");
+    return 1;
+  }
+  puts("untracked-collision-refused-no-clobber");
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 1) {
+    return run_layout(0);
+  }
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s [perturb-third|growdown|hugetlb|collision]\n", argv[0]);
+    return 2;
+  }
+  if (strcmp(argv[1], "perturb-third") == 0) {
+    return run_layout(1);
+  }
+  if (strcmp(argv[1], "growdown") == 0) {
+    return run_growdown();
+  }
+  if (strcmp(argv[1], "hugetlb") == 0) {
+    return run_hugetlb();
+  }
+  if (strcmp(argv[1], "collision") == 0) {
+    return run_untracked_collision();
+  }
+  fprintf(stderr, "unknown mode: %s\n", argv[1]);
+  return 2;
 }

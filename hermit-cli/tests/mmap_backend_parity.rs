@@ -69,6 +69,35 @@ fn run_backend(backend: &str, perturb_third: bool) -> Vec<usize> {
 }
 
 #[cfg(feature = "dbi")]
+fn run_semantics_mode(backend: &str, mode: &str, marker: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "run",
+            "--backend",
+            backend,
+            "--strict",
+            "--base-env=minimal",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(guest())
+        .arg(mode)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start {backend}/{mode}: {error}"));
+    assert!(
+        output.status.success(),
+        "{backend}/{mode} failed: status={}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{marker}\n")
+    );
+}
+
+#[cfg(feature = "dbi")]
 fn parse_addresses(stdout: &[u8]) -> Vec<usize> {
     let line = std::str::from_utf8(stdout).expect("guest stdout was not UTF-8");
     let mut fields = line.split_whitespace();
@@ -141,6 +170,34 @@ fn mmap_address_comparator_rejects_a_one_backend_allocator_perturbation() {
     assert!(mismatch.contains("matched 3/4"), "{mismatch}");
     assert!(mismatch.contains("address 2 differs"), "{mismatch}");
     eprintln!("negative control: {mismatch}");
+}
+
+#[test]
+#[cfg(feature = "dbi")]
+fn growdown_expansion_remains_kernel_managed() {
+    for backend in ["ptrace", "dbi"] {
+        run_semantics_mode(backend, "growdown", "growdown-expansion-ok");
+    }
+}
+
+#[test]
+#[cfg(feature = "dbi")]
+fn hugetlb_alignment_semantics_remain_kernel_managed() {
+    for backend in ["ptrace", "dbi"] {
+        run_semantics_mode(backend, "hugetlb", "hugetlb-semantics-preserved");
+    }
+}
+
+#[test]
+#[cfg(feature = "dbi")]
+fn movable_mremap_refuses_an_untracked_destination_without_clobbering() {
+    for backend in ["ptrace", "dbi"] {
+        run_semantics_mode(
+            backend,
+            "collision",
+            "untracked-collision-refused-no-clobber",
+        );
+    }
 }
 
 #[test]
