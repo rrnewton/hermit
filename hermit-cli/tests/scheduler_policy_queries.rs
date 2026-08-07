@@ -64,7 +64,7 @@ fn scheduler_policy_queries_are_deterministic() {
         trace_stdout.contains("scheduler-policy-queries-ok"),
         "guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
-    for syscall in ["getitimer", "ioprio_get", "sched_setattr"] {
+    for syscall in ["getitimer", "ioprio_get", "ioprio_set", "sched_setattr"] {
         assert!(
             trace_stderr.contains(&format!("inbound syscall: {syscall}(")),
             "trace omitted {syscall}\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",

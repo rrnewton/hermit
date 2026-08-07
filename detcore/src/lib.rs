@@ -1475,6 +1475,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                                 .clone(),
                         ))
                     },
+                    // Match Linux I/O-context ownership: CLONE_IO shares the
+                    // virtual priority and every other clone inherits a copy.
+                    io_priority: if clone_flags.contains(CloneFlags::CLONE_IO) {
+                        Arc::clone(&pts.1.io_priority)
+                    } else {
+                        Arc::new(Mutex::new(
+                            *pts.1
+                                .io_priority
+                                .lock()
+                                .expect("I/O priority mutex poisoned"),
+                        ))
+                    },
                     process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         Arc::clone(&pts.1.process_cpu_time)
                     } else {
