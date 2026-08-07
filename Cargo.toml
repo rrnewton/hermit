@@ -40,3 +40,16 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# MEASUREMENT-ONLY patch (kvm-compat-ratchet, NOT for PR): build against the
+# local reverie checkout (worktrees/kvmcompat/reverie @ 79517704 = #355 head +
+# the startup-livelock measurement revert) to quantify the post-fix KVM corpus.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "../reverie/reverie" }
+reverie-memory = { path = "../reverie/reverie-memory" }
+reverie-rpc-transport = { path = "../reverie/reverie-rpc-transport" }
+reverie-syscalls = { path = "../reverie/reverie-syscalls" }
+reverie-ptrace = { path = "../reverie/reverie-ptrace" }
+reverie-kvm = { path = "../reverie/reverie-kvm" }
+reverie-dbi = { path = "../reverie/reverie-dbi" }
+reverie-liteinst = { path = "../reverie/reverie-liteinst" }
