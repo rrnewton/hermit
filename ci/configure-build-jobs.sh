@@ -231,7 +231,7 @@ fi
 # unaffected by a client.c edit.
 #
 # CALIBRATION AT 038e993 (Hermit 4be8edcd2f947746b5d9d30c81a35202f36a46d4,
-# host devbig014, shared host, dedicated cgroup CPUs 0-3, nproc=4,
+# measurement receipt rrnewton/hermit#1876, shared host, dedicated cgroup CPUs 0-3, nproc=4,
 # CARGO_BUILD_JOBS=4, native jobs=4, no per-task pinning): five successful
 # DBI-enabled Hermit builds, each after `cargo clean -p reverie-dbi`, produced
 # exactly one content-key MISS and completed build_dynamorio() in 41.66,
@@ -244,7 +244,7 @@ fi
 REVERIE_DBI_CALIBRATED_RECIPE_KEY=76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d
 REVERIE_DBI_CALIBRATED_BUILD_RS_OBJECT=9e35e1b699b76d8b9f8a6adacc21c7a095f4f8f7
 REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT=de352475846e385002c1e4e54604fa0a7647b2de
-REVERIE_DBI_CALIBRATED_BASIS=devbig014-cgroup-cold-miss-n5-cpu4
+REVERIE_DBI_CALIBRATED_BASIS=shared-cgroup-cold-miss-n5-cpu4
 
 if ! budget_metadata=$(cargo metadata --format-version 1 --locked \
     --manifest-path "$budget_repo_root/Cargo.toml"); then
