@@ -525,13 +525,18 @@ def hermit_command(
         # pointer argument and a differing openat path all collapse to the same
         # token.  Mutation testing measured 3 of 5 planted defects surviving it
         # (dev-hermit experiments/strict-certification-mutation-sweep_20260806).
-        # Whatever this run earns is read off `--verify-json` below; it is not
-        # assumed from the flag and it is not scraped from the banner.
+        # `--verify-strict` is therefore passed alongside it to request the
+        # BITWISE comparison, closing that 3-of-5 survival hole at the source
+        # rather than annotating it.  This is a strictness RATCHET: cells that
+        # only ever passed under normalisation will now report their real
+        # divergence, so the matrix must be re-measured, not assumed unchanged.
+        # Whatever this run earns is still read off `--verify-json` below; it is
+        # not assumed from the flag and it is not scraped from the banner.
         #
         # `--verify-allow both` keeps the guest's own exit status (including
         # deliberate non-zero cases such as exit_status) flowing through so the
         # runner can still enforce exit-status parity.
-        command.extend(["--verify", "--verify-allow", "both"])
+        command.extend(["--verify", "--verify-strict", "--verify-allow", "both"])
         if verify_json is not None:
             command.append(f"--verify-json={verify_json}")
     command.extend(
