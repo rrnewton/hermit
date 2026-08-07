@@ -843,12 +843,13 @@ function audit_ci_correspondence {
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
         # The positive runs above prove the current pin's recipe is accepted.
-        # Change one of source_recipe_key()'s live inputs and plant an inert
-        # command marker: the wrapper must refuse before command execution.
+        # Set one of source_recipe_key()'s live inputs to empty and plant an
+        # inert command marker. Rust's var_os() distinguishes set-empty from
+        # unset, so the wrapper must also refuse before command execution.
         recipe_mismatch_sentinel="$scratch/recipe-mismatch-command-ran"
         if recipe_mismatch_log=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                CMAKE=definitely-not-the-calibrated-cmake CARGO_BUILD_JOBS=8 \
+                CMAKE= CARGO_BUILD_JOBS=8 \
                 "$budget_wrapper" touch "$recipe_mismatch_sentinel" 2>&1
         ); then
             recipe_mismatch_status=0
