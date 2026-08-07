@@ -56,8 +56,20 @@ mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/
 #[path = "lib/validate_corpus.rs"]
 mod validate_corpus;
 
+#[path = "lib/validate_envelope.rs"]
+mod validate_envelope;
+
+#[path = "lib/validate_history.rs"]
+mod validate_history;
+
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
+
+#[path = "lib/validate_receipt.rs"]
+mod validate_receipt;
+
+#[path = "lib/validate_super.rs"]
+mod validate_super;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -156,6 +168,9 @@ enum Focused {
     PrivilegedOnly,
     Only { lane: String, nodes: String },
     Selective { shallow: bool },
+    /// `--envelope-only`, plus `--envelope-compare FILE` which is the same
+    /// measurement followed by a monotonicity check (validate.sh:172-176).
+    Envelope { baseline: Option<PathBuf> },
 }
 
 impl Focused {
@@ -173,6 +188,10 @@ impl Focused {
             Focused::PrivilegedOnly => "privileged-only".into(),
             Focused::Only { lane, .. } => format!("only-{lane}"),
             Focused::Selective { .. } => "selective".into(),
+            // Both spellings record ONE profile, matching validate.sh:382, so
+            // envelope history stays continuous whether or not a baseline was
+            // supplied.
+            Focused::Envelope { .. } => "envelope-only".into(),
         }
     }
     /// `--all/--full-run` refuses to combine with any focused mode; this is the
@@ -193,6 +212,13 @@ impl Focused {
                     "shallow-select"
                 } else {
                     "selective"
+                }
+            }
+            Focused::Envelope { baseline } => {
+                if baseline.is_some() {
+                    "envelope-compare"
+                } else {
+                    "envelope-only"
                 }
             }
         }
@@ -246,6 +272,8 @@ fn usage() -> &'static str {
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
+     \x20 --envelope-only               Measure and emit the working-envelope vector (JSON + human).\n\
+     \x20 --envelope-compare FILE       Measure, then fail if any count regressed below FILE.\n\
      \x20 --all, --full-run             Assert the COMPLETE suite explicitly.\n\
      \n\
      Other options:\n\
@@ -265,7 +293,8 @@ fn usage() -> &'static str {
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL, CI_DAG_JOBS,\n\
-     HERMIT_VALIDATE_LEDGER, PR_NUMBER."
+     HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
+     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -273,6 +302,17 @@ fn env_flag(name: &str, want: &str) -> bool {
 }
 
 fn parse_args() -> Result<Args, u8> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    parse_argv(&argv)
+}
+
+/// Argument parsing over an EXPLICIT argv.
+///
+/// Split out from [`parse_args`] so `--self-test` can exercise the real parser
+/// on synthetic command lines without spawning a subprocess — a subprocess would
+/// re-enter `main`, hit the dirty-tree and rebase-freshness gates, and turn a CLI
+/// bracket into a test of the checkout's state instead of the flag surface.
+fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     let mut level = Level::Full;
     let mut level_explicit = false;
     if let Ok(v) = std::env::var("VALIDATE_LEVEL") {
@@ -310,8 +350,9 @@ fn parse_args() -> Result<Args, u8> {
     let mut shallow = false;
     let mut selective = false;
     let mut show_plan = false;
+    let mut envelope = false;
+    let mut envelope_baseline: Option<PathBuf> = None;
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     let set_level = |args: &mut Args, l: Level| -> Result<(), u8> {
         if args.level_explicit {
@@ -338,20 +379,23 @@ fn parse_args() -> Result<Args, u8> {
             "--liteinst-compat-only" => focused.push(Focused::LiteinstCompat),
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
-            // Recognized but NOT ported. These are accepted so the failure is a
-            // clear refusal rather than "unknown argument" — in-tree callers
-            // (scripts/progress-report.sh, the progress-rubric skill) pass them,
-            // and an unknown-argument exit would read as a CLI regression rather
-            // than as the unported feature it is.
-            "--envelope-only" => {
-                eprintln!("validate: --envelope-only is not ported to the Rust driver yet.");
-                eprintln!("  The working-envelope measurement still lives in validate.sh; this");
-                eprintln!("  driver will not report a different measurement under its name.");
-                return Err(2);
-            }
+            // `--envelope-only` and `--envelope-compare` are ONE mode in
+            // validate.sh (both set ENVELOPE_MODE=only; the second merely adds a
+            // baseline, validate.sh:172-176), so they accumulate into a single
+            // Focused entry rather than colliding as two focused modes.
+            "--envelope-only" => envelope = true,
             "--envelope-compare" => {
-                eprintln!("validate: --envelope-compare is not ported to the Rust driver yet.");
-                return Err(2);
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() => {
+                        envelope = true;
+                        envelope_baseline = Some(PathBuf::from(v));
+                    }
+                    _ => {
+                        eprintln!("validate: --envelope-compare needs a FILE");
+                        return Err(2);
+                    }
+                }
             }
             "--show-plan" => show_plan = true,
             "--selective" | "--since-green" => selective = true,
@@ -413,6 +457,9 @@ fn parse_args() -> Result<Args, u8> {
     }
     if selective {
         focused.push(Focused::Selective { shallow });
+    }
+    if envelope {
+        focused.push(Focused::Envelope { baseline: envelope_baseline });
     }
     if focused.len() > 1 {
         eprintln!("validate: choose only one focused validation mode");
@@ -580,6 +627,236 @@ fn self_test() -> Result<(), String> {
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
+    // Every ported subsystem brings its own two-sided brackets. They are inert:
+    // none of them runs a gate, publishes a label, writes the real ledger, or
+    // touches a PR — see each module's `self_test` doc for why that matters.
+    for line in [
+        validate_super::self_test(&root)?,
+        validate_envelope::self_test()?,
+        validate_history::self_test()?,
+        validate_receipt::self_test()?,
+    ] {
+        println!("  {line}");
+    }
+    // The `--envelope-*` CLI shape is a CONTRACT with scripts/progress-report.sh
+    // and the progress-rubric skill, so it is asserted rather than assumed.
+    envelope_cli_bracket()?;
+    super_plan_bracket()?;
+    selective_subset_bracket(&root)?;
+    Ok(())
+}
+
+/// Bracket the `--selective` subset builder against the REAL portable lane.
+///
+/// The dangerous failure here is silent under-running: a subset that drops a
+/// node the selector asked for, or keeps a dangling dependency that makes the
+/// runner skip a selected node. Both are checked against `ci/dag/portable.json`
+/// itself rather than a fixture, because a fixture would not notice the lane
+/// file changing shape underneath the selector.
+fn selective_subset_bracket(root: &Path) -> Result<(), String> {
+    let all = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
+    let all_tags: BTreeSet<String> = all.iter().map(|s| s.tag()).collect();
+    // Pick a node that has at least one intra-lane dependency, plus that
+    // dependency, so the "keep both" and "prune the rest" behaviours are both
+    // exercised on real data.
+    let (child, parent) = all
+        .iter()
+        .find_map(|s| {
+            s.deps.iter().find(|d| all_tags.contains(*d)).map(|d| (s.tag(), d.clone()))
+        })
+        .ok_or("selective bracket: ci/dag/portable.json has no intra-lane dependency to test")?;
+    let keep: BTreeSet<String> = [child.clone(), parent.clone()].into_iter().collect();
+    let sel = validate_plan::select_lane_nodes(all.clone(), &keep);
+    // Positive: exactly the two named nodes survive, the kept edge survives, and
+    // the manifest-gate edge (outside the lane) is NOT pruned.
+    if sel.steps.len() != 2 {
+        return Err(format!("selective bracket: kept {} node(s), expected 2", sel.steps.len()));
+    }
+    let kept_child = sel
+        .steps
+        .iter()
+        .find(|s| s.tag() == child)
+        .ok_or("selective bracket: the selected child node was dropped")?;
+    if !kept_child.deps.contains(&parent) {
+        return Err("selective bracket: a dependency inside the selected set must survive".into());
+    }
+    if sel.unknown_tags != Vec::<String>::new() {
+        return Err(format!("selective bracket: unexpected unknown tags {:?}", sel.unknown_tags));
+    }
+    let root_node = sel.steps.iter().find(|s| s.tag() == parent).unwrap();
+    if !root_node.deps.iter().all(|d| !all_tags.contains(d)) {
+        return Err("selective bracket: an unselected lane dependency was left dangling".into());
+    }
+    // Negative: a tag the lane does not contain must be REPORTED, because that
+    // means the selector and the DAG disagree and the subset is untrustworthy.
+    let bogus: BTreeSet<String> =
+        [parent.clone(), "no.such_node".to_string()].into_iter().collect();
+    let sel2 = validate_plan::select_lane_nodes(all, &bogus);
+    if sel2.unknown_tags != vec!["no.such_node".to_string()] {
+        return Err(format!(
+            "selective bracket: an unknown tag MUST be reported; got {:?}",
+            sel2.unknown_tags
+        ));
+    }
+    println!(
+        "  selective subset: kept {child} + its dep {parent} from the real portable lane \
+         ({} edge(s) pruned); 1 unknown-tag refusal",
+        sel.pruned_edges
+    );
+    Ok(())
+}
+
+/// Assert that `super` plans a complete, fully-boxed suite — and that the audit
+/// which guarantees that would actually REFUSE an unboxed node.
+///
+/// The caps audit is the driver's own load-bearing guard: it is what makes
+/// "boxing ACTIVE" true for every node rather than for the ones someone
+/// remembered. A guard that never fires is indistinguishable from no guard, so
+/// this brackets it on both sides with an inert synthetic node.
+fn super_plan_bracket() -> Result<(), String> {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("validate-super-plan-{}", std::process::id()));
+    let args = parse_argv(&["super".to_string()])
+        .map_err(|c| format!("super plan: the `super` level was REFUSED with exit {c}"))?;
+    let plan = build_plan(&root, &args, &tmp)
+        .map_err(|e| format!("super plan: could not build a plan: {e}"))?;
+    // Positive: the audit must ACCEPT a real, fully-declared super plan.
+    let undeclared = validate_plan::undeclared_nodes(&plan.cfg);
+    if !undeclared.is_empty() {
+        return Err(format!(
+            "super plan: {} node(s) lack declared caps: {}",
+            undeclared.len(),
+            undeclared.join(", ")
+        ));
+    }
+    let tags: BTreeSet<String> = plan.cfg.steps.iter().map(|s| s.tag()).collect();
+    // One representative of each expansion the table names, so a lost synthetic
+    // is caught here and not at 2am in the weekly run.
+    for want in [
+        "super.build_workspace",
+        "super.build_release_hermit",
+        "super.sqlite_veryquick_strict_determinism",
+        "super.pmu_analyze_hello_race_stress_calibrated_skid",
+        "superstress.ptrace_strict_verify_01",
+        "superstress.kvm_available",
+        "compatprep.fixtures",
+        "compat.rustc",
+    ] {
+        if !tags.contains(want) {
+            return Err(format!("super plan: node {want} is missing"));
+        }
+    }
+    if !plan.super_mode {
+        return Err("super plan: super_mode must be set so the stress table is printed".into());
+    }
+    // Negative: one node with no caps must be REFUSED by the same audit.
+    let mut broken = validate_plan::config_from(
+        vec![safe_ci_dag_runner::model::Step {
+            group: "bracket".into(),
+            job: "uncapped".into(),
+            desc: "inert fixture: declares no caps".into(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: vec![],
+            env: BTreeMap::new(),
+            hint: Default::default(),
+            networkonly: false,
+            engine_only: false,
+            timeout: 0,
+            cpu_timeout: 0,
+            jobs_flag: None,
+        }],
+        "caps-audit negative bracket",
+    );
+    broken.default_step_cpu_timeout = 0;
+    let refused = validate_plan::undeclared_nodes(&broken);
+    if refused != vec!["bracket.uncapped".to_string()] {
+        return Err(format!(
+            "caps audit: an uncapped node MUST be refused; the audit returned {refused:?}"
+        ));
+    }
+    println!(
+        "  super plan: {} boxed node(s), all capped; caps audit bracketed 1 accept / 1 refusal",
+        plan.cfg.steps.len()
+    );
+    Ok(())
+}
+
+/// Assert the `--envelope-only` / `--envelope-compare FILE` surface, and that it
+/// actually plans the envelope measurement.
+///
+/// `scripts/progress-report.sh:102` runs `./validate.sh --envelope-only` and the
+/// progress-rubric skill runs it with `ENVELOPE_JSON=...`. Those callers break
+/// silently if the flag stops being accepted or starts meaning something else.
+/// The parser and planner are exercised in-process, so the bracket measures the
+/// FLAG SURFACE and not the checkout's cleanliness.
+fn envelope_cli_bracket() -> Result<(), String> {
+    let argv = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("validate-envelope-cli-{}", std::process::id()));
+    // Positive: both spellings must be ACCEPTED, select the envelope profile,
+    // and produce a plan containing the L4 stress node — a parser that accepted
+    // the flag and planned nothing would satisfy a weaker check.
+    let mut accepted = 0usize;
+    for v in [vec!["--envelope-only"], vec!["--envelope-compare", "/nonexistent-baseline.json"]] {
+        let args = parse_argv(&argv(&v))
+            .map_err(|c| format!("envelope CLI: `{v:?}` was REFUSED with exit {c}"))?;
+        if !matches!(args.focused, Some(Focused::Envelope { .. })) {
+            return Err(format!("envelope CLI: `{v:?}` did not select the envelope mode"));
+        }
+        let plan = build_plan(&root, &args, &tmp)
+            .map_err(|e| format!("envelope CLI: `{v:?}` could not build a plan: {e}"))?;
+        if plan.profile != "envelope-only" {
+            return Err(format!("envelope CLI: `{v:?}` recorded profile {}", plan.profile));
+        }
+        let tags: BTreeSet<String> = plan.cfg.steps.iter().map(|s| s.tag()).collect();
+        for want in ["envelope.build", "envelope.true_l4", "envelope.date_rr"] {
+            if !tags.contains(want) {
+                return Err(format!("envelope CLI: `{v:?}` planned no {want} node"));
+            }
+        }
+        if !plan.force_keep_going {
+            return Err("envelope CLI: the measurement must force keep-going".into());
+        }
+        if plan.nonblocking.len() != validate_envelope::PROBES.len() * validate_envelope::LEVELS.len()
+        {
+            return Err(format!(
+                "envelope CLI: {} probe node(s) must be nonblocking, found {}",
+                validate_envelope::PROBES.len() * validate_envelope::LEVELS.len(),
+                plan.nonblocking.len()
+            ));
+        }
+        // The build node must NOT be excused: it is the one gate in this profile.
+        if plan.nonblocking.contains("envelope.build") {
+            return Err("envelope CLI: the workspace build must stay BLOCKING".into());
+        }
+        accepted += 1;
+    }
+    // Negative: a missing FILE must be refused, not silently defaulted, and the
+    // mode must not combine with a level, --all, or another focused mode.
+    let mut refused = 0usize;
+    for (why, v) in [
+        ("--envelope-compare with no FILE", vec!["--envelope-compare"]),
+        ("--envelope-only combined with a level", vec!["quick", "--envelope-only"]),
+        ("--envelope-only combined with --all", vec!["--all", "--envelope-only"]),
+        ("--envelope-only combined with another focused mode", vec!["--envelope-only", "--rr-compat-only"]),
+    ] {
+        if parse_argv(&argv(&v)).is_ok() {
+            return Err(format!("envelope CLI: {why} must be REFUSED"));
+        }
+        refused += 1;
+    }
+    // Both spellings are ONE mode, so combining them is legal and the baseline
+    // wins — this is the case validate.sh accepted (ENVELOPE_MODE=only twice).
+    match parse_argv(&argv(&["--envelope-only", "--envelope-compare", "b.json"]))
+        .map_err(|c| format!("envelope CLI: the two spellings must combine, got exit {c}"))?
+        .focused
+    {
+        Some(Focused::Envelope { baseline: Some(_) }) => accepted += 1,
+        other => return Err(format!("envelope CLI: combined spellings gave {other:?}")),
+    }
+    println!("  envelope CLI: {accepted} accepted form(s), {refused} refused misuse(s) (the \
+              refusal messages above are expected)");
     Ok(())
 }
 
@@ -969,6 +1246,43 @@ struct Plan {
     /// True only for a complete `full` plan, authorizing `gates_expected` to be
     /// derived from what ran (validate.sh:718).
     suite_complete: bool,
+    /// True for the `super` stress suite, so its pass-rate table is printed and
+    /// its verdict comes from the ratchet rather than the raw node count.
+    super_mode: bool,
+    /// Set for `--envelope-only`/`--envelope-compare`: the measurement is scored
+    /// and emitted afterwards, and an optional baseline is enforced.
+    envelope: Option<EnvelopePlan>,
+    /// Tags whose failure must NOT turn the run red. This is how a MEASUREMENT
+    /// (envelope probes) and a NEVER-BEFORE-MEASURED row (KVM/DBI stress) are
+    /// kept out of the blocking verdict without hiding them from the report.
+    /// Every member is named in the summary with the reason it is nonblocking.
+    nonblocking: BTreeSet<String>,
+    /// Forced on for the envelope profile, whose whole point is to measure every
+    /// probe: an eager exit on the first probe failure would truncate the vector.
+    force_keep_going: bool,
+}
+
+struct EnvelopePlan {
+    reps: i64,
+    baseline: Option<PathBuf>,
+}
+
+impl Default for Plan {
+    fn default() -> Self {
+        Plan {
+            cfg: DagConfig::default(),
+            second: None,
+            profile: String::new(),
+            selection_mode: "full",
+            planned_test_nodes: BTreeSet::new(),
+            compat: None,
+            suite_complete: false,
+            super_mode: false,
+            envelope: None,
+            nonblocking: BTreeSet::new(),
+            force_keep_going: false,
+        }
+    }
 }
 
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
@@ -1031,7 +1345,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             profile,
             selection_mode: "full",
             compat: Some(mode),
-            suite_complete: false,
+            ..Default::default()
         });
     }
 
@@ -1046,8 +1360,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             second: None,
             profile: args.focused.as_ref().unwrap().profile(),
             selection_mode: "only",
-            compat: None,
-            suite_complete: false,
+            ..Default::default()
         });
     }
 
@@ -1066,7 +1379,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let cfg = validate_plan::config_from(steps, "liteinst compatibility");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
-            compat: None, suite_complete: false });
+            ..Default::default() });
     }
 
     // Focused QEMU L2 boot (validate.sh:4860). Heavyweight; two ordered gates.
@@ -1081,7 +1394,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let cfg = validate_plan::config_from(steps, "QEMU L2 boot");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
-            compat: None, suite_complete: false });
+            ..Default::default() });
     }
 
     // `quick` is NOT "the portable lane" — it is seven specific smoke gates
@@ -1110,36 +1423,45 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             "quick.build", 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
-            profile: "quick".into(), selection_mode: "full", compat: None, suite_complete: false });
+            profile: "quick".into(), selection_mode: "full", ..Default::default() });
     }
 
-    // REFUSE rather than silently substitute. `super` (the 20x stress repetition
-    // suite) and the `--envelope-*` measurement modes are NOT ported yet. Falling
-    // through to a lane would run something ELSE under the requested name and
-    // report it as success — a wrong answer is worse than a refusal.
+    // The `super` stress/diagnostic suite (validate.sh:4702).
     if args.level == Level::Super && args.focused.is_none() {
-        return Err(
-            "the `super` stress suite is not ported to the Rust driver yet, and this driver will \
-             not silently run a different profile in its place. Use validate.sh's super suite \
-             until it lands (tracked in the PR as the remaining port work)."
-                .into(),
-        );
+        return super_plan(root, tmp, pre, gate);
+    }
+
+    // Working-envelope measurement (validate.sh:4173). A MEASUREMENT, not a
+    // gate: probe failures lower a count and never abort, so keep-going is
+    // forced and every probe node is nonblocking.
+    if let Some(Focused::Envelope { baseline }) = &args.focused {
+        let reps = validate_envelope::l4_reps();
+        let hermit_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
+        let mut steps = pre;
+        steps.push(validate_envelope::build_node(gate));
+        let probes = validate_envelope::nodes(&hermit_bin, reps, "envelope.build");
+        let nonblocking: BTreeSet<String> = probes.iter().map(|s| s.tag()).collect();
+        steps.extend(probes);
+        let cfg = validate_plan::config_from(steps, "working-envelope measurement");
+        return Ok(Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            profile: "envelope-only".into(),
+            envelope: Some(EnvelopePlan { reps, baseline: baseline.clone() }),
+            nonblocking,
+            force_keep_going: true,
+            ..Default::default()
+        });
+    }
+
+    // Node-level `--selective` / `--since-green` (validate.sh:4421).
+    if let Some(Focused::Selective { shallow }) = &args.focused {
+        return selective_plan(root, args, pre, gate, *shallow);
     }
 
     // Lane-based profiles.
     let lanes: Vec<&str> = match (&args.focused, args.level) {
         (Some(Focused::PrivilegedOnly), _) => vec!["privileged"],
-        // --selective's documented FAIL-SAFE is to run the complete portable
-        // lane on any doubt; node-level selection is not ported, so it always
-        // takes the safe branch and says so, rather than quietly running fewer
-        // tests than the selector proved safe to omit.
-        (Some(Focused::Selective { .. }), _) => {
-            eprintln!(
-                "validate: node-level selection is not ported; running the FULL portable lane \
-                 (--selective's documented fail-safe branch)."
-            );
-            vec!["portable"]
-        }
         (None, Level::PortableOnly) => vec!["portable"],
         (None, Level::Full) => vec!["portable", "privileged"],
         (_, _) => {
@@ -1178,8 +1500,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             profile,
             selection_mode,
             planned_test_nodes: planned,
-            compat: None,
             suite_complete: args.level == Level::Full && args.focused.is_none(),
+            ..Default::default()
         });
     }
 
@@ -1203,8 +1525,272 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         second: None,
         profile,
         selection_mode,
-        compat: None,
         suite_complete: args.level == Level::Full && args.focused.is_none(),
+        ..Default::default()
+    })
+}
+
+/// Build the `super` plan from the mechanically extracted gate table.
+///
+/// Dependency policy — the bash ran all 32 rows strictly sequentially through
+/// `run_check`, so ANY edge set that preserves the real prerequisites is a
+/// faithful port and a strictly better schedule. The prerequisites are:
+///   * the two build rows gate everything that needs a binary;
+///   * `run_exact_detcore_cases` is FAIL-FAST within its group
+///     (validate.sh:4514), reproduced by chaining those rows so a failure SKIPS
+///     the rest instead of running them;
+///   * the LevelDB test needs its fixture built first.
+/// Everything else is independent and is allowed to overlap.
+fn super_plan(
+    root: &Path,
+    tmp: &Path,
+    pre: Vec<safe_ci_dag_runner::model::Step>,
+    gate: &str,
+) -> Result<Plan, String> {
+    let gates = validate_super::load_gates(root)?;
+    let reps = validate_super::repetitions();
+    let build_ws = "super.build_workspace".to_string();
+    let build_rel = "super.build_release_hermit".to_string();
+    let debug_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
+    let release_bin = std::env::var("STRICT_COMPAT_HERMIT_BIN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| root.join("target/release/hermit").to_string_lossy().into_owned());
+
+    let mut steps = pre;
+    let mut nonblocking: BTreeSet<String> = BTreeSet::new();
+    // `run_exact_detcore_cases` labels its rows "<group>: <case>"; consecutive
+    // rows sharing a group prefix are one fail-fast family. Deriving the chain
+    // from the label SHAPE keeps it correct if a case is added or removed.
+    let family = |label: &str| label.split_once(": ").map(|(g, _)| g.to_string());
+    let mut prev_family: Option<(String, String)> = None; // (family, previous tag)
+
+    for g in &gates {
+        let deps = match g.job.as_str() {
+            "build_workspace" | "build_release_hermit" => vec![gate.to_string()],
+            "full_leveldb_strict_determinism" => {
+                vec!["super.build_pinned_leveldb_super_fixture".to_string()]
+            }
+            _ => vec![build_ws.clone()],
+        };
+        match g.synthetic.as_deref() {
+            Some("portable_slow_strict_diagnostics") => {
+                // The four PORTABLE_STRICT_SUPER_ONLY workloads, run with the
+                // portable-strict flags after the shared functional fixtures are
+                // prepared (validate.sh:4603).
+                let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
+                steps.push(prepare_fixtures_node_dep("compatprep.fixtures", &fixtures, &build_rel));
+                let only: BTreeSet<String> =
+                    validate_corpus::portable_super_only().keys().map(|k| k.to_string()).collect();
+                let shell_build = tmp.join("shell-build");
+                let paths = validate_corpus::CorpusPaths {
+                    root_dir: &root.to_string_lossy(),
+                    real_compat_fixtures: &fixtures.to_string_lossy(),
+                    validation_tmp_dir: &tmp.to_string_lossy(),
+                    shell_build_dir: &shell_build.to_string_lossy(),
+                };
+                steps.extend(validate_plan::compat_nodes_for(
+                    root,
+                    CompatMode::PortableStrict,
+                    &release_bin,
+                    "",
+                    &paths,
+                    Some("compatprep.fixtures"),
+                    Some(&only),
+                    Some(g.wall()),
+                )?);
+            }
+            Some("super_stress_suite") => {
+                let stress =
+                    validate_super::stress_nodes(&release_bin, &debug_bin, tmp, reps, &build_rel, &build_ws);
+                steps.extend(stress);
+                nonblocking.extend(validate_super::nonblocking_tags(reps));
+            }
+            Some("calibrated_analyze_tests") => {
+                steps.push(validate_super::calibrated_analyze_node(g, deps));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "ci/super/gates.json row {} names an unknown synthetic expansion `{other}`; \
+                     refusing to skip it silently",
+                    g.job
+                ))
+            }
+            None => {
+                // Fail-fast chaining inside a `run_exact_detcore_cases` family.
+                let mut deps = deps;
+                if let Some(f) = family(&g.label) {
+                    if let Some((pf, ptag)) = &prev_family {
+                        if *pf == f {
+                            deps = vec![ptag.clone()];
+                        }
+                    }
+                    prev_family = Some((f, format!("super.{}", g.job)));
+                } else {
+                    prev_family = None;
+                }
+                steps.push(validate_super::gate_node(g, deps));
+            }
+        }
+    }
+    let cfg = validate_plan::config_from(steps, "super stress + diagnostic suite");
+    Ok(Plan {
+        planned_test_nodes: test_nodes_of(&cfg),
+        cfg,
+        profile: "super".into(),
+        super_mode: true,
+        nonblocking,
+        ..Default::default()
+    })
+}
+
+/// What `ci/select-tests.rs` decided, and what that means for the plan.
+enum SelectDecision {
+    /// No CI-relevant change: run nothing beyond preflight.
+    Skip,
+    /// Run exactly this dependency-closed node set.
+    Nodes(BTreeSet<String>),
+    /// Fail-safe: run the complete portable lane, for the stated reason.
+    Full(String),
+}
+
+/// Ask `ci/select-tests.rs` what to run.
+///
+/// This is PLAN CONSTRUCTION, not a gate: the selector produces no verdict about
+/// the tree, and its output is only used to choose which already-declared nodes
+/// to schedule. Every failure mode — a nonzero exit, unparseable JSON, an empty
+/// node set, or an unproducible coverage report — resolves to
+/// [`SelectDecision::Full`], so the driver can only ever err toward running MORE
+/// than the selector proved safe to omit (validate.sh:4416-4420).
+fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
+    let run = |format: &str| -> Option<String> {
+        let mut c = Command::new(root.join("ci").join("select-tests.rs"));
+        c.arg("--since-green");
+        if let Some(b) = baseline {
+            c.args(["--baseline", b]);
+        }
+        c.args(["--format", format]);
+        let out = c.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    let Some(json_text) = run("json") else {
+        return SelectDecision::Full("select-tests.rs failed".into());
+    };
+    let Ok(sel) = serde_json::from_str::<serde_json::Value>(&json_text) else {
+        return SelectDecision::Full("select-tests.rs emitted unparseable JSON".into());
+    };
+    // A subset must never run without a human-auditable account of what it
+    // dropped and why, so an unproducible report is treated as doubt.
+    let report = run("human").unwrap_or_default();
+    if report.trim().is_empty() {
+        return SelectDecision::Full("could not produce the coverage report".into());
+    }
+    println!("----- selective coverage report (skipped nodes/shards/e2e cells + reasons) -----");
+    println!("{}", report.trim_end());
+    println!("-------------------------------------------------------------------------------");
+    match sel.get("decision").and_then(|d| d.as_str()).unwrap_or("full") {
+        "skip" => SelectDecision::Skip,
+        "selective" => {
+            let nodes: BTreeSet<String> = sel
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+                .unwrap_or_default();
+            if nodes.is_empty() {
+                SelectDecision::Full("empty selected node set".into())
+            } else {
+                SelectDecision::Nodes(nodes)
+            }
+        }
+        other => SelectDecision::Full(format!("decision={other}")),
+    }
+}
+
+/// Build the `--selective` plan (validate.sh:4421).
+fn selective_plan(
+    root: &Path,
+    args: &Args,
+    pre: Vec<safe_ci_dag_runner::model::Step>,
+    gate: &str,
+    shallow: bool,
+) -> Result<Plan, String> {
+    let commit_exists =
+        |sha: &str| sh("git", &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
+            || Command::new("git")
+                .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+    let baseline: Option<String> = if shallow {
+        // --shallow-select pins the baseline to HEAD~1. A root commit has no
+        // parent, so selection fails safe to the full lane (validate.sh:4369).
+        sh("git", &["rev-parse", "--verify", "HEAD~1"])
+    } else {
+        let ledger = ledger_path(root);
+        let rows = validate_history::read_rows(&ledger);
+        let parent = find_parent(root);
+        let slot = slot_name(root, parent.as_deref());
+        validate_history::selective_baseline(&rows, args.baseline.as_deref(), &slot, &commit_exists)
+    };
+    match &baseline {
+        Some(b) => println!("Selective validation: last-known-green baseline = {b}"),
+        None => println!(
+            "Selective validation: no trustworthy green baseline; running the FULL portable lane."
+        ),
+    }
+
+    let all = validate_plan::lane_nodes(root, "portable", "", gate)?;
+    let total = all.len();
+    let decision = match &baseline {
+        Some(b) => ask_selector(root, Some(b)),
+        None => SelectDecision::Full("no trustworthy green baseline".into()),
+    };
+    let steps: Vec<safe_ci_dag_runner::model::Step> = match decision {
+        SelectDecision::Skip => {
+            println!(
+                "Selective validation: no CI-relevant changes since baseline — nothing to run \
+                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
+                 zero planned test nodes, so this cannot be misread as a full pass."
+            );
+            Vec::new()
+        }
+        SelectDecision::Nodes(keep) => {
+            let sel = validate_plan::select_lane_nodes(all, &keep);
+            if !sel.unknown_tags.is_empty() {
+                return Err(format!(
+                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
+                     selector and the DAG disagree, so refusing to run a subset derived from a \
+                     stale mapping",
+                    sel.unknown_tags.len(),
+                    sel.unknown_tags.join(", ")
+                ));
+            }
+            println!(
+                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
+                 dependency edge(s) pruned to the selected set):\n  {}",
+                sel.steps.len(),
+                sel.pruned_edges,
+                keep.iter().cloned().collect::<Vec<_>>().join(" ")
+            );
+            sel.steps
+        }
+        SelectDecision::Full(why) => {
+            println!("Selective validation: {why} — running the FULL portable lane.");
+            all
+        }
+    };
+    let mut nodes = pre;
+    nodes.extend(steps);
+    let cfg = validate_plan::config_from(nodes, "selective portable subset");
+    Ok(Plan {
+        planned_test_nodes: test_nodes_of(&cfg),
+        cfg,
+        profile: "selective".into(),
+        selection_mode: "selective",
+        ..Default::default()
     })
 }
 
@@ -1255,6 +1841,18 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
 }
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
+    prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
+}
+
+/// The functional-fixture prep node, with an explicit predecessor.
+///
+/// The `super` suite already builds a release Hermit under its own tag, so it
+/// hangs the fixtures off THAT node instead of adding a second identical build.
+fn prepare_fixtures_node_dep(
+    _tag: &str,
+    fixtures: &Path,
+    dep: &str,
+) -> safe_ci_dag_runner::model::Step {
     step_with_caps(
         "compatprep",
         "fixtures",
@@ -1263,7 +1861,7 @@ fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::mod
             "./tests/compat/prepare_real_compat_fixtures.sh {}",
             validate_plan::shell_quote(&fixtures.to_string_lossy())
         ),
-        vec!["compatprep.hermit_release".to_string()],
+        vec![dep.to_string()],
         900,
         900,
         4 * 1024 * 1024 * 1024,
@@ -1784,32 +2382,209 @@ fn warn_if_unreadable_ledger(ledger: &Path) {
 
 // --------------------------------------------------------------------------- main
 
+// --------------------------------------------------------------------- summary
+
+/// What the invocation concluded. One variant per way validate can stop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    Pass,
+    Fail,
+    /// Admission control declined to run: dirty tree, stale base, unplannable
+    /// profile, uncapped node, no boxing, no durable log, bad arguments.
+    Refused,
+    /// An operator stop. A NO-RESULT, not a failure.
+    Interrupted,
+    /// `--show-plan`: nothing was executed by design.
+    PlanOnly,
+    /// A prior passing record for this exact tree was reused.
+    CacheHit,
+    SelfTest,
+    /// `--help`; the usage text IS the output.
+    Help,
+}
+
+impl Verdict {
+    fn marker(self) -> &'static str {
+        match self {
+            Verdict::Pass | Verdict::SelfTest | Verdict::CacheHit => "✅",
+            Verdict::Fail => "❌",
+            Verdict::Refused => "🚫",
+            Verdict::Interrupted => "⏹",
+            Verdict::PlanOnly => "📋",
+            Verdict::Help => "",
+        }
+    }
+    fn word(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Fail => "FAIL",
+            Verdict::Refused => "REFUSED",
+            Verdict::Interrupted => "INTERRUPTED (no result)",
+            Verdict::PlanOnly => "PLAN ONLY (nothing executed)",
+            Verdict::CacheHit => "PASS (cache hit; nothing executed)",
+            Verdict::SelfTest => "SELF-TEST",
+            Verdict::Help => "HELP",
+        }
+    }
+}
+
+/// The end-of-run summary. **Every** exit path constructs one.
+///
+/// Owner directive (2026-08-07): "Validate itself should ALWAYS print a SUMMARY
+/// at the end." That is enforced STRUCTURALLY rather than by discipline: `run`
+/// returns a `RunSummary` instead of an exit code, so a new early return cannot
+/// compile without saying what it concluded, and `main` is the single place that
+/// renders it. A scope guard would have been weaker — it can only print a
+/// default, whereas this makes each path state WHAT was refused and WHY.
+///
+/// The renderer runs BEFORE `DurableLog::finish`, so the summary is written into
+/// the durable log as well as the terminal. The motivating gap was a real run
+/// (main tip d2cdd2317, slot sol-validate, 2026-08-07T16:37:51Z) whose log ended
+/// with a bare `Exit: 1 / Duration: 0s` and no conclusion at all.
+struct RunSummary {
+    verdict: Verdict,
+    exit_code: u8,
+    /// One or more lines naming what happened; for a refusal, what and why.
+    detail: Vec<String>,
+    profile: String,
+    commit: String,
+    nodes_executed: usize,
+    nodes_failed: usize,
+    nodes_skipped: usize,
+    wall_s: Option<f64>,
+    jobs: Option<i64>,
+    log: Option<PathBuf>,
+    ledger: Option<PathBuf>,
+}
+
+impl RunSummary {
+    fn new(verdict: Verdict, exit_code: u8, profile: &str, detail: Vec<String>) -> Self {
+        RunSummary {
+            verdict,
+            exit_code,
+            detail,
+            profile: profile.to_string(),
+            commit: git_sha(),
+            nodes_executed: 0,
+            nodes_failed: 0,
+            nodes_skipped: 0,
+            wall_s: None,
+            jobs: None,
+            log: None,
+            ledger: None,
+        }
+    }
+    /// Admission control declined. `what` names the gate, `why` the reason.
+    fn refused(exit_code: u8, profile: &str, what: &str, why: Vec<String>) -> Self {
+        let mut detail = vec![format!("refused by: {what}")];
+        detail.extend(why);
+        RunSummary::new(Verdict::Refused, exit_code, profile, detail)
+    }
+}
+
+/// The ONE summary renderer. Called from exactly one place.
+fn print_run_summary(s: &RunSummary) {
+    if s.verdict == Verdict::Help {
+        return;
+    }
+    println!();
+    println!(
+        "{} validate {} (exit {}) — profile {} @ {}",
+        s.verdict.marker(),
+        s.verdict.word(),
+        s.exit_code,
+        s.profile,
+        s.commit
+    );
+    for line in &s.detail {
+        println!("   {line}");
+    }
+    // Node accounting is printed whenever a DAG ran, and deliberately printed as
+    // an explicit zero when one did not, so "no nodes ran" is a stated fact
+    // rather than an absent line a reader has to interpret.
+    match s.wall_s {
+        Some(wall) => println!(
+            "   nodes: {} executed, {} failed, {} skipped in {}{}",
+            s.nodes_executed,
+            s.nodes_failed,
+            s.nodes_skipped,
+            human_duration(wall),
+            s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
+        ),
+        None => println!("   nodes: none executed (stopped before the DAG ran)"),
+    }
+    match &s.log {
+        Some(p) => println!("   durable log: {}", p.display()),
+        None => println!("   durable log: (none — stopped before one was opened)"),
+    }
+    if let Some(p) = &s.ledger {
+        println!("   ledger: {}", p.display());
+    }
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
     install_stop_handlers();
 
+    // The durable log outlives `run` so the summary lands INSIDE it.
+    let mut durable: Option<DurableLog> = None;
+    let summary = run(&mut durable);
+    print_run_summary(&summary);
+    if let Some(d) = durable.take() {
+        d.finish();
+    }
+    ExitCode::from(summary.exit_code)
+}
+
+/// The whole invocation, returning what it concluded rather than an exit code.
+fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let args = match parse_args() {
         Ok(a) => a,
-        Err(code) => return ExitCode::from(code),
+        // `parse_args` returns 0 only for `--help`, whose usage text is the
+        // output; anything else is a genuine CLI refusal and gets a summary.
+        Err(0) => return RunSummary::new(Verdict::Help, 0, "help", vec![]),
+        Err(code) => {
+            return RunSummary::refused(
+                code,
+                "(arguments not parsed)",
+                "argument parsing",
+                vec!["see the message above; run --help for the accepted flags".into()],
+            )
+        }
     };
 
     if args.self_test {
         return match self_test() {
-            Ok(()) => {
-                println!("validate: self-test OK (force-full policy brackets, shell quoting, corpus counts)");
-                ExitCode::from(0)
-            }
+            Ok(()) => RunSummary::new(
+                Verdict::SelfTest,
+                0,
+                "self-test",
+                vec![
+                    "force-full policy brackets, shell quoting, corpus counts, super gate table, \
+                     envelope scoring/comparison, ledger cache, receipt eligibility, and the \
+                     selective subset builder all passed"
+                        .into(),
+                    "every bracket is inert: none runs a gate, publishes a label, or writes the \
+                     real ledger"
+                        .into(),
+                ],
+            ),
             Err(e) => {
                 eprintln!("validate: SELF-TEST FAILED: {e}");
-                ExitCode::from(2)
+                RunSummary::new(Verdict::Fail, 2, "self-test", vec![format!("self-test failed: {e}")])
             }
         };
     }
 
+    let level_name = args.level.name().to_string();
     let root = repo_root();
     if std::env::set_current_dir(&root).is_err() {
-        eprintln!("validate: cannot cd to repo root {}", root.display());
-        return ExitCode::from(2);
+        return RunSummary::refused(
+            2,
+            &level_name,
+            "repository root",
+            vec![format!("cannot cd to repo root {}", root.display())],
+        );
     }
     let parent = find_parent(&root);
 
@@ -1824,7 +2599,19 @@ fn main() -> ExitCode {
         eprintln!("  stage the WIP with 'git add', then re-run. To force an explicitly unanchored");
         eprintln!("  run pass --run-on-dirty-tree (agents must not).");
         let _ = Command::new("git").args(["status", "--short"]).status();
-        return ExitCode::from(2);
+        return RunSummary::refused(
+            2,
+            &level_name,
+            "the dirty-working-tree gate",
+            vec![
+                "HEAD has uncommitted working-tree changes, so a record anchored to it would \
+                 describe a tree that exists nowhere in history"
+                    .into(),
+                "commit (preferred) or `git add` the WIP, then re-run; --run-on-dirty-tree forces \
+                 an explicitly unanchored run"
+                    .into(),
+            ],
+        );
     }
 
     // Rebase-freshness gate. Mechanically enforced, not advisory.
@@ -1832,22 +2619,41 @@ fn main() -> ExitCode {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
-            return ExitCode::from(2);
+            return RunSummary::refused(
+                2,
+                &level_name,
+                "the rebase-freshness gate",
+                msg.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+            );
         }
     }
 
     // Run state lives under target/, never under HERMIT_DIR (a user setting).
     let tmp = root.join("target/validation").join(format!("run-{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&tmp) {
-        eprintln!("validate: cannot create {}: {e}", tmp.display());
-        return ExitCode::from(2);
+        return RunSummary::refused(
+            2,
+            &level_name,
+            "run-state setup",
+            vec![format!("cannot create {}: {e}", tmp.display())],
+        );
     }
 
     let mut plan = match build_plan(&root, &args, &tmp) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("validate: cannot build the execution plan: {e}");
-            return ExitCode::from(2);
+            return RunSummary::refused(
+                2,
+                &level_name,
+                "plan construction",
+                vec![
+                    e,
+                    "no substitute profile was run: reporting a DIFFERENT gate set under the \
+                     requested name would be worse than refusing"
+                        .into(),
+                ],
+            );
         }
     };
 
@@ -1880,7 +2686,21 @@ fn main() -> ExitCode {
             undeclared.join(", ")
         );
         eprintln!("  Declare timeout + cpu_timeout + a memory hint for each; see scripts/lib/validate_plan.rs.");
-        return ExitCode::from(3);
+        return RunSummary::refused(
+            3,
+            &plan.profile,
+            "the declared-caps audit",
+            vec![
+                format!(
+                    "{} node(s) would run UNBOXED while the driver claimed boxing was active: {}",
+                    undeclared.len(),
+                    undeclared.join(", ")
+                ),
+                "declare timeout + cpu_timeout + a memory hint for each; see \
+                 scripts/lib/validate_plan.rs"
+                    .into(),
+            ],
+        );
     }
 
     // Print the plan and exit. This makes "what will actually run, and under what
@@ -1906,24 +2726,132 @@ fn main() -> ExitCode {
         }
         let total: usize = all.iter().map(|c| c.steps.len()).sum();
         println!("\ntotal boxed nodes: {total}; all have declared wall+cpu+memory caps (audited above).");
-        return ExitCode::from(0);
+        return RunSummary::new(
+            Verdict::PlanOnly,
+            0,
+            &plan.profile,
+            vec![
+                format!("--show-plan: {total} boxed node(s) printed, all with declared wall+cpu+memory caps"),
+                "nothing was executed and no ledger row was written".into(),
+            ],
+        );
+    }
+
+    // ---- tree-keyed result cache (validate.sh:620/655) -------------------
+    //
+    // Runs BEFORE boxing and before the durable log, so a hit leaves no partial
+    // state behind and appends no derived record — the same placement the bash
+    // used. The key is the TREE hash, not the commit: a rebase or amend that
+    // leaves content byte-identical is the same thing to validate, and keying on
+    // the commit would re-run it. `--ignore-cache` forces a real run; a focused
+    // or selective profile is never cached because `selection_mode == "full"` is
+    // part of the key.
+    let ledger = ledger_path(&root);
+    let ledger_rows = validate_history::read_rows(&ledger);
+    let tree = git_tree();
+    let host = short_hostname();
+    let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
+    let cache = cache_state(&root);
+    let cache_key = validate_history::CacheKey {
+        tree: &tree,
+        profile: &plan.profile,
+        host: &host,
+        toolchain: &toolchain,
+    };
+    if !args.ignore_cache && !wt_dirty && !tree_dirty() && plan.selection_mode == "full" {
+        if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
+            println!("# ============================================================");
+            println!("# validate CACHE HIT for tree {tree}");
+            println!("#   (commit {})", git_sha());
+            println!(
+                "#   passed {} (wall {}, CPU {}, {} {} executed)",
+                hit.finished_at,
+                human_duration(hit.real_seconds),
+                human_duration(hit.cpu_seconds),
+                hit.executed,
+                hit.executed_unit
+            );
+            println!(
+                "#   from a run of commit {} by {} -- use --ignore-cache to force a real run",
+                hit.commit, hit.producer
+            );
+            println!("#   profile={} host={host} toolchain={toolchain}", plan.profile);
+            println!("#   NO gates ran this invocation; reused a clean, commit-anchored passing");
+            println!("#   record (nonzero executed count, satisfied gate coverage) from the");
+            println!("#   run-ledger ({}).", ledger.display());
+            println!("# ============================================================");
+            let _ = std::fs::remove_dir_all(&tmp);
+            let mut s = RunSummary::new(
+                Verdict::CacheHit,
+                0,
+                &plan.profile,
+                vec![
+                    format!(
+                        "reused the passing record from {} (commit {}, producer {}), keyed on tree {tree}",
+                        hit.finished_at, hit.commit, hit.producer
+                    ),
+                    format!(
+                        "that run recorded {} {} executed with satisfied gate coverage; \
+                         --ignore-cache forces a real run",
+                        hit.executed, hit.executed_unit
+                    ),
+                ],
+            );
+            s.ledger = Some(ledger.clone());
+            return s;
+        }
+        // A prior FAIL does NOT skip: it may be flaky or environmental, and only
+        // a PASS satisfies the landing predicate. Note it and run.
+        if let Some(prev) = validate_history::cache_lookup(&ledger_rows, "fail", &cache_key) {
+            eprintln!(
+                "# validate: tree {tree} has a prior FAIL record ({}) on this host+toolchain; \
+                 running anyway (a fail may be flaky/environmental). Only a PASS satisfies the \
+                 landing predicate.",
+                prev.finished_at
+            );
+        }
     }
 
     let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
         Ok(c) => c,
-        Err(code) => return ExitCode::from(code),
+        Err(code) => {
+            return RunSummary::refused(
+                code,
+                &plan.profile,
+                "cgroup boxing (fail-closed)",
+                vec![
+                    "two-level cgroup-v2 boxing could not be established; see the message above"
+                        .into(),
+                    "resource boxing is this tool's primary purpose — re-run with \
+                     --allow-cgroup-failure to accept an UNBOXED run"
+                        .into(),
+                ],
+            )
+        }
     };
 
     let commit = git_sha();
-    let durable = match setup_durable_log(&root, &plan.profile, &commit) {
-        Ok(d) => d,
-        Err(code) => return ExitCode::from(code),
-    };
+    match setup_durable_log(&root, &plan.profile, &commit) {
+        Ok(d) => *durable_slot = Some(d),
+        Err(code) => {
+            return RunSummary::refused(
+                code,
+                &plan.profile,
+                "durable-log setup",
+                vec![
+                    "a run with no durable receipt is a silent no-result; see the message above"
+                        .into(),
+                ],
+            )
+        }
+    }
+    // Safe: just assigned. Cloned so the summary and the ledger can both name it
+    // without borrowing the live tee handle.
+    let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
 
     let jobs = args.jobs.unwrap_or_else(default_jobs);
     let started_at = utc_now();
     let started_epoch = epoch_now();
-    let cache = cache_state(&root);
     let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
 
@@ -1931,23 +2859,40 @@ fn main() -> ExitCode {
     println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
     println!("Plan: {node_count} boxed DAG node(s){}", if plan.second.is_some() { " across 2 sequential lanes" } else { "" });
+    // A measured estimate from THIS machine's own history, or an honest "not
+    // enough history" (validate.sh:936). Printed after the durable log is
+    // established so the receipt carries the prediction next to the outcome.
+    println!(
+        "Estimated time: {}",
+        validate_history::history_estimate(&ledger_rows, &plan.profile, cache, &host, ledger.exists())
+    );
+    if plan.super_mode {
+        println!(
+            "Super stress: {} repetitions/probe scheduled as individual boxed nodes at -j {jobs} \
+             ({host_cpus} online CPUs)",
+            validate_super::repetitions()
+        );
+    }
 
     // Verbosity floored at 2: the runner streams each node's tagged output, so
     // the operator always sees which node is running. Never blind.
     let verbosity = if args.verbose { 3 } else { 2 };
+    // The envelope profile is a MEASUREMENT: an eager exit on the first probe
+    // failure would truncate the very vector it exists to produce.
+    let keep_going = args.keep_going || plan.force_keep_going;
 
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut ok = true;
 
-    let r = run_dag_boxed_ordered(&plan.cfg, jobs, args.keep_going, verbosity, cgroups.clone(), None, None);
+    let r = run_dag_boxed_ordered(&plan.cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
 
     if let Some(second) = &plan.second {
-        if ok || args.keep_going {
-            let r2 = run_dag_boxed_ordered(second, jobs, args.keep_going, verbosity, cgroups.clone(), None, None);
+        if ok || keep_going {
+            let r2 = run_dag_boxed_ordered(second, jobs, keep_going, verbosity, cgroups.clone(), None, None);
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
@@ -1963,19 +2908,25 @@ fn main() -> ExitCode {
     // completed run and falls through to the normal write below. See
     // `install_stop_handlers` for why an interrupt row is worse than no row.
     if let Some(sig) = interrupted_by() {
-        println!(
-            "\n⏹ Validation interrupted by {sig} after {} — recording NO ledger row.",
-            human_duration(wall)
-        );
-        println!(
-            "   An interrupt learned nothing about the tree, so it is not a result. \
-             {} node(s) had completed; partial output is in the durable log.",
-            outcomes.len()
-        );
-        println!("   durable log: {}", durable.path.display());
         let _ = std::fs::remove_dir_all(&tmp);
-        durable.finish();
-        return ExitCode::from(130);
+        let mut s = RunSummary::new(
+            Verdict::Interrupted,
+            130,
+            &plan.profile,
+            vec![
+                format!("stopped by {sig}; NO ledger row was written"),
+                "an interrupt learned nothing about the tree, so it is not a result — a TIMEOUT, \
+                 by contrast, is recorded"
+                    .into(),
+            ],
+        );
+        s.nodes_executed = outcomes.len();
+        s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+        s.nodes_skipped = skipped.len();
+        s.wall_s = Some(wall);
+        s.jobs = Some(jobs);
+        s.log = Some(log_path);
+        return s;
     }
 
     // Compatibility ratchet, evaluated from typed outcomes.
@@ -2001,12 +2952,76 @@ fn main() -> ExitCode {
         }
     }
 
+    // Super stress pass rates, from typed outcomes rather than a scraped report.
+    let mut super_blocking = 0usize;
+    if plan.super_mode {
+        let reps = validate_super::repetitions();
+        let rates = validate_super::stress_rates(&outcomes, reps);
+        super_blocking = validate_super::stress_verdict(&rates, reps, jobs, host_cpus);
+    }
+
+    // Working-envelope vector: score, emit JSON, print the human summary, and
+    // enforce monotonicity when a baseline was supplied.
+    let mut envelope_regressed = false;
+    let mut envelope_error: Option<(u8, String)> = None;
+    if let Some(env) = &plan.envelope {
+        let short = sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        let vector = validate_envelope::score(&outcomes, env.reps, &short);
+        let json_file = validate_envelope::json_path(&root);
+        match serde_json::to_string(&vector) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&json_file, format!("{text}\n")) {
+                    eprintln!("validate: warning: cannot write {}: {e}", json_file.display());
+                }
+            }
+            Err(e) => eprintln!("validate: warning: cannot serialize the envelope vector: {e}"),
+        }
+        validate_envelope::print_summary(&vector, env.reps, &json_file);
+        if let Some(baseline) = &env.baseline {
+            match validate_envelope::compare(&vector, baseline) {
+                Ok(reg) => envelope_regressed = reg,
+                Err((code, msg)) => {
+                    eprintln!("{msg}");
+                    envelope_error = Some((code, msg));
+                }
+            }
+        }
+    }
+
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
-    // A compat run's verdict is the RATCHET, not the raw node count: known
-    // fail-closed rows and bounded portable diagnostics are nonblocking by
-    // policy, so they must not turn the run red on their own.
-    let effective_failures = if plan.compat.is_some() { compat_blocking } else { failures };
-    let exit_code: u8 = if ok && effective_failures == 0 { 0 } else { 1 };
+    // The verdict is the RATCHET, not the raw node count.
+    //
+    // Three profiles deliberately have a verdict narrower than "every node
+    // passed", and each states which rows it excluded and why:
+    //   * compat — known fail-closed rows and bounded portable diagnostics are
+    //     nonblocking by policy;
+    //   * super — the KVM/DBI stress rows were unreachable in validate.sh, so
+    //     their first measurement is reported rather than ratcheted;
+    //   * envelope — it is a measurement, so probe failures lower a count and
+    //     only the build/preflight spine can fail it.
+    let blocking_failures = outcomes
+        .iter()
+        .filter(|o| !o.ok && !o.aborted && !plan.nonblocking.contains(&o.tag))
+        .count();
+    let effective_failures = if plan.compat.is_some() {
+        compat_blocking
+    } else if plan.super_mode {
+        blocking_failures + super_blocking
+    } else {
+        blocking_failures
+    };
+    let mut exit_code: u8 = if effective_failures == 0 { 0 } else { 1 };
+    // `ok` from the runner reflects every node, including the nonblocking ones,
+    // so it is only authoritative when nothing is excused.
+    if plan.nonblocking.is_empty() && plan.compat.is_none() && !ok {
+        exit_code = 1;
+    }
+    if envelope_regressed {
+        exit_code = 1;
+    }
+    if let Some((code, _)) = envelope_error {
+        exit_code = code;
+    }
 
     // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
     // zero_executed_nodes is always empty and means "not determinable here", not
@@ -2033,10 +3048,11 @@ fn main() -> ExitCode {
     let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let dirty_now = tree_dirty();
 
+    let commit_anchored = commit != "unknown" && !dirty_now;
     let ctx = LedgerCtx {
         started_at,
-        host: sh("hostname", &["-s"]).unwrap_or_else(|| "unknown".into()),
-        toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
+        host: host.clone(),
+        toolchain: toolchain.clone(),
         slot: slot_name(&root, parent.as_deref()),
         cwd: root.to_string_lossy().into(),
         profile: plan.profile.clone(),
@@ -2046,33 +3062,93 @@ fn main() -> ExitCode {
         tree: git_tree(),
         git_ahead,
         git_behind,
-        commit_anchored: commit != "unknown" && !dirty_now,
+        commit_anchored,
         tree_dirty: dirty_now,
         dag_jobs: jobs,
     };
     write_ledger(
-        &ledger_path(&root),
+        &ledger,
         &ctx,
         &outcomes,
         &skipped,
         wall,
         exit_code,
-        &durable.path.to_string_lossy(),
+        &log_path.to_string_lossy(),
         plan.suite_complete,
         coverage,
     );
 
-    let marker = if exit_code == 0 { "✅" } else { "❌" };
-    println!(
-        "{marker} {} — {} node(s) executed, {failures} failed, {} skipped in {} at -j {jobs}",
-        if exit_code == 0 { "PASS" } else { "FAIL" },
-        outcomes.len(),
-        skipped.len(),
-        human_duration(wall)
-    );
-    println!("   durable log: {}", durable.path.display());
+    // Receipt publication, strictly AFTER the ledger append: `ci-hub
+    // apply-local-label` re-derives the receipt FROM the ledger, so publishing
+    // first would label the PR from the previous run's newest row. Non-fatal by
+    // contract — the exit code is already decided above and nothing here can
+    // change it (validate.sh:1735).
+    match validate_receipt::eligible(
+        exit_code,
+        effective_failures,
+        args.label_pr,
+        commit_anchored,
+        dirty_now,
+        &plan.profile,
+    ) {
+        Ok(()) => {
+            let _ = validate_receipt::publish(&ledger);
+        }
+        Err(why) => {
+            if args.verbose {
+                eprintln!("validate: not publishing a receipt-backed label: {why}");
+            }
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
-    durable.finish();
-    ExitCode::from(exit_code)
+
+    // The completed-run summary. Names the excused rows explicitly, so a green
+    // verdict that ignored some failures can never read as "everything passed".
+    let mut detail = Vec::new();
+    let excused = failures - blocking_failures;
+    if exit_code == 0 {
+        detail.push(format!("every blocking gate passed ({} node(s) ran)", outcomes.len()));
+    } else {
+        let named: Vec<&str> = outcomes
+            .iter()
+            .filter(|o| !o.ok && !o.aborted && !plan.nonblocking.contains(&o.tag))
+            .map(|o| o.tag.as_str())
+            .take(8)
+            .collect();
+        detail.push(format!(
+            "{effective_failures} blocking failure(s){}",
+            if named.is_empty() { String::new() } else { format!(": {}", named.join(", ")) }
+        ));
+    }
+    if excused > 0 {
+        detail.push(format!(
+            "{excused} failing node(s) were NONBLOCKING by policy and excluded from the verdict \
+             (see the ratchet lines above for which and why)"
+        ));
+    }
+    if !timed_out_nodes(&outcomes).is_empty() {
+        detail.push(format!(
+            "{} node(s) hit a wall or CPU budget; a timeout IS a recorded result: {}",
+            timed_out_nodes(&outcomes).len(),
+            timed_out_nodes(&outcomes).join(", ")
+        ));
+    }
+    if !skipped.is_empty() {
+        detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+    }
+    let mut s = RunSummary::new(
+        if exit_code == 0 { Verdict::Pass } else { Verdict::Fail },
+        exit_code,
+        &plan.profile,
+        detail,
+    );
+    s.nodes_executed = outcomes.len();
+    s.nodes_failed = failures;
+    s.nodes_skipped = skipped.len();
+    s.wall_s = Some(wall);
+    s.jobs = Some(jobs);
+    s.log = Some(log_path);
+    s.ledger = Some(ledger);
+    s
 }
