@@ -9,6 +9,7 @@
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -58,6 +59,9 @@ enum ProcfsKind {
     ArchStatus,
     CpuidleCounter,
     Smaps,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-liteinst-maps-inode): Review mapping-inode normalization.
+    Maps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
     KeyUsers,
@@ -359,7 +363,9 @@ pub(crate) struct ProcfsFile {
 }
 
 /// Guest-visible values used to normalize one procfs snapshot.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+// Not `Copy`: the maps inode table is a Vec. Every construction site
+// builds the value once and hands it to `initialize_procfs`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_uptime_seconds: u64,
     pub(crate) virtual_realtime_seconds: i64,
@@ -369,6 +375,11 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
     pub(crate) random_uuid: Option<[u8; 16]>,
+    /// Raw-to-virtual inode pairs for every mapping row in a `/proc/<pid>/maps`
+    /// snapshot, resolved through the same `determinize_inode` namespace that
+    /// `stat`, `getdents` and `/proc/<pid>/fd` already use. Empty for every
+    /// other procfs kind.
+    pub(crate) maps_inodes: Vec<(u64, u64)>,
 }
 
 impl ProcfsFile {
@@ -447,6 +458,10 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
+            // Must follow the "smaps"/"numa_maps" arms only for readability;
+            // `is_process_file_path` matches the exact leaf, so these three
+            // cannot shadow one another.
+            other if is_process_file_path(other, "maps") => ProcfsKind::Maps,
             "/proc/key-users" => ProcfsKind::KeyUsers,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-903): Review host pressure accounting normalization.
@@ -573,6 +588,11 @@ impl ProcfsFile {
         self.kind == ProcfsKind::RandomUuid
     }
 
+    /// Whether this snapshot's mapping rows carry inodes needing determinizing.
+    pub(crate) fn needs_maps_inodes(&self) -> bool {
+        self.kind == ProcfsKind::Maps
+    }
+
     /// Normalizes and stores a complete snapshot captured from the kernel.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity normalization.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
@@ -586,6 +606,7 @@ impl ProcfsFile {
             virtual_pty_count,
             fdinfo_identity,
             random_uuid,
+            maps_inodes,
         } = context;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
@@ -641,6 +662,7 @@ impl ProcfsFile {
             ProcfsKind::Swaps => sanitize_swaps(&contents),
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents),
+            ProcfsKind::Maps => sanitize_maps(&contents, &maps_inodes),
             ProcfsKind::KeyUsers => sanitize_key_users(&contents),
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::Buddyinfo => sanitize_buddyinfo(&contents),
@@ -2540,6 +2562,130 @@ fn is_smaps_mapping_header(line: &str) -> bool {
     start < end && valid_permissions && valid_offset && valid_device && valid_inode
 }
 
+/// Byte span of the inode field in a `/proc/<pid>/maps` row, with its value.
+///
+/// The row is `start-end perms offset dev inode` followed by padding and an
+/// optional pathname, so the inode is the fifth whitespace-delimited token.
+/// `None` when the line is not a mapping row.
+fn maps_row_inode_span(line: &str) -> Option<(Range<usize>, u64)> {
+    if !is_smaps_mapping_header(line) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut offset = 0;
+    for token_index in 0..=4 {
+        while offset < bytes.len() && bytes[offset] == b' ' {
+            offset += 1;
+        }
+        let start = offset;
+        while offset < bytes.len() && bytes[offset] != b' ' {
+            offset += 1;
+        }
+        if start == offset {
+            return None;
+        }
+        if token_index == 4 {
+            return line[start..offset]
+                .parse::<u64>()
+                .ok()
+                .map(|inode| (start..offset, inode));
+        }
+    }
+    None
+}
+
+/// Every distinct nonzero raw inode named by a `/proc/<pid>/maps` snapshot, in
+/// order of first appearance. Zero means "no backing file" and is already
+/// deterministic, so it is not determinized.
+pub(crate) fn maps_raw_inodes(contents: &[u8]) -> Vec<u64> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    let mut inodes: Vec<u64> = Vec::new();
+    for line in text.lines() {
+        if let Some((_, inode)) = maps_row_inode_span(line)
+            && inode != 0
+            && !inodes.contains(&inode)
+        {
+            inodes.push(inode);
+        }
+    }
+    inodes
+}
+
+/// Replace host inode numbers in `/proc/<pid>/maps` with their determinized
+/// equivalents.
+///
+/// The inode column is a host-global allocation counter. For a file-backed
+/// mapping it is stable across runs, but for an anonymous file — notably a
+/// `memfd`, which is how the LiteInst backend publishes its trampolines — the
+/// kernel draws it from a machine-wide sequence, so two otherwise identical
+/// runs disagree. Any guest that reads its own maps then holds host state:
+/// under `--detlog-heap` that text is hashed and the run looks nondeterministic
+/// even though every address, permission and syscall matches.
+///
+/// No row and no byte of guest data is dropped. Only the inode value changes,
+/// and it changes into the same namespace `stat`, `getdents` and
+/// `/proc/<pid>/fd` already report, so a guest comparing the two now sees them
+/// agree — today it does not.
+///
+/// The pathname column is preserved: the width difference is absorbed by the
+/// padding the kernel already emits, so line lengths, read offsets and chunk
+/// boundaries are untouched.
+fn sanitize_maps(contents: &[u8], inode_map: &[(u64, u64)]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut normalized = Vec::with_capacity(contents.len());
+    let mut rows = 0;
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.strip_suffix('\n').unwrap_or(line);
+
+        // A row we cannot parse is a shape we do not model. Return the file
+        // byte-identical rather than half-normalizing it.
+        let Some((span, raw_inode)) = maps_row_inode_span(body) else {
+            return contents.to_vec();
+        };
+        rows += 1;
+
+        let virtual_inode = inode_map
+            .iter()
+            .find_map(|(host, virtualized)| (*host == raw_inode).then_some(*virtualized))
+            .unwrap_or(raw_inode);
+        let replacement = virtual_inode.to_string();
+
+        let bytes = body.as_bytes();
+        let trailing = &bytes[span.end..];
+        let padding = trailing.iter().take_while(|byte| **byte == b' ').count();
+        let pathname = &trailing[padding..];
+        // Keep the pathname where the kernel put it by spending the freed (or
+        // borrowed) width on the padding run. Never collapse the separator to
+        // nothing when a pathname follows.
+        let field_width = (span.end - span.start) + padding;
+        let mut keep = field_width.saturating_sub(replacement.len());
+        if keep == 0 && !pathname.is_empty() {
+            keep = 1;
+        }
+
+        normalized.extend_from_slice(&bytes[..span.start]);
+        normalized.extend_from_slice(replacement.as_bytes());
+        normalized.extend(std::iter::repeat_n(b' ', keep));
+        normalized.extend_from_slice(pathname);
+
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
+
+    if rows == 0 {
+        contents.to_vec()
+    } else {
+        normalized
+    }
+}
+
 fn is_smaps_kilobyte_value(value: &str) -> bool {
     let mut fields = value.split_whitespace();
     matches!(
@@ -3541,7 +3687,146 @@ mod tests {
             );
         }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
-        assert!(ProcfsFile::from_path(Path::new("/proc/self/maps")).is_none());
+        // `/proc/<pid>/maps` used to be deliberately unclassified and this
+        // assertion pinned that. It is now snapshotted so its host inode
+        // numbers can be determinized; see `recognizes_maps_paths`.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Maps
+        );
+    }
+
+    #[test]
+    fn recognizes_maps_paths() {
+        for path in [
+            "/proc/self/maps",
+            "/proc/thread-self/maps",
+            "/proc/123/maps",
+            "/proc/self/task/456/maps",
+        ] {
+            assert_eq!(
+                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
+                ProcfsKind::Maps,
+                "{path}"
+            );
+        }
+        // The neighbouring leaves must keep their own kinds: `is_process_file_path`
+        // matches an exact leaf, so `maps` must not swallow these.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Smaps
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NumaMaps
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
+                .unwrap()
+                .kind,
+            ProcfsKind::SmapsRollup
+        );
+    }
+
+    /// Two real rows captured from a LiteInst run of a trivial guest. The
+    /// memfd inodes are what differed between two otherwise identical runs.
+    const MAPS_SAMPLE: &[u8] = concat!(
+        "00380000-00400000 r-xs 00000000 00:01 314404                             /memfd:liteinst2-trampoline (deleted)\n",
+        "00405000-00426000 rw-p 00000000 00:00 0                                  [heap]\n",
+        "7ffff7d8b000-7ffff7db1000 r--p 00000000 00:23 6029325                    /usr/lib64/libc.so.6\n",
+    ).as_bytes();
+
+    #[test]
+    fn maps_inode_is_replaced_by_its_determinized_value() {
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(
+            !text.contains("314404"),
+            "host memfd inode survived: {text}"
+        );
+        assert!(
+            !text.contains("6029325"),
+            "host file inode survived: {text}"
+        );
+        assert!(text.contains(" 7 "), "virtual memfd inode absent: {text}");
+        assert!(text.contains(" 8 "), "virtual file inode absent: {text}");
+    }
+
+    #[test]
+    fn maps_sanitizing_drops_no_row_and_no_guest_data() {
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let text = std::str::from_utf8(&out).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        // Every address, permission and pathname is preserved verbatim.
+        for fragment in [
+            "00380000-00400000 r-xs 00000000 00:01",
+            "/memfd:liteinst2-trampoline (deleted)",
+            "00405000-00426000 rw-p 00000000 00:00",
+            "[heap]",
+            "7ffff7d8b000-7ffff7db1000 r--p 00000000 00:23",
+            "/usr/lib64/libc.so.6",
+        ] {
+            assert!(text.contains(fragment), "lost {fragment:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn maps_sanitizing_keeps_the_pathname_column() {
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let original = std::str::from_utf8(MAPS_SAMPLE).unwrap();
+        let text = std::str::from_utf8(&out).unwrap();
+        for (before, after) in original.lines().zip(text.lines()) {
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "row width changed, which would move read offsets:\n{before}\n{after}"
+            );
+            assert_eq!(
+                before.find('/').or_else(|| before.find('[')),
+                after.find('/').or_else(|| after.find('[')),
+                "pathname column moved:\n{before}\n{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_anonymous_zero_inode_is_left_alone() {
+        // Zero means "no backing file"; it is already deterministic and must
+        // not be rewritten into some virtual object.
+        let out = sanitize_maps(MAPS_SAMPLE, &[(314404, 7), (6029325, 8)]);
+        let text = std::str::from_utf8(&out).unwrap();
+        let heap = text.lines().find(|line| line.contains("[heap]")).unwrap();
+        assert_eq!(heap.split_whitespace().nth(4), Some("0"));
+    }
+
+    #[test]
+    fn maps_raw_inodes_collects_distinct_nonzero_values_in_order() {
+        assert_eq!(maps_raw_inodes(MAPS_SAMPLE), vec![314404, 6029325]);
+        // Repeats collapse; a memfd is mapped twice (r-x and rw-).
+        let repeated = b"00380000-00400000 r-xs 00000000 00:01 42  /memfd:x\n\
+                         00400000-00480000 rw-s 00000000 00:01 42  /memfd:x\n";
+        assert_eq!(maps_raw_inodes(repeated), vec![42]);
+    }
+
+    #[test]
+    fn maps_with_an_unparseable_row_is_returned_unchanged() {
+        // Fail closed: never half-normalize a shape we do not model.
+        let malformed = b"this is not a maps row\n";
+        assert_eq!(sanitize_maps(malformed, &[(1, 2)]), malformed.to_vec());
+    }
+
+    #[test]
+    fn maps_without_a_determinized_entry_keeps_its_raw_inode() {
+        // An inode we were not given a mapping for must pass through rather
+        // than silently becoming zero or being dropped.
+        let out = sanitize_maps(MAPS_SAMPLE, &[]);
+        assert_eq!(out, MAPS_SAMPLE.to_vec());
     }
 
     #[test]

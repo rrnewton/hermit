@@ -448,6 +448,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // Mapping rows name host inodes. For a file-backed mapping that value
+        // is stable, but an anonymous file (a `memfd`, which is how the
+        // LiteInst backend publishes its trampolines) draws its inode from a
+        // machine-wide counter, so it differs run to run. Resolve every one
+        // through the same namespace `stat` and `getdents` already use, so the
+        // guest sees one consistent inode per object instead of host state.
+        let needs_maps_inodes = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_maps_inodes())?;
+        let mut maps_inodes = Vec::new();
+        if needs_maps_inodes {
+            for raw_inode in crate::procfs::maps_raw_inodes(&contents) {
+                let virtual_inode = determinize_inode(guest, raw_inode).await.0;
+                maps_inodes.push((raw_inode, virtual_inode));
+            }
+        }
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -467,6 +483,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_pty_count,
                     fdinfo_identity,
                     random_uuid,
+                    maps_inodes: maps_inodes.clone(),
                 },
             );
         })?;

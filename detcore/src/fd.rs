@@ -345,6 +345,14 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_random_uuid)
     }
 
+    /// Whether this procfs snapshot needs its mapping inodes determinized.
+    pub(crate) fn procfs_needs_maps_inodes(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_maps_inodes)
+    }
+
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
