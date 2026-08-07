@@ -173,9 +173,11 @@ impl CompatMode {
     }
 }
 
-/// Build a fully-declared node. There is no other constructor in this module, so
-/// a node cannot be created without caps.
-fn node(
+/// Build a fully-declared node. This is the ONLY node constructor the plan
+/// modules use, so a node cannot be created without caps. It is `pub(crate)` in
+/// spirit — `validate_super` and `validate_envelope` call it precisely so that
+/// their nodes cannot skip the cap declaration either.
+pub fn node(
     group: &str,
     job: &str,
     desc: &str,
@@ -341,32 +343,68 @@ pub fn compat_nodes(
     paths: &CorpusPaths,
     gate_dep: Option<&str>,
 ) -> Result<Vec<Step>, String> {
+    compat_nodes_for(root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None)
+}
+
+/// [`compat_nodes`] with two extra knobs used by the `super` suite's
+/// `run_portable_slow_strict_diagnostics` port (validate.sh:4603).
+///
+/// * `only` restricts the corpus to an explicit label set AND suppresses the
+///   `PORTABLE_STRICT_SUPER_ONLY` skip — because that gate exists precisely to
+///   defer those four heavy rows *to this suite*, so the suite that runs them
+///   must not also honor the deferral.
+/// * `wall_override` replaces the per-row 60s corpus budget. The bash gave the
+///   whole group of four one 600s `run_check_with_timeout`; each of these rows
+///   is a full compile-link-run or JVM startup workload, so inheriting the
+///   group's budget per node is the faithful reading. The 60s corpus default
+///   would fail all four for lack of time and report it as a compatibility loss.
+#[allow(clippy::too_many_arguments)]
+pub fn compat_nodes_for(
+    root: &Path,
+    mode: CompatMode,
+    hermit_bin: &str,
+    nsswitch: &str,
+    paths: &CorpusPaths,
+    gate_dep: Option<&str>,
+    only: Option<&std::collections::BTreeSet<String>>,
+    wall_override: Option<i64>,
+) -> Result<Vec<Step>, String> {
     let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
     let rr_allowed: Vec<&str> = validate_corpus::RR_PASSING_LABELS.to_vec();
     let super_only = validate_corpus::portable_super_only();
     let mut out = Vec::new();
     for row in rows {
+        if let Some(keep) = only {
+            if !keep.contains(&row.label) {
+                continue;
+            }
+        }
         // rr measures ONLY the labels proven to pass record/replay; the bash
         // applies the same filter inside rr_compatibility_probe.
         if mode == CompatMode::Rr && !rr_allowed.contains(&row.label.as_str()) {
             continue;
         }
         // Heavy runtime workloads are deferred out of the portable profile to the
-        // scheduled super suite (validate.sh:3090).
-        if mode == CompatMode::PortableStrict && super_only.contains_key(row.label.as_str()) {
+        // scheduled super suite (validate.sh:3090) — unless this IS that suite,
+        // which names them explicitly through `only`.
+        if only.is_none()
+            && mode == CompatMode::PortableStrict
+            && super_only.contains_key(row.label.as_str())
+        {
             continue;
         }
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
         argv.extend(row.argv.iter().cloned());
+        let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.assurance(), row.label),
             format!("{} </dev/null", shell_join(&argv)),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
-            mode.timeout_for(&row.label),
-            COMPAT_CPU_TIMEOUT_S,
+            wall,
+            COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
         ));
     }
@@ -374,6 +412,41 @@ pub fn compat_nodes(
         return Err(format!("compatibility mode {mode:?} selected zero probes"));
     }
     Ok(out)
+}
+
+/// Keep only the named lane nodes, pruning each survivor's deps to the kept set.
+///
+/// Port of `build_selected_portable_dag` (validate.sh:4400), which did the same
+/// `jq` surgery into a temporary DAG file consumed through
+/// `RUN_DAG_FILE_OVERRIDE`. Here the plan is already in memory, so no temp file
+/// and no second DAG-loading path are involved.
+///
+/// `ci/select-tests.rs` emits a dependency-CLOSED node set, so pruning cannot
+/// drop a genuine dependency — but that is the selector's guarantee, not this
+/// function's, so the caller is told how many edges were pruned and how many of
+/// the requested tags were not found. An unknown tag is a selector/DAG mismatch
+/// and is reported rather than silently ignored.
+pub struct Selection {
+    pub steps: Vec<Step>,
+    pub pruned_edges: usize,
+    pub unknown_tags: Vec<String>,
+}
+
+pub fn select_lane_nodes(all: Vec<Step>, keep: &std::collections::BTreeSet<String>) -> Selection {
+    let present: std::collections::BTreeSet<String> = all.iter().map(|s| s.tag()).collect();
+    let unknown_tags: Vec<String> = keep.difference(&present).cloned().collect();
+    let mut pruned_edges = 0usize;
+    let steps = all
+        .into_iter()
+        .filter(|s| keep.contains(&s.tag()))
+        .map(|mut s| {
+            let before = s.deps.len();
+            s.deps.retain(|d| keep.contains(d) || !present.contains(d));
+            pruned_edges += before - s.deps.len();
+            s
+        })
+        .collect();
+    Selection { steps, pruned_edges, unknown_tags }
 }
 
 /// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
