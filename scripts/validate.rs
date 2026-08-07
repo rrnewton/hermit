@@ -643,6 +643,77 @@ fn self_test() -> Result<(), String> {
     envelope_cli_bracket()?;
     super_plan_bracket()?;
     selective_subset_bracket(&root)?;
+    self_output_bracket()?;
+    Ok(())
+}
+
+/// Bracket the self-output classifier that decides whether the tree is dirty.
+///
+/// This predicate is load-bearing in a way that is easy to miss: `tree_dirty()`
+/// feeds `commit_anchored`, which gates BOTH the tree-keyed cache and receipt
+/// publication. When it was wrong, both features were inert and nothing said so
+/// — every run simply recorded `commit_anchored: false` and re-ran. So each
+/// listing SHAPE gets an explicit case, including the exact one that regressed:
+/// a porcelain line whose leading status column has been eaten by a trim.
+fn self_output_bracket() -> Result<(), String> {
+    // MUST be excused (validate's own output, in every shape a caller emits).
+    let excused = [
+        (" M ci/validate-ledger/local.devbig014.jsonl", "porcelain, modified, leading space intact"),
+        ("M ci/validate-ledger/local.devbig014.jsonl", "porcelain whose leading space a trim ate"),
+        ("?? ci/validate-ledger/local.other.jsonl", "porcelain, untracked shard"),
+        ("ci/validate-ledger/local.devbig014.jsonl", "bare path (git diff --name-only)"),
+        ("ignored/validate/validate-full-abc-1.log", "bare path, durable log"),
+        (" M \"ci/validate-ledger/has space.jsonl\"", "porcelain, quoted path"),
+        ("R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl", "rename within the ledger dir"),
+    ];
+    for (line, why) in excused {
+        if !line_is_self_output(line) {
+            return Err(format!("self-output: {line:?} ({why}) must be excused as validate's own"));
+        }
+    }
+    // MUST NOT be excused. A predicate that excused everything would satisfy the
+    // list above and silently disable the dirty gate entirely.
+    let foreign = [
+        (" M scripts/validate.rs", "a real source change"),
+        ("?? detcore/src/new_thing.rs", "a new untracked source file"),
+        ("M  Cargo.lock", "a staged lockfile change"),
+        ("scripts/lib/validate_plan.rs", "bare path, real source"),
+        ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
+        ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
+        (" M ci/dag/portable.json", "a lane change under ci/, but not the ledger"),
+        (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
+    ];
+    for (line, why) in foreign {
+        if line_is_self_output(line) {
+            return Err(format!("self-output: {line:?} ({why}) must count as a DIRTY tree"));
+        }
+    }
+    // LIVE invariant, independent of the synthetic shapes above: whatever this
+    // checkout's real state is, no surviving entry may be validate's own output.
+    // This is what actually catches a reintroduced trim, because it exercises
+    // the real `git` invocation rather than a hand-written line.
+    let mut live = 0usize;
+    for args in [
+        vec!["status", "--porcelain"],
+        vec!["diff", "--name-only"],
+        vec!["ls-files", "--others", "--exclude-standard"],
+    ] {
+        for line in foreign_porcelain(&args) {
+            live += 1;
+            if path_readings(&line).iter().any(|p| is_self_output(p)) {
+                return Err(format!(
+                    "self-output: `git {}` leaked validate's own output into the dirty set: {line:?}",
+                    args.join(" ")
+                ));
+            }
+        }
+    }
+    println!(
+        "  self-output: {} own-output shape(s) excused, {} foreign change(s) still dirty, \
+         {live} live entr(y/ies) from the real checkout all correctly classified",
+        excused.len(),
+        foreign.len()
+    );
     Ok(())
 }
 
@@ -1076,28 +1147,103 @@ fn repo_root() -> PathBuf {
 /// gitignored (the shards are meant to be committed and unioned across machines).
 const SELF_OUTPUT_PREFIXES: &[&str] = &[LEDGER_DIR, "ignored/"];
 
+/// True when `path` is inside (or equal to) one of validate's own output roots.
+///
+/// The match is on a PATH BOUNDARY, not a raw string prefix. A bare
+/// `starts_with("ci/validate-ledger")` also swallowed siblings such as
+/// `ci/validate-ledger-notes.md`, which would have been silently excused from the
+/// dirty gate — the opposite of the failure it is meant to prevent, and exactly
+/// the kind of "correlated proxy" match this driver is supposed to avoid.
 fn is_self_output(path: &str) -> bool {
-    SELF_OUTPUT_PREFIXES.iter().any(|p| path.starts_with(p))
+    SELF_OUTPUT_PREFIXES.iter().any(|p| {
+        let root = p.trim_end_matches('/');
+        path == root || path.starts_with(&format!("{root}/"))
+    })
+}
+
+/// Every path a git listing line could be referring to.
+///
+/// The callers emit two different shapes — `git status --porcelain` prefixes each
+/// path with a two-character status plus a space, while `git diff --name-only`
+/// and `git ls-files` emit a bare path — and a rename line carries two paths.
+/// Rather than guess which caller produced a line, every plausible reading is
+/// derived and the classification asks whether ALL of them are validate's own
+/// output.
+///
+/// **Do not reintroduce a fixed-offset strip.** Two bugs have now come from one:
+/// stripping three characters unconditionally broke the bare-path callers
+/// (turning `ci/validate-ledger/…` into `validate-ledger/…`), and the fix for
+/// that still relied on the porcelain line keeping its leading status column —
+/// which `sh()` trimmed off the FIRST line of the output. The measured effect of
+/// the second bug: after any run, `git status --porcelain` returned exactly one
+/// line, ` M ci/validate-ledger/<shard>.jsonl`, whose leading space `sh()` ate;
+/// the 3-char strip then produced `i/validate-ledger/…`, no reading matched, and
+/// `tree_dirty()` reported TRUE. Every subsequent ledger row was written with
+/// `commit_anchored: false`, so the tree-keyed cache could never hit and a
+/// receipt-backed label could never be published — both features inert, silently.
+fn path_readings(line: &str) -> Vec<String> {
+    let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+    let mut out = vec![unquote(line)];
+    if let Some(rest) = porcelain_payload(line) {
+        out.push(unquote(rest));
+    }
+    // Belt and braces for the exact bug this replaced: a porcelain line whose
+    // leading status column was eaten by a trim reads as `M <path>`. Reading it
+    // costs nothing (an extra reading can only WIDEN "self output", and the two
+    // prefixes are specific paths) and it means a future accidental trim
+    // degrades to "still classified correctly" instead of "cache silently off".
+    const CODES: &[u8] = b"MADRCUT?!";
+    let b = line.as_bytes();
+    if b.len() > 2 && b[1] == b' ' && CODES.contains(&b[0]) {
+        out.push(unquote(&line[2..]));
+    }
+    out
+}
+
+/// If `line` has a `git status --porcelain` `XY ` prefix, the text after it.
+///
+/// Both status characters are checked against git's actual code set rather than
+/// just testing for a space at index 2, so an ordinary path that happens to
+/// contain a space in its third position is not mistaken for a status prefix.
+fn porcelain_payload(line: &str) -> Option<&str> {
+    const CODES: &[u8] = b" MADRCUT?!";
+    let b = line.as_bytes();
+    if b.len() > 3 && b[2] == b' ' && CODES.contains(&b[0]) && CODES.contains(&b[1]) {
+        Some(&line[3..])
+    } else {
+        None
+    }
+}
+
+/// True when this listing line describes only validate's own output.
+///
+/// A rename (`R  old -> new`) counts as self-output only when BOTH sides are:
+/// moving a source file INTO the ledger directory is a real change and must not
+/// be excused.
+fn line_is_self_output(line: &str) -> bool {
+    let payload: &str = porcelain_payload(line).unwrap_or(line);
+    if let Some((from, to)) = payload.split_once(" -> ") {
+        let clean = |s: &str| s.trim().trim_matches('"').to_string();
+        return is_self_output(&clean(from)) && is_self_output(&clean(to));
+    }
+    path_readings(line).iter().any(|p| is_self_output(p))
 }
 
 /// Entries from a git listing that are not validate's own output.
 ///
-/// The callers emit two different shapes — `git status --porcelain` prefixes each
-/// path with a two-character status plus a space, while `git diff --name-only`
-/// and `git ls-files` emit a bare path. Testing BOTH forms is deliberate: an
-/// earlier version stripped three characters unconditionally, which turned
-/// `ci/validate-ledger/...` into `validate-ledger/...` for the bare-path callers,
-/// failed the prefix match, and made validate refuse on its own ledger write.
+/// Reads git's stdout UNTRIMMED, because `git status --porcelain`'s leading
+/// status column is significant and a global trim silently shifts the first
+/// line's columns (see [`path_readings`]).
 fn foreign_porcelain(args: &[&str]) -> Vec<String> {
-    let Some(out) = sh("git", args) else { return Vec::new() };
-    out.lines()
+    let Ok(out) = Command::new("git").args(args).output() else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter(|l| {
-            let bare = l.trim().trim_matches('"');
-            let stripped = l.get(3..).unwrap_or(l).trim().trim_matches('"');
-            !is_self_output(bare) && !is_self_output(stripped)
-        })
-        .map(|l| l.to_string())
+        .filter(|l| !line_is_self_output(l))
+        .map(|l| l.trim_end().to_string())
         .collect()
 }
 
