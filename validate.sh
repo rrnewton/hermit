@@ -791,10 +791,11 @@ failures=0
 # The signal trap sets this before EXIT cleanup writes the ledger. An explicit
 # operator stop is a NO-RESULT unless a completed gate already proved a failure.
 VALIDATION_INTERRUPTION_SIGNAL=""
-# A validate receipt is trustworthy only when this run proved that the recorded
-# Reverie dependency equals the live main tip. cleanup fails closed if any path
-# reaches a nominally successful exit without setting this after the gate.
+# A validate receipt is trustworthy only when this run proved that every
+# independently owned dependency equals its live main tip. cleanup fails closed
+# if any path reaches a nominally successful exit without setting both gates.
 REVERIE_PIN_GATE_PASSED=0
+AGENT_UTILS_PIN_GATE_PASSED=0
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -1420,7 +1421,7 @@ function append_validation_ledger {
     local first_error_line_json=null failed_substep_classes_json='[]'
     local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
-    local reverie_pin_current_json
+    local reverie_pin_current_json agent_utils_pin_current_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1525,6 +1526,7 @@ function append_validation_ledger {
         interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
     fi
     if ((REVERIE_PIN_GATE_PASSED == 1)); then reverie_pin_current_json=true; else reverie_pin_current_json=false; fi
+    if ((AGENT_UTILS_PIN_GATE_PASSED == 1)); then agent_utils_pin_current_json=true; else agent_utils_pin_current_json=false; fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1560,6 +1562,7 @@ function append_validation_ledger {
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"reverie_pin_current\":$reverie_pin_current_json,"
+    line+="\"agent_utils_pin_current\":$agent_utils_pin_current_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
@@ -1695,6 +1698,11 @@ function cleanup {
     # return success merely because its selected tests happened to pass.
     if ((exit_status == 0 && REVERIE_PIN_GATE_PASSED != 1)); then
         printf "❌ Validation path bypassed the latest-Reverie pin gate; refusing a passing receipt.\n" >&2
+        failures=$((failures + 1))
+        exit_status=1
+    fi
+    if ((exit_status == 0 && AGENT_UTILS_PIN_GATE_PASSED != 1)); then
+        printf "❌ Validation path bypassed the latest-agent-utils pin gate; refusing a passing receipt.\n" >&2
         failures=$((failures + 1))
         exit_status=1
     fi
@@ -2065,13 +2073,10 @@ function initialize_repository_submodules {
     }
 }
 
-# Independent enforcement of the Reverie dependency pin. `git commit --no-verify`
-# bypasses the pre-commit hook, so validate.sh (and therefore every CI profile
-# that runs it) must catch a drifted or orphaned pin on its own. The check is
-# cheap: the canonical Reverie-pin checker scans tracked Cargo.toml/Cargo.lock and confirms
-# the pin is a real commit on rrnewton/reverie:main history. When the nested
-# lockfile guard is present (lands separately as rrnewton/hermit#1609) it also
-# runs so liteinst-runtime-build/Cargo.lock cannot drift from the root pin.
+# Independent enforcement of dependency pins. `git commit --no-verify` bypasses
+# the pre-commit hook, so validate.sh must invoke each authority-specific
+# verifier itself. The Reverie checker scans tracked Cargo metadata; the
+# agent-utils checker compares the tracked gitlink directly with its live main.
 #
 # Run a remaining standalone repository checker WITHOUT requiring the
 # `rust-script` interpreter on PATH. The Reverie-pin checker itself always uses
@@ -4739,12 +4744,22 @@ if ((failures != 0)); then
 fi
 REVERIE_PIN_GATE_PASSED=1
 
+# Agent-utils is a separate repository authority. Keep this gate distinct so a
+# stale tooling gitlink cannot hide behind a green Reverie result.
+run_check "Agent-utils dependency pin equals latest main" \
+    "$ROOT_DIR/ci/run-agent-utils-pin-check.sh" --repo "$ROOT_DIR"
+if ((failures != 0)); then
+    print_summary
+    exit 1
+fi
+AGENT_UTILS_PIN_GATE_PASSED=1
+
 # Keep direct ./validate.sh invocations as self-sufficient as `make validate`.
 # This initializes Hermit's registered submodules; Cargo's pinned Reverie build
 # script separately materializes its nested DynamoRIO checkout.
 run_check "Initialize repository submodules" initialize_repository_submodules
-# Fail fast on Reverie pin drift before any heavy build/test work. Independent of
-# the pre-commit hook, which git commit --no-verify can bypass.
+# Fail fast on Reverie metadata/lockfile drift before any heavy build/test work.
+# Independent of the pre-commit hook, which git commit --no-verify can bypass.
 run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
