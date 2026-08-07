@@ -207,6 +207,10 @@ class Fixtures:
                 local / "sigaltstack_state.c",
                 ("-D_GNU_SOURCE",),
             ),
+            "getcpu_identity": (
+                REPOSITORY / "tests/c/getcpu_identity.c",
+                (),
+            ),
         }
         source, flags = sources[name]
         binary = compile_fixture(source, self.root / name, *flags)
@@ -328,6 +332,11 @@ def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes |
             [str(fixtures.binary("sigaltstack_state"))],
             0,
             b"sigaltstack ok=4\n",
+        ),
+        "getcpu_identity": (
+            [str(fixtures.binary("getcpu_identity"))],
+            0,
+            b"getcpu-identity-ok\n",
         ),
     }
     try:

@@ -126,10 +126,26 @@ is not reached.
 | `random_sources` | pass / detlog | pass / detlog | pass / guest |
 | `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
 | `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
+<<<<<<< HEAD
 | `signal_disposition` | pass / detlog | pass / detlog | **gap** / gap |
 | `sigaction_state` | pass / detlog | pass / detlog | **gap** / gap |
 | `sigprocmask_state` | pass / detlog | pass / detlog | **gap** / gap |
 | `sigaltstack_state` | pass / detlog | pass / detlog | **gap** / gap |
+=======
+| `getcpu_identity` | pass / detlog | pass / detlog | pass / guest |
+
+The `getcpu_identity` contract pins Detcore's `getcpu(2)` determinization. The
+guest poisons its `cpu`/`node` output words with a sentinel, then issues the raw
+`SYS_getcpu` syscall (never the vDSO `sched_getcpu`, which does not route through
+interception) repeatedly and across all three pointer combinations (both
+pointers, `cpu` only, `node` only). Detcore's `handle_getcpu` always writes
+`cpu = 0` and `node = 0` and returns `0`, so the guest observes a fixed,
+host-independent placement on every call regardless of which physical CPU the
+supervisor happened to run it on — a native run reports the real host CPU (e.g.
+115) and diverges. Because the determinization lives in the shared Detcore tool,
+the result is identical across ptrace, DBI, and KVM and across the `--verify`
+double run.
+>>>>>>> b82c71f0 (Add getcpu_identity backend-parity contract fixture)
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
