@@ -50,6 +50,14 @@
 //! libc = "0.2"
 //! ```
 
+// `serde_json::json!` expands one recursive macro level PER FIELD, and the ledger
+// record is one literal carrying every qualification a reader needs. Keeping it a
+// single literal is the point — it is what makes "the row states its own
+// conditions" checkable by eye — so the limit is raised rather than the record
+// split across statements where a field could be added on one path and not the
+// other.
+#![recursion_limit = "512"]
+
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
@@ -2288,12 +2296,17 @@ fn install_stop_handlers() {
     }
 }
 
+/// The stopping signal's BARE name (`INT`/`TERM`/`HUP`), not `SIGINT`.
+///
+/// The bare form is the ledger's `interruption_signal` value and is what
+/// `scripts/test_validate_stop_paths.py` asserts
+/// (`sig.name.removeprefix("SIG")`). Prose call sites print `SIG{name}`.
 fn interrupted_by() -> Option<&'static str> {
     match INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
         0 => None,
-        libc::SIGINT => Some("SIGINT"),
-        libc::SIGTERM => Some("SIGTERM"),
-        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("INT"),
+        libc::SIGTERM => Some("TERM"),
+        libc::SIGHUP => Some("HUP"),
         _ => Some("signal"),
     }
 }
@@ -2514,6 +2527,47 @@ struct LedgerCtx {
     cpu_sys: f64,
     /// Retry ROUNDS spent on environmental blocks; `0` for a clean first pass.
     env_block_retries: i64,
+    /// libtest counts parsed from the durable log; `None` is UNKNOWN.
+    executed_tests: Option<i64>,
+    filtered_tests: Option<i64>,
+}
+
+/// Parse the libtest `executed` / `filtered` counts out of the durable log.
+///
+/// **This is the field the whole receipt rests on.** A row whose
+/// `executed_tests` is null is a NON-VERDICT: every downstream completeness
+/// predicate keys `is_clean_full_pass` on a nonzero executed count, so a driver
+/// that ran no tests at all would otherwise emit a row indistinguishable from one
+/// that ran the whole suite. `main` at `61edbef4` recorded 862 executed / 693
+/// filtered, and a port that cannot reproduce that number has not preserved the
+/// thing validate exists to do.
+///
+/// Deliberately NOT re-implemented here: the banner parser lives once, in the
+/// parent (`ci-hub/remediation/nonzero_result.py --ledger-fields`), and every
+/// consumer calls that one. A second in-tree parser would be a second authority
+/// that can disagree. A missing helper, an unreadable log, or unparseable output
+/// all yield `None` (UNKNOWN) — never a fabricated zero.
+fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64>) {
+    let Some(parent) = parent else { return (None, None) };
+    let helper = parent.join("ci-hub/remediation/nonzero_result.py");
+    if !helper.is_file() || log.as_os_str().is_empty() {
+        return (None, None);
+    }
+    let Ok(out) = Command::new("python3")
+        .arg(&helper)
+        .arg("--ledger-fields")
+        .arg(log)
+        .output()
+    else {
+        return (None, None);
+    };
+    if !out.status.success() {
+        return (None, None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut it = text.split_whitespace();
+    let parse = |v: Option<&str>| v.and_then(|v| v.parse::<i64>().ok());
+    (parse(it.next()), parse(it.next()))
 }
 
 /// Write one JSONL ledger record.
@@ -2536,7 +2590,13 @@ fn write_ledger(
 ) {
     let gates_run = outcomes.len();
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
-    let result = if exit_code == 0 && failures == 0 { "pass" } else { "fail" };
+    // An operator stop learned nothing new about the product. Preserve the raw
+    // shell outcome for forensics, but do not mint a FAILED verdict unless a
+    // completed gate had already established one before the stop
+    // (validate.sh:1473 `interruption_is_no_result`).
+    let raw_result = if exit_code == 0 && failures == 0 { "pass" } else { "fail" };
+    let result =
+        if ctx.interruption.is_some() && failures == 0 { "no_result" } else { raw_result };
     let timed_out = timed_out_nodes(outcomes);
     // Stable per-row identity. Corrections never edit a row; they append a new
     // one carrying `corrects: <this id>`, which is what keeps the shard
@@ -2583,11 +2643,36 @@ fn write_ledger(
         "commit_anchored": ctx.commit_anchored,
         "tree_dirty": ctx.tree_dirty,
         "result": result,
-        "raw_result": result,
+        "raw_result": raw_result,
         "exit_code": exit_code,
         "checks": gates_run,
         "failures": failures,
         "dag_jobs": ctx.dag_jobs,
+        // Peak CPU-ACTIVE peer validates, and HOW that was established. `null`
+        // means UNKNOWN — a bare run with no observed peer is not proven
+        // exclusive, and writing 0 there would be a fabricated exclusivity claim.
+        "concurrent_validates": ctx.concurrent_validates,
+        "concurrency_proof": ctx.concurrency_proof,
+        // Present (non-null) only for an operator stop; `result` above is then
+        // `no_result` unless a completed gate had already failed.
+        "interruption_signal": ctx.interruption,
+        // Whole-run CPU (self + reaped children), the same numbers the printed
+        // summary carries. Wall alone cannot separate a busy run from a wedged
+        // one; the pair can.
+        "user_seconds": ctx.cpu_user,
+        "sys_seconds": ctx.cpu_sys,
+        // Retry ROUNDS spent on environmental blocks. A green that only survived
+        // because the host was retried must be distinguishable from a first-pass
+        // green.
+        "env_block_retries": ctx.env_block_retries,
+        // LIBTEST counts parsed from the durable log by the parent's single-
+        // sourced banner parser, exactly as validate.sh:1671 recorded them.
+        // `null` is UNKNOWN and stays UNKNOWN: the receipt publisher fails closed
+        // rather than turning missing evidence into a zero or a pass. These are
+        // the counts every downstream `is_clean_full_pass` predicate keys on, so
+        // a row without them is a NON-VERDICT, not a green.
+        "executed_tests": ctx.executed_tests,
+        "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
         "skipped_nodes": skipped.len(),
@@ -3413,7 +3498,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut ok = true;
     let mut env_retries = 0usize;
 
-    let mut lane = |cfg: &DagConfig| -> LaneResult {
+    let lane = |cfg: &DagConfig| -> LaneResult {
         run_lane_with_env_retries(cfg, jobs, keep_going, verbosity, cgroups.clone(), &log_path)
     };
 
@@ -3438,19 +3523,126 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let wall = (epoch_now() - started_epoch) as f64;
     print_cost_table(&outcomes, &skipped);
 
-    // Operator stop => NO-RESULT => no ledger row. A timeout, by contrast, is a
-    // completed run and falls through to the normal write below. See
-    // `install_stop_handlers` for why an interrupt row is worse than no row.
-    if let Some(sig) = interrupted_by() {
+    // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
+    //
+    // From here to the ledger append is ONE critical section. A second stop
+    // signal must not abort it between teardown and the append, or a run that did
+    // real work would leave no record of having run at all — which reads exactly
+    // like never having started. `SIG_IGN` for the window is what `trap ''
+    // INT TERM HUP` bought the bash.
+    validate_runtime::enter_cleanup_critical_section();
+    let interruption = interrupted_by().map(|s| s.to_string());
+    // Stop the monitor and take the peak ONCE, here, so the ledger and the
+    // summary cannot disagree about how crowded the box was.
+    let (peak_active, peak_live) = match &monitor {
+        Some(m) => {
+            let (a, l) = m.finish();
+            (Some(a as i64), Some(l as i64))
+        }
+        None => (None, None),
+    };
+    // Whole-run CPU, taken once in THIS process (a worker thread would see only
+    // its own accounting, exactly as a bash subshell's `times` would).
+    let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
+    let (executed_tests, filtered_tests) = libtest_counts(parent.as_deref(), &log_path);
+    if executed_tests.is_none() {
+        eprintln!(
+            "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
+             executed_tests=null is a NON-VERDICT, not a green: no downstream completeness \
+             predicate can qualify it."
+        );
+    }
+
+    // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
+    // zero_executed_nodes is always empty and means "not determinable here", not
+    // "verified none" — a node that ran while executing zero test cases is only
+    // visible in the log banners, which is finalize_receipt.py --scan's job.
+    let executed_nodes: BTreeSet<String> = outcomes
+        .iter()
+        .filter(|o| !o.aborted)
+        .map(|o| o.tag.clone())
+        .filter(|t| plan.planned_test_nodes.contains(t))
+        .collect();
+    let absent: Vec<&String> =
+        plan.planned_test_nodes.iter().filter(|t| !executed_nodes.contains(*t)).collect();
+    let coverage = serde_json::json!({
+        "planned_test_nodes": plan.planned_test_nodes.len(),
+        "executed_test_nodes": executed_nodes.len(),
+        "zero_executed_nodes": Vec::<String>::new(),
+        "absent_nodes": absent,
+    });
+
+    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
+        .unwrap_or_else(|| "0 0".into());
+    let mut ba = behind_ahead.split_whitespace();
+    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let dirty_now = tree_dirty();
+    let commit_anchored = commit != "unknown" && !dirty_now;
+    let ctx = LedgerCtx {
+        started_at,
+        host: host.clone(),
+        toolchain: toolchain.clone(),
+        slot: slot_name(&root, parent.as_deref()),
+        cwd: root.to_string_lossy().into(),
+        profile: plan.profile.clone(),
+        selection_mode: plan.selection_mode.into(),
+        cache_state: cache.into(),
+        commit: commit.clone(),
+        tree: git_tree(),
+        git_ahead,
+        git_behind,
+        commit_anchored,
+        tree_dirty: dirty_now,
+        dag_jobs: jobs,
+        concurrent_validates: peak_active,
+        concurrency_proof: peak_active.map(|_| "live_flock_registry_cpu_delta"),
+        interruption: interruption.clone(),
+        cpu_user,
+        cpu_sys,
+        env_block_retries: env_retries as i64,
+        executed_tests,
+        filtered_tests,
+    };
+    if let (Some(a), Some(l)) = (peak_active, peak_live) {
+        println!(
+            "Peer validates: {a} peak CPU-active of {l} peak live top-level run(s) registered in \
+             {} (existence alone is not concurrency; each peer had to hold its own flock AND burn \
+             CPU between two samples).",
+            registry.display()
+        );
+    }
+
+    // An operator stop is a NO-RESULT, and it is RECORDED as one. It is not
+    // silently dropped: `scripts/test_validate_stop_paths.py` is the durable
+    // consumer contract for exactly this row (result `no_result`, raw_result
+    // `fail`, interruption_signal named), and every reader already knows the
+    // no_result verdict. A TIMEOUT, by contrast, is a completed run and falls
+    // through to the normal verdict below.
+    if let Some(sig) = &interruption {
+        if !nesting.nested {
+            write_ledger(
+                &ledger,
+                &ctx,
+                &outcomes,
+                &skipped,
+                wall,
+                130,
+                &log_path.to_string_lossy(),
+                false,
+                coverage.clone(),
+            );
+        }
+        drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
         let mut s = RunSummary::new(
             Verdict::Interrupted,
             130,
             &plan.profile,
             vec![
-                format!("stopped by {sig}; NO ledger row was written"),
-                "an interrupt learned nothing about the tree, so it is not a result — a TIMEOUT, \
-                 by contrast, is recorded"
+                format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
+                "an interrupt learned nothing about the tree, so it does not establish a product \
+                 verdict — a TIMEOUT, by contrast, does"
                     .into(),
             ],
         );
@@ -3460,6 +3652,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
+        s.cpu_wall = Some((wall, cpu_user, cpu_sys));
+        if !nesting.nested {
+            s.ledger = Some(ledger);
+        }
         return s;
     }
 
@@ -3553,60 +3749,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         exit_code = *code;
     }
 
-    // Coverage in the consumer's exact CoverageRow shape. NODE-RAN granularity:
-    // zero_executed_nodes is always empty and means "not determinable here", not
-    // "verified none" — a node that ran while executing zero test cases is only
-    // visible in the log banners, which is finalize_receipt.py --scan's job.
-    let executed: BTreeSet<String> = outcomes
-        .iter()
-        .filter(|o| !o.aborted)
-        .map(|o| o.tag.clone())
-        .filter(|t| plan.planned_test_nodes.contains(t))
-        .collect();
-    let absent: Vec<&String> = plan.planned_test_nodes.iter().filter(|t| !executed.contains(*t)).collect();
-    let coverage = serde_json::json!({
-        "planned_test_nodes": plan.planned_test_nodes.len(),
-        "executed_test_nodes": executed.len(),
-        "zero_executed_nodes": Vec::<String>::new(),
-        "absent_nodes": absent,
-    });
-
-    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0 0".into());
-    let mut ba = behind_ahead.split_whitespace();
-    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let dirty_now = tree_dirty();
-
-    let commit_anchored = commit != "unknown" && !dirty_now;
-    let ctx = LedgerCtx {
-        started_at,
-        host: host.clone(),
-        toolchain: toolchain.clone(),
-        slot: slot_name(&root, parent.as_deref()),
-        cwd: root.to_string_lossy().into(),
-        profile: plan.profile.clone(),
-        selection_mode: plan.selection_mode.into(),
-        cache_state: cache.into(),
-        commit: commit.clone(),
-        tree: git_tree(),
-        git_ahead,
-        git_behind,
-        commit_anchored,
-        tree_dirty: dirty_now,
-        dag_jobs: jobs,
-    };
-    write_ledger(
-        &ledger,
-        &ctx,
-        &outcomes,
-        &skipped,
-        wall,
-        exit_code,
-        &log_path.to_string_lossy(),
-        plan.suite_complete,
-        coverage,
-    );
+    // A NESTED payload writes nothing: the outer run owns the ledger and the
+    // receipt, and a second row for one logical run is exactly the duplication
+    // the re-entrancy guard exists to prevent.
+    if !nesting.nested {
+        write_ledger(
+            &ledger,
+            &ctx,
+            &outcomes,
+            &skipped,
+            wall,
+            exit_code,
+            &log_path.to_string_lossy(),
+            plan.suite_complete,
+            coverage,
+        );
+    }
 
     // Receipt publication, strictly AFTER the ledger append: `ci-hub
     // apply-local-label` re-derives the receipt FROM the ledger, so publishing
@@ -3616,7 +3774,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     match validate_receipt::eligible(
         exit_code,
         effective_failures,
-        args.label_pr,
+        args.label_pr && !nesting.nested,
         commit_anchored,
         dirty_now,
         &plan.profile,
@@ -3631,6 +3789,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
+    drop(run_record);
     let _ = std::fs::remove_dir_all(&tmp);
 
     // The completed-run summary. Names the excused rows explicitly, so a green
@@ -3679,6 +3838,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
     }
+    if env_retries > 0 {
+        detail.push(format!(
+            "{env_retries} environmental retry round(s) were spent on host/sandbox blocks; this \
+             verdict did NOT pass on the first attempt"
+        ));
+    }
+    match executed_tests {
+        Some(n) => detail.push(format!(
+            "{n} test(s) executed, {} filtered (parsed from the durable log by the parent's \
+             single-sourced banner parser)",
+            filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
+        )),
+        None => detail.push(
+            "executed_tests is UNKNOWN — this row is a NON-VERDICT and cannot qualify a receipt, \
+             whatever the exit code says"
+                .into(),
+        ),
+    }
     let mut s = RunSummary::new(
         if exit_code == 0 { Verdict::Pass } else { Verdict::Fail },
         exit_code,
@@ -3691,6 +3868,131 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
+    s.cpu_wall = Some((wall, cpu_user, cpu_sys));
+    if !nesting.nested {
+        s.ledger = Some(ledger);
+    }
+    s
+}
+
+// ------------------------------------------------------------- stop-path seam
+
+/// The `HERMIT_VALIDATE_STOP_TEST_MODE` fixture (validate.sh:1899).
+///
+/// It exercises this driver's REAL stop handlers and REAL ledger writer without
+/// starting a product build, which is the only way to test the signal paths in
+/// bounded time. It cannot produce a pass: it records two synthetic gates and
+/// then waits to be stopped. `scripts/test_validate_stop_paths.py` is its
+/// consumer and asserts the exact row shape produced here.
+///
+/// # The leak this closes
+///
+/// The fixture parks until its parent test signals it, and the test spawns it
+/// with `start_new_session=True` — so if the test dies first (an assertion before
+/// the signal, a `wait` timeout, or the agent being recycled) nothing ever
+/// signals it, and nothing in its new session can. Measured on this box
+/// 2026-08-07: six orphaned `validate.sh full` process groups, all `ppid=1`, ages
+/// 2h20m to 4h30m, each parked in `sleep 1` at CPU/wall ~0.00. Two exits now make
+/// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
+/// deadline — and the Python harness additionally tears its own child's process
+/// group down in a `finally`.
+fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+    let started_at = utc_now();
+    let started = std::time::Instant::now();
+    let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
+    let synth = |name: &str, ok: bool| StepOutcome {
+        tag: name.to_string(),
+        ok,
+        duration_s: 0.0,
+        summary: String::new(),
+        returncode: Some(if ok { 0 } else { 1 }),
+        reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
+        aborted: false,
+    };
+    let outcomes =
+        vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
+
+    validate_runtime::stop_test_announce();
+    let exit = validate_runtime::stop_test_park(interrupted_by);
+
+    // Cleanup is the evidence-commit point: make it signal-atomic BEFORE the
+    // readiness hook fires, because the cleanup-race case then hammers this
+    // process with SIGTERM and must not be able to abort the single append.
+    validate_runtime::enter_cleanup_critical_section();
+    validate_runtime::stop_test_cleanup_hook();
+
+    let interruption = match exit {
+        validate_runtime::StopTestExit::Signalled => interrupted_by().map(|s| s.to_string()),
+        _ => None,
+    };
+    let exit_code: u8 = if interruption.is_some() { 130 } else { 1 };
+    let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
+    let wall = started.elapsed().as_secs_f64();
+    let ledger = ledger_path(root);
+    let ctx = LedgerCtx {
+        started_at,
+        host: short_hostname(),
+        toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
+        slot: slot_name(root, parent),
+        cwd: root.to_string_lossy().into(),
+        profile: profile.to_string(),
+        selection_mode: "full".into(),
+        cache_state: cache_state(root).into(),
+        commit: git_sha(),
+        tree: git_tree(),
+        git_ahead: 0,
+        git_behind: 0,
+        commit_anchored: false,
+        tree_dirty: tree_dirty(),
+        dag_jobs: 0,
+        // The fixture never registers as a top-level driver, so it can neither
+        // observe peers nor be counted as one.
+        concurrent_validates: None,
+        concurrency_proof: None,
+        interruption: interruption.clone(),
+        cpu_user,
+        cpu_sys,
+        env_block_retries: 0,
+        executed_tests: None,
+        filtered_tests: None,
+    };
+    // `suite_complete: false` — a fixture that ran two synthetic gates must never
+    // publish a gates_expected obligation, which is what would make it look like
+    // a completed full profile.
+    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+
+    let detail = match exit {
+        validate_runtime::StopTestExit::Signalled => vec![format!(
+            "stop-path fixture: stopped by SIG{}; recorded as {}",
+            interruption.clone().unwrap_or_default(),
+            if prior_failure { "fail (a completed gate had already failed)" } else { "no_result" }
+        )],
+        validate_runtime::StopTestExit::EarlyExit => vec![
+            "stop-path fixture: VALIDATE_STOP_TEST_EXIT_EARLY — an ordinary incomplete exit, NOT \
+             an operator stop, so the row stays a raw fail with no interruption signal"
+                .into(),
+        ],
+        validate_runtime::StopTestExit::Orphaned => vec![
+            "stop-path fixture: ORPHANED (getppid()==1) — the test that spawned it died without \
+             signalling, so it self-terminated instead of parking forever"
+                .into(),
+        ],
+        validate_runtime::StopTestExit::Deadline => vec![
+            "stop-path fixture: lifetime deadline expired (VALIDATE_STOP_TEST_MAX_SECONDS); \
+             self-terminated rather than leaking a parked process group"
+                .into(),
+        ],
+    };
+    let mut s = RunSummary::new(
+        if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
+        exit_code,
+        profile,
+        detail,
+    );
+    s.nodes_executed = outcomes.len();
+    s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
+    s.wall_s = Some(wall);
+    s.cpu_wall = Some((wall, cpu_user, cpu_sys));
     s.ledger = Some(ledger);
     s
 }
