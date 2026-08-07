@@ -803,15 +803,22 @@ fn is_self_output(path: &str) -> bool {
     SELF_OUTPUT_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
-/// Porcelain entries that are not validate's own output.
+/// Entries from a git listing that are not validate's own output.
+///
+/// The callers emit two different shapes — `git status --porcelain` prefixes each
+/// path with a two-character status plus a space, while `git diff --name-only`
+/// and `git ls-files` emit a bare path. Testing BOTH forms is deliberate: an
+/// earlier version stripped three characters unconditionally, which turned
+/// `ci/validate-ledger/...` into `validate-ledger/...` for the bare-path callers,
+/// failed the prefix match, and made validate refuse on its own ledger write.
 fn foreign_porcelain(args: &[&str]) -> Vec<String> {
     let Some(out) = sh("git", args) else { return Vec::new() };
     out.lines()
         .filter(|l| !l.trim().is_empty())
         .filter(|l| {
-            // `XY path` for --porcelain; a bare path for ls-files.
-            let path = l.get(3..).unwrap_or(l).trim().trim_matches('"');
-            !is_self_output(path)
+            let bare = l.trim().trim_matches('"');
+            let stripped = l.get(3..).unwrap_or(l).trim().trim_matches('"');
+            !is_self_output(bare) && !is_self_output(stripped)
         })
         .map(|l| l.to_string())
         .collect()
