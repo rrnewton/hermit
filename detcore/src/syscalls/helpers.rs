@@ -1182,6 +1182,16 @@ where
                 );
                 record_retry_event(guest, call).await;
             }
+
+            // A scheduler request can complete synchronously when this is the
+            // only runnable guest thread. Without a real Pending boundary, a
+            // WNOHANG polling loop (notably wait4) can monopolize a
+            // current-thread Tokio runtime and starve the notifier-driven
+            // tracee task whose PTRACE_CONT makes the polled condition true.
+            // Yield only the supervisor executor here: this grants no guest
+            // resource and advances neither virtual time nor the deterministic
+            // schedule, but lets readiness producers run before the next poll.
+            tokio::task::yield_now().await;
         } else {
             let res = call
                 .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
