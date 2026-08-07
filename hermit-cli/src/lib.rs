@@ -1469,7 +1469,7 @@ pub fn run_with_backend(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_backend_config(config, backend);
+    let config = normalize_backend_config(config, backend);
     run_with_backend_inner(
         command,
         config,
@@ -1480,7 +1480,13 @@ pub fn run_with_backend(
 }
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
-fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+/// Apply the execution backend's Detcore capability contract in one place.
+///
+/// The CLI binary has a dedicated DBI launch adapter, while the other paths
+/// enter through this library. Keeping the normalization public lets both
+/// dispatch seams use this exact policy instead of cloning backend flags.
+#[doc(hidden)]
+pub fn normalize_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
     config.discover_live_file_metadata = backend == Backend::Sabre;
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
@@ -1611,7 +1617,7 @@ pub fn run_with_output_backend(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_backend_config(config, backend);
+    let config = normalize_backend_config(config, backend);
     run_with_output_backend_inner(
         command,
         config,
@@ -1935,8 +1941,8 @@ mod tests {
     use super::liteinst_requires_forced_shutdown;
     #[cfg(feature = "dbi")]
     use super::liteinst_runtime_unavailable_reason;
+    use super::normalize_backend_config;
     use super::output_backend_stdin_file;
-    use super::prepare_backend_config;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
@@ -2002,12 +2008,12 @@ mod tests {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         assert!(
-            prepare_backend_config(config.clone(), Backend::Liteinst)
+            normalize_backend_config(config.clone(), Backend::Liteinst)
                 .max_timeslice
                 .is_some()
         );
         assert!(
-            prepare_backend_config(config, Backend::Ptrace)
+            normalize_backend_config(config, Backend::Ptrace)
                 .max_timeslice
                 .is_some()
         );
@@ -2016,7 +2022,7 @@ mod tests {
     #[test]
     fn sabre_backend_config_enables_process_local_capabilities() {
         let config = super::DetConfig::default();
-        let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
+        let sabre = normalize_backend_config(config.clone(), Backend::Sabre);
         assert!(sabre.discover_live_file_metadata);
         assert!(sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
@@ -2028,7 +2034,7 @@ mod tests {
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
         assert!(!sabre.backend_defers_vfork_child_registration);
-        let ptrace = prepare_backend_config(config, Backend::Ptrace);
+        let ptrace = normalize_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
         assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
@@ -2045,7 +2051,7 @@ mod tests {
     #[test]
     fn kvm_backend_config_marks_concurrent_process_children() {
         let config = super::DetConfig::default();
-        let kvm = prepare_backend_config(config, Backend::Kvm);
+        let kvm = normalize_backend_config(config, Backend::Kvm);
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
@@ -2055,8 +2061,9 @@ mod tests {
 
     #[test]
     fn dbi_backend_config_translates_process_signals_to_host_threads() {
-        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
+        let config = normalize_backend_config(super::DetConfig::default(), Backend::Dbi);
         assert!(config.backend_requires_thread_directed_process_signals);
+        assert!(config.initial_stack_unavailable_at_post_exec);
         assert!(!config.backend_defers_vfork_child_registration);
     }
 

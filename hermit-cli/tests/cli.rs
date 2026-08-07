@@ -990,7 +990,7 @@ fn run_dbi_keeps_diagnostics_out_of_guest_stderr() {
 }
 
 #[test]
-fn run_dbi_forwards_detcore_info_logs() {
+fn run_dbi_forwards_info_without_reading_the_initial_stack() {
     let args = [
         "--log",
         "INFO",
@@ -1008,6 +1008,11 @@ fn run_dbi_forwards_detcore_info_logs() {
     assert!(
         stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
         "DBI did not forward the Detcore INFO syscall stream:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("DETLOG [env,")
+            && stderr.contains("unavailable (backend cannot read initial stack)"),
+        "DBI did not forward the safe env-hash sentinel:\n{stderr}",
     );
 }
 

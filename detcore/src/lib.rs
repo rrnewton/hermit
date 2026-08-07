@@ -792,8 +792,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// example KVM vs. ptrace) then surfaces as a single differing line instead
     /// of an eyeballed syscall stream, and the name list makes "they differ in
     /// TMPDIR and HOSTNAME" a one-line comparison rather than a full diff.
-    /// Callers must gate this on active INFO logging; it is read-only and never
-    /// feeds guest-visible state, so it cannot affect determinism.
+    /// Callers must gate this on an observable DETLOG sink; it is read-only and
+    /// never feeds guest-visible state, so it cannot affect determinism.
     async fn detlog_guest_env<G: Guest<Self>>(&self, guest: &mut G) {
         let dettid = guest.thread_state().dettid;
         // Some backends do not expose the initial process stack at this hook
@@ -1507,9 +1507,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Emit an order-independent hash of the guest's environment for
-        // cross-backend diffing. The read + hash runs only when INFO logging
-        // (and thus DETLOG) is active, so a normal run pays nothing.
-        if tracing::enabled!(tracing::Level::INFO) {
+        // cross-backend diffing. DETLOG is observable either through tracing
+        // INFO or a process-local backend forwarder (SaBRe); a normal run with
+        // neither sink still pays only for this gate.
+        if crate::detlog::info_observable() {
             self.detlog_guest_env(guest).await;
         }
 
