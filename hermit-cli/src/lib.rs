@@ -596,8 +596,16 @@ pub enum Backend {
     /// Use Reverie's ptrace backend.
     #[default]
     Ptrace,
-    /// Use the DynamoRIO backend.
-    Dbi,
+    /// Use the DynamoRIO dynamic-binary-translation backend.
+    ///
+    /// DynamoRIO performs dynamic binary TRANSLATION -- it rewrites the whole
+    /// instruction stream out-of-place -- so `dbt` is the accurate name. The
+    /// former `dbi` spelling is kept as an alias so existing invocations,
+    /// scripts and CI nodes keep working; `dbi` (binary INSTRUMENTATION) is the
+    /// superset term and does not distinguish this backend from the in-place
+    /// patching ones (e9patch, LiteInst, SaBRe).
+    #[value(alias = "dbi")]
+    Dbt,
     /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
@@ -612,7 +620,7 @@ pub enum Backend {
 impl Backend {
     const ALL: [Self; 6] = [
         Self::Ptrace,
-        Self::Dbi,
+        Self::Dbt,
         Self::Liteinst,
         Self::Sabre,
         Self::Kvm,
@@ -623,7 +631,7 @@ impl Backend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ptrace => "ptrace",
-            Self::Dbi => "dbi",
+            Self::Dbt => "dbt",
             Self::Liteinst => "liteinst",
             Self::Sabre => "sabre",
             Self::Kvm => "kvm",
@@ -663,7 +671,7 @@ impl Backend {
             Self::Ptrace => validate_tracing_environment()
                 .err()
                 .map(|error| error.to_string()),
-            Self::Dbi => dbi_unavailable_reason(),
+            Self::Dbt => dbi_unavailable_reason(),
             Self::Liteinst => liteinst_runtime_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_unavailable_reason(),
@@ -1490,7 +1498,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = true;
-    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbi;
+    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -1527,7 +1535,7 @@ async fn run_with_backend_inner(
         .await?
         .status);
     }
-    if backend == Backend::Dbi {
+    if backend == Backend::Dbt {
         #[cfg(feature = "dbi")]
         {
             return Ok(run_dbi(command, config, print_summary, false).await?.status);
@@ -1635,7 +1643,7 @@ async fn run_with_output_backend_inner(
         )
         .await;
     }
-    if backend == Backend::Dbi {
+    if backend == Backend::Dbt {
         #[cfg(feature = "dbi")]
         {
             return run_dbi(command, config, print_summary, true).await;
@@ -2051,7 +2059,7 @@ mod tests {
 
     #[test]
     fn dbi_backend_config_translates_process_signals_to_host_threads() {
-        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbi);
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
     }
@@ -2096,7 +2104,7 @@ mod tests {
             Backend::Ptrace.is_available()
         );
         assert_eq!(
-            available.contains(&Backend::Dbi),
+            available.contains(&Backend::Dbt),
             dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
@@ -2306,7 +2314,7 @@ mod tests {
     #[test]
     #[cfg(feature = "dbi")]
     fn optional_backends_report_accurate_availability() {
-        match Backend::Dbi.ensure_available() {
+        match Backend::Dbt.ensure_available() {
             Ok(()) => assert!(
                 dynamorio_sdk_available() && dbi_runtime_unavailable_reason().is_none(),
                 "DBI reported available without its SDK and runtime"
@@ -2373,7 +2381,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbi)
+        let error = super::run_with_output_backend(command, config, false, &None, Backend::Dbt)
             .expect_err("DBI must reject non-sequentialized execution");
         assert!(
             error
@@ -2388,7 +2396,7 @@ mod tests {
     fn dbi_public_dispatch_runs_echo_through_detcore() {
         use clap::Parser;
 
-        if Backend::Dbi.ensure_available().is_err() {
+        if Backend::Dbt.ensure_available().is_err() {
             return;
         }
 
@@ -2397,7 +2405,7 @@ mod tests {
         let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
         config.sequentialize_threads = true;
         config.validate();
-        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbi)
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/echo through DbiGuest<Detcore>");
 
         assert_eq!(output.status, super::ExitStatus::Exited(0));
@@ -2416,7 +2424,7 @@ mod tests {
     fn dbi_public_status_dispatch_runs_true_through_detcore() {
         use clap::Parser;
 
-        if Backend::Dbi.ensure_available().is_err() {
+        if Backend::Dbt.ensure_available().is_err() {
             return;
         }
 
@@ -2424,7 +2432,7 @@ mod tests {
         let mut config = super::DetConfig::parse_from(["hermit-dbi-test"]);
         config.sequentialize_threads = true;
         config.validate();
-        let status = super::run_with_backend(command, config, true, &None, Backend::Dbi)
+        let status = super::run_with_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/true through DbiGuest<Detcore>");
 
         assert_eq!(status, super::ExitStatus::Exited(0));
