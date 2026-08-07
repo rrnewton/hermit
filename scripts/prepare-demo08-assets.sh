@@ -39,7 +39,7 @@ STAMP="$ASSETS/.nightly-prep-version"
 JOBS="${DEMO08_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/hermit/target/release/hermit}"
 CALIBRATION_SEEDS="${DEMO08_CALIBRATION_SEEDS:-64}"
-# Measured on devbig176 (176-core AMD EPYC 9D64) over seeds 0-15 of the freshly built v7.1
+# Measured on a 176-core AMD EPYC 9D64 development host over seeds 0-15 of the freshly built v7.1
 # fixture: min 6s, median 11s, max 103s per seed. The former 30s default truncated the tail
 # into false negatives, since a truncated seed cannot report a UAF it never reached.
 CALIBRATION_TIMEOUT="${DEMO08_CALIBRATION_TIMEOUT:-150}"
