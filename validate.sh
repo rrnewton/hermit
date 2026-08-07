@@ -54,15 +54,17 @@ function validation_slot_name {
 }
 
 # --- Argument parsing -------------------------------------------------------
-# Usage: ./validate.sh [quick|portable-only|full|super] [options]
+# Usage: ./validate.sh [quick|portable-only|full|stress] [options]
 # Default (no level): run the full validation suite, which also prints the
 # working-envelope vector at the end. VALIDATE_LEVEL may select the same level.
 #   quick        Core ptrace run/verify/record smoke tests; no alternate backends.
 #   portable-only  Portable build, test, lint, format, and documentation gates
 #                matching GitHub-managed portable CI; no PMU or namespace requirements.
 #   full         Everything in quick plus the complete suite and DBI/KVM gates.
-#   super        Repeat stress probes (20x by default) under moderate
+#   stress       Repeat stress probes (20x by default) under moderate
 #                oversubscription and report a pass rate for every probe.
+#                NOT a superset of full: runs NO E2E manifest cells. Was `super`,
+#                which overstated it; the old spelling still works and warns.
 #   --quick      Alias for the quick level.
 #   --portable     Alias for the portable-only level.
 #
@@ -104,11 +106,31 @@ function validation_slot_name {
 # to disable that non-fatal publication.
 ENVELOPE_MODE="full"          # full | only
 ENVELOPE_BASELINE=""
-VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | super
+VALIDATION_LEVEL=${VALIDATE_LEVEL:-full} # quick | portable-only | full | stress
 VALIDATION_LEVEL_EXPLICIT=0
+
+# `super` was renamed to `stress` because the name overstated its coverage. It is
+# NOT a superset of `full`: it runs zero E2E manifest cells, while `full` runs the
+# portable lane's 81 and even `quick` runs 58 of them (measured 2026-08-06). The
+# rest of the machinery already agreed -- the stress level never sets
+# VALIDATION_SUITE_COMPLETE and cannot publish a receipt-backed label. Expanding it
+# into a true superset was rejected: it already fails to finish inside the 6h CI
+# budget, so adding two 7200s lanes would guarantee the timeout.
+# The old spelling still works and always will; it just says so.
+function normalize_validation_level {
+    if [[ $1 == super ]]; then
+        echo "validate.sh: NOTE: level 'super' is now 'stress'. It is NOT a superset of" >&2
+        echo "  'full' -- it runs NO E2E manifest cells, where 'full' runs the portable" >&2
+        echo "  lane and 'quick' runs a 58-cell slice of it. Run 'full' for E2E coverage." >&2
+        printf 'stress\n'
+        return 0
+    fi
+    printf '%s\n' "$1"
+}
+VALIDATION_LEVEL=$(normalize_validation_level "$VALIDATION_LEVEL")
 if [[ -n ${VALIDATE_LEVEL:-} ]]; then
     case "$VALIDATION_LEVEL" in
-        quick|portable-only|full|super) ;;
+        quick|portable-only|full|stress) ;;
         *)
             echo "validate.sh: invalid VALIDATE_LEVEL: $VALIDATION_LEVEL" >&2
             exit 2 ;;
@@ -160,8 +182,8 @@ VERBOSE=0
 PR_NUMBER=${PR_NUMBER:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        quick|portable-only|full|super)
-            select_validation_level "$1"
+        quick|portable-only|full|stress|super)
+            select_validation_level "$(normalize_validation_level "$1")"
             shift ;;
         --quick)
             select_validation_level quick
@@ -219,8 +241,12 @@ Levels:
   portable-only    Portable build, test, lint, format, and doc gates matching
                    GitHub-managed portable CI; no PMU or namespace requirements.
   full             quick plus the complete suite and DBI/KVM gates (default).
-  super            Repeat stress probes (20x by default) under moderate
+  stress           Repeat stress probes (20x by default) under moderate
                    oversubscription; report a pass rate per probe.
+                   NOT a superset of full -- it runs NO E2E manifest cells, while
+                   full runs the portable lane and quick runs a slice of it. Use
+                   full for E2E coverage. (Formerly `super`; that spelling still
+                   works and prints a notice.)
   --quick          Alias for the quick level.
   --portable       Alias for the portable-only level.
 
@@ -1054,8 +1080,8 @@ if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
 fi
 printf "Estimated time: %s\n" \
     "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
-if [[ $VALIDATION_LEVEL == super ]]; then
-    printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
+if [[ $VALIDATION_LEVEL == stress ]]; then
+    printf "Stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
 fi
 if ((VERBOSE == 1)); then
@@ -4699,7 +4725,7 @@ function run_super_diagnostic_suite {
         cargo test -p hermit --features third-party-backends --test cli run_dbi_keeps_diagnostics_out_of_guest_stderr -- --exact --test-threads=1
 }
 
-function run_super_suite {
+function run_stress_suite {
     local leveldb_install="$ROOT_DIR/target/hermit-leveldb-super"
     local leveldb_build="$ROOT_DIR/target/hermit-leveldb-build-super"
 
@@ -4891,7 +4917,7 @@ case "$VALIDATION_LEVEL" in
     quick) run_quick_suite ;;
     portable-only) run_portable_only_suite ;;
     full) run_full_suite ;;
-    super) run_super_suite ;;
+    stress) run_stress_suite ;;
 esac
 
 print_summary
