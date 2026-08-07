@@ -66,11 +66,11 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 6144323c. The portable wrapper
+# The calibration below is valid only for Reverie 038e9939. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 6144323c5dab8b521278fce206f8774360c2b05f ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 6144323c5dab8b521278fce206f8774360c2b05f" >&2
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 038e993926e45514264d30367b70df9b6ac3b9b8 ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 038e993926e45514264d30367b70df9b6ac3b9b8" >&2
     return 2
 fi
 
@@ -199,6 +199,25 @@ fi
 # than by a fresh timing run, exactly as the dd3c178 and 0ae0c01 carries above:
 # no DBI build input changed, so there is nothing for a new timing sample to
 # measure.
+#
+# CARRY TO 038e9939 (2026-08-07). reverie main advanced again while a validate
+# was still running, so the currency gate re-armed mid-run; this carry chases it.
+# 6144323c..038e9939 is the DBI first-instruction scrub series and touches four
+# files: reverie-dbi/native/client.c, two test fixtures, and one test.
+#
+# UNLIKE the carries above, the reverie-dbi SUBTREE is NOT byte-identical here
+# (eb284556d2df -> 5c15596f7397); say so plainly rather than reuse their wording.
+# What the budget depends on is narrower than the subtree: source_recipe_key()
+# hashes {reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs, $CMAKE,
+# $CMAKE_GENERATOR}, and all four are unchanged -- vendor/dynamorio
+# de352475846e and build.rs 9e35e1b699b7 at BOTH pins, with CMAKE and
+# CMAKE_GENERATOR unset. The recipe key therefore remains
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
+# DynamoRIO content-key MISS the budget governs is the same build, and
+# MAX_PARALLEL_JOBS is still 16. native/client.c is a small C source compiled
+# after that build and outside the measured window. This carry is therefore on
+# recipe-key identity alone, a weaker warrant than the whole-subtree identity
+# used for 0ae0c01; re-derive the budget if client.c ever grows enough to matter.
 #
 # Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
 # development host whose cores finish the identical work ~3.3x faster than the
