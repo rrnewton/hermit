@@ -640,7 +640,21 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getgid
         | Sysno::getegid
         | Sysno::getresuid
-        | Sysno::getresgid => SyscallClassification::Determinized,
+        | Sysno::getresgid
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1849): Complete the fixed virtual-root identity by
+        // emulating file-ownership MUTATION too. The query family above and the
+        // credential-setting family are already virtualized to root; leaving the
+        // chown family as pass-through contradicted that model, because the host
+        // identity backing the guest is not root (`--no-namespace`: EPERM even
+        // for 0:0) or is root in a one-uid user namespace (`--tmp=/tmp`: EINVAL
+        // for any unmapped uid), and in-process backends have no namespace at
+        // all. See is_ownership_change_noop_syscall for the full rationale and
+        // the stated semantic boundary. Dispatched by Sysno in lib.rs.
+        | Sysno::chown
+        | Sysno::fchown
+        | Sysno::fchownat
+        | Sysno::lchown => SyscallClassification::Determinized,
 
         // ===== BEGIN PASS-THRU SYSCALLS =====
         // These existing and triaged passthroughs are conditionally repeatable under
@@ -649,9 +663,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // TODO-HUMAN-REVIEW(#503): Confirm the stable-state boundary for these promotions.
         Sysno::access
         | Sysno::brk
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#663)
-        | Sysno::chown
         | Sysno::getcwd
         | Sysno::getpid
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -735,10 +746,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fchmodat2
         // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchown
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::fchownat
-        // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fgetxattr
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::flistxattr
@@ -746,8 +753,6 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::fremovexattr
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::fsetxattr
-        // AUTONOMOUS-BOT-IMPLEMENTED
-        | Sysno::lchown
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::link
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -950,6 +955,49 @@ pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
             | Sysno::setgroups
             | Sysno::setfsuid
             | Sysno::setfsgid
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1849): File-ownership mutation completed to match the
+// fixed virtual-root identity.
+/// The `chown` family: `chown`, `fchown`, `fchownat`, `lchown`.
+///
+/// Detcore presents a **fixed virtual-root identity** — the credential *query*
+/// family is emulated to `0` (#1549) and the credential *set* family succeeds as
+/// a no-op (#787) — but ownership mutation was left as the one pass-through
+/// member of that model, and pass-through contradicts it. A real root process's
+/// `chown` to any uid succeeds; the guest instead receives the errno of whatever
+/// identity the backend happens to run under:
+///
+/// * `--no-namespace`: no user namespace at all, so **`EPERM`** even for
+///   `chown(path, 0, 0)`, and `stat` reports the real host uid while `getuid`
+///   reports 0 — the model is already incoherent there.
+/// * `--tmp=/tmp`: a user namespace whose `uid_map` is `0 <caller-uid> 1`, i.e.
+///   exactly ONE mapped id. `chown(path, 0, 0)` succeeds, but **`EINVAL`** for
+///   any other uid because it is unmapped.
+/// * in-process backends (DBI) have no namespace at all, so the answer differs
+///   per backend — the same host dependency #1549 removed from the query side.
+///
+/// Emulating them to a no-op success is the same choice already made for the
+/// credential-setting family, for the same reasons: `0` is the value a real root
+/// process gets for a permitted ownership change, the result is never forwarded
+/// to the host, and it is backend-independent and bitwise-identical across
+/// `--verify` and record/replay.
+///
+/// **Semantic boundary, stated explicitly.** Detcore does not model per-file
+/// ownership, so a no-op success is not observable through a later `stat` the
+/// way a real `chown` would be. Under `--tmp=/tmp` this is invisible for the
+/// dominant case: every file the guest creates already reads back as `0:0`
+/// (the user namespace maps the caller to 0), so `chown(path, 0, 0)` agrees with
+/// the read-back exactly. It diverges only when a guest chowns to a *foreign*
+/// uid and then reads the owner back, which a single-uid container cannot
+/// represent in any case. That divergence is strictly smaller than the status
+/// quo, where the guest believes it is root and yet cannot chown at all.
+pub(crate) const fn is_ownership_change_noop_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::chown | Sysno::fchown | Sysno::fchownat | Sysno::lchown
     )
 }
 
@@ -1293,7 +1341,12 @@ mod tests {
         // getgid, getegid, getresuid, getresgid) from PassThrough to
         // Determinized, so the census shifts 6 from column 1 to column 0
         // (283/89 -> 289/83). The total is unchanged and is re-asserted below.
-        assert_eq!(counts, [289, 83, 1]);
+        //
+        // #1849 then moved the four ownership-mutation syscalls (chown, fchown,
+        // fchownat, lchown) the same way, completing the fixed virtual-root
+        // identity that #1549 and #787 had left half-applied: 289/83 -> 293/79.
+        // Again only the split moves; the total is re-asserted below.
+        assert_eq!(counts, [293, 79, 1]);
         assert_eq!(counts.iter().sum::<usize>(), EXPECTED_X86_64_SYSNO_COUNT);
     }
 
@@ -1442,7 +1495,6 @@ mod tests {
         for sysno in [
             Sysno::capget,
             Sysno::capset,
-            Sysno::chown,
             Sysno::chdir,
             Sysno::chmod,
             Sysno::faccessat,
@@ -1451,8 +1503,6 @@ mod tests {
             Sysno::fchmod,
             Sysno::fchmodat,
             Sysno::fchmodat2,
-            Sysno::fchown,
-            Sysno::fchownat,
             Sysno::fdatasync,
             Sysno::fallocate,
             Sysno::fgetxattr,
@@ -1468,7 +1518,6 @@ mod tests {
             Sysno::getgroups,
             Sysno::getppid,
             Sysno::getxattr,
-            Sysno::lchown,
             Sysno::getpgid,
             Sysno::getpgrp,
             Sysno::getsid,
@@ -2181,5 +2230,51 @@ mod tests {
         for sysno in [Sysno::openat2, Sysno::perf_event_open, Sysno::clock_settime] {
             assert!(!is_strict_only_deterministic_refusal_syscall(sysno));
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1849)
+    #[test]
+    fn ownership_change_family_is_determinized_not_passthrough() {
+        // POSITIVE: exactly the four ownership-mutation syscalls are in the
+        // predicate AND are classified Determinized, so the lib.rs dispatch arm
+        // that matches on the predicate is actually reachable for them.
+        for sysno in [
+            Sysno::chown,
+            Sysno::fchown,
+            Sysno::fchownat,
+            Sysno::lchown,
+        ] {
+            assert!(
+                is_ownership_change_noop_syscall(sysno),
+                "{sysno:?} must be in the ownership-change no-op set"
+            );
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} must be Determinized; PassThrough forwards it to a host \
+                 identity that is not the virtual root Detcore reports"
+            );
+        }
+
+        // NEGATIVE: the predicate must not swallow neighbours. chmod/fchmod are
+        // the adjacent metadata mutators and stay PassThrough; the credential
+        // families are a DIFFERENT no-op set with its own dispatch arm, and
+        // collapsing the two would make either arm's removal untestable.
+        for sysno in [
+            Sysno::chmod,
+            Sysno::fchmod,
+            Sysno::fchmodat,
+            Sysno::setuid,
+            Sysno::setgid,
+            Sysno::getuid,
+        ] {
+            assert!(
+                !is_ownership_change_noop_syscall(sysno),
+                "{sysno:?} must NOT be in the ownership-change no-op set"
+            );
+        }
+        assert!(!is_credential_identity_noop_syscall(Sysno::chown));
+        assert!(!is_ownership_change_noop_syscall(Sysno::setuid));
     }
 }
