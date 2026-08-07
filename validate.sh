@@ -19,5 +19,13 @@
 # flag), so forwarding "$@" untouched is a pure pass-through.
 #
 # `exec` is load-bearing: the driver must BE this process, so its pid is the one a
-# caller signals, waits on, and finds in the re-entrancy marker's ancestry.
-exec "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/scripts/validate.rs" "$@"
+# caller signals, waits on, and finds in the re-entrancy marker's ancestry. The
+# launcher execs the compiled binary in turn, so the chain preserves this pid.
+#
+# The driver is COMPILED, never dispatched through its `#!/usr/bin/env
+# rust-script` shebang: GitHub's portable images ship rustc and cargo but
+# intentionally not rust-script, so a shebang launch dies at execve with exit 127
+# in ~0.1s having run nothing -- a no-result that reads as a test failure. See
+# ci/run-rust-script.sh.
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "$ROOT_DIR/ci/run-rust-script.sh" "$ROOT_DIR/scripts/validate.rs" "$@"
