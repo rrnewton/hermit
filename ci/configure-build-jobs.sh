@@ -110,14 +110,14 @@ fi
 #   effective native jobs = min(requested jobs, child CPUs, Reverie clamp)
 #   max elapsed seconds = ceil(effective-job-second threshold / effective jobs)
 #
-# PROVENANCE (GitHub portable run 31008044311 at Hermit f21b22ed, requested
+# HISTORICAL PROVENANCE (GitHub portable run 31008044311 at Hermit f21b22ed,
+# requested
 # jobs=8, runner affinity=4): three content-key misses measured 115.82s,
 # 128.27s, and 131.21s -- one debug build and two concurrent release builds --
 # i.e. 463.28, 513.08, and 524.84 effective-job-seconds at min(8, 4, 16)=4.
-# Reverie's original ratchet policy used 2x the slowest of n=3 clean
-# observations; applying that policy and rounding up gives 1050
-# effective-job-seconds. The concurrent release builds embody contention;
-# replace this calibration when >=5 clean Hermit-lane samples support it.
+# Reverie's original ratchet policy used 2x the slowest clean observation. The
+# concurrent release builds embody contention. The calibration at 038e993
+# below supersedes this historical threshold with n=5 clean Hermit builds.
 #
 # CARRY TO 9470712 (2026-08-05). The threshold above was measured at 025d378
 # and is reused here, so the reuse is evidenced rather than assumed. The budget
@@ -201,34 +201,26 @@ fi
 # rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178 and 0ae0c01
 # carries above: no DBI build input changed, so there is nothing to re-measure.
 #
-# CARRY TO 038e993 (2026-08-07). NOTE: unlike the 6a6b4ec/dd3c178/0ae0c01/6144323
-# carries above, the whole reverie-dbi subtree is NOT identical this time, so the
-# argument is narrower and is stated explicitly rather than reused.
+# CARRY TO 038e993 (2026-08-07). The reverie-dbi subtree is
+# 5c15596f739710b48aaafe6f90b9dc6f5f1a4b8a. Its four DBI commits after
+# 6144323 are 22a548051592dd9917e389dc296fa4766eb4557b,
+# 4192dfc7a75fa2643a3ab223c41d193397a052e7,
+# 0c9fd2499c7cb9133af50cc3b15f3ddc93f562f1, and
+# 038e993926e45514264d30367b70df9b6ac3b9b8. They change native/client.c,
+# two fixtures, and one test; the recipe key remains
+# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d.
 #
-# 6144323..038e993 touches reverie-dbi/native/client.c, two test fixtures
-# (first_scrub_marker.c, stack_scrub_marker.c) and one test
-# (stack_scrub_preserves_guest_data.rs).
-#
-# The budget governs exactly one quantity: the elapsed time build_dynamorio()
-# reports on a DynamoRIO content-key MISS. source_recipe_key() is computed over
-# (source_dir = reverie-dbi/vendor/dynamorio, reverie-dbi/build.rs, $CMAKE,
-# $CMAKE_GENERATOR) -- see reverie-dbi/build.rs:75-80 -- and ALL FOUR are
-# unchanged: vendor/dynamorio and build.rs are byte-identical at both pins.
-# build_dynamorio() only cmake-configures and cmake-builds source_dir
-# (build.rs:199-220); native/client.c is not referenced by build.rs at all and is
-# compiled outside the timed region. So the recipe identity remains
-# sha256:76403e8e76b128119be4a7192893b7ec3084aeb85f4bd0377198a538d94b2a1d, the
-# MAX_PARALLEL_JOBS=16 clamp still applies, and the measured MISS cost is
-# unaffected by a client.c edit.
-#
-# Those 2026-08-05 samples deliberately do NOT replace 1050. They come from a
-# development host whose cores finish the identical work ~3.3x faster than the
-# GitHub portable runner this budget governs; 2x their slowest would give 319
-# effective-job-seconds and would fail the portable lane on its first genuine
-# cold miss. The replacement bar stated above -- >=5 clean Hermit-lane samples
-# -- is unchanged and still unmet.
+# CALIBRATION (Hermit 4be8edcd2f947746b5d9d30c81a35202f36a46d4, host
+# devbig014, shared host, dedicated cgroup CPUs 0-3, nproc=4,
+# CARGO_BUILD_JOBS=4, native jobs=4, no per-task pinning): five clean
+# DBI-enabled Hermit builds each produced exactly one content-key MISS and
+# completed build_dynamorio() in 41.66, 37.58, 32.80, 32.92, and 32.52s.
+# That is 166.64, 150.32, 131.20, 131.68, and 130.08 effective-job-seconds
+# (n=5, median 32.92s, IQR 6.96s). Applying the existing 2x-slowest policy and
+# rounding up gives ceil(2 * 166.64)=334 effective-job-seconds. The derived
+# elapsed budgets are ceil(334/4)=84s and ceil(334/16)=21s.
 REVERIE_DBI_MAX_PARALLEL_JOBS=16
-REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
+REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=334
 REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
 if ((REVERIE_DBI_EFFECTIVE_CPUS < REVERIE_DBI_EFFECTIVE_BUILD_JOBS)); then
     REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_EFFECTIVE_CPUS
