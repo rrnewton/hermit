@@ -846,7 +846,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        if let Some(resource) = out_resource.or_else(|| out_inode.map(ResourceID::FileContents)) {
+        // A raw host inode must never become a deterministic resource id; map
+        // it through the global inode pool first. Done after the `with_detfd`
+        // closure returns, because determinizing needs `guest` mutably.
+        let out_resource = match out_resource {
+            Some(resource) => Some(resource),
+            None => match out_inode {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
+        if let Some(resource) = out_resource {
             resources.insert(resource, Permission::W);
         }
         resources.fyi("sendfile");
@@ -966,7 +978,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // See the sendfile path above: a raw host inode is environment-derived
+        // and must be determinized before it can name a deterministic resource.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1223,7 +1245,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // See the sendfile path above: a raw host inode is environment-derived
+        // and must be determinized before it can name a deterministic resource.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1253,7 +1285,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // See the sendfile path above: a raw host inode is environment-derived
+        // and must be determinized before it can name a deterministic resource.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1388,7 +1430,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => determinize_inode(guest, stat.inode).await,
         };
-        stat.inode = d_ino; // Reveal only the deterministic inode.
+        stat.inode = d_ino.get(); // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping.
@@ -2599,7 +2641,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.get();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
@@ -2639,7 +2681,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.get();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];

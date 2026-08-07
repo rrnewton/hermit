@@ -105,7 +105,9 @@ struct InodePool {
     // TODO(T87258449): merge these two maps:
     inodes: HashMap<RawInode, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
-    next_inode: RawInode,
+    /// Monotonic ordinal source for minted `DetInode`s. Deliberately a
+    /// plain counter, not a `RawInode`: it has nothing to do with host inodes.
+    next_inode: u64,
 }
 
 /// Everything we know (globally) about a DetInode.
@@ -165,7 +167,10 @@ impl InodePool {
     fn add_inode(&mut self, raw_inode: RawInode, mtime: LogicalTime) -> (DetInode, LogicalTime) {
         match self.inodes.get(&raw_inode) {
             None => {
-                let new = self.next_inode;
+                // The single minting site: `next_inode` is a monotonic per-run
+                // counter, so the ordinal is a function of guest execution
+                // order and not of any host inode value.
+                let new = DetInode::from_ordinal(self.next_inode);
                 self.next_inode += 1;
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(

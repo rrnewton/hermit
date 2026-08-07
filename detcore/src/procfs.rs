@@ -18,6 +18,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::types::DetInode;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
     Stat,
@@ -367,7 +369,7 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
-    pub(crate) fdinfo_identity: Option<(u64, i32, u64)>,
+    pub(crate) fdinfo_identity: Option<(DetInode, i32, u64)>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
@@ -2244,7 +2246,7 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
-fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64)>) -> Vec<u8> {
+fn sanitize_fdinfo(contents: &[u8], identity: Option<(DetInode, i32, u64)>) -> Vec<u8> {
     let Some((virtual_inode, logical_flags, virtual_open_file)) = identity else {
         return Vec::new();
     };
@@ -4520,7 +4522,7 @@ ino:\t47761541\n\
 eventfd-count: 0000000000000007\n";
 
         assert_eq!(
-            sanitize_fdinfo(contents, Some((9007, 0o100002, 42))),
+            sanitize_fdinfo(contents, Some((DetInode::from_ordinal(9007), 0o100002, 42))),
             b"pos:\t1\n\
 flags:\t0100002\n\
 mnt_id:\t1\n\

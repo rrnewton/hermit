@@ -19,7 +19,72 @@ pub type RawFd = std::os::unix::io::RawFd;
 pub type RawInode = u64;
 
 /// Deterministic "virtual" inode.
-pub type DetInode = RawInode;
+///
+/// This is a newtype rather than an alias to [`RawInode`] on purpose. A raw
+/// host inode is environment-derived: it differs between hosts and between
+/// runs on one host, so letting one reach a record that is specified to be
+/// reproducible (`ResourceID::FileContents`, a guest-visible `st_ino`) makes
+/// the deterministic log irreproducible. While this was an alias, exactly that
+/// flow type-checked silently at three sites in `syscalls/files.rs`.
+///
+/// The only supported way to turn a host inode into a `DetInode` is the global
+/// inode pool's minting path (`add_inode`, reached through the
+/// `DeterminizeInode` RPC), which hands out a monotonic per-run ordinal. There
+/// is deliberately **no** `From<RawInode>`, so any other conversion has to name
+/// [`DetInode::from_ordinal`] and is therefore greppable and reviewable.
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+#[serde(transparent)]
+pub struct DetInode(u64);
+
+/// Render as the bare ordinal, not as `DetInode(4)`. `ResourceID` is `Debug`-
+/// formatted straight into DETLOG records, so a derived `Debug` would change
+/// `FileContents(4)` to `FileContents(DetInode(4))` and churn the record
+/// framing for every log parser and comparator. The type is a compile-time
+/// guard; it is deliberately invisible in the output.
+impl std::fmt::Debug for DetInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl DetInode {
+    /// Mint a `DetInode` from an already-deterministic ordinal.
+    ///
+    /// Callers must pass a value that is a deterministic function of guest
+    /// execution — the inode pool's monotonic counter, or a fixed offset
+    /// constant. Passing a host inode here reintroduces the very leak the
+    /// newtype exists to prevent.
+    pub const fn from_ordinal(ordinal: u64) -> Self {
+        Self(ordinal)
+    }
+
+    /// The underlying ordinal, for formatting and for guest-visible `st_ino`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Derive a related deterministic inode at a fixed offset from this one.
+    /// Deterministic in, deterministic out.
+    pub const fn offset_by(self, delta: u64) -> Self {
+        Self(self.0 + delta)
+    }
+}
+
+impl std::fmt::Display for DetInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Identity of a Linux descriptor table (`files_struct`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -142,5 +207,28 @@ mod tests {
         );
         assert_ne!(first, OpenFileId::new(DetTid::from_raw(3), 7));
         assert_eq!(first.deterministic_socket_cookie(), (3_u64 << 32) | 7);
+    }
+
+    /// `ResourceID` is `Debug`-formatted directly into DETLOG records, so the
+    /// newtype must stay invisible in the output. A derived `Debug` would
+    /// silently rewrite every `FileContents(4)` as `FileContents(DetInode(4))`
+    /// and churn the record framing for every log parser and comparator.
+    #[test]
+    fn det_inode_renders_as_a_bare_ordinal() {
+        let ino = DetInode::from_ordinal(4);
+        assert_eq!(format!("{:?}", ino), "4");
+        assert_eq!(format!("{}", ino), "4");
+        assert_eq!(format!("{:?}", Some(ino)), "Some(4)");
+    }
+
+    /// The pool mints ordinals from a monotonic counter starting at 1, so a
+    /// deterministic inode is small. This pins the round-trip the minting path
+    /// depends on; a host inode reaching `FileContents` is prevented by the
+    /// type, not by this test.
+    #[test]
+    fn det_inode_ordinal_round_trips_and_offsets() {
+        assert_eq!(DetInode::from_ordinal(1).get(), 1);
+        assert_eq!(DetInode::from_ordinal(1000).offset_by(2).get(), 1002);
+        assert!(DetInode::from_ordinal(1) < DetInode::from_ordinal(2));
     }
 }
