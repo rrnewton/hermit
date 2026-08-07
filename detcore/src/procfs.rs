@@ -60,7 +60,7 @@ enum ProcfsKind {
     CpuidleCounter,
     Smaps,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-liteinst-maps-inode): Review mapping-inode normalization.
+    // TODO-HUMAN-REVIEW(PR-1847): Review mapping-inode normalization.
     Maps,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review key-user resource normalization.
