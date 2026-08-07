@@ -289,6 +289,17 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     ]
 }
 
+/// THE one place a CI lane's file is resolved.
+///
+/// `ci/test_harness.sh` audits that this expression appears EXACTLY ONCE in this
+/// file, so that a lane's node set can never be resolved from two places that
+/// could drift. Both `lane_nodes` (steps) and `lane_config` (top-level config)
+/// go through here; adding a second construction of the path is what the audit
+/// exists to catch, and it caught exactly that when `lane_config` was added.
+pub fn lane_dag_path(root: &Path, lane: &str) -> std::path::PathBuf {
+    root.join("ci").join("dag").join(format!("{lane}.json"))
+}
+
 /// Load one shipped CI lane (`ci/dag/<lane>.json`) and hang it off the preflight.
 ///
 /// `prefix` disambiguates tags when two lanes are fused into one DAG; it is empty
@@ -301,7 +312,7 @@ pub fn lane_nodes(
     prefix: &str,
     gate_dep: &str,
 ) -> Result<Vec<Step>, String> {
-    let path = root.join("ci").join("dag").join(format!("{lane}.json"));
+    let path = lane_dag_path(root, lane);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let cfg = dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
@@ -474,7 +485,7 @@ pub fn sanitize_job(label: &str) -> String {
 /// top-level, and every one of them silently reverts to `DagConfig::default()` if
 /// the caller rebuilds the config instead of carrying it.
 pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
-    let path = root.join("ci").join("dag").join(format!("{lane}.json"));
+    let path = lane_dag_path(root, lane);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))
