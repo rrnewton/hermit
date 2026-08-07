@@ -39,7 +39,31 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
         if process.poll() is not None:
             raise AssertionError(f"validate exited before ready: rc={process.returncode}")
         time.sleep(0.05)
-    raise AssertionError(f"validate stop-test hook did not emit {text!r}")
+    proc = Path("/proc") / str(process.pid)
+    try:
+        wchan = (proc / "wchan").read_text().strip()
+    except OSError as error:
+        wchan = f"unavailable: {error}"
+    process_tree = subprocess.run(
+        [
+            "ps",
+            "-o",
+            "pid=,ppid=,pgid=,stat=,wchan:32=,args=",
+            "--forest",
+            "-g",
+            str(process.pid),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    output = log.read_text(errors="replace") if log.exists() else "<log absent>"
+    raise AssertionError(
+        f"validate stop-test hook did not emit {text!r}; "
+        f"pid={process.pid} wchan={wchan}; process tree:\n{process_tree}"
+        f"output:\n{output}"
+    )
 
 
 def run_signal(
@@ -62,7 +86,16 @@ def run_signal(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+            except BaseException:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait(timeout=10)
+                raise
             process.send_signal(sig)
             rc = process.wait(timeout=10)
 

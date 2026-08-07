@@ -1044,7 +1044,15 @@ printf "Build cache: %s (target/ debug=%s release=%s)\n" \
     "$VALIDATION_CACHE_STATE" \
     "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
     "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
-VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
+    # The stop/signal fixture tests trap and ledger behavior, not artifact
+    # integrity. Scanning a populated cache starts one structural probe per
+    # object before the fixture can emit READY, making readiness depend on
+    # unrelated cache size and state.
+    VALIDATION_ZERO_BYTE_PURGED=0
+else
+    VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+fi
 readonly VALIDATION_ZERO_BYTE_PURGED
 if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
     printf "🧹 Artifact-integrity: purged %s zero-byte object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
