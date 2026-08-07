@@ -129,7 +129,7 @@ if [[ $budget_vendor_object != "$REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT"
     echo "configure-build-jobs.sh: reverie-dbi/vendor/dynamorio object $budget_vendor_object does not match calibrated object $REVERIE_DBI_CALIBRATED_VENDOR_DYNAMORIO_OBJECT" >&2
     budget_recipe_mismatch=1
 fi
-if [[ ${CMAKE:-cmake} != cmake ]]; then
+if [[ ${CMAKE-cmake} != cmake ]]; then
     echo "configure-build-jobs.sh: CMAKE=${CMAKE} changes calibrated DynamoRIO recipe key $REVERIE_DBI_CALIBRATED_RECIPE_KEY" >&2
     budget_recipe_mismatch=1
 fi
