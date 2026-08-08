@@ -102,14 +102,11 @@ use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
 use validate_plan::CompatMode;
 
-/// Ledger schema this producer emits.
-///
-/// 4 matches what `validate.sh` wrote, field for field, so the parent aggregator,
-/// `ci-hub/validate/*`, and the merge gate keep reading one schema across the
-/// refactor. Deliberately NOT bumped as part of the port: changing the driver and
-/// the record shape in one step would make a consumer regression indistinguishable
-/// from a port regression.
-const LEDGER_SCHEMA_VERSION: i64 = 4;
+/// Ledger schema emitted when no real per-node coverage judgement exists.
+const LEGACY_LEDGER_SCHEMA_VERSION: i64 = 4;
+
+/// Ledger schema that promises a real per-node coverage judgement.
+const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 
 /// Recorded in each row so a version-aware reader can tell which driver produced
 /// it without inference.
@@ -661,6 +658,7 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    coverage_schema_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -713,6 +711,59 @@ cleared-caps refusal names {} starved step(s)",
         }
     }
 
+    Ok(())
+}
+
+/// Bind the ledger schema to the evidence the row actually carries.
+///
+/// Schema 5 promises a real per-node judgement, which requires a nonzero
+/// planned set. Anything else is unresolved coverage: preserve the schema-4
+/// grandfather but erase the unusable object to `null`, so a schema-4 row can
+/// never claim per-node evidence its version does not define.
+fn ledger_schema_and_coverage(
+    coverage: serde_json::Value,
+) -> (i64, serde_json::Value) {
+    let has_real_judgement = coverage
+        .get("planned_test_nodes")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|planned| planned > 0);
+    if has_real_judgement {
+        (COVERAGE_LEDGER_SCHEMA_VERSION, coverage)
+    } else {
+        (LEGACY_LEDGER_SCHEMA_VERSION, serde_json::Value::Null)
+    }
+}
+
+/// Two-sided producer bracket for [`ledger_schema_and_coverage`]. Inert: it
+/// serializes no row and writes no ledger.
+fn coverage_schema_bracket() -> Result<(), String> {
+    let real = serde_json::json!({
+        "planned_test_nodes": 4,
+        "executed_test_nodes": 4,
+        "zero_executed_nodes": [],
+        "absent_nodes": [],
+    });
+    let (schema, carried) = ledger_schema_and_coverage(real.clone());
+    if schema != COVERAGE_LEDGER_SCHEMA_VERSION || carried != real {
+        return Err("coverage schema: a real judgement must be carried as schema 5".into());
+    }
+
+    for unresolved in [
+        serde_json::Value::Null,
+        serde_json::json!({}),
+        serde_json::json!({"planned_test_nodes": 0}),
+        serde_json::json!({"planned_test_nodes": "4"}),
+    ] {
+        let (schema, carried) = ledger_schema_and_coverage(unresolved);
+        if schema != LEGACY_LEDGER_SCHEMA_VERSION || !carried.is_null() {
+            return Err(
+                "coverage schema: schema 4 must carry null, never a coverage claim".into(),
+            );
+        }
+    }
+    println!(
+        "  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 4/null"
+    );
     Ok(())
 }
 
@@ -2771,6 +2822,7 @@ fn write_ledger(
     suite_complete: bool,
     coverage: serde_json::Value,
 ) {
+    let (ledger_schema, coverage) = ledger_schema_and_coverage(coverage);
     let gates_run = outcomes.len();
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
     // An operator stop learned nothing new about the product. Preserve the raw
@@ -2804,7 +2856,7 @@ fn write_ledger(
         })
         .collect();
     let record = serde_json::json!({
-        "schema_version": LEDGER_SCHEMA_VERSION,
+        "schema_version": ledger_schema,
         "producer": LEDGER_PRODUCER,
         // Immutable-row identity. `corrects` is null here; a correcting row
         // repeats this shape with `corrects` set to the id it supersedes.
