@@ -1923,15 +1923,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // observe; forwarding instead returned the errno of whatever host
             // identity the backend happened to run under (EPERM with no user
             // namespace, EINVAL for an unmapped uid inside a one-uid map, and
-            // backend-dependent for in-process backends). Never forwarded to the
-            // host, so it is backend-independent and bitwise-identical across
-            // --verify and record/replay. Detcore does not model per-file
-            // ownership, so this is not observable through a later stat; see
-            // is_ownership_change_noop_syscall for the semantic boundary.
+            // backend-dependent for in-process backends).
+            //
+            // The emulation covers the IDENTITY half only. Root privilege
+            // waives the ownership permission check; it does not waive pathname,
+            // descriptor, or flag errors, so handle_ownership_change_noop
+            // reissues the guest's own call with both ids set to (uid_t)-1 and
+            // returns 0 only if that validating call succeeds. ENOENT, EBADF,
+            // EFAULT, ENOTDIR, EROFS and the fchownat flag EINVAL therefore
+            // still reach the guest; the host-identity-dependent EPERM/EINVAL
+            // cannot be produced at all. Host ownership is never modified, and
+            // Detcore does not model per-file ownership, so the success is not
+            // observable through a later stat -- see
+            // is_ownership_change_noop_syscall and handle_ownership_change_noop
+            // for the full boundary, and
+            // hermit-cli/tests/chown_virtual_root_identity.rs for the bracket
+            // that fails if this arm's RESULT regresses.
             SyscallClassification::Determinized
                 if is_ownership_change_noop_syscall(call.number()) =>
             {
-                Ok(0)
+                self.handle_ownership_change_noop(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
