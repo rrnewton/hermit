@@ -64,19 +64,54 @@ const IOPRIO_WHO_PROCESS: libc::c_int = 1;
 const IOPRIO_WHO_PGRP: libc::c_int = 2;
 const IOPRIO_WHO_USER: libc::c_int = 3;
 const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+const IOPRIO_CLASS_RT: libc::c_int = 1;
 const IOPRIO_CLASS_BE: libc::c_int = 2;
+const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+const IOPRIO_LEVEL_MASK: libc::c_int = 7;
 const IOPRIO_BE_NORM: libc::c_int = 4;
 const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
     (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-881)
-fn virtual_ioprio(which: libc::c_int) -> Result<i64, Errno> {
+fn virtual_ioprio(which: libc::c_int, priority: libc::c_int) -> Result<i64, Errno> {
     match which {
-        IOPRIO_WHO_PROCESS => Ok(0),
-        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE)),
+        IOPRIO_WHO_PROCESS => Ok(i64::from(priority)),
+        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER if priority >> IOPRIO_CLASS_SHIFT == 0 => {
+            Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE))
+        }
+        IOPRIO_WHO_PGRP | IOPRIO_WHO_USER => Ok(i64::from(priority)),
         _ => Err(Errno::EINVAL),
     }
+}
+
+fn validate_virtual_ioprio(priority: libc::c_int) -> Result<(), Errno> {
+    if priority < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let class = priority >> IOPRIO_CLASS_SHIFT;
+    let valid = match class {
+        0 => priority & IOPRIO_LEVEL_MASK == 0,
+        IOPRIO_CLASS_RT | IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => true,
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(Errno::EINVAL) }
+}
+
+fn validate_ioprio_target(
+    which: libc::c_int,
+    who: libc::c_int,
+    current_pid: libc::pid_t,
+    current_pgrp: libc::pid_t,
+) -> Result<(), Errno> {
+    let matches = match which {
+        IOPRIO_WHO_PROCESS => who == 0 || who == current_pid,
+        IOPRIO_WHO_PGRP => who == 0 || who == current_pgrp,
+        // Hermit's credential model exposes a fixed virtual-root identity.
+        IOPRIO_WHO_USER => who == 0,
+        _ => return Err(Errno::EINVAL),
+    };
+    if matches { Ok(()) } else { Err(Errno::ESRCH) }
 }
 
 #[repr(C)]
@@ -1141,20 +1176,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(0)
     }
 
-    /// ioprio_set under Hermit. Detcore serializes guest threads onto one virtual
-    /// CPU, so the block-layer I/O scheduling class and priority cannot change
-    /// guest-visible computation. Accept and suppress the request as a
-    /// deterministic no-op success, mirroring how sched_setaffinity is handled.
-    /// Re-enables `ionice` under --strict.
+    /// ioprio_set under Hermit. The block-layer policy remains inert, but the
+    /// guest-visible value is retained so a successful set can round-trip
+    /// through ioprio_get. Only the current virtual process/group/user target is
+    /// modeled; a different target fails with ESRCH instead of silently
+    /// accepting a dropped update.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#791)
     pub async fn handle_ioprio_set<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::IoprioSet,
     ) -> Result<i64, Error> {
+        validate_virtual_ioprio(call.priority())?;
+        self.validate_ioprio_call_target(guest, call.which(), call.who())
+            .await?;
+        *guest
+            .thread_state()
+            .io_priority
+            .lock()
+            .expect("I/O priority mutex poisoned") = call.priority();
         info!(
-            "Suppressing ioprio_set(which={}, who={}, priority={}); I/O priority is virtual",
+            "Emulating ioprio_set(which={}, who={}, priority={}): virtual state updated",
             call.which(),
             call.who(),
             call.priority()
@@ -1163,25 +1206,53 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// ioprio_get under Hermit. I/O priority is inert under Detcore's serialized
-    /// scheduler, so process queries observe the fixed raw IOPRIO_CLASS_NONE
-    /// value while group/user queries observe the effective SCHED_OTHER default
-    /// of IOPRIO_CLASS_BE/4, without consulting host block-scheduler state.
+    /// scheduler, so queries read the retained virtual state without consulting
+    /// host block-scheduler state. An unset process query reports raw
+    /// IOPRIO_CLASS_NONE, while group/user queries report the effective
+    /// SCHED_OTHER default IOPRIO_CLASS_BE/4.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-881)
     pub async fn handle_ioprio_get<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::IoprioGet,
     ) -> Result<i64, Error> {
-        let priority = virtual_ioprio(call.which())?;
+        self.validate_ioprio_call_target(guest, call.which(), call.who())
+            .await?;
+        let stored = *guest
+            .thread_state()
+            .io_priority
+            .lock()
+            .expect("I/O priority mutex poisoned");
+        let priority = virtual_ioprio(call.which(), stored)?;
 
         info!(
-            "Emulating ioprio_get(which={}, who={}): fixed priority {}",
+            "Emulating ioprio_get(which={}, who={}): virtual priority {}",
             call.which(),
             call.who(),
             priority
         );
         Ok(priority)
+    }
+
+    async fn validate_ioprio_call_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        which: libc::c_int,
+        who: libc::c_int,
+    ) -> Result<(), Error> {
+        let current_pid = if which == IOPRIO_WHO_PROCESS && who != 0 {
+            guest.inject(syscalls::Getpid::new()).await? as libc::pid_t
+        } else {
+            0
+        };
+        let current_pgrp = if which == IOPRIO_WHO_PGRP && who != 0 {
+            guest.inject(syscalls::Getpgrp::new()).await? as libc::pid_t
+        } else {
+            0
+        };
+        validate_ioprio_target(which, who, current_pid, current_pgrp)?;
+        Ok(())
     }
 }
 
@@ -1190,18 +1261,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ioprio_query_reports_fixed_raw_and_effective_defaults() {
-        assert_eq!(virtual_ioprio(IOPRIO_WHO_PROCESS), Ok(0));
+    fn ioprio_query_reports_virtual_raw_and_effective_values() {
+        assert_eq!(virtual_ioprio(IOPRIO_WHO_PROCESS, 0), Ok(0));
         assert_eq!(
-            virtual_ioprio(IOPRIO_WHO_PGRP),
+            virtual_ioprio(IOPRIO_WHO_PGRP, 0),
             Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE))
         );
         assert_eq!(
-            virtual_ioprio(IOPRIO_WHO_USER),
+            virtual_ioprio(IOPRIO_WHO_USER, 0),
             Ok(i64::from(IOPRIO_DEFAULT_EFFECTIVE))
         );
-        assert_eq!(virtual_ioprio(0), Err(Errno::EINVAL));
-        assert_eq!(virtual_ioprio(4), Err(Errno::EINVAL));
+        let idle = (IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) | 7;
+        assert_eq!(
+            virtual_ioprio(IOPRIO_WHO_PROCESS, idle),
+            Ok(i64::from(idle))
+        );
+        assert_eq!(virtual_ioprio(IOPRIO_WHO_PGRP, idle), Ok(i64::from(idle)));
+        assert_eq!(virtual_ioprio(IOPRIO_WHO_USER, idle), Ok(i64::from(idle)));
+        assert_eq!(virtual_ioprio(0, idle), Err(Errno::EINVAL));
+        assert_eq!(virtual_ioprio(4, idle), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn ioprio_validation_rejects_missing_targets_and_invalid_values() {
+        assert_eq!(
+            validate_ioprio_target(IOPRIO_WHO_PROCESS, 42, 42, 7),
+            Ok(())
+        );
+        assert_eq!(validate_ioprio_target(IOPRIO_WHO_PGRP, 7, 42, 7), Ok(()));
+        assert_eq!(validate_ioprio_target(IOPRIO_WHO_USER, 0, 42, 7), Ok(()));
+        assert_eq!(
+            validate_ioprio_target(IOPRIO_WHO_PROCESS, 99, 42, 7),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            validate_ioprio_target(IOPRIO_WHO_PGRP, 99, 42, 7),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            validate_ioprio_target(IOPRIO_WHO_USER, 99, 42, 7),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(validate_ioprio_target(0, 0, 42, 7), Err(Errno::EINVAL));
+
+        let idle = (IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) | 7;
+        assert_eq!(validate_virtual_ioprio(0), Ok(()));
+        assert_eq!(validate_virtual_ioprio(idle), Ok(()));
+        assert_eq!(validate_virtual_ioprio(1), Err(Errno::EINVAL));
+        assert_eq!(
+            validate_virtual_ioprio(7 << IOPRIO_CLASS_SHIFT),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

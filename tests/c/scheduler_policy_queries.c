@@ -19,6 +19,12 @@
 #define SCHED_DEADLINE 6
 #endif
 
+#define IOPRIO_WHO_PROCESS 1
+#define IOPRIO_WHO_PGRP 2
+#define IOPRIO_WHO_USER 3
+#define IOPRIO_CLASS_SHIFT 13
+#define IOPRIO_CLASS_IDLE 3
+
 struct sched_attr_compat {
   uint32_t size;
   uint32_t sched_policy;
@@ -67,11 +73,47 @@ int main(void) {
     return 1;
   }
 
-  long priority = syscall(SYS_ioprio_get, 1, 0);
+  long priority = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
   if (priority != 0) {
     fprintf(stderr, "ioprio_get returned %ld, expected virtual default 0\n",
             priority);
     return 1;
+  }
+
+  const int requested_priority = (IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT) | 7;
+  const pid_t current_pid = getpid();
+  if (require_zero(syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, current_pid,
+                           requested_priority),
+                   "ioprio_set") != 0) {
+    return 1;
+  }
+  priority = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, current_pid);
+  if (priority != requested_priority) {
+    fprintf(stderr, "ioprio_get returned %ld after set, expected %d\n", priority,
+            requested_priority);
+    return 1;
+  }
+
+  const int selectors[] = {IOPRIO_WHO_PROCESS, IOPRIO_WHO_PGRP,
+                           IOPRIO_WHO_USER};
+  for (size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); ++i) {
+    errno = 0;
+    if (syscall(SYS_ioprio_get, selectors[i], 999999) != -1 ||
+        errno != ESRCH) {
+      fprintf(stderr,
+              "ioprio_get selector %d missing target did not return ESRCH: %s\n",
+              selectors[i], strerror(errno));
+      return 1;
+    }
+    errno = 0;
+    if (syscall(SYS_ioprio_set, selectors[i], 999999,
+                requested_priority) != -1 ||
+        errno != ESRCH) {
+      fprintf(stderr,
+              "ioprio_set selector %d missing target did not return ESRCH: %s\n",
+              selectors[i], strerror(errno));
+      return 1;
+    }
   }
 
   struct sched_attr_compat attr;
