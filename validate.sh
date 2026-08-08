@@ -816,8 +816,8 @@ fi
 # run actually executed rather than a hardcoded number, so it can never go stale
 # as gates are added or removed. `run_check` is not fail-fast: a `full` run that
 # reaches the end of `run_full_suite` has recorded EVERY gate in its plan exactly
-# once (the preflight submodule + Reverie-pin checks, then the portable and
-# privileged manifest lanes). We therefore DEFER the expected count to
+# once (the three preflight checks, one explicit manifest/inventory check, then
+# the portable and privileged DAG lanes). We therefore DEFER the expected count to
 # ledger-write time and set it to the observed `gates_run` -- but ONLY once
 # VALIDATION_SUITE_COMPLETE proves the whole plan ran. An incomplete `full` run
 # (e.g. a preflight abort) leaves the flag 0 and the count `null`, so the outcome
@@ -4486,12 +4486,16 @@ function run_ci_manifest_lane {
     local lane=$1
     local timeout_seconds=${2:-7200}
 
-    run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
     run_check_with_timeout "$timeout_seconds" "$lane CI DAG lane" \
         ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v
 }
 
+function run_ci_manifest_inventory {
+    run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate
+}
+
 function run_portable_only_suite {
+    run_ci_manifest_inventory
     run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     print_summary
     ((failures == 0))
@@ -4716,6 +4720,7 @@ function run_calibrated_analyze_tests {
 }
 
 function run_privileged_validation {
+    run_ci_manifest_inventory
     run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
     print_summary
     ((failures == 0))
@@ -4733,11 +4738,17 @@ function run_quick_suite {
 }
 
 function run_full_suite {
+    # The explicit inventory is lane-independent. Three same-tree full runs
+    # produced identical normalized inventory output, while the second explicit
+    # pass cost 26-27s. Run it once before the first lane; each DAG retains its
+    # own e2e.metadata node as an in-lane guard.
+    run_ci_manifest_inventory
     run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"
     run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"
-    # Both lanes ran to completion, so every gate in the full plan has been
-    # recorded (run_check is not fail-fast). This authorizes deriving the
-    # expected gate count from the observed gates_run at ledger-write time.
+    # The inventory and both lanes ran to completion, so every gate in the full
+    # plan has been recorded (run_check is not fail-fast). This authorizes
+    # deriving the expected gate count from observed gates_run at ledger-write
+    # time.
     VALIDATION_SUITE_COMPLETE=1
 }
 

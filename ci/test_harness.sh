@@ -395,6 +395,122 @@ function assert_validate_entrypoint {
         die "validate.sh $function_name command diverged from the audited entrypoint"
 }
 
+function assert_inventory_entrypoint {
+    local function_name=$1
+    local body
+    body=$(function_body "$function_name" "$ROOT_DIR/validate.sh")
+    [[ -n $body ]] || die "validate.sh function is missing: $function_name"
+    [[ $(grep -Ec '^[[:space:]]*run_ci_manifest_inventory([[:space:]]|$)' <<<"$body") == 1 ]] ||
+        die "validate.sh $function_name must call run_ci_manifest_inventory exactly once"
+}
+
+# Execute the real full-suite function bodies with gate wrappers replaced by an
+# event recorder. This observes control flow rather than merely counting source
+# strings: the positive fixture must emit one explicit inventory gate followed
+# by the portable and privileged DAG gates, then mark the suite complete.
+function observe_full_validation_suite {
+    local inventory_body lane_body full_body
+    inventory_body=$(function_body run_ci_manifest_inventory "$ROOT_DIR/validate.sh")
+    lane_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
+    full_body=$(function_body run_full_suite "$ROOT_DIR/validate.sh")
+    [[ -n $inventory_body && -n $lane_body && -n $full_body ]] ||
+        die "validate.sh full-suite function bodies are incomplete"
+
+    (
+        function run_check {
+            printf 'run_check'
+            printf '\t%s' "$@"
+            printf '\n'
+        }
+        function run_check_with_timeout {
+            printf 'run_check_with_timeout'
+            printf '\t%s' "$@"
+            printf '\n'
+        }
+
+        eval "$inventory_body"
+        eval "$lane_body"
+        eval "$full_body"
+        CI_PORTABLE_DAG_TIMEOUT_SECONDS=7200
+        CI_PRIVILEGED_DAG_TIMEOUT_SECONDS=7200
+        VALIDATION_DAG_JOBS=16
+        VALIDATION_SUITE_COMPLETE=0
+        run_full_suite
+        printf 'suite_complete\t%s\n' "$VALIDATION_SUITE_COMPLETE"
+    )
+}
+
+function assert_full_validation_gate_plan {
+    local observed expected preflight_section suite_gates preflight_gates
+    observed=$(observe_full_validation_suite)
+    expected=$'run_check\tCentralized test manifest and inventory\t./ci/test_harness.sh\tvalidate\nrun_check_with_timeout\t7200\tportable CI DAG lane\t./ci/run-dag.sh\tportable\t-j\t16\t-v\nrun_check_with_timeout\t7200\tprivileged CI DAG lane\t./ci/run-dag.sh\tprivileged\t-j\t16\t-v\nsuite_complete\t1'
+    [[ $observed == "$expected" ]] ||
+        die "validate.sh full-suite gate plan diverged from one inventory + two DAG lanes:
+$observed"
+
+    # Production derives gates_expected from the completed run. Keep an exact
+    # fixture too, so a plan change must account for the landing receipt shape:
+    # three preflight gates plus the three observed suite gates equals six.
+    preflight_section=$(awk '
+        /^# The archival pin is not a testing exemption:/ { inside = 1 }
+        /^# --only is the first-class fast path/ { exit }
+        inside { print }
+    ' "$ROOT_DIR/validate.sh")
+    [[ $(grep -Fxc 'run_check "Reverie dependency pin equals latest main" \' <<<"$preflight_section") == 1 ]] ||
+        die "validate.sh full preflight lost the latest-Reverie gate"
+    [[ $(grep -Fxc 'run_check "Initialize repository submodules" initialize_repository_submodules' <<<"$preflight_section") == 1 ]] ||
+        die "validate.sh full preflight lost the submodule-initialization gate"
+    [[ $(grep -Fxc 'run_check "Reverie pin consistency" validate_reverie_pin_consistency' <<<"$preflight_section") == 1 ]] ||
+        die "validate.sh full preflight lost the Reverie-pin consistency gate"
+    preflight_gates=$(grep -Ec '^run_check ' <<<"$preflight_section")
+    suite_gates=$(grep -Ec '^run_check(_with_timeout)?' <<<"$observed")
+    [[ $preflight_gates == 3 && $suite_gates == 3 && $((preflight_gates + suite_gates)) == 6 ]] ||
+        die "validate.sh complete full plan must record exactly 6 gates (3 preflight + 3 suite), got $preflight_gates + $suite_gates"
+}
+
+function assert_dag_metadata_nodes {
+    local dag_root=$1 lane
+    for lane in portable privileged; do
+        jq -e '
+            [.steps[] | select(
+                .group == "e2e"
+                and .job == "metadata"
+                and .cmd == "./ci/test_harness.sh validate"
+                and .timeout == 60
+                and .hint.est_duration_s == 30
+                and .hint.hard_mem_max_bytes == 1073741824
+            )] | length == 1
+        ' "$dag_root/$lane.json" >/dev/null ||
+            die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
+    done
+}
+
+# Bracket the retained in-DAG guards: deleting either metadata node, with every
+# other byte copied from the committed DAGs, must make the production assertion
+# refuse. These are inert temporary fixtures; they never execute or authorize CI.
+function assert_dag_metadata_negative_fixtures {
+    local dag_root=$1
+    (
+        local scratch case_root lane
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        for lane in portable privileged; do
+            case_root="$scratch/missing-$lane"
+            mkdir -p "$case_root"
+            cp "$dag_root/portable.json" "$case_root/portable.json"
+            cp "$dag_root/privileged.json" "$case_root/privileged.json"
+            jq 'del(.steps[] | select(.group == "e2e" and .job == "metadata"))' \
+                "$dag_root/$lane.json" >"$case_root/$lane.json"
+            [[ $(jq '[.steps[] | select(.group == "e2e" and .job == "metadata")] | length' \
+                "$case_root/$lane.json") == 0 ]] ||
+                die "negative fixture failed to remove $lane e2e.metadata"
+            if (assert_dag_metadata_nodes "$case_root") >/dev/null 2>&1; then
+                die "metadata guard accepted a $lane DAG with e2e.metadata removed"
+            fi
+        done
+    )
+}
+
 # Keep the latest-Reverie invariant attached to every testing evidence path.
 # The checker unit tests plant stale/current pins; these structural assertions
 # prove that those same fail-closed semantics cannot be bypassed by selecting a
@@ -951,9 +1067,11 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_portable_only_suite \
         '    run_ci_manifest_lane portable "${CI_PORTABLE_DAG_TIMEOUT_SECONDS:-7200}"'
+    assert_inventory_entrypoint run_portable_only_suite
     # shellcheck disable=SC2016
     assert_validate_entrypoint privileged run_privileged_validation \
         '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
+    assert_inventory_entrypoint run_privileged_validation
     # The default full validation must delegate to both audited DAGs too.
     # shellcheck disable=SC2016
     assert_validate_entrypoint portable run_full_suite \
@@ -961,28 +1079,24 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     assert_validate_entrypoint privileged run_full_suite \
         '    run_ci_manifest_lane privileged "${CI_PRIVILEGED_DAG_TIMEOUT_SECONDS:-7200}"'
-    local runner_body
+    assert_inventory_entrypoint run_full_suite
+    assert_full_validation_gate_plan
+    local runner_body inventory_body
     runner_body=$(function_body run_ci_manifest_lane "$ROOT_DIR/validate.sh")
+    inventory_body=$(function_body run_ci_manifest_inventory "$ROOT_DIR/validate.sh")
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '        ./ci/run-dag.sh "$lane" -j "$VALIDATION_DAG_JOBS" -v' <<<"$runner_body") == 1 ]] ||
         die "validate.sh run_ci_manifest_lane must execute exactly one audited DAG"
+    ! grep -Fq './ci/test_harness.sh validate' <<<"$runner_body" ||
+        die "validate.sh lane runner must not repeat the lane-independent explicit inventory"
+    [[ $(grep -Fxc '    run_check "Centralized test manifest and inventory" ./ci/test_harness.sh validate' <<<"$inventory_body") == 1 ]] ||
+        die "validate.sh inventory runner must execute exactly one explicit inventory"
 
     # This validation command contains real concurrent rustc probes. Keep both
     # lane copies on the measured 30s workload class and the same 60s cap so a
     # shorter privileged proxy cannot reject work that passed the portable gate.
-    for lane in portable privileged; do
-        jq -e '
-            [.steps[] | select(
-                .group == "e2e"
-                and .job == "metadata"
-                and .cmd == "./ci/test_harness.sh validate"
-                and .timeout == 60
-                and .hint.est_duration_s == 30
-                and .hint.hard_mem_max_bytes == 1073741824
-            )] | length == 1
-        ' "$DAG_ROOT/$lane.json" >/dev/null ||
-            die "$lane e2e.metadata must carry the measured validation workload and 60s/1GiB bounds"
-    done
+    assert_dag_metadata_nodes "$DAG_ROOT"
+    assert_dag_metadata_negative_fixtures "$DAG_ROOT"
 
     local privileged_critical_path privileged_job_timeout_minutes
     local privileged_inner_timeout_seconds=360
