@@ -42,28 +42,34 @@
 #define PR_MCE_KILL_EARLY 1
 #endif
 
+/*
+ * THE OBSERVED errno IS EMITTED, for the reason spelled out in
+ * child_subreaper_refusal: the refusal errno is the substance of the contract,
+ * the old diagnostics went to stderr which the cell observation excludes, and a
+ * tally could not say which of the two entry points refused wrongly.
+ */
 int main(void) {
-  int ok = 0;
+  enum { EXPECTED_CHECKS = 2 };
 
   /* Setting the machine-check kill policy is refused with a fixed ENOSYS. */
   errno = 0;
-  if (prctl(PR_MCE_KILL, PR_MCE_KILL_SET, PR_MCE_KILL_EARLY, 0, 0) == -1 &&
-      errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(stderr, "PR_MCE_KILL_SET not refused: errno %d\n", errno);
-    return 1;
-  }
+  int set_rc = prctl(PR_MCE_KILL, PR_MCE_KILL_SET, PR_MCE_KILL_EARLY, 0, 0);
+  int set_errno = errno;
+  int set_refused = set_rc == -1 && set_errno == ENOSYS;
 
   /* Querying the machine-check kill policy is refused with a fixed ENOSYS. */
   errno = 0;
-  if (prctl(PR_MCE_KILL_GET, 0, 0, 0, 0) == -1 && errno == ENOSYS) {
-    ok++;
-  } else {
-    fprintf(stderr, "PR_MCE_KILL_GET not refused: errno %d\n", errno);
-    return 1;
-  }
+  int get_rc = prctl(PR_MCE_KILL_GET, 0, 0, 0, 0);
+  int get_errno = errno;
+  int get_refused = get_rc == -1 && get_errno == ENOSYS;
 
-  printf("mcekill ok=%d\n", ok);
-  return 0;
+  int ok = set_refused + get_refused;
+  printf(
+      "mcekill ok=%d set_rc=%d set_errno=%d get_rc=%d get_errno=%d\n",
+      ok,
+      set_rc,
+      set_errno,
+      get_rc,
+      get_errno);
+  return ok == EXPECTED_CHECKS ? 0 : 1;
 }

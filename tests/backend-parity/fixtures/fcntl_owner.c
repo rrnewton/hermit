@@ -38,13 +38,15 @@ int main(void) {
     if (fcntl(fds[0], F_SETOWN, me) == 0) {
         ok++;
     }
-    if (fcntl(fds[0], F_GETOWN) == me) {
+    int getown = fcntl(fds[0], F_GETOWN);
+    if (getown == me) {
         ok++;
     }
     if (fcntl(fds[0], F_SETSIG, SIGUSR1) == 0) {
         ok++;
     }
-    if (fcntl(fds[0], F_GETSIG) == SIGUSR1) {
+    int getsig = fcntl(fds[0], F_GETSIG);
+    if (getsig == SIGUSR1) {
         ok++;
     }
     struct f_owner_ex set_ex = {.type = F_OWNER_PID, .pid = me};
@@ -62,6 +64,11 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("fowner ok=%d\n", ok);
+    /* Emit the OBSERVED VALUES, not just the sum. getsig and the owner TYPE are
+     * host-independent constants (SIGUSR1, F_OWNER_PID); getown is compared to our
+     * own pid rather than printed raw, because a raw pid is not host-independent. */
+    printf("fowner ok=%d getsig=%d owner_type=%d getown_is_self=%d ex_pid_is_self=%d\n",
+           ok, getsig, (int)got_ex.type, getown == me ? 1 : 0,
+           got_ex.pid == me ? 1 : 0);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
