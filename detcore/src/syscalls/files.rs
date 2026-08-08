@@ -28,6 +28,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
@@ -1691,6 +1692,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ret = self.record_or_replay(guest, call).await?;
         self.canonicalize_statfs_buf(guest, call.buf())?;
         Ok(ret)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1849): Determinized ownership mutation. Emulate the
+    // IDENTITY half of the call and let Linux answer the ARGUMENT half.
+    /// The `chown` family (`chown`, `fchown`, `fchownat`, `lchown`).
+    ///
+    /// Detcore presents a fixed virtual-root identity, so the *permission*
+    /// answer must be the one a real root gets: success, for any uid. But root
+    /// privilege affects only the ownership permission check — it does not
+    /// waive pathname, descriptor, or flag errors. A real root's
+    /// `chown("/does/not/exist", 0, 0)` still fails with `ENOENT`.
+    ///
+    /// So this does not fabricate a bare `Ok(0)`. It reissues the guest's own
+    /// call with both ids replaced by `(uid_t)-1`, Linux's "leave this id
+    /// unchanged" sentinel, and reports success only if that succeeds:
+    ///
+    /// * the kernel performs the identical path walk, `dirfd` lookup, and
+    ///   `AT_*` flag validation, so `ENOENT`, `ENOTDIR`, `ELOOP`,
+    ///   `ENAMETOOLONG`, `EFAULT`, `EBADF`, `EROFS`, and the `fchownat`
+    ///   flag `EINVAL` all survive;
+    /// * because neither `ATTR_UID` nor `ATTR_GID` is set, `setattr_prepare`
+    ///   skips the ownership permission check entirely, so the two errnos that
+    ///   were host-identity-dependent — `EPERM` with no user namespace, and
+    ///   `EINVAL` for a uid unmapped inside a one-uid `uid_map` — cannot be
+    ///   produced. Those are exactly the ones the virtual-root identity must
+    ///   suppress;
+    /// * host ownership is never modified, which is the property that makes
+    ///   this a no-op rather than a forwarded `chown`.
+    ///
+    /// Routed through `record_or_replay` rather than `inject`, so a replay does
+    /// not need the guest's filesystem to still exist.
+    ///
+    /// **Semantic boundary, stated explicitly.** Detcore does not model
+    /// per-file ownership, so the success is not observable through a later
+    /// `stat`. A guest that chowns to a foreign uid and reads the owner back
+    /// sees the unchanged owner — a divergence a single-uid container cannot
+    /// avoid, and strictly smaller than the status quo in which the guest
+    /// believes it is root and cannot chown at all.
+    ///
+    /// **Residual, also stated.** Path resolution still requires search
+    /// permission on the parent directories, so `EACCES` remains a function of
+    /// the host identity under `--no-namespace`. That exposure is shared with
+    /// every pass-through filesystem syscall (`open`, `stat`, `chmod`) and is
+    /// not introduced here; it is recorded so the boundary is not overstated.
+    ///
+    /// The behavioural contract is bracketed end to end by
+    /// `hermit-cli/tests/chown_virtual_root_identity.rs`; the unit tests in
+    /// `syscall_classification` pin membership only and cannot see this
+    /// function's result.
+    pub async fn handle_ownership_change_noop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        /// `(uid_t)-1` / `(gid_t)-1`: Linux's "do not change this id" sentinel.
+        const ID_UNCHANGED: libc::uid_t = libc::uid_t::MAX;
+
+        let validate = match call {
+            Syscall::Chown(c) => Syscall::Chown(
+                c.with_owner(ID_UNCHANGED)
+                    .with_group(ID_UNCHANGED as libc::gid_t),
+            ),
+            Syscall::Fchown(c) => Syscall::Fchown(
+                c.with_owner(ID_UNCHANGED)
+                    .with_group(ID_UNCHANGED as libc::gid_t),
+            ),
+            Syscall::Lchown(c) => Syscall::Lchown(
+                c.with_owner(ID_UNCHANGED)
+                    .with_group(ID_UNCHANGED as libc::gid_t),
+            ),
+            Syscall::Fchownat(c) => Syscall::Fchownat(
+                c.with_owner(ID_UNCHANGED)
+                    .with_group(ID_UNCHANGED as libc::gid_t),
+            ),
+            // Unreachable while `is_ownership_change_noop_syscall` and this
+            // match name the same four syscalls. If they ever drift, fall back
+            // to the pre-#1849 pass-through rather than panicking in a syscall
+            // handler or silently claiming a success we did not validate.
+            other => {
+                warn!(
+                    "ownership-change no-op reached with an unexpected syscall {:?}; \
+                     forwarding unchanged",
+                    other.number()
+                );
+                other
+            }
+        };
+
+        // The errno of the validating call is the guest's answer; only a
+        // successful validation becomes the emulated success.
+        self.record_or_replay(guest, validate).await?;
+        Ok(0)
     }
 
     /// Overwrite the host-varying fields of a `statfs` result buffer with fixed
