@@ -3,43 +3,43 @@
 This directory tracks executable parity contracts across Hermit's ptrace,
 DynamoRIO (DBI), and KVM backends. The case catalog and its small set of known
 gaps live in `run_matrix.py`; new cases are green contracts by default. Live
-results are compatibility measurement state, so when Hermit is checked out
-inside dev-hermit the runner appends them to the outer
-`compat-envelope/scorecard.csv` instead of maintaining a generated TSV here.
+results are compatibility measurement state. Inside dev-hermit, the runner
+writes one ignored artifact per invocation under
+`compat-envelope/ignored/backend-parity/`. The tracked scorecard changes only
+when a caller explicitly supplies `--parent-scorecard`.
 
 ## Current ratchet
 
-The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the L2
-ratchet (`--strict --verify`, hermit's own double-run bitwise comparison) are
-tracked separately, because a contract can hold at L1 yet not at L2.
+The L1 ratchet (`--strict`, run three times) and the L2 ratchet (`--strict
+--verify`, Hermit's backend-specific double-run verifier) are tracked
+separately, because a contract can hold at L1 yet not at L2.
 
 L1 (`hermit run --strict`):
 
-| Backend | Passing pairs | Parity vs ptrace |
+| Backend | Passing contracts | Contract coverage |
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
 | DBI | 26/28 | 93% |
-| KVM | 23/28 | 82% |
+| KVM | 27/28 | 96% |
 
 L2 (`hermit run --strict --verify`):
 
-| Backend | Verified pairs | L2 kind | Parity vs ptrace |
+| Backend | Verified contracts | L2 kind | Contract coverage |
 | --- | ---: | --- | ---: |
-| ptrace | 28/28 | DETLOG-bitwise | 100% |
-| DBI | 26/28 | DETLOG-bitwise | 93% |
-| KVM | 22/28 | guest-visible only | 79% |
+| ptrace | 28/28 | stripped DETLOG | 100% |
+| DBI | 25/28 | native self-verify | 89% |
+| KVM | 26/28 | guest-visible only | 93% |
 
-The two L2 assurance *kinds* are not interchangeable. **DETLOG-bitwise** L2
-(ptrace, DBI) means hermit re-ran the guest and found the two normalized DETLOG
-streams — the full syscall and scheduling trace — bitwise-identical.
-**guest-visible** L2 (KVM) is strictly weaker: reverie-kvm runs concurrently and
-declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the L2 subsection
-below for the two contracts that hold at L1 but not L2.
+The L2 assurance kinds are not interchangeable. Ptrace's plain `--verify`
+normalizes and compares DETLOG under the lossy `Stripped` policy; it is not a
+bitwise claim. DBI uses a dedicated adapter that compares its two stdout/exit
+results, native Detcore summaries, and guest-memory hashes, not DETLOG. KVM
+compares guest stdout, stderr, and exit status while deliberately omitting its
+nondeterministic internal trace order. These are within-backend consistency
+witnesses, not cross-backend stdout parity.
 
 The task's pre-existing DBI-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
+measures the backend's own Reverie suite. The 26/28 number above is deliberately
 separate: it measures the cross-backend Hermit contracts in this directory.
 The current DBI path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
@@ -87,9 +87,9 @@ deterministic `EPERM` without copying the source byte, while the same calls
 succeed outside Hermit.
 
 KVM loads dynamic Linux ELF programs through `KvmGuest<Detcore>` and passes
-twenty-three pairs, including its bounded cooperative pthread lifecycle, executable
-memory, deterministic memory-advice policy, clock, PID, inert scheduler-policy
-queries, synthetic CPUID, and
+twenty-seven contracts, including its bounded cooperative pthread lifecycle,
+executable memory, deterministic memory-advice policy, clock, PID, inert
+scheduler-policy queries, synthetic CPUID, and
 threaded random-source probes, plus file mutation, listmount refusal,
 process-memory read/write refusal, io_uring refusal with epoll fallback,
 repeatable heap growth, and private/shared anonymous mapping layouts. KVM
@@ -105,40 +105,41 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Cases
 
-Each cell shows the L1 status and, after `/`, the L2 status: `detlog` for
-DETLOG-bitwise L2, `guest` for KVM guest-visible L2, and `gap` where the level
-is not reached.
+Each cell shows the L1 status and, after `/`, the L2 status: `stripped` for
+ptrace's normalized DETLOG comparison, `self` for DBI's native verifier,
+`guest` for KVM guest-visible verification, and `gap` where the level is not
+reached.
 
 | Test | ptrace | DBI | KVM |
 | --- | --- | --- | --- |
-| `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
-| `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
-| `exit_zero` | pass / detlog | pass / detlog | pass / guest |
-| `exit_status` | pass / detlog | pass / detlog | pass / guest |
-| `file_read` | pass / detlog | pass / detlog | pass / guest |
-| `file_mutation` | pass / detlog | pass / detlog | pass / guest |
-| `file_metadata` | pass / detlog | gap / gap | pass / guest |
-| `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
-| `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
-| `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
-| `process_vm_writev_refusal` | pass / detlog | pass / detlog | pass / guest |
-| `executable_mmap` | pass / detlog | pass / detlog | pass / guest |
-| `memory_advice` | pass / detlog | pass / detlog | pass / guest |
-| `heap_growth` | pass / detlog | pass / detlog | pass / guest |
-| `anonymous_mmap_layout` | pass / detlog | pass / detlog | pass / guest |
-| `shared_anonymous_mmap` | pass / detlog | pass / detlog | pass / guest |
-| `pthread_lifecycle` | pass / detlog | gap / gap | pass / guest |
-| `process_wait_accounting` | pass / detlog | pass / detlog | pass / **gap** |
-| `process_wait_lifecycle` | pass / detlog | pass / detlog | gap / gap |
-| `cpuid_policy` | pass / detlog | pass / detlog | pass / guest |
-| `virtual_clock` | pass / detlog | pass / detlog | pass / guest |
-| `random_sources` | pass / detlog | pass / detlog | pass / guest |
-| `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
-| `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
-| `signal_disposition` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigaction_state` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigprocmask_state` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigaltstack_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `hello_stdout` | pass / stripped | pass / self | pass / guest |
+| `argument_forwarding` | pass / stripped | pass / self | pass / guest |
+| `exit_zero` | pass / stripped | pass / self | pass / guest |
+| `exit_status` | pass / stripped | pass / **gap** | pass / guest |
+| `file_read` | pass / stripped | pass / self | pass / guest |
+| `file_mutation` | pass / stripped | pass / self | pass / guest |
+| `file_metadata` | pass / stripped | gap / gap | pass / guest |
+| `io_uring_fallback` | pass / stripped | pass / self | pass / guest |
+| `listmount_unavailable` | pass / stripped | pass / self | pass / guest |
+| `process_vm_readv_refusal` | pass / stripped | pass / self | pass / guest |
+| `process_vm_writev_refusal` | pass / stripped | pass / self | pass / guest |
+| `executable_mmap` | pass / stripped | pass / self | pass / guest |
+| `memory_advice` | pass / stripped | pass / self | pass / guest |
+| `heap_growth` | pass / stripped | pass / self | pass / guest |
+| `anonymous_mmap_layout` | pass / stripped | pass / self | pass / guest |
+| `shared_anonymous_mmap` | pass / stripped | pass / self | pass / guest |
+| `pthread_lifecycle` | pass / stripped | gap / gap | pass / guest |
+| `process_wait_accounting` | pass / stripped | pass / self | pass / **gap** |
+| `process_wait_lifecycle` | pass / stripped | pass / self | gap / gap |
+| `cpuid_policy` | pass / stripped | pass / self | pass / guest |
+| `virtual_clock` | pass / stripped | pass / self | pass / guest |
+| `random_sources` | pass / stripped | pass / self | pass / guest |
+| `virtual_pid` | pass / stripped | pass / self | pass / guest |
+| `scheduler_policy_queries` | pass / stripped | pass / self | pass / guest |
+| `signal_disposition` | pass / stripped | pass / self | pass / guest |
+| `sigaction_state` | pass / stripped | pass / self | pass / guest |
+| `sigprocmask_state` | pass / stripped | pass / self | pass / guest |
+| `sigaltstack_state` | pass / stripped | pass / self | pass / guest |
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
@@ -166,17 +167,20 @@ three byte-identical runs. The runner disables PMU timeslicing for portability.
 
 Passing `--verify` lifts every probe to L2: the runner invokes
 `hermit run --strict --verify --verify-allow both`, so hermit itself runs each
-guest twice and asserts a bitwise-identical result. Because `--verify` diverts
-the guest's own stdout into per-run temporary logs, the L2 path cannot re-check
-stdout the way the L1 path does; instead it enforces that the guest exit status
-matches and that hermit's double-run comparison succeeded at *at least* the
-assurance kind expected for the backend. The runner keys on two distinct stderr
-witnesses: `Determinism verified` (DETLOG-bitwise, ptrace and DBI) and
-`guest output and exit status matched` (KVM guest-visible). A DETLOG result
-satisfies a `guest` contract because it is strictly stronger; the reverse fails.
+guest twice and applies the selected backend's self-consistency check. Ptrace
+compares exact stdout/stderr/exit plus a normalized DETLOG; DBI's separate
+adapter compares stdout/exit, native Detcore summaries, and guest-memory hashes;
+KVM compares exact stdout/stderr/exit without an internal trace. The runner
+records those as within-backend evidence. It does not reinterpret an overall
+verify PASS as cross-backend stdout parity.
 
-One contract holds at L1 but not L2 and is recorded as an L2 `gap` with its
-reason in the runner:
+Two contracts hold at L1 but not L2 and are recorded as L2 `gap`s with their
+reasons in the runner:
+
+- **`exit_status` on DBI.** The fixed nonzero-exit oracle passes three L1 runs,
+  but `--verify-allow both` completes after the first DBI run exits nonzero, so
+  no second run or self-consistency witness exists. The L2 row remains a gap
+  rather than treating one successful expected exit as a double-run compare.
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
@@ -303,9 +307,12 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Every non-check run auto-discovers an outer dev-hermit checkout and appends
-scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
-to select another outer scorecard, `--no-parent-scorecard` for a deliberately
-side-effect-free run, or `--output /tmp/backend-parity.tsv` for the legacy
-standalone observation TSV. `BLOCKED` means a required host capability or
-runtime artifact was absent; it does not change the known-gap contract.
+Every non-check run auto-discovers an outer dev-hermit checkout and writes one
+ignored per-run CSV below `compat-envelope/ignored/backend-parity/`. The runner
+prints one absolute, shell-quoted, schema-aware command for a deliberate
+reviewed fold-in; it maps columns by name and refuses a duplicate run ID. Use
+`--parent-scorecard PATH` to opt into appending that exact file (including the
+tracked scorecard), `--no-parent-scorecard` to suppress the observation artifact,
+or `--output /tmp/backend-parity.tsv` for the legacy standalone observation TSV.
+`BLOCKED` means a required host capability or runtime artifact was absent; it
+does not change the known-gap contract.
