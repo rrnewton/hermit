@@ -289,11 +289,21 @@ def write_fake_process(
     start_ticks: int,
     argv: tuple[str, ...],
     cgroup: str,
+    state: str = "S",
+    flags: int = 0,
 ) -> None:
     process = proc_root / str(pid)
     process.mkdir(parents=True)
     # /proc/PID/stat fields 3..22: state, ppid, pgrp, then through starttime.
-    fields = ["S", str(ppid), str(pgid), *("0" for _ in range(16)), str(start_ticks)]
+    fields = [
+        state,
+        str(ppid),
+        str(pgid),
+        *("0" for _ in range(3)),
+        str(flags),
+        *("0" for _ in range(12)),
+        str(start_ticks),
+    ]
     (process / "stat").write_text(f"{pid} (fixture) {' '.join(fields)}\n")
     (process / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
     (process / "cgroup").write_text(f"0::{cgroup}\n")
@@ -426,6 +436,154 @@ def run_peer_identity_fixtures() -> None:
         assert [peer["systemd_unit"] for peer in snapshot["peers"]] == [
             "validate-B.scope"
         ], snapshot
+
+
+def run_peer_scan_completeness_fixtures() -> None:
+    def fixture_root(label: str) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory(prefix=f"validate-peer-{label}-")
+        proc_root = Path(temporary.name)
+        write_fake_process(
+            proc_root,
+            10,
+            ppid=0,
+            pgid=10,
+            start_ticks=10,
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        write_fake_process(
+            proc_root,
+            40,
+            ppid=1,
+            pgid=40,
+            start_ticks=40,
+            argv=("bash", "/external/validate.sh", "full"),
+            cgroup="/user.slice/validate-Z.service",
+        )
+        return temporary, proc_root
+
+    # A genuine ENOENT race is safe only after re-enumeration proves that the
+    # numeric PID vanished. It must not poison an otherwise complete snapshot.
+    temporary, proc_root = fixture_root("exit-race")
+    with temporary:
+        def vanishing_reader(root: Path, pid: int) -> peer_snapshot.ProcessRecord:
+            if pid == 40:
+                process = root / str(pid)
+                for child in process.iterdir():
+                    child.unlink()
+                process.rmdir()
+                raise FileNotFoundError(f"planted exit race for PID {pid}")
+            return peer_snapshot.read_record(root, pid)
+
+        snapshot = peer_snapshot.collect_peer_snapshot(
+            proc_root, 10, record_reader=vanishing_reader
+        )
+        assert snapshot["peers"] == [], snapshot
+        assert snapshot["owner"]["pid"] == 10, snapshot
+
+    # The same bracket applies if the candidate was readable initially but
+    # exits before its start_ticks identity is confirmed.
+    temporary, proc_root = fixture_root("confirmation-exit-race")
+    with temporary:
+        def vanishing_start(root: Path, pid: int) -> int:
+            if pid == 40:
+                process = root / str(pid)
+                for child in process.iterdir():
+                    child.unlink()
+                process.rmdir()
+                raise FileNotFoundError(f"planted confirmation exit for PID {pid}")
+            return peer_snapshot.read_start_ticks(root, pid)
+
+        snapshot = peer_snapshot.collect_peer_snapshot(
+            proc_root, 10, start_reader=vanishing_start
+        )
+        assert snapshot["peers"] == [], snapshot
+
+    # A persistent numeric entry whose evidence cannot be read is unknown, not
+    # an absent peer. This is the exact sibling-hole class from the re-review.
+    temporary, proc_root = fixture_root("unreadable")
+    with temporary:
+        def unreadable_reader(root: Path, pid: int) -> peer_snapshot.ProcessRecord:
+            if pid == 40:
+                raise PermissionError("planted unreadable numeric PID")
+            return peer_snapshot.read_record(root, pid)
+
+        try:
+            peer_snapshot.collect_peer_snapshot(
+                proc_root, 10, record_reader=unreadable_reader
+            )
+        except peer_snapshot.SnapshotUnresolved as error:
+            assert "PID 40" in str(error), error
+            assert "unreadable or malformed" in str(error), error
+            state = peer_snapshot.persist_state(
+                proc_root / "state.json",
+                {"owner": None, "same_service_processes": [], "peers": []},
+                indeterminate=True,
+                indeterminate_detail=f"snapshot-unresolved:{error}",
+            )
+        else:
+            raise AssertionError("persistent unreadable numeric PID was dropped")
+        assert state["scan_complete"] is False, state
+        assert state["indeterminate"] is True, state
+        assert state["scan_count"] == 0, state
+
+        # Sticky means a later readable scan cannot recover authority.
+        readable = peer_snapshot.collect_peer_snapshot(proc_root, 10)
+        state = peer_snapshot.persist_state(proc_root / "state.json", readable)
+        assert state["scan_complete"] is True, state
+        assert state["indeterminate"] is True, state
+        assert state["indeterminate_detail"].startswith(
+            "snapshot-unresolved:process PID 40"
+        ), state
+
+    for label, mutate, detail in (
+        (
+            "malformed-stat",
+            lambda root: (root / "40" / "stat").write_text("malformed\n"),
+            "stat",
+        ),
+        (
+            "malformed-cmdline",
+            lambda root: (root / "40" / "cmdline").write_bytes(b""),
+            "empty cmdline",
+        ),
+        (
+            "malformed-cgroup",
+            lambda root: (root / "40" / "cgroup").write_text("malformed\n"),
+            "cgroup",
+        ),
+    ):
+        temporary, proc_root = fixture_root(label)
+        with temporary:
+            mutate(proc_root)
+            try:
+                peer_snapshot.collect_peer_snapshot(proc_root, 10)
+            except peer_snapshot.SnapshotUnresolved as error:
+                assert "PID 40" in str(error), error
+                assert detail in str(error), error
+            else:
+                raise AssertionError(f"{label} process evidence was dropped")
+
+    # Well-formed kernel-thread evidence is classifiable even though it has no
+    # argv or app unit; it must not make every real /proc scan indeterminate.
+    temporary, proc_root = fixture_root("kernel-thread")
+    with temporary:
+        kernel = proc_root / "40"
+        for child in kernel.iterdir():
+            child.unlink()
+        kernel.rmdir()
+        write_fake_process(
+            proc_root,
+            2,
+            ppid=0,
+            pgid=0,
+            start_ticks=2,
+            argv=(),
+            cgroup="/",
+            flags=peer_snapshot.PF_KTHREAD,
+        )
+        snapshot = peer_snapshot.collect_peer_snapshot(proc_root, 10)
+        assert snapshot["peers"] == [], snapshot
 
 
 def admission_verdict(row: dict) -> dict:
@@ -677,9 +835,21 @@ def run_schema5_receipt_fixture() -> dict:
         )
         fake_proc_root = tmpdir / "caller-proc"
         fake_proc_root.mkdir()
+        stop_test_proc_root = tmpdir / "stop-test-proc"
+        stop_test_proc_root.mkdir()
+        write_fake_process(
+            stop_test_proc_root,
+            os.getpid(),
+            ppid=0,
+            pgid=os.getpid(),
+            start_ticks=process_start_ticks(os.getpid()),
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
         env = stop_test_env(tmpdir, ledger)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
+            VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(stop_test_proc_root),
             HERMIT_VALIDATE_FINALIZE_RECEIPT_HELPER=str(caller_helper),
             HERMIT_VALIDATE_PEER_SNAPSHOT_HELPER=str(caller_helper),
             HERMIT_VALIDATE_PROC_ROOT=str(fake_proc_root),
@@ -770,6 +940,93 @@ def run_forged_sidecar_refusal_fixture() -> tuple[int, int, int]:
         return rows_total, qualifying, publisher_count
 
 
+def run_unresolvable_process_refusal_fixture() -> tuple[int, int, int]:
+    with tempfile.TemporaryDirectory(prefix="validate-unresolvable-process-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        log = tmpdir / "validate.log"
+        proc_root = tmpdir / "proc"
+        proc_root.mkdir()
+        write_fake_process(
+            proc_root,
+            os.getpid(),
+            ppid=0,
+            pgid=os.getpid(),
+            start_ticks=process_start_ticks(os.getpid()),
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        write_fake_process(
+            proc_root,
+            40,
+            ppid=1,
+            pgid=40,
+            start_ticks=40,
+            argv=("bash", "/external/validate.sh", "full"),
+            cgroup="/user.slice/validate-Z.service",
+        )
+        unreadable_stat = proc_root / "40" / "stat"
+        unreadable_stat.chmod(0)
+        release_file = tmpdir / "success-release"
+        publisher_calls = tmpdir / "publisher-calls"
+        publisher = tmpdir / "inert-publisher"
+        publisher.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(publisher_calls)!r}).write_text('called\\n')\n"
+        )
+        publisher.chmod(0o755)
+        env = stop_test_env(tmpdir, ledger)
+        env.update(
+            VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(proc_root),
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+            VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                release_file.write_text("release\n")
+                rc = process.wait(timeout=15)
+            finally:
+                unreadable_stat.chmod(0o600)
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+        assert rc == 0, (rc, log.read_text(errors="replace"))
+        row = assert_indeterminate_diagnostic(
+            ledger,
+            expected_detail="final-snapshot-failed:snapshot-unresolved:process PID 40",
+            expected_raw_result="pass",
+        )
+        assert row["concurrent_validates"] is None, row
+        assert row["concurrency_proof"] is None, row
+        assert not publisher_calls.exists(), publisher_calls.read_text(errors="replace")
+        rows_total = len(read_ledger(ledger))
+        qualifying = sum(
+            qualification_verdict(candidate)["accepted"]
+            for candidate in read_ledger(ledger)
+        )
+        publisher_count = 1 if publisher_calls.exists() else 0
+        assert (rows_total, qualifying, publisher_count) == (1, 0, 0)
+        return rows_total, qualifying, publisher_count
+
+
 def run_schema5_receipt_fixtures() -> None:
     production_source = VALIDATE.read_text()
     references = {
@@ -822,10 +1079,12 @@ def run_schema5_receipt_fixtures() -> None:
     assert verdict["base_status"] == "satisfied", verdict
 
     assert run_forged_sidecar_refusal_fixture() == (1, 0, 0)
+    assert run_unresolvable_process_refusal_fixture() == (1, 0, 0)
 
 
 def main() -> None:
     run_peer_identity_fixtures()
+    run_peer_scan_completeness_fixtures()
     run_schema5_receipt_fixtures()
     run_initial_authority_failure_fixture()
     run_monitor_refusal_fixture("killed", "monitor-died")
@@ -843,6 +1102,9 @@ def main() -> None:
     print(
         "PASS: identity-bound peer fixtures; schema-5 admission/base fixtures; "
         "forged sidecar/PID refusal 1 diagnostic/0 qualifying/0 publisher calls; "
+        "unresolvable process refusal 1 diagnostic/0 qualifying/0 publisher calls; "
+        "peer scan completeness: exit races 2/2 accepted, unresolved evidence 4/4 refused sticky, "
+        "kernel-thread 1/1 classified; "
         "override negative 3 planted/0 production references/0 invoked; "
         "monitor refusal negatives 4/4 => exactly 1 diagnostic + 0 qualifying; "
         "initial authority failure => sticky + monitor live + 1 diagnostic/0 qualifying; "

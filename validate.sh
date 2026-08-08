@@ -1677,6 +1677,22 @@ function write_validation_concurrency_indeterminate_marker {
     fi
 }
 
+function run_validation_peer_snapshot {
+    local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
+    local -a snapshot_args=(
+        --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID"
+        --state "$VALIDATION_CONCURRENT_MARKER"
+    )
+    # The custom proc tree is confined to the intrinsically non-authorizing
+    # stop-test path. Production always scans /proc, and the helper itself
+    # cannot emit a validation receipt.
+    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
+        && -n ${VALIDATE_STOP_TEST_PEER_PROC_ROOT:-} ]]; then
+        snapshot_args+=(--proc-root "$VALIDATE_STOP_TEST_PEER_PROC_ROOT")
+    fi
+    python3 "$helper" "${snapshot_args[@]}"
+}
+
 function start_validation_concurrency_monitor {
     local root_pid=$$
     local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
@@ -1698,9 +1714,7 @@ function start_validation_concurrency_monitor {
     # Complete one scan synchronously so even an early-exit receipt cannot race
     # ahead of the monitor and turn "not observed" into a false zero.
     if ((initial_scan_failed == 0)) \
-        && ! initial_output=$(python3 "$helper" \
-            --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
-            --state "$VALIDATION_CONCURRENT_MARKER" 2>&1); then
+        && ! initial_output=$(run_validation_peer_snapshot 2>&1); then
         initial_scan_failed=1
         # The helper has already persisted sticky indeterminate state. Surface
         # its exact error while retaining it in the durable run log.
@@ -1709,9 +1723,7 @@ function start_validation_concurrency_monitor {
     (
         while kill -0 "$root_pid" 2>/dev/null; do
             if [[ $VALIDATION_CANONICAL_LOCK_OWNER_PID =~ ^[1-9][0-9]*$ ]]; then
-                python3 "$helper" \
-                    --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
-                    --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE" || true
+                run_validation_peer_snapshot >/dev/null 2>>"$LOG_FILE" || true
             fi
             sleep 1
         done
@@ -1800,7 +1812,6 @@ function refresh_validation_concurrency_evidence {
 # indeterminate evidence; the caller must persist one diagnostic row before it
 # can return and must never publish authority from that row.
 function finalize_validation_concurrency_monitor {
-    local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
     local monitor_state monitor_start marker_detail
     local authority_final_ok=0
 
@@ -1866,8 +1877,7 @@ function finalize_validation_concurrency_monitor {
         fi
         return 1
     fi
-    if ! python3 "$helper" --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
-        --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE"; then
+    if ! run_validation_peer_snapshot >/dev/null 2>>"$LOG_FILE"; then
         VALIDATION_CONCURRENCY_FINAL_OK=0
         VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-snapshot-failed
         marker_detail=$(jq -r \

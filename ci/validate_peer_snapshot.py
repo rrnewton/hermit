@@ -19,6 +19,8 @@ import time
 from typing import Callable
 
 MAX_SCAN_GAP_NS = 5_000_000_000
+PF_KTHREAD = 0x00200000
+
 
 class SnapshotUnresolved(RuntimeError):
     """The snapshot could not safely classify a candidate process."""
@@ -27,8 +29,10 @@ class SnapshotUnresolved(RuntimeError):
 @dataclass(frozen=True)
 class ProcessRecord:
     pid: int
+    state: str
     ppid: int
     pgid: int
+    flags: int
     start_ticks: int
     cgroup: str
     cgroup_path: str
@@ -48,15 +52,18 @@ class ProcessRecord:
         }
 
 
-def _parse_stat(text: str) -> tuple[int, int, int]:
-    """Return (ppid, pgid, start_ticks) from one /proc/PID/stat row."""
+def _parse_stat(text: str) -> tuple[str, int, int, int, int]:
+    """Return (state, ppid, pgid, flags, start_ticks) from one stat row."""
     close = text.rfind(")")
     if close < 0:
         raise ValueError("missing stat comm terminator")
     fields = text[close + 1 :].split()
     if len(fields) < 20:
         raise ValueError("short stat row")
-    return int(fields[1]), int(fields[2]), int(fields[19])
+    state = fields[0]
+    if len(state) != 1:
+        raise ValueError("malformed stat state")
+    return state, int(fields[1]), int(fields[2]), int(fields[6]), int(fields[19])
 
 
 def _cgroup_identity(text: str) -> tuple[str, str, str, str]:
@@ -84,7 +91,10 @@ def _cgroup_identity(text: str) -> tuple[str, str, str, str]:
     elif scope_indexes:
         index = scope_indexes[-1]
     else:
-        raise ValueError("cgroup has no observable systemd unit")
+        # A well-formed root cgroup is normal for kernel threads.  Keep the
+        # observable path and classify the empty unit later from stat/cmdline;
+        # do not conflate "no unit" with malformed cgroup evidence.
+        return unified, path, "", ""
     unit = components[index]
     unit_cgroup = "/" + "/".join(components[: index + 1])
     return unified, path, unit, unit_cgroup
@@ -92,19 +102,25 @@ def _cgroup_identity(text: str) -> tuple[str, str, str, str]:
 
 def read_record(proc_root: Path, pid: int) -> ProcessRecord:
     process = proc_root / str(pid)
-    ppid, pgid, start_ticks = _parse_stat((process / "stat").read_text())
+    state, ppid, pgid, flags, start_ticks = _parse_stat(
+        (process / "stat").read_text()
+    )
     argv = tuple(
         value.decode(errors="surrogateescape")
         for value in (process / "cmdline").read_bytes().split(b"\0")
         if value
     )
+    if not argv and state not in {"Z", "X", "x"} and not flags & PF_KTHREAD:
+        raise ValueError("empty cmdline for live userspace process")
     cgroup, cgroup_path, systemd_unit, systemd_unit_cgroup = _cgroup_identity(
         (process / "cgroup").read_text()
     )
     return ProcessRecord(
         pid,
+        state,
         ppid,
         pgid,
+        flags,
         start_ticks,
         cgroup,
         cgroup_path,
@@ -115,7 +131,21 @@ def read_record(proc_root: Path, pid: int) -> ProcessRecord:
 
 
 def read_start_ticks(proc_root: Path, pid: int) -> int:
-    return _parse_stat((proc_root / str(pid) / "stat").read_text())[2]
+    return _parse_stat((proc_root / str(pid) / "stat").read_text())[4]
+
+
+def _numeric_pids(proc_root: Path) -> list[int]:
+    try:
+        return sorted(
+            int(entry.name) for entry in proc_root.iterdir() if entry.name.isdigit()
+        )
+    except OSError as error:
+        raise SnapshotUnresolved(f"cannot enumerate {proc_root}: {error}") from error
+
+
+def _vanished_after_enoent(proc_root: Path, pid: int) -> bool:
+    """Bracket only a real exit race, never a persistent unreadable record."""
+    return pid not in _numeric_pids(proc_root)
 
 
 def is_direct_validate(argv: tuple[str, ...]) -> bool:
@@ -174,23 +204,28 @@ def collect_peer_snapshot(
 ) -> dict:
     """Classify root validate drivers by owner ancestry and systemd unit."""
     records: dict[int, ProcessRecord] = {}
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError as error:
-        raise SnapshotUnresolved(f"cannot enumerate {proc_root}: {error}") from error
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+    for pid in _numeric_pids(proc_root):
         try:
             records[pid] = record_reader(proc_root, pid)
-        except (OSError, ValueError):
-            continue
+        except FileNotFoundError as error:
+            if _vanished_after_enoent(proc_root, pid):
+                continue
+            raise SnapshotUnresolved(
+                f"process PID {pid} evidence disappeared but PID remains visible: {error}"
+            ) from error
+        except (OSError, ValueError) as error:
+            raise SnapshotUnresolved(
+                f"process PID {pid} evidence is unreadable or malformed: {error}"
+            ) from error
 
     if owner_pid <= 1 or owner_pid not in records:
         raise SnapshotUnresolved(f"validate-lock owner PID {owner_pid} is not live")
 
     owner = records[owner_pid]
+    if not owner.systemd_unit or not owner.systemd_unit_cgroup:
+        raise SnapshotUnresolved(
+            f"validate-lock owner PID {owner_pid} has no observable systemd unit"
+        )
     actual = {pid for pid, record in records.items() if is_direct_validate(record.argv)}
     candidate_roots: list[ProcessRecord] = []
     for pid in sorted(actual):
@@ -204,11 +239,21 @@ def collect_peer_snapshot(
     peers: list[dict[str, int | str]] = []
     same_service: list[dict[str, int | str]] = []
     for record in candidate_roots:
+        if not record.systemd_unit or not record.systemd_unit_cgroup:
+            raise SnapshotUnresolved(
+                f"candidate PID {record.pid} has no observable systemd unit"
+            )
         try:
             observed_again = start_reader(proc_root, record.pid)
+        except FileNotFoundError as error:
+            if _vanished_after_enoent(proc_root, record.pid):
+                continue
+            raise SnapshotUnresolved(
+                f"candidate PID {record.pid} identity disappeared but PID remains visible"
+            ) from error
         except (OSError, ValueError) as error:
             raise SnapshotUnresolved(
-                f"candidate PID {record.pid} vanished before identity confirmation"
+                f"candidate PID {record.pid} identity is unreadable or malformed"
             ) from error
         if observed_again != record.start_ticks:
             raise SnapshotUnresolved(
