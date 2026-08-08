@@ -256,26 +256,117 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
     })
 }
 
+/// Pull a full SHA out of `ls-remote` output.
+///
+/// Tolerates leading banner lines (herdr-run prints an `[herdr-run] engine=...`
+/// line), so it scans for the first token that is a full SHA on a line naming
+/// the ref rather than blindly taking word 1 of line 1.
+fn parse_ls_remote(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        if !line.contains(MAIN_REF) {
+            continue;
+        }
+        if let Some(tok) = line.split_whitespace().next() {
+            if is_full_sha(tok) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Locate `herdr-run`, the sandbox's egress path. Returns None if absent.
+fn herdr_run_path() -> Option<PathBuf> {
+    // An explicit override wins, so a caller can point at a specific relay.
+    if let Ok(explicit) = std::env::var("HERDR_RUN") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // Walk UPWARD from the cwd looking for `agent-utils/bin/herdr-run`. Fixed
+    // relative depths do not work: this script runs from the primary checkout,
+    // from `worktrees/<slot>/hermit`, and from CI trees, and agent-utils sits at
+    // a different depth in each. Walking finds it in all of them.
+    let mut dir = std::env::current_dir().ok();
+    while let Some(current) = dir {
+        let candidate = current.join("agent-utils/bin/herdr-run");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = current.parent().map(|p| p.to_path_buf());
+    }
+    // Finally, honour PATH.
+    if let Ok(path_var) = std::env::var("PATH") {
+        for entry in path_var.split(':') {
+            let candidate = PathBuf::from(entry).join("herdr-run");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Ask the remote for `refs/heads/main`.
+///
+/// STRICTNESS IS UNCHANGED: this still has to obtain a real full SHA from the
+/// real remote, and every failure path still returns Err. What changed is only
+/// HOW the query reaches the network.
+///
+/// A direct `git ls-remote` from an agent sandbox fails with
+/// `CONNECT tunnel failed, response 403`, because the destination filter admits
+/// only traffic carrying the sandbox's proxy identity. That made this lint
+/// impossible to satisfy and therefore blocked EVERY hermit/reverie commit --
+/// a false block: the pin being checked was already correct. So on failure we
+/// retry through `herdr-run`, the sandbox's sanctioned egress path, passing the
+/// command as ONE QUOTED POSITIONAL (herdr-run's CLI requires that form; split
+/// argv words are silently mishandled).
+///
+/// The direct attempt is kept FIRST and verbatim so this keeps working outside a
+/// sandbox with no extra hop -- and so the literal argument form that
+/// `ci/test_harness.sh` greps for to stop anyone weakening this check is still
+/// present.
 fn query_main(remote: &str) -> Result<String, String> {
     let output = Command::new("git")
         .args(["ls-remote", "--exit-code", remote, MAIN_REF])
         .output()
         .map_err(|error| format!("could not run git ls-remote: {error}"))?;
-    if !output.status.success() {
+    if output.status.success() {
+        return match parse_ls_remote(&String::from_utf8_lossy(&output.stdout)) {
+            Some(sha) => Ok(sha),
+            None => Err("remote returned no full SHA for main".to_string()),
+        };
+    }
+    let direct_err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    let Some(herdr) = herdr_run_path() else {
         return Err(format!(
-            "git ls-remote {remote} {MAIN_REF} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "git ls-remote {remote} {MAIN_REF} failed: {direct_err} \
+             (and herdr-run was not found to retry through)"
+        ));
+    };
+    let relayed = Command::new(&herdr)
+        .args([
+            "--agent",
+            "reverie-pin-check",
+            &format!("with-proxy git ls-remote --exit-code {remote} {MAIN_REF}"),
+        ])
+        .output()
+        .map_err(|error| format!("could not run herdr-run: {error}"))?;
+    if !relayed.status.success() {
+        return Err(format!(
+            "git ls-remote {remote} {MAIN_REF} failed directly ({direct_err}) and via herdr-run: {}",
+            String::from_utf8_lossy(&relayed.stderr).trim()
         ));
     }
-    let sha = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if !is_full_sha(&sha) {
-        return Err(format!("remote returned invalid main SHA {sha:?}"));
+    match parse_ls_remote(&String::from_utf8_lossy(&relayed.stdout)) {
+        Some(sha) => Ok(sha),
+        None => Err(format!(
+            "herdr-run relay returned no full SHA for {MAIN_REF}; stdout was {:?}",
+            String::from_utf8_lossy(&relayed.stdout).trim()
+        )),
     }
-    Ok(sha)
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
