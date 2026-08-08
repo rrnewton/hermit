@@ -42,6 +42,7 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
@@ -658,7 +659,14 @@ fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
 
 #[cfg(feature = "dbt")]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
-    ExitStatus::Exited(status.code().unwrap_or(1))
+    // `std::process::ExitStatus::code()` is `None` for a process killed by a
+    // signal, so `code().unwrap_or(1)` reported every signalled death as a
+    // normal `Exited(1)`: a guest killed by SIGSEGV came back as "exited
+    // normally with status 1", and `WIFSIGNALED`/`WTERMSIG`/`WCOREDUMP` were
+    // all lost. Convert the raw wait status instead -- `ExitStatus::from_raw`
+    // already decodes exited-vs-signalled and the core-dump flag the same way
+    // the ptrace backend does.
+    ExitStatus::from_raw(status.into_raw())
 }
 
 #[cfg(feature = "dbt")]
@@ -726,7 +734,8 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 #[cfg(feature = "dbt")]
 fn output_status(output: &Output) -> ExitStatus {
-    ExitStatus::Exited(output.status.code().unwrap_or(1))
+    // Same signal-losing conversion as `process_status`; see the comment there.
+    ExitStatus::from_raw(output.status.into_raw())
 }
 
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
@@ -1039,5 +1048,52 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
+    }
+    /// POSITIVE side: a normal exit still reports its code unchanged.
+    #[cfg(feature = "dbi")]
+    #[test]
+    fn dbi_status_preserves_normal_exit_codes() {
+        for code in [0, 1, 42, 255] {
+            let raw = std::process::ExitStatus::from_raw(code << 8);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Exited(code),
+                "a normal exit with code {code} must round-trip"
+            );
+        }
+    }
+
+    /// NEGATIVE side -- the regression this guards. `std::process::ExitStatus::code()`
+    /// is `None` for a signalled death, so the previous `code().unwrap_or(1)`
+    /// reported every one of these as `Exited(1)`, destroying WIFSIGNALED,
+    /// WTERMSIG and WCOREDUMP. A guest killed by SIGSEGV must not come back as
+    /// "exited normally with status 1".
+    #[cfg(feature = "dbi")]
+    #[test]
+    fn dbi_status_preserves_death_by_signal() {
+        for (signum, signal) in [
+            (libc::SIGABRT, reverie::Signal::SIGABRT),
+            (libc::SIGSEGV, reverie::Signal::SIGSEGV),
+            (libc::SIGFPE, reverie::Signal::SIGFPE),
+            (libc::SIGILL, reverie::Signal::SIGILL),
+            (libc::SIGTERM, reverie::Signal::SIGTERM),
+            (libc::SIGKILL, reverie::Signal::SIGKILL),
+            (libc::SIGTRAP, reverie::Signal::SIGTRAP),
+        ] {
+            // without a core dump
+            let raw = std::process::ExitStatus::from_raw(signum);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, false),
+                "death by signal {signum} must be reported as Signaled, not Exited"
+            );
+            // with the core-dump flag set (bit 0x80 of the wait status)
+            let raw = std::process::ExitStatus::from_raw(signum | 0x80);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, true),
+                "the core-dump flag for signal {signum} must survive the conversion"
+            );
+        }
     }
 }
