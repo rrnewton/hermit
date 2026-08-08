@@ -40,6 +40,7 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::prepare_exec;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
@@ -408,6 +409,17 @@ struct NativeThreadScratch {
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
 static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Host pid of the process whose local DynamoRIO background client thread is
+/// running `run_cooperative` (i.e. the process that can service the native-exec
+/// pause handshake). Set in `reverie_dbi_runtime_background_init`. A forked
+/// child inherits this value (statics survive fork), but its DR-created
+/// background thread does NOT survive `fork()`, so in a copied child this holds
+/// the parent's pid, not `getpid()`. Comparing it against the current process
+/// pid therefore distinguishes a process that owns a background thread (root, or
+/// any post-exec image after DynamoRIO reloads `dr_client_main`) from a copied
+/// child that has none. Used to skip the exec pause in copied children, which
+/// would otherwise busy-spin forever on `RUNTIME_PAUSED` with nothing to set it.
+static RUNTIME_BACKGROUND_OWNER_PID: AtomicI32 = AtomicI32::new(0);
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -805,6 +817,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_background_init(argument: *mut c_vo
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
+    // Claim ownership of the native-exec pause for THIS process. DynamoRIO only
+    // starts this background thread for a process whose runtime is not a fork
+    // copy (`!has_copied_runtime()` in the native client), and re-runs
+    // `dr_client_main` for each post-exec image, so recording the current pid
+    // here marks exactly the processes that can service the exec pause. A copied
+    // child never reaches this code, so it keeps the parent's pid and is
+    // recognized as not owning a background thread.
+    RUNTIME_BACKGROUND_OWNER_PID.store(unsafe { libc::getpid() }, Ordering::Release);
     emit_lifecycle_marker(emit, b"detcore-dbi: background client thread entered\n");
     let tracing_active = init_dbi_tracing(emit);
     let runtime = {
@@ -918,6 +938,7 @@ pub extern "C" fn reverie_dbi_runtime_ready(image_generation: u64) -> i32 {
 // TODO-HUMAN-REVIEW(PR-743): Review the native thread initialization ABI and state handoff.
 // TODO-HUMAN-REVIEW(PR-874): Review compatibility with Reverie's expanded DBI callback ABI.
 // TODO-HUMAN-REVIEW(PR-1060): Review separation of host thread identity from stable RNG entropy.
+// TODO-HUMAN-REVIEW(PR-1147): Review copied-process Detcore state rebasing.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
@@ -962,6 +983,19 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+    let mut inherited_parent = if host_tid == host_pid && !scratch.runtime_state.is_null() {
+        // SAFETY: a copied DynamoRIO process inherits the parent's COW runtime
+        // allocation. This process owns its copy and replaces it below.
+        let parent = Some(unsafe { Box::from_raw(scratch.runtime_state) });
+        scratch.runtime_state = std::ptr::null_mut();
+        parent
+    } else {
+        None
+    };
+    if let Some(parent) = inherited_parent.as_mut() {
+        parent.state.clone_flags =
+            Some(CloneFlags::from_bits_truncate(scratch.pending_clone_flags));
+    }
     let parent = if host_tid == host_pid {
         None
     } else {
@@ -977,20 +1011,31 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     let Some(det_tid) = dbi_scheduler_tid(host_tid) else {
         return -1;
     };
-    let parent_ref = parent
+    let parent_ref = inherited_parent
         .as_ref()
-        .map(|parent| (parent.parent_tid, &parent.state));
+        .map(|parent| (Tid::from_raw(parent.tid.into()), &parent.state))
+        .or_else(|| {
+            parent
+                .as_ref()
+                .map(|parent| (parent.parent_tid, &parent.state))
+        });
     let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
     let mut state = tool.init_thread_state(det_tid, parent_ref);
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
+    } else if let Some(parent) = &inherited_parent {
+        let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
+        let Some(rng_entropy) = dbi_child_rng_entropy(scratch.virtual_pid, child_ordinal) else {
+            return -1;
+        };
+        state.reseed_child_rngs(&parent.state, rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
         tid: det_pid,
         state,
         initialized: false,
-        post_exec_pending: host_tid == pid,
+        post_exec_pending: host_tid == pid && inherited_parent.is_none(),
     });
     if reverie_dbi::run_tool_thread_start(
         tool,
@@ -1011,6 +1056,7 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_init(
     }
     thread.initialized = true;
     scratch.runtime_state = Box::into_raw(thread);
+    scratch.pending_clone_flags = 0;
     0
 }
 
@@ -1110,8 +1156,14 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_created(
 ///
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbi_runtime_thread_init`].
+// TODO-HUMAN-REVIEW(PR-1147): Review guest-safe DBI thread-exit lifecycle delivery.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    _tid: i32,
+    invoke_syscall: SyscallInvoker,
+) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         return;
@@ -1129,8 +1181,10 @@ pub unsafe extern "C" fn reverie_dbi_runtime_thread_exit(scratch: *mut c_void) {
             .tool
             .get()
             .expect("Detcore DBI tool was initialized");
-        let _ = reverie_dbi::run_tool_thread_exit(
+        let _ = reverie_dbi::run_tool_thread_exit_from_guest(
             tool,
+            context as usize,
+            invoke_syscall,
             tid,
             state,
             &runtime.global,
@@ -1266,6 +1320,72 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
+/// Drives a Detcore handler future to completion on the calling guest thread.
+///
+/// Reverie handlers are `async`, but the DBI coordinator RPC client resolves
+/// each RPC synchronously (see `reverie_dbi`'s `run_ready`), so a handler that
+/// performs only RPCs (like [`prepare_exec`]) is ready on the first poll. A
+/// no-op waker therefore suffices; the bounded fallback loop keeps a stray
+/// `Pending` from wedging the guest thread. Returns `None` if the future never
+/// resolves within the bound.
+fn drive_handler_to_ready<F: Future>(future: F) -> Option<F::Output> {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..1_000_000 {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return Some(value),
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+    None
+}
+
+/// Notifies the coordinator of this thread's pending `execve`, mirroring the
+/// `PrepareExec` that the ptrace/SaBRe path issues from `handle_execveat`.
+///
+/// Must be called while the pre-exec thread is still live (before the native
+/// exec pause). It records `pending_exec_states` in the out-of-process
+/// coordinator so the post-exec image's self-registration is reconciled as an
+/// exec-reconnect that preserves this thread's logical clock and scheduler
+/// identity, rather than a fresh registration whose epoch-reset clock would
+/// rewind coordinator time.
+#[allow(clippy::too_many_arguments)]
+fn send_dbi_prepare_exec(
+    context: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    thread_state: &mut DetcoreThreadState,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) {
+    let runtime = current_runtime();
+    // The pre-exec address-space identity the coordinator maps to the post-exec
+    // incarnation via `MmId::for_exec`.
+    let mm = thread_state.mm_id;
+    let mut guest = DbiGuest::<Detcore>::new(
+        context as usize,
+        Pid::from_raw(tid),
+        Pid::from_raw(pid),
+        None,
+        branches,
+        thread_state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    // The DBI backend does not discover live descriptor status, so an empty
+    // fd-blocking override set matches the default execve accounting.
+    drive_handler_to_ready(prepare_exec(
+        &mut guest,
+        mm,
+        std::collections::BTreeSet::new(),
+    ));
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -1359,16 +1479,76 @@ pub unsafe extern "C" fn reverie_dbi_runtime_pre_syscall(
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
         if sysnum == libc::SYS_execve {
-            READY_IMAGE.store(0, Ordering::Release);
-            RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
-            while !RUNTIME_PAUSED.load(Ordering::Acquire) {
-                std::thread::yield_now();
+            // Mirror the ptrace/SaBRe execve path: while the pre-exec thread is
+            // still live, tell the coordinator an exec is pending on this
+            // process. This populates the coordinator's `pending_exec_states` so
+            // that when the post-exec image re-registers itself (a
+            // `CreateChildThread` self-registration on a freshly initialized
+            // thread state whose logical clock has reset to the container
+            // epoch), the coordinator recognizes it as an exec-reconnect. The
+            // reconnect path reuses this thread's established scheduler identity
+            // and logical clock instead of registering a brand-new thread whose
+            // epoch-reset time would rewind global time and panic
+            // `update_global_time`. The RPC is delivered out-of-process to the
+            // coordinator, which survives the `execve` that wipes this guest's
+            // address space, so no guest-side state has to persist across exec.
+            //
+            // Scope: EVERY initialized process leader that execs re-registers
+            // this way post-exec, not just the tree root. Under the shared
+            // coordinator (external-global) a forked child drives its syscalls
+            // through this Rust path too, and after `execve` DynamoRIO reloads
+            // `dr_client_main` for the child's fresh image, whose first syscall
+            // self-registers via `CreateChildThread` exactly like the root and
+            // would rewind global time without a matching `PrepareExec`. Sending
+            // it for the child (an initialized process leader, `tid == pid`) is
+            // therefore required, not harmful.
+            if tid == pid && !scratch.runtime_state.is_null() {
+                let thread = unsafe { &mut *scratch.runtime_state };
+                // Only a thread that has completed its Detcore thread-start hook
+                // has a `detpid` and a scheduler identity to reconnect; a thread
+                // that execs before its first dispatched syscall has nothing
+                // registered yet and needs no PrepareExec.
+                if thread.initialized {
+                    send_dbi_prepare_exec(
+                        context,
+                        tid,
+                        pid,
+                        branches,
+                        &mut thread.state,
+                        invoke_syscall,
+                        read_registers,
+                        write_registers,
+                    );
+                }
             }
-            assert_eq!(
-                IMAGE_GENERATION.load(Ordering::Acquire),
-                image_generation,
-                "DBI image generation changed while pausing for exec"
-            );
+            // The pause handshake quiesces THIS process's background client
+            // thread (`run_cooperative`) so it stops touching guest state while
+            // DynamoRIO replaces the image. Only a process that owns a local
+            // background thread can complete it: `run_cooperative` is what sets
+            // `RUNTIME_PAUSED`. A copied (forked) child under the shared
+            // coordinator has no background thread — the DR-created thread does
+            // not survive `fork()` and the native client skips
+            // `ensure_runtime_background` for copied runtimes — so requesting the
+            // pause and busy-spinning on `RUNTIME_PAUSED` would deadlock forever
+            // (the observed 900s hang in `run_dbi_virtualizes_process_identities`).
+            // A copied child has nothing to quiesce; let its native execve
+            // proceed, after which DynamoRIO reloads `dr_client_main` and the
+            // fresh image gets its own background thread and reconnects via the
+            // `PrepareExec` sent above.
+            let owns_background_thread =
+                RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid;
+            if owns_background_thread {
+                READY_IMAGE.store(0, Ordering::Release);
+                RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+                while !RUNTIME_PAUSED.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    IMAGE_GENERATION.load(Ordering::Acquire),
+                    image_generation,
+                    "DBI image generation changed while pausing for exec"
+                );
+            }
         }
         return 0;
     }
