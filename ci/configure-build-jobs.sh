@@ -69,8 +69,8 @@ fi
 # The calibration below is valid only for Reverie 5bf9e0b. The portable wrapper
 # obtains the repository's recorded pin through the canonical checker and
 # carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != fb963d90dc6c5a136cfff23d3e898ab06f8cb265 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie fb963d90dc6c5a136cfff23d3e898ab06f8cb265" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab44bbf7351e2329a0de5270d22a02a0c8142f4a ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie ab44bbf7351e2329a0de5270d22a02a0c8142f4a" >&2
     return 2
 fi
 
@@ -285,13 +285,13 @@ fi
 # transition; it does NOT replace the hosted-runner calibration or its
 # >=5-sample replacement bar, and the budget values below are unchanged.
 #
-# AND THAT KEY SURVIVES THE PIN MOVE TO fb963d90. source_recipe_key() hashes
+# AND THAT KEY SURVIVES THE PIN MOVE TO ab44bbf7. source_recipe_key() hashes
 # exactly {vendor/dynamorio, build.rs, $CMAKE, $CMAKE_GENERATOR}. Measured
-# 88363a5 -> fb963d90:
+# 88363a5 -> ab44bbf7:
 #   reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de (identical)
 #   reverie-dbt/build.rs         -> af2faa442335... (identical)
 #   reverie-dbt (whole subtree)  -> 31ed9e93 -> 7cf124ac (DIFFERS)
-# The subtree differs only because fb963d90 is "Finish DBT rename across
+# The subtree differs only because ab44bbf7 is "Finish DBT rename across
 # rebased native client", i.e. native/client.c -- which is NOT a
 # source_recipe_key() input. So 019b7967 is the correct key at this pin.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
