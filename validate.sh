@@ -1505,16 +1505,33 @@ function start_validation_concurrency_monitor {
     fi
     (
         while kill -0 "$root_pid" 2>/dev/null; do
-            local count previous=0
-            count=$(ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
+            # A MEASURED ZERO AND A FAILED LOOK ARE DIFFERENT FACTS. `ps | awk`
+            # prints 0 for both an empty process table and a ps that could not
+            # run, so the enumeration is captured first and an unusable sample is
+            # SKIPPED rather than recorded as "no peers". Only a sample that
+            # actually enumerated processes is allowed to assert zero.
+            local ps_out count previous=-1
+            ps_out=$(ps -eo pgid=,args= 2>/dev/null) || ps_out=""
+            if [[ -z $ps_out ]]; then
+                sleep 1
+                continue
+            fi
+            count=$(awk -v own="$root_pgid" '
                 $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { seen[$1]=1 }
                 END { print length(seen) }
-            ')
-            [[ $count =~ ^[0-9]+$ ]] || count=0
+            ' <<<"$ps_out")
+            [[ $count =~ ^[0-9]+$ ]] || { sleep 1; continue; }
             if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
                 previous=$(<"$VALIDATION_CONCURRENT_MARKER")
-                [[ $previous =~ ^[0-9]+$ ]] || previous=0
+                [[ $previous =~ ^[0-9]+$ ]] || previous=-1
             fi
+            # `previous` starts at -1, NOT 0, so the FIRST successful sample always
+            # writes -- including a zero. The old default of 0 meant a run that saw
+            # no peer for its entire life never created the marker at all, and the
+            # receipt then recorded `concurrent_validates: null` (UNKNOWN) despite a
+            # monitor having watched the whole run and proven the answer was 0.
+            # That single line is why ~70% of ledger rows carry an unqualified wall
+            # time, and why the main-branch wall series cannot arm.
             if ((count > previous)); then
                 printf '%s\n' "$count" >"$VALIDATION_CONCURRENT_MARKER"
             fi
@@ -1580,7 +1597,12 @@ function append_validation_ledger {
 
     if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
         concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
-        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+        # ZERO IS A RESULT, NOT AN ABSENCE. The old pattern was `^[1-9][0-9]*$`,
+        # which discarded a monitor-measured 0 and fell through to null -- so the
+        # commonest real outcome (a solo run) was recorded as UNKNOWN and its wall
+        # time became uncomparable. The marker now only ever holds a count the
+        # monitor actually enumerated, so accept the full range.
+        [[ $concurrent_validates_json =~ ^[0-9]+$ ]] || concurrent_validates_json=null
         concurrency_proof_json='"process_group_overlap_monitor"'
     elif validate_lock_exclusivity_proven; then
         concurrent_validates_json=0
