@@ -24,7 +24,7 @@ use toml::Value;
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbi", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
-const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
+const EXPLICIT_TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/explicit-test-files.json";
 
 #[derive(Debug)]
 struct PlanRow {
@@ -76,20 +76,89 @@ fn parse_format() -> Format {
     format
 }
 
+fn discover_manifest_paths(manifest_root: &Path) -> Vec<PathBuf> {
+    let mut manifests = Vec::new();
+    let mut directories = vec![manifest_root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| die(format!("cannot read {}: {error}", directory.display())))
+        {
+            let entry =
+                entry.unwrap_or_else(|error| die(format!("cannot read directory entry: {error}")));
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .unwrap_or_else(|error| die(format!("cannot inspect {}: {error}", path.display())));
+            let is_toml = path
+                .extension()
+                .is_some_and(|extension| extension == "toml");
+            if file_type.is_symlink() && is_toml {
+                let relative = path.strip_prefix(manifest_root).unwrap_or(&path);
+                die(format!(
+                    "{}: manifest documents must be regular files, not symlinks",
+                    relative.display()
+                ));
+            }
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() && is_toml {
+                let relative = path
+                    .strip_prefix(manifest_root)
+                    .unwrap_or_else(|_| die(format!("manifest escaped root: {}", path.display())));
+                if relative.components().count() > 2 {
+                    die(format!(
+                        "{}: manifest shards must be exactly one directory below manifests/",
+                        relative.display()
+                    ));
+                }
+                manifests.push(path);
+            }
+        }
+    }
+    manifests.sort();
+    manifests
+}
+
+fn manifest_location_and_expected_bucket(manifest_root: &Path, path: &Path) -> (String, String) {
+    let relative = path
+        .strip_prefix(manifest_root)
+        .unwrap_or_else(|_| die(format!("manifest escaped root: {}", path.display())));
+    let location = relative.display().to_string();
+    let expected_bucket = match relative.components().count() {
+        1 => path.file_stem().unwrap().to_string_lossy().into_owned(),
+        2 => path
+            .parent()
+            .and_then(Path::file_name)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        _ => die(format!(
+            "{location}: manifest shards must be exactly one directory below manifests/"
+        )),
+    };
+    (location, expected_bucket)
+}
+
+fn validate_manifest_bucket(bucket: &str, expected_bucket: &str, location: &str) {
+    if bucket != expected_bucket {
+        die(format!(
+            "{location}: bucket `{bucket}` must equal `{expected_bucket}`"
+        ));
+    }
+}
+
+fn record_test_id(seen_ids: &mut BTreeSet<String>, id: &str) {
+    if !seen_ids.insert(id.to_string()) {
+        die(format!("duplicate test id across manifests: {id}"));
+    }
+}
+
 fn main() {
     let format = parse_format();
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
     let repo_root = script_dir.join("../../..");
 
-    let mut manifests: Vec<PathBuf> = std::fs::read_dir(&script_dir)
-        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", script_dir.display())))
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .collect();
-    manifests.sort();
+    let manifests = discover_manifest_paths(&script_dir);
     if manifests.is_empty() {
         die(format!(
             "no *.toml manifests found in {}",
@@ -108,19 +177,14 @@ fn main() {
         let document: Value = text
             .parse()
             .unwrap_or_else(|error| die(format!("{}: invalid TOML: {error}", path.display())));
-        let location = path.file_name().unwrap().to_string_lossy().to_string();
+        let (location, expected_bucket) = manifest_location_and_expected_bucket(&script_dir, path);
         ensure_keys(&document, &["schema", "bucket", "test"], &location);
 
         if document.get("schema").and_then(Value::as_integer) != Some(2) {
             die(format!("{location}: schema must be 2"));
         }
         let bucket = required_string(&document, "bucket", &location);
-        let stem = path.file_stem().unwrap().to_string_lossy();
-        if bucket != stem {
-            die(format!(
-                "{location}: bucket `{bucket}` must equal file stem `{stem}`"
-            ));
-        }
+        validate_manifest_bucket(bucket, &expected_bucket, &location);
         let tests = document
             .get("test")
             .and_then(Value::as_array)
@@ -240,7 +304,11 @@ fn backend_private_guest_files(inventory: &JsonValue) -> BTreeSet<String> {
     inventory
         .get("files")
         .and_then(JsonValue::as_array)
-        .unwrap_or_else(|| die(format!("{TEST_INVENTORY}: `files` must be an array")))
+        .unwrap_or_else(|| {
+            die(format!(
+                "{EXPLICIT_TEST_INVENTORY}: `files` must be an array"
+            ))
+        })
         .iter()
         .filter(|entry| {
             entry.get("disposition").and_then(JsonValue::as_str) == Some("guest-fixture")
@@ -350,7 +418,7 @@ fn validate_front_door(repo_root: &Path, documents: &[Value]) {
         MATRIX_SYMMETRY_BASELINE,
     );
 
-    let inventory_path = repo_root.join(TEST_INVENTORY);
+    let inventory_path = repo_root.join(EXPLICIT_TEST_INVENTORY);
     let inventory_text = std::fs::read_to_string(&inventory_path)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", inventory_path.display())));
     let inventory: JsonValue = serde_json::from_str(&inventory_text).unwrap_or_else(|error| {
@@ -468,9 +536,7 @@ fn validate_and_expand(
             "{location}: id `{id}` must be lowercase and start with `{bucket}/`"
         ));
     }
-    if !seen_ids.insert(id.clone()) {
-        die(format!("duplicate test id across manifests: {id}"));
-    }
+    record_test_id(seen_ids, &id);
     required_string(test, "description", &id);
 
     let lane = required_string(test, "lane", &id);
@@ -800,6 +866,112 @@ mod tests {
 
     fn parse_mode(text: &str) -> Value {
         text.parse::<Value>().expect("test mode must be valid TOML")
+    }
+
+    fn temporary_manifest_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-manifest-plan-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temporary manifest root");
+        root
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            "non-string panic".to_string()
+        }
+    }
+
+    #[test]
+    fn discovers_one_level_manifest_shard() {
+        let root = temporary_manifest_root("nested-shard");
+        let shard = root.join("backend-parity-c/example.toml");
+        std::fs::create_dir_all(shard.parent().unwrap()).expect("create shard directory");
+        std::fs::write(&shard, "schema = 2\n").expect("write shard");
+
+        assert_eq!(discover_manifest_paths(&root), vec![shard.clone()]);
+        assert_eq!(
+            manifest_location_and_expected_bucket(&root, &shard),
+            (
+                "backend-parity-c/example.toml".to_string(),
+                "backend-parity-c".to_string()
+            )
+        );
+        std::fs::remove_dir_all(root).expect("remove temporary manifest root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_manifest_document_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_manifest_root("symlink-document");
+        let bucket = root.join("backend-parity-c");
+        let regular = bucket.join("regular.toml");
+        let linked = bucket.join("linked.toml");
+        std::fs::create_dir_all(&bucket).expect("create shard directory");
+        std::fs::write(&regular, "schema = 2\n").expect("write regular manifest");
+
+        assert_eq!(discover_manifest_paths(&root), vec![regular.clone()]);
+        symlink("regular.toml", &linked).expect("create manifest symlink");
+        let error = std::panic::catch_unwind(|| discover_manifest_paths(&root))
+            .expect_err("manifest symlink must be rejected");
+        std::fs::remove_dir_all(root).expect("remove temporary manifest root");
+        assert!(
+            panic_message(error)
+                .contains("linked.toml: manifest documents must be regular files, not symlinks")
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_shard_more_than_one_level_deep() {
+        let root = temporary_manifest_root("too-deep");
+        let shard = root.join("backend-parity-c/nested/example.toml");
+        std::fs::create_dir_all(shard.parent().unwrap()).expect("create nested shard directory");
+        std::fs::write(&shard, "schema = 2\n").expect("write nested shard");
+
+        let error = std::panic::catch_unwind(|| discover_manifest_paths(&root))
+            .expect_err("too-deep shard must be rejected");
+        std::fs::remove_dir_all(root).expect("remove temporary manifest root");
+        assert!(
+            panic_message(error)
+                .contains("manifest shards must be exactly one directory below manifests/")
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_shard_bucket_mismatch() {
+        let error = std::panic::catch_unwind(|| {
+            validate_manifest_bucket(
+                "wrong-bucket",
+                "backend-parity-c",
+                "backend-parity-c/example.toml",
+            )
+        })
+        .expect_err("bucket mismatch must be rejected");
+        assert!(
+            panic_message(error).contains("bucket `wrong-bucket` must equal `backend-parity-c`")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_test_id_across_manifest_shards() {
+        let mut seen = BTreeSet::new();
+        record_test_id(&mut seen, "backend-parity-c/example");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            record_test_id(&mut seen, "backend-parity-c/example");
+        }))
+        .expect_err("duplicate shard id must be rejected");
+        assert!(
+            panic_message(error)
+                .contains("duplicate test id across manifests: backend-parity-c/example")
+        );
     }
 
     #[test]

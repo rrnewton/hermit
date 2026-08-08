@@ -1,0 +1,1187 @@
+{
+  "schema": 2,
+  "files": [
+    {
+      "disposition": "support-data",
+      "path": "tests/Cargo.toml",
+      "runner": "Cargo and Hermit Rust integration tests",
+      "why": "tests/Cargo.toml is owned by Cargo and Hermit Rust integration tests: This package manifest declares the named Rust guest binaries and their dependencies. Cargo consumes it to build targets; it is configuration rather than executable input and the generic manifest must not duplicate Cargo's target graph."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/README.md",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/README.md is owned by tests/backend-parity/run_matrix.py maintainers: This README specifies backend-parity matrix semantics and reproduction commands. It documents the driver but contains no executable workload."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/e9patch_corpus.py",
+      "runner": "e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI)",
+      "why": "tests/backend-parity/e9patch_corpus.py is owned by e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI): Standalone driver that compiles each freestanding corpus guest, rewrites it with e9tool, and enforces exit-status and stdout parity, golden and e9patch L2, full direct-AOT coverage with mapped==candidate, no SIGILL fallback with b0==0, and a guest-syscall DETLOG tail-match against golden ptrace. It needs e9tool and a hermit built --features e9patch, both absent in CI, so it is BLOCKED there like the KVM /dev/kvm gate rather than a manifest-plan program."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/backend-parity/e9patch_corpus/README.md",
+      "runner": "tests/backend-parity/e9patch_corpus.py maintainers",
+      "why": "tests/backend-parity/e9patch_corpus/README.md is owned by tests/backend-parity/e9patch_corpus.py maintainers: Documents why the e9patch preprocessing parity corpus must be freestanding, statically linked, raw-syscall guests, since a dynamically linked libc program exposes zero in-ELF SYSCALL sites, and tabulates what each guest exercises. It is reference documentation for the driver and contains no executable workload."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/clock_gettime.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/clock_gettime.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a guest clock_gettime(CLOCK_MONOTONIC) read stays byte-identical between golden plain-ptrace and e9patch preprocessing plus ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/compute.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/compute.c is owned by tests/backend-parity/e9patch_corpus.py: Probes an RCB-preempted CPU-bound loop so branch-count preemption behaves identically under e9patch rewriting and plain ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/dup3_high.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/dup3_high.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that dup3 honors an explicit caller-chosen high descriptor number (10) and that a write through it reaches stdout, proving fixed-fd duplication parity under e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/fcntl_cloexec.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/fcntl_cloexec.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that F_GETFD reports no close-on-exec bit on both stdout and a freshly opened descriptor, proving e9patch preprocessing sets no stray FD_CLOEXEC on inherited or guest-opened descriptors. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/fd_lowest_free.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/fd_lowest_free.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a closed descriptor number is immediately reused by the next open (open 3 then 4, close 3, reopen reuses 3), proving the guest fd allocation order is identical under e9patch preprocessing and golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/fd_open_number.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/fd_open_number.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the first descriptor a guest opens is the lowest free number (3, after stdin, stdout, and stderr), proving e9patch preprocessing leaks no extra open descriptor into the guest fd table. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/getpid_check.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getpid_check.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the virtualized getpid result is identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/getrandom.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/getrandom.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the determinized getrandom byte stream is identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/loop_write.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/loop_write.c is owned by tests/backend-parity/e9patch_corpus.py: Probes a single write site invoked repeatedly in a loop so the rewritten trampoline is reused deterministically across iterations. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/minimal_exit.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/minimal_exit.c is owned by tests/backend-parity/e9patch_corpus.py: Probes the smallest possible rewrite, a lone exit_group site, establishing the e9loader-prologue baseline used by the DETLOG tail-match check. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/mmap_anon.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/mmap_anon.c is owned by tests/backend-parity/e9patch_corpus.py: Probes an anonymous mmap, touch, and munmap sequence so memory-mapping syscalls are rewritten and replayed identically to plain ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/multi_site.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/multi_site.c is owned by tests/backend-parity/e9patch_corpus.py: Probes three distinct noinline syscall sites so multi-site rewriting maps every candidate and adds the expected additional trampoline mmaps. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/nanosleep.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/nanosleep.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a nanosleep request is virtualized identically under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/pipe_fds.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/pipe_fds.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that pipe2 returns zero and assigns the two lowest free descriptors to the read and write ends (3 and 4), proving fd-pair allocation parity between e9patch preprocessing and golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/proc_self_fd_count.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/proc_self_fd_count.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the /proc/self/fd entry count is byte-identical under e9patch preprocessing and golden ptrace, proving the e9loader closes its self-fd and leaves no extra loader descriptor visible to the guest. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/readlink_exe.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/readlink_exe.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that readlink of /proc/self/exe resolves to the original guest binary rather than the rewritten e9patch temp image, the decisive no-temp-binary-leak regression for e9patch preprocessing. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/sigmask.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/sigmask.c is owned by tests/backend-parity/e9patch_corpus.py: Probes gettid plus rt_sigprocmask so signal-mask syscalls survive rewriting without introducing a SIGILL signal-fallback site. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/uname.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/uname.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that the deterministic uname buffer is byte-identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/write_stdout.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/write_stdout.c is owned by tests/backend-parity/e9patch_corpus.py: Probes a single write(1,...) site so basic guest-visible stdout is byte-identical under e9patch preprocessing and golden plain-ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/e9patch_corpus/writev_multi.c",
+      "runner": "tests/backend-parity/e9patch_corpus.py",
+      "why": "tests/backend-parity/e9patch_corpus/writev_multi.c is owned by tests/backend-parity/e9patch_corpus.py: Probes that a single writev with three iovecs emits the gathered bytes atomically and returns the correct total byte count, proving gathered-write output parity between e9patch preprocessing and golden ptrace. This freestanding, statically linked, raw-syscall guest is driven only by the standalone e9patch_corpus.py parity harness (e9tool plus a hermit built --features e9patch), which is absent from CI like the KVM /dev/kvm gate, so it stays a driver-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/input.txt",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/input.txt is owned by tests/backend-parity/run_matrix.py: This fixed text payload is input data for backend-parity guest cases; run_matrix.py supplies it to compiled guests and compares backend results, so the data file is not executable."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/sigaction_state.c",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigaction_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaction(2) handler installation and SA_* flag round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/sigaltstack_state.c",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigaltstack_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigaltstack(2) alternate signal-stack install/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/sigprocmask_state.c",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/backend-parity/fixtures/sigprocmask_state.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic sigprocmask(2) signal-mask block/unblock/query round-tripping as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/retarget_to_manifest.py",
+      "runner": "backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual)",
+      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and writes one independent tests/e2e/manifests/backend-parity-c/<test>.toml shard per converted test. The checked-out-head inventory derives both the shard and its guest program, avoiding shared manifest and inventory appends; the driver also self-tests dry-run, apply, idempotence, and conflict-free two-branch shard merges."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/run_matrix.py",
+      "runner": "portable and privileged backend-parity partitions",
+      "why": "tests/backend-parity/run_matrix.py is owned by portable and privileged backend-parity partitions: run_matrix.py expands its executable case catalog across backend-specific capability checks, build flags, and expected results, then writes live observations to the outer dev-hermit scorecard. It stays a driver because those cross-backend comparisons cannot be represented as one program observation."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/split_asymmetric_pr.py",
+      "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
+      "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/test_scorecard_header_compat.py",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/test_scorecard_header_compat.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's outer-scorecard writer, asserting that the writer binds to the target file's header so a parent-side column addition cannot refuse every append. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/backend-parity/test_verify_tier_evidence.py",
+      "runner": "tests/backend-parity/run_matrix.py maintainers",
+      "why": "tests/backend-parity/test_verify_tier_evidence.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's verify-tier derivation, asserting that a stripped verdict can never claim the bitwise tier and that a bitwise_parity record with a zero compared-message count is refused. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "buck-fixture",
+      "path": "tests/bin/README.md",
+      "runner": "Meta Buck test targets",
+      "why": "tests/bin/README.md is owned by Meta Buck test targets: This README documents Buck-owned C fixture targets under tests/bin. Those internal targets have no standalone public build/run contract, so the file and its documented fixtures remain under Buck rather than the public manifest builder."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/liteinst_host_activation.c",
+      "runner": "hermit-cli/tests/liteinst_host_activation.rs",
+      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/liteinst_inert_runtime.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/netlink_autobind_common.h",
+      "runner": "C guests that include netlink_autobind_common.h",
+      "why": "tests/c/netlink_autobind_common.h is owned by C guests that include netlink_autobind_common.h: The `netlink_autobind_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/netns_cookie_common.h",
+      "runner": "C guests that include netns_cookie_common.h",
+      "why": "tests/c/netns_cookie_common.h is owned by C guests that include netns_cookie_common.h: The `netns_cookie_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/relaxed_flag_matrix.c",
+      "runner": "hermit-cli/tests/relaxed_flag_matrix.rs",
+      "why": "tests/c/relaxed_flag_matrix.c is owned by hermit-cli/tests/relaxed_flag_matrix.rs: The Rust integration test compiles this observation guest and runs it across the exhaustive strict/relaxed flag matrix with bounded execution and exact result classification; a generic manifest cell cannot express the matrix-wide flag cross-product or ratcheted expected-failure contract."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sabre_exit_group_parked.c",
+      "runner": "hermit-cli/tests/hermit_modes.rs",
+      "why": "tests/c/sabre_exit_group_parked.c is owned by hermit-cli/tests/hermit_modes.rs: The Rust integration test compiles this SaBRe-only lifecycle guest, supplies the reviewed loader, enforces strict verification, and owns bounded process-group cleanup; a generic manifest cell cannot express that backend-specific setup and timeout contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/sched_setattr_common.h",
+      "runner": "C guests that include sched_setattr_common.h",
+      "why": "tests/c/sched_setattr_common.h is owned by C guests that include sched_setattr_common.h: The `sched_setattr_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/signal_disposition.c",
+      "runner": "tests/backend-parity/run_matrix.py",
+      "why": "tests/c/signal_disposition.c is owned by tests/backend-parity/run_matrix.py: Probes deterministic signal disposition inheritance (SIG_DFL/SIG_IGN and pending-signal state) as a direct C guest exercised only by the standalone backend-parity matrix harness, which drives ptrace/DBI/KVM strict and --verify probes against matrix.tsv; not registered in a CI manifest bucket, so it stays a driver-owned guest fixture."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/socket_cookie_common.h",
+      "runner": "C guests that include socket_cookie_common.h",
+      "why": "tests/c/socket_cookie_common.h is owned by C guests that include socket_cookie_common.h: The `socket_cookie_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/unix_autobind_common.h",
+      "runner": "C guests that include unix_autobind_common.h",
+      "why": "tests/c/unix_autobind_common.h is owned by C guests that include unix_autobind_common.h: The `unix_autobind_common.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/c/util/assert.h",
+      "runner": "C guests that include assert.h",
+      "why": "tests/c/util/assert.h is owned by C guests that include assert.h: The `assert.h` header provides shared declarations or inline helpers to related C probes. It has no translation unit or main function, so its behavior is covered through the manifest entries that compile its consumers."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/chaos/cas_sequence.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/cas_sequence.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `cas_sequence` is built from `tests/chaos/cas_sequence.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/chaos/hello_chaos.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/hello_chaos.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `hello_chaos` is built from `tests/chaos/hello_chaos.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/chaos/keyvalue.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/keyvalue.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `keyvalue` is built from `tests/chaos/keyvalue.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/chaos/nanosleep-threads-nocrash-rust.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/nanosleep-threads-nocrash-rust.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `nanosleep-threads-nocrash-rust` is built from `tests/chaos/nanosleep-threads-nocrash-rust.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/compat/complex_shell_workload.sh",
+      "runner": "validate.sh compatibility partitions",
+      "why": "tests/compat/complex_shell_workload.sh is owned by validate.sh compatibility partitions: The `complex_shell_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBI, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/compat/prepare_real_compat_fixtures.sh",
+      "runner": "validate.sh compatibility partitions",
+      "why": "tests/compat/prepare_real_compat_fixtures.sh is owned by validate.sh compatibility partitions: The `prepare_real_compat_fixtures` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBI, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/compat/real_compat_workload.sh",
+      "runner": "validate.sh compatibility partitions",
+      "why": "tests/compat/real_compat_workload.sh is owned by validate.sh compatibility partitions: The `real_compat_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBI, SaBRe, LiteInst, or record/replay ratchets. validate.sh owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/.gitignore",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/.gitignore is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `.gitignore` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/README.md",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/README.md is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `README.md` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/harness.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/harness.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `harness.py` is the shared gdb-remote protocol harness imported by the debugger cases. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/debugger/run_debugger_tests.sh",
+      "runner": "validate.sh privileged debugger gate",
+      "why": "tests/debugger/run_debugger_tests.sh is owned by validate.sh privileged debugger gate: This driver allocates gdbserver sessions and runs four GDB/LLDB live/replay Python cases with shared cleanup. The privileged multi-process protocol cannot be reduced to the generic single-program manifest lifecycle."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_gdb_replay_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_gdb_replay_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_replay_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_gdb_run_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_gdb_run_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_run_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_lldb_replay_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_lldb_replay_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_lldb_replay_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/debugger/test_lldb_run_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_lldb_run_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_lldb_run_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/determinism-stress/README.md",
+      "runner": "maintainers of tests/e2e/determinism-stress",
+      "why": "tests/e2e/determinism-stress/README.md is owned by maintainers of tests/e2e/determinism-stress: This README records the scope, invocation, and assumptions of `tests/e2e/determinism-stress`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/language-runtimes/RuntimeProbe.java",
+      "runner": "tests/e2e/lib/language-runtimes/run.sh",
+      "why": "tests/e2e/language-runtimes/RuntimeProbe.java is owned by tests/e2e/lib/language-runtimes/run.sh: The `RuntimeProbe.java` source is the java runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/language-runtimes/javascript.js",
+      "runner": "tests/e2e/lib/language-runtimes/run.sh",
+      "why": "tests/e2e/language-runtimes/javascript.js is owned by tests/e2e/lib/language-runtimes/run.sh: The `javascript.js` source is the js runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/language-runtimes/python.py",
+      "runner": "tests/e2e/lib/language-runtimes/run.sh",
+      "why": "tests/e2e/language-runtimes/python.py is owned by tests/e2e/lib/language-runtimes/run.sh: The `python.py` source is the py runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/e2e/language-runtimes/ruby.rb",
+      "runner": "tests/e2e/lib/language-runtimes/run.sh",
+      "why": "tests/e2e/language-runtimes/ruby.rb is owned by tests/e2e/lib/language-runtimes/run.sh: The `ruby.rb` source is the rb runtime payload. The language-runtime driver resolves the interpreter/compiler, injects a sentinel, and validates RANDOM/TIME/THREAD/SYSTEM categories; the generic manifest builder supports only shell, C, and Rust programs."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/build_tools.sh",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/build_tools.sh is owned by tests/e2e/lib/applications/run_all.sh: The `build_tools` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/common.sh",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/common.sh is owned by tests/e2e/lib/applications/run_all.sh: The `common.sh` shell library is sourced by the applications scenarios for shared Hermit invocation, temporary-directory, and assertion functions. It is not executable test input and therefore has no independent manifest observation."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/http_server.sh",
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/http_server.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored http_server_session_is_nondeterministic_natively_and_l2_under_hermit: The long-lived Python server plus curl client remains an explicit occasional L2 check, preserving its process-lifecycle coverage without allowing a server-child starvation defect to consume every-commit CI's full application timeout."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/redis_deep.sh",
+      "runner": "hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit",
+      "why": "tests/e2e/lib/applications/redis_deep.sh is owned by hermit-cli/tests/frontier_app_benchmarks.rs ignored redis_deep_session_is_nondeterministic_natively_and_l2_under_hermit: The full redis-server plus redis-cli session takes about one minute even when healthy, so the ignored Rust wrapper keeps it available as explicit occasional L2 validation without adding a long-lived server workload to every-commit portable CI."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/applications/run_all.sh",
+      "runner": "ci/dag/portable.json test.applications_e2e",
+      "why": "tests/e2e/lib/applications/run_all.sh is owned by ci/dag/portable.json test.applications_e2e: The `run_all.sh` executable is the applications suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/sqlite_deep.sh",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/sqlite_deep.sh is owned by tests/e2e/lib/applications/run_all.sh: The `sqlite_deep` scenario is one named case inside the applications aggregate suite, driven by run_all.sh with suite-owned lifecycle. It builds a deeper multi-table relational SQLite database and folds its determinism assertions into the suite's combined pass/fail contract, so scheduling the helper on its own would duplicate that setup and fracture the contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/applications/sqlite_on_disk.sh",
+      "runner": "tests/e2e/lib/applications/run_all.sh",
+      "why": "tests/e2e/lib/applications/sqlite_on_disk.sh is owned by tests/e2e/lib/applications/run_all.sh: The `sqlite_on_disk` scenario is one named case inside the applications aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/archive.sh",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/archive.sh is owned by tests/e2e/lib/data-handling/run.sh: The `archive` scenario is one named case inside the data-handling aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/common.bash",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/common.bash is owned by tests/e2e/lib/data-handling/run.sh: The `common.bash` shell library is sourced by the data-handling scenarios for shared Hermit invocation, temporary-directory, and assertion functions. It is not executable test input and therefore has no independent manifest observation."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/compression.sh",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/compression.sh is owned by tests/e2e/lib/data-handling/run.sh: The `compression` scenario is one named case inside the data-handling aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/numerical.sh",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/numerical.sh is owned by tests/e2e/lib/data-handling/run.sh: The `numerical` scenario is one named case inside the data-handling aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/reproducible-build.sh",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/reproducible-build.sh is owned by tests/e2e/lib/data-handling/run.sh: The `reproducible-build` scenario is one named case inside the data-handling aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/data-handling/run.sh",
+      "runner": "the explicit data-handling category suite",
+      "why": "tests/e2e/lib/data-handling/run.sh is owned by the explicit data-handling category suite: The `run.sh` executable is the data-handling suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/data-handling/text-processing.sh",
+      "runner": "tests/e2e/lib/data-handling/run.sh",
+      "why": "tests/e2e/lib/data-handling/text-processing.sh is owned by tests/e2e/lib/data-handling/run.sh: The `text-processing` scenario is one named case inside the data-handling aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/common.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/common.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `common.sh` shell library is sourced by the determinism-stress scenarios for shared Hermit invocation, temporary-directory, and assertion functions. It is not executable test input and therefore has no independent manifest observation."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/examples.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/examples.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `examples` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/pid-tid.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/pid-tid.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `pid-tid` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/pipe-chain.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/pipe-chain.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `pipe-chain` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/random.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/random.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `random` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/determinism-stress/run.sh",
+      "runner": "the explicit determinism-stress category suite",
+      "why": "tests/e2e/lib/determinism-stress/run.sh is owned by the explicit determinism-stress category suite: The `run.sh` executable is the determinism-stress suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/signals.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/signals.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `signals` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/syscalls.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/syscalls.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `syscalls` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/thread-racing.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/thread-racing.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `thread-racing` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/determinism-stress/time-clock.sh",
+      "runner": "tests/e2e/lib/determinism-stress/run.sh",
+      "why": "tests/e2e/lib/determinism-stress/time-clock.sh is owned by tests/e2e/lib/determinism-stress/run.sh: The `time-clock` scenario is one named case inside the determinism-stress aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/language-runtimes/run.sh",
+      "runner": "the explicit language-runtimes category suite",
+      "why": "tests/e2e/lib/language-runtimes/run.sh is owned by the explicit language-runtimes category suite: The `run.sh` executable is the language-runtimes suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/_common.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/_common.sh is owned by tests/e2e/lib/system-utils/run.sh: The `_common.sh` shell library is sourced by the system-utils scenarios for shared Hermit invocation, temporary-directory, and assertion functions. It is not executable test input and therefore has no independent manifest observation."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/df.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/df.sh is owned by tests/e2e/lib/system-utils/run.sh: The `df` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/du.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/du.sh is owned by tests/e2e/lib/system-utils/run.sh: The `du` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/groups.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/groups.sh is owned by tests/e2e/lib/system-utils/run.sh: The `groups` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/hostname.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/hostname.sh is owned by tests/e2e/lib/system-utils/run.sh: The `hostname` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/id.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/id.sh is owned by tests/e2e/lib/system-utils/run.sh: The `id` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/lscpu.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/lscpu.sh is owned by tests/e2e/lib/system-utils/run.sh: The `lscpu` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/lshw.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/lshw.sh is owned by tests/e2e/lib/system-utils/run.sh: The `lshw` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/numactl.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/numactl.sh is owned by tests/e2e/lib/system-utils/run.sh: The `numactl` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/proc.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/proc.sh is owned by tests/e2e/lib/system-utils/run.sh: The `proc` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/system-utils/run.sh",
+      "runner": "the explicit system-utils category suite",
+      "why": "tests/e2e/lib/system-utils/run.sh is owned by the explicit system-utils category suite: The `run.sh` executable is the system-utils suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/uname.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/uname.sh is owned by tests/e2e/lib/system-utils/run.sh: The `uname` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "suite-helper",
+      "path": "tests/e2e/lib/system-utils/whoami.sh",
+      "runner": "tests/e2e/lib/system-utils/run.sh",
+      "why": "tests/e2e/lib/system-utils/whoami.sh is owned by tests/e2e/lib/system-utils/run.sh: The `whoami` scenario is one named case inside the system-utils aggregate suite. Its category driver invokes it with suite-owned setup and combines its assertions, so scheduling the helper separately would duplicate setup and change the suite's pass/fail contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/manifests/README.md",
+      "runner": "maintainers of tests/e2e/manifests",
+      "why": "tests/e2e/manifests/README.md is owned by maintainers of tests/e2e/manifests: This README records the scope, invocation, and assumptions of `tests/e2e/manifests`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "test-inventory",
+      "path": "tests/e2e/manifests/inventory/explicit-test-files.json",
+      "runner": "ci/test_harness.sh audit-inventory",
+      "why": "tests/e2e/manifests/inventory/explicit-test-files.json is owned by ci/test_harness.sh audit-inventory: This fail-closed exception ledger classifies only files that are neither manifest documents nor manifest programs; those two inventories are derived directly at the checked-out head to avoid shared append conflicts and stale copied classifications."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/system-utils/README.md",
+      "runner": "maintainers of tests/e2e/system-utils",
+      "why": "tests/e2e/system-utils/README.md is owned by maintainers of tests/e2e/system-utils: This README records the scope, invocation, and assumptions of `tests/e2e/system-utils`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/xdg-config/README.md",
+      "runner": "maintainers of tests/e2e/xdg-config",
+      "why": "tests/e2e/xdg-config/README.md is owned by maintainers of tests/e2e/xdg-config: This README records the scope, invocation, and assumptions of `tests/e2e/xdg-config`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/e2e/xdg-config/git/config",
+      "runner": "ci/test_harness.sh isolated HOME setup",
+      "why": "tests/e2e/xdg-config/git/config is owned by ci/test_harness.sh isolated HOME setup: This deterministic Git configuration is copied into each E2E cell's isolated XDG_CONFIG_HOME to prevent host settings from changing observations. It is environment data, not a test program."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/helpers.bzl",
+      "runner": "Meta Buck test targets",
+      "why": "tests/helpers.bzl is owned by Meta Buck test targets: helpers.bzl defines Buck macros and target wiring for internal tests. Buck evaluates it during graph construction; it is build policy, not guest code runnable by the public manifest harness."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/manifest-cli.rs",
+      "runner": "test-corpus operators",
+      "why": "tests/manifest-cli.rs is owned by test-corpus operators: This rust-script command lists, renders, and runs centrally declared manifest cells for interactive inspection. It is a method over the test corpus rather than a guest workload, and classifying it as a manifest test would recursively ask the CLI to execute itself under Hermit."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/python/hashseed_order.py",
+      "runner": "hermit-cli Python integration targets",
+      "why": "tests/python/hashseed_order.py is owned by hermit-cli Python integration targets: The Python payload `hashseed_order.py` is selected by a Rust integration case that owns strict/non-strict mode and interpreter assertions. It remains a guest fixture because the manifest builder does not own Python dependency or interpreter policy."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/python/non_strict/hello.py",
+      "runner": "hermit-cli Python integration targets",
+      "why": "tests/python/non_strict/hello.py is owned by hermit-cli Python integration targets: The Python payload `hello.py` is selected by a Rust integration case that owns strict/non-strict mode and interpreter assertions. It remains a guest fixture because the manifest builder does not own Python dependency or interpreter policy."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/python/non_strict/rand.py",
+      "runner": "hermit-cli Python integration targets",
+      "why": "tests/python/non_strict/rand.py is owned by hermit-cli Python integration targets: The Python payload `rand.py` is selected by a Rust integration case that owns strict/non-strict mode and interpreter assertions. It remains a guest fixture because the manifest builder does not own Python dependency or interpreter policy."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/python/non_strict/timed_progress_bar.py",
+      "runner": "hermit-cli Python integration targets",
+      "why": "tests/python/non_strict/timed_progress_bar.py is owned by hermit-cli Python integration targets: The Python payload `timed_progress_bar.py` is selected by a Rust integration case that owns strict/non-strict mode and interpreter assertions. It remains a guest fixture because the manifest builder does not own Python dependency or interpreter policy."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/qemu-boot/smoke_test.sh",
+      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/smoke_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `smoke_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/qemu-boot/strict_l2_network_test.sh",
+      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_network_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_network_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/qemu-boot/strict_l2_test.sh",
+      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/qemu-boot/strict_l2_userspace_test.sh",
+      "runner": "validate.sh QEMU_L2_ONLY or the direct QEMU suite",
+      "why": "tests/qemu-boot/strict_l2_userspace_test.sh is owned by validate.sh QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_userspace_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/reproducible-builds/README.md",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "tests/reproducible-builds/README.md is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `README.md` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.lock",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "tests/reproducible-builds/build-time-0.1.3/Cargo.lock is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `Cargo.lock` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.toml",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "tests/reproducible-builds/build-time-0.1.3/Cargo.toml is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `Cargo.toml` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/reproducible-builds/build-time-0.1.3/src/lib.rs",
+      "runner": "tests/reproducible-builds/run.sh",
+      "why": "tests/reproducible-builds/build-time-0.1.3/src/lib.rs is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `lib.rs` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/reproducible-builds/run.sh",
+      "runner": "reproducible-build E2E suite",
+      "why": "tests/reproducible-builds/run.sh is owned by reproducible-build E2E suite: run.sh performs two isolated Cargo builds of the pinned fixture and compares their artifacts. That paired-build assertion is a build-system experiment, not a single Hermit guest observation."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/RuntimeRandom.java",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/RuntimeRandom.java is owned by Hermit managed-runtime integration targets: The runtime probe `RuntimeRandom.java` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/random.go",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/random.go is owned by Hermit managed-runtime integration targets: The runtime probe `random.go` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/random.js",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/random.js is owned by Hermit managed-runtime integration targets: The runtime probe `random.js` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/random.ml",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/random.ml is owned by Hermit managed-runtime integration targets: The runtime probe `random.ml` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/random.py",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/random.py is owned by Hermit managed-runtime integration targets: The runtime probe `random.py` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/runtime/random.rb",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/random.rb is owned by Hermit managed-runtime integration targets: The runtime probe `random.rb` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/bind_connect_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/bind_connect_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `bind_connect_race` is built from `tests/rust/bind_connect_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/clock_gettime.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/clock_gettime.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `clock_gettime` is built from `tests/rust/clock_gettime.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/clock_total_order.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/clock_total_order.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `clock_total_order` is built from `tests/rust/clock_total_order.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/exit_group.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/exit_group.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `exit_group` is built from `tests/rust/exit_group.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/futex_and_print.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_and_print.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_and_print` is built from `tests/rust/futex_and_print.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/futex_timeout.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_timeout.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_timeout` is built from `tests/rust/futex_timeout.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/futex_wait_child.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_wait_child.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_wait_child` is built from `tests/rust/futex_wait_child.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/futex_wake_some.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_wake_some.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_wake_some` is built from `tests/rust/futex_wake_some.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/heap_ptrs.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/heap_ptrs.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `heap_ptrs` is built from `tests/rust/heap_ptrs.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/interrogate_tty.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/interrogate_tty.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `interrogate_tty` is built from `tests/rust/interrogate_tty.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/landlock.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/landlock.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `landlock` is built from `tests/rust/landlock.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/mem_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/mem_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `mem_race` is built from `tests/rust/mem_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/nanosleep.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/nanosleep.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `nanosleep` is built from `tests/rust/nanosleep.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/network_hello_world.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/network_hello_world.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_hello_world` is built from `tests/rust/network_hello_world.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/pipe_basics.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/pipe_basics.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `pipe_basics` is built from `tests/rust/pipe_basics.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/poll.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/poll.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `poll` is built from `tests/rust/poll.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/poll_spin.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/poll_spin.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `poll_spin` is built from `tests/rust/poll_spin.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_abs_race` is built from `tests/rust/print_clock_nanosleep_monotonic_abs_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/print_clock_nanosleep_monotonic_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_monotonic_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_race` is built from `tests/rust/print_clock_nanosleep_monotonic_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_realtime_abs_race` is built from `tests/rust/print_clock_nanosleep_realtime_abs_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/print_nanosleep_race.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_nanosleep_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_nanosleep_race` is built from `tests/rust/print_nanosleep_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/rdtsc.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/rdtsc.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `rdtsc` is built from `tests/rust/rdtsc.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/recvmmsg.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/recvmmsg.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `recvmmsg` is built from `tests/rust/recvmmsg.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/sched_yield.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/sched_yield.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `sched_yield` is built from `tests/rust/sched_yield.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/select.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/select.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `select` is built from `tests/rust/select.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/shutdown.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/shutdown.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `shutdown` is built from `tests/rust/shutdown.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/socketpair.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/socketpair.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `socketpair` is built from `tests/rust/socketpair.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/stack_ptr.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/stack_ptr.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `stack_ptr` is built from `tests/rust/stack_ptr.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/rust/test_utils/mod.rs",
+      "runner": "Rust guests under tests/rust",
+      "why": "tests/rust/test_utils/mod.rs is owned by Rust guests under tests/rust: The test_utils module provides shared Rust guest helpers to sibling Cargo targets; it has no main function or standalone observation contract, so it cannot be a program manifest entry."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/thread_random.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/thread_random.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `thread_random` is built from `tests/rust/thread_random.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/rust/tkill.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/tkill.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `tkill` is built from `tests/rust/tkill.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shared-futex-verify/Threaded.java",
+      "runner": "Hermit shared-futex integration targets",
+      "why": "tests/shared-futex-verify/Threaded.java is owned by Hermit shared-futex integration targets: The `Threaded.java` guest exercises shared futexes through its managed runtime. The owning integration target starts the runtime and compares Hermit behavior; the generic manifest builder does not compile Java or coordinate Node workers."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shared-futex-verify/node_worker.js",
+      "runner": "Hermit shared-futex integration targets",
+      "why": "tests/shared-futex-verify/node_worker.js is owned by Hermit shared-futex integration targets: The `node_worker.js` guest exercises shared futexes through its managed runtime. The owning integration target starts the runtime and compares Hermit behavior; the generic manifest builder does not compile Java or coordinate Node workers."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/date.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/date.sh is owned by hermit-cli shell integration targets: The `date.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/devrand.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/devrand.sh is owned by hermit-cli shell integration targets: The `devrand.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/non_strict/curl.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/non_strict/curl.sh is owned by hermit-cli shell integration targets: The `curl.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/par_work.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/par_work.sh is owned by hermit-cli shell integration targets: The `par_work.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/py_hello.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/py_hello.sh is owned by hermit-cli shell integration targets: The `py_hello.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/race.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/race.sh is owned by hermit-cli shell integration targets: The `race.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/shell/taskset.sh",
+      "runner": "hermit-cli shell integration targets",
+      "why": "tests/shell/taskset.sh is owned by hermit-cli shell integration targets: The `taskset.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/standalone/README.md",
+      "runner": "maintainers of tests/standalone",
+      "why": "tests/standalone/README.md is owned by maintainers of tests/standalone: This README records the scope, invocation, and assumptions of `tests/standalone`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/cat_proc_uptime.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/cat_proc_uptime.sh is owned by hermit-cli/tests integration targets: The `cat_proc_uptime` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/curl_client_only.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/curl_client_only.sh is owned by hermit-cli/tests integration targets: The `curl_client_only` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/env_var_passthru.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/env_var_passthru.sh is owned by hermit-cli/tests integration targets: The `env_var_passthru` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/minimal_hello_backtraces.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/minimal_hello_backtraces.sh is owned by hermit-cli/tests integration targets: The `minimal_hello_backtraces` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/standalone/network_bind.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/network_bind.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_bind` is built from `tests/standalone/network_bind.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/standalone/network_bind_full.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/network_bind_full.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_bind_full` is built from `tests/standalone/network_bind_full.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/replay_and_print_stacktraces.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/replay_and_print_stacktraces.sh is owned by hermit-cli/tests integration targets: The `replay_and_print_stacktraces` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/replay_chaos_trace.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/replay_chaos_trace.sh is owned by hermit-cli/tests integration targets: The `replay_chaos_trace` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/replay_trace.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/replay_trace.sh is owned by hermit-cli/tests integration targets: The `replay_trace` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/standalone/stacktrace_events.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/stacktrace_events.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `stacktrace_events` is built from `tests/standalone/stacktrace_events.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/stacktrace_signal.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/stacktrace_signal.sh is owned by hermit-cli/tests integration targets: The `stacktrace_signal` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/strict_setitimer.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/strict_setitimer.sh is owned by hermit-cli/tests integration targets: The `strict_setitimer` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/strict_timer_create.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/strict_timer_create.sh is owned by hermit-cli/tests integration targets: The `strict_timer_create` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/test_no_networking_network_bind.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/test_no_networking_network_bind.sh is owned by hermit-cli/tests integration targets: The `test_no_networking_network_bind` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/standalone/validate_race_example_properties.sh",
+      "runner": "hermit-cli/tests integration targets",
+      "why": "tests/standalone/validate_race_example_properties.sh is owned by hermit-cli/tests integration targets: The `validate_race_example_properties` workload is invoked by a named hermit-cli integration case that injects mode-specific environment, recordings, or expected diagnostics. It remains attached to that Rust test because the shell file alone cannot express the caller-owned assertion."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/stress/README.md",
+      "runner": "maintainers of tests/stress",
+      "why": "tests/stress/README.md is owned by maintainers of tests/stress: This README records the scope, invocation, and assumptions of `tests/stress`. It is retained as operator documentation and contains no executable guest contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/stress/concurrency.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/stress/concurrency.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `concurrency` is built from `tests/stress/concurrency.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "cargo-binary",
+      "path": "tests/stress/scheduling_fairness.rs",
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+    },
+    {
+      "disposition": "support-data",
+      "path": "tests/util/README.md",
+      "runner": "developers invoking tests/util probes",
+      "why": "tests/util/README.md is owned by developers invoking tests/util probes: This README documents the exact callers and hardware assumptions of the utility probes; it contains no executable test and is retained as operator documentation rather than a manifest program."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/util/chaos_stress_wrapper.sh",
+      "runner": "validate.sh or Hermit integration targets",
+      "why": "tests/util/chaos_stress_wrapper.sh is owned by validate.sh or Hermit integration targets: The `chaos_stress_wrapper` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/util/curl_to_server_with_ssl.sh",
+      "runner": "manual TLS client/server compatibility entrypoint",
+      "why": "tests/util/curl_to_server_with_ssl.sh is owned by manual TLS client/server compatibility entrypoint: This executable starts ssl_server.py as a coprocess, reads its dynamic address, launches curl through Hermit with nondeterministic-I/O options, and waits for server shutdown. It remains a manual driver because its two-process network lifecycle and dynamic endpoint do not fit the single-program manifest contract."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/util/hermit_analyze_e2e.sh",
+      "runner": "manual PMU schedule-search entrypoint",
+      "why": "tests/util/hermit_analyze_e2e.sh is owned by manual PMU schedule-search entrypoint: This executable builds Hermit plus two race fixtures, compiles a freestanding C guest, calibrates optional skid arguments, and invokes hermit_analyze_test.sh with source-location expectations. It remains a manual driver because PMU schedule localization and paired fixture builds require dedicated hardware-aware orchestration."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/util/hermit_analyze_test.sh",
+      "runner": "validate.sh or Hermit integration targets",
+      "why": "tests/util/hermit_analyze_test.sh is owned by validate.sh or Hermit integration targets: The `hermit_analyze_test` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/util/hermit_verify_trace_replay.sh",
+      "runner": "manual trace/replay comparison entrypoint",
+      "why": "tests/util/hermit_verify_trace_replay.sh is owned by manual trace/replay comparison entrypoint: This executable records one Hermit schedule, replays it in a second process, and compares exit status, stdout, stderr, and normalized syscall histories before cleaning its logs. It remains a manual driver because its cross-run trace artifacts and four-part comparison exceed a single manifest observation."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/util/perf_supported.sh",
+      "runner": "validate.sh or Hermit integration targets",
+      "why": "tests/util/perf_supported.sh is owned by validate.sh or Hermit integration targets: The `perf_supported` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/util/simplest_server.py",
+      "runner": "validate.sh or Hermit integration targets",
+      "why": "tests/util/simplest_server.py is owned by validate.sh or Hermit integration targets: The `simplest_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/util/ssl_server.py",
+      "runner": "validate.sh or Hermit integration targets",
+      "why": "tests/util/ssl_server.py is owned by validate.sh or Hermit integration targets: The `ssl_server` utility provides a caller-facing probe or server helper; its caller owns process coordination, hardware preflight, arguments, and assertions. Running this helper as an independent manifest cell would test setup machinery without the behavior it supports."
+    }
+  ]
+}
