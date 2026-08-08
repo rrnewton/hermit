@@ -811,6 +811,12 @@
       "why": "tests/c/epoll_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/flock_exclusion.c",
+      "runner": "hermit-cli/tests/flock_exclusion.rs",
+      "why": "tests/c/flock_exclusion.c is owned by hermit-cli/tests/flock_exclusion.rs: Multi-scenario flock(2) guest selected by argv, so the caller chooses which contract to measure and asserts on scenario-specific markers. Its upgrade scenario deliberately deadlocks natively (a contended blocking LOCK_SH to LOCK_EX conversion sleeps forever by construction) and is meaningful only under Detcore's refusal, so it must not be run by a manifest mode that also executes guests natively or without a Hermit-specific expectation."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fp_reduction_nondeterminism.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
