@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
-"""Exercise validate.sh's real signal traps and ledger writer without a build."""
+"""Exercise validate's real signal traps and ledger writer without a build.
+
+`./validate.sh` is a shim that `exec`s `scripts/validate.rs`, so this drives the
+real driver through the entrypoint every other caller uses.
+
+THE FIXTURE MUST NOT OUTLIVE THIS TEST. Each child is spawned with
+``start_new_session=True`` so a signal aimed at the fixture cannot reach the test
+runner -- but that also means nothing in the child's new session will ever stop
+it if this process dies first (an assertion before the signal, a ``wait``
+timeout, or the agent being recycled). Measured on this box 2026-08-07: six
+orphaned ``validate.sh full`` process groups, all ``ppid=1``, ages 2h20m to
+4h30m, each parked in ``sleep 1`` at CPU/wall ~0.00, silently inflating every
+concurrency count that scanned the process table.
+
+Three independent guards close that:
+
+1. every spawn goes through :func:`spawned`, whose ``finally`` kills the child's
+   OWN process group -- and only that group, identified by the pid this process
+   created, never by a name or pattern match;
+2. ``VALIDATE_STOP_TEST_MAX_SECONDS`` bounds the fixture's lifetime from inside;
+3. the driver itself exits as soon as it observes ``getppid() == 1``.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -26,13 +48,38 @@ def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
         DEV_HERMIT_PARENT=str(ROOT.parent),
         VALIDATE_RUN_ON_DIRTY_TREE="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+        # Backstop: even a fixture this test never reaches must die on its own.
+        VALIDATE_STOP_TEST_MAX_SECONDS="120",
         TMPDIR=str(tmpdir),
     )
     return env
 
 
+@contextlib.contextmanager
+def spawned(**kwargs):
+    """Run a stop-test fixture, guaranteeing its process group is reaped.
+
+    ``start_new_session=True`` makes the child a session and process-group leader
+    whose pgid equals its pid, so ``killpg(child.pid, ...)`` addresses EXACTLY the
+    group this test created. That is the only kill this file performs: no name
+    match, no pattern, no ``-f`` substring -- up to eighteen agents share this box
+    and its binary paths, and a pattern kill would take out their live work.
+    """
+    process = subprocess.Popen(start_new_session=True, **kwargs)  # noqa: S603
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+
+
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 10
+    # Generous: `./validate.sh` execs a rust-script, so the FIRST invocation on a
+    # cold cache compiles the driver before it can print anything.
+    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         if log.exists() and text in log.read_text(errors="replace"):
             return
@@ -53,18 +100,16 @@ def run_signal(
         env.update(
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
-        with log.open("wb") as output:
-            process = subprocess.Popen(
-                [str(VALIDATE), "full"],
-                cwd=ROOT,
-                env=env,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        with log.open("wb") as output, spawned(
+            args=[str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        ) as process:
             wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
             process.send_signal(sig)
-            rc = process.wait(timeout=10)
+            rc = process.wait(timeout=30)
 
         rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
         if not expect_record:
@@ -97,6 +142,7 @@ def run_incomplete_exit() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
+            timeout=300,
         )
         assert process.returncode == 1, process.stdout.decode(errors="replace")
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
@@ -121,16 +167,14 @@ def run_cleanup_signal_race() -> None:
             VALIDATE_STOP_TEST_CLEANUP_READY_FILE=str(cleanup_ready),
             VALIDATE_STOP_TEST_CLEANUP_DELAY_SECONDS="1",
         )
-        with log.open("wb") as output:
-            process = subprocess.Popen(
-                [str(VALIDATE), "full"],
-                cwd=ROOT,
-                env=env,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            deadline = time.monotonic() + 10
+        with log.open("wb") as output, spawned(
+            args=[str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline and not cleanup_ready.exists():
                 if process.poll() is not None:
                     raise AssertionError(
@@ -141,7 +185,7 @@ def run_cleanup_signal_race() -> None:
             for _ in range(20):
                 process.send_signal(signal.SIGTERM)
                 time.sleep(0.01)
-            rc = process.wait(timeout=10)
+            rc = process.wait(timeout=30)
 
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert rc == 1, (rc, log.read_text(errors="replace"))
