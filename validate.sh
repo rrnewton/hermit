@@ -929,6 +929,11 @@ VALIDATION_CONCURRENT_OWNER_JSON=null
 VALIDATION_CONCURRENT_SAME_SERVICE_JSON=null
 VALIDATION_CONCURRENT_PEERS_JSON=null
 VALIDATION_LOCK_OWNER_PROVEN=0
+VALIDATION_CANONICAL_LOCK_OWNER_PID=""
+VALIDATION_CANONICAL_LOCK_OWNER_START_TICKS=""
+VALIDATION_CANONICAL_LOCK_START_IDENTITY_JSON=null
+VALIDATION_CANONICAL_LOCK_FINAL_PROVEN=0
+VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=""
 VALIDATION_CONCURRENCY_FINAL_OK=1
 VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=""
 VALIDATION_RECEIPT_AUTHORITY_ELIGIBLE=1
@@ -1527,24 +1532,175 @@ function validation_process_identity {
     printf '%s %s\n' "${fields[0]}" "${fields[19]}"
 }
 
+function validation_identity_in_ancestry {
+    local wanted_pid=$1 wanted_start_ticks=$2 current=$$
+    local state observed_start_ticks
+    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
+        if [[ $current == "$wanted_pid" ]]; then
+            read -r state observed_start_ticks < <(
+                validation_process_identity "$current"
+            ) || return 1
+            [[ $observed_start_ticks == "$wanted_start_ticks" ]] || return 1
+            return 0
+        fi
+        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
+    done
+    return 1
+}
+
+function validation_lock_authority_snapshot {
+    local phase=$1 ci_hub status_json reason boot_id
+    local owner_pid owner_start_ticks owner_state observed_start_ticks identity_json
+
+    VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=""
+    ci_hub="$DEV_HERMIT_PARENT/ci-hub/ci-hub"
+    if ! command -v jq >/dev/null 2>&1; then
+        VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-authority-query-unavailable
+        return 1
+    fi
+    # A stop-test-only value exercises the consumer against an isolated,
+    # non-authorizing authority snapshot. Stop-test mode exits before product
+    # gates and has zero per-node coverage, so this value can never mint a
+    # qualifying receipt. Production always executes the fixed parent query.
+    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
+        && -n ${VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON:-} ]]; then
+        status_json=$VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON
+    else
+        if [[ -z $DEV_HERMIT_PARENT || ! -x $ci_hub ]]; then
+            VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-authority-query-unavailable
+            return 1
+        fi
+        if ! status_json=$("$ci_hub" validate-lock authority-status --json 2>>"$LOG_FILE"); then
+            VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-authority-query-error
+            return 1
+        fi
+    fi
+    reason=$(jq -r '.reason_code // empty' <<<"$status_json" 2>/dev/null) || reason=""
+    if ! jq -e --arg target "$VALIDATION_COMMIT" --arg host "$VALIDATION_HOST" '
+        .schema_version == 1
+        and .admissible == true
+        and .state == "held"
+        and .reason_code == null
+        and .canonical_anchor_held == true
+        and (.cleanup_state == "none" or .cleanup_state == "active-bound")
+        and (.holder | type) == "object"
+        and .holder.kind == "validate"
+        and .holder.target == $target
+        and .holder.host == $host
+        and (.owner | type) == "object"
+        and .owner.host == $host
+        and .owner.liveness == "alive"
+        and (.owner.pid | type) == "number"
+        and .owner.pid > 1
+        and (.owner.start_ticks | type) == "number"
+        and .owner.start_ticks > 0
+        and (.owner.boot_id | type) == "string"
+        and (.owner.boot_id | length) > 0
+    ' <<<"$status_json" >/dev/null 2>&1; then
+        if [[ -n $reason ]]; then
+            VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL="canonical-lock-authority-refused:$reason"
+        else
+            VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-authority-malformed-or-mismatched
+        fi
+        return 1
+    fi
+
+    boot_id=$(tr -d '\n' </proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=""
+    owner_pid=$(jq -r '.owner.pid' <<<"$status_json")
+    owner_start_ticks=$(jq -r '.owner.start_ticks' <<<"$status_json")
+    if [[ -z $boot_id ]] \
+        || [[ $(jq -r '.owner.boot_id' <<<"$status_json") != "$boot_id" ]] \
+        || ! read -r owner_state observed_start_ticks < <(
+            validation_process_identity "$owner_pid"
+        ) \
+        || [[ $owner_state == Z || $owner_state == T || $owner_state == t ]] \
+        || [[ $observed_start_ticks != "$owner_start_ticks" ]] \
+        || ! validation_identity_in_ancestry "$owner_pid" "$owner_start_ticks"; then
+        VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-owner-identity-mismatch
+        return 1
+    fi
+
+    identity_json=$(jq -c '{
+        holder: {
+            agent: .holder.agent,
+            kind: .holder.kind,
+            target: .holder.target,
+            host: .holder.host,
+            acquired_at: .holder.acquired_at
+        },
+        owner: {
+            host: .owner.host,
+            boot_id: .owner.boot_id,
+            pid: .owner.pid,
+            start_ticks: .owner.start_ticks
+        }
+    }' <<<"$status_json") || {
+        VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-authority-malformed-identity
+        return 1
+    }
+
+    if [[ $phase == start ]]; then
+        VALIDATION_CANONICAL_LOCK_OWNER_PID=$owner_pid
+        VALIDATION_CANONICAL_LOCK_OWNER_START_TICKS=$owner_start_ticks
+        VALIDATION_CANONICAL_LOCK_START_IDENTITY_JSON=$identity_json
+        return 0
+    fi
+    if [[ $phase != final || $identity_json != "$VALIDATION_CANONICAL_LOCK_START_IDENTITY_JSON" ]]; then
+        VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=canonical-lock-owner-changed
+        return 1
+    fi
+    VALIDATION_CANONICAL_LOCK_FINAL_PROVEN=1
+    return 0
+}
+
+function write_validation_concurrency_indeterminate_marker {
+    local detail=$1
+    if command -v jq >/dev/null 2>&1; then
+        jq -cn --arg detail "$detail" '{
+            schema_version: 1,
+            scan_complete: false,
+            indeterminate: true,
+            indeterminate_detail: $detail,
+            scan_count: 0,
+            first_successful_scan_monotonic_ns: null,
+            last_successful_scan_monotonic_ns: null,
+            max_successful_scan_gap_ns: 0,
+            allowed_max_scan_gap_ns: 5000000000,
+            owner: null,
+            same_service_processes: [],
+            peers: []
+        }' >"$VALIDATION_CONCURRENT_MARKER"
+    else
+        printf '%s\n' \
+            '{"schema_version":1,"scan_complete":false,"indeterminate":true,"indeterminate_detail":"canonical-lock-authority-unavailable","scan_count":0,"first_successful_scan_monotonic_ns":null,"last_successful_scan_monotonic_ns":null,"max_successful_scan_gap_ns":0,"allowed_max_scan_gap_ns":5000000000,"owner":null,"same_service_processes":[],"peers":[]}' \
+            >"$VALIDATION_CONCURRENT_MARKER"
+    fi
+}
+
 function start_validation_concurrency_monitor {
     local root_pid=$$
-    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
     local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
     local monitor_state monitor_start initial_output
     local initial_scan_failed=0
-    if [[ ! $owner_pid =~ ^[1-9][0-9]*$ || ! -r $helper ]] \
-        || ! command -v python3 >/dev/null 2>&1; then
-        printf '%s\n' \
-            '{"schema_version":1,"scan_complete":false,"indeterminate":true,"peers":[]}' \
-            >"$VALIDATION_CONCURRENT_MARKER"
-        return 1
+    if [[ ! -r $helper ]] || ! command -v python3 >/dev/null 2>&1; then
+        VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=peer-snapshot-helper-unavailable
+        write_validation_concurrency_indeterminate_marker \
+            "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL"
+        initial_scan_failed=1
+    elif ! validation_lock_authority_snapshot start; then
+        write_validation_concurrency_indeterminate_marker \
+            "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL"
+        printf 'validate.sh: canonical validate-lock authority unavailable: %s\n' \
+            "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL" | tee -a "$LOG_FILE" >&2
+        initial_scan_failed=1
     fi
 
     # Complete one scan synchronously so even an early-exit receipt cannot race
     # ahead of the monitor and turn "not observed" into a false zero.
-    if ! initial_output=$(python3 "$helper" --owner-pid "$owner_pid" \
-        --state "$VALIDATION_CONCURRENT_MARKER" 2>&1); then
+    if ((initial_scan_failed == 0)) \
+        && ! initial_output=$(python3 "$helper" \
+            --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
+            --state "$VALIDATION_CONCURRENT_MARKER" 2>&1); then
         initial_scan_failed=1
         # The helper has already persisted sticky indeterminate state. Surface
         # its exact error while retaining it in the durable run log.
@@ -1552,8 +1708,11 @@ function start_validation_concurrency_monitor {
     fi
     (
         while kill -0 "$root_pid" 2>/dev/null; do
-            python3 "$helper" --owner-pid "$owner_pid" \
-                --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE" || true
+            if [[ $VALIDATION_CANONICAL_LOCK_OWNER_PID =~ ^[1-9][0-9]*$ ]]; then
+                python3 "$helper" \
+                    --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
+                    --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE" || true
+            fi
             sleep 1
         done
     ) &
@@ -1568,23 +1727,6 @@ function start_validation_concurrency_monitor {
     return "$initial_scan_failed"
 }
 
-# Prove that this shell is a descendant of the live process-bound validate-lock
-# owner. Merely setting an environment variable is not enough: the owner sidecar
-# must name the same PID, and that PID must occur in this process's ancestry.
-function validate_lock_exclusivity_proven {
-    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
-    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
-    local recorded_pid current=$$
-    [[ $owner_pid =~ ^[1-9][0-9]*$ && -r $owner_file ]] || return 1
-    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
-    [[ $recorded_pid == "$owner_pid" ]] || return 1
-    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
-        [[ $current == "$owner_pid" ]] && return 0
-        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
-    done
-    return 1
-}
-
 function refresh_validation_concurrency_evidence {
     local monitor_complete=false monitor_indeterminate=true peer_count=0
     VALIDATION_ADMISSION_JSON=null
@@ -1594,10 +1736,9 @@ function refresh_validation_concurrency_evidence {
     VALIDATION_CONCURRENT_OWNER_JSON=null
     VALIDATION_CONCURRENT_SAME_SERVICE_JSON=null
     VALIDATION_CONCURRENT_PEERS_JSON=null
-    VALIDATION_LOCK_OWNER_PROVEN=0
+    VALIDATION_LOCK_OWNER_PROVEN=$VALIDATION_CANONICAL_LOCK_FINAL_PROVEN
 
-    if validate_lock_exclusivity_proven; then
-        VALIDATION_LOCK_OWNER_PROVEN=1
+    if ((VALIDATION_LOCK_OWNER_PROVEN == 1)); then
         VALIDATION_ADMISSION_JSON='"ci-hub-validate-lock"'
     fi
     if [[ -r $VALIDATION_CONCURRENT_MARKER ]] && command -v jq >/dev/null 2>&1; then
@@ -1660,8 +1801,8 @@ function refresh_validation_concurrency_evidence {
 # can return and must never publish authority from that row.
 function finalize_validation_concurrency_monitor {
     local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
-    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
     local monitor_state monitor_start marker_detail
+    local authority_final_ok=0
 
     if [[ ! $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ \
         || ! $VALIDATION_CONCURRENCY_MONITOR_START_TICKS =~ ^[0-9]+$ ]]; then
@@ -1710,7 +1851,22 @@ function finalize_validation_concurrency_monitor {
 
     terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
     VALIDATION_CONCURRENCY_MONITOR_PID=""
-    if ! python3 "$helper" --owner-pid "$owner_pid" \
+    if validation_lock_authority_snapshot final; then
+        authority_final_ok=1
+    else
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL
+        printf '⚠️  final canonical validate-lock authority failed: %s; recording diagnostic NO-RESULT\n' \
+            "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL" >&2
+    fi
+    if [[ ! $VALIDATION_CANONICAL_LOCK_OWNER_PID =~ ^[1-9][0-9]*$ ]]; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        if [[ -z $VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL ]]; then
+            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=canonical-lock-owner-never-established
+        fi
+        return 1
+    fi
+    if ! python3 "$helper" --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID" \
         --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE"; then
         VALIDATION_CONCURRENCY_FINAL_OK=0
         VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-snapshot-failed
@@ -1741,6 +1897,9 @@ function finalize_validation_concurrency_monitor {
             VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
         fi
         printf '⚠️  final validation peer evidence is indeterminate; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if ((authority_final_ok != 1)); then
         return 1
     fi
     return 0

@@ -35,6 +35,55 @@ FORBIDDEN_EVIDENCE_OVERRIDES = (
 )
 
 
+def process_start_ticks(pid: int) -> int:
+    text = Path(f"/proc/{pid}/stat").read_text()
+    close = text.rfind(")")
+    assert close >= 0, text
+    fields = text[close + 1 :].split()
+    assert len(fields) >= 20, text
+    return int(fields[19])
+
+
+def isolated_authority_status() -> str:
+    """Return a stop-test-only admissible snapshot for this live ancestor.
+
+    validate.sh accepts this only in its intrinsically non-authorizing stop-test
+    path. Production always calls the canonical parent authority-status query.
+    """
+    owner_pid = os.getpid()
+    host = subprocess.check_output(["hostname", "-s"], text=True).strip()
+    target = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    now = int(time.time())
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "admissible": True,
+            "state": "held",
+            "reason_code": None,
+            "holder": {
+                "agent": "validate-stop-path-fixture",
+                "kind": "validate",
+                "target": target,
+                "host": host,
+                "acquired_at": now,
+                "expires_at": now + 300,
+            },
+            "owner": {
+                "host": host,
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "pid": owner_pid,
+                "start_ticks": process_start_ticks(owner_pid),
+                "liveness": "alive",
+            },
+            "canonical_anchor_held": True,
+            "cleanup_state": "active-bound",
+        },
+        separators=(",", ":"),
+    )
+
+
 def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
@@ -44,20 +93,25 @@ def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
         DEV_HERMIT_PARENT=str(DEV_HERMIT_PARENT),
         VALIDATE_RUN_ON_DIRTY_TREE="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+        VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON=isolated_authority_status(),
         TMPDIR=str(tmpdir),
     )
     return env
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
-    deadline = time.monotonic() + 10
+    # The first canonical parent query may cold-compile the rust-script binary.
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if log.exists() and text in log.read_text(errors="replace"):
             return
         if process.poll() is not None:
             raise AssertionError(f"validate exited before ready: rc={process.returncode}")
         time.sleep(0.05)
-    raise AssertionError(f"validate stop-test hook did not emit {text!r}")
+    observed = log.read_text(errors="replace") if log.exists() else "<no log>"
+    raise AssertionError(
+        f"validate stop-test hook did not emit {text!r}; observed:\n{observed}"
+    )
 
 
 def read_ledger(ledger: Path) -> list[dict]:
@@ -133,7 +187,13 @@ def run_signal(
                 start_new_session=True,
             )
             wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
-            process.send_signal(sig)
+            if sig == signal.SIGKILL:
+                # SIGKILL cannot run validate.sh's cleanup trap. Kill the exact
+                # private fixture process group so its monitor cannot outlive
+                # the leader and recreate the temporary state directory.
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
             rc = process.wait(timeout=10)
 
         rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
@@ -542,21 +602,19 @@ def run_monitor_refusal_fixture(mode: str, expected_detail: str) -> None:
         )
 
 
-def run_initial_scan_failure_fixture() -> None:
-    with tempfile.TemporaryDirectory(prefix="validate-monitor-initial-failure-") as tmp:
+def run_initial_authority_failure_fixture() -> None:
+    with tempfile.TemporaryDirectory(prefix="validate-authority-initial-failure-") as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
         monitor_pid_file = tmpdir / "monitor-pid"
-        dead_owner = subprocess.Popen(["/bin/true"])
-        dead_owner.wait(timeout=5)
-        wait_for_process_state(dead_owner.pid, {None})
         owner_file = tmpdir / "owner"
-        owner_file.write_text(f"pid={dead_owner.pid}\n")
+        owner_file.write_text(f"pid={os.getpid()}\n")
         env = stop_test_env(tmpdir, ledger)
+        env.pop("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
         env.update(
             VALIDATE_STOP_TEST_MONITOR_PID_FILE=str(monitor_pid_file),
-            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(dead_owner.pid),
+            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
             CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
             VALIDATE_TIMEOUT_KILL_GRACE_SECONDS="1",
         )
@@ -577,7 +635,7 @@ def run_initial_scan_failure_fixture() -> None:
                 initial_state = json.loads(marker.read_text())
                 assert initial_state["indeterminate"] is True, initial_state
                 assert initial_state["indeterminate_detail"].startswith(
-                    "snapshot-unresolved:validate-lock owner PID"
+                    "canonical-lock-authority-"
                 ), initial_state
                 time.sleep(1.25)
                 later_state = json.loads(marker.read_text())
@@ -598,21 +656,19 @@ def run_initial_scan_failure_fixture() -> None:
                         pass
 
         assert rc == 130, (rc, log.read_text(errors="replace"))
-        assert "validate-peer-snapshot: unresolved:" in log.read_text(errors="replace")
+        assert "canonical validate-lock authority unavailable" in log.read_text(
+            errors="replace"
+        )
         assert_indeterminate_diagnostic(
             ledger,
-            expected_detail="final-snapshot-failed:snapshot-unresolved:",
+            expected_detail="canonical-lock-authority-",
         )
 
 
-def run_schema5_receipt_fixture(*, tamper_owner_file: bool) -> dict:
+def run_schema5_receipt_fixture() -> dict:
     with tempfile.TemporaryDirectory(prefix="validate-schema5-") as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
-        owner_file = tmpdir / "owner"
-        owner_file.write_text(
-            f"pid={os.getpid() + (1 if tamper_owner_file else 0)}\n"
-        )
         override_marker = tmpdir / "caller-override-ran"
         caller_helper = tmpdir / "caller-helper.py"
         caller_helper.write_text(
@@ -624,8 +680,6 @@ def run_schema5_receipt_fixture(*, tamper_owner_file: bool) -> dict:
         env = stop_test_env(tmpdir, ledger)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
-            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
-            CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
             HERMIT_VALIDATE_FINALIZE_RECEIPT_HELPER=str(caller_helper),
             HERMIT_VALIDATE_PEER_SNAPSHOT_HELPER=str(caller_helper),
             HERMIT_VALIDATE_PROC_ROOT=str(fake_proc_root),
@@ -645,6 +699,77 @@ def run_schema5_receipt_fixture(*, tamper_owner_file: bool) -> dict:
         return rows[0]
 
 
+def run_forged_sidecar_refusal_fixture() -> tuple[int, int, int]:
+    with tempfile.TemporaryDirectory(prefix="validate-forged-lock-sidecar-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        log = tmpdir / "validate.log"
+        owner_file = tmpdir / "forged-owner"
+        owner_file.write_text(f"pid={os.getpid()}\n")
+        release_file = tmpdir / "success-release"
+        publisher_calls = tmpdir / "publisher-calls"
+        publisher = tmpdir / "inert-publisher"
+        publisher.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(publisher_calls)!r}).write_text('called\\n')\n"
+        )
+        publisher.chmod(0o755)
+        env = stop_test_env(tmpdir, ledger)
+        # This is the production consumer path: remove the stop-test authority
+        # fixture, then plant exactly the two old caller-controlled proofs.
+        env.pop("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
+        env.update(
+            CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
+            CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+            VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                release_file.write_text("release\n")
+                rc = process.wait(timeout=15)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+        assert rc == 0, (rc, log.read_text(errors="replace"))
+        row = assert_indeterminate_diagnostic(
+            ledger,
+            expected_detail="canonical-lock-authority-",
+            expected_raw_result="pass",
+        )
+        assert row["admission"] is None, row
+        assert row["concurrent_validates"] is None, row
+        assert row["concurrency_proof"] is None, row
+        assert not publisher_calls.exists(), publisher_calls.read_text(errors="replace")
+        rows_total = len(read_ledger(ledger))
+        qualifying = sum(
+            qualification_verdict(candidate)["accepted"]
+            for candidate in read_ledger(ledger)
+        )
+        publisher_count = 1 if publisher_calls.exists() else 0
+        assert (rows_total, qualifying, publisher_count) == (1, 0, 0)
+        return rows_total, qualifying, publisher_count
+
+
 def run_schema5_receipt_fixtures() -> None:
     production_source = VALIDATE.read_text()
     references = {
@@ -652,7 +777,7 @@ def run_schema5_receipt_fixtures() -> None:
     }
     assert references == {name: 0 for name in FORBIDDEN_EVIDENCE_OVERRIDES}, references
 
-    row = run_schema5_receipt_fixture(tamper_owner_file=False)
+    row = run_schema5_receipt_fixture()
     assert row["schema_version"] == 5, row
     assert row["producer"] == "hermit-validate-sh", row
     assert row["repo"] == "hermit", row
@@ -696,21 +821,13 @@ def run_schema5_receipt_fixtures() -> None:
     assert verdict["admission_status"] == "satisfied", verdict
     assert verdict["base_status"] == "satisfied", verdict
 
-    tampered = run_schema5_receipt_fixture(tamper_owner_file=True)
-    assert tampered["schema_version"] == 5, tampered
-    assert tampered["admission"] is None, tampered
-    assert tampered["concurrent_validates"] is None, tampered
-    assert tampered["concurrency_proof"] is None, tampered
-    verdict = admission_verdict(tampered)
-    assert verdict["_exit_code"] == 1, verdict
-    assert verdict["accepted"] is False, verdict
-    assert verdict["admission_status"] == "admission-missing", verdict
+    assert run_forged_sidecar_refusal_fixture() == (1, 0, 0)
 
 
 def main() -> None:
     run_peer_identity_fixtures()
     run_schema5_receipt_fixtures()
-    run_initial_scan_failure_fixture()
+    run_initial_authority_failure_fixture()
     run_monitor_refusal_fixture("killed", "monitor-died")
     run_monitor_refusal_fixture("stopped", "monitor-stopped")
     run_monitor_refusal_fixture("stale", "final-state-indeterminate")
@@ -725,9 +842,10 @@ def main() -> None:
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: identity-bound peer fixtures; schema-5 admission/base fixtures; "
+        "forged sidecar/PID refusal 1 diagnostic/0 qualifying/0 publisher calls; "
         "override negative 3 planted/0 production references/0 invoked; "
         "monitor refusal negatives 4/4 => exactly 1 diagnostic + 0 qualifying; "
-        "initial scan failure => sticky + monitor live + 1 diagnostic/0 qualifying; "
+        "initial authority failure => sticky + monitor live + 1 diagnostic/0 qualifying; "
         "success disruption => raw pass downgraded + publisher calls 0; "
         "TERM/INT/HUP => NO-RESULT; KILL => no record; prior failure remains "
         "fail; cleanup is signal-atomic"
