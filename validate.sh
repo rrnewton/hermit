@@ -1691,6 +1691,7 @@ function write_validation_concurrency_indeterminate_marker {
 function start_validation_concurrency_monitor {
     local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
     local monitor_state monitor_start monitor_ready=false marker_monitor_pid=""
+    local controller_state controller_start_ticks
     local monitor_indeterminate=true exclusion_held=false owner_pid=$$
     local attempt probe_output
     local -a monitor_args
@@ -1710,11 +1711,21 @@ function start_validation_concurrency_monitor {
         owner_pid=$VALIDATION_CANONICAL_LOCK_OWNER_PID
     fi
 
+    if ! read -r controller_state controller_start_ticks < <(
+        validation_process_identity "$$"
+    ) || [[ $controller_state == Z || $controller_state == T \
+        || $controller_state == t || ! $controller_start_ticks =~ ^[0-9]+$ ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-controller-identity-unavailable
+        return 1
+    fi
+
     monitor_args=(
         --monitor
         --owner-pid "$owner_pid"
         --state "$VALIDATION_CONCURRENT_MARKER"
         --control-socket "$VALIDATION_CONCURRENCY_CONTROL_SOCKET"
+        --controller-pid "$$"
+        --controller-start-ticks "$controller_start_ticks"
     )
     # Both the proc-root and exclusion-lock seams are confined to the
     # intrinsically non-authorizing stop-test path. Production hard-binds /proc

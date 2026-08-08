@@ -923,6 +923,109 @@ def run_paused_monitor_recovery_fixture() -> None:
         assert publisher_calls.read_text() == "called\n", publisher_calls
 
 
+def run_same_uid_nonowner_final_refusal_fixture() -> None:
+    """A same-uid sibling cannot finalize another validation's monitor."""
+    with tempfile.TemporaryDirectory(prefix="validate-monitor-nonowner-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        log = tmpdir / "validate.log"
+        monitor_pid_file = tmpdir / "monitor-pid"
+        release_file = tmpdir / "success-release"
+        proc_root = tmpdir / "proc"
+        proc_root.mkdir()
+        write_fake_process(
+            proc_root,
+            os.getpid(),
+            ppid=0,
+            pgid=os.getpid(),
+            start_ticks=process_start_ticks(os.getpid()),
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        publisher_calls = tmpdir / "publisher-calls"
+        publisher = tmpdir / "inert-publisher"
+        publisher.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(publisher_calls)!r}).write_text('called\\n')\n"
+        )
+        publisher.chmod(0o755)
+        env = stop_test_env(tmpdir, ledger)
+        env.update(
+            VALIDATE_STOP_TEST_MONITOR_PID_FILE=str(monitor_pid_file),
+            VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(proc_root),
+            VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                monitor_pid = wait_for_monitor_pid(monitor_pid_file, process)
+                marker = find_monitor_state(tmpdir, process)
+                before = json.loads(marker.read_text())
+                assert before["monitor_pid"] == monitor_pid, before
+                assert before["final_ack_sequence"] is None, before
+
+                # This helper is a sibling of validate.sh, not its descendant.
+                # It has the same uid and can reach the socket, but SO_PEERCRED
+                # ancestry must refuse it without consuming the final sequence.
+                attempt = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "ci" / "validate_peer_snapshot.py"),
+                        "--finalize",
+                        "--control-socket",
+                        str(marker.parent / "peer-monitor.sock"),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                assert attempt.returncode == 2, (
+                    attempt.stdout.decode(errors="replace"),
+                    attempt.stderr.decode(errors="replace"),
+                )
+                assert "response refused" in attempt.stderr.decode(errors="replace")
+                after_attempt = json.loads(marker.read_text())
+                assert after_attempt["final_ack_sequence"] is None, after_attempt
+                assert after_attempt["monitor_pid"] == monitor_pid, after_attempt
+                assert process_state(monitor_pid) not in {None, "Z", "T", "t"}
+
+                release_file.write_text("release\n")
+                rc = process.wait(timeout=30)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+        assert rc == 0, (rc, log.read_text(errors="replace"))
+        rows = read_ledger(ledger)
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["raw_result"] == "pass", row
+        assert row["concurrency_indeterminate"] is False, row
+        monitor = row["concurrent_validate_monitor"]
+        assert monitor["monitor_sequence"] == monitor["final_ack_sequence"], monitor
+        assert monitor["monitor_pid"] == monitor_pid, monitor
+        assert sum(qualification_verdict(candidate)["accepted"] for candidate in rows) == 0
+        assert publisher_calls.read_text() == "called\n", publisher_calls
+
+
 def run_descheduled_exclusion_fixture() -> None:
     """A stopped lock holder excludes a second receipt-producing monitor."""
     with tempfile.TemporaryDirectory(prefix="validate-monitor-exclusion-") as tmp:
@@ -961,6 +1064,10 @@ def run_descheduled_exclusion_fixture() -> None:
                 str(holder_state),
                 "--control-socket",
                 str(holder_socket),
+                "--controller-pid",
+                str(os.getpid()),
+                "--controller-start-ticks",
+                str(process_start_ticks(os.getpid())),
                 "--fixture-mode",
                 "--fixture-exclusion-lock",
                 str(shared_lock),
@@ -1396,6 +1503,7 @@ def main() -> None:
     run_monitor_refusal_fixture("stopped", "monitor-stopped")
     run_monitor_refusal_fixture("missing-ack", "monitor-final-ack-missing")
     run_paused_monitor_recovery_fixture()
+    run_same_uid_nonowner_final_refusal_fixture()
     run_descheduled_exclusion_fixture()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
@@ -1414,6 +1522,7 @@ def main() -> None:
         "override negative 3 planted/0 production references/0 invoked; "
         "monitor refusal negatives 3/3 => exactly 1 diagnostic + 0 qualifying; "
         "recovered >5s pause => sequence/final-ack accepted; "
+        "same-uid non-owner final => refused/no final sequence consumed; "
         "descheduled exclusion => second monitor 1 diagnostic/0 qualifying/0 publisher; "
         "initial authority failure => sticky + monitor live + 1 diagnostic/0 qualifying; "
         "success disruption => raw pass downgraded + publisher calls 0; "

@@ -482,6 +482,30 @@ def _production_exclusion_lock() -> Path:
     return runtime / "hermit-validate-peer-snapshot.lock"
 
 
+def _peer_descends_from_controller(
+    peer_pid: int, controller_pid: int, controller_start_ticks: int
+) -> bool:
+    """Bind a socket peer to the exact validation-shell controller identity."""
+    current = peer_pid
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        try:
+            state, parent, _pgid, _flags, start_ticks = _parse_stat(
+                (Path("/proc") / str(current) / "stat").read_text()
+            )
+        except (OSError, ValueError):
+            return False
+        if state in {"Z", "X", "x"}:
+            return False
+        if current == controller_pid:
+            return start_ticks == controller_start_ticks
+        if parent in {0, current}:
+            return False
+        current = parent
+    return False
+
+
 def _scan_once(
     state_path: Path,
     proc_root: Path,
@@ -525,6 +549,8 @@ def run_monitor(
     control_socket: Path,
     proc_root: Path,
     owner_pid: int,
+    controller_pid: int,
+    controller_start_ticks: int,
     exclusion_lock: Path,
 ) -> int:
     """Hold exclusion and serve one sequence-bound final snapshot request."""
@@ -586,6 +612,30 @@ def run_monitor(
                 connection = None
             if connection is not None:
                 with connection:
+                    peer_pid, peer_uid, _peer_gid = struct.unpack(
+                        "3i",
+                        connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+                    )
+                    if peer_uid != os.getuid() or not _peer_descends_from_controller(
+                        peer_pid, controller_pid, controller_start_ticks
+                    ):
+                        connection.sendall(
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": "unauthorized-controller",
+                                    "monitor_pid": os.getpid(),
+                                },
+                                separators=(",", ":"),
+                            ).encode()
+                            + b"\n"
+                        )
+                        print(
+                            "validate-peer-snapshot: refused control request from "
+                            f"non-controller peer PID {peer_pid}",
+                            file=sys.stderr,
+                        )
+                        continue
                     request = connection.recv(64)
                     if request == b"probe\n" and not finalized:
                         response = {
@@ -703,6 +753,8 @@ def main() -> int:
     parser.add_argument("--finalize", action="store_true")
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--control-socket", type=Path)
+    parser.add_argument("--controller-pid", type=int)
+    parser.add_argument("--controller-start-ticks", type=int)
     parser.add_argument("--fixture-mode", action="store_true")
     parser.add_argument("--fixture-exclusion-lock", type=Path)
     parser.add_argument(
@@ -731,8 +783,16 @@ def main() -> int:
     if args.fixture_exclusion_lock is not None and not args.fixture_mode:
         parser.error("--fixture-exclusion-lock requires --fixture-mode")
     if args.monitor:
-        if args.control_socket is None:
-            parser.error("--monitor requires --control-socket")
+        if (
+            args.control_socket is None
+            or args.controller_pid is None
+            or args.controller_pid <= 1
+            or args.controller_start_ticks is None
+            or args.controller_start_ticks <= 0
+        ):
+            parser.error(
+                "--monitor requires --control-socket and a live controller identity"
+            )
         exclusion_lock = (
             args.fixture_exclusion_lock
             if args.fixture_mode and args.fixture_exclusion_lock is not None
@@ -744,6 +804,8 @@ def main() -> int:
                 args.control_socket,
                 args.proc_root,
                 args.owner_pid,
+                args.controller_pid,
+                args.controller_start_ticks,
                 exclusion_lock,
             )
         except (OSError, SnapshotUnresolved) as error:
