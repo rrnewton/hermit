@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
-# Block Hermit commits whose Reverie dependency pin is not latest Reverie main.
-# See the canonical checker launcher and docs/updating-reverie.md.
+# Guard Hermit commits against Reverie pin defects.
+#
+# TWO PROPERTIES, DELIBERATELY NOT COLLAPSED:
+#
+#   CONSISTENCY — the revision entries agree with each other, and every LiteInst
+#   cache key prefixes the pin. This is a statement about THE TREE BEING
+#   COMMITTED. Always fatal, for every commit.
+#
+#   FRESHNESS — the pin equals whatever `rrnewton/reverie:main` points at right
+#   now. This is a statement about a remote ref that moves under you, and about
+#   whether this host has egress at all. Fatal only when the staged change
+#   actually touches a pin site; otherwise advisory, and checked without any
+#   network call.
+#
+# WHY THE SPLIT EXISTS. Gating every commit on freshness meant that whenever the
+# pin trailed main — which it does routinely, since main moves during the bump —
+# NO commit could be made anywhere in the repository. The printed remedy rewrites
+# 46 revision entries across 10 tracked Cargo files, which for an unrelated
+# two-file change is not a fix but an incoherent, build-changing edit that races
+# main again. So the only remaining move was `--no-verify`, which discards
+# consistency and the nested-lockfile guard along with freshness. The control
+# stopped applying while everyone behaved reasonably. Scope the coupling, not the
+# checks.
+#
+# Bypassing this hook should be rare enough to be remarkable. If you are reaching
+# for `--no-verify`, the gate is probably mis-scoped again — fix the scope.
 
 set -u
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
@@ -18,13 +42,27 @@ if command -v with-proxy >/dev/null 2>&1; then
   proxy=(with-proxy)
 fi
 
-"${proxy[@]}" "$checker" --repo "$root" || exit 1
+# EVERY CHECK RUNS, AND FAILURES AGGREGATE.
+#
+# These used to be chained with `|| exit 1`, so the pin check masked the
+# nested-lockfile guard: while the pin was stale that guard did not merely get
+# bypassed, it was unreachable even for an honest committer. A developer also
+# had to rediscover one failure per attempt. Collect both, report both.
+failed=()
 
-# Also guard the nested-workspace lockfile against pin drift once its checker is
-# present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.
+"${proxy[@]}" "$checker" --repo "$root" --freshness auto || failed+=("reverie pin")
+
+# Guard the nested-workspace lockfile against pin drift when its checker is
+# present (rrnewton/hermit#1609).
 nested="$root/scripts/check-nested-lockfiles.rs"
 if [[ -x "$nested" ]]; then
-  "${proxy[@]}" "$nested" || exit 1
+  "${proxy[@]}" "$nested" || failed+=("nested lockfiles")
+fi
+
+if ((${#failed[@]} > 0)); then
+  printf 'pre-commit BLOCKED by %d check(s): %s\n' \
+    "${#failed[@]}" "$(IFS=', '; echo "${failed[*]}")" >&2
+  exit 1
 fi
 
 exit 0

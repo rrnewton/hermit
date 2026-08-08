@@ -44,6 +44,32 @@ use std::process::Command;
 
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
 const MAIN_REF: &str = "refs/heads/main";
+/// How to treat FRESHNESS — "is the pin equal to the ref `rrnewton/reverie:main`
+/// currently points at" — as distinct from CONSISTENCY.
+///
+/// The distinction is the whole point, so it is a type rather than a bool:
+/// consistency (the 46 revision entries agreeing with each other, and the
+/// LiteInst cache keys prefixing the pin) is a statement about THE TREE BEING
+/// COMMITTED and is never negotiable. Freshness is a statement about a remote
+/// ref that moves under you, and about whether this host has egress at all.
+/// Gating an unrelated commit on the second one is how a stale pin came to block
+/// every commit in the repository and taught the fleet to pass `--no-verify` —
+/// which discards consistency too, along with the nested-lockfile guard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Freshness {
+    /// Stale or unverifiable freshness is fatal. The default, so CI, `make lint`
+    /// and every existing caller keep exactly today's behaviour.
+    #[default]
+    Block,
+    /// Report freshness advisorily and never fail on it. Does NOT contact the
+    /// network: a commit that touches no pin site must not be blockable by a
+    /// hanging or unreachable remote.
+    Warn,
+    /// Decide from the staged change: `Block` if it touches a pin site,
+    /// `Warn` if it does not. Resolves to one of the two above before use.
+    Auto,
+}
+
 #[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
@@ -51,6 +77,7 @@ struct Config {
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    freshness: Freshness,
 }
 
 #[derive(Debug)]
@@ -72,10 +99,103 @@ fn usage() -> &'static str {
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --freshness block|warn|auto         Is a stale/unverifiable pin fatal? (default: block)\n\
+                                           warn: advisory, and no network call\n\
+                                           auto: block only if the STAGED change touches a pin site\n\
        -h, --help                          Show this help\n\
      \n\
      Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
      Excludes non-Cargo files, untracked/generated files, and nested submodule contents."
+}
+
+/// Resolve [`Freshness::Auto`] against the staged change.
+///
+/// THE TRIGGER IS "DOES THIS CHANGE CARRY A PIN VALUE", and nothing wider.
+/// I first also treated the pin MACHINERY — this checker, its launcher, the hook
+/// — as a trigger, on a defence-in-depth argument, and it was wrong twice over.
+/// It buys no protection: the hook compiles and runs the checker from the
+/// WORKING TREE, so an edit that weakened the check would be judged by the
+/// weakened check either way; freshness blocking cannot detect that. And it
+/// recreates the exact deadlock this scoping exists to remove, aimed precisely
+/// at whoever is repairing the pin machinery — including the commit that
+/// introduced this function, which could then only have landed with the
+/// `--no-verify` it exists to make unnecessary. A gate its own maintainer must
+/// bypass is the failure mode, not a stricter version of the fix.
+///
+/// A genuine pin BUMP is unaffected and still strict: it stages ten Cargo files,
+/// so it is in scope by content, and if main moved again mid-bump the value being
+/// committed really is already wrong.
+///
+/// THE SCOPE IS DERIVED, NEVER HARDCODED. It is the intersection of the staged
+/// paths with the checker's OWN scanned file set — the same `scan.tracked_files`
+/// the verdict is computed from. A glob written into
+/// the hook would be a second, independently-drifting copy of the scope, and the
+/// first manifest that stopped matching it would be silently exempted from a
+/// check it still needs. Deriving it means the two cannot disagree.
+///
+/// A newly ADDED manifest is covered without special-casing: `tracked_files`
+/// comes from `git ls-files`, which reads the index, so a staged addition is
+/// already in the scanned set.
+///
+/// FAILS CONSERVATIVE. Any uncertainty — no HEAD yet, git unavailable, a path we
+/// cannot interpret — resolves to [`Freshness::Block`], i.e. exactly today's
+/// behaviour. The relaxation must be something we affirmatively established, not
+/// a default we fell into when the question could not be answered.
+fn resolve_freshness(root: &Path, scan: &PinScan, requested: Freshness) -> (Freshness, String) {
+    if requested != Freshness::Auto {
+        return (requested, String::new());
+    }
+    let output = match git_in(root, &["diff", "--cached", "--name-only", "-z"]) {
+        Ok(output) if output.status.success() => output,
+        // No HEAD, a broken index, git missing: we cannot prove the change is
+        // unrelated, so we do not get to relax anything.
+        _ => {
+            return (
+                Freshness::Block,
+                "the staged path set could not be determined".to_string(),
+            );
+        }
+    };
+    let staged: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if staged.is_empty() {
+        // An empty staged set is not evidence of an unrelated change; it usually
+        // means this is not a normal commit at all.
+        return (
+            Freshness::Block,
+            "nothing is staged".to_string(),
+        );
+    }
+    let scanned: BTreeSet<&Path> = scan.tracked_files.iter().map(PathBuf::as_path).collect();
+    let touched: Vec<String> = staged
+        .iter()
+        .filter(|path| {
+            scanned.contains(root.join(path).as_path())
+        })
+        .map(|path| path.display().to_string())
+        .collect();
+    if touched.is_empty() {
+        (
+            Freshness::Warn,
+            format!(
+                "{} staged path(s), 0 of them pin sites",
+                staged.len()
+            ),
+        )
+    } else {
+        (
+            Freshness::Block,
+            format!(
+                "{} of {} staged path(s) are pin sites: {}",
+                touched.len(),
+                staged.len(),
+                touched.join(", ")
+            ),
+        )
+    }
 }
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -94,6 +214,18 @@ fn parse_args() -> Result<Config, String> {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
             "--update-to-latest" => config.update_to_latest = true,
+            "--freshness" => {
+                config.freshness = match take_value(&args, &mut i, "--freshness")?.as_str() {
+                    "block" => Freshness::Block,
+                    "warn" => Freshness::Warn,
+                    "auto" => Freshness::Auto,
+                    other => {
+                        return Err(format!(
+                            "--freshness expects block|warn|auto, got {other:?}"
+                        ));
+                    }
+                }
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -583,6 +715,41 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(1);
     }
 
+    // LOCAL CONSISTENCY RUNS BEFORE THE NETWORK, and the order is the fix.
+    //
+    // This call used to sit AFTER `query_main`, so a failed `ls-remote` — a fact
+    // about egress, not about this tree — masked the LiteInst cache-key check,
+    // which is a real correctness defect in the tree being committed. The thing
+    // that cannot be wrong about your commit must not hide the thing that can.
+    // Consistency is checked at every freshness setting: it is never advisory.
+    let pin = unique_pin(&scan)?;
+    let cache_code = check_liteinst_cache_keys(&root, pin)?;
+    if cache_code != 0 {
+        return Ok(cache_code);
+    }
+
+    let (freshness, why) = resolve_freshness(&root, &scan, config.freshness);
+    // `--update-to-latest` exists precisely to change the pin, so it always needs
+    // the remote regardless of what is staged.
+    if freshness == Freshness::Warn && !config.update_to_latest {
+        // Deliberately NO network call. A commit that touches no pin site must
+        // not be blockable — or hangable — by an unreachable remote, which is
+        // how this gate would wedge every commit on a host without egress.
+        println!(
+            "Reverie pin freshness: NOT CHECKED ({why}). Local consistency PASSED: \
+             pin {pin} is uniform across {} revision entries in {} tracked Cargo file(s), \
+             and every LiteInst cache key matches it.",
+            pins.len(),
+            pinned_file_count.len()
+        );
+        println!(
+            "  Freshness against rrnewton/reverie:main is enforced by CI, and by this hook \
+             on any commit that touches a pin site. To check it now: \
+             with-proxy ./ci/run-reverie-pin-check.sh"
+        );
+        return Ok(0);
+    }
+
     // Production has no CLI/env/recorded-value override for the authority.
     // Tests substitute only the remote transport, then exercise this same
     // refs/heads/main dereference rather than injecting a well-shaped SHA.
@@ -596,10 +763,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         Ok(main) => main,
         Err(error) => {
             loud_header("COULD NOT VERIFY LATEST REVERIE MAIN - BLOCKED");
-            if let Ok(pin) = unique_pin(&scan) {
-                eprintln!("Hermit pin: {pin}");
-            }
+            eprintln!("Hermit pin: {pin}");
             eprintln!("Lookup error: {error}");
+            if !why.is_empty() {
+                eprintln!("Freshness is fatal here because {why}.");
+            }
             blocked_instructions();
             return Ok(1);
         }
@@ -614,12 +782,6 @@ fn run_with_config(config: Config) -> Result<i32, String> {
             return Ok(cache_code);
         }
         return Ok(0);
-    }
-
-    let pin = unique_pin(&scan)?;
-    let cache_code = check_liteinst_cache_keys(&root, pin)?;
-    if cache_code != 0 {
-        return Ok(cache_code);
     }
 
     let entries = pins.len();
@@ -637,6 +799,9 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         eprintln!(
             "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
         );
+        if !why.is_empty() {
+            eprintln!("Freshness is fatal here because {why}.");
+        }
         blocked_instructions();
         Ok(1)
     }
@@ -1024,6 +1189,137 @@ mod tests {
             "a cache key that is not a prefix of the pin must fail closed"
         );
 
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    // ---------------- freshness scoping (the --no-verify decoupling) -----------
+
+    /// A committed fixture repo whose manifest pins `pin`, plus one extra
+    /// tracked file to stage. The remote is deliberately a path that does not
+    /// exist, so ANY attempt to dereference it fails — which is what makes
+    /// "warn does not touch the network" an observation rather than a promise.
+    fn staged_fixture(label: &str, pin: &str) -> PathBuf {
+        let root = temp_path(label);
+        init_fixture_repo(&root);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{pin}\" }}\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        fs::write(root.join("README.md"), "seed\n").expect("write fixture doc");
+        assert!(git_in(&root, &["add", "Cargo.toml", "README.md"]).unwrap().status.success());
+        assert!(git_in(&root, &["commit", "-qm", "seed"]).unwrap().status.success());
+        root
+    }
+
+    const UNREACHABLE_REMOTE: &str = "/nonexistent/definitely-not-a-git-remote";
+    const PIN_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    const PIN_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn warn_freshness_passes_a_stale_pin_and_never_calls_the_network() {
+        let root = staged_fixture("warn-stale", PIN_A);
+        // Not merely "stale": the remote CANNOT be reached at all. Under
+        // `Block` this is the COULD NOT VERIFY path and must fail (asserted
+        // below), so a pass here can only mean no lookup was attempted.
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(UNREACHABLE_REMOTE.to_string()),
+            freshness: Freshness::Warn,
+            ..Config::default()
+        })
+        .expect("warn should classify");
+        assert_eq!(code, 0, "warn must not fail on freshness it did not check");
+
+        let blocked = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(UNREACHABLE_REMOTE.to_string()),
+            freshness: Freshness::Block,
+            ..Config::default()
+        })
+        .expect("block should classify");
+        assert_eq!(
+            blocked, 1,
+            "the same fixture MUST fail under block, or the test above proves nothing"
+        );
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn warn_freshness_still_blocks_inconsistent_revisions() {
+        // Consistency is about the tree being committed and is never advisory.
+        let root = staged_fixture("warn-inconsistent", PIN_A);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\na = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{PIN_A}\" }}\nb = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{PIN_B}\" }}\n"
+            ),
+        )
+        .expect("write inconsistent manifest");
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(UNREACHABLE_REMOTE.to_string()),
+            freshness: Freshness::Warn,
+            ..Config::default()
+        })
+        .expect("warn should classify");
+        assert_eq!(code, 1, "disagreeing revision entries must block at every freshness setting");
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn auto_warns_only_when_no_staged_path_is_a_pin_site() {
+        let root = staged_fixture("auto-unrelated", PIN_A);
+        fs::write(root.join("README.md"), "unrelated edit\n").expect("edit doc");
+        assert!(git_in(&root, &["add", "README.md"]).unwrap().status.success());
+        let scan = read_pins(&root).expect("scan fixture");
+        let (resolved, why) = resolve_freshness(&root, &scan, Freshness::Auto);
+        assert_eq!(resolved, Freshness::Warn, "a doc-only change is not a pin change: {why}");
+        assert!(why.contains("0 of them pin sites"), "the reason must carry counts: {why}");
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn auto_blocks_when_a_staged_path_is_a_pin_site() {
+        let root = staged_fixture("auto-manifest", PIN_A);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{PIN_A}\" }}\n# touched\n"
+            ),
+        )
+        .expect("edit manifest");
+        assert!(git_in(&root, &["add", "Cargo.toml"]).unwrap().status.success());
+        let scan = read_pins(&root).expect("scan fixture");
+        let (resolved, why) = resolve_freshness(&root, &scan, Freshness::Auto);
+        assert_eq!(resolved, Freshness::Block, "a staged manifest must keep the strict reading");
+        assert!(why.contains("Cargo.toml"), "the refusal must name the pin site: {why}");
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn auto_fails_conservative_when_the_scope_is_unknowable() {
+        // Nothing staged is not evidence that the change is unrelated, so the
+        // relaxation must not be reachable by simply failing to answer.
+        let root = staged_fixture("auto-empty", PIN_A);
+        let scan = read_pins(&root).expect("scan fixture");
+        let (resolved, why) = resolve_freshness(&root, &scan, Freshness::Auto);
+        assert_eq!(resolved, Freshness::Block, "an empty staged set must not relax anything");
+        assert!(why.contains("nothing is staged"), "{why}");
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn explicit_settings_are_not_reinterpreted_by_scope() {
+        // `--freshness block` and `--freshness warn` mean what they say; only
+        // `auto` consults the index. CI passes neither and gets `block`.
+        let root = staged_fixture("explicit", PIN_A);
+        let scan = read_pins(&root).expect("scan fixture");
+        assert_eq!(resolve_freshness(&root, &scan, Freshness::Block).0, Freshness::Block);
+        assert_eq!(resolve_freshness(&root, &scan, Freshness::Warn).0, Freshness::Warn);
+        assert_eq!(Config::default().freshness, Freshness::Block, "the default must stay strict");
         fs::remove_dir_all(root).expect("remove fixture repository");
     }
 }
