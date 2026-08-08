@@ -10,13 +10,14 @@
  * AUTONOMOUS-BOT-IMPLEMENTED
  * TODO-HUMAN-REVIEW(PR-973): Review positioned/copy procfs bypass coverage.
  *
- * Exercises the offset-based procfs read paths that used to bypass the
- * deterministic ProcfsFile snapshot:
+ * Exercises procfs snapshot lifecycle and offset-based read mediation:
  *
- *   1. pread64(/proc/self/stat) must return the *sanitized* snapshot, so the
+ *   1. One open /proc/self/maps fd must refresh after mmap, mprotect and
+ *      munmap when rewound, preserving Linux's live address-space view.
+ *   2. pread64(/proc/self/stat) must return the *sanitized* snapshot, so the
  *      volatile "starttime" field (proc stat field 22) reads back as 0 rather
  *      than a live, run-varying kernel value.
- *   2. sendfile() with a procfs input must be refused with ENOSYS so callers
+ *   3. sendfile() with a procfs input must be refused with ENOSYS so callers
  *      fall back to the mediated read()/write() path.
  *
  * The probe prints only fixed strings, so a --strict --verify run is bitwise
@@ -27,11 +28,135 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/mman.h>
 #include <unistd.h>
+
+#define MAPS_CAPACITY (1024 * 1024)
+
+static char maps_text[MAPS_CAPACITY];
+
+static int reread_maps(int fd) {
+  if (lseek(fd, 0, SEEK_SET) != 0) {
+    perror("lseek /proc/self/maps");
+    return -1;
+  }
+
+  size_t used = 0;
+  while (used + 1 < sizeof(maps_text)) {
+    ssize_t n = read(fd, maps_text + used, sizeof(maps_text) - used - 1);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n < 0) {
+      perror("read /proc/self/maps");
+      return -1;
+    }
+    if (n == 0) {
+      maps_text[used] = '\0';
+      return (int)used;
+    }
+    used += (size_t)n;
+  }
+
+  fprintf(stderr, "/proc/self/maps exceeded probe capacity\n");
+  return -1;
+}
+
+static int mapping_permissions(uintptr_t address, char permissions[5]) {
+  const char *line = maps_text;
+  while (*line != '\0') {
+    unsigned long start = 0;
+    unsigned long end = 0;
+    char current[5] = {0};
+    if (sscanf(line, "%lx-%lx %4s", &start, &end, current) == 3 &&
+        address >= (uintptr_t)start && address < (uintptr_t)end) {
+      memcpy(permissions, current, sizeof(current));
+      return 1;
+    }
+    const char *newline = strchr(line, '\n');
+    if (newline == NULL) {
+      break;
+    }
+    line = newline + 1;
+  }
+  return 0;
+}
+
+static int check_maps_lifecycle(void) {
+  int fd = open("/proc/self/maps", O_RDONLY);
+  if (fd < 0) {
+    perror("open /proc/self/maps");
+    return 1;
+  }
+  if (reread_maps(fd) <= 0) {
+    close(fd);
+    return 1;
+  }
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    perror("sysconf(_SC_PAGESIZE)");
+    close(fd);
+    return 1;
+  }
+  void *mapping = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    perror("mmap");
+    close(fd);
+    return 1;
+  }
+
+  char permissions[5] = {0};
+  if (reread_maps(fd) <= 0 ||
+      !mapping_permissions((uintptr_t)mapping, permissions) ||
+      strcmp(permissions, "rw-p") != 0) {
+    fprintf(stderr, "maps did not refresh after mmap (perms=%s)\n", permissions);
+    munmap(mapping, (size_t)page_size);
+    close(fd);
+    return 1;
+  }
+  puts("procfs-maps-live-mmap-ok");
+
+  if (mprotect(mapping, (size_t)page_size, PROT_READ) != 0) {
+    perror("mprotect");
+    munmap(mapping, (size_t)page_size);
+    close(fd);
+    return 1;
+  }
+  memset(permissions, 0, sizeof(permissions));
+  if (reread_maps(fd) <= 0 ||
+      !mapping_permissions((uintptr_t)mapping, permissions) ||
+      strcmp(permissions, "r--p") != 0) {
+    fprintf(stderr, "maps did not refresh after mprotect (perms=%s)\n",
+            permissions);
+    munmap(mapping, (size_t)page_size);
+    close(fd);
+    return 1;
+  }
+  puts("procfs-maps-live-mprotect-ok");
+
+  if (munmap(mapping, (size_t)page_size) != 0) {
+    perror("munmap");
+    close(fd);
+    return 1;
+  }
+  memset(permissions, 0, sizeof(permissions));
+  if (reread_maps(fd) <= 0 ||
+      mapping_permissions((uintptr_t)mapping, permissions)) {
+    fprintf(stderr, "maps retained an unmapped address\n");
+    close(fd);
+    return 1;
+  }
+  puts("procfs-maps-live-munmap-ok");
+  close(fd);
+  return 0;
+}
 
 /* Returns the 1-based proc stat field `index` (>= 3), or NULL on parse error.
  * The comm field (2) may contain spaces and parentheses, so scan past the
@@ -112,6 +237,9 @@ static int check_sendfile_refused(void) {
 }
 
 int main(void) {
+  if (check_maps_lifecycle() != 0) {
+    return 1;
+  }
   if (check_pread_sanitized() != 0) {
     return 1;
   }
