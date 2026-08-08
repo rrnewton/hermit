@@ -22,6 +22,7 @@ def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         HERMIT_VALIDATE_STOP_TEST_MODE="1",
+        HERMIT_VALIDATE_TEST_ALLOW_UNADMITTED="1",
         HERMIT_VALIDATE_LEDGER=str(ledger),
         DEV_HERMIT_PARENT=str(ROOT.parent),
         VALIDATE_RUN_ON_DIRTY_TREE="1",
@@ -40,6 +41,41 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
             raise AssertionError(f"validate exited before ready: rc={process.returncode}")
         time.sleep(0.05)
     raise AssertionError(f"validate stop-test hook did not emit {text!r}")
+
+
+def assert_fixture_provenance(row: dict[str, object]) -> None:
+    assert row["producer"] == "hermit-validate-sh", row
+    assert row["admission"] == "test-fixture-unadmitted", row
+    assert row["concurrent_validates"] is None, row
+    assert row["concurrency_proof"] is None, row
+
+
+def run_admission_refusals() -> None:
+    for owner_pid, owner_file in (
+        (None, None),
+        ("1", "/tmp/alternate.validate-lock.owner"),
+    ):
+        env = os.environ.copy()
+        env.pop("CI_HUB_VALIDATE_LOCK_OWNER_PID", None)
+        env.pop("CI_HUB_VALIDATE_LOCK_OWNER_FILE", None)
+        # Skip the checkout-local implementation lock so this test isolates the
+        # box-global admission predicate. The unadmitted fixture escape remains
+        # disabled, so no product gate or ledger write can occur.
+        env["HERMIT_VALIDATE_STOP_TEST_MODE"] = "1"
+        if owner_pid is not None:
+            env["CI_HUB_VALIDATE_LOCK_OWNER_PID"] = owner_pid
+            env["CI_HUB_VALIDATE_LOCK_OWNER_FILE"] = owner_file
+        process = subprocess.run(
+            [str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 3, (owner_file, process.returncode, output)
+        assert "no canonical ci-hub validation admission" in output, output
 
 
 def run_signal(
@@ -75,6 +111,7 @@ def run_signal(
         assert rc == 130, (sig.name, rc, log.read_text(errors="replace"))
         assert len(rows) == 1, (sig.name, rows)
         row = rows[0]
+        assert_fixture_provenance(row)
         assert row["result"] == ("fail" if prior_failure else "no_result"), row
         assert row["raw_result"] == "fail", row
         assert row["gates_run"] == row["checks"] == 2, row
@@ -102,6 +139,7 @@ def run_incomplete_exit() -> None:
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert len(rows) == 1, rows
         row = rows[0]
+        assert_fixture_provenance(row)
         # An ordinary early exit is not an operator stop. It remains a raw
         # failure unless the producer carries an explicit interruption signal.
         assert row["result"] == "fail", row
@@ -146,11 +184,13 @@ def run_cleanup_signal_race() -> None:
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert rc == 1, (rc, log.read_text(errors="replace"))
         assert len(rows) == 1, rows
+        assert_fixture_provenance(rows[0])
         assert rows[0]["result"] == "fail", rows[0]
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
 def main() -> None:
+    run_admission_refusals()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
     run_signal(signal.SIGKILL, expect_record=False)

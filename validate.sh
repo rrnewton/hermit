@@ -558,8 +558,72 @@ VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
 DEV_HERMIT_PARENT=$(find_dev_hermit_parent || true)
 VALIDATION_SLOT=$(validation_slot_name "$DEV_HERMIT_PARENT")
+
+# A top-level validation can mint landing authority, so it must prove that the
+# process which launched it owns the ONE box-global admission boundary.  The
+# environment values are claims, not proof: bind them to the canonical parent
+# path, the live owner sidecar, and this process's actual ancestry.
+function canonical_validate_admission_proven {
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
+    local canonical_parent expected_owner expected_lock recorded_pid current=$$
+    local lock_kind lock_target expected_target
+
+    [[ -n $DEV_HERMIT_PARENT && $owner_pid =~ ^[1-9][0-9]*$ ]] || return 1
+    canonical_parent=$(cd -- "$DEV_HERMIT_PARENT" 2>/dev/null && pwd -P) || return 1
+    expected_owner="$canonical_parent/.validate-lock.owner"
+    expected_lock="$canonical_parent/.validate-lock"
+    # Lexical equality and a non-symlink requirement matter: realpath equality
+    # alone would let an alternate lock path alias the canonical owner sidecar.
+    [[ $owner_file == "$expected_owner" && ! -L $owner_file && -r $owner_file ]] || return 1
+    [[ ! -L $expected_lock && -r $expected_lock ]] || return 1
+    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
+    [[ $recorded_pid == "$owner_pid" ]] || return 1
+    lock_kind=$(sed -n 's/^kind=//p' "$expected_lock" 2>/dev/null)
+    lock_target=$(sed -n 's/^target=//p' "$expected_lock" 2>/dev/null)
+    expected_target=$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null) || return 1
+    [[ $lock_kind == validate && $lock_target == "$expected_target" ]] || return 1
+    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
+        [[ $current == "$owner_pid" ]] && return 0
+        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
+    done
+    return 1
+}
+
+VALIDATION_ADMISSION=""
+if ((VALIDATION_NESTED == 1)); then
+    # The admitted outer driver owns the receipt; a nested focused payload
+    # cannot write one and simply inherits the outer process boundary.
+    VALIDATION_ADMISSION="outer-driver"
+elif canonical_validate_admission_proven; then
+    VALIDATION_ADMISSION="ci-hub-validate-lock"
+elif [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
+    && ${HERMIT_VALIDATE_TEST_ALLOW_UNADMITTED:-0} == 1 ]]; then
+    # Narrow fixture escape: stop-test mode never runs product gates or mints a
+    # qualifying receipt, and the row says explicitly that it was not admitted.
+    VALIDATION_ADMISSION="test-fixture-unadmitted"
+else
+    cat >&2 <<EOF
+validate.sh: REFUSED - no canonical ci-hub validation admission.
+  expected owner: ${DEV_HERMIT_PARENT:-<no dev-hermit parent>}/.validate-lock.owner
+  supplied owner: ${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-<unset>}
+  Run validation through: <dev-hermit>/ci-hub/ci-hub validate-run ...
+EOF
+    exit 3
+fi
+readonly VALIDATION_ADMISSION
 VALIDATION_LEDGER_FILE=${HERMIT_VALIDATE_LEDGER:-}
-if [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
+if [[ $VALIDATION_ADMISSION == ci-hub-validate-lock \
+    && ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} != 1 ]]; then
+    CANONICAL_VALIDATION_LEDGER="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
+    if [[ -n $VALIDATION_LEDGER_FILE \
+        && $VALIDATION_LEDGER_FILE != "$CANONICAL_VALIDATION_LEDGER" ]]; then
+        printf 'validate.sh: REFUSED - admitted validation ledger must be %s, got %s\n' \
+            "$CANONICAL_VALIDATION_LEDGER" "$VALIDATION_LEDGER_FILE" >&2
+        exit 3
+    fi
+    VALIDATION_LEDGER_FILE=$CANONICAL_VALIDATION_LEDGER
+elif [[ -z $VALIDATION_LEDGER_FILE && -n $DEV_HERMIT_PARENT ]]; then
     VALIDATION_LEDGER_FILE="$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl"
 fi
 VALIDATION_COMMIT=$(git rev-parse HEAD 2>/dev/null || printf "unknown")
@@ -1528,17 +1592,8 @@ function start_validation_concurrency_monitor {
 # owner. Merely setting an environment variable is not enough: the owner sidecar
 # must name the same PID, and that PID must occur in this process's ancestry.
 function validate_lock_exclusivity_proven {
-    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
-    local owner_file=${CI_HUB_VALIDATE_LOCK_OWNER_FILE:-}
-    local recorded_pid current=$$
-    [[ $owner_pid =~ ^[1-9][0-9]*$ && -r $owner_file ]] || return 1
-    recorded_pid=$(sed -n 's/^pid=//p' "$owner_file" 2>/dev/null)
-    [[ $recorded_pid == "$owner_pid" ]] || return 1
-    while [[ $current =~ ^[1-9][0-9]*$ ]] && ((current > 1)); do
-        [[ $current == "$owner_pid" ]] && return 0
-        current=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$current/status" 2>/dev/null)
-    done
-    return 1
+    [[ $VALIDATION_ADMISSION == ci-hub-validate-lock ]] \
+        && canonical_validate_admission_proven
 }
 
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
@@ -1578,13 +1633,19 @@ function append_validation_ledger {
         result=$raw_result
     fi
 
-    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+    if [[ $VALIDATION_ADMISSION == test-fixture-unadmitted ]]; then
+        concurrent_validates_json=null
+        concurrency_proof_json=null
+    elif validate_lock_exclusivity_proven; then
+        # The canonical box-global lock is stronger than the legacy process-name
+        # heuristic, which also sees parked stop-test fixtures. Once ownership
+        # is proven, no alternate producer can be admitted on this box.
+        concurrent_validates_json=0
+        concurrency_proof_json='"validate_lock_owner_ancestry"'
+    elif [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
         concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
         [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
         concurrency_proof_json='"process_group_overlap_monitor"'
-    elif validate_lock_exclusivity_proven; then
-        concurrent_validates_json=0
-        concurrency_proof_json='"validate_lock_owner_ancestry"'
     else
         # A bare run with no observed peer is UNKNOWN, not proven exclusive.
         concurrent_validates_json=null
@@ -1684,7 +1745,9 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":4,\"producer\":\"hermit-validate-sh\","
+    line+="\"admission\":$(json_quote "$VALIDATION_ADMISSION"),"
+    line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"

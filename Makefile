@@ -72,7 +72,10 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
 # against validate.sh and merely COPIES it to a file named `validate` instead of
 # running validation. .PHONY + this recipe overrides that implicit rule.
-validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
+# validate.sh enforces the canonical ci-hub owner token itself.  Keeping the
+# check in the producer (rather than only in this convenience target) closes
+# direct-script and wrapper entrypoints as well as `make validate`.
+validate: check-submodules ## Run the admitted full suite (pass extra flags via ARGS="--help")
 	./validate.sh $(ARGS)
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills

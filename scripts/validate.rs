@@ -124,17 +124,17 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use safe_ci_dag_runner::cgroup::CgroupManager;
+use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::cgroup::reexec_in_scope;
-use safe_ci_dag_runner::cgroup::CgroupManager;
-use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
+use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
 
 /// Ledger schema this producer emits. See the schema-transition constraint in
 /// the module doc comment before changing this.
@@ -155,19 +155,15 @@ const LEDGER_SCHEMA_VERSION: i64 = 3;
 
 /// Producer identity recorded in each ledger row, so a backward-tolerant reader
 /// can tell a validate.rs receipt from a validate.sh one without inference.
-const LEDGER_PRODUCER: &str = "validate.rs";
+const LEDGER_PRODUCER: &str = "hermit-validate-rs";
+
+/// Process-bound proof injected only by the canonical ci-hub validate lock.
+const ADMISSION_OWNER_PID_ENV: &str = "CI_HUB_VALIDATE_LOCK_OWNER_PID";
+const ADMISSION_OWNER_FILE_ENV: &str = "CI_HUB_VALIDATE_LOCK_OWNER_FILE";
 
 /// Env var that names an explicit ledger file (highest precedence). Matches the
 /// override `validate.sh` honors so both producers can share one ledger.
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
-
-/// Env var naming the dev-hermit parent workspace (second precedence).
-const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
-
-/// Checkout-local default ledger file (third precedence). This is the landmine
-/// fix: a STANDALONE checkout with neither env set previously produced no
-/// receipt at all; now it always writes here so a green claim has evidence.
-const LOCAL_LEDGER_BASENAME: &str = ".hermit-validate-ledger.jsonl";
 
 /// Env override for an exact DAG file, mirroring `ci/run-dag.sh`.
 const DAG_FILE_OVERRIDE_ENV: &str = "RUN_DAG_FILE_OVERRIDE";
@@ -207,7 +203,9 @@ fn usage() -> &'static str {
 /// Parse argv. Returns `Err(code)` for a usage error (2) or a handled `--help` (0).
 fn parse_args() -> Result<Args, u8> {
     let mut profile: Option<String> = None;
-    let mut dag_file: Option<String> = std::env::var(DAG_FILE_OVERRIDE_ENV).ok().filter(|s| !s.is_empty());
+    let mut dag_file: Option<String> = std::env::var(DAG_FILE_OVERRIDE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut jobs: Option<i64> = None;
     let mut verbosity: i64 = 0;
     let mut keep_going = false;
@@ -437,74 +435,130 @@ fn repo_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Resolve the ledger file with a defined precedence that is NEVER empty (the
-/// standalone-checkout landmine fix):
-///   1. `$HERMIT_VALIDATE_LEDGER` — explicit file.
-///   2. `$DEV_HERMIT_PARENT/ignored/validate-run-ledger.jsonl` — parent workspace.
-///   3. `<repo_root>/.hermit-validate-ledger.jsonl` — checkout-local default.
-fn ledger_path(root: &Path) -> PathBuf {
-    if let Ok(explicit) = std::env::var(LEDGER_ENV) {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
+/// Find the enclosing dev-hermit workspace by its registered Hermit submodule,
+/// not by a caller-controlled environment variable.
+fn dev_hermit_parent(root: &Path) -> Option<PathBuf> {
+    for candidate in root.ancestors().skip(1) {
+        let modules = candidate.join(".gitmodules");
+        if !modules.is_file() {
+            continue;
         }
-    }
-    if let Ok(parent) = std::env::var(PARENT_ENV) {
-        if !parent.is_empty() {
-            return PathBuf::from(parent)
-                .join("ignored")
-                .join("validate-run-ledger.jsonl");
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(candidate)
+            .args([
+                "config",
+                "-f",
+                ".gitmodules",
+                "--get",
+                "submodule.hermit.path",
+            ])
+            .output()
+            .ok()?;
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "hermit" {
+            return candidate.canonicalize().ok();
         }
-    }
-    // The env var being unset does NOT mean there is no parent -- far more often it means a run
-    // inside a dev-hermit slot that simply did not export it. Measured 2026-08-08: 111 real rows
-    // sat in two slots' `.hermit-validate-ledger.jsonl` for exactly that reason, and
-    // `ci-hub validate-status` could not see one of them. So look for the parent before falling
-    // back, because a discoverable parent makes the fallback a bug rather than a choice.
-    if let Some(found) = discover_parent_ledger(root) {
-        eprintln!(
-            "validate.rs: {PARENT_ENV} is unset; recording to the DISCOVERED parent ledger {}",
-            found.display()
-        );
-        return found;
-    }
-    root.join(LOCAL_LEDGER_BASENAME)
-}
-
-/// Walk up from `root` for a dev-hermit parent workspace that already has a run ledger.
-///
-/// Deliberately keyed on the ledger FILE existing, not on a directory name: the point is to find
-/// the location a reader actually queries, and a `ignored/` directory with no ledger in it is not
-/// that. Returns `None` for a genuinely standalone checkout, which is the only case the
-/// checkout-local fallback is meant to serve.
-fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
-    let mut dir = root.parent();
-    while let Some(candidate) = dir {
-        let ledger = candidate.join("ignored").join("validate-run-ledger.jsonl");
-        if ledger.is_file() {
-            return Some(ledger);
-        }
-        dir = candidate.parent();
     }
     None
 }
 
-/// Say plainly that a row is not going anywhere a reader will look.
-///
-/// A writer that SUCCEEDS into a location no consumer reads reports success and attests nothing --
-/// the same shape as a `locally-validated` label with no backing run. This does not fail the run,
-/// because a standalone checkout must still be able to validate; it makes the invisibility
-/// impossible to miss, so "silent success" stops being the failure mode.
-fn warn_if_unreadable_ledger(ledger: &Path) {
-    if ledger.file_name().and_then(|n| n.to_str()) != Some(LOCAL_LEDGER_BASENAME) {
-        return;
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Prove that this producer descends from the live owner of the canonical,
+/// box-global validate lock. Environment values alone are never authority.
+fn canonical_validate_admission_proven(root: &Path) -> bool {
+    let Some(parent) = dev_hermit_parent(root) else {
+        return false;
+    };
+    let expected_owner = parent.join(".validate-lock.owner");
+    let expected_lock = parent.join(".validate-lock");
+    let Some(owner_file) = std::env::var_os(ADMISSION_OWNER_FILE_ENV).map(PathBuf::from) else {
+        return false;
+    };
+    if owner_file != expected_owner
+        || std::fs::symlink_metadata(&owner_file)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(true)
+    {
+        return false;
     }
-    eprintln!(
-        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL ledger {}, which NO reader \
-         queries -- `ci-hub validate-status` will report NOT-VALIDATED for this commit even though \
-         the run passed. Set {PARENT_ENV} to the dev-hermit workspace (or {LEDGER_ENV} to an \
-         explicit file) if this row is meant to count.",
-        ledger.display()
-    );
+    if std::fs::symlink_metadata(&expected_lock)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(owner_pid) = std::env::var(ADMISSION_OWNER_PID_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if owner_pid == 0 {
+        return false;
+    }
+    let Ok(sidecar) = std::fs::read_to_string(&owner_file) else {
+        return false;
+    };
+    let recorded_pid = sidecar
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok());
+    if recorded_pid != Some(owner_pid) {
+        return false;
+    }
+    let Ok(holder) = std::fs::read_to_string(&expected_lock) else {
+        return false;
+    };
+    let field = |name: &str| {
+        holder
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    let expected_target = git_sha();
+    if field("kind=").as_deref() != Some("validate")
+        || field("target=").as_deref() != Some(expected_target.as_str())
+    {
+        return false;
+    }
+    let mut current = std::process::id();
+    while current > 1 {
+        if current == owner_pid {
+            return true;
+        }
+        let Some(next) = parent_pid(current) else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+/// Resolve the ONE ledger queried by ci-hub. An admitted producer may not write
+/// a private fallback: a green row no authority can discover is not evidence.
+fn ledger_path(root: &Path) -> Option<PathBuf> {
+    let canonical = dev_hermit_parent(root)?
+        .join("ignored")
+        .join("validate-run-ledger.jsonl");
+    if let Some(explicit) = std::env::var_os(LEDGER_ENV).filter(|value| !value.is_empty()) {
+        if PathBuf::from(explicit) != canonical {
+            eprintln!(
+                "validate.rs: REFUSED - admitted validation ledger must be {}, got a different path",
+                canonical.display()
+            );
+            return None;
+        }
+    }
+    Some(canonical)
 }
 
 fn utc_now() -> String {
@@ -581,6 +635,9 @@ fn write_ledger_record(
     let record = serde_json::json!({
         "schema_version": LEDGER_SCHEMA_VERSION,
         "producer": LEDGER_PRODUCER,
+        "admission": "ci-hub-validate-lock",
+        "concurrent_validates": 0,
+        "concurrency_proof": "validate_lock_owner_ancestry",
         "started_at": started_at,
         "finished_at": finished_at,
         "host": host,
@@ -590,7 +647,7 @@ fn write_ledger_record(
         // branch (is_clean_full_pass) read a ~47-NODE DAG run as a 47-TEST full
         // pass. Fail-closed: no libtest-count-named field is written here. The
         // authoritative counted+coverage receipt is minted by
-        // finalize_receipt.py --scan off the durable log; producer="validate.rs"
+        // finalize_receipt.py --scan off the durable log; producer="hermit-validate-rs"
         // already disambiguates this row.
         "profile": profile,
         "executed_nodes": executed_nodes,
@@ -639,8 +696,10 @@ fn write_ledger_record(
                     ledger.display()
                 );
             } else {
-                eprintln!("validate.rs: ledger record appended to {}", ledger.display());
-                warn_if_unreadable_ledger(ledger);
+                eprintln!(
+                    "validate.rs: ledger record appended to {}",
+                    ledger.display()
+                );
             }
         }
         Err(e) => eprintln!(
@@ -656,7 +715,10 @@ fn write_ledger_record(
 /// `StepOutcome` fields (never scraped text).
 fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     println!("\n=== per-node cost (safe-ci-dag-runner) ===");
-    println!("{:<40} {:>10}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
+    println!(
+        "{:<40} {:>10}  {:<8} {}",
+        "node", "seconds", "status", "reason/returncode"
+    );
     println!("{}", "-".repeat(80));
     let mut total = 0.0_f64;
     for o in outcomes {
@@ -680,7 +742,10 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
         } else {
             String::new()
         };
-        println!("{:<40} {:>10.2}  {:<8} {}", o.tag, o.duration_s, status, detail);
+        println!(
+            "{:<40} {:>10.2}  {:<8} {}",
+            o.tag, o.duration_s, status, detail
+        );
     }
     println!("{}", "-".repeat(80));
     println!("{:<40} {:>10.2}  (sum of node wall)", "TOTAL", total);
@@ -706,11 +771,25 @@ fn main() -> ExitCode {
 
     let root = repo_root();
 
+    if !canonical_validate_admission_proven(&root) {
+        eprintln!(
+            "validate.rs: REFUSED - no canonical ci-hub validation admission; run through \
+             <dev-hermit>/ci-hub/ci-hub validate-run"
+        );
+        return ExitCode::from(3);
+    }
+    let Some(ledger) = ledger_path(&root) else {
+        return ExitCode::from(3);
+    };
+
     // Resolve the DAG file: explicit --dag-file / RUN_DAG_FILE_OVERRIDE wins,
     // else ci/dag/<profile>.json.
     let dag_path: PathBuf = match &args.dag_file {
         Some(p) => PathBuf::from(p),
-        None => root.join("ci").join("dag").join(format!("{}.json", args.profile)),
+        None => root
+            .join("ci")
+            .join("dag")
+            .join(format!("{}.json", args.profile)),
     };
     if !dag_path.is_file() {
         eprintln!(
@@ -776,10 +855,11 @@ fn main() -> ExitCode {
 
     // Forward per-step profile rows only when a profile dir is configured
     // (--perf-dir or the env), mirroring the runner's own opt-in.
-    let profile_dir = args
-        .perf_dir
-        .clone()
-        .or_else(|| std::env::var(PROFILE_DIR_ENV).ok().filter(|s| !s.is_empty()));
+    let profile_dir = args.perf_dir.clone().or_else(|| {
+        std::env::var(PROFILE_DIR_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     if let Some(dir) = profile_dir {
         let sha = git_sha();
         append_step_profiles(
@@ -791,16 +871,23 @@ fn main() -> ExitCode {
             "unverified",
             LEDGER_PRODUCER,
         );
-        eprintln!("validate.rs: forwarded {} step profile row(s) to {dir}", result.step_profile_rows.len());
+        eprintln!(
+            "validate.rs: forwarded {} step profile row(s) to {dir}",
+            result.step_profile_rows.len()
+        );
     }
 
-    // Ledger — always writes (checkout-local default when no env override), at
-    // the single write point that carries every qualification with the value.
+    // Ledger — always writes to the canonical parent history queried by ci-hub,
+    // at the single write point that carries every qualification with the value.
     let commit = git_sha();
     let dirty = tree_dirty();
-    let selection_mode = if args.dag_file.is_some() { "override" } else { "full" };
+    let selection_mode = if args.dag_file.is_some() {
+        "override"
+    } else {
+        "full"
+    };
     write_ledger_record(
-        &ledger_path(&root),
+        &ledger,
         &started_at,
         &finished_at,
         &args.profile,
