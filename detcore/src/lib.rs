@@ -741,13 +741,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     continue;
                 }
                 let dettid = guest.thread_state().dettid;
+                let digest = procmaps::compute_hash_range(guest, region.start, region.end)?;
+                // A backend-reported region carries no /proc metadata, so it has
+                // no `detail`; the comparable fields are identical in shape to
+                // the ptrace record below.
                 detlog!(
-                    "[memory][dtid {}] {:?} {:#x}-{:#x}->{}",
-                    dettid,
-                    region.kind,
-                    region.start,
-                    region.end,
-                    procmaps::compute_hash_range(guest, region.start, region.end)?
+                    "{}",
+                    procmaps::format_memory_record(
+                        dettid,
+                        &format!("{:?}", region.kind),
+                        region.start,
+                        region.end,
+                        None,
+                        &digest,
+                    )
                 )
             }
             return Ok(());
@@ -758,11 +765,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => false,
         })? {
             let dettid = guest.thread_state().dettid;
+            let digest = procmaps::compute_hash(guest, &mmap)?;
+            // `mmap.address` is the domain `compute_hash` actually hashed, so the
+            // recorded bounds and size cannot drift from the digest.
             detlog!(
-                "[memory][dtid {}] {}->{}",
-                dettid,
-                procmaps::display(&mmap),
-                procmaps::compute_hash(guest, &mmap)?
+                "{}",
+                procmaps::format_memory_record(
+                    dettid,
+                    &format!("{:?}", mmap.pathname),
+                    mmap.address.0,
+                    mmap.address.1,
+                    Some(&procmaps::map_detail(&mmap)),
+                    &digest,
+                )
             )
         }
         Ok(())

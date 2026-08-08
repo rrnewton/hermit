@@ -536,6 +536,41 @@ impl<'a> Display for Comparison<'a> {
 ///
 /// We could use an existing diff library on the entire log, but this provides us more
 /// control over how to present the (stripped/unstripped) differences, and to focus on the
+/// Explain a `[memory]` record mismatch in terms of WHICH KIND of divergence it
+/// is, when both sides are memory records.
+///
+/// A digest disagreement has two causes that look identical in a line diff and
+/// have opposite remedies: the two runs hashed DIFFERENT AMOUNTS OF MEMORY, or
+/// they hashed the same amount and got different bytes. Only the second is a
+/// determinism finding. Without this, a domain artifact -- ptrace hashing a
+/// page-granular VMA while an out-of-process backend hashes the exact break --
+/// reads as memory corruption, and the reader has to reconstruct the region
+/// sizes by hand to find out otherwise.
+///
+/// Returns `None` when either side is not a parseable memory record, which
+/// includes records from logs written before the domain was recorded. Those
+/// cannot be classified and must not be guessed at.
+fn classify_memory_mismatch(left: &str, right: &str) -> Option<String> {
+    let left = crate::procmaps::parse_memory_record(left)?;
+    let right = crate::procmaps::parse_memory_record(right)?;
+    match crate::procmaps::classify_memory_divergence(&left, &right) {
+        crate::procmaps::MemoryDivergence::None => None,
+        crate::procmaps::MemoryDivergence::KindMismatch { left, right } => Some(format!(
+            "memory records are not counterparts: compared a `{left}` region against a `{right}` region"
+        )),
+        crate::procmaps::MemoryDivergence::Domain { left: l, right: r } => Some(format!(
+            "MEASUREMENT DOMAIN divergence, not byte content: run 1 hashed {l:#x} bytes and run 2 \
+             hashed {r:#x}. Digests over different-sized regions cannot match however identical \
+             the memory is, so this says NOTHING about the bytes -- the comparison is unmeasured, \
+             not failed. Reconcile the region definitions before reading the digests."
+        )),
+        crate::procmaps::MemoryDivergence::Content { size } => Some(format!(
+            "BYTE CONTENT divergence: both runs hashed the same {size:#x}-byte region and got \
+             different digests. This is a real memory-determinism divergence."
+        )),
+    }
+}
+
 /// per-line divergence(s), and potentially focus on the first point of divergence.
 //
 // Future TODO:
@@ -613,6 +648,9 @@ fn diff_vecs(
                 "({which}) Original entries before normalization: {}",
                 Comparison::new(opts.no_color, left, right)
             )?;
+        }
+        if let Some(classification) = classify_memory_mismatch(left, right) {
+            writeln!(w, "({which}) {classification}")?;
         }
         write_syscall_context(
             w,
@@ -1087,6 +1125,97 @@ mod test {
         let debug_diverged =
             super::log_diff_summary_from_strs(left, right, &full_trace, &mut Vec::new())?;
         assert!(debug_diverged.diff_found);
+        Ok(())
+    }
+
+    /// The two memory-divergence kinds must be reported DIFFERENTLY in real
+    /// diff output, not merely distinguishable in principle.
+    ///
+    /// Both halves use the same guest, the same thread and the same region, so
+    /// the only variable is the one under test. The domain case is built from
+    /// the KVM heap decomposition's record1: a page-granular `0x1000` region
+    /// against the unrounded `0xd80` break, where the memory is identical and
+    /// only the extent measured differs.
+    #[test]
+    fn memory_divergence_reports_domain_and_content_differently() -> std::io::Result<()> {
+        let hash_a = "74b43faf7b78ace9443772ef63a30f66feaf9bd320256c82b8bd880634d19d46";
+        let hash_b = "1984d1aaf386fce67eaa926624ecc1d5a4105828e4f286ee59cc69c0491cd5fe";
+        let stamp = "2026-08-06T01:00:00.000000Z  INFO detcore: DETLOG ";
+        let record = |start: u64, end: u64, hash: &str| {
+            format!(
+                "{stamp}{}",
+                crate::procmaps::format_memory_record(
+                    3,
+                    "Heap",
+                    start,
+                    end,
+                    None,
+                    &<crate::Digest as std::str::FromStr>::from_str(hash).unwrap(),
+                )
+            )
+        };
+        let opts = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            no_color: true,
+            ..Default::default()
+        };
+
+        // DOMAIN: same bytes conceptually, different extents measured.
+        let mut out = Vec::new();
+        assert!(super::log_diff_from_strs(
+            record(0x602000, 0x603000, hash_a),
+            record(0x602000, 0x602d80, hash_b),
+            &opts,
+            &mut out
+        )?);
+        let domain = String::from_utf8(out).unwrap();
+        assert!(
+            domain.contains("MEASUREMENT DOMAIN divergence"),
+            "a size mismatch must be classified as domain:\n{domain}"
+        );
+        assert!(
+            domain.contains("0x1000") && domain.contains("0xd80"),
+            "both domain sizes must be named so the reader need not subtract:\n{domain}"
+        );
+        assert!(
+            !domain.contains("BYTE CONTENT divergence"),
+            "a domain artifact must NOT be reported as a content divergence:\n{domain}"
+        );
+
+        // CONTENT: identical extent, different digest. The other direction --
+        // without this the classifier could pass by calling everything a domain
+        // problem and never reporting a real divergence.
+        let mut out = Vec::new();
+        assert!(super::log_diff_from_strs(
+            record(0x602000, 0x603000, hash_a),
+            record(0x602000, 0x603000, hash_b),
+            &opts,
+            &mut out
+        )?);
+        let content = String::from_utf8(out).unwrap();
+        assert!(
+            content.contains("BYTE CONTENT divergence"),
+            "equal domains with unequal digests is a real finding:\n{content}"
+        );
+        assert!(
+            !content.contains("MEASUREMENT DOMAIN divergence"),
+            "must not excuse a real divergence as a measurement artifact:\n{content}"
+        );
+
+        // Control: identical records produce no classification at all, so the
+        // annotation cannot be an unconditional banner.
+        let mut out = Vec::new();
+        assert!(!super::log_diff_from_strs(
+            record(0x602000, 0x603000, hash_a),
+            record(0x602000, 0x603000, hash_a),
+            &opts,
+            &mut out
+        )?);
+        let same = String::from_utf8(out).unwrap();
+        assert!(
+            !same.contains("divergence"),
+            "clean compare must stay quiet:\n{same}"
+        );
         Ok(())
     }
 
