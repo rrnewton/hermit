@@ -204,6 +204,21 @@ jobs:
           RUSTUP_TOOLCHAIN=stable rustc --edition=2021 scripts/check-nested-lockfiles.rs -o "$nested_checker"
           "$nested_checker"
 
+  # Keep Hermit's tooling gitlink synchronized with the independently owned
+  # agent-utils main branch. This is a distinct authority from Reverie and gets
+  # a distinct job so a red identifies the exact pin that drifted.
+  agent-utils-pin:
+    name: Agent-utils pin is latest main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the exact latest agent-utils main revision
+        run: |
+          set -euo pipefail
+          ./ci/run-agent-utils-pin-check.sh --self-test
+          ./ci/run-agent-utils-pin-check.sh
+
   # ---------------------------------------------------------------- plan (cheap)
   # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
   # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
@@ -859,6 +874,7 @@ jobs:
     needs:
       - select
       - reverie-pin
+      - agent-utils-pin
       - plan
       - preflight
       - build-debug

@@ -658,6 +658,68 @@ EOF
         die "merge-gate must run the canonical live-query checker on the exact PR head"
 }
 
+# Keep the agent-utils gitlink current on every ordinary commit/test path. The
+# checker self-tests provide the stale/current mutation bracket; these
+# assertions ensure every consumer invokes that one semantic verifier.
+function assert_agent_utils_pin_enforcement {
+    local checker="$ROOT_DIR/scripts/check-agent-utils-pin.rs"
+    local runner="$ROOT_DIR/ci/run-agent-utils-pin-check.sh"
+    [[ -x $runner ]] || die "agent-utils pin runner must be executable"
+    grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
+        die "agent-utils checker must dereference refs/heads/main"
+    ! grep -Fq -- '--agent-utils-remote' "$checker" ||
+        die "production callers must not redirect the agent-utils authority"
+    [[ $(grep -Fxc '        scripts/check-agent-utils-pin.rs -o "$checker"' "$runner") == 2 ]] ||
+        die "agent-utils runner must compile the canonical source in both modes"
+    local direct_references expected_direct_references
+    direct_references=$(
+        git -C "$ROOT_DIR" grep -Il -F 'scripts/check-agent-utils-pin.rs' -- . |
+            LC_ALL=C sort
+    )
+    expected_direct_references=$'ci/run-agent-utils-pin-check.sh\nci/test_harness.sh'
+    [[ $direct_references == "$expected_direct_references" ]] ||
+        die "direct agent-utils-pin source references differ from the trusted allowlist:
+$direct_references"
+    [[ $(grep -Fxc $'\t$(SUBMODULE_PROXY) ./ci/run-agent-utils-pin-check.sh' "$ROOT_DIR/Makefile") == 1 ]] ||
+        die "Makefile lint must use the canonical agent-utils launcher"
+    [[ $(grep -Fxc 'agent_utils_checker="$root/ci/run-agent-utils-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit must name the canonical agent-utils launcher"
+    [[ $(grep -Fxc '"${proxy[@]}" "$agent_utils_checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
+        die "pre-commit must bind the agent-utils launcher to the exact repository"
+    [[ $(grep -Fc '"$ROOT_DIR/ci/run-agent-utils-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate must execute exactly one exact-repository agent-utils gate"
+    [[ $(grep -Fc 'run_check "Agent-utils dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate must expose exactly one agent-utils pin gate"
+    [[ $(grep -Fc 'AGENT_UTILS_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate receipt cleanup must reject a bypassed agent-utils gate"
+    [[ $(grep -Fc '\"agent_utils_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
+        die "validate receipts must carry the agent-utils pin condition"
+
+    local dag
+    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
+        jq -e '
+            [.steps[] | select(
+                .group == "check"
+                and .job == "agent_utils_pin"
+                and .cmd == "./ci/run-agent-utils-pin-check.sh"
+            )] | length == 1
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must contain exactly one agent-utils pin gate"
+    done
+
+    local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
+    [[ $(grep -Fxc '    name: Agent-utils pin is latest main' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one agent-utils pin job"
+    [[ $(grep -Fxc '      - agent-utils-pin' "$portable_workflow") == 1 ]] ||
+        die "the portable aggregate must depend on the agent-utils pin job"
+    [[ $(grep -Fxc '          ./ci/run-agent-utils-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute agent-utils checker self-tests"
+    [[ $(grep -Fxc '          ./ci/run-agent-utils-pin-check.sh' "$portable_workflow") == 1 ]] ||
+        die "portable CI must execute the live agent-utils query"
+    "$runner" --self-test >/dev/null ||
+        die "agent-utils pin stale/current mutation bracket failed"
+}
+
 function dag_critical_path_seconds {
     local dag=$1
     jq -r '
@@ -939,6 +1001,7 @@ function audit_ci_correspondence {
     done
 
     assert_reverie_pin_enforcement
+    assert_agent_utils_pin_enforcement
 
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs
     # its small hardware DAG within one job.
