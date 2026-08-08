@@ -245,6 +245,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # The preflight shard includes check.reverie_pin. Its monotonicity clause
+      # needs the Hermit base just as the dedicated pin job does; a depth-1
+      # checkout has no origin/main and the canonical checker correctly refuses
+      # to confuse that missing evidence with a pass.
+      - name: Fetch the monotonicity base (origin/main)
+        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main
       # run-node.sh now executes nodes THROUGH safe-ci-dag-runner (not a jq+bash
       # shim), so the tracked runner submodule must be present in this job too.
       - name: Initialize safe-ci-dag-runner submodule
@@ -519,6 +525,11 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
     steps:
       - uses: actions/checkout@v4
+      # strict-compat invokes validate.sh, which re-checks the canonical
+      # Reverie predicate. Supply the real landing base; --no-base would turn a
+      # genuinely answerable PR check into a declared skip.
+      - name: Fetch the monotonicity base (origin/main)
+        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main
       - name: Initialize safe-ci-dag-runner submodule
         run: git submodule update --init agent-utils
       - uses: Swatinem/rust-cache@v2

@@ -699,6 +699,11 @@ EOF
         die "portable CI must execute the canonical checker self-tests through rustc"
     [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh' "$portable_workflow") == 1 ]] ||
         die "portable CI must execute the canonical live-query checker through rustc"
+    # Three consumers execute the predicate: the dedicated pin job, the
+    # preflight DAG, and strict-compat through validate.sh. A fetch on only the
+    # first leaves the other two in the checker's could-not-determine state.
+    [[ $(grep -Fxc '        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main' "$portable_workflow") == 3 ]] ||
+        die "every portable Reverie-pin consumer must fetch its monotonicity base"
     ! grep -Fq 'Stale-Reverie-Pin-Reason' "$portable_workflow" ||
         die "portable CI must not retain a stale-Reverie override"
 
