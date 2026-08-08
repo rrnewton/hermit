@@ -991,8 +991,50 @@ function detect_cache_state {
 # per-file version instead ran `python3 ... && return 1 || return 0`, so a
 # missing interpreter made every .o/.so classify as CORRUPT and the purge would
 # have deleted the entire object tree.
+# Evidence sidecar lives beside the run ledger, in the parent's gitignored
+# ignored/ dir, so it has the same durability and the same "never committed"
+# property as the ledger itself. With no parent (a standalone checkout) it falls
+# back into the checkout's own ignored/ dir rather than being dropped. Pure: the
+# caller resolves it once and passes it in, so the value cannot differ between
+# the scan and the ledger row that cites it.
+function artifact_purge_evidence_path {
+    if [[ -n ${HERMIT_VALIDATE_ARTIFACT_EVIDENCE:-} ]]; then
+        printf '%s' "$HERMIT_VALIDATE_ARTIFACT_EVIDENCE"
+    elif [[ -n ${DEV_HERMIT_PARENT:-} ]]; then
+        printf '%s' "$DEV_HERMIT_PARENT/ignored/validate-artifact-purge.jsonl"
+    else
+        printf '%s' "$ROOT_DIR/ignored/validate-artifact-purge.jsonl"
+    fi
+}
+
+# Replacement body for validate.sh's purge_zero_byte_objects (:994).
+#
+# WHAT CHANGED AND WHY. The old scan computed six distinguishable corruption
+# reasons and collapsed every one of them into `removed += 1`. Path, size,
+# mtime, the reason that fired, and the artifact's own first bytes were all in
+# scope at the moment of `os.unlink` and all discarded, so the only thing that
+# ever reached durable storage was a count: "N artifacts were corrupt somewhere
+# under target/ at some point before this run". A frequency with no attribution
+# tells you the problem is worth investigating and simultaneously guarantees you
+# cannot. Every field below was already computed or one stat away; none of it is
+# new measurement.
+#
+# The artifact is still purged -- the whole point is that a build must never
+# consume a structurally-incomplete object. What is preserved is the RECORD.
+#
+# CONTRACT PRESERVED: stdout is still a bare integer, because the caller does
+# `VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects ...)`, marks it
+# readonly, and compares it arithmetically. Everything new goes to the evidence
+# JSONL and to a small summary file the caller reads for the ledger row.
+#
+# SUBSHELL-SAFE INTERFACE. The caller captures stdout with $(...), which forks,
+# so anything this function assigns to a global is lost the instant it returns.
+# The evidence and summary PATHS are therefore chosen by the caller and passed
+# in; the function only writes to them. (Found by the plant test: an earlier
+# revision set them as globals here and the caller read an unbound variable.)
+# Args: root [evidence-jsonl] [summary-json]
 function purge_zero_byte_objects {
-    local root=$1
+    local root=$1 evidence=${2:-} summary=${3:-}
     # DISABLED BY DEFAULT (owner directive, 2026-08-07). This scan was added
     # without review inside a 23-PR coalesce batch (#1633, commit b7f9c7131) and
     # then escalated to a per-file ELF probe by a bot (#1705, commit 23874c0d0).
@@ -1006,54 +1048,213 @@ function purge_zero_byte_objects {
         printf 0
         return 0
     fi
+    [[ -n $evidence ]] || evidence=$(artifact_purge_evidence_path)
+    mkdir -p "$(dirname "$evidence")" 2>/dev/null || true
+
     find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
         -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null \
-        | python3 -c '
-import fnmatch, os, struct, sys
+        | PURGE_EVIDENCE=$evidence \
+          PURGE_SUMMARY=$summary \
+          PURGE_MAX_RECORDS=${VALIDATE_PURGE_MAX_RECORDS:-} \
+          PURGE_CHECKOUT=$ROOT_DIR \
+          PURGE_COMMIT=${VALIDATION_COMMIT:-unknown} \
+          PURGE_TREE=${VALIDATION_TREE:-unknown} \
+          PURGE_HOST=${VALIDATION_HOST:-unknown} \
+          PURGE_SLOT=${VALIDATION_SLOT:-unknown} \
+          PURGE_PROFILE=${VALIDATION_PROFILE:-unknown} \
+          PURGE_CACHE_STATE=${VALIDATION_CACHE_STATE:-unknown} \
+          PURGE_RUN_STARTED_AT=${VALIDATION_STARTED_AT:-unknown} \
+          PURGE_RUN_STARTED_EPOCH=${VALIDATION_STARTED_EPOCH:-0} \
+          python3 -c '
+import fnmatch, json, os, re, struct, sys, time
+
+# Cap the per-record evidence, not the count. A tree with 20k corrupt objects
+# must not produce a 20k-line JSONL, but a silently truncated file would read as
+# "that was all of them", so the cap and the true total are both recorded.
+MAX_RECORDS = int(os.environ.get("PURGE_MAX_RECORDS") or 2000)
 
 def corrupt(path):
+    """Return (is_corrupt, reason, size, head). Reason is the SPECIFIC predicate
+    that fired -- the diagnostic the old scan computed and threw away."""
     try:
         size = os.path.getsize(path)
     except OSError:
-        return False                      # unstattable: not our business
+        return (False, None, None, b"")   # unstattable: not our business
     if size == 0:
-        return True
+        return (True, "zero_size", size, b"")
     try:
         with open(path, "rb") as fh:
             head = fh.read(64)
     except OSError:
-        return False
+        return (False, None, size, b"")
     # Case order mirrors the shell `case`: *.a|*.rlib is tested before the
     # object/shared-library globs, so e.g. "foo.so.a" is treated as an archive.
     if fnmatch.fnmatch(path, "*.a") or fnmatch.fnmatch(path, "*.rlib"):
         if not head.startswith(b"!<arch>\n"):
-            return True
-        return size < 68
+            return (True, "ar_bad_magic", size, head)
+        if size < 68:
+            return (True, "ar_too_short", size, head)
+        return (False, None, size, head)
     if (fnmatch.fnmatch(path, "*.o") or fnmatch.fnmatch(path, "*.so")
             or fnmatch.fnmatch(path, "*.so.*") or fnmatch.fnmatch(path, "*.lo")):
         if not head.startswith(b"\x7fELF"):
-            return True
+            return (True, "elf_bad_magic", size, head)
         if len(head) < 64:
-            return True                   # too short to carry a section table
+            return (True, "elf_header_short", size, head)
         if head[4] != 2:
-            return False                  # not ELFCLASS64: magic-only check
+            return (False, None, size, head)   # not ELFCLASS64: magic-only check
         shoff = struct.unpack_from("<Q", head, 0x28)[0]
         need = (shoff + struct.unpack_from("<H", head, 0x3A)[0]
                 * struct.unpack_from("<H", head, 0x3C)[0])
-        return bool(shoff and need > size)
-    return False
+        if shoff and need > size:
+            return (True, "elf_section_table_truncated", size, head)
+        return (False, None, size, head)
+    return (False, None, size, head)
+
+
+_BUILD_DIR = re.compile(r"^(?P<pkg>.+)-[0-9a-f]{16}$")
+_DEP_FILE = re.compile(r"^(?P<crate>.+?)-[0-9a-f]{16}\b")
+
+def producer(rel):
+    """Infer the producing build step FROM THE PATH.
+
+    Stated as an inference, not an observation: the scan runs pre-build, so the
+    step that wrote this artifact belongs to an earlier run and cannot be
+    observed here. The path is what is actually available, and cargo/cmake both
+    encode the producer in it. `inferred_from` records that, so a reader never
+    mistakes this for a witnessed producer.
+
+    `cargo_tracked` is the field that answers the standing question directly:
+    anything under a build script`s out/ dir is a NON-CARGO RESIDENT that
+    nothing fingerprints, which is where the corruption was already believed to
+    live.
+    """
+    parts = rel.split("/")
+    chain = []
+    cargo_tracked = None
+    profile = None
+    for i, p in enumerate(parts):
+        if p in ("debug", "release") and profile is None:
+            profile = p
+        if p == "build" and i + 2 < len(parts) and parts[i + 2] == "out":
+            m = _BUILD_DIR.match(parts[i + 1])
+            chain.append({"kind": "cargo-build-script",
+                          "package": m.group("pkg") if m else parts[i + 1]})
+            cargo_tracked = False          # build-script output: unfingerprinted
+        elif p == "deps" and i + 1 < len(parts):
+            m = _DEP_FILE.match(parts[i + 1])
+            chain.append({"kind": "cargo-dep",
+                          "crate": m.group("crate") if m else parts[i + 1]})
+            if cargo_tracked is None:
+                cargo_tracked = True
+        elif p == "incremental" and i + 1 < len(parts):
+            m = _DEP_FILE.match(parts[i + 1])
+            chain.append({"kind": "cargo-incremental",
+                          "crate": m.group("crate") if m else parts[i + 1]})
+            if cargo_tracked is None:
+                cargo_tracked = True
+        elif p == "CMakeFiles" and i + 1 < len(parts) and parts[i + 1].endswith(".dir"):
+            chain.append({"kind": "cmake-target",
+                          "target": parts[i + 1][:-4],
+                          "source": parts[i + 2] if i + 2 < len(parts) else None})
+            cargo_tracked = False          # cmake output: cargo does not hash it
+        elif p == "dynamorio-build":
+            chain.append({"kind": "dynamorio-build"})
+            cargo_tracked = False
+    if not chain:
+        chain.append({"kind": "unattributed"})
+    return {"chain": chain, "profile": profile,
+            "cargo_tracked": cargo_tracked, "inferred_from": "path"}
+
+
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+checkout = os.environ.get("PURGE_CHECKOUT", "")
+run_started_epoch = int(os.environ.get("PURGE_RUN_STARTED_EPOCH") or 0)
+# dict(...) rather than a brace literal: a "}" in column 0 would terminate the
+# shell function early for any reader that slices it by brace, including the
+# test that extracts this function out of validate.sh.
+run = dict(
+    commit=os.environ.get("PURGE_COMMIT", "unknown"),
+    tree=os.environ.get("PURGE_TREE", "unknown"),
+    host=os.environ.get("PURGE_HOST", "unknown"),
+    slot=os.environ.get("PURGE_SLOT", "unknown"),
+    profile=os.environ.get("PURGE_PROFILE", "unknown"),
+    cache_state=os.environ.get("PURGE_CACHE_STATE", "unknown"),
+    started_at=os.environ.get("PURGE_RUN_STARTED_AT", "unknown"),
+    checkout=checkout,
+)
+now = time.time()
+detected_at = iso(now)
 
 removed = 0
-for path in sys.stdin.buffer.read().split(b"\0"):
-    if not path:
+recorded = 0
+reasons = {}
+records = []
+
+for raw in sys.stdin.buffer.read().split(b"\0"):
+    if not raw:
         continue
-    name = os.fsdecode(path)
-    if corrupt(name):
-        try:
-            os.unlink(name)
-        except OSError:
-            continue
-        removed += 1
+    name = os.fsdecode(raw)
+    is_bad, reason, size, head = corrupt(name)
+    if not is_bad:
+        continue
+    # Capture the evidence BEFORE the unlink -- after it, mtime is gone.
+    try:
+        mtime = os.path.getmtime(name)
+    except OSError:
+        mtime = None
+    rel = os.path.relpath(name, checkout) if checkout else name
+    try:
+        os.unlink(name)
+    except OSError:
+        continue                      # not purged, so not counted and not recorded
+    removed += 1
+    reasons[reason] = reasons.get(reason, 0) + 1
+    if recorded < MAX_RECORDS:
+        records.append({
+            "schema_version": 1,
+            "detected_at": detected_at,
+            "run": run,
+            "path": rel,
+            "size_bytes": size,
+            "mtime": iso(mtime) if mtime is not None else None,
+            "mtime_epoch": int(mtime) if mtime is not None else None,
+            "age_seconds": int(now - mtime) if mtime is not None else None,
+            "written_during_this_run": (
+                bool(run_started_epoch and mtime is not None and mtime >= run_started_epoch)),
+            "reason": reason,
+            "head_hex": head[:16].hex(),
+            "producer": producer(rel),
+        })
+        recorded += 1
+
+evidence = os.environ.get("PURGE_EVIDENCE")
+if evidence and records:
+    try:
+        with open(evidence, "a") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as exc:
+        # No Silent Failure: losing the evidence must be visible, but it must not
+        # fail the run -- the artifacts are already purged and the build is safe.
+        sys.stderr.write("validate.sh: artifact-purge evidence NOT written to "
+                         "%s (%s)\n" % (evidence, exc))
+
+summary = os.environ.get("PURGE_SUMMARY")
+if summary:
+    try:
+        with open(summary, "w") as fh:
+            json.dump({"purged": removed, "recorded": recorded,
+                       "truncated": removed > recorded,
+                       "reasons": reasons,
+                       "evidence_file": evidence if records else None},
+                      fh, sort_keys=True)
+    except OSError:
+        pass
+
 sys.stdout.write(str(removed))
 '
 }
@@ -1692,6 +1893,27 @@ function append_validation_ledger {
     line+="\"selection_mode\":$(json_quote "$VALIDATION_SELECTION_MODE"),"
     line+="\"cache_state\":$(json_quote "$VALIDATION_CACHE_STATE"),"
     line+="\"zero_byte_purged\":${VALIDATION_ZERO_BYTE_PURGED:-0},"
+    # The purge count no longer travels alone. `artifact_purge_reasons` says WHICH
+    # corruption predicate fired and how often; `artifact_purge_evidence` is a
+    # dereferenceable pointer to the per-artifact records (path, size, mtime,
+    # inferred producing build step, run context). A reader can now go from a
+    # frequency to a specific file, producer, and timestamp instead of stopping at
+    # the number. `artifact_purge_truncated` marks a capped evidence file so a
+    # short record list is never mistaken for the whole population.
+    # Normalized into locals first. `${VAR:-{}}` cannot be written inline -- the
+    # brace closes the parameter expansion -- and escaping it as `${VAR:-\{\}}`
+    # emits a literal backslash, which is exactly the malformed row
+    # scripts/test_validate_stop_paths.py caught: `"artifact_purge_reasons":\{}`.
+    # The stop-test seam returns before the purge call site runs, so these are
+    # genuinely unset on a real path and the default has to be correct.
+    local purge_reasons=${VALIDATION_ARTIFACT_PURGE_REASONS:-}
+    [[ -n $purge_reasons ]] || purge_reasons="{}"
+    local purge_truncated=false
+    [[ ${VALIDATION_ARTIFACT_PURGE_TRUNCATED:-} == true ]] && purge_truncated=true
+    line+="\"artifact_purge_reasons\":$purge_reasons,"
+    line+="\"artifact_purge_recorded\":${VALIDATION_ARTIFACT_PURGE_RECORDED:-0},"
+    line+="\"artifact_purge_truncated\":$purge_truncated,"
+    line+="\"artifact_purge_evidence\":$(json_quote "${VALIDATION_ARTIFACT_EVIDENCE_FILE:-}"),"
     line+="\"commit\":$(json_quote "$VALIDATION_COMMIT"),\"tree\":$(json_quote "$VALIDATION_TREE"),"
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
@@ -4913,13 +5135,45 @@ fi
 # Running it here keeps the guarantee that matters -- no build ever consumes a
 # structurally-incomplete artifact -- while making a 0-second refusal cost 0
 # seconds. Nothing between the two points builds anything.
-VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+# The caller owns the evidence and summary paths: the scan's stdout is captured
+# with $(...), which forks, so anything the function assigned to a global would
+# be lost on return. Resolving the evidence path HERE also guarantees the ledger
+# row cites the same file the scan wrote.
+VALIDATION_ARTIFACT_EVIDENCE_FILE=$(artifact_purge_evidence_path)
+VALIDATION_ARTIFACT_PURGE_SUMMARY=$(mktemp "${TMPDIR:-/tmp}/hermit-validate-purge.XXXXXX.json")
+VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target" \
+    "$VALIDATION_ARTIFACT_EVIDENCE_FILE" "$VALIDATION_ARTIFACT_PURGE_SUMMARY")
 readonly VALIDATION_ZERO_BYTE_PURGED
+# Reason breakdown + evidence pointer, so the ledger's count stops being a bare
+# number: it travels with WHICH corruption predicates fired and WHERE the
+# per-artifact records live. Defaults keep the row well-formed when the scan was
+# disabled, skipped for a missing python3, or found nothing.
+VALIDATION_ARTIFACT_PURGE_REASONS="{}"
+VALIDATION_ARTIFACT_PURGE_RECORDED=0
+VALIDATION_ARTIFACT_PURGE_TRUNCATED=false
+if [[ -s ${VALIDATION_ARTIFACT_PURGE_SUMMARY:-} ]] && command -v python3 >/dev/null 2>&1; then
+    read -r VALIDATION_ARTIFACT_PURGE_REASONS VALIDATION_ARTIFACT_PURGE_RECORDED \
+        VALIDATION_ARTIFACT_PURGE_TRUNCATED < <(python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1]))
+print(json.dumps(s.get("reasons") or {}, sort_keys=True, separators=(",", ":")),
+      int(s.get("recorded") or 0),
+      "true" if s.get("truncated") else "false")
+' "$VALIDATION_ARTIFACT_PURGE_SUMMARY" 2>/dev/null) || true
+fi
+rm -f "${VALIDATION_ARTIFACT_PURGE_SUMMARY:-}" 2>/dev/null || true
 if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
     printf "Artifact-integrity: purged %s structurally-incomplete object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
         "$VALIDATION_ZERO_BYTE_PURGED"
-    printf "validate.sh: purged %s incomplete object(s) from target/ pre-build\n" \
-        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
+    printf "Artifact-integrity: reasons %s; per-artifact evidence (path, size, mtime, inferred producer, run context) retained at %s -- %s record(s).\n" \
+        "$VALIDATION_ARTIFACT_PURGE_REASONS" "$VALIDATION_ARTIFACT_EVIDENCE_FILE" \
+        "$VALIDATION_ARTIFACT_PURGE_RECORDED"
+    if [[ $VALIDATION_ARTIFACT_PURGE_TRUNCATED == true ]]; then
+        printf "Artifact-integrity: WARNING: evidence capped at %s record(s) of %s purged; raise VALIDATE_PURGE_MAX_RECORDS to keep them all.\n" \
+            "$VALIDATION_ARTIFACT_PURGE_RECORDED" "$VALIDATION_ZERO_BYTE_PURGED"
+    fi
+    printf "validate.sh: purged %s incomplete object(s) from target/ pre-build; evidence -> %s\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED" "$VALIDATION_ARTIFACT_EVIDENCE_FILE" >>"$LOG_FILE"
 fi
 
 # --only is the first-class fast path for one already-built DAG shard. Run it
