@@ -197,6 +197,89 @@ if err is None:
     )
     check("created header is 23 columns", len(hdr.split(",")) == 23, hdr)
 
+print("case COMPARISON-TIER — every appended row states its comparison standard")
+# WHY. `restval=""` fills any column the outer file has and this producer does
+# not populate, so `comparison_tier` -- a column the PARENT added and this
+# producer had never heard of -- was written BLANK on every row. The parent
+# refuses a blank outright, because an untiered row is an unqualified green: a
+# verdict with no record of what comparison produced it. Measured before the
+# fix: six runs appended 168 rows to the parent scorecard, 168 blank-tier,
+# reddening the parent's ci-hub shard.
+#
+# The parent owns this vocabulary (compat-envelope/check-scorecard-tier.py).
+# It is restated rather than imported because Hermit must build standalone, and
+# the two QUALIFYING values are listed separately so this test fails loudly if
+# this producer ever starts minting a green it cannot earn.
+PARENT_QUALIFYING_TIERS = {
+    "full-stdout-info-stack-heap",
+    "stdout-info-stack-heap-spot-check",
+}
+PARENT_UNQUALIFIED_TIERS = {
+    "legacy-unqualified",
+    "unqualified-stdout-only",
+    "unqualified-tool-count-only",
+}
+TIERED_HEADER = CURRENT_20 + ",comparison_tier"
+path, err = append(TIERED_HEADER)
+check("append is accepted", err is None, repr(err))
+if err is None:
+    with path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    tiers = [(r.get("comparison_tier") or "").strip() for r in rows]
+    blank = sum(1 for t in tiers if not t)
+    # The count travels with the claim (#319): "no blanks" out of how many?
+    check(f"all {len(tiers)} appended rows are tiered (blank={blank})", blank == 0)
+    check(
+        "every tier is a value the parent knows",
+        all(t in PARENT_QUALIFYING_TIERS | PARENT_UNQUALIFIED_TIERS for t in tiers),
+        str(sorted(set(tiers))),
+    )
+    # This harness records no stack/heap evidence, so it must NEVER mint green.
+    check(
+        "no row claims a QUALIFYING (green) tier",
+        not any(t in PARENT_QUALIFYING_TIERS for t in tiers),
+        str(sorted(set(tiers))),
+    )
+    check(
+        "the failing row is tiered too, not just the passing one",
+        (read_planted(path)["planted-dbi-diff"].get("comparison_tier") or "").strip()
+        in PARENT_UNQUALIFIED_TIERS,
+    )
+
+# NOT INERT. An assertion that cannot fail is not evidence, so plant the exact
+# defect -- a producer that emits a blank tier -- and confirm the check above
+# catches it. The fixture is inert: it mutates only this in-process module and
+# writes to a temp file, and a blank tier is data, never an authorization.
+saved = run_matrix.COMPARISON_TIER
+try:
+    run_matrix.COMPARISON_TIER = ""
+    path, err = append(TIERED_HEADER)
+    with path.open(newline="", encoding="utf-8") as fh:
+        regressed = [(r.get("comparison_tier") or "").strip() for r in csv.DictReader(fh)]
+    check(
+        f"planting a blank tier DOES produce blanks ({sum(1 for t in regressed if not t)}"
+        f"/{len(regressed)}) — the check above is not vacuous",
+        err is None and len(regressed) > 0 and all(not t for t in regressed),
+        repr(err) if err else str(regressed),
+    )
+finally:
+    run_matrix.COMPARISON_TIER = saved
+
+print("case UNTIERED-PARENT — a file without the column is still accepted")
+# Backward compatibility, and the reason `comparison_tier` is NOT added to
+# SCORECARD_HEADER: that would put it in PRODUCED_COLUMNS and make it REQUIRED,
+# turning "this producer learned to record more" into a hard refusal of every
+# older parent scorecard -- the exact fleet outage this module exists to prevent.
+path, err = append(CURRENT_20)
+check("append is accepted", err is None, repr(err))
+if err is None:
+    hdr = path.read_text(encoding="utf-8").splitlines()[0]
+    check("no comparison_tier column was invented", "comparison_tier" not in hdr, hdr)
+    widths = {
+        len(r) for r in csv.reader(path.read_text(encoding="utf-8").splitlines()) if r
+    }
+    check("rows are still 20 fields wide (no widening)", widths == {20}, str(widths))
+
 print()
 if FAILURES:
     print(f"FAIL ({len(FAILURES)} assertions)")

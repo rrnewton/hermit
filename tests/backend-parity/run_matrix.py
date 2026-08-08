@@ -84,6 +84,41 @@ EVIDENCE_COLUMNS = (
     "tier",
 )
 
+# The cross-backend certification standard this harness earns, written on EVERY
+# row it appends.  It is a constant because it is a property of what this
+# harness compares, not of any individual result.
+#
+# WHY A CONSTANT AND NOT A BLANK.  `restval=""` below fills any column the outer
+# file has and this producer does not populate.  `comparison_tier` was not in
+# the dict above, so every appended row got a BLANK one -- and the parent
+# refuses a blank outright (`ci-hub/tests/test_published_scorecards_are_tiered.py`,
+# `compat-envelope/check-scorecard-tier.py`), because an untiered row is an
+# unqualified green: a verdict with no record of what comparison produced it.
+# Measured: six runs of this harness appended 168 rows to the parent scorecard,
+# 168 of them blank-tier, which reddened the parent's ci-hub CI shard.  A
+# producer that cannot state its comparison standard must not be able to write
+# the column at all, so it is filled here unconditionally.
+#
+# WHY THIS PARTICULAR VALUE.  The parent's vocabulary
+# (compat-envelope/check-scorecard-tier.py) admits exactly five values, and only
+# `full-stdout-info-stack-heap` and `stdout-info-stack-heap-spot-check` qualify a
+# raw pass as green.  Both require stack and heap evidence.  This harness records
+# neither -- it writes no `output_hash`, and produces no `stack_hash`/`heap_hash`
+# at all -- so it CANNOT earn either, and must never appear to.  Of the three
+# non-green values, `legacy-unqualified` is reserved for rows retro-labelled by
+# the schema migration and would be a lie on a fresh measurement, and
+# `unqualified-tool-count-only` describes the Reverie counter harness.  That
+# leaves the one that is true of every mode here: stdout (and exit status) is
+# compared in strict, verify, and repeat alike.
+#
+# It deliberately UNDERSTATES `--verify` runs, which additionally compare DETLOG
+# under the lossy `Stripped` comparator.  There is no tier value for "stripped
+# DETLOG without stack or heap", and understating is the safe direction: the
+# finer detail already travels on the same row in `verify_compare`, `tier`, and
+# `reason`, and no available value could promote these rows to green anyway.
+COMPARISON_TIER_COLUMN = "comparison_tier"
+COMPARISON_TIER = "unqualified-stdout-only"
+
 # Recorded as the comparator when the run produced no typed verdict at all, so a
 # reader can tell "no verdict existed" from "a verdict existed and was stripped".
 # A blank would conflate those two, and only one of them is a measurement.
@@ -1052,6 +1087,12 @@ def append_parent_scorecard(
                     column: (result.get("evidence") or {}).get(column, "")
                     for column in EVIDENCE_COLUMNS
                 },
+                # Unconditional, and NOT sourced from `evidence`: the standard
+                # this harness compares to is fixed by the harness, so a result
+                # that forgot to report it must not be able to produce a blank.
+                # `extrasaction="ignore"` drops it for an outer file that does
+                # not carry the column, so writing it stays backward compatible.
+                COMPARISON_TIER_COLUMN: COMPARISON_TIER,
             }
         )
 
