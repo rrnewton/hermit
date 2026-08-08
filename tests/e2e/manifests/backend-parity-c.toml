@@ -4048,7 +4048,7 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 [[test]]
 id = "backend-parity-c/getcpu-identity"
-description = "Strict verification for tests/c/getcpu_identity.c"
+description = "getcpu(2) host-topology determinization: raw syscall reports CPU 0 / node 0 with the observed values emitted"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
@@ -4057,9 +4057,10 @@ program = "tests/c/getcpu_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "dbi", "kvm"]
+ci = true
+backends_enabled = ["ptrace", "dbi"]
 [test.modes.verify.backends_disabled]
+kvm = "Measured on the validation host: KVM does not start the guest, so no getcpu verdict is available. Previously listed as enabled while the whole entry was ci=false, i.e. never exercised"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
