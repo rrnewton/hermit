@@ -1086,6 +1086,26 @@ async fn run_sabre(
         guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
+    // SaBRe loads the guest ELF and its interpreter BEFORE it loads this
+    // plugin, so the entire dynamic-loading phase runs with no Detcore in the
+    // address space. Those syscalls never become COMMIT records and the run
+    // still exits 0 -- measured on this host, `/bin/true` yields 3 COMMITs
+    // under SaBRe against 14 under the ptrace reference, the 11 missing ones
+    // being the loader's libc.so.6 path resolution.
+    //
+    // This is an unconditional property of SaBRe's launch order, not a
+    // per-run measurement, so it is reported unconditionally. Deliberately
+    // NOT gated on a counter: the ptrace fallback cannot observe this window
+    // (SaBRe has already rewritten those sites, so they never reach the
+    // supervisor as raw syscall instructions), which means any such counter
+    // reads zero here and would be an inert guard reporting false coverage.
+    tracing::warn!(
+        target: "hermit::sabre",
+        "SaBRe does not observe the guest's dynamic-loading phase: the guest \
+         interpreter is loaded before the Detcore plugin, so loader syscalls \
+         are ABSENT from the Detcore log. A SaBRe run is NOT full-coverage \
+         and its log is not comparable to the ptrace reference prefix.",
+    );
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
