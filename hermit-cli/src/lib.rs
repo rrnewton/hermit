@@ -1083,9 +1083,29 @@ async fn run_sabre(
         target: "hermit::sabre::fallback",
         ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
         trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
+        detcore_rpc_requests = supervised.path_evidence.detcore_rpc_requests,
+        routing = supervised.path_evidence.routing,
         guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
+    // A run that routed nothing to Detcore produced no determinization at all,
+    // yet exits 0 and reports the same zero counters as a clean run. Say so at
+    // a level that is on by default; the previous signal could not tell these
+    // apart, so a warning built on it would only have made the ambiguity
+    // louder.
+    match supervised.path_evidence.routing {
+        "not_engaged" => tracing::warn!(
+            target: "hermit::sabre",
+            "no guest-side Detcore tool ever reached this coordinator: the run \
+             was NOT determinized and its result is a no-result, not a pass.",
+        ),
+        "connected_idle" => tracing::warn!(
+            target: "hermit::sabre",
+            "the SaBRe plugin connected but routed ZERO requests to Detcore: \
+             nothing was determinized. This is a no-result, not a pass.",
+        ),
+        _ => {}
+    }
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)

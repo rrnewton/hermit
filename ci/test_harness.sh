@@ -1368,22 +1368,28 @@ function summarize_sabre_path_evidence {
     shift
     jq -s --argjson expected "$expected" '
         if all(.[];
-            .schema == 1
+            .schema == 2
             and (.guest_rpc_observed | type == "boolean")
+            and (.detcore_rpc_requests | type == "number")
+            and (.routing | type == "string")
             and (.ptrace_fallback_sites | type == "number")
             and (.trusted_shared_object_sites | type == "number")
             and (.trusted_shared_objects | type == "array"))
         then {
-            schema: 1,
+            schema: 2,
             expected_execution_count: $expected,
             complete: (length == $expected),
             execution_count: length,
             guest_rpc_observed: (length > 0 and all(.[]; .guest_rpc_observed)),
+            detcore_rpc_requests: (map(.detcore_rpc_requests) | add // 0),
+            routing: (map(.routing) | unique),
             ptrace_fallback_sites: (map(.ptrace_fallback_sites) | add // 0),
             trusted_shared_object_sites: (map(.trusted_shared_object_sites) | add // 0),
             trusted_shared_objects: (map(.trusted_shared_objects) | add // [] | unique),
             eligible: (length == $expected and length > 0 and all(.[];
                 .guest_rpc_observed
+                and .routing == "routed"
+                and .detcore_rpc_requests > 0
                 and .ptrace_fallback_sites == 0
                 and .trusted_shared_object_sites == 0)),
             executions: .
@@ -1401,9 +1407,9 @@ function collect_sabre_path_evidence {
     files=("$cell_dir"/captures/*.sabre-path.jsonl)
     shopt -u nullglob
     if ((${#files[@]} == 0)); then
-        jq -cn --argjson expected "$expected" '{schema:1,
+        jq -cn --argjson expected "$expected" '{schema:2,
             expected_execution_count:$expected,complete:false,execution_count:0,
-            guest_rpc_observed:false,
+            guest_rpc_observed:false,detcore_rpc_requests:0,routing:[],
             ptrace_fallback_sites:0,trusted_shared_object_sites:0,
             trusted_shared_objects:[],eligible:false,executions:[]}'
         return
@@ -1422,23 +1428,29 @@ function expected_sabre_execution_count {
 }
 
 function audit_sabre_path_evidence_contract {
-    local eligible fallback trusted shortfall
+    local eligible fallback trusted shortfall idle unengaged
     eligible=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 2)
     fallback=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 1)
     trusted=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
         summarize_sabre_path_evidence 1)
     # PLANTED NEGATIVE for the execution-count obligation: one otherwise-clean
     # record where the mode contracts for two. Every per-record predicate here
     # passes, so this is refused only if the count itself is enforced.
     shortfall=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 2)
+    idle=$(printf '%s\n' \
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":0,"routing":"connected_idle","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
+    unengaged=$(printf '%s\n' \
+        '{"schema":2,"guest_rpc_observed":false,"detcore_rpc_requests":0,"routing":"not_engaged","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
     jq -e '.eligible and .complete and .execution_count == 2' <<<"$eligible" >/dev/null ||
         die "legitimate SaBRe path evidence must remain eligible"
     jq -e '(.eligible | not) and .ptrace_fallback_sites == 1' <<<"$fallback" >/dev/null ||
@@ -1448,6 +1460,29 @@ function audit_sabre_path_evidence_contract {
     jq -e '(.eligible | not) and (.complete | not)
         and .execution_count == 1 and .expected_execution_count == 2' <<<"$shortfall" >/dev/null ||
         die "an execution-count shortfall must be ineligible even when every record is clean"
+    # THE AMBIGUOUS ZERO. Both planted records below carry the exact counters a
+    # clean run carries -- ptrace_fallback_sites 0, trusted_shared_object_sites
+    # 0, guest_rpc_observed true. Before the routed signal existed they were
+    # INDISTINGUISHABLE from the eligible fixture above and passed. They are
+    # refused only if positive routing evidence is required.
+    jq -e '(.eligible | not) and .detcore_rpc_requests == 0
+        and (.routing == ["connected_idle"])' <<<"$idle" >/dev/null ||
+        die "a plugin that connected but routed nothing must be ineligible"
+    jq -e '(.eligible | not) and (.routing == ["not_engaged"])' <<<"$unengaged" >/dev/null ||
+        die "a run where no guest tool reached the coordinator must be ineligible"
+    # POSITIVE CONTROL for the new axis specifically: identical to the idle
+    # record except for the routed evidence, so this proves the clause fires on
+    # the routing fact and is not just rejecting everything.
+    jq -e '.eligible and .detcore_rpc_requests == 232
+        and (.routing == ["routed"])' <<<"$eligible" >/dev/null ||
+        die "a genuinely routed run must remain eligible"
+    # A schema-1 record predates the routed signal, so its zeros cannot carry
+    # the distinction. Refuse it outright rather than read it as clean.
+    if printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1 >/dev/null 2>&1; then
+        die "pre-routing schema-1 SaBRe path evidence must be refused, not accepted as clean"
+    fi
 }
 
 function prepare_test {
