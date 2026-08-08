@@ -46,6 +46,14 @@ if [[ $advisory_status -eq 1 ]]; then
   exit 1
 fi
 
+# Refuse a checkout where an unreviewable merge driver can rewrite committed
+# content. This is local-only by nature -- the binding lives in untracked config,
+# so no CI job can ever see it -- which is exactly why it belongs in the hook.
+hygiene="$root/ci/check-merge-driver-hygiene.sh"
+if [[ -x "$hygiene" ]]; then
+  "$hygiene" || exit 1
+fi
+
 # Also guard the nested-workspace lockfile against pin drift once its checker is
 # present (lands separately as rrnewton/hermit#1609). Until then this is a no-op.
 nested="$root/scripts/check-nested-lockfiles.rs"
