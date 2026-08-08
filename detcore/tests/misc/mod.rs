@@ -247,22 +247,144 @@ fn prctl_keepcaps_round_trips_deterministically() {
     });
 }
 
+/// Linux's initial per-task timer slack. Measured natively on this kernel:
+/// a freshly-execed process reports 50000 from both `PR_GET_TIMERSLACK` and
+/// `/proc/self/timerslack_ns`.
+const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
+
 #[test]
-fn prctl_timer_slack_round_trips_deterministically() {
-    // Timer slack only controls host timer coalescing. Detcore virtualizes
-    // sleeps and thread scheduling, so preserving Linux's per-thread set/get
-    // behavior cannot change guest ordering or logical time.
+fn prctl_timer_slack_is_virtualized_not_read_from_the_host() {
+    // The guest must see Detcore's fixed default, NOT whatever slack Hermit's
+    // launcher happened to be running with. Before virtualization this read the
+    // tracee's real inherited value, which is unmodeled host state.
     det_test_fn_sequential_without_pmu(|| unsafe {
-        let original = libc::prctl(libc::PR_GET_TIMERSLACK);
-        assert!(original > 0, "timer slack must be positive");
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            DEFAULT_TIMER_SLACK_NS,
+            "initial timer slack must be Linux's 50us default, not the host's"
+        );
 
         const REQUESTED_SLACK_NS: libc::c_int = 1_000_000;
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
-        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            REQUESTED_SLACK_NS,
+            "GET must report the value the guest SET -- not a constant"
+        );
 
-        // A zero value restores the thread's inherited default timer slack.
+        // Zero restores the thread's default. It does NOT set a zero slack.
         assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
-        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), original);
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            DEFAULT_TIMER_SLACK_NS,
+            "SET 0 must reset to the default, not zero the slack"
+        );
+    });
+}
+
+#[test]
+fn prctl_timer_slack_does_not_change_the_physical_tracee_value() {
+    // The whole reason to virtualize rather than pass through: a large slack on
+    // the real task would change wake latency and timeout ordering on the paths
+    // Detcore still times against the host. `/proc/self/timerslack_ns` is the
+    // physical value, so it must not move when the guest sets a virtual one.
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        let physical_before = std::fs::read_to_string("/proc/self/timerslack_ns")
+            .expect("timerslack_ns must be readable");
+
+        const HUGE_SLACK_NS: libc::c_int = 1_000_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, HUGE_SLACK_NS), 0);
+        assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), HUGE_SLACK_NS);
+
+        let physical_after = std::fs::read_to_string("/proc/self/timerslack_ns")
+            .expect("timerslack_ns must be readable");
+        assert_eq!(
+            physical_before.trim(),
+            physical_after.trim(),
+            "the guest's virtual slack must not be written to the real task"
+        );
+
+        // A timeout-bearing syscall still completes promptly. Under the old
+        // passthrough a one-second physical slack could coalesce this wakeup.
+        let request = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        let mut remain = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(libc::nanosleep(&request, &mut remain), 0);
+    });
+}
+
+/// The named bypass, exercised end to end rather than only as a subscription
+/// assertion. Under `passthru_opt` the subscription is an allow-list, so if
+/// `prctl` is not on it the syscall reaches the host and the guest observes the
+/// launcher's real slack instead of Detcore's virtual one. This is the config
+/// `hermit record` and `hermit replay` actually run with.
+#[test]
+fn prctl_timer_slack_is_still_mediated_under_passthru_opt() {
+    let config = detcore::Config {
+        max_timeslice: None,
+        sequentialize_threads: true,
+        passthru_opt: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        || unsafe {
+            assert_eq!(
+                libc::prctl(libc::PR_GET_TIMERSLACK),
+                DEFAULT_TIMER_SLACK_NS,
+                "passthru_opt must not route prctl past the virtualization"
+            );
+            const REQUESTED_SLACK_NS: libc::c_int = 3_000_000;
+            assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, REQUESTED_SLACK_NS), 0);
+            assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), REQUESTED_SLACK_NS);
+
+            let physical = std::fs::read_to_string("/proc/self/timerslack_ns")
+                .expect("timerslack_ns must be readable");
+            assert_ne!(
+                physical.trim(),
+                REQUESTED_SLACK_NS.to_string(),
+                "the virtual slack must not have been written to the real task"
+            );
+        },
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+#[test]
+fn prctl_timer_slack_default_is_inherited_from_the_creating_thread() {
+    // Linux asymmetry, measured natively rather than assumed: a new task's
+    // DEFAULT becomes the creating thread's CURRENT slack. So a thread spawned
+    // after its parent raised the slack resets to the raised value, not to 50us.
+    det_test_fn_sequential_without_pmu(|| unsafe {
+        const PARENT_SLACK_NS: libc::c_int = 2_000_000;
+        assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, PARENT_SLACK_NS), 0);
+
+        let child = std::thread::spawn(|| {
+            let inherited = libc::prctl(libc::PR_GET_TIMERSLACK);
+            assert_eq!(
+                inherited, PARENT_SLACK_NS,
+                "child inherits parent's current"
+            );
+            assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_GET_TIMERSLACK),
+                PARENT_SLACK_NS,
+                "child's SET 0 resets to the inherited default, not 50us"
+            );
+        });
+        child.join().expect("child thread panicked");
+
+        assert_eq!(
+            libc::prctl(libc::PR_GET_TIMERSLACK),
+            PARENT_SLACK_NS,
+            "the child must not disturb the parent's slack"
+        );
     });
 }
 

@@ -908,6 +908,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::rt_sigprocmask,
                 Sysno::rt_sigaction,
                 Sysno::getrusage,
+                // TODO-HUMAN-REVIEW(PR-924): Keep prctl intercepted under the
+                // performance opt-in. `handle_prctl` emulates
+                // PR_{SET,GET}_TIMERSLACK against per-thread Detcore state, and
+                // that emulation is only reachable if Detcore sees the syscall.
+                // Without this entry the opt-in routes prctl straight to the
+                // host -- and because `record_or_replay_config` sets
+                // passthru_opt, that is the DEFAULT for `hermit record` and
+                // `hermit replay`, where the guest would both observe the
+                // launcher's inherited slack and physically change the tracee's.
+                Sysno::prctl,
                 Sysno::sysinfo,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -1243,6 +1253,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     last_accounted_user_time,
                     last_accounted_system_time,
+                    // Timer slack is per-task and is inherited by BOTH a new
+                    // thread and a forked process, so `CLONE_THREAD` does not
+                    // enter into it. Note the asymmetry, which is Linux's and
+                    // was measured rather than assumed: the child's CURRENT
+                    // slack is the parent's current slack, and the child's
+                    // DEFAULT — what `PR_SET_TIMERSLACK 0` restores — is also
+                    // the parent's current slack, not the initial 50us default.
+                    // So a thread created after its parent raised its slack
+                    // resets to the raised value.
+                    timer_slack_ns: pts.1.timer_slack_ns,
+                    default_timer_slack_ns: pts.1.timer_slack_ns,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -2367,6 +2388,35 @@ mod subscription_tests {
             deterministic_io: true,
             passthru_opt,
             ..Default::default()
+        }
+    }
+
+    /// The named bypass for the timer-slack virtualization.
+    ///
+    /// `handle_prctl` emulates `PR_{SET,GET}_TIMERSLACK` against per-thread
+    /// Detcore state, and that emulation is only reachable if Detcore is
+    /// subscribed to `prctl`. Under the performance opt-in the subscription is
+    /// an explicit allow-list, so an unlisted syscall goes straight to the host
+    /// and the handler never runs. That is not a corner case:
+    /// `record_or_replay_config` sets `passthru_opt`, so it is the DEFAULT for
+    /// `hermit record` and `hermit replay`.
+    ///
+    /// N-of-M: `prctl` is 1 of the 2 syscalls this virtualization depends on
+    /// reaching Detcore (`prctl` itself, and `clone`/`clone3` for the
+    /// inheritance path, which were already subscribed).
+    #[test]
+    fn passthru_opt_still_intercepts_prctl_for_timer_slack() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::prctl),
+            "prctl must stay intercepted under passthru_opt or PR_SET_TIMERSLACK \
+             reaches the host and the per-thread virtualization is bypassed"
+        );
+        // The inheritance path depends on Detcore seeing task creation too.
+        for sysno in [Sysno::clone, Sysno::clone3] {
+            assert!(subscriptions.iter_syscalls().any(|s| s == sysno), "{sysno}");
         }
     }
 
