@@ -469,7 +469,8 @@
     {
       "group": "test", "job": "strict_compat",
       "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose",
+      "description": "This is the ONLY DAG node that re-enters validate, so it is the only place where the driver's fail-closed cgroup boxing is nested inside an already-unboxed caller. ci/run-node.sh opts the OUTER safe-ci-dag-runner out of fail-closed boxing whenever $GITHUB_ACTIONS or $CI is set, on the grounds that the throwaway Actions VM is itself the containment boundary; the Actions runner deliberately skips the systemd --user scope, so nothing inside it can establish a scope. The allowance must be re-stated here because the driver takes it ONLY as a CLI flag -- it has no env-var override, by design, so that the environment can never silently disable boxing. The guard mirrors run-node.sh's condition exactly: an inner rule STRICTER than the outer one would reproduce the original failure in any context where the outer opted out. With no CI variable set (a local or producer run) the guard is false and the nested validate still boxes fail-closed.",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./validate.sh --portable-strict-compat-only --no-label-pr --verbose \"${acf[@]}\"",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
