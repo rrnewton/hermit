@@ -51,6 +51,10 @@ struct Config {
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    /// Skip the post-bump compile check. Stored INVERTED so the derived
+    /// `Default` cannot silently produce the unsafe setting: verification is on
+    /// unless a caller explicitly asks for it to be off.
+    skip_verify_build: bool,
 }
 
 #[derive(Debug)]
@@ -72,6 +76,7 @@ fn usage() -> &'static str {
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        -h, --help                          Show this help\n\
      \n\
      Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
@@ -94,6 +99,7 @@ fn parse_args() -> Result<Config, String> {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
             "--update-to-latest" => config.update_to_latest = true,
+            "--no-verify-build" => config.skip_verify_build = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -361,7 +367,7 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
     Ok((changed_files, changed_entries))
 }
 
-fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
+fn update_to_latest(root: &Path, scan: &PinScan, main: &str, verify_build: bool) -> Result<(), String> {
     if scan
         .occurrences
         .iter()
@@ -401,11 +407,50 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
             "update completed but derived Cargo metadata records {pin}, expected {main}"
         ));
     }
+    // PIN CONSISTENCY IS NOT PIN VIABILITY. Everything above proves the tree
+    // names ONE revision and that it equals latest main. It proves nothing
+    // about whether Hermit still COMPILES against that revision, and a Reverie
+    // main that builds standalone can still break a consumer here. Without this
+    // step such a bump is rewritten, re-derived, reported as a clean success --
+    // and the pin gate then certifies it GREEN, actively vouching for a tree
+    // that cannot build.
+    if verify_build {
+        println!("Verifying the bumped tree compiles (cargo check --locked --workspace)...");
+        run_cargo_check(root)?;
+        println!("Bumped tree compiles.");
+    } else {
+        eprintln!(
+            "WARNING: --no-verify-build was passed: pin CONSISTENCY was checked, pin \
+             VIABILITY was not. This bump may not compile."
+        );
+    }
+
     println!(
         "Reverie pin updated to latest main {main} across {} derived revision entries.",
         updated.occurrences.len()
     );
     Ok(())
+}
+
+/// Compile gate for a bumped tree.
+///
+/// `--locked` on purpose: the lockfiles were regenerated moments ago, so a
+/// resolution the lockfile cannot satisfy is itself the defect. Letting cargo
+/// re-resolve here would paper over exactly the inconsistency being tested for.
+fn run_cargo_check(root: &Path) -> Result<(), String> {
+    let status = Command::new("cargo")
+        .current_dir(root)
+        .args(["check", "--locked", "--workspace", "--all-targets"])
+        .status()
+        .map_err(|error| format!("could not run cargo check: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "BUMP REFUSED: the pin was updated consistently but the tree does NOT compile \
+         against it ({status}). The edits remain on disk for inspection; do not commit \
+         them. Re-run with --no-verify-build only to land a knowingly-broken pin."
+    ))
 }
 
 fn loud_header(title: &str) {
@@ -606,7 +651,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     };
 
     if config.update_to_latest {
-        update_to_latest(&root, &scan, &main)?;
+        update_to_latest(&root, &scan, &main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
         let updated_pin = unique_pin(&updated)?;
         let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
@@ -664,6 +709,24 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    /// The compile gate must be ON unless someone explicitly asks for it off.
+    ///
+    /// `Config` derives `Default`, and a `verify_build: bool` field would have
+    /// defaulted to FALSE -- silently shipping the unsafe setting to every
+    /// caller that did not think about it. Storing the inverse makes the safe
+    /// state the default state structurally rather than by remembering to set
+    /// it. This pins that: if someone renames the field back to a positive
+    /// sense, this test fails.
+    #[test]
+    fn build_verification_defaults_to_on() {
+        let config = Config::default();
+        assert!(
+            !config.skip_verify_build,
+            "Config::default() must leave build verification ENABLED; a derived \
+             Default that disables it would make every unaware caller unsafe"
+        );
+    }
 
     #[test]
     fn extracts_rev_key_not_reverie_prefix() {
