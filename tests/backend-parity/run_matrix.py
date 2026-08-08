@@ -22,9 +22,12 @@ BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
 
 # The compatibility scorecard is measurement state, not Hermit source.  When
-# this checkout is nested in dev-hermit, live observations are appended to the
-# outer workspace's canonical scorecard.  Standalone Hermit clones simply skip
-# that side effect unless --parent-scorecard is supplied.
+# this checkout is nested in dev-hermit, live observations are recorded under the
+# outer workspace's compat-envelope/ignored/backend-parity/ — one file per run,
+# git-ignored, so running a test never dirties the parent's tracked tree.
+# Standalone Hermit clones skip the side effect unless --parent-scorecard names a
+# destination.  Publishing into the tracked scorecard is a deliberate fold-in,
+# not something a test run does to you; see DEFAULT_OBSERVATION_SUBDIR.
 SCORECARD_HEADER = (
     "run_id",
     "run_utc",
@@ -49,6 +52,7 @@ SCORECARD_HEADER = (
     "bitwise_parity",
     "compared_log_messages",
     "tier",
+    "comparison_tier",
 )
 
 # Accepted spellings for the stdout-parity column, in preference order.
@@ -82,7 +86,53 @@ EVIDENCE_COLUMNS = (
     "bitwise_parity",
     "compared_log_messages",
     "tier",
+    # Listed here, and in SCORECARD_HEADER, for two different reasons that must
+    # both hold. In SCORECARD_HEADER so a file this producer CREATES carries the
+    # column: the default destination is now a fresh per-run file, and without
+    # this the created header had 23 columns, `extrasaction="ignore"` silently
+    # dropped the tier on the way out, and folding that file into the published
+    # scorecard would have reintroduced exactly the blank-tier rows this producer
+    # was fixed to stop emitting. Here so it stays OPTIONAL of an EXISTING file
+    # (PRODUCED_COLUMNS excludes EVIDENCE_COLUMNS), because demanding it would
+    # hard-refuse every older parent scorecard — the fleet-outage shape this
+    # module exists to prevent.
+    "comparison_tier",
 )
+
+# The cross-backend certification standard this harness earns, written on EVERY
+# row it appends.  It is a constant because it is a property of what this
+# harness compares, not of any individual result.
+#
+# WHY A CONSTANT AND NOT A BLANK.  `restval=""` below fills any column the outer
+# file has and this producer does not populate.  `comparison_tier` was not in
+# the dict above, so every appended row got a BLANK one -- and the parent
+# refuses a blank outright (`ci-hub/tests/test_published_scorecards_are_tiered.py`,
+# `compat-envelope/check-scorecard-tier.py`), because an untiered row is an
+# unqualified green: a verdict with no record of what comparison produced it.
+# Measured: six runs of this harness appended 168 rows to the parent scorecard,
+# 168 of them blank-tier, which reddened the parent's ci-hub CI shard.  A
+# producer that cannot state its comparison standard must not be able to write
+# the column at all, so it is filled here unconditionally.
+#
+# WHY THIS PARTICULAR VALUE.  The parent's vocabulary
+# (compat-envelope/check-scorecard-tier.py) admits exactly five values, and only
+# `full-stdout-info-stack-heap` and `stdout-info-stack-heap-spot-check` qualify a
+# raw pass as green.  Both require stack and heap evidence.  This harness records
+# neither -- it writes no `output_hash`, and produces no `stack_hash`/`heap_hash`
+# at all -- so it CANNOT earn either, and must never appear to.  Of the three
+# non-green values, `legacy-unqualified` is reserved for rows retro-labelled by
+# the schema migration and would be a lie on a fresh measurement, and
+# `unqualified-tool-count-only` describes the Reverie counter harness.  That
+# leaves the one that is true of every mode here: stdout (and exit status) is
+# compared in strict, verify, and repeat alike.
+#
+# It deliberately UNDERSTATES `--verify` runs, which additionally compare DETLOG
+# under the lossy `Stripped` comparator.  There is no tier value for "stripped
+# DETLOG without stack or heap", and understating is the safe direction: the
+# finer detail already travels on the same row in `verify_compare`, `tier`, and
+# `reason`, and no available value could promote these rows to green anyway.
+COMPARISON_TIER_COLUMN = "comparison_tier"
+COMPARISON_TIER = "unqualified-stdout-only"
 
 # Recorded as the comparator when the run produced no typed verdict at all, so a
 # reader can tell "no verdict existed" from "a verdict existed and was stripped".
@@ -952,15 +1002,60 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
         writer.writerows(results)
 
 
-def discover_parent_scorecard() -> Path | None:
+# Where an auto-discovered run writes, RELATIVE TO compat-envelope/.
+#
+# `ignored/` is git-ignored by an existing repo-wide rule (dev-hermit
+# .gitignore:119, a bare `ignored/`, which matches at any depth) — so this needs
+# no new ignore entry, and a run cannot dirty the parent's tracked tree.
+#
+# WHY THIS IS NOT `scorecard.csv` ANY MORE. It used to be, and the consequence
+# was that `make validate-dbi` or `make validate-kvm` — from ANY worktree, since
+# discovery walks upward — appended 28 rows to the parent's TRACKED
+# compat-envelope/scorecard.csv as a side effect of running a test. Measured on
+# 2026-08-07: six such runs left 168 accumulated rows, 28 cells x 6 repeats, with
+# ZERO unique measurements (all 28 logical cells were already present in the
+# committed 624, and all six runs were verdict-identical to each other and to the
+# committed newest verdict per cell). Anyone who staged that file reddened the
+# ci-hub tiering guard. A published scorecard that grows every time a test runs
+# also cannot serve as a baseline, which is what it exists to be.
+#
+# So: a test run records its observations, always, to a per-run artifact; folding
+# them into the published scorecard is a deliberate act with a reviewer, not a
+# side effect nobody chose. `--parent-scorecard PATH` remains the explicit way to
+# write a specific file, including the tracked one.
+DEFAULT_OBSERVATION_SUBDIR = Path("ignored") / "backend-parity"
+
+
+def discover_compat_envelope() -> Path | None:
+    """The nearest enclosing dev-hermit `compat-envelope/`, or None if standalone."""
     configured = os.environ.get("DEV_HERMIT_ROOT") or os.environ.get("DEV_HERMIT")
     roots = [Path(configured)] if configured else []
     roots.extend((REPOSITORY, *REPOSITORY.parents))
     for root in roots:
         compat_dir = root / "compat-envelope"
         if compat_dir.is_dir():
-            return compat_dir / "scorecard.csv"
+            return compat_dir
     return None
+
+
+def default_observation_path(run_id: str) -> Path | None:
+    """The auto-discovered destination: one ignored file per run, never the tracked one."""
+    compat_dir = discover_compat_envelope()
+    if compat_dir is None:
+        return None
+    return compat_dir / DEFAULT_OBSERVATION_SUBDIR / f"{run_id}.csv"
+
+
+def make_run_id() -> tuple[str, int]:
+    """`(run_id, epoch)`. Hoisted out of the writer so the caller can name the file.
+
+    Every invocation is distinct, so per-run files never collide and concurrent
+    worktrees cannot interleave — which is what the shared-file lock used to be
+    for.
+    """
+    hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
+    epoch = int(time.time())
+    return f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}", epoch
 
 
 def git_output(*args: str) -> str | None:
@@ -982,16 +1077,23 @@ def append_parent_scorecard(
     strict: bool,
     verify: bool,
     probe_gaps: bool,
+    run_id: str | None = None,
+    epoch: int | None = None,
 ) -> None:
     # Multiple worktrees can validate concurrently against one outer workspace.
     # Serialize whole-row appends so the shared measurement log remains valid.
+    # Still required: `--parent-scorecard` can name a shared file, and the
+    # default per-run path only makes a collision unlikely, not impossible.
     import fcntl
 
     path.parent.mkdir(parents=True, exist_ok=True)
     hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
     dirty = bool(git_output("status", "--porcelain"))
-    epoch = int(time.time())
-    run_id = f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}"
+    # The caller may have already minted these to name the output file. Reusing
+    # its values keeps the filename and the `run_id` column describing the same
+    # run; re-deriving them here would let the two disagree by a second.
+    if run_id is None or epoch is None:
+        run_id, epoch = make_run_id()
     mode = "verify" if verify else "strict" if strict else "repeat"
     rows: list[dict[str, str]] = []
     for result in results:
@@ -1052,6 +1154,12 @@ def append_parent_scorecard(
                     column: (result.get("evidence") or {}).get(column, "")
                     for column in EVIDENCE_COLUMNS
                 },
+                # Unconditional, and NOT sourced from `evidence`: the standard
+                # this harness compares to is fixed by the harness, so a result
+                # that forgot to report it must not be able to produce a blank.
+                # `extrasaction="ignore"` drops it for an outer file that does
+                # not carry the column, so writing it stays backward compatible.
+                COMPARISON_TIER_COLUMN: COMPARISON_TIER,
             }
         )
 
@@ -1116,14 +1224,15 @@ def parse_args() -> argparse.Namespace:
         "--parent-scorecard",
         type=Path,
         help=(
-            "append observations to this outer dev-hermit scorecard (default: "
-            "auto-detect compat-envelope/scorecard.csv)"
+            "append observations to this exact file, including a tracked "
+            "scorecard if that is what you mean (default: one ignored per-run "
+            "file under compat-envelope/ignored/backend-parity/)"
         ),
     )
     parser.add_argument(
         "--no-parent-scorecard",
         action="store_true",
-        help="disable the outer dev-hermit scorecard side effect",
+        help="record no observations anywhere (they are otherwise always recorded)",
     )
     parser.add_argument(
         "--probe-gaps",
@@ -1257,20 +1366,38 @@ def main() -> int:
             "--parent-scorecard and --no-parent-scorecard cannot be used together"
         )
     if not args.no_parent_scorecard and results:
-        parent_scorecard = args.parent_scorecard or discover_parent_scorecard()
-        if parent_scorecard is None:
+        # Mint the run identity HERE so it can name the output file, and pass it
+        # down so the filename and the `run_id` column cannot disagree.
+        run_id, epoch = make_run_id()
+        explicit = args.parent_scorecard is not None
+        destination = args.parent_scorecard or default_observation_path(run_id)
+        if destination is None:
             print(
-                "TRACKING: outer dev-hermit scorecard not found; "
-                "use --parent-scorecard to select one"
+                "TRACKING: no enclosing dev-hermit compat-envelope/ found; "
+                f"{len(results)} observation(s) NOT recorded. "
+                "Use --parent-scorecard PATH to choose a destination, or "
+                "--no-parent-scorecard to make that explicit."
             )
         else:
             append_parent_scorecard(
-                parent_scorecard,
+                destination,
                 results,
                 strict=strict,
                 verify=args.verify,
                 probe_gaps=args.probe_gaps,
+                run_id=run_id,
+                epoch=epoch,
             )
+            if not explicit:
+                # Say where the data went and how to publish it. Redirecting the
+                # write is only half the fix: a run whose results land somewhere
+                # nobody is told about has not recorded them in any useful sense.
+                print(
+                    "TRACKING: these observations are a per-run artifact, not the "
+                    "published scorecard. To fold them in deliberately (and review "
+                    f"the diff):\n  python3 compat-envelope/migrate-scorecard-schema.py {destination} --apply\n"
+                    f"  tail -n +2 {destination} >> compat-envelope/scorecard.csv"
+                )
     return 1 if failures else 0
 
 
