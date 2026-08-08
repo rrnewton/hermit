@@ -2769,8 +2769,16 @@ mod tests {
     #[test]
     fn ownership_change_family_is_determinized_not_passthrough() {
         // POSITIVE: exactly the four ownership-mutation syscalls are in the
-        // predicate AND are classified Determinized, so the lib.rs dispatch arm
-        // that matches on the predicate is actually reachable for them.
+        // predicate AND are classified Determinized, so the guard on the lib.rs
+        // dispatch arm would be satisfied for them.
+        //
+        // WHAT THIS TEST CANNOT SEE, stated so nobody reads it as more coverage
+        // than it is: it pins MEMBERSHIP, not the arm's RESULT. Measured -- with
+        // the arm's body mutated from the emulated success to Err(EPERM), and
+        // again with the whole arm deleted, this test stays GREEN. The
+        // behavioural contract lives in
+        // hermit-cli/tests/chown_virtual_root_identity.rs, which fails under
+        // both of those mutations. Do not let this test stand in for it.
         for sysno in [Sysno::chown, Sysno::fchown, Sysno::fchownat, Sysno::lchown] {
             assert!(
                 is_ownership_change_noop_syscall(sysno),

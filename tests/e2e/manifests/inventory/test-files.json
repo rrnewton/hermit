@@ -787,6 +787,12 @@
       "why": "tests/c/cachestat_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBT and runs in blocking GitHub CI"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/chown_virtual_root_identity.c",
+      "runner": "hermit-cli/tests/chown_virtual_root_identity.rs",
+      "why": "tests/c/chown_virtual_root_identity.c is owned by hermit-cli/tests/chown_virtual_root_identity.rs: Guest asserting BOTH halves of the determinized chown-family contract -- a virtual root's ownership change succeeds for any uid, and the errors that are not identity errors (ENOENT, EBADF, ENOTDIR, and the fchownat flag EINVAL) still reach the guest. It is the behavioural bracket the syscall_classification unit tests cannot be: those pin set membership, and stay green when the dispatch arm's result regresses. The Rust integration test compiles it with cc and runs it under hermit in both namespace configurations. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/clock_adjtime_deterministic.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
