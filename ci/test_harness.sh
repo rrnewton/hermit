@@ -1510,6 +1510,38 @@ function prepare_test {
     fi
 }
 
+# Preserve the product's typed verification verdict in the harness result.  The
+# outer scorecard collector must not infer comparison strength from exit status
+# or from the human-readable success banner: only --verify-json records the
+# selected policy, the bitwise verdict, and the non-vacuous message counts.
+# Missing reports remain null for backends that do not publish this channel;
+# malformed reports are explicit errors rather than silently becoming absence.
+function read_verification_report {
+    local path=$1
+    if [[ ! -e $path ]]; then
+        printf 'null\n'
+    elif ! jq -ce 'select(type == "object")' "$path" 2>/dev/null; then
+        jq -cn --arg path "$path" '{report_error:"malformed-verify-json",path:$path}'
+    fi
+}
+
+function audit_verification_report_contract {
+    local positive mismatch missing
+    positive=$(read_verification_report <(printf '%s\n' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":9,"right":9}}'))
+    mismatch=$(read_verification_report <(printf '%s\n' \
+        '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":9,"right":9}}'))
+    missing=$(read_verification_report /dev/null)
+    jq -e '.verified == true and .bitwise_parity == true
+        and .comparison.strictness == "canonical"
+        and .compared_log_messages == {left:9,right:9}' <<<"$positive" >/dev/null ||
+        die "verification-report positive contract was not preserved"
+    jq -e '.verified == false and .bitwise_parity == false and .verdict == "diverged"' \
+        <<<"$mismatch" >/dev/null || die "verification-report mismatch was not preserved"
+    jq -e '.report_error == "malformed-verify-json"' <<<"$missing" >/dev/null ||
+        die "an existing malformed verification report became an absent report"
+}
+
 function execute_attempt {
     local test=$1
     local metadata=$2
@@ -1518,7 +1550,8 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
-    local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
+    local timeout_seconds stdout_file stderr_file path_evidence_file verify_json_file
+    local guest_tmpdir kind guest_backend verification_report=null
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
@@ -1584,7 +1617,9 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
+            verify_json_file="$cell_dir/captures/${mode}-${attempt}.verify.json"
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
+                --verify-strict "--verify-json=$verify_json_file"
                 "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
@@ -1610,14 +1645,19 @@ function execute_attempt {
     status=$?
     set -e
 
+    if [[ -n ${verify_json_file:-} ]]; then
+        verification_report=$(read_verification_report "$verify_json_file")
+    fi
+
     local hash
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    printf '%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$status" "$hash" "$stdout_file" "$stderr_file" "$verification_report"
 }
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
-    local path_evidence=$9
+    local path_evidence=$9 verification_report=${10}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -1648,7 +1688,8 @@ function append_result {
             ;;
         verify)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]')
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify",
+                  "--verify-strict","--verify-json=<per-cell-verdict.json>"]')
             log_level=info
             ;;
         replay)
@@ -1690,6 +1731,7 @@ function append_result {
         --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
         --argjson path_evidence "$path_evidence" \
+        --argjson verification_report "$verification_report" \
         '{schema:2,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
@@ -1698,6 +1740,7 @@ function append_result {
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
+          verification:$verification_report,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -1713,7 +1756,7 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' path_evidence=null
+    local outcome=PASS reason='' path_evidence=null verification_report=null
     if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
@@ -1791,7 +1834,7 @@ function run_cell {
     else
         local row status
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _ _ _ <<<"$row"
+        IFS=$'\t' read -r status _ _ _ verification_report <<<"$row"
         if [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
@@ -1819,7 +1862,8 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" \
+        "$reason" "$path_evidence" "$verification_report"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -1912,6 +1956,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_verification_report_contract
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
