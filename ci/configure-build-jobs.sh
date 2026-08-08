@@ -66,11 +66,13 @@ if [[ -v CI_DAG_REVERIE_DBI_MAX_BUILD_JOB_SECONDS ]]; then
     return 2
 fi
 
-# The calibration below is valid only for Reverie 108f9ab. The portable wrapper
-# obtains the repository's recorded pin through the canonical checker and
-# carries it here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 108f9ab47605a7a2e8ae40353fde21f8a8b2310c ]]; then
-    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 108f9ab47605a7a2e8ae40353fde21f8a8b2310c" >&2
+# The calibration below is valid only for Reverie 5bf9e0b. The measured DBI
+# recipe is unchanged from 108f9ab (the intervening commit changes two ptrace
+# logging files only), so the existing clamp and threshold carry forward. The
+# portable wrapper obtains the repository's recorded pin through the canonical
+# checker; a later pin bump cannot silently retain this calibration.
+if [[ ${REVERIE_DBI_BUDGET_BOUND_PIN:-} != 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf ]]; then
+    echo "configure-build-jobs.sh: DBI budget is not bound to calibrated Reverie 5bf9e0b5e294bab7ba719f13f1fc7e4ddae43daf" >&2
     return 2
 fi
 
