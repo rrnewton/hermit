@@ -1579,14 +1579,19 @@ function append_validation_ledger {
         result=$raw_result
     fi
 
-    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
-        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
-        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
-        concurrency_proof_json='"process_group_overlap_monitor"'
-    elif validate_lock_exclusivity_proven; then
+    # The process-bound box-global lock is the stronger authority. The legacy
+    # process-group observer also sees parked stop-test fixtures and other
+    # unadmitted validate.sh processes, so it cannot override a live canonical
+    # owner whose PID is proven in this shell's ancestry. Keep the observer as
+    # fail-closed evidence for direct, non-admitted runs only.
+    if validate_lock_exclusivity_proven; then
         concurrent_validates_json=0
         concurrency_proof_json='"validate_lock_owner_ancestry"'
         admission_json='"ci-hub-validate-lock"'
+    elif [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
+        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
+        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
+        concurrency_proof_json='"process_group_overlap_monitor"'
     else
         # A bare run with no observed peer is UNKNOWN, not proven exclusive.
         concurrent_validates_json=null

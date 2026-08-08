@@ -36,10 +36,10 @@ def stop_test_env(
         env.update(
             CI_HUB_VALIDATE_LOCK_OWNER_PID=str(os.getpid()),
             CI_HUB_VALIDATE_LOCK_OWNER_FILE=str(owner_file),
-            # Safe only with STOP_TEST_MODE, which cannot produce PASS. It keeps
-            # unrelated fleet validates from contaminating this owner-ancestry
-            # unit bracket while still exercising the real proof function.
-            VALIDATE_STOP_TEST_SKIP_CONCURRENCY_MONITOR="1",
+            # Plant the weaker legacy observation too. Canonical owner ancestry
+            # must win; otherwise parked stop-test fixtures make every genuine
+            # admitted schema-5 receipt unqualifiable.
+            CI_HUB_VALIDATE_CONCURRENT="true",
         )
     return env
 
