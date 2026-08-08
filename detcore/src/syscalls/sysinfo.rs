@@ -22,6 +22,9 @@ const MB: u64 = 1024 * 1024;
 // Linux exposes USER_HZ, not the kernel's configurable scheduler HZ, through times(2).
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+// `timeval.tv_usec` is microseconds; this is the divisor from the virtual clock's nanoseconds.
+const NANOS_PER_MICRO: u64 = 1_000;
 
 fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
     duration.as_nanos() / NANOS_PER_CLOCK_TICK
@@ -29,6 +32,20 @@ fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
 
 fn clock_t_from_ticks(ticks: u64) -> libc::clock_t {
     ticks as libc::clock_t
+}
+
+/// Convert a virtual-time duration to a `timeval` for the `rusage` CPU fields.
+///
+/// Microsecond resolution, truncating — the `timeval` unit itself, NOT rounded up to the
+/// clock-tick granularity `times(2)` is forced into. Keeping the finer unit matters: coarsening a
+/// virtual-time value is the same defect as freezing it, and a guest sampling `getrusage` in a
+/// loop must see CPU advance rather than sit on a tick boundary.
+fn timeval_from_logical(duration: crate::types::LogicalTime) -> libc::timeval {
+    let nanos = duration.as_nanos();
+    libc::timeval {
+        tv_sec: (nanos / NANOS_PER_SECOND) as libc::time_t,
+        tv_usec: ((nanos % NANOS_PER_SECOND) / NANOS_PER_MICRO) as libc::suseconds_t,
+    }
 }
 
 fn logical_clock_ticks(
@@ -181,15 +198,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         );
         Ok(0)
     }
-    /// Return a deterministic resource-usage snapshot. Host CPU times, page-fault counts, and
-    /// context-switch counts depend on kernel scheduling, so report zero until Detcore models
-    /// those counters using logical execution progress.
+    /// Return a deterministic resource-usage snapshot, with the CPU-time fields derived from
+    /// Detcore's VIRTUAL clock rather than reported as zero.
     ///
-    /// `ru_maxrss` is the exception: it is populated with the guest's peak resident set size so
-    /// that programs which require a positive maximum RSS (e.g. rr's `rusage` test) behave like
-    /// they do on Linux. The value comes from the same procfs memory accounting that `sysinfo`'s
-    /// free-memory reporting already relies on, which is deterministic across runs under Detcore's
-    /// fixed schedule.
+    /// `ru_utime`/`ru_stime` used to be left at zero because host CPU times depend on kernel
+    /// scheduling. Zero is deterministic, but it is deterministic the wrong way: it is a FROZEN
+    /// value, so a guest that measures its own CPU consumption sees no progress no matter how much
+    /// work it does, and `getrusage` disagrees with `times(2)` — which sits immediately below and
+    /// has derived exactly these quantities from logical execution progress all along. Freezing a
+    /// value to make it reproducible is the failure mode this codebase explicitly rejects; the fix
+    /// is to make the value a continuous function of virtual time, which is what
+    /// [`Self::handle_times`] already does and what this now mirrors.
+    ///
+    /// The accounting source is identical to `times(2)`'s (`process_cpu_time`), so the two
+    /// syscalls can no longer contradict each other. Resolution is microseconds (the `timeval`
+    /// unit), which is FINER than `times(2)`'s clock ticks — the value is not rounded to tick
+    /// granularity, because coarsening is the same defect as freezing, just smaller.
+    ///
+    /// `ru_maxrss` is unchanged: the guest's peak resident set size, from the same procfs memory
+    /// accounting `sysinfo`'s free-memory reporting relies on.
+    ///
+    /// **`RUSAGE_THREAD` deliberately still reports zero CPU.** Detcore aggregates CPU per
+    /// PROCESS (`ProcessCpuTime::add_thread_delta`), so no per-thread total exists to report.
+    /// Serving process totals under `RUSAGE_THREAD` would overstate a multithreaded guest's
+    /// per-thread CPU, and a plausible-but-wrong number corrupts comparisons more insidiously than
+    /// an obviously-absent zero. Per-thread accounting is the prerequisite for fixing it.
     pub async fn handle_getrusage<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -203,8 +236,30 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let usage_addr = call.usage().ok_or(Errno::EFAULT)?;
 
+        // Take the CPU snapshot BEFORE the peak-RSS read: `process_cpu_time` needs `&mut` guest
+        // state and `guest_peak_rss_kb` needs `&` guest, so this order keeps the borrows disjoint.
+        let cpu = guest.thread_state_mut().process_cpu_time();
+
         // SAFETY: `libc::rusage` is a plain-old-data C struct that is valid when zero-initialized.
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+
+        match who {
+            // This process's own consumed user/system CPU, as virtual time.
+            libc::RUSAGE_SELF => {
+                usage.ru_utime = timeval_from_logical(cpu.user);
+                usage.ru_stime = timeval_from_logical(cpu.system);
+            }
+            // Linux's RUSAGE_CHILDREN aggregates WAITED-FOR children only. Detcore rolls a child's
+            // totals into `children_*` when it is reaped, which is the same rule, so this is a
+            // faithful mapping rather than an approximation.
+            libc::RUSAGE_CHILDREN => {
+                usage.ru_utime = timeval_from_logical(cpu.children_user);
+                usage.ru_stime = timeval_from_logical(cpu.children_system);
+            }
+            // RUSAGE_THREAD: see the doc comment — no per-thread accounting exists, so the CPU
+            // fields stay zero rather than being filled with a process total that would be wrong.
+            _ => {}
+        }
 
         // RUSAGE_SELF/RUSAGE_THREAD report this process's peak RSS. RUSAGE_CHILDREN aggregates
         // terminated children only; with no such accounting we leave it zero, matching Linux when
