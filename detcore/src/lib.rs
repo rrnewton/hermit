@@ -120,6 +120,7 @@ use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1316,7 +1317,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        // TODO-HUMAN-REVIEW(PR-1147): Review child-state identity at DBI thread start.
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {
