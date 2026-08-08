@@ -865,6 +865,94 @@ mod tests {
         assert!(!is_full_sha("z123456789abcdef0123456789abcdef01234567"));
     }
 
+    /// A tree where the calibration site names `old` and one derived site does
+    /// too, so a carry has something real to move and something real to refuse.
+    fn calibration_fixture(label: &str, old: &str) -> PathBuf {
+        let root = temp_path(label);
+        fs::create_dir_all(root.join("ci")).expect("mkdir ci");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            format!("#!/bin/bash\nexpected_pin={old}\n"),
+        )
+        .expect("write wrapper");
+        fs::write(
+            root.join("ci/configure-build-jobs.sh"),
+            format!("# bound to {old}\ncheck {old}\n"),
+        )
+        .expect("write derived");
+        init_fixture_repo(&root);
+        git_in(&root, &["add", "-A"]).expect("stage fixture");
+        git_in(&root, &["commit", "-q", "-m", "fixture"]).expect("commit fixture");
+        root
+    }
+
+    /// NEGATIVE. The one judgement must never be defaulted.
+    ///
+    /// Automating the 15 derived sites while silently guessing the 16th would be
+    /// worse than the hand-carry it replaces, because the tool's own success
+    /// would be what hides it. So: carry the derived sites, leave the
+    /// calibration exactly as found, and refuse.
+    #[test]
+    fn refuses_to_guess_the_budget_calibration_and_leaves_it_untouched() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = calibration_fixture("carry-refuse", &old);
+
+        let refusal = finish_ci_pin_sites(&root, Some(&old), &main, false)
+            .expect_err("an unsettled calibration must refuse, not succeed");
+        assert!(refusal.contains("CALIBRATION DECISION REQUIRED"), "{refusal}");
+        // Actionable, not merely negative: it must name the file to edit and the
+        // value to write, or the operator is back to rediscovering the step.
+        assert!(refusal.contains(BUDGET_CALIBRATION_SITE), "{refusal}");
+        assert!(refusal.contains(&format!("expected_pin={main}")), "{refusal}");
+
+        let wrapper = fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE)).expect("read wrapper");
+        assert!(
+            wrapper.contains(&old) && !wrapper.contains(&main),
+            "the calibration was rewritten instead of being left as the decision: {wrapper}"
+        );
+        let derived = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).expect("derived");
+        assert!(
+            derived.contains(&main) && !derived.contains(&old),
+            "the derived site should have been carried: {derived}"
+        );
+    }
+
+    /// POSITIVE. Once the decision is settled the tool completes, and reports no
+    /// work it did not do -- an earlier draft counted already-correct sites and
+    /// claimed to have carried them.
+    #[test]
+    fn settled_calibration_completes_without_reporting_phantom_carries() {
+        let main = "2".repeat(40);
+        let root = calibration_fixture("carry-settled", &main);
+
+        finish_ci_pin_sites(&root, Some(&main), &main, true)
+            .expect("a settled calibration must complete");
+
+        let (touched, rewritten) =
+            carry_derived_pin_sites(&root, &main, &main).expect("no-op carry");
+        assert_eq!(rewritten, 0, "a no-op substitution must not count as a carry");
+        assert!(touched.is_empty(), "no file should be rewritten: {touched:?}");
+    }
+
+    /// The calibration site is the tool's anchor for what it must not decide.
+    /// If it moves and we silently read "no pin" as "nothing to settle", the
+    /// refusal disappears and the tool starts succeeding over a missing check --
+    /// absence reading as agreement, which is the defect this tool exists to fix.
+    #[test]
+    fn a_calibration_site_without_the_marker_is_an_error_not_an_absence() {
+        let root = temp_path("carry-marker");
+        fs::create_dir_all(root.join("ci")).expect("mkdir ci");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            "#!/bin/bash\n# the expected_pin line was moved or renamed\n",
+        )
+        .expect("write wrapper");
+
+        let error = calibrated_pin(&root).expect_err("a marker-less calibration site must error");
+        assert!(error.contains("no expected_pin="), "{error}");
+    }
+
     #[test]
     fn help_states_the_checker_scope() {
         let help = usage();
