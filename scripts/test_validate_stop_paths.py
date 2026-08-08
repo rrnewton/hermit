@@ -15,6 +15,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATE = ROOT / "validate.sh"
 TEST_ROOTS: list[Path] = []
+DEV_HERMIT_PARENT = next(
+    (parent for parent in ROOT.parents if (parent / "ci-hub" / "qualifying_receipt.py").is_file()),
+    ROOT.parent,
+)
 
 
 def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
@@ -150,6 +154,77 @@ def run_cleanup_signal_race() -> None:
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
+def qualification_verdict(row: dict) -> dict:
+    result = subprocess.run(
+        [
+            "python3",
+            str(DEV_HERMIT_PARENT / "ci-hub" / "qualifying_receipt.py"),
+            "--sha",
+            row["commit"],
+            "--json",
+        ],
+        input=json.dumps(row),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode in {0, 1}, (result.stdout, result.stderr)
+    verdict = json.loads(result.stdout)
+    verdict["_exit_code"] = result.returncode
+    return verdict
+
+
+def run_forced_pin_receipt_refusal() -> None:
+    with tempfile.TemporaryDirectory(prefix="validate-forced-pin-receipt-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        log = tmpdir / "validate.log"
+        release_file = tmpdir / "release"
+        publisher_calls = tmpdir / "publisher-calls"
+        publisher = tmpdir / "inert-publisher"
+        publisher.write_text(
+            "#!/bin/sh\n"
+            f"printf called > {publisher_calls}\n"
+        )
+        publisher.chmod(0o755)
+        env = stop_test_env(tmpdir, ledger)
+        env.update(
+            VALIDATE_STOP_TEST_FORCED_PIN_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                release_file.write_text("release\n")
+                rc = process.wait(timeout=10)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert rc == 0, (rc, log.read_text(errors="replace"))
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["raw_result"] == "pass", row
+        assert row["result"] == "no_result", row
+        assert row["reverie_pin_current"] is False, row
+        assert row["reverie_pin_forced"] is True, row
+        verdict = qualification_verdict(row)
+        assert verdict["_exit_code"] == 1 and verdict["accepted"] is False, verdict
+        assert not publisher_calls.exists(), publisher_calls.read_text(errors="replace")
+
+
 def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
@@ -157,11 +232,13 @@ def main() -> None:
     run_signal(signal.SIGTERM, expect_record=True, prior_failure=True)
     run_incomplete_exit()
     run_cleanup_signal_race()
+    run_forced_pin_receipt_refusal()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
-        "prior failure remains fail; cleanup is signal-atomic"
+        "prior failure remains fail; cleanup is signal-atomic; forced stale pin "
+        "=> raw pass/no_result, 1 diagnostic/0 qualifying/0 publisher calls"
     )
 
 

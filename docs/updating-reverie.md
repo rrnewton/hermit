@@ -41,11 +41,23 @@ Install the tracked pre-commit gate once per clone/worktree repository:
 scripts/setup-hooks.sh
 ```
 
-There is no stale-pin override in testing. Local validate, both committed DAGs,
-hosted portable CI, the merge gate, and validate receipt production all invoke
-the same fail-closed rule. Historical source remains buildable at its recorded
-revision; it does not create current validation evidence until rebased and
-updated to latest Reverie main.
+`--force` is a narrow diagnostic escape. It exits zero only after the checker
+has successfully resolved live main, proved all recorded pins consistent, and
+found the single recorded pin unequal to that live tip. Malformed or mixed pins,
+cache-key drift, and live-tip lookup failures remain hard errors. The warning is
+deliberately loud:
+
+```bash
+with-proxy ./ci/run-reverie-pin-check.sh --force
+```
+
+For a full diagnostic run, `./validate.sh --force-reverie-pin` consumes the
+checker's machine-readable factual state. Its ledger row records
+`reverie_pin_current=false` and `reverie_pin_forced=true`; an underlying pass is
+downgraded to `no_result`, and the publisher is not invoked. This escape does
+not create current validation evidence or landing authority. Normal local
+validation, both committed DAGs, hosted CI, and merge gates keep the default
+fail-closed rule.
 
 ## Where the pin lives
 

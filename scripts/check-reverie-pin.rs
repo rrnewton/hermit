@@ -51,6 +51,8 @@ struct Config {
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    force: bool,
+    status_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -72,6 +74,8 @@ fn usage() -> &'static str {
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --force                             Warn and exit 0 only for a verified stale-vs-live pin\n\
+       --status-file PATH                  Write verified current/forced state as JSON\n\
        -h, --help                          Show this help\n\
      \n\
      Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
@@ -94,6 +98,11 @@ fn parse_args() -> Result<Config, String> {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
             "--update-to-latest" => config.update_to_latest = true,
+            "--force" => config.force = true,
+            "--status-file" => {
+                config.status_file =
+                    Some(PathBuf::from(take_value(&args, &mut i, "--status-file")?))
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -105,7 +114,54 @@ fn parse_args() -> Result<Config, String> {
     if config.print_pin && config.update_to_latest {
         return Err("--print-pin and --update-to-latest are mutually exclusive".to_string());
     }
+    if config.force && (config.print_pin || config.update_to_latest) {
+        return Err("--force is valid only for the verification mode".to_string());
+    }
+    if config.status_file.is_some() && (config.print_pin || config.update_to_latest) {
+        return Err("--status-file is valid only for the verification mode".to_string());
+    }
     Ok(config)
+}
+
+fn clear_status_file(path: Option<&Path>) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not clear stale status file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn write_status_file(
+    path: Option<&Path>,
+    pin: &str,
+    latest_main: &str,
+    current: bool,
+    forced: bool,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "could not create status directory {}: {error}",
+            parent.display()
+        )
+    })?;
+    let contents = format!(
+        "{{\"schema_version\":1,\"pin\":\"{pin}\",\"latest_main\":\"{latest_main}\",\"current\":{current},\"forced\":{forced}}}\n"
+    );
+    fs::write(path, contents)
+        .map_err(|error| format!("could not write status file {}: {error}", path.display()))
 }
 
 fn is_full_sha(value: &str) -> bool {
@@ -534,11 +590,14 @@ fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
         eprintln!("cache busts when the Reverie pin moves. See docs/updating-reverie.md.");
         return Ok(1);
     }
-    eprintln!("LiteInst cache keys: {checked} revision-keyed token(s) all track the pin ({short}).");
+    eprintln!(
+        "LiteInst cache keys: {checked} revision-keyed token(s) all track the pin ({short})."
+    );
     Ok(0)
 }
 
 fn run_with_config(config: Config) -> Result<i32, String> {
+    clear_status_file(config.status_file.as_deref())?;
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
@@ -626,8 +685,19 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let pin_files = pinned_file_count.len();
 
     if pin == main {
+        write_status_file(config.status_file.as_deref(), pin, &main, true, false)?;
         println!(
             "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+        );
+        Ok(0)
+    } else if config.force {
+        write_status_file(config.status_file.as_deref(), pin, &main, false, true)?;
+        loud_header("VERIFIED STALE REVERIE PIN - FORCED NON-AUTHORITATIVE");
+        eprintln!("Hermit pin:  {pin}");
+        eprintln!("Latest main: {main}");
+        eprintln!("WARNING: --force permits diagnostic testing, but the pin is still stale.");
+        eprintln!(
+            "Any validation receipt must record reverie_pin_current=false and reverie_pin_forced=true; this state cannot qualify or publish."
         );
         Ok(0)
     } else {
@@ -767,13 +837,22 @@ mod tests {
                 .status
                 .success()
         );
+        let status_file = root.join("current-status.json");
         let code = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
             ..Config::default()
         })
         .expect("current pin should be classified");
         assert_eq!(code, 0, "an exact latest-main pin must pass");
+        assert_eq!(
+            fs::read_to_string(status_file).expect("read current status"),
+            format!(
+                "{{\"schema_version\":1,\"pin\":\"{current}\",\"latest_main\":\"{current}\",\"current\":true,\"forced\":false}}\n"
+            )
+        );
         fs::remove_dir_all(root).expect("remove fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
@@ -846,6 +925,26 @@ mod tests {
         })
         .expect("behind pin should be classified");
         assert_eq!(code, 1, "an ancestor behind latest main must fail closed");
+
+        let status_file = root.join("forced-status.json");
+        let forced_code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
+            ..Config::default()
+        })
+        .expect("verified stale pin should be forceable");
+        assert_eq!(
+            forced_code, 0,
+            "--force must permit only verified staleness"
+        );
+        assert_eq!(
+            fs::read_to_string(&status_file).expect("read forced status"),
+            format!(
+                "{{\"schema_version\":1,\"pin\":\"{old}\",\"latest_main\":\"{latest}\",\"current\":false,\"forced\":true}}\n"
+            )
+        );
 
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
@@ -945,7 +1044,139 @@ mod tests {
         .expect("checker should classify the planted inconsistency");
         assert_eq!(code, 1, "a tracked stale Cargo.lock must fail closed");
 
+        let status_file = root.join("forced-status.json");
+        let forced_code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
+            ..Config::default()
+        })
+        .expect("inconsistent pins should be classified");
+        assert_eq!(forced_code, 1, "--force must not bypass inconsistent pins");
+        assert!(
+            !status_file.exists(),
+            "a refused check must not leave status evidence"
+        );
+
         fs::remove_dir_all(root).expect("remove fixture repository");
+        fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    #[test]
+    fn force_does_not_bypass_malformed_pin_or_lookup_failure() {
+        let root = temp_path("force-hard-failures");
+        init_fixture_repo(&root);
+        let status_file = root.join("forced-status.json");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[dependencies]\nreverie = { git = \"https://github.com/rrnewton/reverie.git\", rev = \"deadbeef\" }\n",
+        )
+        .expect("write malformed fixture manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let malformed = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(root.join("missing-remote").to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
+            ..Config::default()
+        });
+        assert!(
+            malformed.is_err(),
+            "--force must not accept a malformed pin"
+        );
+        assert!(!status_file.exists());
+
+        let valid = "0123456789abcdef0123456789abcdef01234567";
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{valid}\" }}\n"
+            ),
+        )
+        .expect("write valid fixture manifest");
+        let lookup_code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(root.join("missing-remote").to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
+            ..Config::default()
+        })
+        .expect("lookup failure should be classified");
+        assert_eq!(
+            lookup_code, 1,
+            "--force must not bypass live-tip lookup failure"
+        );
+        assert!(!status_file.exists());
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn force_does_not_bypass_cache_key_drift() {
+        let root = temp_path("force-cache-drift-hermit");
+        let remote = temp_path("force-cache-drift-reverie");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        fs::write(remote.join("revision"), "latest\n").expect("write Reverie fixture");
+        assert!(
+            git_in(&remote, &["add", "revision"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["commit", "-qm", "latest"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let latest =
+            String::from_utf8_lossy(&git_in(&remote, &["rev-parse", "HEAD"]).unwrap().stdout)
+                .trim()
+                .to_string();
+        let stale = "0123456789abcdef0123456789abcdef01234567";
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{stale}\" }}\n"
+            ),
+        )
+        .expect("write stale fixture manifest");
+        fs::write(
+            root.join("cache-path.txt"),
+            "target/liteinst-runtime-build-deadbee\n",
+        )
+        .expect("write drifted cache key");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml", "cache-path.txt"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let status_file = root.join("forced-status.json");
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            force: true,
+            status_file: Some(status_file.clone()),
+            ..Config::default()
+        })
+        .expect("cache drift should be classified");
+        assert_ne!(stale, latest);
+        assert_eq!(code, 1, "--force must not bypass cache-key drift");
+        assert!(!status_file.exists());
+        fs::remove_dir_all(root).expect("remove Hermit fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
     }
 

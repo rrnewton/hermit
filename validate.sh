@@ -149,6 +149,8 @@ SHALLOW_SELECT=0
 # ever flip to smart selection.
 FORCE_FULL=0
 [[ ${VALIDATE_FORCE_FULL:-0} == 1 ]] && FORCE_FULL=1
+FORCE_REVERIE_PIN=0
+[[ ${VALIDATE_FORCE_REVERIE_PIN:-0} == 1 ]] && FORCE_REVERIE_PIN=1
 RUN_ON_DIRTY_TREE=0
 [[ ${VALIDATE_RUN_ON_DIRTY_TREE:-0} == 1 ]] && RUN_ON_DIRTY_TREE=1
 IGNORE_CACHE=0
@@ -190,6 +192,7 @@ while [[ $# -gt 0 ]]; do
         --selective|--since-green) SELECTIVE_MODE=1; shift ;;
         --shallow-select) SELECTIVE_MODE=1; SHALLOW_SELECT=1; shift ;;
         --all|--full-run) FORCE_FULL=1; shift ;;
+        --force-reverie-pin) FORCE_REVERIE_PIN=1; shift ;;
         --baseline)
             SELECTIVE_BASELINE=${2:-}
             [[ -n $SELECTIVE_BASELINE ]] || { echo "validate.sh: --baseline needs a SHA" >&2; exit 2; }
@@ -251,6 +254,8 @@ Focused gates (run one matrix/lane and exit):
   --all, --full-run             Assert the COMPLETE suite explicitly. Refuses to be
                                 combined with a non-full level or any focused/selective
                                 mode. (Equivalent to VALIDATE_FORCE_FULL=1.)
+  --force-reverie-pin           Continue only for a verified stale-vs-live Reverie pin.
+                                The receipt records stale/forced and cannot qualify.
 
 Other options:
   --verbose        Stream each gate's command, PID, elapsed time, and output.
@@ -281,6 +286,7 @@ Environment:
   VALIDATE_VERBOSE=1                             Same as --verbose.
   VALIDATE_RUN_ON_DIRTY_TREE=1                   Same as --run-on-dirty-tree (agents: do not use).
   VALIDATE_IGNORE_CACHE=1                        Same as --ignore-cache (force a real run).
+  VALIDATE_FORCE_REVERIE_PIN=1                   Same as --force-reverie-pin.
   HERMIT_VALIDATE_LEDGER=FILE                    Override the parent JSONL ledger path.
   PR_NUMBER=N                                    Override branch-based PR detection.
 
@@ -892,6 +898,10 @@ VALIDATION_INTERRUPTION_SIGNAL=""
 # Reverie dependency equals the live main tip. cleanup fails closed if any path
 # reaches a nominally successful exit without setting this after the gate.
 REVERIE_PIN_GATE_PASSED=0
+# Diagnostic permission and factual currency are distinct. A verified stale
+# pin may be forced so tests can run, but it remains non-authoritative.
+REVERIE_PIN_CURRENT=0
+REVERIE_PIN_FORCED=0
 # Environmental (sandbox) blocks that survived all retries. Counted toward
 # `failures` too, so every existing `((failures == 0))` exit gate still fails a
 # blocked run, but tracked separately so the summary can distinguish an
@@ -925,6 +935,8 @@ fi
 readonly VALIDATION_TMP_DIR
 VALIDATION_CONCURRENT_MARKER="$VALIDATION_TMP_DIR/concurrent-validate-observed"
 readonly VALIDATION_CONCURRENT_MARKER
+REVERIE_PIN_STATUS_FILE="$VALIDATION_TMP_DIR/reverie-pin-status.json"
+readonly REVERIE_PIN_STATUS_FILE
 export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
@@ -1557,7 +1569,7 @@ function append_validation_ledger {
     local first_error_line_json=null failed_substep_classes_json='[]'
     local evidence_available=0 failure_origin_json gate_substeps_json
     local interruption_signal_json=null
-    local reverie_pin_current_json
+    local reverie_pin_current_json reverie_pin_forced_json
     local i
 
     [[ -n $VALIDATION_LEDGER_FILE ]] || return 0
@@ -1576,6 +1588,13 @@ function append_validation_ledger {
         result=no_result
     else
         result=$raw_result
+    fi
+    if ((REVERIE_PIN_FORCED == 1)); then
+        # --force is diagnostic permission, never an authority upgrade. Keep
+        # the underlying outcome for debugging but emit no qualifying PASS.
+        if [[ $raw_result == pass ]]; then
+            result=no_result
+        fi
     fi
 
     if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
@@ -1661,7 +1680,8 @@ function append_validation_ledger {
     if [[ -n $VALIDATION_INTERRUPTION_SIGNAL ]]; then
         interruption_signal_json=$(json_quote "$VALIDATION_INTERRUPTION_SIGNAL")
     fi
-    if ((REVERIE_PIN_GATE_PASSED == 1)); then reverie_pin_current_json=true; else reverie_pin_current_json=false; fi
+    if ((REVERIE_PIN_CURRENT == 1)); then reverie_pin_current_json=true; else reverie_pin_current_json=false; fi
+    if ((REVERIE_PIN_FORCED == 1)); then reverie_pin_forced_json=true; else reverie_pin_forced_json=false; fi
 
     # Use the parent's single-sourced libtest-banner parser. Unknown stays null;
     # the receipt publisher fails closed rather than turning missing evidence
@@ -1739,6 +1759,7 @@ function append_validation_ledger {
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
     line+="\"reverie_pin_current\":$reverie_pin_current_json,"
+    line+="\"reverie_pin_forced\":$reverie_pin_forced_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
@@ -1915,6 +1936,7 @@ function cleanup {
             "$validation_wall" "$validation_user" "$validation_sys"
     fi
     if ((VALIDATION_NESTED == 0 && exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+        REVERIE_PIN_CURRENT == 1 && REVERIE_PIN_FORCED == 0 && \
         VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
        [[ $VALIDATION_LEVEL == full ]]; then
         publish_receipt_backed_label
@@ -1961,6 +1983,17 @@ if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
     printf "VALIDATE_STOP_TEST_READY pid=%s\n" "$$"
     if [[ ${VALIDATE_STOP_TEST_EXIT_EARLY:-0} == 1 ]]; then
         exit 1
+    fi
+    if [[ ${VALIDATE_STOP_TEST_FORCED_PIN_RELEASE:-0} == 1 ]]; then
+        if [[ -z ${VALIDATE_STOP_TEST_RELEASE_FILE:-} ]]; then
+            printf 'validate.sh: forced-pin stop test requires a release file\n' >&2
+            exit 2
+        fi
+        while [[ ! -e $VALIDATE_STOP_TEST_RELEASE_FILE ]]; do sleep 0.05; done
+        REVERIE_PIN_GATE_PASSED=1
+        REVERIE_PIN_CURRENT=0
+        REVERIE_PIN_FORCED=1
+        exit 0
     fi
     while :; do sleep 1; done
 fi
@@ -2310,8 +2343,46 @@ function run_repo_rust_script {
     "${proxy[@]}" "$binary" "$@"
 }
 
+function run_reverie_pin_gate {
+    local -a args=(--repo "$ROOT_DIR" --status-file "$REVERIE_PIN_STATUS_FILE")
+    if ((FORCE_REVERIE_PIN == 1)); then
+        args+=(--force)
+    fi
+    rm -f -- "$REVERIE_PIN_STATUS_FILE"
+    "$ROOT_DIR/ci/run-reverie-pin-check.sh" "${args[@]}" || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -e '
+        .schema_version == 1
+        and (.pin | type) == "string"
+        and (.pin | test("^[0-9a-fA-F]{40}$"))
+        and (.latest_main | type) == "string"
+        and (.latest_main | test("^[0-9a-fA-F]{40}$"))
+        and (.current | type) == "boolean"
+        and (.forced | type) == "boolean"
+        and ((.current == true and .forced == false and .pin == .latest_main)
+             or (.current == false and .forced == true and .pin != .latest_main))
+    ' "$REVERIE_PIN_STATUS_FILE" >/dev/null 2>&1
+}
+
+function load_reverie_pin_status {
+    local current forced
+    current=$(jq -r '.current' "$REVERIE_PIN_STATUS_FILE" 2>/dev/null) || return 1
+    forced=$(jq -r '.forced' "$REVERIE_PIN_STATUS_FILE" 2>/dev/null) || return 1
+    if [[ $current == true && $forced == false ]]; then
+        REVERIE_PIN_CURRENT=1
+        REVERIE_PIN_FORCED=0
+        return 0
+    fi
+    if [[ $current == false && $forced == true ]] && ((FORCE_REVERIE_PIN == 1)); then
+        REVERIE_PIN_CURRENT=0
+        REVERIE_PIN_FORCED=1
+        return 0
+    fi
+    return 1
+}
+
 function validate_reverie_pin_consistency {
-    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" || return 1
+    run_reverie_pin_gate || return 1
     if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
         run_repo_rust_script ./scripts/check-nested-lockfiles.rs || return 1
     fi
@@ -4943,9 +5014,13 @@ fi
 # The archival pin is not a testing exemption: validate always proves it equals
 # the live Reverie main tip before initializing dependencies or running tests.
 run_check "Reverie dependency pin equals latest main" \
-    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR"
+    run_reverie_pin_gate
 if ((failures != 0)); then
     print_summary
+    exit 1
+fi
+if ! load_reverie_pin_status; then
+    printf 'validate.sh: Reverie pin gate returned success without a valid factual status\n' >&2
     exit 1
 fi
 REVERIE_PIN_GATE_PASSED=1
@@ -4959,6 +5034,10 @@ run_check "Initialize repository submodules" initialize_repository_submodules
 run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
+    exit 1
+fi
+if ! load_reverie_pin_status; then
+    printf 'validate.sh: Reverie consistency gate returned success without a valid factual status\n' >&2
     exit 1
 fi
 
