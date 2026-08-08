@@ -149,6 +149,10 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
+        // Neutral: this metadata Config is not built through RunOpts::validate_args, so
+        // the opt-out flag is never consulted here. Kept false to leave this path's
+        // behaviour byte-identical to before fail-closed became the default.
+        no_panic_on_unsupported_syscalls: false,
         exit_on_unsupported_syscall: false,
         shutdown_on_unsupported_syscall: false,
         unsupported_syscall_report_fd: None,
