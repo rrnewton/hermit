@@ -106,7 +106,9 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
         if log.exists() and text in log.read_text(errors="replace"):
             return
         if process.poll() is not None:
-            raise AssertionError(f"validate exited before ready: rc={process.returncode}")
+            raise AssertionError(
+                f"validate exited before ready: rc={process.returncode}"
+            )
         time.sleep(0.05)
     observed = log.read_text(errors="replace") if log.exists() else "<no log>"
     raise AssertionError(
@@ -137,7 +139,9 @@ def wait_for_process_state(pid: int, accepted: set[str | None]) -> str | None:
         if state in accepted:
             return state
         time.sleep(0.02)
-    raise AssertionError(f"PID {pid} never reached one of {accepted}; state={process_state(pid)}")
+    raise AssertionError(
+        f"PID {pid} never reached one of {accepted}; state={process_state(pid)}"
+    )
 
 
 def wait_for_monitor_pid(path: Path, process: subprocess.Popen[bytes]) -> int:
@@ -148,20 +152,30 @@ def wait_for_monitor_pid(path: Path, process: subprocess.Popen[bytes]) -> int:
             if value.isdigit():
                 return int(value)
         if process.poll() is not None:
-            raise AssertionError(f"validate exited before monitor PID: rc={process.returncode}")
+            raise AssertionError(
+                f"validate exited before monitor PID: rc={process.returncode}"
+            )
         time.sleep(0.02)
-    raise AssertionError("validate monitor PID was not recorded")
+    log = path.parent / "validate.log"
+    observed = log.read_text(errors="replace") if log.exists() else "<no fixture log>"
+    raise AssertionError(
+        f"validate monitor PID was not recorded; observed:\n{observed}"
+    )
 
 
 def find_monitor_state(tmpdir: Path, process: subprocess.Popen[bytes]) -> Path:
     deadline = time.monotonic() + 10
     validation_root = tmpdir / "validation"
     while time.monotonic() < deadline:
-        states = list(validation_root.glob("hermit-validate.*/concurrent-validate-observed"))
+        states = list(
+            validation_root.glob("hermit-validate.*/concurrent-validate-observed")
+        )
         if len(states) == 1:
             return states[0]
         if process.poll() is not None:
-            raise AssertionError(f"validate exited before monitor state: rc={process.returncode}")
+            raise AssertionError(
+                f"validate exited before monitor state: rc={process.returncode}"
+            )
         time.sleep(0.02)
     raise AssertionError("validate monitor state was not found")
 
@@ -169,7 +183,9 @@ def find_monitor_state(tmpdir: Path, process: subprocess.Popen[bytes]) -> Path:
 def run_signal(
     sig: signal.Signals, expect_record: bool, *, prior_failure: bool = False
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"validate-stop-{sig.name.lower()}-"
+    ) as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
@@ -196,7 +212,11 @@ def run_signal(
                 process.send_signal(sig)
             rc = process.wait(timeout=10)
 
-        rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+        rows = (
+            [json.loads(line) for line in ledger.read_text().splitlines()]
+            if ledger.exists()
+            else []
+        )
         if not expect_record:
             assert not rows, (sig.name, rows)
             assert rc == -sig.value, (sig.name, rc)
@@ -313,31 +333,56 @@ def run_peer_identity_fixtures() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-peer-fixture-") as tmp:
         proc_root = Path(tmp)
         write_fake_process(
-            proc_root, 1, ppid=0, pgid=1, start_ticks=1,
-            argv=("/sbin/init",), cgroup="/init.scope",
+            proc_root,
+            1,
+            ppid=0,
+            pgid=1,
+            start_ticks=1,
+            argv=("/sbin/init",),
+            cgroup="/init.scope",
         )
         write_fake_process(
-            proc_root, 10, ppid=1, pgid=10, start_ticks=10,
+            proc_root,
+            10,
+            ppid=1,
+            pgid=10,
+            start_ticks=10,
             argv=("ci-hub", "validate-lock"),
             cgroup="/user.slice/validate-X.service",
         )
         write_fake_process(
-            proc_root, 20, ppid=10, pgid=20, start_ticks=20,
+            proc_root,
+            20,
+            ppid=10,
+            pgid=20,
+            start_ticks=20,
             argv=("safe-ci-dag-runner",),
             cgroup="/user.slice/validate-X.service",
         )
         write_fake_process(
-            proc_root, 21, ppid=20, pgid=21, start_ticks=21,
+            proc_root,
+            21,
+            ppid=20,
+            pgid=21,
+            start_ticks=21,
             argv=("bash", "/checkout/validate.sh", "full"),
             cgroup="/user.slice/validate-X.service/safe-ci-N.scope",
         )
         write_fake_process(
-            proc_root, 22, ppid=1, pgid=22, start_ticks=22,
+            proc_root,
+            22,
+            ppid=1,
+            pgid=22,
+            start_ticks=22,
             argv=("bash", "/reparented/validate.sh", "full"),
             cgroup="/user.slice/validate-X.service/safe-ci-R.scope",
         )
         write_fake_process(
-            proc_root, 30, ppid=1, pgid=30, start_ticks=30,
+            proc_root,
+            30,
+            ppid=1,
+            pgid=30,
+            start_ticks=30,
             argv=("bash", "-c", "tool_cost ./validate.sh full"),
             cgroup="/user.slice/validate-Z.service/wrapper.scope",
         )
@@ -356,16 +401,26 @@ def run_peer_identity_fixtures() -> None:
             "systemd_unit": "validate-X.service",
             "systemd_unit_cgroup": "/user.slice/validate-X.service",
         }, snapshot
-        same_service = {process["pid"]: process for process in snapshot["same_service_processes"]}
+        same_service = {
+            process["pid"]: process for process in snapshot["same_service_processes"]
+        }
         assert same_service[21]["classification"] == "owner-ancestry-self", same_service
         assert same_service[21]["systemd_unit"] == "validate-X.service", same_service
-        assert same_service[21]["systemd_unit_cgroup"] == "/user.slice/validate-X.service", same_service
-        assert same_service[22]["classification"] == "reparented-same-service-self", same_service
+        assert (
+            same_service[21]["systemd_unit_cgroup"] == "/user.slice/validate-X.service"
+        ), same_service
+        assert (
+            same_service[22]["classification"] == "reparented-same-service-self"
+        ), same_service
         assert same_service[22]["systemd_unit"] == "validate-X.service", same_service
         assert set(same_service) == {21, 22}, same_service
 
         write_fake_process(
-            proc_root, 40, ppid=1, pgid=40, start_ticks=40,
+            proc_root,
+            40,
+            ppid=1,
+            pgid=40,
+            start_ticks=40,
             argv=("bash", "/other/validate.sh", "full"),
             cgroup="/user.slice/validate-Z.service/safe-ci-E.scope",
         )
@@ -400,21 +455,38 @@ def run_peer_identity_fixtures() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-user-manager-fixture-") as tmp:
         proc_root = Path(tmp)
         write_fake_process(
-            proc_root, 1, ppid=0, pgid=1, start_ticks=1,
-            argv=("/sbin/init",), cgroup="/init.scope",
+            proc_root,
+            1,
+            ppid=0,
+            pgid=1,
+            start_ticks=1,
+            argv=("/sbin/init",),
+            cgroup="/init.scope",
         )
         write_fake_process(
-            proc_root, 50, ppid=1, pgid=50, start_ticks=50,
+            proc_root,
+            50,
+            ppid=1,
+            pgid=50,
+            start_ticks=50,
             argv=("ci-hub", "validate-lock"),
             cgroup="/user.slice/user@1000.service/app.slice/validate-A.scope",
         )
         write_fake_process(
-            proc_root, 51, ppid=1, pgid=51, start_ticks=51,
+            proc_root,
+            51,
+            ppid=1,
+            pgid=51,
+            start_ticks=51,
             argv=("bash", "/reparented/validate.sh", "full"),
             cgroup="/user.slice/user@1000.service/app.slice/validate-A.scope",
         )
         write_fake_process(
-            proc_root, 52, ppid=1, pgid=52, start_ticks=52,
+            proc_root,
+            52,
+            ppid=1,
+            pgid=52,
+            start_ticks=52,
             argv=("bash", "/external/validate.sh", "full"),
             cgroup="/user.slice/user@1000.service/app.slice/validate-B.scope",
         )
@@ -466,6 +538,7 @@ def run_peer_scan_completeness_fixtures() -> None:
     # numeric PID vanished. It must not poison an otherwise complete snapshot.
     temporary, proc_root = fixture_root("exit-race")
     with temporary:
+
         def vanishing_reader(root: Path, pid: int) -> peer_snapshot.ProcessRecord:
             if pid == 40:
                 process = root / str(pid)
@@ -485,6 +558,7 @@ def run_peer_scan_completeness_fixtures() -> None:
     # exits before its start_ticks identity is confirmed.
     temporary, proc_root = fixture_root("confirmation-exit-race")
     with temporary:
+
         def vanishing_start(root: Path, pid: int) -> int:
             if pid == 40:
                 process = root / str(pid)
@@ -503,6 +577,7 @@ def run_peer_scan_completeness_fixtures() -> None:
     # an absent peer. This is the exact sibling-hole class from the re-review.
     temporary, proc_root = fixture_root("unreadable")
     with temporary:
+
         def unreadable_reader(root: Path, pid: int) -> peer_snapshot.ProcessRecord:
             if pid == 40:
                 raise PermissionError("planted unreadable numeric PID")
@@ -588,7 +663,9 @@ def run_peer_scan_completeness_fixtures() -> None:
 
 def admission_verdict(row: dict) -> dict:
     policy = json.loads(
-        (DEV_HERMIT_PARENT / "ci-hub" / "validate" / "qualifying-receipt.json").read_text()
+        (
+            DEV_HERMIT_PARENT / "ci-hub" / "validate" / "qualifying-receipt.json"
+        ).read_text()
     )
     request = {
         "row": row,
@@ -640,7 +717,6 @@ def assert_indeterminate_diagnostic(
     *,
     expected_detail: str,
     expected_raw_result: str = "fail",
-    stale_gap: bool = False,
 ) -> dict:
     rows = read_ledger(ledger)
     assert len(rows) == 1, rows
@@ -651,9 +727,6 @@ def assert_indeterminate_diagnostic(
     assert row["concurrency_proof"] is None, row
     assert row["concurrency_indeterminate"] is True, row
     assert row["concurrency_indeterminate_detail"].startswith(expected_detail), row
-    if stale_gap:
-        monitor = row["concurrent_validate_monitor"]
-        assert monitor["max_successful_scan_gap_ns"] > monitor["allowed_max_scan_gap_ns"], monitor
     verdict = qualification_verdict(row)
     assert verdict["_exit_code"] == 1 and verdict["accepted"] is False, verdict
     assert sum(qualification_verdict(candidate)["accepted"] for candidate in rows) == 0
@@ -686,7 +759,7 @@ def run_monitor_refusal_fixture(mode: str, expected_detail: str) -> None:
             PR_NUMBER="999999",
             VALIDATE_TIMEOUT_KILL_GRACE_SECONDS="1",
         )
-        normal_success = mode == "success-indeterminate"
+        normal_success = mode == "missing-ack"
         if normal_success:
             env.update(
                 VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
@@ -711,19 +784,10 @@ def run_monitor_refusal_fixture(mode: str, expected_detail: str) -> None:
                 elif mode == "stopped":
                     os.kill(monitor_pid, signal.SIGSTOP)
                     wait_for_process_state(monitor_pid, {"T", "t"})
-                elif mode in {"stale", "success-indeterminate"}:
-                    os.kill(monitor_pid, signal.SIGSTOP)
-                    wait_for_process_state(monitor_pid, {"T", "t"})
-                    time.sleep(peer_snapshot.MAX_SCAN_GAP_NS / 1_000_000_000 + 0.75)
-                    os.kill(monitor_pid, signal.SIGCONT)
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        state = json.loads(marker.read_text())
-                        if state.get("indeterminate") is True:
-                            break
-                        time.sleep(0.05)
-                    else:
-                        raise AssertionError("stale monitor gap did not become sticky-indeterminate")
+                elif mode == "missing-ack":
+                    control_socket = marker.parent / "peer-monitor.sock"
+                    assert control_socket.is_socket(), control_socket
+                    control_socket.unlink()
                 else:
                     raise AssertionError(f"unknown monitor refusal mode {mode}")
                 if normal_success:
@@ -752,7 +816,6 @@ def run_monitor_refusal_fixture(mode: str, expected_detail: str) -> None:
             ledger,
             expected_detail=expected_detail,
             expected_raw_result="pass" if normal_success else "fail",
-            stale_gap=mode in {"stale", "success-indeterminate"},
         )
         assert not publisher_calls.exists(), (
             mode,
@@ -760,8 +823,231 @@ def run_monitor_refusal_fixture(mode: str, expected_detail: str) -> None:
         )
 
 
+def run_paused_monitor_recovery_fixture() -> None:
+    """A recovered long scan is acknowledged, not rejected by elapsed time."""
+    with tempfile.TemporaryDirectory(prefix="validate-monitor-recovered-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        log = tmpdir / "validate.log"
+        monitor_pid_file = tmpdir / "monitor-pid"
+        release_file = tmpdir / "success-release"
+        proc_root = tmpdir / "proc"
+        proc_root.mkdir()
+        write_fake_process(
+            proc_root,
+            os.getpid(),
+            ppid=0,
+            pgid=os.getpid(),
+            start_ticks=process_start_ticks(os.getpid()),
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        publisher_calls = tmpdir / "publisher-calls"
+        publisher = tmpdir / "inert-publisher"
+        publisher.write_text(
+            f"#!{sys.executable}\n"
+            "from pathlib import Path\n"
+            f"Path({str(publisher_calls)!r}).write_text('called\\n')\n"
+        )
+        publisher.chmod(0o755)
+        env = stop_test_env(tmpdir, ledger)
+        env.update(
+            VALIDATE_STOP_TEST_MONITOR_PID_FILE=str(monitor_pid_file),
+            VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(proc_root),
+            VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                monitor_pid = wait_for_monitor_pid(monitor_pid_file, process)
+                marker = find_monitor_state(tmpdir, process)
+                before = json.loads(marker.read_text())
+                assert before["monitor_pid"] == monitor_pid, before
+                os.kill(monitor_pid, signal.SIGSTOP)
+                wait_for_process_state(monitor_pid, {"T", "t"})
+                stopped = json.loads(marker.read_text())
+                # Longer than the removed five-second heuristic. The kernel
+                # flock remains held while the monitor is descheduled.
+                time.sleep(5.75)
+                still_stopped = json.loads(marker.read_text())
+                assert (
+                    still_stopped["monitor_sequence"] == stopped["monitor_sequence"]
+                ), (
+                    stopped,
+                    still_stopped,
+                )
+                os.kill(monitor_pid, signal.SIGCONT)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    later = json.loads(marker.read_text())
+                    if later["monitor_sequence"] > before["monitor_sequence"]:
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("resumed monitor did not advance its sequence")
+                release_file.write_text("release\n")
+                rc = process.wait(timeout=30)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+        assert rc == 0, (rc, log.read_text(errors="replace"))
+        rows = read_ledger(ledger)
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["raw_result"] == "pass", row
+        assert row["concurrency_indeterminate"] is False, row
+        monitor = row["concurrent_validate_monitor"]
+        assert monitor["monitor_sequence"] == monitor["final_ack_sequence"], monitor
+        assert monitor["exclusion_held"] is True, monitor
+        assert (
+            sum(qualification_verdict(candidate)["accepted"] for candidate in rows) == 0
+        )
+        assert publisher_calls.read_text() == "called\n", publisher_calls
+
+
+def run_descheduled_exclusion_fixture() -> None:
+    """A stopped lock holder excludes a second receipt-producing monitor."""
+    with tempfile.TemporaryDirectory(prefix="validate-monitor-exclusion-") as tmp:
+        tmpdir = Path(tmp)
+        shared_lock = tmpdir / "shared-peer-exclusion.lock"
+        proc_root = tmpdir / "proc"
+        proc_root.mkdir()
+        write_fake_process(
+            proc_root,
+            10,
+            ppid=0,
+            pgid=10,
+            start_ticks=10,
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        write_fake_process(
+            proc_root,
+            os.getpid(),
+            ppid=0,
+            pgid=os.getpid(),
+            start_ticks=process_start_ticks(os.getpid()),
+            argv=("ci-hub", "validate-lock"),
+            cgroup="/user.slice/validate-X.service",
+        )
+        holder_state = tmpdir / "holder-state.json"
+        holder_socket = tmpdir / "holder.sock"
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "ci" / "validate_peer_snapshot.py"),
+                "--monitor",
+                "--owner-pid",
+                "10",
+                "--state",
+                str(holder_state),
+                "--control-socket",
+                str(holder_socket),
+                "--fixture-mode",
+                "--fixture-exclusion-lock",
+                str(shared_lock),
+                "--proc-root",
+                str(proc_root),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if holder_state.exists():
+                    state = json.loads(holder_state.read_text())
+                    if state.get("monitor_ready") is True:
+                        break
+                if holder.poll() is not None:
+                    raise AssertionError(holder.stderr.read().decode(errors="replace"))
+                time.sleep(0.05)
+            else:
+                raise AssertionError("exclusion holder did not become ready")
+            assert state["exclusion_held"] is True, state
+            os.kill(holder.pid, signal.SIGSTOP)
+            wait_for_process_state(holder.pid, {"T", "t"})
+
+            ledger = tmpdir / "ledger.jsonl"
+            log = tmpdir / "validate.log"
+            release_file = tmpdir / "success-release"
+            publisher_calls = tmpdir / "publisher-calls"
+            publisher = tmpdir / "inert-publisher"
+            publisher.write_text(
+                f"#!{sys.executable}\n"
+                "from pathlib import Path\n"
+                f"Path({str(publisher_calls)!r}).write_text('called\\n')\n"
+            )
+            publisher.chmod(0o755)
+            env = stop_test_env(tmpdir, ledger)
+            env.update(
+                VALIDATE_STOP_TEST_EXCLUSION_LOCK=str(shared_lock),
+                VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(proc_root),
+                VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+                VALIDATE_STOP_TEST_RELEASE_FILE=str(release_file),
+                CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+                PR_NUMBER="999999",
+            )
+            with log.open("wb") as output:
+                process = subprocess.Popen(
+                    [str(VALIDATE), "full"],
+                    cwd=ROOT,
+                    env=env,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                try:
+                    wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                    release_file.write_text("release\n")
+                    rc = process.wait(timeout=30)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=10)
+                    else:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+            assert rc == 0, (rc, log.read_text(errors="replace"))
+            row = assert_indeterminate_diagnostic(
+                ledger,
+                expected_detail="final-state-indeterminate:peer-exclusion-lock-contended",
+                expected_raw_result="pass",
+            )
+            assert row["concurrent_validates"] is None, row
+            assert row["concurrency_proof"] is None, row
+            assert not publisher_calls.exists(), publisher_calls
+        finally:
+            if process_state(holder.pid) in {"T", "t"}:
+                os.kill(holder.pid, signal.SIGCONT)
+            holder.terminate()
+            holder.wait(timeout=10)
+
+
 def run_initial_authority_failure_fixture() -> None:
-    with tempfile.TemporaryDirectory(prefix="validate-authority-initial-failure-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix="validate-authority-initial-failure-"
+    ) as tmp:
         tmpdir = Path(tmp)
         ledger = tmpdir / "ledger.jsonl"
         log = tmpdir / "validate.log"
@@ -798,8 +1084,14 @@ def run_initial_authority_failure_fixture() -> None:
                 time.sleep(1.25)
                 later_state = json.loads(marker.read_text())
                 assert later_state["indeterminate"] is True, later_state
-                assert later_state["indeterminate_detail"] == initial_state["indeterminate_detail"]
-                assert later_state["scan_count"] == 0, later_state
+                assert (
+                    later_state["indeterminate_detail"]
+                    == initial_state["indeterminate_detail"]
+                )
+                assert (
+                    later_state["monitor_sequence"] >= initial_state["monitor_sequence"]
+                ), later_state
+                assert later_state["monitor_ready"] is True, later_state
                 assert process_state(monitor_pid) not in {None, "Z", "T", "t"}
                 process.send_signal(signal.SIGTERM)
                 rc = process.wait(timeout=15)
@@ -819,7 +1111,7 @@ def run_initial_authority_failure_fixture() -> None:
         )
         assert_indeterminate_diagnostic(
             ledger,
-            expected_detail="canonical-lock-authority-",
+            expected_detail="final-state-indeterminate:canonical-lock-authority-",
         )
 
 
@@ -866,6 +1158,14 @@ def run_schema5_receipt_fixture() -> dict:
         assert not override_marker.exists(), "caller evidence helper was invoked"
         rows = [json.loads(line) for line in ledger.read_text().splitlines()]
         assert len(rows) == 1, rows
+        if rows[0]["admission"] != "ci-hub-validate-lock":
+            raise AssertionError(
+                (
+                    rows[0],
+                    result.stdout.decode(errors="replace"),
+                    Path(rows[0]["log_file"]).read_text(errors="replace"),
+                )
+            )
         return rows[0]
 
 
@@ -923,7 +1223,7 @@ def run_forged_sidecar_refusal_fixture() -> tuple[int, int, int]:
         assert rc == 0, (rc, log.read_text(errors="replace"))
         row = assert_indeterminate_diagnostic(
             ledger,
-            expected_detail="canonical-lock-authority-",
+            expected_detail="final-state-indeterminate:canonical-lock-authority-",
             expected_raw_result="pass",
         )
         assert row["admission"] is None, row
@@ -1011,7 +1311,7 @@ def run_unresolvable_process_refusal_fixture() -> tuple[int, int, int]:
         assert rc == 0, (rc, log.read_text(errors="replace"))
         row = assert_indeterminate_diagnostic(
             ledger,
-            expected_detail="final-snapshot-failed:snapshot-unresolved:process PID 40",
+            expected_detail="final-state-indeterminate:snapshot-unresolved:process PID 40",
             expected_raw_result="pass",
         )
         assert row["concurrent_validates"] is None, row
@@ -1044,6 +1344,11 @@ def run_schema5_receipt_fixtures() -> None:
     assert row["concurrency_indeterminate"] is False, row
     assert row["concurrency_indeterminate_detail"] is None, row
     assert row["concurrent_validate_peers"] == [], row
+    monitor = row["concurrent_validate_monitor"]
+    assert monitor["monitor_protocol"] == peer_snapshot.MONITOR_PROTOCOL, monitor
+    assert monitor["monitor_sequence"] == monitor["final_ack_sequence"], monitor
+    assert monitor["exclusion_kind"] == "kernel-flock", monitor
+    assert monitor["exclusion_held"] is True, monitor
     assert row["coverage"]["planned_test_nodes"] == 19, row
     expected_base = subprocess.check_output(
         ["git", "merge-base", "HEAD", "origin/main"], cwd=ROOT, text=True
@@ -1089,8 +1394,9 @@ def main() -> None:
     run_initial_authority_failure_fixture()
     run_monitor_refusal_fixture("killed", "monitor-died")
     run_monitor_refusal_fixture("stopped", "monitor-stopped")
-    run_monitor_refusal_fixture("stale", "final-state-indeterminate")
-    run_monitor_refusal_fixture("success-indeterminate", "final-state-indeterminate")
+    run_monitor_refusal_fixture("missing-ack", "monitor-final-ack-missing")
+    run_paused_monitor_recovery_fixture()
+    run_descheduled_exclusion_fixture()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
     run_signal(signal.SIGKILL, expect_record=False)
@@ -1106,7 +1412,9 @@ def main() -> None:
         "peer scan completeness: exit races 2/2 accepted, unresolved evidence 4/4 refused sticky, "
         "kernel-thread 1/1 classified; "
         "override negative 3 planted/0 production references/0 invoked; "
-        "monitor refusal negatives 4/4 => exactly 1 diagnostic + 0 qualifying; "
+        "monitor refusal negatives 3/3 => exactly 1 diagnostic + 0 qualifying; "
+        "recovered >5s pause => sequence/final-ack accepted; "
+        "descheduled exclusion => second monitor 1 diagnostic/0 qualifying/0 publisher; "
         "initial authority failure => sticky + monitor live + 1 diagnostic/0 qualifying; "
         "success disruption => raw pass downgraded + publisher calls 0; "
         "TERM/INT/HUP => NO-RESULT; KILL => no record; prior failure remains "

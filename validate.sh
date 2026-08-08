@@ -920,7 +920,10 @@ declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
 VALIDATION_CONCURRENCY_MONITOR_PID=""
+VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID=""
 VALIDATION_CONCURRENCY_MONITOR_START_TICKS=""
+VALIDATION_CONCURRENCY_CONTROL_SOCKET=""
+VALIDATION_CONCURRENCY_START_OK=0
 VALIDATION_ADMISSION_JSON=null
 VALIDATION_CONCURRENT_VALIDATES_JSON=null
 VALIDATION_CONCURRENCY_PROOF_JSON=null
@@ -951,6 +954,8 @@ fi
 readonly VALIDATION_TMP_DIR
 VALIDATION_CONCURRENT_MARKER="$VALIDATION_TMP_DIR/concurrent-validate-observed"
 readonly VALIDATION_CONCURRENT_MARKER
+VALIDATION_CONCURRENCY_CONTROL_SOCKET="$VALIDATION_TMP_DIR/peer-monitor.sock"
+readonly VALIDATION_CONCURRENCY_CONTROL_SOCKET
 export XDG_CONFIG_HOME="$VALIDATION_TMP_DIR/xdg-config"
 mkdir -p "$XDG_CONFIG_HOME"
 readonly XDG_CONFIG_HOME
@@ -1665,77 +1670,140 @@ function write_validation_concurrency_indeterminate_marker {
             first_successful_scan_monotonic_ns: null,
             last_successful_scan_monotonic_ns: null,
             max_successful_scan_gap_ns: 0,
-            allowed_max_scan_gap_ns: 5000000000,
+            monitor_protocol: "sequence-final-ack-v1",
+            monitor_ready: false,
+            monitor_pid: null,
+            monitor_sequence: 0,
+            final_ack_sequence: null,
+            exclusion_kind: "kernel-flock",
+            exclusion_held: false,
             owner: null,
             same_service_processes: [],
             peers: []
         }' >"$VALIDATION_CONCURRENT_MARKER"
     else
         printf '%s\n' \
-            '{"schema_version":1,"scan_complete":false,"indeterminate":true,"indeterminate_detail":"canonical-lock-authority-unavailable","scan_count":0,"first_successful_scan_monotonic_ns":null,"last_successful_scan_monotonic_ns":null,"max_successful_scan_gap_ns":0,"allowed_max_scan_gap_ns":5000000000,"owner":null,"same_service_processes":[],"peers":[]}' \
+            '{"schema_version":1,"scan_complete":false,"indeterminate":true,"indeterminate_detail":"canonical-lock-authority-unavailable","scan_count":0,"first_successful_scan_monotonic_ns":null,"last_successful_scan_monotonic_ns":null,"max_successful_scan_gap_ns":0,"monitor_protocol":"sequence-final-ack-v1","monitor_ready":false,"monitor_pid":null,"monitor_sequence":0,"final_ack_sequence":null,"exclusion_kind":"kernel-flock","exclusion_held":false,"owner":null,"same_service_processes":[],"peers":[]}' \
             >"$VALIDATION_CONCURRENT_MARKER"
     fi
 }
 
-function run_validation_peer_snapshot {
-    local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
-    local -a snapshot_args=(
-        --owner-pid "$VALIDATION_CANONICAL_LOCK_OWNER_PID"
-        --state "$VALIDATION_CONCURRENT_MARKER"
-    )
-    # The custom proc tree is confined to the intrinsically non-authorizing
-    # stop-test path. Production always scans /proc, and the helper itself
-    # cannot emit a validation receipt.
-    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
-        && -n ${VALIDATE_STOP_TEST_PEER_PROC_ROOT:-} ]]; then
-        snapshot_args+=(--proc-root "$VALIDATE_STOP_TEST_PEER_PROC_ROOT")
-    fi
-    python3 "$helper" "${snapshot_args[@]}"
-}
-
 function start_validation_concurrency_monitor {
-    local root_pid=$$
     local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
-    local monitor_state monitor_start initial_output
+    local monitor_state monitor_start monitor_ready=false marker_monitor_pid=""
+    local monitor_indeterminate=true exclusion_held=false owner_pid=$$
+    local attempt probe_output
+    local -a monitor_args
     local initial_scan_failed=0
     if [[ ! -r $helper ]] || ! command -v python3 >/dev/null 2>&1; then
         VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL=peer-snapshot-helper-unavailable
         write_validation_concurrency_indeterminate_marker \
             "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL"
-        initial_scan_failed=1
+        return 1
     elif ! validation_lock_authority_snapshot start; then
         write_validation_concurrency_indeterminate_marker \
             "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL"
         printf 'validate.sh: canonical validate-lock authority unavailable: %s\n' \
             "$VALIDATION_CANONICAL_LOCK_FAILURE_DETAIL" | tee -a "$LOG_FILE" >&2
         initial_scan_failed=1
+    else
+        owner_pid=$VALIDATION_CANONICAL_LOCK_OWNER_PID
     fi
 
-    # Complete one scan synchronously so even an early-exit receipt cannot race
-    # ahead of the monitor and turn "not observed" into a false zero.
-    if ((initial_scan_failed == 0)) \
-        && ! initial_output=$(run_validation_peer_snapshot 2>&1); then
-        initial_scan_failed=1
-        # The helper has already persisted sticky indeterminate state. Surface
-        # its exact error while retaining it in the durable run log.
-        printf '%s\n' "$initial_output" | tee -a "$LOG_FILE" >&2
+    monitor_args=(
+        --monitor
+        --owner-pid "$owner_pid"
+        --state "$VALIDATION_CONCURRENT_MARKER"
+        --control-socket "$VALIDATION_CONCURRENCY_CONTROL_SOCKET"
+    )
+    # Both the proc-root and exclusion-lock seams are confined to the
+    # intrinsically non-authorizing stop-test path. Production hard-binds /proc
+    # and the per-uid /run/user kernel lock inside the helper.
+    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
+        monitor_args+=(
+            --fixture-mode
+            --fixture-exclusion-lock \
+                "${VALIDATE_STOP_TEST_EXCLUSION_LOCK:-$VALIDATION_TMP_DIR/peer-exclusion.lock}"
+        )
+        if [[ -n ${VALIDATE_STOP_TEST_PEER_PROC_ROOT:-} ]]; then
+            monitor_args+=(--proc-root "$VALIDATE_STOP_TEST_PEER_PROC_ROOT")
+        fi
     fi
-    (
-        while kill -0 "$root_pid" 2>/dev/null; do
-            if [[ $VALIDATION_CANONICAL_LOCK_OWNER_PID =~ ^[1-9][0-9]*$ ]]; then
-                run_validation_peer_snapshot >/dev/null 2>>"$LOG_FILE" || true
-            fi
-            sleep 1
-        done
-    ) &
-    VALIDATION_CONCURRENCY_MONITOR_PID=$!
+
+    python3 "$helper" "${monitor_args[@]}" >>"$LOG_FILE" 2>&1 &
+    VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID=$!
     if ! read -r monitor_state monitor_start < <(
-        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_PID"
+        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID"
     ) || [[ $monitor_state == Z || $monitor_state == T || $monitor_state == t \
         || ! $monitor_start =~ ^[0-9]+$ ]]; then
         return 1
     fi
     VALIDATION_CONCURRENCY_MONITOR_START_TICKS=$monitor_start
+
+    # Wait for the long-lived monitor's first completed sequence and control
+    # socket. This is an explicit acknowledgement, not an elapsed-gap claim.
+    # The generous ten-minute bound is only a fail-closed operational ceiling;
+    # no successful receipt derives authority from how quickly the ack arrives.
+    for ((attempt = 0; attempt < 12000; attempt++)); do
+        if ! kill -0 "$VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID" 2>/dev/null; then
+            break
+        fi
+        if [[ -S $VALIDATION_CONCURRENCY_CONTROL_SOCKET \
+            && -r $VALIDATION_CONCURRENT_MARKER ]]; then
+            monitor_ready=$(jq -r \
+                '.monitor_protocol == "sequence-final-ack-v1"
+                 and .monitor_ready == true
+                 and (.monitor_pid | type) == "number"
+                 and (.monitor_sequence | type) == "number"
+                 and .monitor_sequence >= 1' \
+                "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || monitor_ready=false
+            if [[ $monitor_ready == true ]]; then
+                break
+            fi
+        fi
+        sleep 0.05
+    done
+    if [[ $monitor_ready != true ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-initial-ack-missing
+        return 1
+    fi
+    if ! probe_output=$(python3 "$helper" --probe \
+        --control-socket "$VALIDATION_CONCURRENCY_CONTROL_SOCKET" 2>>"$LOG_FILE"); then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-initial-probe-missing
+        return 1
+    fi
+    marker_monitor_pid=$(jq -r \
+        'if .ok == true and .protocol == "sequence-final-ack-v1"
+         and (.monitor_pid | type) == "number" and .monitor_pid > 1
+         then .monitor_pid else empty end' <<<"$probe_output" 2>/dev/null) || marker_monitor_pid=""
+    if [[ ! $marker_monitor_pid =~ ^[1-9][0-9]*$ ]] \
+        || [[ $(jq -r '.monitor_pid // empty' "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) \
+            != "$marker_monitor_pid" ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-marker-identity-mismatch
+        return 1
+    fi
+    VALIDATION_CONCURRENCY_MONITOR_PID=$marker_monitor_pid
+    if ! read -r monitor_state monitor_start < <(
+        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    ) || [[ $monitor_state == Z || $monitor_state == T || $monitor_state == t \
+        || ! $monitor_start =~ ^[0-9]+$ ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-marker-identity-not-live
+        return 1
+    fi
+    VALIDATION_CONCURRENCY_MONITOR_START_TICKS=$monitor_start
+    exclusion_held=$(jq -r '.exclusion_held == true' \
+        "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || exclusion_held=false
+    monitor_indeterminate=$(jq -r '.indeterminate == true' \
+        "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || monitor_indeterminate=true
+    if [[ $exclusion_held != true ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=peer-exclusion-lock-contended
+        return 1
+    fi
+    if [[ $monitor_indeterminate == true ]]; then
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=initial-state-indeterminate
+        return 1
+    fi
+    VALIDATION_CONCURRENCY_START_OK=1
     return "$initial_scan_failed"
 }
 
@@ -1764,7 +1832,13 @@ function refresh_validation_concurrency_evidence {
               first_successful_scan_monotonic_ns,
               last_successful_scan_monotonic_ns,
               max_successful_scan_gap_ns,
-              allowed_max_scan_gap_ns,
+              monitor_protocol,
+              monitor_ready,
+              monitor_pid,
+              monitor_sequence,
+              final_ack_sequence,
+              exclusion_kind,
+              exclusion_held,
               indeterminate,
               indeterminate_detail
             }
@@ -1772,7 +1846,14 @@ function refresh_validation_concurrency_evidence {
                  and (.first_successful_scan_monotonic_ns | type) == "number"
                  and (.last_successful_scan_monotonic_ns | type) == "number"
                  and (.max_successful_scan_gap_ns | type) == "number"
-                 and (.allowed_max_scan_gap_ns | type) == "number"
+                 and .monitor_protocol == "sequence-final-ack-v1"
+                 and .monitor_ready == true
+                 and (.monitor_pid | type) == "number"
+                 and (.monitor_sequence | type) == "number"
+                 and ((.final_ack_sequence == null)
+                      or (.final_ack_sequence | type) == "number")
+                 and .exclusion_kind == "kernel-flock"
+                 and (.exclusion_held | type) == "boolean"
                  and (.indeterminate | type) == "boolean"
                  and ((.indeterminate_detail == null)
                       or (.indeterminate_detail | type) == "string")
@@ -1806,13 +1887,13 @@ function refresh_validation_concurrency_evidence {
     fi
 }
 
-# The same monitor process must survive from launch to the receipt boundary.
-# Stop it only after checking its PID/start_ticks/non-zombie identity, then take
-# one final synchronous hardcoded-/proc snapshot. Any gap becomes sticky
-# indeterminate evidence; the caller must persist one diagnostic row before it
-# can return and must never publish authority from that row.
+# The same monitor process must survive from launch through ledger emission. It
+# owns the kernel exclusion lock, advances a scan sequence, and performs the
+# final synchronous hardcoded-/proc snapshot in response to this process over a
+# private Unix socket. Authority derives from that explicit final ack plus the
+# still-held exclusion lock, never from an elapsed scan-gap threshold.
 function finalize_validation_concurrency_monitor {
-    local monitor_state monitor_start marker_detail
+    local monitor_state monitor_start marker_detail final_output ack_sequence
     local authority_final_ok=0
 
     if [[ ! $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ \
@@ -1860,8 +1941,68 @@ function finalize_validation_concurrency_monitor {
         return 1
     fi
 
-    terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
-    VALIDATION_CONCURRENCY_MONITOR_PID=""
+    if ! final_output=$(python3 "$ROOT_DIR/ci/validate_peer_snapshot.py" \
+        --finalize --control-socket "$VALIDATION_CONCURRENCY_CONTROL_SOCKET" \
+        2>>"$LOG_FILE"); then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-final-ack-missing
+        printf '⚠️  validation peer monitor did not acknowledge the final scan; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    ack_sequence=$(jq -r --argjson monitor_pid \
+        "$VALIDATION_CONCURRENCY_MONITOR_PID" \
+        'if .ok == true and .protocol == "sequence-final-ack-v1"
+         and .monitor_pid == $monitor_pid
+         and (.ack_sequence | type) == "number"
+         then .ack_sequence else empty end' \
+        <<<"$final_output" 2>/dev/null) || ack_sequence=""
+    if [[ ! $ack_sequence =~ ^[1-9][0-9]*$ ]]; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-final-ack-malformed
+        printf '⚠️  validation peer monitor returned a malformed final acknowledgement; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+
+    # The ack must describe the monitor's latest completed scan and the kernel
+    # exclusion must still be held. A delayed scan is acceptable; a missing,
+    # failed, regressed, or caller-fabricated sequence is not.
+    if ! jq -e --argjson ack "$ack_sequence" \
+        --argjson monitor_pid "$VALIDATION_CONCURRENCY_MONITOR_PID" '
+        .scan_complete == true and .indeterminate == false
+        and (.scan_count | type) == "number" and .scan_count >= 2
+        and .monitor_protocol == "sequence-final-ack-v1"
+        and .monitor_ready == true
+        and .monitor_pid == $monitor_pid
+        and .monitor_sequence == $ack
+        and .final_ack_sequence == $ack
+        and .exclusion_kind == "kernel-flock"
+        and .exclusion_held == true
+        and (.owner | type) == "object"
+        and (.same_service_processes | type) == "array"
+        and (.peers | type) == "array"' \
+        "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>&1; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-state-indeterminate
+        marker_detail=$(jq -r \
+            'if (.indeterminate_detail | type) == "string" then .indeterminate_detail else empty end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || marker_detail=""
+        if [[ -n $marker_detail ]]; then
+            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
+        fi
+        printf '⚠️  final validation peer acknowledgement is indeterminate; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+
+    if ! read -r monitor_state monitor_start < <(
+        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    ) || [[ $monitor_state == Z || $monitor_state == T || $monitor_state == t \
+        || $monitor_start != "$VALIDATION_CONCURRENCY_MONITOR_START_TICKS" ]]; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-dead-after-final-ack
+        printf '⚠️  validation peer monitor lost identity after final acknowledgement; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+
     if validation_lock_authority_snapshot final; then
         authority_final_ok=1
     else
@@ -1877,42 +2018,23 @@ function finalize_validation_concurrency_monitor {
         fi
         return 1
     fi
-    if ! run_validation_peer_snapshot >/dev/null 2>>"$LOG_FILE"; then
-        VALIDATION_CONCURRENCY_FINAL_OK=0
-        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-snapshot-failed
-        marker_detail=$(jq -r \
-            'if (.indeterminate_detail | type) == "string" then .indeterminate_detail else empty end' \
-            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || marker_detail=""
-        if [[ -n $marker_detail ]]; then
-            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
-        fi
-        printf '⚠️  final validation peer snapshot failed; recording diagnostic NO-RESULT\n' >&2
-        return 1
-    fi
-    if ! jq -e '.scan_complete == true and .indeterminate == false
-        and (.scan_count | type) == "number" and .scan_count >= 2
-        and (.max_successful_scan_gap_ns | type) == "number"
-        and (.allowed_max_scan_gap_ns | type) == "number"
-        and .max_successful_scan_gap_ns <= .allowed_max_scan_gap_ns
-        and (.owner | type) == "object"
-        and (.same_service_processes | type) == "array"
-        and (.peers | type) == "array"' \
-        "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>&1; then
-        VALIDATION_CONCURRENCY_FINAL_OK=0
-        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-state-indeterminate
-        marker_detail=$(jq -r \
-            'if (.indeterminate_detail | type) == "string" then .indeterminate_detail else empty end' \
-            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || marker_detail=""
-        if [[ -n $marker_detail ]]; then
-            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
-        fi
-        printf '⚠️  final validation peer evidence is indeterminate; recording diagnostic NO-RESULT\n' >&2
-        return 1
-    fi
     if ((authority_final_ok != 1)); then
         return 1
     fi
     return 0
+}
+
+function stop_validation_concurrency_monitor {
+    if [[ $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ \
+        && $VALIDATION_CONCURRENCY_MONITOR_PID != "$VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID" ]]; then
+        terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    fi
+    if [[ $VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID =~ ^[1-9][0-9]*$ ]]; then
+        terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID"
+        wait "$VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID" 2>/dev/null || true
+    fi
+    VALIDATION_CONCURRENCY_MONITOR_PID=""
+    VALIDATION_CONCURRENCY_MONITOR_LAUNCH_PID=""
 }
 
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
@@ -2364,6 +2486,9 @@ function cleanup {
        [[ $VALIDATION_LEVEL == full ]]; then
         publish_receipt_backed_label
     fi
+    # On the authority path the monitor retains the kernel exclusion through
+    # ledger append and publisher decision. Release it only afterward.
+    stop_validation_concurrency_monitor
     rm -rf "$VALIDATION_TMP_DIR"
     rm -rf "$REAL_COMPAT_FIXTURES"
     print_wall_cpu_summary "$exit_status" \
@@ -2385,12 +2510,19 @@ trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
 if ((VALIDATION_NESTED == 0)); then
-    start_validation_concurrency_monitor || true
+    if ! start_validation_concurrency_monitor; then
+        VALIDATION_CONCURRENCY_START_OK=0
+    fi
     if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
         && -n ${VALIDATE_STOP_TEST_MONITOR_PID_FILE:-} \
         && $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ ]]; then
         printf '%s\n' "$VALIDATION_CONCURRENCY_MONITOR_PID" \
             >"$VALIDATE_STOP_TEST_MONITOR_PID_FILE"
+    fi
+    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} != 1 \
+        && $VALIDATION_CONCURRENCY_START_OK != 1 ]]; then
+        printf 'validate.sh: peer monitor/exclusion admission failed; recording diagnostic NO-RESULT\n' >&2
+        exit 1
     fi
 fi
 
