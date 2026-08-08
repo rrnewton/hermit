@@ -190,12 +190,29 @@ if err is None:
     # landed: a bare `deterministic=1` cannot say WHICH comparison earned it, so
     # the verdict now travels with its strictness, its parity boolean and the
     # counts that make the boolean falsifiable.
+    #
+    # 23 -> 24 when the default destination became a fresh per-run file. Until
+    # then this producer only ever APPENDED to a parent that already carried
+    # `comparison_tier`, so omitting it from the created header was invisible.
+    # Creating the file made it load-bearing: `extrasaction="ignore"` drops any
+    # column the file lacks, so a 23-column header silently discarded the tier on
+    # the way out and every folded-in row would have been untiered — the exact
+    # defect this producer was fixed to stop emitting, reintroduced by the
+    # redirect. A created file must be publishable as-is.
     check(
         "created header carries the tier-evidence columns",
-        hdr.endswith(",verify_compare,bitwise_parity,compared_log_messages,tier"),
+        hdr.endswith(",verify_compare,bitwise_parity,compared_log_messages,tier,comparison_tier"),
         hdr,
     )
-    check("created header is 23 columns", len(hdr.split(",")) == 23, hdr)
+    check("created header is 24 columns", len(hdr.split(",")) == 24, hdr)
+    check(
+        "a CREATED file's rows are tiered, so it can be folded in without repair",
+        all(
+            (row.get("comparison_tier") or "").strip() == run_matrix.COMPARISON_TIER
+            for row in read_planted(path).values()
+        ),
+        str({k: v.get("comparison_tier") for k, v in read_planted(path).items()}),
+    )
 
 print("case COMPARISON-TIER — every appended row states its comparison standard")
 # WHY. `restval=""` fills any column the outer file has and this producer does
