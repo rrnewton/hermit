@@ -1684,7 +1684,16 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    # `producer` names the writer that emitted this row, so receipt provenance is
+    # a recorded fact rather than forensics inferred from `cwd`. The slug is
+    # repo-qualified because hermit and reverie both ship a `validate.sh` and a
+    # bare name could not distinguish them. It must stay registered in the
+    # parent's qualifying-receipt `producer.known` list; an unregistered value is
+    # REFUSED once `applies_from_finished_at` is set. Keep it immediately after
+    # `schema_version`: the parent's C3 binding test anchors its slug pattern to
+    # that position, so moving it reads as writer/registry drift.
+    line="{\"schema_version\":4,\"producer\":\"hermit-validate-sh\","
+    line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
