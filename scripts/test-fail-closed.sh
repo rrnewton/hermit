@@ -39,9 +39,20 @@ cd "$repository"
 [[ -f "$known_failure_manifest" ]] || fail "missing $known_failure_manifest"
 [[ -f "$allowed_ignore_manifest" ]] || fail "missing $allowed_ignore_manifest"
 
+# Enumerate integration-test targets through GIT, not a bare filesystem walk,
+# for the same reason ci/test_harness.sh audit_inventory does (61edbef42): a
+# bare `find` reports every file ON DISK, so gitignored output sitting in
+# hermit-cli/tests/ becomes a cargo target that does not exist. `.tmp*` is
+# gitignored here, and `cargo test --test .tmpfoo` fails on a tree that
+# `git status` still reports as clean.
+#
+# `--cached --others --exclude-standard` is tracked files PLUS genuinely new
+# untracked ones, MINUS ignored output, so a newly added test file is still
+# picked up. The pathspec plus `[^/]+$` reproduce `-maxdepth 1 -type f`.
 mapfile -t targets < <(
-  find hermit-cli/tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
-    | sed 's/\.rs$//' \
+  git -C "$repository" ls-files --cached --others --exclude-standard -- hermit-cli/tests \
+    | grep -E '^hermit-cli/tests/[^/]+\.rs$' \
+    | sed 's|^hermit-cli/tests/||; s/\.rs$//' \
     | sort
 )
 ((${#targets[@]} > 0)) || fail "no Hermit integration-test targets found"

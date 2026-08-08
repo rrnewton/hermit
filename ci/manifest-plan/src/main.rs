@@ -26,6 +26,58 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
+/// Enumerate the e2e manifests through GIT, not a bare `read_dir`.
+///
+/// Same defect class as `ci/test_harness.sh` audit_inventory (61edbef42): a raw
+/// directory read reports every file ON DISK, so gitignored scratch landing in
+/// `tests/e2e/manifests/` becomes a "manifest". `.tmp*` and `*.orig` are both
+/// gitignored and both end in `.toml` often enough to matter -- planting
+/// `tests/e2e/manifests/.tmpx.toml` makes this binary die with
+/// `.tmpx.toml: schema must be 2`, taking the WHOLE e2e plan down, on a tree
+/// `git status` still reports as clean.
+///
+/// `--cached --others --exclude-standard` is tracked files PLUS genuinely new
+/// untracked ones, MINUS ignored output, so a newly added manifest is still
+/// validated. Falls back to the directory read when git is unavailable (for
+/// example an exported tarball) rather than failing the build.
+fn manifest_paths(repo_root: &Path, script_dir: &Path) -> Vec<PathBuf> {
+    let listing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "tests/e2e/manifests",
+        ])
+        .output();
+    if let Ok(output) = listing {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                // Filter on the repo-relative line, not on the joined path:
+                // `script_dir` is built with `..` segments and never compares
+                // equal to a normalized parent.
+                return text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("tests/e2e/manifests/"))
+                    .filter(|rest| !rest.contains('/') && rest.ends_with(".toml"))
+                    .map(|rest| script_dir.join(rest))
+                    .collect();
+            }
+        }
+    }
+    std::fs::read_dir(script_dir)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", script_dir.display())))
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct PlanRow {
     bucket: String,
@@ -81,14 +133,7 @@ fn main() {
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
     let repo_root = script_dir.join("../../..");
 
-    let mut manifests: Vec<PathBuf> = std::fs::read_dir(&script_dir)
-        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", script_dir.display())))
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "toml")
-        })
-        .collect();
+    let mut manifests: Vec<PathBuf> = manifest_paths(&repo_root, &script_dir);
     manifests.sort();
     if manifests.is_empty() {
         die(format!(
