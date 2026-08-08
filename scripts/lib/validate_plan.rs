@@ -121,7 +121,7 @@ impl CompatMode {
 
     /// The `hermit run ...` flags preceding `--`, reproducing the `run_args`
     /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
-    pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
+    pub fn run_args(self, label: &str, nsswitch: &str, verify_json: Option<&str>) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
             CompatMode::Strict => vec![s("run"), s("--strict"), s("--verify"), s("--")],
@@ -153,8 +153,23 @@ impl CompatMode {
             }
             // rr rows are driven through `hermit record start --verify`, matching
             // rr_compatibility_probe rather than the plain run path.
+            //
+            // `--verify-json` is NOT optional decoration. The wrapper's exit
+            // status cannot express this lane's verdict in either direction:
+            // `VerificationOutcome::into_exit_status` maps `Matched` to the
+            // GUEST's status, so a comparison that consumed ZERO log messages
+            // exits 0 (hermit's own `empty_log_comparison_matches_but_is_never_parity`
+            // asserts Matched with `compared_log_messages` 0/0 under the strictest
+            // spec), while a genuinely-parity run whose guest legitimately exits
+            // nonzero exits nonzero. The JSON is the only place the three-way
+            // `bitwise_parity` conjunction is published. See [`rr_verdict_check`].
             CompatMode::Rr => {
-                vec![s("record"), s("start"), s("--verify"), s("--verify-strict"), s("--")]
+                let mut v = vec![s("record"), s("start"), s("--verify"), s("--verify-strict")];
+                if let Some(path) = verify_json {
+                    v.push(format!("--verify-json={path}"));
+                }
+                v.push(s("--"));
+                v
             }
         }
     }
@@ -224,6 +239,63 @@ pub fn shell_quote(arg: &str) -> String {
         return arg.to_string();
     }
     format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// The record/replay lane's VERDICT, as a shell predicate over `--verify-json`.
+///
+/// Port of `rr_report_has_bitwise_parity` (validate.sh:2898), which the bash ran
+/// on the report of every rr row. It has no successor in this driver, and its
+/// absence is not cosmetic: without it the lane's verdict collapses onto the
+/// wrapper's exit status, which is wrong in BOTH directions.
+///
+/// - FAIL-OPEN. `VerificationOutcome::into_exit_status` maps `Matched` to the
+///   guest's own status. A comparison that consumed ZERO log messages is
+///   legitimately `Matched` — hermit's `empty_log_comparison_matches_but_is_never_parity`
+///   asserts exactly that, with `compared_log_messages` 0/0 and a fully
+///   qualifying spec, because diffing two empty selections reports "no
+///   difference". Such a row exits 0. And the compared stream is the INFO log,
+///   whose level is `requested.unwrap_or(INFO)` where `requested` is
+///   `GlobalOpts.log`, declared `env = "HERMIT_LOG"` — so an ambient
+///   `HERMIT_LOG=warn` empties every comparison and the whole lane reports pass
+///   having compared nothing.
+/// - FAIL-CLOSED. A genuinely-parity run whose guest legitimately exits nonzero
+///   exits nonzero, which the wrapper-status reading would call a divergence.
+///
+/// So the report, not the exit status, is the verdict — which is why the caller
+/// runs hermit with `;` rather than `&&` and lets this predicate decide.
+///
+/// `bitwise_parity` is the single field to ask for because hermit already
+/// computes the whole conjunction there (`VerificationReport::from`): the runs
+/// matched, AND the comparison was strict enough for the match to MEAN bitwise
+/// identity, AND it actually consumed log evidence. Asking for the conjuncts
+/// separately here would duplicate a policy this driver does not own.
+///
+/// Fail-closed on a missing, empty, truncated or malformed report. That matters
+/// because hermit stamps a no-result report BEFORE any fallible work
+/// (`record_start.rs:414`), so an aborted row leaves a report that says so
+/// rather than a stale green from a previous invocation.
+///
+/// `-s`/`--slurp` IS LOAD-BEARING, and the reason is a trap this predicate fell
+/// into first: `jq -e` sets a failing status from the LAST output value, so on
+/// an input that yields NO outputs at all it exits 0. Measured with jq 1.6, a
+/// whitespace-only report passed `test -s` and then passed a bare
+/// `jq -e '.bitwise_parity == true'` with exit 0 — a truncated report would have
+/// certified parity, which is the very failure class this predicate exists to
+/// close. Slurping reads the whole stream into an array, so "no JSON at all"
+/// becomes `[]` and evaluates to a definite `false` instead of to nothing.
+/// `length == 1` then also refuses a concatenated multi-document report.
+///
+/// Everything else is a type check rather than a truthiness check: `type ==
+/// "object"` refuses an array or scalar, and requiring `bitwise_parity` to be a
+/// BOOLEAN refuses a truthy `"true"` string.
+pub fn rr_verdict_check(report: &str) -> String {
+    let q = shell_quote(report);
+    format!(
+        "test -s {q} && jq -s -e 'length == 1 and (.[0] \
+         | type == \"object\" \
+         and (.bitwise_parity | type == \"boolean\") \
+         and .bitwise_parity == true)' {q} >/dev/null"
+    )
 }
 
 /// Join an argv into a shell command string.
@@ -412,15 +484,44 @@ pub fn compat_nodes_for(
         {
             continue;
         }
+        // rr rows are judged by their `--verify-json` report, not by the
+        // wrapper's exit status (see [`rr_verdict_check`]). One report per row,
+        // under this run's temp dir, so concurrent rows cannot read each other's.
+        let report = (mode == CompatMode::Rr).then(|| {
+            format!(
+                "{}/rr-{}/verify.json",
+                paths.validation_tmp_dir,
+                sanitize_job(&row.label)
+            )
+        });
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch));
+        argv.extend(mode.run_args(&row.label, nsswitch, report.as_deref()));
         argv.extend(row.argv.iter().cloned());
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
+        // `;` and not `&&`: the report is the verdict, so the predicate must run
+        // even when hermit exits nonzero — that is precisely the genuine-parity
+        // /nonzero-guest case the bash comment at validate.sh:2908 calls out.
+        // A row that never produced a report still fails, because the predicate
+        // refuses an absent file.
+        let cmd = match &report {
+            Some(path) => format!(
+                "mkdir -p {} && rm -f {} && {{ {} </dev/null; }}; {}",
+                shell_quote(&format!(
+                    "{}/rr-{}",
+                    paths.validation_tmp_dir,
+                    sanitize_job(&row.label)
+                )),
+                shell_quote(path),
+                shell_join(&argv),
+                rr_verdict_check(path),
+            ),
+            None => format!("{} </dev/null", shell_join(&argv)),
+        };
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.assurance(), row.label),
-            format!("{} </dev/null", shell_join(&argv)),
+            cmd,
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),

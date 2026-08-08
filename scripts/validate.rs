@@ -661,6 +661,10 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    // The record/replay lane's own verdict. Its bash ancestor ran on EVERY
+    // invocation; the port dropped it, leaving the lane judged by an exit status
+    // that is wrong in both directions.
+    rr_verdict_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -713,6 +717,118 @@ cleared-caps refusal names {} starved step(s)",
         }
     }
 
+    Ok(())
+}
+
+/// Bracket the record/replay lane's verdict predicate, both directions.
+///
+/// Successor to `rr_report_consumer_self_test` (validate.sh:2912), which the
+/// bash ran UNCONDITIONALLY on every invocation (validate.sh:4868) and which had
+/// no successor in this driver until now. The fixtures below are the bash's own,
+/// byte-for-byte, because they are producer-shaped: each is a report
+/// `--verify-json` can actually emit.
+///
+/// The two positives are the ones that make this non-vacuous. A predicate that
+/// refused everything would satisfy every negative row and still destroy the
+/// lane — and the second positive (genuine parity, guest exited 3) is the exact
+/// case the wrapper's exit status gets WRONG, so it is the reason this predicate
+/// exists rather than a convenience.
+fn rr_verdict_bracket() -> Result<(), String> {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("rr-verdict-bracket-{}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|e| format!("rr verdict bracket: mkdir: {e}"))?;
+    let judge = |name: &str| -> Result<bool, String> {
+        let path = dir.join(name);
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(validate_plan::rr_verdict_check(&path.to_string_lossy()))
+            .output()
+            .map_err(|e| format!("rr verdict bracket: cannot run bash: {e}"))?;
+        Ok(out.status.success())
+    };
+    let plant = |name: &str, body: &str| -> Result<(), String> {
+        fs::write(dir.join(name), format!("{body}\n"))
+            .map_err(|e| format!("rr verdict bracket: write {name}: {e}"))
+    };
+
+    // NEGATIVE. Every one of these is a report a real run can produce, and every
+    // one must be REFUSED. `zero-counts` is the whole reason this task exists:
+    // it is `verified: true` under an unstripped comparison, and it is what an
+    // ambient `HERMIT_LOG=warn` turns all 139 rows into.
+    let refuse: &[(&str, &str)] = &[
+        ("missing.json", ""), // deliberately NOT planted; see below
+        ("no-result.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}"#),
+        ("diverged.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        ("stripped.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":true},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        ("zero-counts.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}"#),
+        // Shape attacks the bash did not carry, added because this predicate is
+        // now the lane's only verdict: a truthy NON-boolean and a non-object must
+        // not slip through a `== true` written carelessly.
+        ("truthy-string.json", r#"{"bitwise_parity":"true"}"#),
+        ("not-an-object.json", r#"[{"bitwise_parity":true}]"#),
+        // REGRESSION FIXTURE, and it caught a real bug in this very predicate.
+        // `jq -e` derives its status from the LAST output, so on input yielding
+        // NO outputs it exits 0: with jq 1.6 a whitespace-only report passed
+        // `test -s` and then passed a bare `jq -e '.bitwise_parity == true'`
+        // with exit 0. A truncated report would have certified parity. Slurping
+        // turns "no JSON at all" into `[]`, i.e. a definite false.
+        ("whitespace-only.json", ""),
+        ("truncated.json", r#"{"verified":true,"bitwise_pari"#),
+        ("two-documents.json", "{\"bitwise_parity\":false}\n{\"bitwise_parity\":true}"),
+    ];
+    let mut refused = 0usize;
+    for (name, body) in refuse {
+        if *name != "missing.json" {
+            plant(name, body)?;
+        }
+        if judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} must be REFUSED — the lane would report parity over it"
+            ));
+        }
+        refused += 1;
+    }
+
+    // POSITIVE. A real parity report must be ACCEPTED, including when the guest
+    // itself exited nonzero: the bash's note at validate.sh:2908 is that "a
+    // matched parity report remains authoritative when the guest (and therefore
+    // the wrapper) exits nonzero", and gating on the wrapper would fail it.
+    let accept: &[(&str, &str)] = &[
+        ("matched.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        ("nonzero-guest.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":3,"guest_signal":null}"#),
+    ];
+    let mut accepted = 0usize;
+    for (name, body) in accept {
+        plant(name, body)?;
+        if !judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} is genuine bitwise parity and must be ACCEPTED; \
+                 a predicate that refuses everything would pass the negatives alone"
+            ));
+        }
+        accepted += 1;
+    }
+
+    // The lane must actually CARRY the flag, or the predicate above judges a
+    // report nothing writes and every row fails closed on an absent file. Bind
+    // the two together so they cannot drift apart.
+    let rr = validate_plan::CompatMode::Rr.run_args("echo", "/nonexistent", Some("/tmp/x.json"));
+    if !rr.iter().any(|a| a == "--verify-json=/tmp/x.json") {
+        return Err(format!("rr verdict: the rr argv does not request a report: {rr:?}"));
+    }
+    if !rr.iter().any(|a| a == "--verify-strict") {
+        return Err("rr verdict: --verify-strict is what makes a Matched verdict mean parity".into());
+    }
+    let none = validate_plan::CompatMode::Rr.run_args("echo", "/nonexistent", None);
+    if none.iter().any(|a| a.starts_with("--verify-json")) {
+        return Err("rr verdict: no report path was requested, yet the flag appeared".into());
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    println!(
+        "  rr verdict: {accepted} genuine parity report(s) accepted (incl. nonzero-guest), \
+         {refused} non-parity report(s) refused (incl. zero-evidence, stripped, absent)"
+    );
     Ok(())
 }
 
