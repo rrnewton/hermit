@@ -110,6 +110,13 @@ fi
 #   effective native jobs = min(requested jobs, child CPUs, Reverie clamp)
 #   max elapsed seconds = ceil(effective-job-second threshold / effective jobs)
 #
+# reverie-pin: history-begin
+# Everything to `history-end` is a DATED RECORD of past calibration decisions.
+# `check-reverie-pin.rs --update-to-latest` advances every LIVE binding to the
+# new pin and must leave this block byte-identical: a carry entry says which
+# revision was calibrated ON THAT DATE, so rewriting it would forge the audit
+# trail it exists to provide. Live bindings live OUTSIDE these markers.
+#
 # PROVENANCE (GitHub portable run 31008044311 at Hermit f21b22ed, requested
 # jobs=8, runner affinity=4): three content-key misses measured 115.82s,
 # 128.27s, and 131.21s -- one debug build and two concurrent release builds --
@@ -247,6 +254,7 @@ fi
 # effective-job-seconds and would fail the portable lane on its first genuine
 # cold miss. The replacement bar stated above -- >=5 clean Hermit-lane samples
 # -- is unchanged and still unmet.
+# reverie-pin: history-end
 REVERIE_DBI_MAX_PARALLEL_JOBS=16
 REVERIE_DBI_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBI_EFFECTIVE_BUILD_JOBS=$REVERIE_DBI_RAW_BUILD_JOBS
