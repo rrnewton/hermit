@@ -1177,6 +1177,211 @@ fn has_rdrand_without_detcore() {
     }
 }
 
+/// The randomness contract, as a fixture rather than a sweep.
+///
+/// Every source Hermit claims to determinize is read by one guest in one
+/// process, so no source can be silently skipped, and the whole output stream is
+/// compared across runs. A sweep's finding decays the moment someone changes the
+/// code; this fails the build.
+///
+/// Three properties are asserted, and all three are load-bearing:
+///
+/// 1. **Coverage.** Exactly the expected source set appears, and every source
+///    that exists on this platform yields real bytes. Without this a source that
+///    stopped reporting (an errno, a short read, `CF=0`, or a line quietly
+///    removed) would leave a *shorter* but still self-consistent stream, and the
+///    identity check below would pass while coverage silently shrank.
+/// 2. **Anti-vacuity.** The same probe run natively must produce *different*
+///    bytes. A probe whose sources were naturally constant would satisfy
+///    identity trivially and prove nothing.
+/// 3. **Identity.** Under Detcore the whole stream is byte-identical across
+///    repeated runs.
+///
+/// The probe issues `RDRAND`/`RDSEED` **without consulting CPUID**. That is the
+/// specific hole this pins down: Detcore masks the feature bits, so a
+/// CPUID-checking probe takes a determinized fallback and the fixture would pass
+/// while the instruction remained a live entropy source.
+#[test]
+fn randomness_sources_are_determinized() {
+    /// Sources that must be present in the probe's output, in order.
+    const EXPECTED: &[&str] = &[
+        "getrandom",
+        "urandom",
+        "random",
+        "at_random",
+        "getentropy",
+        // Reaches entropy through the vDSO specifically. Distinct from
+        // getrandom(2): once the vDSO has seeded its per-thread userspace
+        // CSPRNG there is no syscall left on the boundary, so a probe that
+        // exercises only getrandom(2) reports success while this path is
+        // unconstrained. On this backend it is determinized only *transitively*,
+        // because the seeding itself is an intercepted getrandom(2) — a
+        // guarantee that holds exactly as long as that interception does.
+        "vdso_getrandom",
+        "arc4random",
+        "rdrand",
+        "rdseed",
+    ];
+    /// A source absent from this platform. Reported explicitly rather than
+    /// skipped, so "not available here" cannot be read as "determinized here".
+    const ABSENT: &str = "ABSENT";
+    /// An instruction source the *host* cannot execute. Distinct from ABSENT so
+    /// a reader can tell "this libc lacks the symbol" from "this CPU lacks the
+    /// instruction".
+    const SKIPPED_HOST: &str = "SKIPPED_HOST";
+
+    let probe = env!("CARGO_BIN_EXE_randomness_probe");
+
+    // Whether to exercise RDRAND/RDSEED is decided HERE, from the real host's
+    // CPUID, and never by the guest: under Detcore the guest's CPUID reports
+    // both as absent by design, so a guest-side decision would silently stop
+    // covering the instructions this fixture exists to cover.
+    //
+    // Deciding it here also keeps the fixture ENABLED on portable CI hosts that
+    // genuinely lack the instructions, instead of hard-faulting there and
+    // having to be added to a skip list. A test that is skipped everywhere it
+    // is inconvenient is not a contract.
+    let host = hardware_random_features();
+    let host_has_instructions = host.rdrand && host.rdseed;
+    let args: &[&str] = if host_has_instructions {
+        &[]
+    } else {
+        &["--no-instructions"]
+    };
+
+    /// Reject a value that is technically well-formed but carries no entropy.
+    ///
+    /// Identity across runs plus a hex-shaped value is NOT enough: a source
+    /// zeroed out, or frozen to a constant, satisfies both and would sail
+    /// through. That is the same "stable because it is a constant" failure the
+    /// determinism work keeps finding, and a fixture blind to it reports a
+    /// guarantee it never checked.
+    fn reject_degenerate(context: &str, name: &str, value: &str) {
+        let bytes: Vec<&str> = value
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let distinct: std::collections::BTreeSet<&&str> = bytes.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "{context}: source {name} is a degenerate constant ({value}); \
+             deterministic-because-zeroed is not determinized"
+        );
+    }
+
+    fn parse(stdout: &str) -> Vec<(String, String)> {
+        stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (name, value) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("malformed probe line: {line:?}"));
+                (name.to_owned(), value.to_owned())
+            })
+            .collect()
+    }
+
+    // ---- Property 1: coverage, checked on a native run first so a broken
+    // probe is reported as a broken probe rather than as a Hermit defect.
+    let native_runs: Vec<Vec<(String, String)>> = (0..3)
+        .map(|_| {
+            let out = std::process::Command::new(probe)
+                .args(args)
+                .output()
+                .expect("failed to run the randomness probe natively");
+            assert!(
+                out.status.success(),
+                "randomness probe failed natively: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            parse(&String::from_utf8_lossy(&out.stdout))
+        })
+        .collect();
+
+    let names: Vec<&str> = native_runs[0].iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names, EXPECTED,
+        "the probe's source set changed; a source must never be dropped silently"
+    );
+
+    // Which sources exist here. An ABSENT source is excluded from the variation
+    // check below but is still required to be present as a line.
+    let available: Vec<&str> = native_runs[0]
+        .iter()
+        .filter(|(_, value)| value != ABSENT && value != SKIPPED_HOST)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(
+        host_has_instructions,
+        available.contains(&"rdrand") && available.contains(&"rdseed"),
+        "the instruction sources must be covered exactly when the host advertises \
+         them (host_has_instructions={host_has_instructions}, covered={available:?})"
+    );
+    for (name, value) in &native_runs[0] {
+        if value == ABSENT || value == SKIPPED_HOST {
+            continue;
+        }
+        assert!(
+            value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()),
+            "source {name} did not yield bytes natively: {value:?}"
+        );
+        reject_degenerate("native", name, value);
+    }
+
+    // ---- Property 2: anti-vacuity. Every available source must actually vary
+    // off Hermit, or asserting identity under Hermit proves nothing.
+    for source in &available {
+        let seen: std::collections::BTreeSet<&str> = native_runs
+            .iter()
+            .map(|run| {
+                run.iter()
+                    .find(|(name, _)| name == source)
+                    .map(|(_, value)| value.as_str())
+                    .expect("source vanished between native runs")
+            })
+            .collect();
+        assert!(
+            seen.len() > 1,
+            "source {source} did not vary across 3 native runs ({seen:?}); the identity \
+             assertion under Detcore would be vacuous"
+        );
+    }
+    // Emit the OBSERVED BYTES, not a pass count. A bare "ok" cannot show that
+    // two runs (or two backends) agreed on a *wrong* value; the values can.
+    for (name, value) in &native_runs[0] {
+        eprintln!("randomness fixture [native  ] {name} = {value}");
+    }
+    eprintln!("randomness fixture: covering {available:?}");
+
+    // ---- Property 3: identity under Detcore, plus coverage again on the
+    // guest's own output. `det_test_cmd` runs the guest repeatedly and fails on
+    // any divergence between runs.
+    detcore_testutils::det_test_cmd(probe, args, |output, _state| {
+        detcore_testutils::expect_success(output, _state);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let observed = parse(&stdout);
+        let names: Vec<&str> = observed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names, EXPECTED,
+            "a randomness source disappeared under Detcore; output was:\n{stdout}"
+        );
+        for (name, value) in &observed {
+            if value == ABSENT || value == SKIPPED_HOST {
+                continue;
+            }
+            assert!(
+                value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()),
+                "source {name} yielded no bytes under Detcore ({value:?}); a source that \
+                 stops reporting is a coverage hole, not a pass. Full output:\n{stdout}"
+            );
+            reject_degenerate("detcore", name, value);
+            eprintln!("randomness fixture [detcore ] {name} = {value}");
+        }
+    });
+}
+
 #[test]
 fn rdrand_rdseed_is_masked() {
     let features = hardware_random_features();

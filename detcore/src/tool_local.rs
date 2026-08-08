@@ -43,6 +43,7 @@ use crate::detlog;
 use crate::fd::*;
 use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
+use crate::rdrand::RandSiteTable;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
@@ -1221,6 +1222,14 @@ pub struct ThreadState<T> {
     /// Shared memory mappings used to resolve process-shared futex keys.
     pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
 
+    /// RDRAND/RDSEED sites rewritten to a trap in this address space.
+    ///
+    /// Shared with `CLONE_VM` siblings and deep-copied on `fork`, mirroring
+    /// `memory_metadata`: a forked child inherits the parent's already-patched
+    /// text through copy-on-write, so it must inherit the decode table too.
+    #[serde(default)]
+    pub(crate) rand_sites: Arc<Mutex<RandSiteTable>>,
+
     /// This threads path within the thread/process ancestry tree. (The terminology comes from
     /// Cilk.)
     pub pedigree: Pedigree,
@@ -1365,6 +1374,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("detpid", &self.detpid)
             .field("mm_id", &self.mm_id)
             .field("memory_metadata", &self.memory_metadata)
+            .field("rand_sites", &self.rand_sites)
             .field("stats", &self.stats)
             .field("clone_flags", &self.clone_flags)
             .field("file_metadata", &self.file_metadata)
@@ -1616,6 +1626,7 @@ impl<T> ThreadState<T> {
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
+            rand_sites: Arc::new(Mutex::new(RandSiteTable::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(file_metadata)),

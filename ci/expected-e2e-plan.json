@@ -358,6 +358,20 @@
       "test": "system-utils/date-nanoseconds"
     },
     {
+      "backend": "dbi",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-lock-ordering"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-lock-ordering"
+    },
+    {
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
@@ -482,6 +496,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
+    },
+    {
+      "backend": "dbi",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/vdso-getrandom"
     },
     {
       "backend": "ptrace",

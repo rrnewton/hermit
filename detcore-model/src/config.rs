@@ -42,6 +42,19 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
+    /// Disable RDRAND/RDSEED determinization.
+    ///
+    /// Masking the CPUID feature bit (`virtualize_cpuid`) only steers a guest
+    /// that *asks* before it acts. When this is enabled, Detcore additionally
+    /// rewrites every `RDRAND`/`RDSEED` site in the guest's file-backed
+    /// executable mappings to a trap and emulates the instruction from the
+    /// thread's deterministic PRNG, so a guest that issues the instruction
+    /// without consulting CPUID still gets a reproducible value instead of raw
+    /// hardware entropy. See `detcore::rdrand`.
+    #[serde(default = "default_true")]
+    #[clap(long = "no-determinize-rdrand", action = clap::ArgAction::SetFalse)]
+    pub determinize_rdrand: bool,
+
     /// The execution backend installs a deterministic CPUID policy without instruction faults.
     #[serde(default)]
     #[clap(skip)]
@@ -707,6 +720,9 @@ impl fmt::Display for Config {
         if !self.virtualize_cpuid {
             write!(f, " --no-virtualize-cpuid")?;
         }
+        if !self.determinize_rdrand {
+            write!(f, " --no-determinize-rdrand")?;
+        }
         if !self.virtualize_metadata {
             write!(f, " --no-virtualize-metadata")?;
         }
@@ -1150,6 +1166,26 @@ mod tests {
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn rdrand_determinization_is_on_by_default_and_round_trips() {
+        // On by default: hiding RDRAND behind a cleared CPUID bit is not
+        // determinization, so the instruction rewrite is part of the baseline
+        // guarantee rather than an opt-in.
+        let default = Config::default();
+        assert!(default.determinize_rdrand);
+        assert!(!default.to_string().contains("--no-determinize-rdrand"));
+
+        let disabled = Config::parse_from(["detcore", "--no-determinize-rdrand"]);
+        assert!(!disabled.determinize_rdrand);
+        assert!(disabled.to_string().contains(" --no-determinize-rdrand"));
+
+        // It is independent of the CPUID mask: disabling one must not disable
+        // the other, since they cover disjoint classes of guest.
+        let no_cpuid = Config::parse_from(["detcore", "--no-virtualize-cpuid"]);
+        assert!(!no_cpuid.virtualize_cpuid);
+        assert!(no_cpuid.determinize_rdrand);
     }
 
     #[test]

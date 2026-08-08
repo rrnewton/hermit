@@ -39,6 +39,10 @@ name = "detcore"
 name = "syscaller"
 path = "scripts/syscaller.rs"
 
+[[bin]]
+name = "randomness_probe"
+path = "scripts/randomness_probe.rs"
+
 [[test]]
 name = "tests_misc"
 path = "tests/misc/mod.rs"
@@ -59,7 +63,9 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 detcore-model = { version = "0.2.0", path = "../detcore-model" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 hex = { version = "0.4.3", features = ["alloc"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["decoder", "instr_info", "std"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty = "0.12.5"
