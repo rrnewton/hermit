@@ -107,11 +107,13 @@ impl Subscriber for DbiSubscriber {
         let metadata = event.metadata();
         let mut visitor = DbiEventVisitor::default();
         event.record(&mut visitor);
-        let line = format!(
-            "{} {}: {}\n",
-            metadata.level(),
+        // Shared renderer, not a local format!: the record framing is a
+        // cross-backend contract and a second copy is how it drifts.
+        let line = detcore::detlog::canonical_record(
+            detcore::detlog::next_record_stamp(),
+            metadata.level().as_str(),
             metadata.target(),
-            visitor.fields
+            format_args!("{}", visitor.fields),
         );
         unsafe { (self.emit)(line.as_ptr(), line.len()) };
     }
