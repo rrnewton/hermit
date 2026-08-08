@@ -903,10 +903,6 @@ environmental=0
 ENV_BLOCK_MAX_RETRIES=${VALIDATE_ENV_BLOCK_RETRIES:-2}
 readonly ENV_BLOCK_MAX_RETRIES
 active_check_pid=""
-declare -a background_pids=()
-declare -a background_names=()
-declare -a background_logs=()
-declare -a background_duration_files=()
 declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
@@ -1839,9 +1835,6 @@ function cleanup {
     if [[ -n $active_check_pid ]]; then
         terminate_gate_tree "$active_check_pid"
     fi
-    for pid in "${background_pids[@]}"; do
-        terminate_gate_tree "$pid"
-    done
 
     # Wall + CPU for the whole run, computed ONCE here in the trap's top-level
     # shell context (a subshell's `times` would miss the accumulated child CPU).
@@ -2245,107 +2238,6 @@ function validate_reverie_pin_consistency {
     if [[ -x ./scripts/check-nested-lockfiles.rs ]]; then
         run_repo_rust_script ./scripts/check-nested-lockfiles.rs || return 1
     fi
-}
-
-function start_check {
-    local name=$1
-    shift
-
-    local index=${#background_pids[@]}
-    local log_file="$VALIDATION_TMP_DIR/check-$index.log"
-    local duration_file="$VALIDATION_TMP_DIR/check-$index.duration"
-
-    {
-        printf "Command:"
-        printf " %q" "$@"
-        printf "\n"
-    } >"$log_file"
-    if ((VERBOSE == 1)); then
-        printf "\n▶ %s (background)\n" "$name"
-        printf "  command:"
-        printf " %q" "$@"
-        printf "\n  timeout: %ss\n" "$GATE_TIMEOUT_SECONDS"
-    fi
-
-    (
-        local started_at=$SECONDS
-        local status
-
-        if run_timed_command "$name" "$log_file" "$GATE_TIMEOUT_SECONDS" "$@"; then
-            status=0
-        else
-            status=$?
-        fi
-        printf "%s\n" "$((SECONDS - started_at))" >"$duration_file"
-        exit "$status"
-    ) &
-
-    background_pids+=("$!")
-    background_names+=("$name")
-    background_logs+=("$log_file")
-    background_duration_files+=("$duration_file")
-    checks=$((checks + 1))
-}
-
-function wait_for_background_checks {
-    local i
-    for i in "${!background_pids[@]}"; do
-        local pid=${background_pids[$i]}
-        local name=${background_names[$i]}
-        local log_file=${background_logs[$i]}
-        local duration_file=${background_duration_files[$i]}
-        local output_start
-        local status
-        local duration
-        local summary
-
-        if ((VERBOSE == 1)); then
-            printf "\n▶ Collecting background gate: %s (manager PID %s)\n" "$name" "$pid"
-        fi
-
-        if wait "$pid"; then
-            status=0
-        else
-            status=$?
-            failures=$((failures + 1))
-        fi
-
-        printf "=== %s ===\n" "$name" >>"$LOG_FILE"
-        output_start=$(($(wc -l <"$LOG_FILE") + 1))
-        cat "$log_file" >>"$LOG_FILE"
-        if [[ -r $duration_file ]]; then
-            duration=$(<"$duration_file")
-        else
-            duration=0
-        fi
-
-        if ((status == 0)); then
-            printf "✅ %s (1 passed, 0 failed, %ss)\n" "$name" "$duration"
-        elif is_environmental_block "$output_start"; then
-            # Background checks run to completion before collection, so they
-            # cannot be retried in place; still label the block unambiguously as
-            # infrastructure rather than a test failure (already counted in
-            # failures above) and tally it separately.
-            environmental=$((environmental + 1))
-            summary=$(failure_summary "$output_start")
-            printf "🧱 %s (ENVIRONMENTAL BLOCK: host sandbox FS-permission denial (BPFJailer) or vendored third-party (DynamoRIO) build flake, NOT a test failure — validate could not complete; exit %s: %s; full log: %s)\n" \
-                "$name" "$status" "$summary" "$LOG_FILE"
-        else
-            summary=$(failure_summary "$output_start")
-            printf "❌ %s (0 passed, 1 failed, exit %s: %s; full log: %s)\n" \
-                "$name" "$status" "$summary" "$LOG_FILE"
-        fi
-        {
-            printf "Exit: %s\n" "$status"
-            printf "Duration: %ss\n\n" "$duration"
-        } >>"$LOG_FILE"
-        record_ledger_gate "$name" "$status" "$duration"
-    done
-
-    background_pids=()
-    background_names=()
-    background_logs=()
-    background_duration_files=()
 }
 
 function ensure_cargo_nextest {
