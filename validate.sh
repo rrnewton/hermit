@@ -456,6 +456,103 @@ readonly STRICT_COMPAT_ONLY PORTABLE_STRICT_COMPAT_ONLY RR_COMPAT_ONLY SABRE_COM
 readonly E9PATCH_COMPAT_ONLY LITEINST_COMPAT_ONLY QEMU_L2_ONLY PRIVILEGED_ONLY
 readonly VALIDATION_LEVEL VALIDATION_PROFILE
 
+# --- Re-entrancy -------------------------------------------------------------
+# validate.sh MUST NOT run its full driver inside itself. ci/dag/portable.json's
+# `test.strict_compat` node invokes `./validate.sh --portable-strict-compat-only`,
+# so a plain run re-entered this script and paid the ENTIRE preamble a second
+# time -- dirty-tree gate, result-cache lookup, artifact scan, history estimate,
+# concurrency monitor -- inside a node with a 1800s budget, and then appended a
+# SECOND ledger row and could publish a SECOND receipt for one logical run.
+#
+# A nested invocation is now explicitly a PAYLOAD, not a driver: it runs its
+# focused envelope and nothing else. The outer run owns all bookkeeping.
+# Re-entering at a non-focused LEVEL is refused outright -- that would be a full
+# suite inside a full suite, which is never intended.
+#
+# The durable fix is to stop shipping the envelope inside the driver at all; that
+# is what the Rust port does by making each probe its own DAG node.
+if [[ -n ${HERMIT_VALIDATE_ACTIVE:-} ]]; then
+    VALIDATION_NESTED=1
+    VALIDATION_OUTER_PID=$HERMIT_VALIDATE_ACTIVE
+else
+    VALIDATION_NESTED=0
+    VALIDATION_OUTER_PID=""
+fi
+# Capture the OUTER pid before claiming the marker, so diagnostics name the run
+# we are nested inside rather than ourselves.
+export HERMIT_VALIDATE_ACTIVE=$$
+readonly VALIDATION_NESTED VALIDATION_OUTER_PID
+if ((VALIDATION_NESTED == 1 && only_modes == 0)); then
+    echo "validate.sh: refusing to re-enter a full validation level from inside validate.sh (outer pid ${VALIDATION_OUTER_PID}); nested invocations may only run a focused mode" >&2
+    exit 2
+fi
+
+# --- Concurrent invocation ---------------------------------------------------
+# A second validate in the SAME checkout is unambiguously wrong: both drive one
+# target/ tree and one ledger. Refuse it LOUDLY and IMMEDIATELY, naming the
+# holder, rather than letting the two interleave or one silently block.
+#
+# SCOPE IS PER-CHECKOUT, deliberately. Box-wide exclusivity belongs to
+# `ci-hub validate-lock`; duplicating it here would give the fleet two
+# independent admission controllers that can disagree.
+#
+# THE PRIMITIVE IS flock, NOT A PIDFILE, and not a scan of the process table:
+#   * flock is released by the KERNEL when the holder dies, so a crashed or
+#     SIGKILLed run cannot strand the lock. A pidfile makes the dead-owner case
+#     something you have to represent and reclaim; flock makes it unrepresentable.
+#   * a `ps | grep validate.sh` scan would count PARKED fixtures. Measured on
+#     this box: 9 live `validate.sh` process groups, 8 of them stop-test
+#     fixtures sitting in `sleep 1` at CPU/wall 0.00-0.02. A scan-based guard
+#     would have refused EVERY validate on the box -- an outage strictly worse
+#     than the reentrancy it set out to fix.
+#
+# Two invocations deliberately do NOT take the lock, because neither is a second
+# driver: a NESTED payload (the outer run already holds it) and the stop-test
+# fixture (which never runs gates, and whose leaked orphans must never wedge a
+# real run).
+VALIDATION_LOCK_DIR="$ROOT_DIR/target/validation"
+VALIDATION_LOCK_FILE="$VALIDATION_LOCK_DIR/validate-invocation.lock"
+VALIDATION_LOCK_HOLDER="$VALIDATION_LOCK_DIR/validate-invocation.holder"
+readonly VALIDATION_LOCK_DIR VALIDATION_LOCK_FILE VALIDATION_LOCK_HOLDER
+if ((VALIDATION_NESTED == 0)) && [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} != 1 ]] \
+    && command -v flock >/dev/null 2>&1; then
+    mkdir -p "$VALIDATION_LOCK_DIR"
+    exec {VALIDATION_LOCK_FD}>>"$VALIDATION_LOCK_FILE"
+    if ! flock -n "$VALIDATION_LOCK_FD"; then
+        {
+            printf 'validate.sh: REFUSED - another validate is already running in this checkout.\n'
+            printf '  checkout: %s\n' "$ROOT_DIR"
+            # The holder RECORD is written by validate.sh; anything else holding
+            # the lock (or a record left by an earlier run) would name a pid that
+            # is not the live holder. Check liveness before presenting it, so the
+            # refusal never points at a dead process as though it were running.
+            holder_pid=""
+            if [[ -r $VALIDATION_LOCK_HOLDER ]]; then
+                holder_pid=$(sed -n 's/^pid=//p' "$VALIDATION_LOCK_HOLDER" 2>/dev/null)
+            fi
+            if [[ $holder_pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$holder_pid" 2>/dev/null; then
+                printf '  holder (pid %s is LIVE):\n' "$holder_pid"
+                sed 's/^/    /' "$VALIDATION_LOCK_HOLDER"
+            elif [[ -r $VALIDATION_LOCK_HOLDER ]]; then
+                printf '  holder: lock is held, but the recorded pid %s is NOT alive, so this\n' "${holder_pid:-unknown}"
+                printf '          record is STALE and does not describe the current holder:\n'
+                sed 's/^/    /' "$VALIDATION_LOCK_HOLDER"
+            else
+                printf '  holder: (lock held, but no holder record was readable)\n'
+            fi
+            printf '  This is a refusal, not a wait: two validates in one checkout share\n'
+            printf "  target/ and the ledger, and would corrupt each other's results.\n"
+            printf '  Wait for the holder to finish, or run in a different checkout.\n'
+        } >&2
+        exit 3
+    fi
+    : >"$VALIDATION_LOCK_HOLDER"
+    printf 'pid=%s\nstarted_at=%s\ncommit=%s\nprofile=%s\ncheckout=%s\n' \
+        "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "$(git rev-parse HEAD 2>/dev/null || printf unknown)" \
+        "$VALIDATION_PROFILE" "$ROOT_DIR" >"$VALIDATION_LOCK_HOLDER" 2>/dev/null || true
+fi
+
 VALIDATION_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VALIDATION_STARTED_EPOCH=$(date +%s)
 VALIDATION_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf "unknown")
@@ -548,7 +645,7 @@ readonly VALIDATION_COMMIT_ANCHORED VALIDATION_SELECTION_MODE
 # (agents must not). A forced run is likewise stamped commit_anchored=false. This
 # gate runs before the validation tmp dir and EXIT trap are established, so a
 # refused run leaves no partial state behind.
-if ((VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
+if ((VALIDATION_NESTED == 0 && VALIDATION_WORKTREE_DIRTY == 1 && RUN_ON_DIRTY_TREE == 0)); then
     {
         printf "validate.sh: refusing to run on a dirty working tree.\n"
         printf "  HEAD %s has uncommitted changes in the working tree, so a\n" "$VALIDATION_COMMIT"
@@ -652,7 +749,7 @@ function cache_lookup_record {
               end' 2>/dev/null
 }
 
-if ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
+if ((VALIDATION_NESTED == 0)) && ((IGNORE_CACHE == 0)) && ((VALIDATION_COMMIT_ANCHORED == 1)) \
    && [[ $VALIDATION_SELECTION_MODE == full && $VALIDATION_TREE != unknown ]]; then
     cache_hit_tsv=$(cache_lookup_record pass)
     if [[ -n $cache_hit_tsv ]]; then
@@ -855,72 +952,110 @@ function detect_cache_state {
 }
 
 # Artifact-integrity pre-flight. A compiler/archiver killed mid-write leaves a
-# TRUNCATED zero-length *.o in a build tree -- classically the OOM-killer firing
-# on a NEIGHBOUR's step cgroup with memory.oom.group=1, so make never runs its
+# TRUNCATED artifact in a build tree -- classically the OOM-killer firing on a
+# NEIGHBOUR's step cgroup with memory.oom.group=1, so make never runs its
 # .DELETE_ON_ERROR cleanup. cmake/make key incremental freshness on TIMESTAMP not
 # CONTENT, so they trust the empty object forever and link it, producing an
 # "undefined reference" that reads as a source defect and never self-corrects.
 # Scan before we trust the tree and delete any such object so the build rebuilds
 # it. This is a CONTENT FACT, not a heuristic: it removes ONLY genuinely-corrupt
-# (0-byte) objects, so healthy artifacts -- and thus incremental skipping and the
-# warm cache -- are preserved (a blanket "clean rebuild after any failure" would
-# not be: cold rebuilds cost +232s and fail more). Covers DynamoRIO (reverie-dbi),
-# SaBRe + e9patch (hermit-install); rustc's target/deps self-heal via fingerprints.
-# Catches corruption from a kill we did not observe, which the per-crate build.rs
-# guard cannot: cargo re-runs a build script only on input change or prior failure,
-# so a neighbour that truncates an already-built object is otherwise linked as-is.
-# True when a linkable build artifact is structurally incomplete.
+# artifacts, so healthy ones -- and thus incremental skipping and the warm cache
+# -- are preserved (a blanket "clean rebuild after any failure" would not be).
 #
-# Size is only a PROXY for corruption: an OOM-killed compiler routinely leaves a
-# partial write that is nonzero AND retains valid magic, so both `-size 0` and a
-# bare magic check pass it through and the linker then reports a bogus
-# "undefined reference". ELF is self-describing, so truncation is detectable from
-# the artifact's own header: the section table must fit inside the file.
+# ONE PROCESS FOR THE WHOLE TREE. This scan used to run per file: `stat`, then
+# `head | od | tr`, then a WHOLE python3 interpreter for every .o/.so -- about
+# five forks each. It runs BEFORE the first gate prints anything, so its cost is
+# indistinguishable from a hang. Measured on a warm checkout: 31.5 ms/file across
+# 101,751 candidates = 53 MINUTES OF SILENCE before validate appeared to start,
+# which is why runs were being killed on the assumption they had wedged. Feeding
+# the whole list to a single python3 scans the same 101,751 files in 15.8 s.
 #
-# Magic is PER-FORMAT. `.a`/`.rlib` are ar archives ("!<arch>\n"), NOT ELF, so a
-# single ELF-magic test would delete every valid static archive.
-function artifact_is_corrupt {
-    local f=$1 magic size
-    size=$(stat -c %s -- "$f" 2>/dev/null) || return 1
-    ((size == 0)) && return 0
-    magic=$(head -c 8 -- "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    case "$f" in
-        *.a | *.rlib)
-            [[ $magic == 213c617263683e0a* ]] || return 0 # !<arch>\n
-            ((size < 68)) && return 0                     # ar header + one member header
-            return 1
-            ;;
-        *.o | *.so | *.so.* | *.lo)
-            [[ $magic == 7f454c46* ]] || return 0 # \x7fELF
-            python3 - "$f" <<'PY' && return 1 || return 0
-import struct, sys
-with open(sys.argv[1], "rb") as fh:
-    head = fh.read(64)
-if len(head) < 64:
-    sys.exit(1)
-if head[4] != 2:  # not ELFCLASS64: magic-only check
-    sys.exit(0)
-shoff = struct.unpack_from("<Q", head, 0x28)[0]
-need = shoff + struct.unpack_from("<H", head, 0x3A)[0] * struct.unpack_from("<H", head, 0x3C)[0]
-import os
-sys.exit(1 if shoff and need > os.path.getsize(sys.argv[1]) else 0)
-PY
-            ;;
-    esac
-    return 1
-}
-
-# Delete build artifacts a killed compiler left structurally incomplete. cmake
-# compares TIMESTAMPS, not content, so a truncated object with a fresh mtime is
-# trusted forever and every later build links against a symbol-less file.
+# The predicate below is the SAME one the per-file version applied, kept in one
+# place now that it has one caller:
+#   size == 0                        -> corrupt
+#   *.a / *.rlib : must begin "!<arch>\n" and be >= 68 bytes (ar header + one
+#                  member header), else corrupt
+#   *.o *.so *.so.* *.lo : must begin \x7fELF, else corrupt; a header shorter
+#                  than 64 bytes is corrupt; a non-ELFCLASS64 object is accepted
+#                  on magic alone; otherwise the section table must fit inside
+#                  the file (shoff + e_shentsize*e_shnum <= size)
+#   anything else                    -> not corrupt
+# Size alone is only a PROXY: an OOM-killed compiler routinely leaves a partial
+# write that is nonzero AND retains valid magic, so both `-size 0` and a bare
+# magic test pass it through and the linker then reports a bogus "undefined
+# reference". ELF is self-describing, so truncation is detectable from the
+# artifact's own header. Magic is PER-FORMAT: `.a`/`.rlib` are ar archives, NOT
+# ELF, so a single ELF-magic test would delete every valid static archive.
+#
+# FAILS SAFE. If python3 is unavailable the scan is SKIPPED and reports 0. The
+# per-file version instead ran `python3 ... && return 1 || return 0`, so a
+# missing interpreter made every .o/.so classify as CORRUPT and the purge would
+# have deleted the entire object tree.
 function purge_zero_byte_objects {
-    local root=$1 removed=0 f
+    local root=$1
+    # DISABLED BY DEFAULT (owner directive, 2026-08-07). This scan was added
+    # without review inside a 23-PR coalesce batch (#1633, commit b7f9c7131) and
+    # then escalated to a per-file ELF probe by a bot (#1705, commit 23874c0d0).
+    # It ran before the first gate and produced no output while it worked, so its
+    # cost was indistinguishable from a hang: a warm tree of 44,996 artifacts cost
+    # more than the 1800s budget of the very DAG node that re-invokes this script.
+    # Opt back in with VALIDATE_PURGE_ARTIFACTS=1 once its cost is justified.
+    [[ ${VALIDATE_PURGE_ARTIFACTS:-0} == 1 ]] || { printf 0; return 0; }
     [[ -d $root ]] || { printf 0; return 0; }
-    while IFS= read -r -d '' f; do
-        artifact_is_corrupt "$f" && rm -f -- "$f" && removed=$((removed + 1))
-    done < <(find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
-        -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null)
-    printf '%s' "$removed"
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 0
+        return 0
+    fi
+    find "$root" -type f \( -name '*.o' -o -name '*.a' -o -name '*.so' \
+        -o -name '*.so.*' -o -name '*.rlib' -o -name '*.lo' \) -print0 2>/dev/null \
+        | python3 -c '
+import fnmatch, os, struct, sys
+
+def corrupt(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False                      # unstattable: not our business
+    if size == 0:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return False
+    # Case order mirrors the shell `case`: *.a|*.rlib is tested before the
+    # object/shared-library globs, so e.g. "foo.so.a" is treated as an archive.
+    if fnmatch.fnmatch(path, "*.a") or fnmatch.fnmatch(path, "*.rlib"):
+        if not head.startswith(b"!<arch>\n"):
+            return True
+        return size < 68
+    if (fnmatch.fnmatch(path, "*.o") or fnmatch.fnmatch(path, "*.so")
+            or fnmatch.fnmatch(path, "*.so.*") or fnmatch.fnmatch(path, "*.lo")):
+        if not head.startswith(b"\x7fELF"):
+            return True
+        if len(head) < 64:
+            return True                   # too short to carry a section table
+        if head[4] != 2:
+            return False                  # not ELFCLASS64: magic-only check
+        shoff = struct.unpack_from("<Q", head, 0x28)[0]
+        need = (shoff + struct.unpack_from("<H", head, 0x3A)[0]
+                * struct.unpack_from("<H", head, 0x3C)[0])
+        return bool(shoff and need > size)
+    return False
+
+removed = 0
+for path in sys.stdin.buffer.read().split(b"\0"):
+    if not path:
+        continue
+    name = os.fsdecode(path)
+    if corrupt(name):
+        try:
+            os.unlink(name)
+        except OSError:
+            continue
+        removed += 1
+sys.stdout.write(str(removed))
+'
 }
 
 # Print a REAL runtime estimate derived from this machine's validate-run history,
@@ -1044,16 +1179,18 @@ printf "Build cache: %s (target/ debug=%s release=%s)\n" \
     "$VALIDATION_CACHE_STATE" \
     "$([[ -x "$ROOT_DIR/target/debug/hermit" ]] && printf present || printf absent)" \
     "$([[ -x "$ROOT_DIR/target/release/hermit" ]] && printf present || printf absent)"
-VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
-readonly VALIDATION_ZERO_BYTE_PURGED
-if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
-    printf "🧹 Artifact-integrity: purged %s zero-byte object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
-        "$VALIDATION_ZERO_BYTE_PURGED"
-    printf "validate.sh: purged %s zero-byte object(s) from target/ pre-build\n" \
-        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
+# DEFERRED past the cheap fail-closed preflight gates -- see the call site below.
+# Declared here (not readonly) so the ledger writer at the `zero_byte_purged`
+# field always has a value, including on the refusal paths that exit before the
+# scan ever runs.
+VALIDATION_ZERO_BYTE_PURGED=0
+if ((VALIDATION_NESTED == 0)); then
+    printf "Estimated time: %s\n" \
+        "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
+else
+    printf "Nested validate (payload of outer pid %s): focused mode %s only; the outer run owns the ledger, receipt, cache and concurrency accounting.\n" \
+        "$VALIDATION_OUTER_PID" "$VALIDATION_PROFILE"
 fi
-printf "Estimated time: %s\n" \
-    "$(history_estimate "$VALIDATION_PROFILE" "$VALIDATION_CACHE_STATE" "$VALIDATION_HOST" "$VALIDATION_LEDGER_FILE")"
 if [[ $VALIDATION_LEVEL == super ]]; then
     printf "Super stress: %s repetitions/probe, up to %s concurrent jobs (%s online CPUs)\n" \
         "$SUPER_REPETITIONS" "$SUPER_JOBS" "$host_cpus"
@@ -1538,6 +1675,48 @@ function append_validation_ledger {
         [[ $filtered_tests_json =~ ^(null|[0-9]+)$ ]] || filtered_tests_json=null
     fi
 
+    # schema_version 5 per-node COVERAGE obligation. Completeness is a COVERAGE
+    # question, not an executed-test COUNT (`executed_tests` above is DIAGNOSTIC
+    # ONLY -- one commit can carry several different aggregate counts). The single
+    # coverage computer is finalize_receipt.build_coverage; we call it here rather
+    # than re-implementing the per-node parse, so writer and the landing-time
+    # `--scan` minter share ONE definition. It reads THIS run's log plus the DAG
+    # manifests at the exact commit (`git show <sha>:ci/dag/*.json`) and returns
+    # coverage{planned_test_nodes,executed_test_nodes,zero_executed_nodes,
+    # absent_nodes}. We bump the row to schema 5 ONLY when a REAL judgement exists
+    # (coverage non-null AND planned_test_nodes>0): then the consumer classifies on
+    # coverage. When the finalizer, python3, jq, or the manifests are unavailable
+    # the judgement is UNRESOLVABLE -- coverage stays null / the row stays schema 4
+    # so the existing grandfather (executed_tests) still stands and absence is
+    # NEVER read as incomplete. The emitted row shape is identical to the schema-5
+    # rows finalize_receipt.py --scan already mints, so no consumer is disturbed.
+    local coverage_helper coverage_out coverage_json=null coverage_planned=0
+    local ledger_schema=4
+    coverage_helper="$DEV_HERMIT_PARENT/ci-hub/validate/finalize_receipt.py"
+    if [[ -n $DEV_HERMIT_PARENT && -r $coverage_helper && -n $VALIDATION_COMMIT ]] \
+        && command -v python3 >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        if coverage_out=$(python3 "$coverage_helper" --log "$LOG_FILE" \
+            --sha "$VALIDATION_COMMIT" --hermit-checkout "$ROOT_DIR" \
+            --emit-only 2>>"$LOG_FILE"); then
+            coverage_json=$(jq -c '.coverage // empty' <<<"$coverage_out" 2>/dev/null)
+            [[ -n $coverage_json ]] || coverage_json=null
+            if [[ $coverage_json != null ]]; then
+                coverage_planned=$(jq -r '.planned_test_nodes // 0' <<<"$coverage_json" 2>/dev/null)
+                [[ $coverage_planned =~ ^[0-9]+$ ]] || coverage_planned=0
+                if ((coverage_planned > 0)); then
+                    # A real per-node judgement -> activate the schema-5 contract.
+                    ledger_schema=5
+                else
+                    # planned==0: manifests not derivable at this commit -> the
+                    # judgement is UNRESOLVABLE, not "complete". Emit null (as the
+                    # --scan minter reports no-manifest and skips) and stay schema 4
+                    # so the grandfather/named-gate path decides, never a false red.
+                    coverage_json=null
+                fi
+            fi
+        fi
+    fi
+
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
     # 4 adds `tree` (the content-addressed build+test identity, the result-cache
     # key), `toolchain` (the rustc build environment the cache must match), and
@@ -1547,7 +1726,7 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":$ledger_schema,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
@@ -1573,6 +1752,7 @@ function append_validation_ledger {
     line+="\"gates_run\":$gates_run,\"gates_expected\":$VALIDATION_GATES_EXPECTED_JSON,"
     line+="\"interruption_signal\":$interruption_signal_json,"
     line+="\"executed_tests\":$executed_tests_json,\"filtered_tests\":$filtered_tests_json,"
+    line+="\"coverage\":$coverage_json,"
     line+="\"real_seconds\":$wall_seconds,\"user_seconds\":$cpu_user,\"sys_seconds\":$cpu_sys,"
     line+="\"log_file\":$(json_quote "$LOG_FILE"),\"gates\":$gates_json}"
 
@@ -1730,9 +1910,11 @@ function cleanup {
     if declare -F print_compatibility_summary >/dev/null; then
         print_compatibility_summary
     fi
-    append_validation_ledger "$exit_status" \
-        "$validation_wall" "$validation_user" "$validation_sys"
-    if ((exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+    if ((VALIDATION_NESTED == 0)); then
+        append_validation_ledger "$exit_status" \
+            "$validation_wall" "$validation_user" "$validation_sys"
+    fi
+    if ((VALIDATION_NESTED == 0 && exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
         VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
        [[ $VALIDATION_LEVEL == full ]]; then
         publish_receipt_backed_label
@@ -1757,7 +1939,9 @@ trap cleanup EXIT
 trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
-start_validation_concurrency_monitor
+if ((VALIDATION_NESTED == 0)); then
+    start_validation_concurrency_monitor
+fi
 
 # Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
 # real traps and ledger writer without starting a product build. The mode cannot
@@ -1788,7 +1972,7 @@ fi
 # transiently deny a file open by a build or test subprocess for reasons
 # unrelated to the code under test.
 #
-# The denial surfaces in TWO forms, both of which we must catch:
+# The denial surfaces in the following forms, all of which we must catch:
 #
 #   1. The canonical BPFJailer banner ("blocked on this server based on a
 #      security policy", "BpfJailer", "Enforcer: FS, Reason: ..."). This is what
@@ -1830,11 +2014,38 @@ fi
 #      only relabeled from "test failure" to "third-party build (environmental)".
 #      Only reverie-dbi's own build script matches, so a Hermit test that merely
 #      prints "panicked at .../build.rs" for a different crate cannot trip it.
+#   4. A build/link tool reporting EBADF ("Bad file descriptor") on a file it is
+#      operating on -- the same FS-enforcer denial class as form 2, but the
+#      enforcer invalidates an already-open descriptor mid-operation instead of
+#      refusing the initial open(). Observed when objcopy strips DynamoRIO's
+#      drconfig (`/usr/bin/objcopy: ../bin64/drconfig.debug: Bad file
+#      descriptor`), which aborts gmake and bubbles up as the form-3 reverie-dbi
+#      build failure. It is caught in practice by the form-3 anchors, but we also
+#      match it directly on the binutils tool phrasing (see the binutils anchor
+#      in ENV_BLOCK_PATTERN) so detection does not depend on the reverie-dbi
+#      crate path -- a different third-party build hitting the same sandbox EBADF
+#      is still classified. Like form 2 the anchor is build-tool-specific
+#      (objcopy|strip|ld|ar|ranlib|as), so a GUEST test that legitimately prints
+#      "Bad file descriptor" / `Err(Errno(EBADF))` does not false-positive.
+#
+# The set of file-access errno strings a sandboxed build/link tool emits when the
+# FS enforcer denies one of its operations. EPERM ("operation not permitted") and
+# EACCES ("permission denied") are the classic open() denials; EBADF ("bad file
+# descriptor") is the same class seen at a different point -- the enforcer
+# invalidates a descriptor mid-operation, observed when objcopy strips
+# DynamoRIO's drconfig (`/usr/bin/objcopy: ../bin64/drconfig.debug: Bad file
+# descriptor`). Enumerated once and reused by every build-tool anchor below so a
+# new tool anchor cannot silently forget an errno. The pattern is a single
+# readonly so scripts/validate-env-block-test.sh exercises the EXACT shipped
+# regex rather than a drifting copy.
+readonly ENV_BLOCK_ERRNOS='operation not permitted|permission denied|bad file descriptor'
+readonly ENV_BLOCK_PATTERN="blocked on this server based on a security policy|\\bBpfJailer\\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*($ENV_BLOCK_ERRNOS)|CMake Error.*($ENV_BLOCK_ERRNOS)|(cannot open|error opening|failed to open|could not open)[^,]*: ($ENV_BLOCK_ERRNOS)|\\b(objcopy|strip|ld|ar|ranlib|as): [^:]+: ($ENV_BLOCK_ERRNOS)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\\.rs"
+
 function is_environmental_block {
     local output_start=$1
     tail -n "+$output_start" "$LOG_FILE" |
         sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
-        grep -qiE 'blocked on this server based on a security policy|\bBpfJailer\b|Enforcer: (FS|EXEC|NET), Reason:|fatal error: [^:]*:.*(operation not permitted|permission denied)|CMake Error.*(operation not permitted|permission denied)|(cannot open|error opening|failed to open|could not open)[^,]*: (operation not permitted|permission denied)|failed to run custom build command for [^[:space:]]*reverie-dbi|panicked at [^[:space:]]*reverie-dbi/build\.rs'
+        grep -qiE "$ENV_BLOCK_PATTERN"
 }
 
 function failure_summary {
@@ -4749,6 +4960,36 @@ run_check "Reverie pin consistency" validate_reverie_pin_consistency
 if ((failures != 0)); then
     print_summary
     exit 1
+fi
+
+# Artifact-integrity scan, DELIBERATELY PLACED HERE: after the cheap fail-closed
+# preflight gates, still before anything builds.
+#
+# It used to run in the pre-build preamble, ~3700 lines earlier. Every statement
+# between there and the first gate is a `readonly` assignment or a function
+# definition, so the scan was always paid IN FULL before a gate that can refuse
+# in zero seconds for a reason that has nothing to do with build artifacts -- the
+# Reverie pin gate fails closed when it merely cannot REACH the remote.
+#
+# Measured cost of that ordering, from two runs of the SAME commit d5e29ce9051e
+# in the SAME slot (w30) four minutes apart:
+#   05:01:58Z cache=cold  real_seconds=357   gates_run=7  -- whole suite ran
+#   05:11:03Z cache=warm  real_seconds=2722  gates_run=1  -- pin gate failed in 0s
+# The warm run spent 45 minutes to accomplish nothing, 7.6x the wall of the cold
+# run that validated everything, at CPU/wall 0.957 (single-core-bound: the
+# serial per-file fork storm). A WARMER cache made validate SLOWER, because the
+# scan's cost scales with the artifact count it has to inspect.
+#
+# Running it here keeps the guarantee that matters -- no build ever consumes a
+# structurally-incomplete artifact -- while making a 0-second refusal cost 0
+# seconds. Nothing between the two points builds anything.
+VALIDATION_ZERO_BYTE_PURGED=$(purge_zero_byte_objects "$ROOT_DIR/target")
+readonly VALIDATION_ZERO_BYTE_PURGED
+if ((VALIDATION_ZERO_BYTE_PURGED > 0)); then
+    printf "Artifact-integrity: purged %s structurally-incomplete object(s) from target/ before build (killed/OOM-truncated; would otherwise link as 'undefined reference'). Rebuild will regenerate them.\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED"
+    printf "validate.sh: purged %s incomplete object(s) from target/ pre-build\n" \
+        "$VALIDATION_ZERO_BYTE_PURGED" >>"$LOG_FILE"
 fi
 
 # --only is the first-class fast path for one already-built DAG shard. Run it

@@ -374,16 +374,35 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // A backend-owned read may have advanced the kernel cursor without
         // passing through Detcore's logical procfs cursor (KVM does this for
-        // worker-shared descriptors). Always rewind before taking the initial
-        // snapshot so a later intercepted pread cannot snapshot from EOF.
-        guest
+        // worker-shared descriptors). Rewind before taking the initial snapshot
+        // so a later intercepted pread cannot snapshot from EOF.
+        //
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(#1903): ESPIPE is not a failure here. Several procfs
+        // files are legitimately non-seekable -- `/proc/net/*` single-release
+        // seq_files return ESPIPE from `llseek` on the host, verified natively:
+        // `lseek(fd, 0, SEEK_SET)` on `/proc/net/sockstat` gives ESPIPE while the
+        // subsequent `read(2)` returns data. Propagating that ESPIPE made the
+        // GUEST's `read` fail on a file Linux reads fine (`cat
+        // /proc/net/sockstat` -> "Illegal seek"), which is a deviation from Linux
+        // semantics, not a determinism requirement: the rewind is an internal
+        // correction Detcore performs for its own benefit and the guest never
+        // asked for it. A non-seekable fd also cannot have been advanced behind
+        // our back by a seek, and a freshly opened one is already at offset 0, so
+        // skipping the rewind loses nothing the rewind was protecting.
+        match guest
             .inject_with_retry(Syscall::Lseek(
                 syscalls::Lseek::new()
                     .with_fd(call.fd())
                     .with_offset(0)
                     .with_whence(Whence::SEEK_SET),
             ))
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(Errno::ESPIPE) => {}
+            Err(err) => return Err(err.into()),
+        }
 
         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
         let mut contents = Vec::new();
@@ -441,7 +460,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => determinize_inode(guest, raw_inode).await.0,
             };
             Some((
-                virtual_inode,
+                // Determinized immediately above (stdio-special or
+                // `determinize_inode`); lowered to an integer only here, at the
+                // point it is rendered into guest-visible fdinfo text.
+                virtual_inode.as_raw(),
                 logical_flags,
                 open_file_id.deterministic_socket_cookie(),
             ))
@@ -846,7 +868,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        if let Some(resource) = out_resource.or_else(|| out_inode.map(ResourceID::FileContents)) {
+        // `out_inode` is the fd's cached HOST inode, so it must be
+        // determinized before naming a resource. It is deliberately left raw
+        // for the `touch_file` call below, which takes a `RawInode`.
+        let out_resource = match out_resource {
+            Some(resource) => Some(resource),
+            None => match out_inode {
+                Some(raw_ino) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw_ino).await.0,
+                )),
+                None => None,
+            },
+        };
+        if let Some(resource) = out_resource {
             resources.insert(resource, Permission::W);
         }
         resources.fyi("sendfile");
@@ -966,7 +1000,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
+        // straight from `fstat`/`statx`), so it must be determinized before it
+        // can name a guest-visible resource. Passing it through directly used
+        // to type-check only because `DetInode` was an alias for `RawInode`.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw_ino) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw_ino).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1223,7 +1269,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
+        // straight from `fstat`/`statx`), so it must be determinized before it
+        // can name a guest-visible resource. Passing it through directly used
+        // to type-check only because `DetInode` was an alias for `RawInode`.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw_ino) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw_ino).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1253,7 +1311,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
-        let resource = resource.or_else(|| raw_ino.map(ResourceID::FileContents));
+        // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
+        // straight from `fstat`/`statx`), so it must be determinized before it
+        // can name a guest-visible resource. Passing it through directly used
+        // to type-check only because `DetInode` was an alias for `RawInode`.
+        let resource = match resource {
+            Some(resource) => Some(resource),
+            None => match raw_ino {
+                Some(raw_ino) => Some(ResourceID::FileContents(
+                    determinize_inode(guest, raw_ino).await.0,
+                )),
+                None => None,
+            },
+        };
 
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1388,7 +1458,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => determinize_inode(guest, stat.inode).await,
         };
-        stat.inode = d_ino; // Reveal only the deterministic inode.
+        stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping.
@@ -2599,7 +2669,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.as_raw();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
@@ -2639,7 +2709,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         dents.sort();
         for dent in &mut dents {
             let (d_ino, _) = determinize_inode(guest, dent.ino).await;
-            dent.ino = d_ino;
+            dent.ino = d_ino.as_raw();
         }
 
         let mut dents_bytes = vec![0; dents_bytes.len()];
