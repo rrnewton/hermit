@@ -658,6 +658,9 @@ fn self_test() -> Result<(), String> {
     // and the progress-rubric skill, so it is asserted rather than assumed.
     envelope_cli_bracket()?;
     super_plan_bracket()?;
+    // Completeness is what a self-certifying driver is least able to check about
+    // itself, so its refusal predicate is bracketed here rather than assumed.
+    verdict_refusal_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -2305,6 +2308,89 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
     (passed, measured, blocking_failures)
 }
 
+/// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
+/// each naming itself so the refusal is readable in the summary.
+///
+/// The defect this closes, measured 2026-08-08 on `--portable-strict-compat-only`
+/// at hermit 0f90722a6: `compatprep.hermit_release` FAILED (it is only
+/// `test -x <bin>`), all 188 `compat.*` rows were skipped as dependents, and the
+/// run printed `✅ validate PASS (exit 0) — every blocking gate passed` over a
+/// `COMPATIBILITY SUMMARY (0 measured programs)`. The cause was structural: for a
+/// compat profile the verdict was `effective_failures = compat_blocking` ALONE, so
+/// a failure in the build/prep/gate spine — precisely the thing that empties the
+/// matrix — contributed nothing, and an empty matrix has no failing rows to count.
+/// A ratchet may narrow WHICH measured rows are allowed to fail; it may never
+/// decide whether any measurement happened.
+///
+/// Pure, so `--self-test` can bracket both directions without running a DAG.
+fn verdict_refusals(
+    compat_measured: Option<usize>,
+    structural_failures: usize,
+    executed_tests: Option<i64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if structural_failures > 0 {
+        out.push(format!(
+            "{structural_failures} node(s) OUTSIDE the measured matrix failed; a spine failure \
+             empties the matrix and can never be excused by the matrix's own ratchet"
+        ));
+    }
+    // `Some(0)` is a MEASURED zero and is fatal; `None` is unknown and is handled
+    // as a NON-VERDICT elsewhere. Conflating the two would turn every profile
+    // that reports no count into a red.
+    if compat_measured == Some(0) {
+        out.push(
+            "the compatibility matrix measured ZERO programs; an empty matrix is not a pass"
+                .to_string(),
+        );
+    }
+    if executed_tests == Some(0) {
+        out.push(
+            "ZERO tests executed; a run that executed nothing cannot certify anything".to_string(),
+        );
+    }
+    out
+}
+
+/// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
+/// label, no PR — it exercises the decision function with planted counts only.
+fn verdict_refusal_bracket() -> Result<(), String> {
+    // POSITIVE 1 — the exact shape measured on 2026-08-08 must fire, and must
+    // fire for BOTH reasons rather than collapsing into one.
+    let observed = verdict_refusals(Some(0), 1, Some(20));
+    if observed.len() != 2 {
+        return Err(format!(
+            "verdict: the observed fail-open shape (0 measured, 1 spine failure, 20 executed) \
+             must trip 2 refusals, tripped {}: {observed:?}",
+            observed.len()
+        ));
+    }
+    // POSITIVE 2 — zero executed tests alone, with nothing else wrong.
+    if verdict_refusals(None, 0, Some(0)).len() != 1 {
+        return Err("verdict: zero executed tests must refuse on its own".into());
+    }
+    // POSITIVE 3 — a spine failure alone, with a fully measured matrix, still
+    // refuses: 187/187 passing rows do not excuse a failed prep node.
+    if verdict_refusals(Some(187), 1, Some(862)).len() != 1 {
+        return Err("verdict: a spine failure must refuse even with a full matrix".into());
+    }
+    // NEGATIVE 1 — a genuinely complete run must stay inert, or the gate is a
+    // blanket red rather than a predicate.
+    let clean = verdict_refusals(Some(187), 0, Some(862));
+    if !clean.is_empty() {
+        return Err(format!("verdict: a complete run must NOT refuse, got {clean:?}"));
+    }
+    // NEGATIVE 2 — unknown counts are not a measured zero.
+    if !verdict_refusals(None, 0, None).is_empty() {
+        return Err("verdict: unknown counts must not be read as a measured zero".into());
+    }
+    println!(
+        "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
+         2 negative(s) inert (complete run, unknown counts)"
+    );
+    Ok(())
+}
+
 fn human_duration(secs: f64) -> String {
     let x = secs.round() as i64;
     let (h, m, s) = (x / 3600, (x % 3600) / 60, x % 60);
@@ -3797,9 +3883,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     // Compatibility ratchet, evaluated from typed outcomes.
     let mut compat_blocking = 0usize;
+    // Carried to the verdict: a compat profile that measured nothing must not be
+    // able to reach PASS through an empty set of failing rows.
+    let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
         let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
+        compat_measured = Some(measured);
         let floor = match mode {
             CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
             CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
@@ -3865,8 +3955,23 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .iter()
         .filter(|o| !o.ok && !o.aborted && !plan.nonblocking.contains(&o.tag))
         .count();
+    // Failures OUTSIDE the measured matrix: the build/prep/gate spine. `compat.*`
+    // rows are excluded because the compat ratchet already judges them (and
+    // excuses the known-fail-closed ones), so counting them here would both
+    // double-count and re-block rows policy has excused. Everything else — a
+    // failed `compatprep.*`, `pre.*`, `gate.*`, `build.*` — is a node whose
+    // failure can EMPTY the matrix, and no matrix ratchet can speak to that.
+    let structural_failures = outcomes
+        .iter()
+        .filter(|o| {
+            !o.ok
+                && !o.aborted
+                && !o.tag.starts_with("compat.")
+                && !plan.nonblocking.contains(&o.tag)
+        })
+        .count();
     let effective_failures = if plan.compat.is_some() {
-        compat_blocking
+        compat_blocking + structural_failures
     } else if plan.super_mode {
         blocking_failures + super_blocking
     } else {
@@ -3883,6 +3988,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
+    }
+
+    // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
+    // measured rows may fail; it cannot answer whether anything was measured, so
+    // these conditions are checked separately and named individually.
+    let refusals = verdict_refusals(compat_measured, structural_failures, executed_tests);
+    if exit_code == 0 && !refusals.is_empty() {
+        for why in &refusals {
+            eprintln!("validate: ERROR: {why}");
+        }
+        eprintln!(
+            "validate: refusing to report PASS: the run did not measure enough to certify \
+             anything."
+        );
+        exit_code = 1;
     }
 
     // Receipt production is itself an enforcement path (validate.sh:1846).
@@ -3991,6 +4111,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+    }
+    for why in &refusals {
+        detail.push(format!("REFUSED ON COMPLETENESS: {why}"));
     }
     if pin_gate_bypassed {
         detail.push(
