@@ -824,10 +824,67 @@ fn rr_verdict_bracket() -> Result<(), String> {
         return Err("rr verdict: no report path was requested, yet the flag appeared".into());
     }
 
+    // COVERAGE, not just capability. The argv check above proves the flag CAN be
+    // emitted; this proves every row in the REAL corpus actually carries it and
+    // its verdict. A single unjudged row is a hole exactly the size of the bug.
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: "/nonexistent",
+        real_compat_fixtures: "/nonexistent",
+        validation_tmp_dir: "/nonexistent/tmp",
+        shell_build_dir: "/nonexistent",
+    };
+    let rr_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Rr,
+        "/nonexistent/hermit",
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    if rr_nodes.is_empty() {
+        return Err("rr verdict: the rr lane built zero nodes; coverage would be vacuous".into());
+    }
+    let unjudged: Vec<&str> = rr_nodes
+        .iter()
+        .filter(|s| !(s.cmd.contains("--verify-json=") && s.cmd.contains("bitwise_parity == true")))
+        .map(|s| s.job.as_str())
+        .collect();
+    if !unjudged.is_empty() {
+        return Err(format!(
+            "rr verdict: {} of {} rr node(s) are judged by exit status alone, e.g. {:?}",
+            unjudged.len(),
+            rr_nodes.len(),
+            &unjudged[..unjudged.len().min(3)]
+        ));
+    }
+    // NEGATIVE for the wiring: a non-rr lane must NOT acquire a report it never
+    // writes, or every strict row would fail closed on an absent file.
+    let strict_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Strict,
+        "/nonexistent/hermit",
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    let leaked = strict_nodes.iter().filter(|s| s.cmd.contains("--verify-json=")).count();
+    if leaked != 0 {
+        return Err(format!(
+            "rr verdict: {leaked} strict node(s) request a report nothing consumes"
+        ));
+    }
+
     let _ = fs::remove_dir_all(&dir);
     println!(
         "  rr verdict: {accepted} genuine parity report(s) accepted (incl. nonzero-guest), \
-         {refused} non-parity report(s) refused (incl. zero-evidence, stripped, absent)"
+         {refused} non-parity report(s) refused (incl. zero-evidence, stripped, absent); \
+         all {} rr node(s) judged by report, 0 of {} strict node(s) contaminated",
+        rr_nodes.len(),
+        strict_nodes.len()
     );
     Ok(())
 }
