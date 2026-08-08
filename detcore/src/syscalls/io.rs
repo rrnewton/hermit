@@ -1118,6 +1118,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let timeout_millis = call.timeout();
         if timeout_millis == 0 {
+            // Cannot block, but must still yield a scheduler turn: a
+            // zero-timeout polling loop that never requests a resource can
+            // monopolize the guest between preemptions and starve the producer
+            // it is polling for. `handle_poll` takes a turn for every
+            // sequential mode, and the record/replay arm of `handle_epoll_pwait`
+            // does the same; before this PR routed NULL-sigmask `epoll_pwait`
+            // here, the old handler always made an empty request. Omitting it
+            // only on the plain-strict path would be a scheduling regression,
+            // not a refactor.
+            if self.cfg.sequentialize_threads {
+                let yield_to_peer = self.cfg.discover_live_file_metadata
+                    && guest.thread_state().has_loopback_peer();
+                resource_request(
+                    guest,
+                    zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
+                )
+                .await;
+            }
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
