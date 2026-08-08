@@ -29,6 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_matrix import (  # noqa: E402
+    COMPARISON_TIER_COLUMN,
+    COMPARISON_TIER_SELF_VERIFY_ONLY,
     EVIDENCE_COLUMNS,
     L2_RANK,
     SCORECARD_HEADER,
@@ -158,6 +160,8 @@ from run_matrix import (  # noqa: E402
 
 
 def emitted_row(evidence):
+    evidence = dict(evidence)
+    evidence.setdefault(COMPARISON_TIER_COLUMN, COMPARISON_TIER_SELF_VERIFY_ONLY)
     with _tf.TemporaryDirectory(prefix="fallback-") as tmp:
         path = Path(tmp) / "sc.csv"
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
@@ -178,6 +182,11 @@ check("fallback row names why no verdict exists, rather than leaving it blank",
       fallback["verify_compare"] == VERIFY_COMPARE_UNAVAILABLE, repr(fallback["verify_compare"]))
 check("fallback outcome is still a PASS (the guest ran and the compare succeeded)",
       fallback["outcome"] == "pass", repr(fallback["outcome"]))
+check("within-backend verify is explicit non-green self-verification",
+      fallback["comparison_tier"] == COMPARISON_TIER_SELF_VERIFY_ONLY,
+      repr(fallback["comparison_tier"]))
+check("verify does not manufacture stdout parity from overall PASS",
+      fallback["parity"] == "", repr(fallback["parity"]))
 check("the no-verdict sentinel is not a bitwise-capable comparator",
       VERIFY_COMPARE_UNAVAILABLE not in BITWISE_CAPABLE_COMPARATORS)
 
@@ -191,8 +200,8 @@ check("typed row carries its counts into the row",
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:
     check(f"{column} is in SCORECARD_HEADER", column in SCORECARD_HEADER)
-check("evidence columns are the last four",
-      SCORECARD_HEADER[-4:] == EVIDENCE_COLUMNS, repr(SCORECARD_HEADER[-4:]))
+check("evidence columns are the last five",
+      SCORECARD_HEADER[-5:] == EVIDENCE_COLUMNS, repr(SCORECARD_HEADER[-5:]))
 
 print()
 if FAILURES:

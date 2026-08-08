@@ -58,6 +58,10 @@ PLANTED = [
         "expectation": "pass",
         "seconds": "1.0",
         "detail": "planted genuine dbi parity",
+        "evidence": {
+            "comparison_tier": "unqualified-stdout-only",
+            "stdout_parity": "1",
+        },
     },
     {
         "result": "FAIL",
@@ -66,6 +70,10 @@ PLANTED = [
         "expectation": "pass",
         "seconds": "2.0",
         "detail": "planted genuine dbi divergence",
+        "evidence": {
+            "comparison_tier": "unqualified-stdout-only",
+            "stdout_parity": "0",
+        },
     },
 ]
 
@@ -192,10 +200,18 @@ if err is None:
     # counts that make the boolean falsifiable.
     check(
         "created header carries the tier-evidence columns",
-        hdr.endswith(",verify_compare,bitwise_parity,compared_log_messages,tier"),
+        hdr.endswith(
+            ",verify_compare,bitwise_parity,compared_log_messages,tier,comparison_tier"
+        ),
         hdr,
     )
-    check("created header is 23 columns", len(hdr.split(",")) == 23, hdr)
+    check("created header is 24 columns", len(hdr.split(",")) == 24, hdr)
+    check(
+        "created rows carry their witnessed non-green comparison tier",
+        set(r["comparison_tier"] for r in read_planted(path).values())
+        == {"unqualified-stdout-only"},
+        repr(read_planted(path)),
+    )
 
 print()
 if FAILURES:

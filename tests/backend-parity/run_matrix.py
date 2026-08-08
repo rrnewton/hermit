@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import shlex
 import signal
 from pathlib import Path
 import shutil
@@ -21,10 +22,10 @@ REPOSITORY = SCRIPT_DIR.parent.parent
 BACKENDS = ("ptrace", "dbi", "kvm")
 RUNS = 3
 
-# The compatibility scorecard is measurement state, not Hermit source.  When
-# this checkout is nested in dev-hermit, live observations are appended to the
-# outer workspace's canonical scorecard.  Standalone Hermit clones simply skip
-# that side effect unless --parent-scorecard is supplied.
+# The compatibility scorecard is measurement state, not Hermit source. When
+# this checkout is nested in dev-hermit, each run writes an ignored observation
+# artifact under the outer workspace. Publishing into the tracked scorecard is
+# an explicit opt-in through --parent-scorecard, never a validation side effect.
 SCORECARD_HEADER = (
     "run_id",
     "run_utc",
@@ -49,6 +50,7 @@ SCORECARD_HEADER = (
     "bitwise_parity",
     "compared_log_messages",
     "tier",
+    "comparison_tier",
 )
 
 # Accepted spellings for the stdout-parity column, in preference order.
@@ -82,7 +84,17 @@ EVIDENCE_COLUMNS = (
     "bitwise_parity",
     "compared_log_messages",
     "tier",
+    # Optional for an existing parent file, but present in every file this
+    # producer creates. The value is derived per row from an observed witness;
+    # it is never a mode-wide constant.
+    "comparison_tier",
 )
+
+COMPARISON_TIER_COLUMN = "comparison_tier"
+COMPARISON_TIER_STDOUT_ONLY = "unqualified-stdout-only"
+COMPARISON_TIER_SELF_VERIFY_ONLY = "unqualified-self-verify-only"
+COMPARISON_TIER_NO_COMPARISON = "unqualified-no-comparison"
+STDOUT_PARITY_EVIDENCE = "stdout_parity"
 
 # Recorded as the comparator when the run produced no typed verdict at all, so a
 # reader can tell "no verdict existed" from "a verdict existed and was stripped".
@@ -729,6 +741,7 @@ def run_case_verify(
         )
     if evidence is not None and observed_evidence:
         evidence.update(observed_evidence)
+        evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
@@ -776,6 +789,7 @@ def run_case_verify(
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
                     "determinism_unmeasured": "1",
+                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
                 }
             )
     elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
@@ -792,6 +806,7 @@ def run_case_verify(
                     "bitwise_parity": "0",
                     "compared_log_messages": "",
                     "determinism_unmeasured": "1",
+                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
                 }
             )
     else:
@@ -839,6 +854,10 @@ def run_case(
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
+    if evidence is not None:
+        # Start fail-closed. A later branch upgrades this only at the exact
+        # point where it observes a comparison witness.
+        evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_NO_COMPARISON
     if backend == "dbi" and name == "random_sources":
         guest = [*guest, "--root-only"]
     if backend == "kvm" and name == "memory_advice":
@@ -891,12 +910,18 @@ def run_case(
                 f"{expected_status}: {diagnostic[-300:]}",
                 time.monotonic() - started,
             )
-        if expected_stdout is not None and result.stdout != expected_stdout:
-            return (
-                "FAIL",
-                f"run {iteration + 1} stdout={result.stdout!r}, expected={expected_stdout!r}",
-                time.monotonic() - started,
-            )
+        if expected_stdout is not None:
+            stdout_matches = result.stdout == expected_stdout
+            if evidence is not None:
+                evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_STDOUT_ONLY
+                if not stdout_matches:
+                    evidence[STDOUT_PARITY_EVIDENCE] = "0"
+            if not stdout_matches:
+                return (
+                    "FAIL",
+                    f"run {iteration + 1} stdout={result.stdout!r}, expected={expected_stdout!r}",
+                    time.monotonic() - started,
+                )
         if expected_stdout is None:
             required_markers = {
                 "virtual_clock": b"clock matrix success\n",
@@ -915,21 +940,29 @@ def run_case(
                 )
             if baseline is None:
                 baseline = result.stdout
-            elif result.stdout != baseline:
-                return (
-                    "FAIL",
-                    f"run {iteration + 1} output differed from run 1",
-                    time.monotonic() - started,
-                )
+            else:
+                if evidence is not None:
+                    evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
+                if result.stdout != baseline:
+                    return (
+                        "FAIL",
+                        f"run {iteration + 1} output differed from run 1",
+                        time.monotonic() - started,
+                    )
             if (
                 ptrace_random is not None
                 and root_random_output(result.stdout) != ptrace_random
             ):
                 return (
                     "FAIL",
-                    f"run {iteration + 1} root random stream differed from ptrace",
+                f"run {iteration + 1} root random stream differed from ptrace",
                     time.monotonic() - started,
                 )
+    if expected_stdout is not None and evidence is not None:
+        # A positive describes the whole repeat batch, so issue it only after
+        # every selected run reached and passed the fixed-oracle comparison.
+        # A later timeout/exit failure must not inherit an earlier run's `1`.
+        evidence[STDOUT_PARITY_EVIDENCE] = "1"
     return "PASS", f"{RUNS}/{RUNS} runs matched", time.monotonic() - started
 
 
@@ -952,15 +985,48 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
         writer.writerows(results)
 
 
-def discover_parent_scorecard() -> Path | None:
+# The auto-discovered destination, relative to compat-envelope/. The parent
+# ignores every `ignored/` directory, so a validation run cannot dirty its
+# tracked scorecard or race an unrelated agent's staged baseline.
+DEFAULT_OBSERVATION_SUBDIR = Path("ignored") / "backend-parity"
+
+
+def discover_compat_envelope() -> Path | None:
+    """Return the nearest enclosing dev-hermit compat-envelope directory."""
     configured = os.environ.get("DEV_HERMIT_ROOT") or os.environ.get("DEV_HERMIT")
     roots = [Path(configured)] if configured else []
     roots.extend((REPOSITORY, *REPOSITORY.parents))
     for root in roots:
         compat_dir = root / "compat-envelope"
         if compat_dir.is_dir():
-            return compat_dir / "scorecard.csv"
+            return compat_dir.resolve()
     return None
+
+
+def make_run_id() -> tuple[str, int]:
+    hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
+    epoch = int(time.time())
+    return f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}", epoch
+
+
+def default_observation_path(run_id: str) -> Path | None:
+    compat_dir = discover_compat_envelope()
+    if compat_dir is None:
+        return None
+    return compat_dir / DEFAULT_OBSERVATION_SUBDIR / f"{run_id}.csv"
+
+
+def fold_in_command(compat_dir: Path, observation: Path) -> str:
+    """Return one absolute, shell-safe, schema-aware publication command."""
+    command = (
+        "python3",
+        str(Path(__file__).resolve()),
+        "--fold-observation",
+        str(observation),
+        "--parent-scorecard",
+        str(compat_dir / "scorecard.csv"),
+    )
+    return " ".join(shlex.quote(part) for part in command)
 
 
 def git_output(*args: str) -> str | None:
@@ -982,6 +1048,8 @@ def append_parent_scorecard(
     strict: bool,
     verify: bool,
     probe_gaps: bool,
+    run_id: str | None = None,
+    epoch: int | None = None,
 ) -> None:
     # Multiple worktrees can validate concurrently against one outer workspace.
     # Serialize whole-row appends so the shared measurement log remains valid.
@@ -990,8 +1058,8 @@ def append_parent_scorecard(
     path.parent.mkdir(parents=True, exist_ok=True)
     hermit_sha = git_output("rev-parse", "HEAD") or "unknown"
     dirty = bool(git_output("status", "--porcelain"))
-    epoch = int(time.time())
-    run_id = f"backend-parity-{hermit_sha[:12]}-{epoch}-{os.getpid()}"
+    if run_id is None or epoch is None:
+        run_id, epoch = make_run_id()
     mode = "verify" if verify else "strict" if strict else "repeat"
     rows: list[dict[str, str]] = []
     for result in results:
@@ -1004,7 +1072,11 @@ def append_parent_scorecard(
             "GAP": "gap",
             "BLOCKED": "skip",
         }[status]
-        parity = "1" if passed else "0" if status == "FAIL" else ""
+        evidence = result.get("evidence") or {}
+        parity = evidence.get(STDOUT_PARITY_EVIDENCE, "")
+        comparison_tier = evidence.get(
+            COMPARISON_TIER_COLUMN, COMPARISON_TIER_NO_COMPARISON
+        )
         detail = result["detail"]
         if verify and result["backend"] == "kvm" and passed:
             detail = (
@@ -1049,9 +1121,10 @@ def append_parent_scorecard(
                 # that make the tier falsifiable.  Written only into files that
                 # carry these columns (see EVIDENCE_COLUMNS).
                 **{
-                    column: (result.get("evidence") or {}).get(column, "")
+                    column: evidence.get(column, "")
                     for column in EVIDENCE_COLUMNS
                 },
+                COMPARISON_TIER_COLUMN: comparison_tier,
             }
         )
 
@@ -1088,7 +1161,141 @@ def append_parent_scorecard(
         writer.writerows(rows)
         scorecard.flush()
         fcntl.flock(scorecard.fileno(), fcntl.LOCK_UN)
-    print(f"TRACKING: appended {len(rows)} rows to outer scorecard {path}")
+    print(f"TRACKING: wrote {len(rows)} observation rows to {path}")
+
+
+def fold_scorecard_observation(source: Path, destination: Path) -> None:
+    """Append one reviewed per-run artifact using the destination's schema.
+
+    The parent scorecard evolves independently of this producer. A raw `tail`
+    can therefore shift every value after a renamed or newly inserted column.
+    Bind both files by column name, translate the accepted parity alias, fill
+    destination-only columns blank, and refuse a duplicate run id.
+    """
+    import fcntl
+
+    source = source.resolve()
+    destination = destination.resolve()
+    if source == destination:
+        raise MatrixError("observation source and parent scorecard are the same file")
+    try:
+        with source.open(newline="", encoding="utf-8") as source_file:
+            reader = csv.DictReader(source_file)
+            if reader.fieldnames is None:
+                raise MatrixError(f"observation {source} has no CSV header")
+            _, source_parity = scorecard_fieldnames(reader.fieldnames, source)
+            source_rows = list(reader)
+    except OSError as error:
+        raise MatrixError(f"cannot read observation {source}: {error}") from error
+    if not source_rows:
+        raise MatrixError(f"observation {source} has no rows")
+    if any(None in row for row in source_rows):
+        raise MatrixError(f"observation {source} has over-wide rows")
+    source_run_ids = {(row.get("run_id") or "").strip() for row in source_rows}
+    if "" in source_run_ids or len(source_run_ids) != 1:
+        raise MatrixError(
+            f"observation {source} must carry exactly one nonblank run_id; "
+            f"found {sorted(source_run_ids)!r}"
+        )
+    source_run_id = next(iter(source_run_ids))
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("a+", newline="", encoding="utf-8") as scorecard:
+        fcntl.flock(scorecard.fileno(), fcntl.LOCK_EX)
+        scorecard.seek(0)
+        reader = csv.DictReader(scorecard)
+        if reader.fieldnames is None:
+            destination_fields = SCORECARD_HEADER
+            destination_parity = PARITY_COLUMNS[0]
+            existing_rows: list[dict[str, str]] = []
+            scorecard.seek(0)
+            csv.DictWriter(
+                scorecard, fieldnames=destination_fields, lineterminator="\n"
+            ).writeheader()
+        else:
+            destination_fields, destination_parity = scorecard_fieldnames(
+                reader.fieldnames, destination
+            )
+            existing_rows = list(reader)
+            if any(None in row for row in existing_rows):
+                raise MatrixError(f"parent scorecard {destination} has over-wide rows")
+        if any(
+            (row.get("run_id") or "").strip() == source_run_id
+            for row in existing_rows
+        ):
+            raise MatrixError(
+                f"parent scorecard {destination} already contains run_id "
+                f"{source_run_id!r}"
+            )
+
+        mapped_rows = []
+        for source_row in source_rows:
+            mapped = {
+                field: source_row.get(field, "") for field in destination_fields
+            }
+            mapped[destination_parity] = source_row.get(source_parity, "")
+            mapped_rows.append(mapped)
+        scorecard.seek(0, os.SEEK_END)
+        writer = csv.DictWriter(
+            scorecard,
+            fieldnames=destination_fields,
+            restval="",
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
+        writer.writerows(mapped_rows)
+        scorecard.flush()
+        os.fsync(scorecard.fileno())
+        fcntl.flock(scorecard.fileno(), fcntl.LOCK_UN)
+    print(
+        f"TRACKING: folded {len(source_rows)} row(s) from {source} into "
+        f"{destination} as run_id {source_run_id}"
+    )
+
+
+def record_parent_observations(
+    results: list[dict[str, str]],
+    *,
+    requested_path: Path | None,
+    disabled: bool,
+    strict: bool,
+    verify: bool,
+    probe_gaps: bool,
+) -> Path | None:
+    """Record through the same destination selection used by the CLI."""
+    if disabled or not results:
+        return None
+    run_id, epoch = make_run_id()
+    explicit = requested_path is not None
+    destination = requested_path or default_observation_path(run_id)
+    if destination is None:
+        print(
+            "TRACKING: no enclosing dev-hermit compat-envelope/ found; "
+            f"{len(results)} observation(s) NOT recorded. Use "
+            "--parent-scorecard PATH to choose a destination, or "
+            "--no-parent-scorecard to make that explicit."
+        )
+        return None
+
+    append_parent_scorecard(
+        destination,
+        results,
+        strict=strict,
+        verify=verify,
+        probe_gaps=probe_gaps,
+        run_id=run_id,
+        epoch=epoch,
+    )
+    if not explicit:
+        compat_dir = discover_compat_envelope()
+        assert compat_dir is not None
+        fold = fold_in_command(compat_dir, destination)
+        print(
+            "TRACKING: per-run artifact only; the tracked scorecard was not "
+            "modified. To publish deliberately, review the artifact and run:\n"
+            f"  {fold}"
+        )
+    return destination
 
 
 def parse_args() -> argparse.Namespace:
@@ -1116,14 +1323,23 @@ def parse_args() -> argparse.Namespace:
         "--parent-scorecard",
         type=Path,
         help=(
-            "append observations to this outer dev-hermit scorecard (default: "
-            "auto-detect compat-envelope/scorecard.csv)"
+            "append observations to this exact file, including the tracked "
+            "scorecard if explicitly intended (default: one ignored per-run "
+            "file under compat-envelope/ignored/backend-parity/)"
+        ),
+    )
+    parser.add_argument(
+        "--fold-observation",
+        type=Path,
+        help=(
+            "append one reviewed per-run observation into --parent-scorecard "
+            "by column name, then exit without running the matrix"
         ),
     )
     parser.add_argument(
         "--no-parent-scorecard",
         action="store_true",
-        help="disable the outer dev-hermit scorecard side effect",
+        help="record no parent observation artifact",
     )
     parser.add_argument(
         "--probe-gaps",
@@ -1145,9 +1361,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "lift every probe to L2: run with hermit run --strict --verify so "
-            "hermit's internal double-run asserts a bitwise-identical DETLOG "
-            "(implies --strict; guest stdout is diverted, so stdout parity is "
-            "not checked in this mode)"
+            "Hermit's backend-specific internal double-run verifier runs "
+            "(implies --strict; this harness records self-consistency, not "
+            "cross-backend stdout parity, in this mode)"
         ),
     )
     return parser.parse_args()
@@ -1155,13 +1371,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.fold_observation is not None:
+        if args.parent_scorecard is None:
+            raise MatrixError("--fold-observation requires --parent-scorecard")
+        if args.no_parent_scorecard:
+            raise MatrixError(
+                "--fold-observation and --no-parent-scorecard cannot be used together"
+            )
+        fold_scorecard_observation(args.fold_observation, args.parent_scorecard)
+        return 0
     names = validate_catalog()
     backends = args.backends or list(BACKENDS)
     # --verify is the L2 lift and presupposes strict mode (L2 = --strict
     # --verify); enable strict implicitly so callers can ask for L2 with one flag.
     strict = args.strict or args.verify
     if args.verify:
-        print("MODE: L2 (--strict --verify), byte-identical DETLOG per probe")
+        print("MODE: L2 (--strict --verify), within-backend verifier per probe")
     elif strict:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
@@ -1256,21 +1481,14 @@ def main() -> int:
         raise MatrixError(
             "--parent-scorecard and --no-parent-scorecard cannot be used together"
         )
-    if not args.no_parent_scorecard and results:
-        parent_scorecard = args.parent_scorecard or discover_parent_scorecard()
-        if parent_scorecard is None:
-            print(
-                "TRACKING: outer dev-hermit scorecard not found; "
-                "use --parent-scorecard to select one"
-            )
-        else:
-            append_parent_scorecard(
-                parent_scorecard,
-                results,
-                strict=strict,
-                verify=args.verify,
-                probe_gaps=args.probe_gaps,
-            )
+    record_parent_observations(
+        results,
+        requested_path=args.parent_scorecard,
+        disabled=args.no_parent_scorecard,
+        strict=strict,
+        verify=args.verify,
+        probe_gaps=args.probe_gaps,
+    )
     return 1 if failures else 0
 
 
