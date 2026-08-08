@@ -614,6 +614,15 @@ if ! git diff --quiet 2>/dev/null; then
 elif [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null || printf "")" ]]; then
     VALIDATION_WORKTREE_DIRTY=1
 fi
+# The causal success-release fixture must exercise the publication latch with
+# every other precondition true, but its synthetic zero-node plan can never
+# qualify. Establish those inert values before the identity variables become
+# readonly; never try to rewrite a bound validation identity during cleanup.
+if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
+    && ${VALIDATE_STOP_TEST_SUCCESS_RELEASE:-0} == 1 ]]; then
+    VALIDATION_TREE_DIRTY=0
+    VALIDATION_WORKTREE_DIRTY=0
+fi
 if [[ $VALIDATION_COMMIT != unknown ]] && ((VALIDATION_TREE_DIRTY == 0)); then
     VALIDATION_COMMIT_ANCHORED=1
 else
@@ -911,6 +920,18 @@ declare -a ledger_gate_names=()
 declare -a ledger_gate_statuses=()
 declare -a ledger_gate_durations=()
 VALIDATION_CONCURRENCY_MONITOR_PID=""
+VALIDATION_CONCURRENCY_MONITOR_START_TICKS=""
+VALIDATION_ADMISSION_JSON=null
+VALIDATION_CONCURRENT_VALIDATES_JSON=null
+VALIDATION_CONCURRENCY_PROOF_JSON=null
+VALIDATION_CONCURRENT_MONITOR_JSON=null
+VALIDATION_CONCURRENT_OWNER_JSON=null
+VALIDATION_CONCURRENT_SAME_SERVICE_JSON=null
+VALIDATION_CONCURRENT_PEERS_JSON=null
+VALIDATION_LOCK_OWNER_PROVEN=0
+VALIDATION_CONCURRENCY_FINAL_OK=1
+VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=""
+VALIDATION_RECEIPT_AUTHORITY_ELIGIBLE=1
 
 VALIDATION_TMP_PARENT="$ROOT_DIR/target/validation"
 if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 && -n ${VALIDATE_STOP_TEST_TMP_ROOT:-} ]]; then
@@ -1490,37 +1511,61 @@ function json_quote {
     printf '"%s"' "$value"
 }
 
-# Observe overlapping top-level validate process groups for the whole run. A
-# point-in-time count at start or finish misses a validate that starts and ends
-# in the middle; the one-second monitor leaves a durable marker for this receipt.
-# Subshells of this validate share its process group and are excluded, so a gate
-# invoking another validate.sh internally cannot forge concurrency.
+# Observe identity-bound external validate drivers for the whole run.  The
+# helper distinguishes a direct validate.sh execution from wrapper argv that
+# merely mention the script, excludes every descendant of the exact lock owner,
+# and persists pid/start_ticks/pgid/cgroup so a count is never detached from the
+# processes that established it.
+function validation_process_identity {
+    local pid=$1 stat remainder
+    local -a fields=()
+    [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/stat ]] || return 1
+    stat=$(</proc/"$pid"/stat) || return 1
+    remainder=${stat##*) }
+    read -r -a fields <<<"$remainder"
+    ((${#fields[@]} >= 20)) || return 1
+    printf '%s %s\n' "${fields[0]}" "${fields[19]}"
+}
+
 function start_validation_concurrency_monitor {
-    local root_pid=$$ root_pgid
-    root_pgid=$(ps -o pgid= -p "$root_pid" 2>/dev/null | tr -d ' ')
-    [[ $root_pgid =~ ^[0-9]+$ ]] || return 0
-    if [[ ${CI_HUB_VALIDATE_CONCURRENT:-} == true ]]; then
-        printf '1\n' >"$VALIDATION_CONCURRENT_MARKER"
+    local root_pid=$$
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
+    local monitor_state monitor_start initial_output
+    local initial_scan_failed=0
+    if [[ ! $owner_pid =~ ^[1-9][0-9]*$ || ! -r $helper ]] \
+        || ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' \
+            '{"schema_version":1,"scan_complete":false,"indeterminate":true,"peers":[]}' \
+            >"$VALIDATION_CONCURRENT_MARKER"
+        return 1
+    fi
+
+    # Complete one scan synchronously so even an early-exit receipt cannot race
+    # ahead of the monitor and turn "not observed" into a false zero.
+    if ! initial_output=$(python3 "$helper" --owner-pid "$owner_pid" \
+        --state "$VALIDATION_CONCURRENT_MARKER" 2>&1); then
+        initial_scan_failed=1
+        # The helper has already persisted sticky indeterminate state. Surface
+        # its exact error while retaining it in the durable run log.
+        printf '%s\n' "$initial_output" | tee -a "$LOG_FILE" >&2
     fi
     (
         while kill -0 "$root_pid" 2>/dev/null; do
-            local count previous=0
-            count=$(ps -eo pgid=,args= 2>/dev/null | awk -v own="$root_pgid" '
-                $1 != own && /(^|[\/ ])validate\.sh([ ]|$)/ { seen[$1]=1 }
-                END { print length(seen) }
-            ')
-            [[ $count =~ ^[0-9]+$ ]] || count=0
-            if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
-                previous=$(<"$VALIDATION_CONCURRENT_MARKER")
-                [[ $previous =~ ^[0-9]+$ ]] || previous=0
-            fi
-            if ((count > previous)); then
-                printf '%s\n' "$count" >"$VALIDATION_CONCURRENT_MARKER"
-            fi
+            python3 "$helper" --owner-pid "$owner_pid" \
+                --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE" || true
             sleep 1
         done
     ) &
     VALIDATION_CONCURRENCY_MONITOR_PID=$!
+    if ! read -r monitor_state monitor_start < <(
+        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    ) || [[ $monitor_state == Z || $monitor_state == T || $monitor_state == t \
+        || ! $monitor_start =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    VALIDATION_CONCURRENCY_MONITOR_START_TICKS=$monitor_start
+    return "$initial_scan_failed"
 }
 
 # Prove that this shell is a descendant of the live process-bound validate-lock
@@ -1540,6 +1585,167 @@ function validate_lock_exclusivity_proven {
     return 1
 }
 
+function refresh_validation_concurrency_evidence {
+    local monitor_complete=false monitor_indeterminate=true peer_count=0
+    VALIDATION_ADMISSION_JSON=null
+    VALIDATION_CONCURRENT_VALIDATES_JSON=null
+    VALIDATION_CONCURRENCY_PROOF_JSON=null
+    VALIDATION_CONCURRENT_MONITOR_JSON=null
+    VALIDATION_CONCURRENT_OWNER_JSON=null
+    VALIDATION_CONCURRENT_SAME_SERVICE_JSON=null
+    VALIDATION_CONCURRENT_PEERS_JSON=null
+    VALIDATION_LOCK_OWNER_PROVEN=0
+
+    if validate_lock_exclusivity_proven; then
+        VALIDATION_LOCK_OWNER_PROVEN=1
+        VALIDATION_ADMISSION_JSON='"ci-hub-validate-lock"'
+    fi
+    if [[ -r $VALIDATION_CONCURRENT_MARKER ]] && command -v jq >/dev/null 2>&1; then
+        monitor_complete=$(jq -r '.scan_complete == true' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || monitor_complete=false
+        monitor_indeterminate=$(jq -r '.indeterminate == true' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || monitor_indeterminate=true
+        VALIDATION_CONCURRENT_MONITOR_JSON=$(jq -c '
+            {
+              scan_count,
+              first_successful_scan_monotonic_ns,
+              last_successful_scan_monotonic_ns,
+              max_successful_scan_gap_ns,
+              allowed_max_scan_gap_ns,
+              indeterminate,
+              indeterminate_detail
+            }
+            | if (.scan_count | type) == "number"
+                 and (.first_successful_scan_monotonic_ns | type) == "number"
+                 and (.last_successful_scan_monotonic_ns | type) == "number"
+                 and (.max_successful_scan_gap_ns | type) == "number"
+                 and (.allowed_max_scan_gap_ns | type) == "number"
+                 and (.indeterminate | type) == "boolean"
+                 and ((.indeterminate_detail == null)
+                      or (.indeterminate_detail | type) == "string")
+              then . else null end
+        ' "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || VALIDATION_CONCURRENT_MONITOR_JSON=null
+        VALIDATION_CONCURRENT_OWNER_JSON=$(jq -c \
+            'if (.owner | type) == "object" then .owner else null end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || VALIDATION_CONCURRENT_OWNER_JSON=null
+        VALIDATION_CONCURRENT_SAME_SERVICE_JSON=$(jq -c \
+            'if (.same_service_processes | type) == "array" then .same_service_processes else null end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || VALIDATION_CONCURRENT_SAME_SERVICE_JSON=null
+        VALIDATION_CONCURRENT_PEERS_JSON=$(jq -c \
+            'if (.peers | type) == "array" then .peers else null end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || VALIDATION_CONCURRENT_PEERS_JSON=null
+        if [[ $VALIDATION_CONCURRENT_PEERS_JSON != null ]]; then
+            peer_count=$(jq -r 'length' <<<"$VALIDATION_CONCURRENT_PEERS_JSON" 2>/dev/null) || peer_count=0
+            [[ $peer_count =~ ^[0-9]+$ ]] || peer_count=0
+        fi
+    fi
+    if ((peer_count > 0)); then
+        VALIDATION_CONCURRENT_VALIDATES_JSON=$peer_count
+        VALIDATION_CONCURRENCY_PROOF_JSON='"external_validate_identity_monitor"'
+    elif [[ $monitor_complete == true && $monitor_indeterminate == false ]] \
+        && [[ $VALIDATION_CONCURRENT_OWNER_JSON != null \
+            && $VALIDATION_CONCURRENT_SAME_SERVICE_JSON != null \
+            && $VALIDATION_CONCURRENT_MONITOR_JSON != null ]] \
+        && ((VALIDATION_LOCK_OWNER_PROVEN == 1)); then
+        VALIDATION_CONCURRENT_VALIDATES_JSON=0
+        VALIDATION_CONCURRENCY_PROOF_JSON='"validate_lock_owner_ancestry"'
+        VALIDATION_CONCURRENT_PEERS_JSON='[]'
+    fi
+}
+
+# The same monitor process must survive from launch to the receipt boundary.
+# Stop it only after checking its PID/start_ticks/non-zombie identity, then take
+# one final synchronous hardcoded-/proc snapshot. Any gap becomes sticky
+# indeterminate evidence; the caller must persist one diagnostic row before it
+# can return and must never publish authority from that row.
+function finalize_validation_concurrency_monitor {
+    local helper="$ROOT_DIR/ci/validate_peer_snapshot.py"
+    local owner_pid=${CI_HUB_VALIDATE_LOCK_OWNER_PID:-}
+    local monitor_state monitor_start marker_detail
+
+    if [[ ! $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ \
+        || ! $VALIDATION_CONCURRENCY_MONITOR_START_TICKS =~ ^[0-9]+$ ]]; then
+        if [[ $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ ]]; then
+            terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
+            VALIDATION_CONCURRENCY_MONITOR_PID=""
+        fi
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-identity-never-established
+        printf '⚠️  validation peer monitor never established an identity; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if ! read -r monitor_state monitor_start < <(
+        validation_process_identity "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    ); then
+        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        VALIDATION_CONCURRENCY_MONITOR_PID=""
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-died
+        printf '⚠️  validation peer monitor died; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if [[ $monitor_start != "$VALIDATION_CONCURRENCY_MONITOR_START_TICKS" ]]; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-identity-changed
+        printf '⚠️  validation peer monitor changed identity; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if [[ $monitor_state == Z ]]; then
+        wait "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        VALIDATION_CONCURRENCY_MONITOR_PID=""
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-died
+        printf '⚠️  validation peer monitor died; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if [[ $monitor_state == T || $monitor_state == t ]]; then
+        kill -CONT "$VALIDATION_CONCURRENCY_MONITOR_PID" 2>/dev/null || true
+        terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
+        VALIDATION_CONCURRENCY_MONITOR_PID=""
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=monitor-stopped
+        printf '⚠️  validation peer monitor was stopped; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+
+    terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
+    VALIDATION_CONCURRENCY_MONITOR_PID=""
+    if ! python3 "$helper" --owner-pid "$owner_pid" \
+        --state "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>>"$LOG_FILE"; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-snapshot-failed
+        marker_detail=$(jq -r \
+            'if (.indeterminate_detail | type) == "string" then .indeterminate_detail else empty end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || marker_detail=""
+        if [[ -n $marker_detail ]]; then
+            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
+        fi
+        printf '⚠️  final validation peer snapshot failed; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    if ! jq -e '.scan_complete == true and .indeterminate == false
+        and (.scan_count | type) == "number" and .scan_count >= 2
+        and (.max_successful_scan_gap_ns | type) == "number"
+        and (.allowed_max_scan_gap_ns | type) == "number"
+        and .max_successful_scan_gap_ns <= .allowed_max_scan_gap_ns
+        and (.owner | type) == "object"
+        and (.same_service_processes | type) == "array"
+        and (.peers | type) == "array"' \
+        "$VALIDATION_CONCURRENT_MARKER" >/dev/null 2>&1; then
+        VALIDATION_CONCURRENCY_FINAL_OK=0
+        VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL=final-state-indeterminate
+        marker_detail=$(jq -r \
+            'if (.indeterminate_detail | type) == "string" then .indeterminate_detail else empty end' \
+            "$VALIDATION_CONCURRENT_MARKER" 2>/dev/null) || marker_detail=""
+        if [[ -n $marker_detail ]]; then
+            VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL+=":$marker_detail"
+        fi
+        printf '⚠️  final validation peer evidence is indeterminate; recording diagnostic NO-RESULT\n' >&2
+        return 1
+    fi
+    return 0
+}
+
 # Append one JSONL record to the shared validate-run ledger. Wall and CPU seconds
 # are computed once by the caller (cleanup) in the top-level shell so they match
 # the human summary exactly and so the `times` builtin sees the accumulated child
@@ -1549,7 +1755,11 @@ function append_validation_ledger {
     local wall_seconds=$2 cpu_user=$3 cpu_sys=$4
     local finished_at result raw_result gates_json gate_result line
     local count_helper counts executed_tests_json=null filtered_tests_json=null
-    local commit_anchored_json tree_dirty_json concurrent_validates_json concurrency_proof_json gates_run
+    local commit_anchored_json tree_dirty_json concurrent_validates_json=null concurrency_proof_json=null gates_run
+    local admission_json=null concurrent_validate_monitor_json=null concurrent_validate_owner_json=null
+    local concurrent_validate_same_service_json=null concurrent_validate_peers_json=null
+    local concurrency_indeterminate_json=false concurrency_indeterminate_detail_json=null
+    local lock_owner_proven=0
     local evidence_helper evidence_json failed_substeps_json='[]' flaky_failed_substeps_json='[]'
     local known_flaky_failure_json=null solo_rerun_confirmation_json=false
     local solo_rerun_of_json=null
@@ -1577,18 +1787,15 @@ function append_validation_ledger {
         result=$raw_result
     fi
 
-    if [[ -r $VALIDATION_CONCURRENT_MARKER ]]; then
-        concurrent_validates_json=$(<"$VALIDATION_CONCURRENT_MARKER")
-        [[ $concurrent_validates_json =~ ^[1-9][0-9]*$ ]] || concurrent_validates_json=null
-        concurrency_proof_json='"process_group_overlap_monitor"'
-    elif validate_lock_exclusivity_proven; then
-        concurrent_validates_json=0
-        concurrency_proof_json='"validate_lock_owner_ancestry"'
-    else
-        # A bare run with no observed peer is UNKNOWN, not proven exclusive.
-        concurrent_validates_json=null
-        concurrency_proof_json=null
-    fi
+    refresh_validation_concurrency_evidence
+    admission_json=$VALIDATION_ADMISSION_JSON
+    concurrent_validates_json=$VALIDATION_CONCURRENT_VALIDATES_JSON
+    concurrency_proof_json=$VALIDATION_CONCURRENCY_PROOF_JSON
+    concurrent_validate_monitor_json=$VALIDATION_CONCURRENT_MONITOR_JSON
+    concurrent_validate_owner_json=$VALIDATION_CONCURRENT_OWNER_JSON
+    concurrent_validate_same_service_json=$VALIDATION_CONCURRENT_SAME_SERVICE_JSON
+    concurrent_validate_peers_json=$VALIDATION_CONCURRENT_PEERS_JSON
+    lock_owner_proven=$VALIDATION_LOCK_OWNER_PROVEN
 
     evidence_helper="$DEV_HERMIT_PARENT/ci-hub/validate/failure_evidence.py"
     if [[ -n $DEV_HERMIT_PARENT && -r $evidence_helper ]] \
@@ -1690,6 +1897,10 @@ function append_validation_ledger {
     # NEVER read as incomplete. The emitted row shape is identical to the schema-5
     # rows finalize_receipt.py --scan already mints, so no consumer is disturbed.
     local coverage_helper coverage_out coverage_json=null coverage_planned=0
+    local base_sha_json=null base_tree_json=null
+    local reverie_base_sha_json=null reverie_base_tree_json=null
+    local base_sha_value base_tree_value reverie_base_sha_value reverie_base_tree_value
+    local base_evidence_complete=0 receipt_provenance_complete=0
     local ledger_schema=4
     coverage_helper="$DEV_HERMIT_PARENT/ci-hub/validate/finalize_receipt.py"
     if [[ -n $DEV_HERMIT_PARENT && -r $coverage_helper && -n $VALIDATION_COMMIT ]] \
@@ -1699,6 +1910,20 @@ function append_validation_ledger {
             --emit-only 2>>"$LOG_FILE"); then
             coverage_json=$(jq -c '.coverage // empty' <<<"$coverage_out" 2>/dev/null)
             [[ -n $coverage_json ]] || coverage_json=null
+            base_sha_value=$(jq -r '.base_sha // empty' <<<"$coverage_out" 2>/dev/null)
+            base_tree_value=$(jq -r '.base_tree // empty' <<<"$coverage_out" 2>/dev/null)
+            reverie_base_sha_value=$(jq -r '.reverie_base_sha // empty' <<<"$coverage_out" 2>/dev/null)
+            reverie_base_tree_value=$(jq -r '.reverie_base_tree // empty' <<<"$coverage_out" 2>/dev/null)
+            if [[ $base_sha_value =~ ^[0-9a-f]{40}$ \
+                && $base_tree_value =~ ^[0-9a-f]{40}$ \
+                && $reverie_base_sha_value =~ ^[0-9a-f]{40}$ \
+                && $reverie_base_tree_value =~ ^[0-9a-f]{40}$ ]]; then
+                base_sha_json=$(json_quote "$base_sha_value")
+                base_tree_json=$(json_quote "$base_tree_value")
+                reverie_base_sha_json=$(json_quote "$reverie_base_sha_value")
+                reverie_base_tree_json=$(json_quote "$reverie_base_tree_value")
+                base_evidence_complete=1
+            fi
             if [[ $coverage_json != null ]]; then
                 coverage_planned=$(jq -r '.planned_test_nodes // 0' <<<"$coverage_json" 2>/dev/null)
                 [[ $coverage_planned =~ ^[0-9]+$ ]] || coverage_planned=0
@@ -1716,6 +1941,51 @@ function append_validation_ledger {
         fi
     fi
 
+    # Close the monitor's whole-run interval at the last possible boundary, then
+    # rebuild the row fields from that final state. A liveness/identity/final
+    # snapshot failure is auditable: exactly one diagnostic row is appended with
+    # null count/proof and sticky indeterminate detail, while the authority latch
+    # prevents any receipt/label publication.
+    finalize_validation_concurrency_monitor || true
+    refresh_validation_concurrency_evidence
+    admission_json=$VALIDATION_ADMISSION_JSON
+    concurrent_validates_json=$VALIDATION_CONCURRENT_VALIDATES_JSON
+    concurrency_proof_json=$VALIDATION_CONCURRENCY_PROOF_JSON
+    concurrent_validate_monitor_json=$VALIDATION_CONCURRENT_MONITOR_JSON
+    concurrent_validate_owner_json=$VALIDATION_CONCURRENT_OWNER_JSON
+    concurrent_validate_same_service_json=$VALIDATION_CONCURRENT_SAME_SERVICE_JSON
+    concurrent_validate_peers_json=$VALIDATION_CONCURRENT_PEERS_JSON
+    lock_owner_proven=$VALIDATION_LOCK_OWNER_PROVEN
+
+    if ((VALIDATION_CONCURRENCY_FINAL_OK != 1)); then
+        concurrent_validates_json=null
+        concurrency_proof_json=null
+        concurrency_indeterminate_json=true
+        concurrency_indeterminate_detail_json=$(json_quote \
+            "${VALIDATION_CONCURRENCY_INDETERMINATE_DETAIL:-unknown-finalization-failure}")
+        VALIDATION_RECEIPT_AUTHORITY_ELIGIBLE=0
+        if [[ $raw_result == pass ]]; then
+            result=no_result
+        fi
+    fi
+
+    if ((ledger_schema == 5 && base_evidence_complete == 1 && lock_owner_proven == 1 \
+        && VALIDATION_CONCURRENCY_FINAL_OK == 1)) \
+        && [[ $concurrent_validates_json == 0 \
+            && $concurrency_proof_json == '"validate_lock_owner_ancestry"' ]]; then
+        receipt_provenance_complete=1
+    fi
+    if [[ $raw_result == pass && $VALIDATION_PROFILE == full \
+        && $VALIDATION_SELECTION_MODE == full ]] \
+        && ((receipt_provenance_complete != 1)); then
+        # A newly written full-pass row must not fall through the schema-4
+        # grandfather when its schema-5 coverage/base/admission evidence is
+        # unavailable. Preserve raw_result for diagnostics but mint no authority.
+        result=no_result
+        VALIDATION_RECEIPT_AUTHORITY_ELIGIBLE=0
+        printf '⚠️  full validation passed without complete schema-5 provenance; recording NO-RESULT\n' >&2
+    fi
+
     # schema_version 3 adds commit_anchored/tree_dirty/selection_mode; schema_version
     # 4 adds `tree` (the content-addressed build+test identity, the result-cache
     # key), `toolchain` (the rustc build environment the cache must match), and
@@ -1725,7 +1995,8 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":$ledger_schema,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    line="{\"schema_version\":$ledger_schema,\"producer\":\"hermit-validate-sh\",\"repo\":\"hermit\","
+    line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"
@@ -1737,11 +2008,20 @@ function append_validation_ledger {
     line+="\"git_depth\":$VALIDATION_GIT_DEPTH,"
     line+="\"git_ahead\":$VALIDATION_GIT_AHEAD,\"git_behind\":$VALIDATION_GIT_BEHIND,"
     line+="\"commit_anchored\":$commit_anchored_json,\"tree_dirty\":$tree_dirty_json,"
+    line+="\"base_sha\":$base_sha_json,\"base_tree\":$base_tree_json,"
+    line+="\"reverie_base_sha\":$reverie_base_sha_json,\"reverie_base_tree\":$reverie_base_tree_json,"
+    line+="\"admission\":$admission_json,"
     line+="\"reverie_pin_current\":$reverie_pin_current_json,"
     line+="\"result\":\"$result\",\"raw_result\":\"$raw_result\",\"exit_code\":$exit_status,"
     line+="\"checks\":$checks,\"failures\":$failures,"
     line+="\"dag_jobs\":$VALIDATION_DAG_JOBS,\"concurrent_validates\":$concurrent_validates_json,"
     line+="\"concurrency_proof\":$concurrency_proof_json,"
+    line+="\"concurrency_indeterminate\":$concurrency_indeterminate_json,"
+    line+="\"concurrency_indeterminate_detail\":$concurrency_indeterminate_detail_json,"
+    line+="\"concurrent_validate_monitor\":$concurrent_validate_monitor_json,"
+    line+="\"concurrent_validate_owner\":$concurrent_validate_owner_json,"
+    line+="\"concurrent_validate_same_service\":$concurrent_validate_same_service_json,"
+    line+="\"concurrent_validate_peers\":$concurrent_validate_peers_json,"
     line+="\"known_flaky_failure\":$known_flaky_failure_json,"
     line+="\"first_error_line\":$first_error_line_json,"
     line+="\"failed_substep_classes\":$failed_substep_classes_json,"
@@ -1865,10 +2145,6 @@ function cleanup {
         sleep "${VALIDATE_STOP_TEST_CLEANUP_DELAY_SECONDS:-0.5}"
     fi
 
-    if [[ -n $VALIDATION_CONCURRENCY_MONITOR_PID ]]; then
-        terminate_gate_tree "$VALIDATION_CONCURRENCY_MONITOR_PID"
-    fi
-
     # Receipt production is itself an enforcement path. If a new fast path or
     # early return accidentally bypasses the pin gate, it must not emit PASS or
     # return success merely because its selected tests happened to pass.
@@ -1914,6 +2190,7 @@ function cleanup {
             "$validation_wall" "$validation_user" "$validation_sys"
     fi
     if ((VALIDATION_NESTED == 0 && exit_status == 0 && failures == 0 && LABEL_PR == 1 && \
+        VALIDATION_RECEIPT_AUTHORITY_ELIGIBLE == 1 && \
         VALIDATION_COMMIT_ANCHORED == 1 && VALIDATION_TREE_DIRTY == 0)) && \
        [[ $VALIDATION_LEVEL == full ]]; then
         publish_receipt_backed_label
@@ -1939,12 +2216,21 @@ trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
 if ((VALIDATION_NESTED == 0)); then
-    start_validation_concurrency_monitor
+    start_validation_concurrency_monitor || true
+    if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 \
+        && -n ${VALIDATE_STOP_TEST_MONITOR_PID_FILE:-} \
+        && $VALIDATION_CONCURRENCY_MONITOR_PID =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$VALIDATION_CONCURRENCY_MONITOR_PID" \
+            >"$VALIDATE_STOP_TEST_MONITOR_PID_FILE"
+    fi
 fi
 
 # Test seam for scripts/test_validate_stop_paths.py. It exercises this script's
 # real traps and ledger writer without starting a product build. The mode cannot
-# produce a pass: it deliberately waits until a test sends a stop signal.
+# produce qualifying authority: its synthetic gates have no per-node execution
+# coverage. Normally it waits until a test sends a stop signal. The explicit
+# success-release bracket makes the underlying shell result pass only to prove
+# that failed monitor evidence downgrades it and blocks the publisher.
 if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
     if [[ ${VALIDATE_STOP_TEST_PRIOR_FAILURE:-0} == 1 ]]; then
         record_ledger_gate "stop-test completed gate 1" 1 0
@@ -1960,6 +2246,18 @@ if [[ ${HERMIT_VALIDATE_STOP_TEST_MODE:-0} == 1 ]]; then
     printf "VALIDATE_STOP_TEST_READY pid=%s\n" "$$"
     if [[ ${VALIDATE_STOP_TEST_EXIT_EARLY:-0} == 1 ]]; then
         exit 1
+    fi
+    if [[ ${VALIDATE_STOP_TEST_SUCCESS_RELEASE:-0} == 1 ]]; then
+        if [[ -z ${VALIDATE_STOP_TEST_RELEASE_FILE:-} ]]; then
+            printf 'validate.sh: stop-test success release requires a release file\n' >&2
+            exit 2
+        fi
+        while [[ ! -e $VALIDATE_STOP_TEST_RELEASE_FILE ]]; do sleep 0.05; done
+        # Make every publication predicate other than the monitor-derived
+        # authority latch true. The row still has zero executed per-node
+        # coverage and is therefore intrinsically non-qualifying.
+        REVERIE_PIN_GATE_PASSED=1
+        exit 0
     fi
     while :; do sleep 1; done
 fi
