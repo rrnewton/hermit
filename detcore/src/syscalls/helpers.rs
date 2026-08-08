@@ -761,6 +761,35 @@ impl TimeoutableSyscall for reverie::syscalls::EpollWait {
     }
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1850): `epoll_pwait` was the one member of the
+// poll/epoll family with no nonblocking form, even though `Ppoll` -- the
+// sigmask variant of `poll` -- has had one all along. glibc implements
+// `epoll_wait(2)` by issuing `epoll_pwait` with a NULL sigmask, so ordinary
+// programs never reach the `EpollWait` impl above; they land on the
+// unhandled path. With a NULL sigmask the two calls are semantically
+// identical, so the nonblocking form is the same: timeout 0, EINTR, and a
+// 0 (no events) timeout return.
+#[async_trait]
+impl NonblockableSyscall for reverie::syscalls::EpollPwait {
+    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+        self,
+        _guest: &mut G,
+    ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
+        (self.with_timeout(0), None)
+    }
+
+    fn signal_interrupt_errno(&self) -> Errno {
+        Errno::EINTR
+    }
+}
+
+impl TimeoutableSyscall for reverie::syscalls::EpollPwait {
+    fn timeout_return_val(&self) -> Result<i64, Errno> {
+        Ok(0)
+    }
+}
+
 async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
 ) -> (Addr<'stack, Timespec>, <G::Stack as Stack>::StackGuard) {
@@ -1255,11 +1284,23 @@ pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: Record
     guest: &mut G,
     timeout_millis: i32,
 ) -> Option<LogicalTime> {
-    if timeout_millis > 0 {
-        nanos_duration_to_absolute_timeout(guest, (timeout_millis as u128) * 1000).await
-    } else {
-        None
+    match positive_millis_as_nanos(timeout_millis) {
+        Some(timeout_nanos) => nanos_duration_to_absolute_timeout(guest, timeout_nanos).await,
+        None => None,
     }
+}
+
+/// Milliseconds to nanoseconds for a strictly positive timeout; `None` for the
+/// non-positive values Linux treats as "return immediately" (0) or "wait
+/// forever" (-1), neither of which is a deadline.
+///
+/// Kept as a separate, unit-bracketed function on purpose. This conversion was
+/// previously inlined as `* 1000` instead of `* 1_000_000`, which made every
+/// finite deadline 1000x too short (a 1 ms timeout expired after 1 us). That
+/// is invisible in an end-to-end test that only checks a syscall's return
+/// value, so the arithmetic is pinned here by `millis_to_nanos_conversion`.
+fn positive_millis_as_nanos(timeout_millis: i32) -> Option<u128> {
+    (timeout_millis > 0).then(|| (timeout_millis as u128) * 1_000_000)
 }
 
 // Convert to absolute logical time point for the timeout.
@@ -1281,6 +1322,40 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bracket the millisecond-to-nanosecond timeout conversion in both
+    /// directions: the non-positive values that are NOT deadlines, and the
+    /// positive values whose magnitude must be exactly 1e6 ns per ms.
+    ///
+    /// The 1 ms case is the specific regression guard: an inlined `* 1000`
+    /// yields 1_000 here instead of 1_000_000, i.e. a deadline 1000x too
+    /// short. Asserting the exact value (not merely "nonzero" or "greater
+    /// than") is what makes that failure visible.
+    #[test]
+    fn millis_to_nanos_conversion() {
+        // Not deadlines: -1 is "infinite", 0 is "return immediately".
+        assert_eq!(positive_millis_as_nanos(-1), None);
+        assert_eq!(positive_millis_as_nanos(i32::MIN), None);
+        assert_eq!(positive_millis_as_nanos(0), None);
+
+        // Positive timeouts: exactly 1e6 nanoseconds per millisecond.
+        assert_eq!(positive_millis_as_nanos(1), Some(1_000_000));
+        assert_eq!(positive_millis_as_nanos(1_000), Some(1_000_000_000));
+        assert_eq!(
+            positive_millis_as_nanos(i32::MAX),
+            Some(i32::MAX as u128 * 1_000_000)
+        );
+
+        // The scale itself, stated independently of any single case so a
+        // future refactor cannot satisfy the above by coincidence.
+        for millis in [1, 2, 7, 250, 1_000, 86_400_000] {
+            assert_eq!(
+                positive_millis_as_nanos(millis),
+                Some(millis as u128 * 1_000_000),
+                "1 ms must convert to 1_000_000 ns, not 1_000"
+            );
+        }
+    }
 
     #[test]
     fn connect_nonblocking_results() {
