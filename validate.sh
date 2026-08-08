@@ -2892,60 +2892,43 @@ function run_rr_compatibility_phase {
     return "$status"
 }
 
-# The product report is the typed verdict channel. The wrapper exit may instead
-# be the deterministic guest's nonzero exit, so it is diagnostic only; parity is
-# true exactly when the producer's boolean `bitwise_parity` field is typed true.
-function rr_report_has_bitwise_parity {
+# Rebuild the expected producer/guest/command/config identity from this exact
+# validation invocation and invoke the product's one semantic receipt verifier.
+# Neither the wrapper exit nor a flattened legacy boolean is an authority.
+function rr_report_has_qualified_receipt {
     local report=$1
+    shift
     [[ -s $report ]] || return 1
-    jq -e '
-        type == "object"
-        and (.bitwise_parity | type == "boolean")
-        and .bitwise_parity == true
-    ' "$report" >/dev/null 2>&1
+    "$STRICT_COMPAT_HERMIT_BIN" record start \
+        --verify-receipt "$report" \
+        --expected-source-revision "$VALIDATION_COMMIT" -- "$@" \
+        >/dev/null 2>&1
 }
 
-# Bracket that load-bearing consumer with producer-shaped reports. In
-# particular, verified=true is insufficient for stripped or zero-evidence
-# comparisons, while a matched parity report remains authoritative when the
-# guest (and therefore the wrapper) exits nonzero.
+# Bracket the load-bearing production consumer using a real receipt. The bare
+# legacy boolean is refused, while changing that diagnostic cache on an otherwise
+# exact receipt cannot change the independently rederived decision.
 function rr_report_consumer_self_test {
     local fixture_dir="$VALIDATION_TMP_DIR/rr-report-consumer-self-test"
-    local simulated_wrapper_status=3
+    local receipt="$fixture_dir/qualified.json"
     mkdir -p "$fixture_dir"
 
-    ! rr_report_has_bitwise_parity "$fixture_dir/missing.json" || return 1
-
     printf '%s\n' \
-        '{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}' \
-        >"$fixture_dir/no-result.json"
-    ! rr_report_has_bitwise_parity "$fixture_dir/no-result.json" || return 1
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched"}' \
+        >"$fixture_dir/legacy-boolean.json"
+    ! rr_report_has_qualified_receipt \
+        "$fixture_dir/legacy-boolean.json" /usr/bin/true || return 1
 
-    printf '%s\n' \
-        '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
-        >"$fixture_dir/diverged.json"
-    ! rr_report_has_bitwise_parity "$fixture_dir/diverged.json" || return 1
+    run_rr_compatibility_phase \
+        "$fixture_dir/produce.stdout" "$fixture_dir/produce.stderr" \
+        "$STRICT_COMPAT_HERMIT_BIN" record start --verify --verify-strict \
+        --verify-json "$receipt" -- /usr/bin/true || return 1
+    rr_report_has_qualified_receipt "$receipt" /usr/bin/true || return 1
 
-    printf '%s\n' \
-        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":true},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
-        >"$fixture_dir/stripped.json"
-    ! rr_report_has_bitwise_parity "$fixture_dir/stripped.json" || return 1
-
-    printf '%s\n' \
-        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}' \
-        >"$fixture_dir/zero-counts.json"
-    ! rr_report_has_bitwise_parity "$fixture_dir/zero-counts.json" || return 1
-
-    printf '%s\n' \
-        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}' \
-        >"$fixture_dir/matched.json"
-    rr_report_has_bitwise_parity "$fixture_dir/matched.json" || return 1
-
-    printf '%s\n' \
-        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":3,"guest_signal":null}' \
-        >"$fixture_dir/nonzero-guest.json"
-    ((simulated_wrapper_status != 0)) || return 1
-    rr_report_has_bitwise_parity "$fixture_dir/nonzero-guest.json" || return 1
+    jq '.bitwise_parity = false | .verified = false' "$receipt" \
+        >"$fixture_dir/tampered-legacy-fields.json"
+    mv "$fixture_dir/tampered-legacy-fields.json" "$receipt"
+    rr_report_has_qualified_receipt "$receipt" /usr/bin/true || return 1
 }
 
 function rr_compatibility_probe {
@@ -2992,10 +2975,10 @@ function rr_compatibility_probe {
         --verify-json "$verify_report" -- "$@"
     verify_status=$?
 
-    if rr_report_has_bitwise_parity "$verify_report"; then
+    if rr_report_has_qualified_receipt "$verify_report" "$@"; then
         RR_COMPAT_PASSED=$((RR_COMPAT_PASSED + 1))
         printf "  ✅ %-12s PASS R/R (%ss)\n" "$label" "$((SECONDS - started_at))"
-        printf "Verify exit (diagnostic): %s; typed bitwise_parity: true\n\n" \
+        printf "Verify exit (diagnostic): %s; semantic strict receipt: qualified\n\n" \
             "$verify_status" >>"$LOG_FILE"
         rm -rf "$case_dir"
         return 0
@@ -3008,7 +2991,7 @@ function rr_compatibility_probe {
         printf "  ⚠️  R/R canary %s failed; skipping the remaining selected probes\n" "$label"
     fi
     {
-        printf "Verify exit (diagnostic): %s; typed bitwise_parity: false\n" \
+        printf "Verify exit (diagnostic): %s; semantic strict receipt: not qualified\n" \
             "$verify_status"
         if [[ -s $verify_report ]]; then
             printf '%s\n' "--- verify report ---"
@@ -4283,6 +4266,10 @@ function run_rr_compatibility_envelope {
             "$LOG_FILE"
         return 1
     fi
+    if ! rr_report_consumer_self_test; then
+        printf "❌ Record/replay semantic receipt consumer brackets failed\n"
+        return 1
+    fi
 
     RR_COMPAT_PASSED=0
     RR_COMPAT_FAILED=0
@@ -4862,13 +4849,6 @@ function run_super_suite {
     run_check "Full LevelDB strict determinism" env HERMIT_LEVELDB_BUILD_DIR="$leveldb_build" cargo test -p hermit --features third-party-backends --test leveldb full_leveldb_suite_is_deterministic_under_strict -- --exact --ignored --test-threads=1
     run_check "SQLite veryquick strict determinism" cargo test -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -- --exact --ignored --test-threads=1
 }
-
-# Run both semantic policy brackets before any authority-bearing validation
-# gate. They are inert fixtures and cannot publish a receipt themselves.
-if ! rr_report_consumer_self_test; then
-    printf "validate.sh: record/replay report consumer brackets failed\n" >&2
-    exit 2
-fi
 
 # The archival pin is not a testing exemption: validate always proves it equals
 # the live Reverie main tip before initializing dependencies or running tests.

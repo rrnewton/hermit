@@ -215,8 +215,8 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
-| L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
+| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...`; invoke `hermit::verify_receipt::load_and_verify_strict_receipt` with independently expected identity and require its derived `Qualified { assurance: L2 }` decision |
+| L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command and require its derived `Qualified { assurance: L3 }` decision (both classes nonempty on both runs) |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
 A claim that a run "passes" is meaningless without a level. Write, for example,
@@ -237,7 +237,11 @@ aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
 must not be stripped. State this canonical envelope rather than calling the raw
 log files literally byte-identical. KVM's output-only fallback reports
-`bitwise_parity: false` and is not L2.
+`bitwise_parity: false` and is not L2. The flattened legacy `verified` and
+`bitwise_parity` fields are diagnostic caches, never authorization: an L2/L3
+claim additionally requires the versioned receipt verifier to dereference the
+content-addressed raw evidence, rederive its framing/classes/digests, bind the
+expected source/binaries/test/config, and return `Qualified`.
 
 ## Debugging
 

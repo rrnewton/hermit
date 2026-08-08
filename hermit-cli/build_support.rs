@@ -30,6 +30,23 @@ pub fn git_short_sha_in(root: &Path) -> String {
     if dirty { format!("{sha}-dirty") } else { sha }
 }
 
+/// Full git revision of the working tree, with the same tracked-dirty marker as
+/// [`git_short_sha`]. Receipts use this spelling because a twelve-character
+/// display abbreviation is not an exact source identity.
+pub fn git_full_sha() -> String {
+    git_full_sha_in(Path::new("."))
+}
+
+pub fn git_full_sha_in(root: &Path) -> String {
+    let Some(sha) = git(root, &["rev-parse", "HEAD"]) else {
+        return "unknown".to_owned();
+    };
+    let dirty = git(root, &["status", "--porcelain", "--untracked-files=no"])
+        .map(|status| !status.is_empty())
+        .unwrap_or(true);
+    if dirty { format!("{sha}-dirty") } else { sha }
+}
+
 /// Git metadata and tracked source files that can change the embedded revision
 /// or dirty state. Resolve these through Git so this also works from a nested
 /// crate and a worktree.
@@ -37,6 +54,10 @@ pub fn git_watch_paths() -> Vec<PathBuf> {
     git_watch_paths_in(Path::new("."))
 }
 
+#[allow(
+    clippy::collapsible_if,
+    reason = "this source is copied verbatim into an Edition 2021 build-script fixture, where let chains are unavailable"
+)]
 pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
     let repository = git(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
     let mut names = vec![
@@ -57,15 +78,15 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
             .map(PathBuf::from)
         })
         .collect();
-    if let Some(repository) = repository
-        && let Some(tracked) = git(&repository, &["ls-files", "--full-name"])
-    {
-        paths.extend(
-            tracked
-                .lines()
-                .filter(|path| !path.is_empty())
-                .map(|path| repository.join(path)),
-        );
+    if let Some(repository) = repository {
+        if let Some(tracked) = git(&repository, &["ls-files", "--full-name"]) {
+            paths.extend(
+                tracked
+                    .lines()
+                    .filter(|path| !path.is_empty())
+                    .map(|path| repository.join(path)),
+            );
+        }
     }
     paths.sort();
     paths.dedup();

@@ -208,7 +208,7 @@ enum Subcommand {
 
     /// Record the execution of a program (EXPERIMENTAL).
     #[clap(name = "record", trailing_var_arg = true)]
-    Record(RecordOpts),
+    Record(Box<RecordOpts>),
 
     /// Replay the execution of a program.
     #[clap(name = "replay")]
@@ -730,6 +730,38 @@ mod tests {
             let parsed = Args::try_parse_from(args).expect("record --strict should parse");
             assert!(matches!(parsed.command, Subcommand::Record(_)));
         }
+    }
+
+    #[test]
+    fn record_receipt_consumer_requires_an_expected_source_revision() {
+        let source = "0123456789abcdef0123456789abcdef01234567";
+        let parsed = Args::try_parse_from([
+            "hermit",
+            "record",
+            "start",
+            "--verify-receipt",
+            "/tmp/receipt.json",
+            "--expected-source-revision",
+            source,
+            "--",
+            "/bin/true",
+        ])
+        .expect("record strict receipt consumer form should parse");
+        assert!(matches!(parsed.command, Subcommand::Record(_)));
+
+        assert!(
+            Args::try_parse_from([
+                "hermit",
+                "record",
+                "start",
+                "--verify-receipt",
+                "/tmp/receipt.json",
+                "--",
+                "/bin/true",
+            ])
+            .is_err(),
+            "receipt verification without an independent source expectation must be rejected"
+        );
     }
 
     #[test]

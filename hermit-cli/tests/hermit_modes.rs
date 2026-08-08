@@ -1085,6 +1085,7 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
         .args([
             "--log=info",
             "run",
+            "--strict",
             "--verify",
             "--verify-strict",
             "--verify-logs",
@@ -1143,6 +1144,37 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
     .expect("strict verification report was not valid JSON");
     assert_eq!(report["verified"], serde_json::json!(true));
     assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(
+        report["schema"],
+        serde_json::json!("hermit.strict-verify-receipt/v1")
+    );
+    assert_eq!(
+        report["declared_decision"]["status"],
+        serde_json::json!("qualified")
+    );
+    assert_eq!(
+        report["declared_decision"]["assurance"],
+        serde_json::json!("l3")
+    );
+    assert_eq!(
+        report["coverage"]["profile"],
+        serde_json::json!("backend-local-strict-repeat/v1")
+    );
+    assert_eq!(report["coverage"]["discovered_tests"], serde_json::json!(1));
+    assert_eq!(report["coverage"]["selected_tests"], serde_json::json!(1));
+    assert_eq!(report["coverage"]["executed_runs"], serde_json::json!(2));
+    assert_eq!(report["coverage"]["filtered_tests"], serde_json::json!(0));
+    assert_eq!(
+        report["coverage"]["comparison_failures"],
+        serde_json::json!(0)
+    );
+    for run in report["runs"].as_array().expect("runs must be an array") {
+        assert!(run["messages"]["info"]["count"].as_u64().unwrap() > 0);
+        assert!(run["messages"]["commit"]["count"].as_u64().unwrap() > 0);
+        assert!(run["messages"]["detlog"]["count"].as_u64().unwrap() > 0);
+        assert!(run["messages"]["detlog_heap"]["count"].as_u64().unwrap() > 0);
+        assert!(run["messages"]["detlog_stack"]["count"].as_u64().unwrap() > 0);
+    }
     assert_eq!(report["comparison"]["log_scope"], serde_json::json!("info"));
     assert!(
         report["compared_log_messages"]["left"]

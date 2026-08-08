@@ -31,6 +31,7 @@ mod replay;
 mod replayer;
 mod sabre_ptrace;
 mod script;
+pub mod verify_receipt;
 
 use std::ffi::OsStr;
 use std::fs;

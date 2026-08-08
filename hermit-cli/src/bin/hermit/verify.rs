@@ -421,17 +421,13 @@ impl VerificationOutcome {
     }
 }
 
-/// Machine-readable verification report written by `--verify-json`.
+/// Legacy machine-readable verification diagnostic written by `--verify-json`.
 ///
-/// Every field carries the condition it describes: `verified`/`verdict` is the
-/// verification result, `comparison` is the comparison that produced it, and
-/// `guest_exit_code`/`guest_signal` describe the guest's own termination. A
-/// consumer keys its decision on `verified` — but a *parity* consumer must not:
-/// `verified` under a stripped comparison, a filtered subset, or an output-only
-/// fallback is not a bitwise-parity claim. Such a consumer reads
-/// [`Self::bitwise_parity`] (or checks the `comparison` fields directly), which
-/// is `true` only when the verdict rests on a full-INFO, unfiltered, unstripped
-/// log comparison.
+/// These fields remain flattened into the versioned strict receipt for CLI
+/// compatibility, but no green consumer may authorize from them. They do not
+/// bind source/binary/config identity or dereference raw evidence. The strict
+/// authority is `hermit::verify_receipt::verify_strict_receipt`, which ignores
+/// these cached values and derives its decision from content-addressed blobs.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationReport {
     /// True iff the two runs matched (the verdict as a boolean).
@@ -439,9 +435,8 @@ pub struct VerificationReport {
     /// True iff the runs matched *and* the comparison that certified the match
     /// satisfies the bitwise INFO-parity contract (see
     /// [`ComparisonSpec::is_bitwise_parity`]). A determinism / record-replay
-    /// ratchet keys on this single boolean; it can never be silently weakened to
-    /// a stripped or filtered compare because a stripped/filtered match sets it
-    /// `false`.
+    /// This remains a useful diagnostic summary. It is not an authorization
+    /// token; strict consumers must invoke the shared receipt verifier.
     pub bitwise_parity: bool,
     /// The verdict as a stable string ("matched" / "diverged").
     pub verdict: Verdict,

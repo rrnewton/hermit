@@ -98,6 +98,20 @@ fn untracked_generated_output_does_not_taint_version() {
 }
 
 #[test]
+fn full_revision_is_exact_and_tracks_dirty_source() {
+    let repo = initialized_repo();
+    let clean = git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(build_support::git_full_sha_in(repo.path()), clean);
+
+    fs::write(repo.path().join("tracked.txt"), "modified\n")
+        .expect("failed to modify tracked fixture");
+    assert_eq!(
+        build_support::git_full_sha_in(repo.path()),
+        format!("{clean}-dirty")
+    );
+}
+
+#[test]
 fn tracked_worktree_and_index_changes_taint_version() {
     let repo = initialized_repo();
     let clean = git(repo.path(), &["rev-parse", "--short=12", "HEAD"]);

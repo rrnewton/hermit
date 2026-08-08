@@ -35,6 +35,11 @@ use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use hermit::verify_receipt::FileIdentity;
+use hermit::verify_receipt::StrictReceiptBuildInput;
+use hermit::verify_receipt::StrictRunInput;
+use hermit::verify_receipt::TypedTermination;
+use hermit::verify_receipt::publish_strict_receipt;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -55,6 +60,7 @@ use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::VerificationReport;
 use super::verify::compare_two_runs;
 use super::verify::temp_log_files;
 use super::verify::validate_log_level;
@@ -72,11 +78,23 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
+fn receipt_byte_identity(bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": bytes.len() as u64,
+        "sha256": detcore::Digest::new(bytes).to_string(),
+    })
+}
+
+struct SabreDetlogExtraction {
+    guest_stderr: Vec<u8>,
+    syscall_records: usize,
+}
+
+fn extract_sabre_detlogs(path: &Path, raw_stderr: &[u8]) -> Result<SabreDetlogExtraction, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
-    let mut guest_stderr = Vec::with_capacity(stderr.len());
+    let mut guest_stderr = Vec::with_capacity(raw_stderr.len());
     let mut syscall_records = 0;
-    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
+    for line in raw_stderr.split_inclusive(|byte| *byte == b'\n') {
         let start = line
             .iter()
             .position(|byte| !byte.is_ascii_whitespace())
@@ -93,8 +111,10 @@ fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Err
             guest_stderr.extend_from_slice(line);
         }
     }
-    *stderr = guest_stderr;
-    Ok(syscall_records)
+    Ok(SabreDetlogExtraction {
+        guest_stderr,
+        syscall_records,
+    })
 }
 struct PreparedMounts {
     mounts: Vec<Mount>,
@@ -349,24 +369,17 @@ pub struct RunOpts {
     #[clap(long, requires = "verify")]
     verify_logs: bool,
 
-    /// With --verify, write the verification verdict as a single JSON line to
-    /// this path: `{"verified":bool,"bitwise_parity":bool,
-    /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
-    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
-    /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
-    /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
-    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
-    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
-    /// channel: `verified` reflects whether the two runs matched, regardless of
-    /// what the guest exited with, so a caller need not (and must not) infer the
-    /// verdict from the process exit code. A determinism / record-replay parity
-    /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
-    /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
-    /// comparison that strips only the real wall-clock prefix, canonicalizes host
-    /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — so it cannot be silently weakened to a
-    /// stripped compare.
+    /// With --verify, write a machine-readable result to this path. The
+    /// authoritative form requires BOTH `--strict` and `--verify-strict`: it is
+    /// a `hermit.strict-verify-receipt/v1` record bound to the exact source,
+    /// producer binary, guest binary, command/test identity, effective config,
+    /// two typed terminations, and content-addressed raw stdout/stderr/log
+    /// artifacts. Its ordered INFO stream strips only the declared wall-clock
+    /// prefix, ordinalizes only explicitly marked host addresses, and preserves
+    /// all numeric, hex, path, COMMIT, DETLOG, heap, and stack bytes. Consumers
+    /// must use `hermit::verify_receipt::load_and_verify_strict_receipt`; the
+    /// flattened legacy `verified`/`bitwise_parity` fields are diagnostics, not
+    /// authorization. Other verify modes retain the legacy diagnostic schema.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -1770,6 +1783,90 @@ impl RunOpts {
         }
     }
 
+    /// Resolve the exact host file whose bytes become the guest's root image.
+    /// This mirrors `validate_program`, but returns the identity-bearing path
+    /// instead of merely checking it. E9patch receipts bind the rewritten ELF;
+    /// image receipts bind the file under the pinned materialized rootfs.
+    fn strict_receipt_guest_binary_path(&self) -> Result<PathBuf, Error> {
+        if let Some(overlay) = &self.e9patch_overlay {
+            return Ok(overlay.source.clone());
+        }
+        if let Some(image) = &self.image {
+            let rootfs = crate::image::materialize_rootfs(image)?;
+            let command = self.guest_command()?;
+            let requested = Path::new(command.get_program());
+            let guest_cwd = command
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let guest_abs = resolve_image_guest_program(requested, &guest_cwd)?;
+            return Ok(crate::image::resolve_in_rootfs(&rootfs, &guest_abs));
+        }
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        Ok(host)
+    }
+
+    /// Build the exact identity inputs independently of the receipt fields. The
+    /// semantic verifier later compares the receipt back to these bytes/digests.
+    fn strict_receipt_identity_material(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(FileIdentity, FileIdentity, Vec<u8>, Vec<u8>), Error> {
+        let producer_path = std::env::current_exe().context("locating Hermit producer binary")?;
+        let guest_path = self.strict_receipt_guest_binary_path()?;
+        let producer = FileIdentity::from_path(&producer_path)?;
+        let guest = FileIdentity::from_path(&guest_path)?;
+        let command = self.guest_command()?;
+        let effective_args: Vec<serde_json::Value> = command
+            .get_args()
+            .map(|argument| receipt_byte_identity(argument.as_bytes()))
+            .collect();
+        // Bind the complete effective environment without publishing credential
+        // values: variable names remain visible, while each value is represented
+        // by its byte length and SHA-256 identity.
+        let captured_environment: Vec<(Vec<u8>, u64, String)> = command
+            .get_captured_envs()
+            .into_iter()
+            .map(|(name, value)| {
+                let value = value.as_bytes();
+                (
+                    name.as_bytes().to_vec(),
+                    value.len() as u64,
+                    detcore::Digest::new(value).to_string(),
+                )
+            })
+            .collect();
+        let guest_command = serde_json::to_vec(&serde_json::json!({
+            "schema": "hermit-guest-command/v1",
+            "requested_program_path": receipt_byte_identity(self.program.as_os_str().as_bytes()),
+            "effective_guest_program_path": receipt_byte_identity(command.get_program().as_bytes()),
+            "arg0": receipt_byte_identity(command.get_arg0().as_bytes()),
+            "args": effective_args,
+            "current_directory": command
+                .get_current_dir()
+                .map(|path| receipt_byte_identity(path.as_os_str().as_bytes())),
+            "captured_environment_value_identities": captured_environment,
+            "guest_binary_sha256": &guest.sha256,
+        }))?;
+        // `RunOpts` is the complete parsed/effective option record (including
+        // non-Detcore container knobs); DetConfig is carried structurally as
+        // well so a consumer need not parse a Debug representation. The source
+        // SHA versions the Debug spelling.
+        let run_options_debug = format!("{self:#?}");
+        let global_options_debug = format!("{global:#?}");
+        let effective_run_config = serde_json::to_vec(&serde_json::json!({
+            "schema": "hermit-effective-run-config/v1",
+            "source_revision": option_env!("HERMIT_BUILD_GIT_FULL_SHA").unwrap_or("unknown"),
+            "selected_backend": self.selected_backend().as_str(),
+            "runtime_backend": self.runtime_backend().as_str(),
+            "detcore": self.effective_det_config(),
+            "captured_environment_value_identities": captured_environment,
+            "run_options": receipt_byte_identity(run_options_debug.as_bytes()),
+            "global_options": receipt_byte_identity(global_options_debug.as_bytes()),
+        }))?;
+        Ok((producer, guest, guest_command, effective_run_config))
+    }
+
     fn verify_liteinst_activation(&self) -> Result<(), Error> {
         let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
         let mut command = Command::new(executable);
@@ -2712,12 +2809,29 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
+        // Bind executable/config identity before either execution. Re-read it
+        // after run 2 below and require equality, so a receipt cannot describe
+        // whatever guest happened to exist only after the measured work.
+        let strict_identity_before = if self.verify_strict && self.verify_json.is_some() {
+            Some(self.strict_receipt_identity_material(global)?)
+        } else {
+            None
+        };
+
         eprintln!(":: {}", "Run1...".yellow().bold());
 
         let mut out1: Output = self.run_verify(log1_file, global)?;
-        let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
-            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
-            .transpose()?;
+        // SaBRe transports deterministic events and guest stderr in one ordered
+        // byte stream. Preserve that untouched stream for the receipt before
+        // splitting a comparison-only guest-stderr view and normalized log.
+        let raw_stderr1 = out1.stderr.clone();
+        let sabre_syscalls1 = if self.selected_backend() == Backend::Sabre {
+            let extracted = extract_sabre_detlogs(&log1_path, &raw_stderr1)?;
+            out1.stderr = extracted.guest_stderr;
+            Some(extracted.syscall_records)
+        } else {
+            None
+        };
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -2747,8 +2861,11 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run2...".yellow().bold());
         let mut out2 = self.run_verify(log2_file, global)?;
+        let raw_stderr2 = out2.stderr.clone();
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
+            let extracted = extract_sabre_detlogs(&log2_path, &raw_stderr2)?;
+            out2.stderr = extracted.guest_stderr;
+            let sabre_syscalls2 = extracted.syscall_records;
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
                 return Err(Error::msg(format!(
                     "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
@@ -2758,6 +2875,43 @@ impl RunOpts {
                 ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
             );
         }
+
+        // Capture receipt inputs while both raw logs still exist. The comparison
+        // below consumes their TempPaths (and deletes them on a match), while a
+        // strict receipt must publish and independently re-parse the raw bytes.
+        let strict_receipt_material = if self.verify_strict && self.verify_json.is_some() {
+            let raw_log1 = fs::read(&log1_path).with_context(|| {
+                format!(
+                    "reading first strict verification log {}",
+                    log1_path.display()
+                )
+            })?;
+            let raw_log2 = fs::read(&log2_path).with_context(|| {
+                format!(
+                    "reading second strict verification log {}",
+                    log2_path.display()
+                )
+            })?;
+            let identity_before = strict_identity_before
+                .expect("strict receipt identity was captured before the first run");
+            let identity_after = self.strict_receipt_identity_material(global)?;
+            if identity_before != identity_after {
+                anyhow::bail!(
+                    "strict verification identity changed between the pre-run and post-run observations"
+                );
+            }
+            let (producer, guest, guest_command, effective_run_config) = identity_before;
+            Some((
+                raw_log1,
+                raw_log2,
+                producer,
+                guest,
+                guest_command,
+                effective_run_config,
+            ))
+        } else {
+            None
+        };
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
         let outcome = compare_two_runs(
@@ -2795,7 +2949,65 @@ impl RunOpts {
         // whether or not the runs matched, and independent of the guest's own
         // exit status.
         if let Some(path) = &self.verify_json {
-            write_verification_json(path, &outcome)?;
+            if let Some((
+                raw_log1,
+                raw_log2,
+                producer,
+                guest,
+                guest_command,
+                effective_run_config,
+            )) = strict_receipt_material
+            {
+                let legacy = match serde_json::to_value(VerificationReport::from(&outcome))? {
+                    serde_json::Value::Object(map) => map.into_iter().collect(),
+                    _ => unreachable!("VerificationReport serializes as an object"),
+                };
+                let config = self.effective_det_config();
+                let decision = publish_strict_receipt(
+                    path,
+                    StrictReceiptBuildInput {
+                        source_revision: option_env!("HERMIT_BUILD_GIT_FULL_SHA")
+                            .unwrap_or("unknown"),
+                        profile: hermit::verify_receipt::STRICT_PROFILE_V1,
+                        producer_binary: producer,
+                        guest_binary: guest,
+                        guest_command: &guest_command,
+                        effective_run_config: &effective_run_config,
+                        selected_backend: self.selected_backend().as_str(),
+                        runtime_backend: self.runtime_backend().as_str(),
+                        selected_tests: 1,
+                        executed_runs: 2,
+                        require_detlog_heap: config.detlog_heap,
+                        require_detlog_stack: config.detlog_stack,
+                        fail_closed_strict_requested: self.strict,
+                        verify_strict_requested: self.verify_strict,
+                        left: StrictRunInput {
+                            stdout: &out1.stdout,
+                            stderr: &raw_stderr1,
+                            raw_log: &raw_log1,
+                            termination: TypedTermination::from(out1.status),
+                        },
+                        right: StrictRunInput {
+                            stdout: &out2.stdout,
+                            stderr: &raw_stderr2,
+                            raw_log: &raw_log2,
+                            termination: TypedTermination::from(out2.status),
+                        },
+                        legacy,
+                    },
+                )?;
+                eprintln!(":: Strict verification receipt: {decision:?}");
+                if !decision.is_qualified() {
+                    return Err(Error::msg(format!(
+                        "strict verification produced no qualifying receipt: {decision:?}"
+                    )));
+                }
+            } else {
+                // Backwards-compatible diagnostic schema for stripped compares
+                // and `--verify-verbose` without the explicitly required
+                // `--verify-strict`. No strict semantic consumer accepts it.
+                write_verification_json(path, &outcome)?;
+            }
         }
 
         // On divergence, preserve the historical behavior: return the error
@@ -3170,15 +3382,20 @@ mod tests {
             "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
         )
         .unwrap();
-        let mut stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
+        let raw_stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
               INFO detcore: DETLOG scheduler event\n\
               INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
             .to_vec();
-        let syscall_records = extract_sabre_detlogs(log.path(), &mut stderr).unwrap();
+        let before = raw_stderr.clone();
+        let extracted = extract_sabre_detlogs(log.path(), &raw_stderr).unwrap();
 
-        assert_eq!(syscall_records, 1);
         assert_eq!(
-            stderr,
+            raw_stderr, before,
+            "raw transport order must remain untouched"
+        );
+        assert_eq!(extracted.syscall_records, 1);
+        assert_eq!(
+            extracted.guest_stderr,
             b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n"
         );
         assert_eq!(
