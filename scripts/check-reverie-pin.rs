@@ -918,6 +918,227 @@ fn calibration_decision_required(old: &str, main: &str) -> String {
     )
 }
 
+/// Tracked non-Cargo files the repair is responsible for.
+///
+/// Cargo metadata is excluded because `rewrite_manifest_pins` owns it. This
+/// checker's own source is excluded for the same reason `liteinst_cache_keys`
+/// excludes it: it embeds deliberately-drifted example tokens in its docstring
+/// and fixtures, and a check must not scan the file that defines it.
+fn tracked_binding_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let output = git_in(
+        root,
+        &[
+            "ls-files",
+            "-z",
+            "--",
+            ".",
+            ":(exclude,top)scripts/check-reverie-pin.rs",
+            ":(exclude,glob,top)**/Cargo.toml",
+            ":(exclude,glob,top)**/Cargo.lock",
+            ":(exclude,top)Cargo.toml",
+            ":(exclude,top)Cargo.lock",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files for pin binding sites failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(path))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn is_hex(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
+}
+
+/// Replace a SHORT revision only where it is a whole hex token.
+///
+/// A bare `replace()` on a 7-hex prefix would also rewrite the first 7
+/// characters of any longer sha that happens to start with it, silently
+/// corrupting a 40-hex value into a chimera. Long forms are rewritten before
+/// this runs, so anything still matching here is a genuine short reference.
+fn replace_short_token(haystack: &str, old: &str, new: &str) -> (String, usize) {
+    let bytes = haystack.as_bytes();
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0usize;
+    let mut hits = 0usize;
+    while let Some(found) = haystack[cursor..].find(old) {
+        let start = cursor + found;
+        let end = start + old.len();
+        let before_is_hex = start > 0 && is_hex(bytes[start - 1]);
+        let after_is_hex = end < bytes.len() && is_hex(bytes[end]);
+        out.push_str(&haystack[cursor..start]);
+        if before_is_hex || after_is_hex {
+            out.push_str(old); // part of a longer hex run: leave it alone
+        } else {
+            out.push_str(new);
+            hits += 1;
+        }
+        cursor = end;
+    }
+    out.push_str(&haystack[cursor..]);
+    (out, hits)
+}
+
+/// Marks a DATED RECORD of a past decision. Everything between these two
+/// markers is history and is never advanced: a carry entry states which
+/// revision was calibrated on a given date, so rewriting it forges the audit
+/// trail it exists to provide.
+const HISTORY_BEGIN: &str = "reverie-pin: history-begin";
+const HISTORY_END: &str = "reverie-pin: history-end";
+const SHORT_LEN: usize = 7;
+
+/// Advance every LIVE pin binding outside the Cargo scope, in BOTH forms.
+///
+/// The invariant is: every live binding tracks the pin; every historical record
+/// stays put. That rules out both naive options. Rewriting only Cargo (what
+/// this command did for six consecutive bumps) updates too little and leaves
+/// the DBI budget bound to a revision that is no longer built. Replacing every
+/// occurrence updates too much and rewrites the carry log.
+///
+/// BOTH FORMS matter. `ci/configure-build-jobs.sh` states "valid only for
+/// Reverie 038e993" at 7 hex directly above the 40-hex guard it describes; a
+/// 40-hex-only pass leaves that sentence naming a revision the guard no longer
+/// accepts.
+fn rewrite_live_bindings(
+    root: &Path,
+    old_revisions: &BTreeSet<&str>,
+    main: &str,
+) -> Result<(usize, usize), String> {
+    rewrite_live_bindings_in(&tracked_binding_files(root)?, old_revisions, main)
+}
+
+/// The rewrite itself, over an explicit file list.
+///
+/// Split from its `git ls-files` enumeration so the behaviour can be tested
+/// without spawning git per case: `test_harness.sh validate` builds and runs
+/// four copies of this suite concurrently, and per-test git processes were
+/// enough to intermittently exhaust process creation there.
+fn rewrite_live_bindings_in(
+    files: &[PathBuf],
+    old_revisions: &BTreeSet<&str>,
+    main: &str,
+) -> Result<(usize, usize), String> {
+    let main_short = &main[..SHORT_LEN.min(main.len())];
+    let mut changed_files = 0usize;
+    let mut changed_sites = 0usize;
+
+    for path in files {
+        let original = match fs::read_to_string(path) {
+            Ok(text) => text,
+            // Binary or non-UTF-8 tracked files cannot carry a pin literal.
+            Err(_) => continue,
+        };
+        if !old_revisions
+            .iter()
+            .any(|old| original.contains(&old[..SHORT_LEN.min(old.len())]))
+        {
+            continue;
+        }
+
+        let mut in_history = false;
+        let mut rebuilt = String::with_capacity(original.len());
+        let mut file_sites = 0usize;
+        for line in original.split_inclusive('\n') {
+            if line.contains(HISTORY_BEGIN) {
+                in_history = true;
+            }
+            if in_history {
+                rebuilt.push_str(line);
+                if line.contains(HISTORY_END) {
+                    in_history = false;
+                }
+                continue;
+            }
+            let mut updated = line.to_string();
+            for old in old_revisions {
+                // Long form first: afterwards, any remaining short match is a
+                // genuine short reference rather than a prefix of a long one.
+                let long_hits = updated.matches(*old).count();
+                if long_hits > 0 {
+                    updated = updated.replace(*old, main);
+                    file_sites += long_hits;
+                }
+                let old_short = &old[..SHORT_LEN.min(old.len())];
+                let (next, short_hits) = replace_short_token(&updated, old_short, main_short);
+                updated = next;
+                file_sites += short_hits;
+            }
+            rebuilt.push_str(&updated);
+        }
+        if in_history {
+            return Err(format!(
+                "{}: '{HISTORY_BEGIN}' has no matching '{HISTORY_END}'; refusing to \
+                 guess where the historical record ends",
+                path.display()
+            ));
+        }
+        if rebuilt != original {
+            fs::write(path, rebuilt)
+                .map_err(|error| format!("could not update {}: {error}", path.display()))?;
+            changed_files += 1;
+            changed_sites += file_sites;
+        }
+    }
+    Ok((changed_files, changed_sites))
+}
+
+/// LIVE sites that still carry a superseded revision, in either form.
+///
+/// Anything inside a history region is excluded by design; anything else is a
+/// binding the repair was supposed to advance and did not.
+fn residual_revision_sites(
+    root: &Path,
+    old_revisions: &BTreeSet<&str>,
+) -> Result<Vec<String>, String> {
+    residual_revision_sites_in(root, &tracked_binding_files(root)?, old_revisions)
+}
+
+fn residual_revision_sites_in(
+    root: &Path,
+    files: &[PathBuf],
+    old_revisions: &BTreeSet<&str>,
+) -> Result<Vec<String>, String> {
+    let mut sites: Vec<String> = Vec::new();
+    for path in files {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        let mut in_history = false;
+        for (index, line) in text.lines().enumerate() {
+            if line.contains(HISTORY_BEGIN) {
+                in_history = true;
+            }
+            if in_history {
+                if line.contains(HISTORY_END) {
+                    in_history = false;
+                }
+                continue;
+            }
+            let stale = old_revisions.iter().any(|old| {
+                line.contains(*old)
+                    || replace_short_token(line, &old[..SHORT_LEN.min(old.len())], "").1 > 0
+            });
+            if stale {
+                sites.push(format!("{}:{}", relative.display(), index + 1));
+            }
+        }
+    }
+    sites.sort();
+    sites.dedup();
+    Ok(sites)
+}
+
 fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
     // Read the calibration BEFORE any rewrite: once the derived sites move, the
     // wrapper is the only remaining record of the revision we are carrying from.
@@ -933,6 +1154,29 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         // over a narrower scope than the caller means by "the pin".
         return finish_ci_pin_sites(root, calibrated.as_deref(), main, true);
     }
+
+    // PRECONDITION, checked before ANY mutation so a refusal leaves the tree
+    // completely untouched rather than half-advanced.
+    //
+    // The out-of-scope bindings are the DBI build-budget calibration: they bind
+    // a MEASURED build cost to an exact revision, which is a different quantity
+    // from "which Reverie do we compile". Advancing them is only honest once
+    // somebody has judged the measured budget still holds at the new pin, and
+    // this repository already records exactly that judgement -- the dated carry
+    // entries inside the history block. So the tool advances the bindings AND
+    // requires the evidence, instead of either silently skipping them (six
+    // bumps' worth of hand-carrying) or silently asserting a calibration nobody
+    // made.
+    require_carry_record(root, main)?;
+
+    // Captured BEFORE the rewrite: after it, the Cargo sites no longer name the
+    // superseded revisions, but the out-of-scope sites still do.
+    let old_revisions: BTreeSet<&str> = scan
+        .occurrences
+        .iter()
+        .map(|occurrence| occurrence.rev.as_str())
+        .filter(|revision| *revision != main)
+        .collect();
 
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
 
@@ -964,8 +1208,39 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
             "update completed but derived Cargo metadata records {pin}, expected {main}"
         ));
     }
+
+    let (binding_files, binding_sites) = rewrite_live_bindings(root, &old_revisions, main)?;
     println!(
-        "Reverie pin updated to latest main {main} across {} derived Cargo revision entries.",
+        "Advanced {binding_sites} live binding site(s) in {binding_files} file(s) outside the \
+         Cargo scope; historical records left byte-identical."
+    );
+
+    // Verifying only the Cargo half is how this command used to report success
+    // for a repair it had not finished. Every prior bump hand-carried the
+    // out-of-scope sites, so the tool silently depended on the operator knowing
+    // to complete its work.
+    let residual = residual_revision_sites(root, &old_revisions)?;
+    if !residual.is_empty() {
+        let count = residual.len();
+        return Err(format!(
+            "PARTIAL REPAIR, NOT COMPLETE.\n\
+             DONE: {} Cargo revision entries record latest main {main}, lockfiles resolved, \
+             and {binding_sites} live binding site(s) advanced.\n\
+             NOT DONE: {count} live site(s) still record a superseded revision:\n\
+             {}\n\
+             Every live binding must track the pin. Fix these, then re-run this command.",
+            updated.occurrences.len(),
+            residual
+                .iter()
+                .map(|site| format!("  {site}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    println!(
+        "Reverie pin updated to latest main {main}: {} derived Cargo revision entries and \
+         {binding_sites} live binding site(s); 0 residual.",
         updated.occurrences.len()
     );
     finish_ci_pin_sites(root, calibrated.as_deref(), main, false)
@@ -1009,6 +1284,61 @@ fn finish_ci_pin_sites(
         println!("  {}", path.display());
     }
     Err(calibration_decision_required(old, main))
+}
+
+/// Refuse unless a dated carry record already justifies the new pin.
+///
+/// The carry log is where the human judgement lives ("the DBI inputs are
+/// byte-identical at both pins, so the measured budget carries"). Without an
+/// entry naming the new revision, advancing the budget guard would assert a
+/// calibration nobody made and make the guard that refuses an uncalibrated
+/// budget vacuously true -- the same fail-open the rest of this change removes,
+/// one level up.
+fn require_carry_record(root: &Path, main: &str) -> Result<(), String> {
+    require_carry_record_in(&tracked_binding_files(root)?, main)
+}
+
+fn require_carry_record_in(files: &[PathBuf], main: &str) -> Result<(), String> {
+    let short = &main[..SHORT_LEN.min(main.len())];
+    let mut history_files = 0usize;
+    for path in files {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        if !text.contains(HISTORY_BEGIN) {
+            continue;
+        }
+        history_files += 1;
+        let mut in_history = false;
+        for line in text.lines() {
+            if line.contains(HISTORY_BEGIN) {
+                in_history = true;
+            }
+            if in_history {
+                if line.contains(short) {
+                    return Ok(());
+                }
+                if line.contains(HISTORY_END) {
+                    in_history = false;
+                }
+            }
+        }
+    }
+    if history_files == 0 {
+        // Nothing declares a history region, so there is no calibration record
+        // to honour and nothing to preserve. Not an error.
+        return Ok(());
+    }
+    Err(format!(
+        "NO CALIBRATION RECORD FOR {short}.\n\
+         The live DBI budget bindings were NOT advanced and no file outside the Cargo scope \
+         was modified.\n\
+         Add a dated carry entry naming {short} inside the '{HISTORY_BEGIN}' block \
+         (ci/configure-build-jobs.sh) stating why the measured build budget still holds at \
+         {main}, then re-run. Advancing the guard without that record would assert a \
+         calibration nobody made."
+    ))
 }
 
 fn loud_header(title: &str) {
@@ -1518,6 +1848,192 @@ mod tests {
             "check-reverie-pin-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    const OLD: &str = "038e993926e45514264d30367b70df9b6ac3b9b8";
+    const NEW: &str = "108f9ab47605a7a2e8ae40353fde21f8a8b2310c";
+
+    /// A tree shaped like the real one: live 40-hex bindings, a live SHORT-form
+    /// reference, and a history block holding dated carry records.
+    /// Deliberately lighter than `init_fixture_repo`: `git ls-files` reads the
+    /// INDEX, so `init` + `add` suffices. `test_harness.sh validate` runs four
+    /// of these suites concurrently, and the extra `config`/`commit` spawns
+    /// were enough to intermittently exhaust process creation there.
+    fn init_binding_fixture(root: &Path, carry_for: Option<&str>) -> BTreeSet<&'static str> {
+        fs::create_dir_all(root.join("ci")).unwrap();
+        fs::write(
+            root.join("ci/run-with-reverie-dbt-budget.sh"),
+            format!("expected_pin={OLD}\n"),
+        )
+        .unwrap();
+        let carry_line = match carry_for {
+            Some(short) => format!("# CARRY TO {short} (2026-08-08). Inputs identical.\n"),
+            None => String::new(),
+        };
+        fs::write(
+            root.join("ci/configure-build-jobs.sh"),
+            format!(
+                "# The calibration below is valid only for Reverie {short_old}.\n\
+                 if [[ $PIN != {OLD} ]]; then\n\
+                 echo \"not bound to calibrated Reverie {OLD}\"\n\
+                 fi\n\
+                 # reverie-pin: history-begin\n\
+                 # CARRY TO {short_old} (2026-08-07). 6144323..{short_old} touches client.c\n\
+                 {carry_line}# reverie-pin: history-end\n",
+                short_old = &OLD[..SHORT_LEN],
+            ),
+        )
+        .unwrap();
+        // Cargo metadata is the repair's own scope and must not be double-counted.
+        fs::write(
+            root.join("Cargo.toml"),
+            format!("[dependencies]\nreverie-core = {{ rev = \"{OLD}\" }}\n"),
+        )
+        .unwrap();
+        BTreeSet::from([OLD])
+    }
+
+    /// The two CI scripts a real bump touches, as an explicit list.
+    fn binding_files(root: &Path) -> Vec<PathBuf> {
+        vec![
+            root.join("ci/configure-build-jobs.sh"),
+            root.join("ci/run-with-reverie-dbt-budget.sh"),
+        ]
+    }
+
+    #[test]
+    fn positive_advances_every_live_binding_in_both_forms() {
+        let root = temp_path("bindings-positive");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+
+        let (files, sites) = rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap();
+        assert_eq!(2, files, "both CI scripts carry live bindings");
+        // 1 wrapper long + 2 config long + 1 config SHORT = 4 live sites.
+        assert_eq!(4, sites, "40-hex and 7-hex live bindings both advance");
+
+        let config = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).unwrap();
+        assert!(
+            config.contains(&format!("valid only for Reverie {}", &NEW[..SHORT_LEN])),
+            "the SHORT-form live reference must track the pin; a 40-hex-only pass misses it"
+        );
+        assert!(config.contains(&format!("$PIN != {NEW}")));
+        assert!(
+            fs::read_to_string(root.join("ci/run-with-reverie-dbt-budget.sh"))
+                .unwrap()
+                .contains(&format!("expected_pin={NEW}"))
+        );
+        assert!(
+            residual_revision_sites_in(&root, &binding_files(&root), &old).unwrap().is_empty(),
+            "a complete repair leaves no live site on the old revision"
+        );
+    }
+
+    #[test]
+    fn positive_preserves_the_historical_carry_record_verbatim() {
+        let root = temp_path("bindings-history");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+        rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap();
+
+        let config = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).unwrap();
+        let short_old = &OLD[..SHORT_LEN];
+        assert!(
+            config.contains(&format!(
+                "# CARRY TO {short_old} (2026-08-07). 6144323..{short_old} touches client.c"
+            )),
+            "the dated carry entry is history and must survive byte-identical"
+        );
+        assert_eq!(
+            2,
+            config.matches(short_old).count(),
+            "exactly the two historical mentions remain; the live one advanced"
+        );
+    }
+
+    #[test]
+    fn positive_preserves_exact_occurrence_counts_the_audit_asserts() {
+        // ci/test_harness.sh asserts `grep -Fc <pin>` == 1 in the wrapper and
+        // == 2 in the config. An in-place rewrite must keep those counts.
+        let root = temp_path("bindings-counts");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+        rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap();
+        let wrapper = fs::read_to_string(root.join("ci/run-with-reverie-dbt-budget.sh")).unwrap();
+        let config = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).unwrap();
+        assert_eq!(1, wrapper.matches(NEW).count());
+        assert_eq!(2, config.matches(NEW).count());
+    }
+
+    #[test]
+    fn negative_refuses_when_no_carry_record_justifies_the_new_pin() {
+        // The repair CANNOT be completed honestly: nothing records that the
+        // measured budget still holds at the new pin.
+        let root = temp_path("bindings-no-carry");
+        init_binding_fixture(&root, None);
+
+        let refusal = require_carry_record_in(&binding_files(&root), NEW).unwrap_err();
+        assert!(refusal.contains("NO CALIBRATION RECORD"));
+        assert!(refusal.contains(&NEW[..SHORT_LEN]));
+
+        // ...and it refuses BEFORE touching anything, so no half-advanced tree.
+        let config = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).unwrap();
+        assert!(config.contains(&format!("$PIN != {OLD}")));
+        assert!(config.contains(&format!("CARRY TO {} (2026-08-07)", &OLD[..SHORT_LEN])));
+    }
+
+    #[test]
+    fn negative_refuses_an_unterminated_history_region() {
+        // An unbalanced marker means the tool cannot tell where history ends.
+        // Guessing would either forge a record or miss a live binding.
+        let root = temp_path("bindings-unbalanced");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+        let path = root.join("ci/configure-build-jobs.sh");
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("# reverie-pin: history-end\n", "");
+        fs::write(&path, text).unwrap();
+
+        let error = rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap_err();
+        assert!(error.contains("has no matching"), "{error}");
+    }
+
+    #[test]
+    fn negative_a_write_failure_is_reported_not_swallowed() {
+        let root = temp_path("bindings-readonly");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+        let wrapper = root.join("ci/run-with-reverie-dbt-budget.sh");
+        let mut perms = fs::metadata(&wrapper).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&wrapper, perms).unwrap();
+
+        let error = rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap_err();
+        assert!(error.contains("could not update"), "{error}");
+    }
+
+    #[test]
+    fn residual_scan_ignores_history_and_catches_a_missed_live_binding() {
+        let root = temp_path("bindings-residual");
+        let old = init_binding_fixture(&root, Some(&NEW[..SHORT_LEN]));
+        rewrite_live_bindings_in(&binding_files(&root), &old, NEW).unwrap();
+        assert!(residual_revision_sites_in(&root, &binding_files(&root), &old).unwrap().is_empty());
+
+        // Re-introduce ONE stale live binding: the scan must find exactly it.
+        let wrapper = root.join("ci/run-with-reverie-dbt-budget.sh");
+        fs::write(&wrapper, format!("expected_pin={OLD}\n")).unwrap();
+        let sites = residual_revision_sites_in(&root, &binding_files(&root), &old).unwrap();
+        assert_eq!(
+            vec!["ci/run-with-reverie-dbt-budget.sh:1".to_string()],
+            sites
+        );
+    }
+
+    #[test]
+    fn short_token_replacement_never_corrupts_a_longer_sha() {
+        let (out, hits) = replace_short_token("038e993926e45514264d30367b70df9b6ac3b9b8", "038e993", "108f9ab");
+        assert_eq!(0, hits, "a 7-hex prefix inside a 40-hex sha is not a short reference");
+        assert_eq!("038e993926e45514264d30367b70df9b6ac3b9b8", out);
+
+        let (out, hits) = replace_short_token("Reverie 038e993.", "038e993", "108f9ab");
+        assert_eq!(1, hits);
+        assert_eq!("Reverie 108f9ab.", out);
     }
 
     fn init_fixture_repo(root: &Path) {
