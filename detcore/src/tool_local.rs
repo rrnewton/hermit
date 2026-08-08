@@ -1044,6 +1044,17 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
+    /// How many register-file samples this thread has CONSIDERED for `--detlog-regs`.
+    ///
+    /// This is the cadence index, and it exists because no pre-existing counter is a clean
+    /// zero-based count of control points: the logged syscall ordinal starts at 2, and
+    /// `syscall_count` also counts points this sampler never reaches. Keying the cadence on either
+    /// let a short guest whose points never landed on a multiple of N emit ZERO samples while the
+    /// run still reported PASS -- a spot-tier green backed by nothing. Counting the samples
+    /// themselves makes index 0 the first control point of every thread, so a spot-tier run always
+    /// samples at least once.
+    pub regs_sample_index: u64,
+
     /// A count of how many signals have arrived at this thread, total.
     pub signal_count: u64,
 
@@ -2807,7 +2818,7 @@ fn thread_rng_from_parent_entropy_labeled(
     parent.clone().fill_bytes(seed.as_mut());
     detlog!("RNG {} Generated new seed {:?}", msg, seed);
     // Pcg64Mcg forces its internal state odd, so seed bit zero carries no
-    // entropy. DBI uses 96 bits for a stable process/thread sequence; mix those
+    // entropy. DBT uses 96 bits for a stable process/thread sequence; mix those
     // bytes after the forced bit while retaining the existing DetTid layout.
     let entropy_bytes = entropy.to_le_bytes();
     for (seed_byte, entropy_byte) in seed[4..].iter_mut().zip(entropy_bytes) {

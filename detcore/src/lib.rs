@@ -139,7 +139,7 @@ pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBI-child classification surface.
+// TODO-HUMAN-REVIEW(PR-644): Review the copied-DBT-child classification surface.
 pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     matches!(
         syscall_classification::classify_syscall(sysno),
@@ -151,7 +151,7 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
 /// `request_key`, `keyctl`) that Detcore hides behind a deterministic
 /// `CONFIG_KEYS`-absent boundary under strict mode.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBI-child policy can preserve
+// TODO-HUMAN-REVIEW(PR-916): Exposed so the copied-DBT-child policy can preserve
 // the same keyring isolation boundary that the reclassification (PR-848) moved
 // out of the Unsupported set.
 pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
@@ -162,14 +162,14 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
 /// errno in strict mode without consulting the host.
 ///
 /// This is the boundary backends that execute guest syscalls outside Detcore's
-/// `handle_syscall_event` dispatcher (the DBI copied-child fast path and the
+/// `handle_syscall_event` dispatcher (the DBT copied-child fast path and the
 /// KVM executor) consult to enforce the same fixed refusal the ptrace path
 /// enforces. It deliberately excludes emulated / no-op / host-forwarding
 /// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
 /// `copy_file_range`), because fail-closing a copied child for those would
 /// diverge from the ptrace path rather than match it.
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBI-child deterministic-refusal surface.
+// TODO-HUMAN-REVIEW(PR-978): Review the copied-DBT-child deterministic-refusal surface.
 pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
     syscall_classification::is_deterministically_refused_syscall(sysno)
 }
@@ -718,6 +718,105 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Hash the guest REGISTER FILE and log it.
+    ///
+    /// # The sampling boundary: GUEST-LOGICAL CONTROL, never handler interior
+    ///
+    /// This is called from exactly one place -- immediately after a syscall has finished and its
+    /// result has been written back, before the guest resumes. At that instant the guest
+    /// LOGICALLY HAS CONTROL: the architectural state is what the guest itself would observe at
+    /// its own RIP, and it is the same instant at which stack and heap are already hashed.
+    ///
+    /// It is deliberately NOT sampled anywhere inside a tool handler. A backend that runs its
+    /// handler IN-GUEST (sabre, liteinst, e9patch) executes instructions the ptrace reference
+    /// never executes, using guest registers as scratch while it does. Registers there
+    /// legitimately differ across backends, so comparing them would report correct behaviour as a
+    /// divergence and burn the prefix-depth ratchet on artifacts. Handler-interior state is out of
+    /// the domain, not excluded from it by a filter -- the same "define the domain" rule the heap
+    /// definition follows.
+    ///
+    /// # What is in the hash, and what is deliberately not
+    ///
+    /// Included: the general-purpose registers the guest can observe, `rip`, `rsp`, `rflags`,
+    /// `orig_rax`, and the TLS bases `fs_base`/`gs_base`.
+    ///
+    /// EXCLUDED, with reasons rather than by convenience:
+    /// * `rcx` and `r11` -- architecturally clobbered by the `SYSCALL` instruction, which stores
+    ///   the return RIP and RFLAGS in them. They carry no information beyond `rip`/`eflags`, which
+    ///   ARE hashed, and a patching backend that reaches the kernel by some route other than a
+    ///   bare `SYSCALL` will leave different values there for a reason that is not a determinism
+    ///   defect.
+    /// * The segment selectors `cs`/`ss`/`ds`/`es`/`fs`/`gs` -- constant for a 64-bit userspace
+    ///   guest, so they add no signal; the TLS BASES are what a guest actually observes and those
+    ///   are hashed.
+    fn detlog_registers<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        regs: &libc::user_regs_struct,
+        seq: u64,
+    ) {
+        if !self.cfg.detlog_regs {
+            return;
+        }
+        // COST TIER: cadence 1 == full (every control point); N > 1 == spot-check every Nth.
+        // The cadence index is a PER-THREAD counter, NOT a shared one: a global atomic would be
+        // incremented in whatever order threads happen to reach it, so the cadence -- and
+        // therefore which points got sampled -- would itself be nondeterministic. A determinism
+        // instrument must not have a nondeterministic sampling schedule.
+        //
+        // It is `stats.syscall_count`, which starts at ZERO, rather than the syscall ORDINAL used
+        // in the log (which starts at 2). With the ordinal, a guest whose control points never
+        // land on a multiple of the cadence emitted NOTHING and the run still reported PASS -- a
+        // spot-tier green backed by zero samples. Indexing from zero makes the first control point
+        // of every thread always sampled, so a spot-tier run can never be silently empty.
+        let cadence = self.cfg.detlog_regs_cadence.max(1);
+        let index = {
+            let stats = &mut guest.thread_state_mut().stats;
+            let i = stats.regs_sample_index;
+            stats.regs_sample_index = i.saturating_add(1);
+            i
+        };
+        let _ = seq;
+        if !index.is_multiple_of(cadence) {
+            return;
+        }
+        let tier = if cadence == 1 {
+            "full".to_string()
+        } else {
+            format!("spot-1/{cadence}")
+        };
+        let mut bytes = Vec::with_capacity(19 * 8);
+        for v in [
+            regs.rax,
+            regs.rbx,
+            regs.rdx,
+            regs.rsi,
+            regs.rdi,
+            regs.rbp,
+            regs.rsp,
+            regs.r8,
+            regs.r9,
+            regs.r10,
+            regs.r12,
+            regs.r13,
+            regs.r14,
+            regs.r15,
+            regs.rip,
+            regs.eflags,
+            regs.orig_rax,
+            regs.fs_base,
+            regs.gs_base,
+        ] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        detlog!(
+            "[registers][dtid {}] control_point=syscall-exit tier={} {}",
+            guest.thread_state().dettid,
+            tier,
+            Digest::new(&bytes)
+        );
+    }
+
     fn detlog_memory_maps<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
         if !(self.cfg.detlog_stack || self.cfg.detlog_heap) {
             // Don't incur the *significant* performance penalty for reading
@@ -974,7 +1073,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // opt-in, Detcore MUST still see every syscall it deterministically
             // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
             // strict guests execute those syscalls natively against the host,
-            // exactly the leak the DBI copied-child path also had to close.
+            // exactly the leak the DBT copied-child path also had to close.
             subscription.syscalls(Sysno::iter().filter(|sysno| {
                 syscall_classification::is_deterministically_refused_syscall(*sysno)
             }));
@@ -2275,6 +2374,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             res
         );
 
+        // Same guest-logical-control point that already anchors the stack/heap hashes: the
+        // syscall is complete and its result written back, so the guest logically has control.
+        // Reading registers is itself backend work, so keep the disabled path inert.  In
+        // particular, a run that does not request register evidence must not be perturbed by
+        // collecting data that will immediately be discarded.
+        if self.cfg.detlog_regs {
+            let control_point_regs = guest.regs().await;
+            let regs_seq = guest.thread_state().stats.syscall_count;
+            self.detlog_registers(guest, &control_point_regs, regs_seq);
+        }
         self.detlog_memory_maps(guest)?;
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
