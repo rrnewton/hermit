@@ -1684,7 +1684,16 @@ function append_validation_ledger {
     # the parent ledger aggregator reads via .get() and is
     # unaffected until it is taught to surface them. (warm-vs-cold is already
     # recorded as cache_state, so this does not duplicate it.)
-    line="{\"schema_version\":4,\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
+    # `producer` names the CODE PATH that appended this row. Establishing that
+    # for one row previously took JSON-whitespace forensics plus a git log -S
+    # across three repos, because no row said who wrote it. The slug must be
+    # registered in `producer.known` of the parent's
+    # ci-hub/validate/qualifying-receipt.json -- an unregistered slug is refused
+    # exactly like an absent one once that predicate's epoch is flipped on.
+    # Additive: the field is inert until then, so this can land before its
+    # sibling writers in the parent and in reverie.
+    line="{\"schema_version\":4,\"producer\":\"hermit-validate-sh\","
+    line+="\"started_at\":$(json_quote "$VALIDATION_STARTED_AT"),"
     line+="\"finished_at\":$(json_quote "$finished_at"),\"host\":$(json_quote "$VALIDATION_HOST"),"
     line+="\"toolchain\":$(json_quote "$VALIDATION_TOOLCHAIN"),"
     line+="\"slot\":$(json_quote "$VALIDATION_SLOT"),\"cwd\":$(json_quote "$ROOT_DIR"),"

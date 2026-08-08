@@ -155,7 +155,14 @@ const LEDGER_SCHEMA_VERSION: i64 = 3;
 
 /// Producer identity recorded in each ledger row, so a backward-tolerant reader
 /// can tell a validate.rs receipt from a validate.sh one without inference.
-const LEDGER_PRODUCER: &str = "validate.rs";
+///
+/// REPO-QUALIFIED since the column became load-bearing: the parent's
+/// ci-hub/validate/qualifying-receipt.json now REFUSES a row whose `producer` is
+/// not in its `known` set, and a bare `validate.sh`/`validate.rs` cannot say
+/// whether it came from hermit or reverie -- both repos ship a `validate.sh`.
+/// The predicate keeps the previous bare `validate.rs` registered as a legacy
+/// value so rows already written under it still verify.
+const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 
 /// Env var that names an explicit ledger file (highest precedence). Matches the
 /// override `validate.sh` honors so both producers can share one ledger.
