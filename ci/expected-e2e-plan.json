@@ -573,6 +573,20 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/du-tree-summary"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/find-tree-metadata"
     }
   ],
   "schema": 1
