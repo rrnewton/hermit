@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DetLogFilter","LogComparisonMode"],"fn":["host_addr","log_diff","log_diff_detailed","strip_log_entry"],"struct":["Comparison","LogDiffOpts","LogDiffSummary"]};
