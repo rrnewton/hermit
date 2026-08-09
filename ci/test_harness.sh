@@ -304,7 +304,11 @@ function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
     local debug_outer_minutes release_outer_minutes debug_test_outer_minutes
-    local strict_compat_timeout
+    local strict_compat_timeout rr_suite_timeout rr_suite_estimate
+    # Terminal Rust-path attempts occupied the strict-compat job for 20m, and
+    # the workload itself is known to exceed 16m. Its 2700s node ceiling and
+    # 60m outer job now retain >2x measured headroom; keep deriving both values
+    # below so neither can silently drift back under the measured workload.
     local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
@@ -344,6 +348,13 @@ function assert_parallel_portable_workflow {
     strict_compat_timeout=$(jq -r '
         .steps[] | select(.group == "test" and .job == "strict_compat") | .timeout
     ' "$DAG_ROOT/portable.json")
+    rr_suite_timeout=$(jq -r '
+        .steps[] | select(.group == "test" and .job == "rr_suite_contract") | .timeout
+    ' "$DAG_ROOT/portable.json")
+    rr_suite_estimate=$(jq -r '
+        .steps[] | select(.group == "test" and .job == "rr_suite_contract")
+        | .hint.est_duration_s
+    ' "$DAG_ROOT/portable.json")
     [[ $debug_inner_path =~ ^[1-9][0-9]*$ ]] ||
         die "portable debug selection has no numeric critical path"
     [[ $release_inner_path =~ ^[1-9][0-9]*$ ]] ||
@@ -356,6 +367,12 @@ function assert_parallel_portable_workflow {
         die "GitHub debug test shards have no numeric outer timeout"
     [[ $strict_compat_timeout =~ ^[1-9][0-9]*$ ]] ||
         die "portable strict-compat node has no numeric timeout"
+    ((strict_compat_timeout >= 2700)) ||
+        die "portable strict-compat node must retain its measured 2700s floor"
+    ((debug_test_outer_minutes >= 60)) ||
+        die "GitHub debug-test outer timeout must retain its measured 60m floor"
+    ((rr_suite_timeout >= 600 && rr_suite_estimate >= 120)) ||
+        die "rr-suite contract must retain its measured 600s ceiling and 120s estimate"
     ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
         die "GitHub debug outer timeout must exceed ${debug_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
     ((release_outer_minutes * 60 > release_inner_path + hosted_job_overhead_seconds)) ||
