@@ -1271,7 +1271,6 @@ impl PeerSnapshotMonitor {
     /// Production hard-binds `/proc` and the uid-derived runtime lock.  There is
     /// intentionally no environment override for either authority input.
     pub fn start_production(
-        socket_dir: &Path,
         owner_pid: i32,
         controller_start_ticks: u64,
     ) -> Result<Self, SnapshotUnresolved> {
@@ -1286,7 +1285,10 @@ impl PeerSnapshotMonitor {
         Self::start_at(
             PathBuf::from("/proc"),
             runtime.join("hermit-validate-peer-snapshot.lock"),
-            socket_dir.join("peer-monitor.sock"),
+            runtime.join(format!(
+                "hermit-validate-peer-{}-{controller_start_ticks}.sock",
+                std::process::id()
+            )),
             owner_pid,
             std::process::id() as i32,
             controller_start_ticks,
