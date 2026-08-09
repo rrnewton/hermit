@@ -209,6 +209,103 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
     None
 }
 
+/// What the retry did to a node's environmental classification.
+///
+/// `environmental_block_class` binds by COLOCATION — a banner somewhere in the
+/// failing node's own detail region. That establishes contemporaneity, not
+/// causation. The retry is the differential experiment that settles it: same
+/// commit, same code, fresh environment. This type is the experiment's readout,
+/// and it deliberately has three variants rather than two, because "we never ran
+/// the experiment" is a distinct state from either of its outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvBlockVerdict {
+    /// Re-run, and it PASSED. The environment was the difference; the class holds.
+    Confirmed,
+    /// Re-run, and it FAILED AGAIN. What this refutes is the class's actual
+    /// claim — a TRANSIENT host condition that a retry clears. It does not on its
+    /// own prove a product bug, because a PERSISTENT denial reproduces too; see
+    /// [`RefutedShape`], which splits the case. The excuse is withdrawn either
+    /// way, since a persistent condition is not what the retry budget absorbs.
+    Refuted,
+    /// Never re-run (zero retry budget, unreadable log, empty retry set, or
+    /// aborted during the retry). No experiment, so no verdict. This must read as
+    /// NEITHER of the other two: an unconfirmed hypothesis keeps no excuse.
+    Unconfirmed,
+}
+
+impl EnvBlockVerdict {
+    /// Settle a classified node against what its retry actually did.
+    ///
+    /// `retried` must mean "this node executed a second time", not "a retry round
+    /// happened" — an aborted retry outcome is NOT a re-run, and treating it as
+    /// one is precisely how a never-tested hypothesis would masquerade as a
+    /// refuted or confirmed one.
+    pub fn settle(retried: bool, passed: bool) -> Self {
+        match (retried, passed) {
+            (true, true) => Self::Confirmed,
+            (true, false) => Self::Refuted,
+            (false, _) => Self::Unconfirmed,
+        }
+    }
+
+    /// True only for the state that earns the node an environmental excuse.
+    pub fn is_environmental(self) -> bool {
+        matches!(self, Self::Confirmed)
+    }
+
+    /// True only for the state where the retry actually settled the question
+    /// against the class. Whether that settled failure is a product bug or a
+    /// standing host defect is [`RefutedShape`]'s question, not this one.
+    ///
+    /// `Unconfirmed` is false for BOTH this and `is_environmental` — that pair of
+    /// falses IS the third state.
+    pub fn is_settled_failure(self) -> bool {
+        matches!(self, Self::Refuted)
+    }
+}
+
+/// What a REFUTED node's NEWEST attempt looked like, compared to the signature
+/// that classified it.
+///
+/// `EnvBlockVerdict::Refuted` is not by itself "product bug". A failing re-run
+/// proves only that the failure reproduces at this commit in this host state,
+/// and a PERSISTENT host denial reproduces exactly as well as a real defect
+/// does. Comparing the newest attempt's class against the original is what
+/// separates the two — cheaply, from data the driver already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefutedShape {
+    /// The banner is GONE from the newest attempt and the node failed anyway.
+    /// The strong case: the classification really was a coincidence, and this is
+    /// a product failure.
+    BannerGone,
+    /// The newest attempt carries the SAME class. A standing host condition, not
+    /// the transient flake the retry budget exists to absorb. Retrying again is
+    /// wasted; it needs a triager, not another attempt.
+    Persistent,
+    /// The class CHANGED between attempts, so no single cause is established.
+    /// Triage the newest signature on its own.
+    SignatureChanged,
+}
+
+impl RefutedShape {
+    /// Classify a refuted node by its newest attempt. `latest` is `None` when the
+    /// newest detail region no longer classifies environmental at all.
+    pub fn of(original: &str, latest: Option<&str>) -> Self {
+        match latest {
+            None => Self::BannerGone,
+            Some(l) if l == original => Self::Persistent,
+            Some(_) => Self::SignatureChanged,
+        }
+    }
+
+    /// True only for the shape that positively identifies a product failure.
+    /// `Persistent` and `SignatureChanged` are REDs that lost their excuse, which
+    /// is not the same claim.
+    pub fn is_product_failure(self) -> bool {
+        matches!(self, Self::BannerGone)
+    }
+}
+
 /// Extract one failed DAG node's captured output from the driver's durable log.
 ///
 /// `safe-ci-dag-runner` re-emits a failed step's combined stdout+stderr between
@@ -955,6 +1052,102 @@ pub fn self_test() -> Result<String, String> {
         return Err("extract: a node with no detail region must yield None".into());
     }
 
+    // ---- the retry verdict, all THREE states, end to end ----
+    //
+    // Classification is only a hypothesis; the retry is the experiment. Bracket
+    // it in both directions with the SAME classifier, so neither state can be
+    // reached by the reporter alone. A change that only ever confirms is
+    // decorative — the refuting direction below is what makes this load-bearing.
+    //
+    // Direction 1 (CONFIRMED): a genuine jail denial. Classifies, and the re-run
+    // at the same commit passes.
+    let env_log = "[gate.reverie_pin] ✗ FAIL   Reverie pin (4s, exit 128)\n\
+                   [gate.reverie_pin] ----- detail -----\n\
+                   [gate.reverie_pin] Enforcer: FS, Reason: FILE_OPEN\n\
+                   [gate.reverie_pin] fatal: could not lock config file .git/config\n\
+                   [gate.reverie_pin] ----- end detail -----\n";
+    let env_detail = extract_node_detail(env_log, "gate.reverie_pin")
+        .ok_or("retry-verdict: the blocked node's detail region must be found")?;
+    let env_class = environmental_block_class(&env_detail)
+        .ok_or("retry-verdict: a jail denial must classify environmental")?;
+    if EnvBlockVerdict::settle(true, true) != EnvBlockVerdict::Confirmed
+        || !EnvBlockVerdict::settle(true, true).is_environmental()
+    {
+        return Err(format!(
+            "retry-verdict: {env_class} that PASSED on re-run must be CONFIRMED environmental"
+        ));
+    }
+
+    // Direction 2 (REFUTED): a real product failure that merely COINCIDED with a
+    // bad slot. The detail region carries both the jail banner and a genuine test
+    // failure, so the classifier — correctly, since it binds by colocation —
+    // still says environmental. The failing re-run is what overrules it.
+    let coincident = "[test.detcore] ✗ FAIL   Detcore tests (61s, exit 101)\n\
+                      [test.detcore] ----- detail -----\n\
+                      [test.detcore] Enforcer: FS, Reason: FILE_OPEN\n\
+                      [test.detcore] ---- tests_time::clock_monotonic stdout ----\n\
+                      [test.detcore] assertion `left == right` failed\n\
+                      [test.detcore] test result: FAILED. 412 passed; 1 failed\n\
+                      [test.detcore] ----- end detail -----\n";
+    let coincident_detail = extract_node_detail(coincident, "test.detcore")
+        .ok_or("retry-verdict: the coincident node's detail region must be found")?;
+    if environmental_block_class(&coincident_detail).is_none() {
+        return Err(
+            "retry-verdict: the coincidence fixture must still CLASSIFY — the point is that a \
+             classification is a hypothesis the retry can overrule, not that the classifier \
+             detects product failures on its own"
+                .into(),
+        );
+    }
+    let refuted = EnvBlockVerdict::settle(true, false);
+    if refuted != EnvBlockVerdict::Refuted || !refuted.is_settled_failure() {
+        return Err(
+            "retry-verdict: a classified node that FAILED AGAIN on re-run must be REFUTED — the \
+             retry settled the question against the class"
+                .into(),
+        );
+    }
+    if refuted.is_environmental() {
+        return Err("retry-verdict: a REFUTED node must not keep its environmental excuse".into());
+    }
+
+    // REFUTED is not a synonym for "product bug", and saying so would be the same
+    // overclaim in the other direction: a PERSISTENT host denial reproduces on
+    // re-run exactly as a real defect does. The newest attempt's signature is
+    // what separates them, so bracket all three shapes — only the first is a
+    // positive product-failure claim.
+    let mut shapes = 0usize;
+    for (latest, want, product) in [
+        (None, RefutedShape::BannerGone, true),
+        (Some("bpfjailer-banner"), RefutedShape::Persistent, false),
+        (Some("proxy-egress"), RefutedShape::SignatureChanged, false),
+    ] {
+        let got = RefutedShape::of("bpfjailer-banner", latest);
+        if got != want || got.is_product_failure() != product {
+            return Err(format!(
+                "retry-verdict: newest attempt {latest:?} against bpfjailer-banner must be \
+                 {want:?} with is_product_failure={product}, got {got:?}"
+            ));
+        }
+        shapes += 1;
+    }
+    if shapes != 3 {
+        return Err("retry-verdict: all three REFUTED shapes must be bracketed".into());
+    }
+
+    // Direction 3 (UNCONFIRMED): never re-run. It must read as NEITHER of the
+    // other two — this is the state that would otherwise silently keep its
+    // excuse, and it is reachable regardless of what the node's last outcome was.
+    for last_outcome_passed in [false, true] {
+        let u = EnvBlockVerdict::settle(false, last_outcome_passed);
+        if u != EnvBlockVerdict::Unconfirmed || u.is_environmental() || u.is_settled_failure() {
+            return Err(format!(
+                "retry-verdict: a classified node that was NEVER re-run (passed={last_outcome_passed}) \
+                 must be UNCONFIRMED and must read as neither environmental nor product failure"
+            ));
+        }
+    }
+
     // ---- CPU-vs-wall hints, both directions ----
     if cpu_wall_hint(5.0, 600.0, 316) != Some("low CPU vs wall — mostly waiting/blocked, not compute-bound") {
         return Err("cpu/wall: 5s CPU over 600s wall must read as blocked".into());
@@ -1103,7 +1296,11 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
+         (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, retry verdict \
+         1 CONFIRMED / 1 REFUTED (coincident banner + real test failure) / 2 UNCONFIRMED, \
+         refuted shape 1 banner-gone (the only product-failure claim) / 1 persistent / \
+         1 signature-changed, \
+         CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
          registry census 1 live / 1 stale-reaped / 1 cpu-active"
