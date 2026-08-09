@@ -302,6 +302,31 @@ jobs:
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-node.sh portable "$(jq -r '.build_debug_nodes|join(",")' ci/portable-shards.json)"
+      # test.strict_compat used to enter through Bash.  Since the Rust-driver
+      # cutover, executing scripts/validate.rs makes rust-script compile the
+      # driver and safe-ci-dag-runner inside the timed test node.  Ephemeral
+      # shard runners do not retain rust-script's ~/.cache target, so that cold
+      # compile is paid on every run before any inner probe timer exists.  Build
+      # it once here, beside the rest of the debug tree, and transport the exact
+      # executable through the artifact the strict shard already downloads.
+      - name: Build validation driver for the debug shards
+        run: |
+          set -euo pipefail
+          cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+          package="$RUNNER_TEMP/hermit-validate-package"
+          rust-script --package --pkg-path "$package" scripts/validate.rs
+          binary=$(
+            cargo metadata --format-version=1 --no-deps \
+              --manifest-path "$package/Cargo.toml" |
+              jq -er '.packages[0].targets[] | select(.kind | index("bin")) | .name'
+          )
+          cargo generate-lockfile --manifest-path "$package/Cargo.toml"
+          cargo build --release --locked \
+            --manifest-path "$package/Cargo.toml" \
+            --target-dir target/validate-driver
+          install -Dm755 "target/validate-driver/release/$binary" \
+            target/ci/hermit-validate
+          target/ci/hermit-validate --help >/dev/null
       - name: Upload debug-build node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -410,11 +435,13 @@ jobs:
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          test -x target/ci/hermit-validate
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/hermit-validate \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -537,37 +564,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The strict-compat node runs `scripts/validate.rs` directly through
-      # `#!/usr/bin/env rust-script`. No
-      # runner image ships that interpreter, and no workflow installed it, so
-      # the exec fails with status 127 before any test runs -- a step that dies
-      # in 0.1s having measured nothing, which reads like a product failure.
-      #
-      # Compiling the driver instead of installing the interpreter is not an
-      # option here: validate.rs carries an embedded `//! ```cargo` manifest and
-      # depends on `safe_ci_dag_runner` from the agent-utils submodule, so plain
-      # `rustc` cannot build it the way the check.skill_discovery node builds its
-      # std-only script.
-      #
-      # `taiki-e/install-action` is used above for cargo-nextest but does NOT
-      # list rust-script in its supported-tool manifest, so it would silently
-      # take an unverified fallback path. A pinned `cargo install` is slower but
-      # its failure mode is legible, which is the whole point of this fix.
-      - name: Install rust-script (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      # Fail with a diagnostic naming the interpreter rather than letting the
-      # shard die at exec. `env` reports the missing program on stderr and the
-      # shell exits 127, but neither string contains "error", so the standard
-      # log triage grep misses it entirely.
-      - name: Verify rust-script resolves (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
-        run: |
-          if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
-            exit 1
-          fi
-          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -597,6 +593,9 @@ jobs:
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          if [[ "${{ matrix.slug }}" == strict-compat ]]; then
+            test -x target/ci/hermit-validate
+          fi
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
       # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
       # `cargo-<subcommand>`, so a PATH entry loses to whatever the rust-cache

@@ -371,6 +371,18 @@ function assert_parallel_portable_workflow {
         die "GitHub portable release artifact must transport the strict-compat Hermit"
     [[ $(grep -Fxc '          test -x target/ci/hermit-strict' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the strict-compat Hermit"
+    [[ $(grep -Fxc '      - name: Build validation driver for the debug shards' "$workflow") == 1 ]] ||
+        die "GitHub portable build must compile the validation driver exactly once"
+    [[ $(grep -Fxc '            target/ci/hermit-validate \' "$workflow") == 1 ]] ||
+        die "GitHub portable debug artifact must transport the validation driver"
+    [[ $(grep -Fxc '      - name: Install rust-script (strict-compat shard)' "$workflow") == 0 ]] ||
+        die "GitHub strict-compat shard must not cold-compile the validation driver"
+    jq -e '
+        .steps[]
+        | select(.group == "test" and .job == "strict_compat")
+        | (.cmd | contains("target/ci/hermit-validate"))
+    ' "$DAG_ROOT/portable.json" >/dev/null ||
+        die "GitHub strict-compat node must execute the transported validation driver"
     # Both the debug test shards (run_dbt_* CLI tests) and the e2e backend cells
     # consume the DBT install package built by build-release, so both must wait on
     # [select, build-debug, build-release]. (select gates the affected-test matrix;
