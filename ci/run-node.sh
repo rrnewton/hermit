@@ -140,10 +140,9 @@ echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARG
 # The first fix still piped the runner through gawk.  A live four-shard run proved
 # that insufficient: all four outer 1800-second steps remained alive beyond 32
 # minutes.  Do not put ANY consumer between the runner and a regular file.  An
-# independent GNU-timeout process supervises the runner, while a best-effort
-# follower timestamps the growing regular file without being in the runner's
-# output path.  Thus a blocked Actions log, timestamp follower, or inherited pipe
-# cannot prevent the watchdog from becoming terminal.  The watchdog allowance is
+# independent GNU-timeout process supervises the ENTIRE runner/logger process
+# group.  Thus a blocked Actions log, timestamp process, or inherited pipe cannot
+# prevent the watchdog from becoming terminal.  The watchdog allowance is
 # the DAG's real inner timeout plus 60 seconds for the runner's bounded teardown.
 # The always() artifact step in ci-portable.yml uploads both logs.
 if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
@@ -170,43 +169,13 @@ if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
 
     set +e
     timeout --signal=TERM --kill-after=30s "${watchdog_timeout}s" \
-        "$runner" run --dag "$dag" --only "$sel" -j "$jobs" \
-        --perf-dir "$perf_dir" "${acf[@]}" -v >"$raw_log" 2>&1 &
-    runner_pid=$!
-    tail --pid="$runner_pid" --sleep-interval=0.2 -n +1 -F "$raw_log" |
-        TZ=UTC gawk -v out="$phase_log" '
-            {
-                stamp = strftime("%Y-%m-%dT%H:%M:%SZ", systime())
-                print stamp, $0 >> out
-                fflush(out)
-            }
-        ' &
-    logger_pid=$!
-
-    wait "$runner_pid"
+        "$ROOT_DIR/ci/run-strict-watchdog.sh" "$runner" "$dag" "$sel" \
+        "$jobs" "$perf_dir" "$raw_log" "$phase_log" "${acf[@]}"
     runner_rc=$?
-    logger_deadline=$((SECONDS + 5))
-    while kill -0 "$logger_pid" 2>/dev/null && (( SECONDS < logger_deadline )); do
-        sleep 1
-    done
-    if kill -0 "$logger_pid" 2>/dev/null; then
-        echo "run-node.sh: timestamp follower did not close after runner exit; terminating exact child pid=$logger_pid" >&2
-        kill -TERM "$logger_pid"
-        wait "$logger_pid"
-        logger_rc=124
-    else
-        wait "$logger_pid"
-        logger_rc=$?
-    fi
     set -e
 
     grep -E '▶ START|✓ PASS|✗ FAIL|⊘ ABORT|TIMEOUT|WARNING|validate: durable log|validate PASS|validate FAIL|safe-ci-dag-runner:' \
         "$phase_log" | tail -n 400 >&2 || true
-    if (( logger_rc != 0 )); then
-        echo "run-node.sh: timestamp follower failed with rc=$logger_rc; refusing an unlogged verdict" >&2
-        tail -n 200 "$raw_log" >&2
-        exit "$logger_rc"
-    fi
     if (( runner_rc == 124 )); then
         echo "run-node.sh: strict composite watchdog expired after ${watchdog_timeout}s (DAG timeout ${inner_timeout}s); runner output was bounded and retained" >&2
     fi
