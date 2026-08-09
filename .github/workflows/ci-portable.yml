@@ -295,7 +295,7 @@ jobs:
       # developer's cached interpreter: a cold cache must provision the pinned
       # runtime before the first DAG node starts.
       - name: Install rust-script (debug build)
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+        run: ./ci/install-cargo-tool.sh rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Keep this separate from installation so a missing or wrong interpreter
       # is reported as a named provisioning failure, not as an opaque
       # e2e.metadata build failure downstream.
@@ -584,11 +584,12 @@ jobs:
       #
       # `taiki-e/install-action` is used above for cargo-nextest but does NOT
       # list rust-script in its supported-tool manifest, so it would silently
-      # take an unverified fallback path. A pinned `cargo install` is slower but
-      # its failure mode is legible, which is the whole point of this fix.
+      # take an unverified fallback path. The shared installer keeps the pinned
+      # Cargo path legible while preventing Hermit's build flags from leaking
+      # into this unrelated tool build.
       - name: Install rust-script (strict-compat shard)
         if: startsWith(matrix.slug, 'strict-compat-')
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+        run: ./ci/install-cargo-tool.sh rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Fail with a diagnostic naming the interpreter rather than letting the
       # shard die at exec. `env` reports the missing program on stderr and the
       # shell exits 127, but neither string contains "error", so the standard
