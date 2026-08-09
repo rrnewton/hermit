@@ -126,4 +126,54 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
 fi
 
 echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
+
+# A strict-compat node is a COMPOSITE Rust driver: this Python runner supervises
+# scripts/validate.rs, which in turn supervises the individual compatibility
+# probes through the Rust runner.  At the old agent-utils pin an unboxed probe
+# could leave a setsid child holding stdout/stderr open; the Rust runner detected
+# its timeout and then blocked forever joining the pipe readers.  The outer
+# Python runner had a second blind spot: its streaming reader calls flush while
+# holding the scheduler lock, so Actions output backpressure can keep a detected
+# 1800-second timeout from reaching terminal reporting.  Actions then kills the
+# whole job at its 40-minute ceiling with neither runner's verdict preserved.
+#
+# Keep the complete stream off Actions' live log pipe for this composite path.
+# gawk consumes it promptly, writes EVERY line with an absolute UTC timestamp to
+# the performance-artifact directory, and emits only phase/terminal lines live.
+# This both removes log backpressure as a second way to hide a timeout and makes
+# the last completed/started inner node recoverable after any future failure.
+# The always() artifact step in ci-portable.yml already uploads perf_dir.
+if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
+    safe_sel=${sel//[^a-zA-Z0-9_.-]/_}
+    phase_log="$perf_dir/run-node-${safe_sel}.timestamped.log"
+    echo "run-node.sh: strict composite timestamp log: $phase_log" >&2
+    set +e
+    "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" \
+        "${acf[@]}" -v 2>&1 |
+        TZ=UTC gawk -v out="$phase_log" '
+            {
+                stamp = strftime("%Y-%m-%dT%H:%M:%SZ", systime())
+                print stamp, $0 >> out
+                fflush(out)
+                if ($0 ~ /▶ START|✓ PASS|✗ FAIL|⊘ ABORT|TIMEOUT|WARNING|validate: durable log|validate PASS|validate FAIL|safe-ci-dag-runner:/) {
+                    print stamp, $0
+                    fflush()
+                }
+            }
+        '
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    runner_rc=${statuses[0]}
+    logger_rc=${statuses[1]}
+    if (( logger_rc != 0 )); then
+        echo "run-node.sh: timestamp logger failed with rc=$logger_rc; refusing an unlogged verdict" >&2
+        exit "$logger_rc"
+    fi
+    if (( runner_rc != 0 )); then
+        echo "run-node.sh: strict composite failed with rc=$runner_rc; final timestamped detail follows" >&2
+        tail -n 200 "$phase_log" >&2
+    fi
+    exit "$runner_rc"
+fi
+
 exec "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v
