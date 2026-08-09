@@ -139,12 +139,14 @@ echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARG
 #
 # The first fix still piped the runner through gawk.  A live four-shard run proved
 # that insufficient: all four outer 1800-second steps remained alive beyond 32
-# minutes.  Do not put ANY consumer between the runner and a regular file.  An
-# independent GNU-timeout process supervises the ENTIRE runner/logger process
-# group.  Thus a blocked Actions log, timestamp process, or inherited pipe cannot
-# prevent the watchdog from becoming terminal.  The watchdog allowance is
-# the DAG's real inner timeout plus 60 seconds for the runner's bounded teardown.
-# The always() artifact step in ci-portable.yml uploads both logs.
+# minutes.  GNU timeout was still insufficient: the outer Python DAG runner
+# launches every real node with start_new_session=True, outside the wrapper's
+# process group.  Hosted CI is deliberately unboxed, so no cgroup.kill existed to
+# reach that new session.  The Rust supervisor below becomes a child subreaper,
+# repeatedly enumerates identity-bound /proc descendants, escalates TERM -> KILL,
+# and refuses to return until its descendant census is empty.  Child output goes
+# directly to a regular file, so no inherited pipe can retain the Actions step.
+# The always() artifact step in ci-portable.yml uploads both retained logs.
 if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
     safe_sel=${sel//[^a-zA-Z0-9_.-]/_}
     raw_log="$perf_dir/run-node-${safe_sel}.raw.log"
@@ -161,16 +163,19 @@ if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
     fi
     watchdog_grace=60
     watchdog_timeout=$((inner_timeout + watchdog_grace))
+    watchdog_term_grace=30
     : >"$raw_log"
     : >"$phase_log"
     echo "run-node.sh: strict composite raw log: $raw_log" >&2
     echo "run-node.sh: strict composite timestamp log: $phase_log" >&2
-    echo "run-node.sh: strict composite watchdog: ${watchdog_timeout}s (${inner_timeout}s DAG timeout + ${watchdog_grace}s bounded teardown)" >&2
+    echo "run-node.sh: strict composite watchdog: ${watchdog_timeout}s (${inner_timeout}s DAG timeout + ${watchdog_grace}s reporting allowance), TERM grace ${watchdog_term_grace}s" >&2
 
     set +e
-    timeout --signal=TERM --kill-after=30s "${watchdog_timeout}s" \
-        "$ROOT_DIR/ci/run-strict-watchdog.sh" "$runner" "$dag" "$sel" \
-        "$jobs" "$perf_dir" "$raw_log" "$phase_log" "${acf[@]}"
+    "$ROOT_DIR/ci/run-strict-watchdog.rs" \
+        "$watchdog_timeout" "$watchdog_term_grace" "$raw_log" "$phase_log" \
+        --require-agent-utils-marker -- \
+        "$runner" run --dag "$dag" --only "$sel" -j "$jobs" \
+        --perf-dir "$perf_dir" "${acf[@]}" -v
     runner_rc=$?
     set -e
 

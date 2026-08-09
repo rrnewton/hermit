@@ -910,6 +910,59 @@ function audit_ci_correspondence {
     # shellcheck disable=SC2016
     [[ $(grep -Fxc 'source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
         die "run-node.sh must source ordinary build-job configuration exactly once"
+    local strict_watchdog="$ROOT_DIR/ci/run-strict-watchdog.rs"
+    [[ -x $strict_watchdog ]] || die "hosted strict watchdog must be an executable Rust script"
+    [[ ! -e $ROOT_DIR/ci/run-strict-watchdog.sh ]] ||
+        die "process-group-only strict watchdog must not remain as a fallback"
+    grep -Fq 'PR_SET_CHILD_SUBREAPER' "$strict_watchdog" ||
+        die "hosted strict watchdog must establish child-subreaper ownership"
+    grep -Fq 'verified-empty teardown' "$strict_watchdog" ||
+        die "hosted strict watchdog must verify its descendant census is empty"
+    grep -Fq 'EXPECTED_AGENT_UTILS_REV' "$strict_watchdog" ||
+        die "hosted strict watchdog must assert its linked agent-utils source"
+    grep -Fq '"$ROOT_DIR/ci/run-strict-watchdog.rs"' "$ROOT_DIR/ci/run-node.sh" ||
+        die "hosted strict nodes must enter the descendant-complete watchdog"
+
+    # Plant the exact mechanism that escaped both earlier supervisors: a TERM-
+    # ignoring process that calls setsid, leaves the wrapper's process group, and
+    # holds a child open. The watchdog may return 124 only after the session is
+    # gone and its identity-bound /proc census reports empty. The outer timeout is
+    # a test-harness safety net, not the mechanism under test; phase assertions
+    # distinguish its expiry from the watchdog's own verdict.
+    (
+        local scratch identity_file raw_log phase_log watchdog_rc
+        local escape_pid= escape_sid= escape_pgid=
+        scratch=$(mktemp -d)
+        identity_file="$scratch/setsid.identity"
+        raw_log="$scratch/raw.log"
+        phase_log="$scratch/phase.log"
+        cleanup_strict_watchdog_fixture() {
+            if [[ $escape_pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$escape_pid" 2>/dev/null; then
+                kill -KILL -- "-$escape_pid" 2>/dev/null || kill -KILL "$escape_pid" 2>/dev/null || true
+            fi
+            rm -rf -- "$scratch"
+        }
+        trap cleanup_strict_watchdog_fixture EXIT
+        cd "$ROOT_DIR"
+        set +e
+        timeout --signal=TERM --kill-after=2s 15s "$strict_watchdog" \
+            1 1 "$raw_log" "$phase_log" -- \
+            bash -c 'setsid sh -c '\''trap "" TERM; sid=$(ps -o sid= -p $$); pgid=$(ps -o pgid= -p $$); printf "%s %s %s\n" "$$" "$sid" "$pgid" > "$1"; while :; do sleep 60; done'\'' _ "$1" & wait' \
+            _ "$identity_file"
+        watchdog_rc=$?
+        set -e
+        [[ -s $identity_file ]] || die "strict watchdog setsid fixture did not publish its identity"
+        read -r escape_pid escape_sid escape_pgid <"$identity_file"
+        [[ $escape_pid == "$escape_sid" && $escape_pid == "$escape_pgid" ]] ||
+            die "strict watchdog fixture did not establish a distinct setsid session/process group"
+        [[ $watchdog_rc == 124 ]] || die "strict watchdog setsid fixture returned $watchdog_rc, expected 124"
+        ! kill -0 "$escape_pid" 2>/dev/null ||
+            die "strict watchdog left setsid escapee pid $escape_pid alive"
+        grep -Fq 'run-strict-watchdog: KILL reason=wall-timeout' "$phase_log" ||
+            die "strict watchdog setsid fixture did not exercise TERM-to-KILL escalation"
+        grep -Fq 'verified-empty teardown reason=wall-timeout phase=KILL' "$phase_log" ||
+            die "strict watchdog setsid fixture did not prove empty teardown"
+    )
     local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
     local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbt-budget.sh"
     [[ -x $budget_wrapper ]] || die "DBT child-budget wrapper must be executable"

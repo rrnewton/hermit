@@ -107,6 +107,15 @@ const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 /// it without inference.
 const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 
+/// Agent-utils source revision this driver was compiled against.
+///
+/// `rust-script` caches the compiled driver independently of the submodule. A
+/// source-only gitlink advance could otherwise leave a warm cache executing an
+/// older scheduler while the checkout *appears* current. Every real invocation
+/// asserts both the recorded gitlink and initialized submodule against this
+/// compiled constant and emits the binding into the supervised log.
+const EXPECTED_AGENT_UTILS_REV: &str = "0f0d667a06f4e141879466caa77640344243f14d";
+
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
@@ -1286,6 +1295,24 @@ fn git_sha() -> String {
 /// yields the SAME tree. This, not the commit SHA, is the result-cache key.
 fn git_tree() -> String {
     sh("git", &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|| "unknown".into())
+}
+
+fn verify_agent_utils_revision() -> Result<(), String> {
+    let linked = sh("git", &["rev-parse", "HEAD:agent-utils"])
+        .ok_or_else(|| "cannot resolve the agent-utils gitlink from HEAD".to_string())?;
+    let resolved = sh("git", &["-C", "agent-utils", "rev-parse", "HEAD"])
+        .ok_or_else(|| "agent-utils is not initialized at a resolvable revision".to_string())?;
+    if linked != EXPECTED_AGENT_UTILS_REV || resolved != EXPECTED_AGENT_UTILS_REV {
+        return Err(format!(
+            "agent-utils revision mismatch: compiled expectation={EXPECTED_AGENT_UTILS_REV}, \
+             linked={linked}, resolved={resolved}"
+        ));
+    }
+    eprintln!(
+        "validate: agent-utils revision verified: expected={EXPECTED_AGENT_UTILS_REV} \
+         linked={linked} resolved={resolved}"
+    );
+    Ok(())
 }
 
 fn repo_root() -> PathBuf {
@@ -3612,6 +3639,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &level_name,
             "repository root",
             vec![format!("cannot cd to repo root {}", root.display())],
+        );
+    }
+    if let Err(error) = verify_agent_utils_revision() {
+        return RunSummary::refused(
+            2,
+            &level_name,
+            "the compiled agent-utils revision binding",
+            vec![error],
         );
     }
     let parent = find_parent(&root);
