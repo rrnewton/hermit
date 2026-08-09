@@ -303,7 +303,8 @@ function workflow_non_dag_step_budget_seconds {
 function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
-    local debug_outer_minutes release_outer_minutes
+    local debug_outer_minutes release_outer_minutes debug_test_outer_minutes
+    local strict_compat_timeout
     local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
@@ -339,6 +340,10 @@ function assert_parallel_portable_workflow {
     ' "$DAG_ROOT/portable.json")
     debug_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-debug)
     release_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-release)
+    debug_test_outer_minutes=$(workflow_job_timeout_minutes "$workflow" test-debug)
+    strict_compat_timeout=$(jq -r '
+        .steps[] | select(.group == "test" and .job == "strict_compat") | .timeout
+    ' "$DAG_ROOT/portable.json")
     [[ $debug_inner_path =~ ^[1-9][0-9]*$ ]] ||
         die "portable debug selection has no numeric critical path"
     [[ $release_inner_path =~ ^[1-9][0-9]*$ ]] ||
@@ -347,10 +352,16 @@ function assert_parallel_portable_workflow {
         die "GitHub debug build has no numeric outer timeout"
     [[ $release_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
         die "GitHub release build has no numeric outer timeout"
+    [[ $debug_test_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
+        die "GitHub debug test shards have no numeric outer timeout"
+    [[ $strict_compat_timeout =~ ^[1-9][0-9]*$ ]] ||
+        die "portable strict-compat node has no numeric timeout"
     ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
         die "GitHub debug outer timeout must exceed ${debug_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
     ((release_outer_minutes * 60 > release_inner_path + hosted_job_overhead_seconds)) ||
         die "GitHub release outer timeout must exceed ${release_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
+    ((debug_test_outer_minutes * 60 > strict_compat_timeout + hosted_job_overhead_seconds)) ||
+        die "GitHub debug-test outer timeout must exceed strict-compat's ${strict_compat_timeout}s node bound plus ${hosted_job_overhead_seconds}s setup overhead"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
     # Match the literal command embedded in workflow YAML.

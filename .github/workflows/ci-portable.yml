@@ -514,7 +514,13 @@ jobs:
       && needs.build-debug.result == 'success'
       && (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # strict-compat is a 1800s DAG node, and this isolated hosted job must also
+    # cold-compile scripts/validate.rs through rust-script. The first production
+    # Rust-path run (31288960248 / job 93183633018) was killed by this former
+    # 15m outer boundary before the node could reach its own timeout. Keep the
+    # outer wall beyond the 30m node bound plus setup; the inner bound remains
+    # the hang detector.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
