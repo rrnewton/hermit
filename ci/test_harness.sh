@@ -1018,7 +1018,6 @@ function audit_ci_correspondence {
         die "hosted strict observer must latch live-log size before reading"
     grep -Fq 'limit=$((wait_seconds + 15))' "$strict_observer" ||
         die "hosted strict observer must carry an independent outer deadline"
-    "$strict_observer" self-test
 
     # Plant the exact mechanism that escaped both earlier supervisors: a TERM-
     # ignoring process that calls setsid, leaves the wrapper's process group, and
@@ -1043,9 +1042,13 @@ function audit_ci_correspondence {
         trap cleanup_strict_watchdog_fixture EXIT
         cd "$ROOT_DIR"
         set +e
+        # One second made child identity publication a scheduler race on a
+        # hosted runner. Five seconds remains a focused timeout fixture while
+        # proving supervision rather than whether a fresh child was scheduled
+        # within one wall-clock second. Production remains 1860s + 30s grace.
         STRICT_WATCHDOG_START_MARKER="$start_marker" \
-        timeout --signal=TERM --kill-after=2s 15s "$strict_watchdog" \
-            1 1 "$raw_log" "$phase_log" -- \
+        timeout --signal=TERM --kill-after=2s 20s "$strict_watchdog" \
+            5 1 "$raw_log" "$phase_log" -- \
             bash -c 'setsid sh -c '\''trap "" TERM; sid=$(ps -o sid= -p $$); pgid=$(ps -o pgid= -p $$); printf "%s %s %s\n" "$$" "$sid" "$pgid" > "$1"; while :; do sleep 60; done'\'' _ "$1" & wait' \
             _ "$identity_file"
         watchdog_rc=$?
@@ -1063,7 +1066,7 @@ function audit_ci_correspondence {
             die "strict watchdog start marker did not bind the supervisor PID"
         grep -Eq '^supervisor_starttime_ticks=[1-9][0-9]*$' "$start_marker" ||
             die "strict watchdog start marker did not bind the supervisor identity"
-        grep -Fxq 'configured_timeout_seconds=1' "$start_marker" ||
+        grep -Fxq 'configured_timeout_seconds=5' "$start_marker" ||
             die "strict watchdog start marker did not bind the configured timeout"
         ! kill -0 "$escape_pid" 2>/dev/null ||
             die "strict watchdog left setsid escapee pid $escape_pid alive"
@@ -1072,6 +1075,10 @@ function audit_ci_correspondence {
         grep -Fq 'verified-empty teardown reason=wall-timeout phase=KILL' "$phase_log" ||
             die "strict watchdog setsid fixture did not prove empty teardown"
     )
+
+    # Run observer stress only after the supervisor's identity/containment
+    # proof. Diagnostic scaffolding must not perturb the proof it observes.
+    "$strict_observer" self-test
     local budget_config="$ROOT_DIR/ci/configure-build-jobs.sh"
     local budget_wrapper="$ROOT_DIR/ci/run-with-reverie-dbt-budget.sh"
     [[ -x $budget_wrapper ]] || die "DBT child-budget wrapper must be executable"
