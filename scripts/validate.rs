@@ -111,20 +111,7 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 
-const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
-
-/// Standalone-only in-repo ledger directory.
-///
-/// Admitted runs never write here: they send their HistoryRow to the parent's
-/// canonical adapter. This fallback exists only for a checkout with no
-/// dev-hermit parent and is deliberately not a qualifying receipt authority.
-const LEDGER_DIR: &str = "ci/validate-ledger";
-
-/// Fleet/team identity component of the shard name. Overridable so a different
-/// team's runs land in a different shard rather than interleaving.
-const LEDGER_TEAM_ENV: &str = "VALIDATE_LEDGER_TEAM";
-const LEDGER_TEAM_DEFAULT: &str = "local";
 
 // --------------------------------------------------------------------------- args
 
@@ -298,8 +285,8 @@ fn usage() -> &'static str {
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL, CI_DAG_JOBS,\n\
-     HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
-     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
+     PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON, HERMIT_LAST_GREEN_SHA,\n\
+     CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -922,15 +909,9 @@ fn coverage_schema_bracket() -> Result<(), String> {
 /// listing SHAPE gets an explicit case, including the exact one that regressed:
 /// a porcelain line whose leading status column has been eaten by a trim.
 fn self_output_bracket() -> Result<(), String> {
-    // MUST be excused (validate's own output, in every shape a caller emits).
+    // MUST be excused (validate's checkout-local log output).
     let excused = [
-        (" M ci/validate-ledger/local.example-host.jsonl", "porcelain, modified, leading space intact"),
-        ("M ci/validate-ledger/local.example-host.jsonl", "porcelain whose leading space a trim ate"),
-        ("?? ci/validate-ledger/local.other.jsonl", "porcelain, untracked shard"),
-        ("ci/validate-ledger/local.example-host.jsonl", "bare path (git diff --name-only)"),
         ("ignored/validate/validate-full-abc-1.log", "bare path, durable log"),
-        (" M \"ci/validate-ledger/has space.jsonl\"", "porcelain, quoted path"),
-        ("R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl", "rename within the ledger dir"),
     ];
     for (line, why) in excused {
         if !line_is_self_output(line) {
@@ -944,10 +925,8 @@ fn self_output_bracket() -> Result<(), String> {
         ("?? detcore/src/new_thing.rs", "a new untracked source file"),
         ("M  Cargo.lock", "a staged lockfile change"),
         ("scripts/lib/validate_plan.rs", "bare path, real source"),
-        ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
-        ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
         (" M ci/dag/portable.json", "a lane change under ci/, but not the ledger"),
-        (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
+        (" M ci/retired-receipts/local.example-host.jsonl", "a retired checkout-local receipt is ordinary dirt"),
     ];
     for (line, why) in foreign {
         if line_is_self_output(line) {
@@ -1411,21 +1390,14 @@ fn repo_root() -> PathBuf {
 
 /// Paths excluded from every dirtiness and anchoring judgement.
 ///
-/// The ledger shard lives IN the repository, and validate is what writes it. If
-/// it counted as dirt, validate would poison the very tree it just judged: the
-/// next run would refuse on a dirty tree, and the tree hash — the result-cache
-/// key — would change after every run, so a cache could never hit. Validate's own
-/// output is not a source change, so it is excluded here rather than being
-/// gitignored (the shards are meant to be committed and unioned across machines).
-const SELF_OUTPUT_PREFIXES: &[&str] = &[LEDGER_DIR, "ignored/"];
+/// Durable logs remain checkout-local self-output. The ledger no longer lives
+/// in a checkout, so there is no ledger-shaped dirt exception to go stale.
+const SELF_OUTPUT_PREFIXES: &[&str] = &["ignored/"];
 
 /// True when `path` is inside (or equal to) one of validate's own output roots.
 ///
-/// The match is on a PATH BOUNDARY, not a raw string prefix. A bare
-/// `starts_with("ci/validate-ledger")` also swallowed siblings such as
-/// `ci/validate-ledger-notes.md`, which would have been silently excused from the
-/// dirty gate — the opposite of the failure it is meant to prevent, and exactly
-/// the kind of "correlated proxy" match this driver is supposed to avoid.
+/// The match is on a PATH BOUNDARY, not a raw string prefix: swallowing a
+/// similarly named sibling would silently excuse a real source change.
 fn is_self_output(path: &str) -> bool {
     SELF_OUTPUT_PREFIXES.iter().any(|p| {
         let root = p.trim_end_matches('/');
@@ -1442,17 +1414,9 @@ fn is_self_output(path: &str) -> bool {
 /// derived and the classification asks whether ALL of them are validate's own
 /// output.
 ///
-/// **Do not reintroduce a fixed-offset strip.** Two bugs have now come from one:
-/// stripping three characters unconditionally broke the bare-path callers
-/// (turning `ci/validate-ledger/…` into `validate-ledger/…`), and the fix for
-/// that still relied on the porcelain line keeping its leading status column —
-/// which `sh()` trimmed off the FIRST line of the output. The measured effect of
-/// the second bug: after any run, `git status --porcelain` returned exactly one
-/// line, ` M ci/validate-ledger/<shard>.jsonl`, whose leading space `sh()` ate;
-/// the 3-char strip then produced `i/validate-ledger/…`, no reading matched, and
-/// `tree_dirty()` reported TRUE. Every subsequent ledger row was written with
-/// `commit_anchored: false`, so the tree-keyed cache could never hit and a
-/// receipt-backed label could never be published — both features inert, silently.
+/// **Do not reintroduce a fixed-offset strip.** Bare-path and porcelain callers
+/// have different shapes, and trimming the first status column changes the
+/// identity of the path being classified.
 fn path_readings(line: &str) -> Vec<String> {
     let unquote = |s: &str| s.trim().trim_matches('"').to_string();
     let mut out = vec![unquote(line)];
@@ -2299,8 +2263,7 @@ fn selective_plan(
         // parent, so selection fails safe to the full lane (validate.sh:4369).
         sh("git", &["rev-parse", "--verify", "HEAD~1"])
     } else {
-        let ledger = ledger_path(root);
-        let rows = validate_history::read_rows(&ledger);
+        let rows = canonical_ledger_rows();
         let parent = find_parent(root);
         let slot = slot_name(root, parent.as_deref());
         validate_history::selective_baseline(&rows, args.baseline.as_deref(), &slot, &commit_exists)
@@ -3240,7 +3203,6 @@ fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64
 /// merge gate keep reading one shape across the port.
 #[allow(clippy::too_many_arguments)]
 fn write_ledger(
-    ledger: &Path,
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
     skipped: &[String],
@@ -3360,84 +3322,49 @@ fn write_ledger(
         "coverage": coverage,
         "gates": gates,
     });
-    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
-    let explicit = std::env::var(LEDGER_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| Path::new(&value) == ledger);
-    if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
-        let Some(parent) = ledger.parent() else {
-            eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
-            return;
-        };
-        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
-        let mut child = match Command::new("python3")
-            .arg(&adapter)
-            .arg("record")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!(
-                    "validate: warning: cannot launch canonical ledger writer {}: {e}",
-                    adapter.display()
-                );
-                return;
-            }
-        };
-        use std::io::Write;
-        let write_error = child
-            .stdin
-            .take()
-            .and_then(|mut stdin| stdin.write_all(line.as_bytes()).err());
-        let output = child.wait_with_output();
-        if let Some(error) = write_error {
-            eprintln!("validate: warning: cannot send row to canonical ledger writer: {error}");
+    use std::io::Write;
+    let tool = ledger_tool_path();
+    let mut child = match Command::new("python3")
+        .arg(&tool)
+        .arg("record")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("validate: warning: cannot execute canonical ledger writer {}: {e}", tool.display());
             return;
         }
-        match output {
-            Ok(output) if output.status.success() => eprintln!(
-                "validate: canonical ledger record appended via {}: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stdout).trim()
-            ),
-            Ok(output) => eprintln!(
-                "validate: warning: canonical ledger writer {} refused: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(e) => eprintln!(
-                "validate: warning: cannot wait for canonical ledger writer {}: {e}",
-                adapter.display()
-            ),
-        }
+    };
+    let write_error = child
+        .stdin
+        .take()
+        .and_then(|mut stdin| stdin.write_all(record.to_string().as_bytes()).err());
+    let output = child.wait_with_output();
+    if let Some(error) = write_error {
+        eprintln!(
+            "validate: warning: cannot send row to canonical ledger writer {}: {error}",
+            tool.display()
+        );
         return;
     }
-
-    if let Some(dir) = ledger.parent() {
-        if !dir.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
-                return;
-            }
+    match output {
+        Ok(output) if output.status.success() => {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+            eprintln!(
+                "validate: ledger event appended to {}",
+                report.get("shard").and_then(|v| v.as_str()).unwrap_or("canonical per-machine shard")
+            );
         }
-    }
-    use std::io::Write;
-    match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => match f.write_all(line.as_bytes()) {
-            Ok(()) => {
-                eprintln!(
-                    "validate: fixture/standalone ledger record appended to {}",
-                    ledger.display()
-                );
-                warn_if_unreadable_ledger(ledger);
-            }
-            Err(e) => eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display()),
-        },
-        Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
+        Ok(output) => eprintln!(
+            "validate: warning: canonical ledger writer {} refused (rc={}): {}",
+            tool.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(e) => eprintln!("validate: warning: canonical ledger writer {} failed: {e}", tool.display()),
     }
 }
 
@@ -3455,86 +3382,54 @@ fn short_hostname() -> String {
     raw.split('.').next().unwrap_or("unknown").to_string()
 }
 
-/// Resolve the logical ledger authority. Precedence:
-///   1. `$HERMIT_VALIDATE_LEDGER` — explicit fixture/standalone file.
-///   2. `$DEV_HERMIT_PARENT/ledger` — the canonical adapter-backed union.
-///   3. A discovered dev-hermit parent's canonical union.
-///   4. The standalone in-repo diagnostic shard.
-fn ledger_path(root: &Path) -> PathBuf {
-    if let Ok(explicit) = std::env::var(LEDGER_ENV) {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
+/// Resolve the one live-ledger shard for this machine.
+///
+/// This deliberately has no override and performs no parent/check-out discovery.
+/// Every Hermit checkout for this account writes the same per-machine file;
+/// ci-hub is the only component that unions it with other machines and the
+/// published append-only shards.
+fn ledger_tool_path() -> PathBuf {
+    if std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").is_some() {
+        if let Some(path) = std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL") {
+            return PathBuf::from(path);
         }
     }
-    if let Ok(parent) = std::env::var(PARENT_ENV) {
-        if !parent.is_empty() {
-            return PathBuf::from(parent).join("ledger");
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
+        .join("work/dev-hermit/ci-hub/ledger/validate_rows.py")
+}
+
+fn canonical_ledger_root() -> PathBuf {
+    if std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").is_some() {
+        if let Some(root) = std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT") {
+            return PathBuf::from(root).join("ledger");
         }
     }
-    let team = std::env::var(LEDGER_TEAM_ENV)
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| LEDGER_TEAM_DEFAULT.to_string());
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-            .collect::<String>()
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
+        .join("work/dev-hermit/ledger")
+}
+
+fn canonical_ledger_rows() -> Vec<serde_json::Value> {
+    let tool = ledger_tool_path();
+    let Ok(output) = Command::new("python3").arg(&tool).arg("rows").output() else {
+        eprintln!("validate: warning: cannot execute canonical ledger reader {}", tool.display());
+        return Vec::new();
     };
-    // CONFLICT RESOLUTION (rebase onto cd428f96): main added this parent-discovery step and this
-    // PR replaced the fallback beneath it. Both are kept -- the discovery runs FIRST, then this
-    // PR's team/host fallback. Dropping it would have silently reverted a landed fix.
-    // main's rationale, preserved verbatim: the env var being unset does NOT mean there is no
-    // parent -- far more often it means a run inside a dev-hermit slot that simply did not export
-    // it. Measured 2026-08-08: 111 real rows sat in two slots' local ledgers for exactly that
-    // reason, and `ci-hub validate-status` could not see one of them.
-    if let Some(found) = discover_parent_ledger(root) {
+    if !output.status.success() {
         eprintln!(
-            "validate.rs: {PARENT_ENV} is unset; recording to the DISCOVERED parent ledger {}",
-            found.display()
+            "validate: warning: canonical ledger reader {} refused (rc={})",
+            tool.display(),
+            output.status
         );
-        return found;
+        return Vec::new();
     }
-    root.join(LEDGER_DIR)
-        .join(format!("{}.{}.jsonl", sanitize(&team), sanitize(&short_hostname())))
-}
-
-/// Walk up from `root` for the dev-hermit parent that owns the canonical adapter.
-///
-/// Deliberately keyed on the executable contract, not a directory name or a
-/// retired raw file. Returns `None` only for a genuinely standalone checkout.
-fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
-    let mut dir = root.parent();
-    while let Some(candidate) = dir {
-        let adapter = candidate.join("ci-hub/ledger/validate_rows.py");
-        if adapter.is_file() {
-            return Some(candidate.join("ledger"));
-        }
-        dir = candidate.parent();
-    }
-    None
-}
-
-/// Say plainly that a row is not going anywhere a reader will look.
-///
-/// A writer that SUCCEEDS into a location no consumer reads reports success and attests nothing --
-/// the same shape as a `locally-validated` label with no backing run. This does not fail the run,
-/// because a standalone checkout must still be able to validate; it makes the invisibility
-/// impossible to miss, so "silent success" stops being the failure mode.
-///
-/// CONFLICT RESOLUTION: main keyed this on `LOCAL_LEDGER_BASENAME`, which this PR removes. Re-keyed
-/// to this PR's `LEDGER_DIR` fallback, which is the same thing under the new design -- the location
-/// no reader queries. Behaviour preserved, constant adapted.
-fn warn_if_unreadable_ledger(ledger: &Path) {
-    if !ledger.parent().is_some_and(|p| p.ends_with(LEDGER_DIR)) {
-        return;
-    }
-    eprintln!(
-        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL ledger {}, which NO reader \
-         queries -- `ci-hub validate-status` will report NOT-VALIDATED for this commit even though \
-         the run passed. Set {PARENT_ENV} to the dev-hermit workspace (or {LEDGER_ENV} to an \
-         explicit file) if this row is meant to count.",
-        ledger.display()
-    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 // --------------------------------------------------------------------------- main
@@ -4062,8 +3957,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the commit would re-run it. `--ignore-cache` forces a real run; a focused
     // or selective profile is never cached because `selection_mode == "full"` is
     // part of the key.
-    let ledger = ledger_path(&root);
-    let ledger_rows = validate_history::read_rows(&ledger);
+    let ledger = canonical_ledger_root();
+    let ledger_rows = canonical_ledger_rows();
     let tree = git_tree();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
@@ -4382,7 +4277,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some(sig) = &interruption {
         if !nesting.nested {
             write_ledger(
-                &ledger,
                 &ctx,
                 &outcomes,
                 &skipped,
@@ -4566,7 +4460,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the re-entrancy guard exists to prevent.
     if !nesting.nested {
         write_ledger(
-            &ledger,
             &ctx,
             &outcomes,
             &skipped,
@@ -4750,7 +4643,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let exit_code: u8 = if interruption.is_some() { 130 } else { 1 };
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let wall = started.elapsed().as_secs_f64();
-    let ledger = ledger_path(root);
+    let ledger = canonical_ledger_root();
     let host = short_hostname();
     let commit = git_sha();
     let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
@@ -4791,7 +4684,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(&ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
