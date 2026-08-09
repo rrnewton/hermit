@@ -5895,7 +5895,7 @@ fn stop_test_seam(
         )
         .is_ok()
         {
-            let _ = validate_receipt::publish(&ledger);
+            let _ = validate_receipt::publish();
         }
     }
     drop(peer_monitor);
