@@ -56,7 +56,7 @@
 #![recursion_limit = "512"]
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude; // rust-script cache-key: 4ea6fe1b4393 (regen: scripts/lib/prelude-cache-key.sh --write)
 
 #[path = "lib/validate_corpus.rs"]
 mod validate_corpus;
@@ -3706,9 +3706,56 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     );
 }
 
+/// Refuse to run out of a checkout that could not have built this binary.
+///
+/// A freshly allocated worktree slot registers the `agent-utils` submodule
+/// without checking it out, so `agent-utils/` exists but is EMPTY. This driver
+/// declares `safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }`,
+/// so that checkout cannot build it. Measured 2026-08-08 with the directory empty:
+///
+///   cold rust-script cache -> exit 1 in 0.034s with a raw `cargo` dependency
+///                             error. Exit 1 is ALSO this driver's ordinary
+///                             "blocking failure(s)" code, so an environment
+///                             fault is indistinguishable from a product red.
+///   warm rust-script cache -> exit 0 in 0.80s printing a COMPLETE, green-looking
+///                             self-test, because rust-script re-executes the
+///                             cached binary and never consults cargo. A checkout
+///                             that cannot build certifies itself.
+///
+/// The warm case is the one this catches, and it is the dangerous one: nothing
+/// else in the run will ever notice. The cold case is unreachable from here by
+/// construction -- if the dependency is missing there is no binary to run -- so
+/// this is deliberately not a claim to cover both.
+///
+/// This lived in `validate.sh` until that shim was deleted (93575493f). Direct
+/// invocation is now the only path, so the check belongs in the driver.
+fn refuse_incomplete_checkout() -> Option<ExitCode> {
+    let root = repo_root();
+    let dep = root.join("agent-utils/rs/safe-ci-dag-runner/Cargo.toml");
+    if dep.is_file() {
+        return None;
+    }
+    eprintln!(
+        "🚫 validate REFUSED (exit 2) — the checkout is incomplete, nothing was validated\n   \
+         missing: agent-utils/rs/safe-ci-dag-runner (this driver's DAG runner dependency)\n   \
+         cause:   a freshly allocated worktree slot registers the agent-utils submodule\n            \
+         without checking it out, so the directory exists but is empty\n   \
+         fix:     git -C {} submodule update --init agent-utils\n   \
+         NOTE:    with a warm rust-script cache this condition otherwise exits 0 and\n            \
+         prints a full green self-test over a checkout that cannot build.",
+        root.display()
+    );
+    Some(ExitCode::from(2))
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
     install_stop_handlers();
+    // Before anything else: a run out of an unbuildable checkout must not be able
+    // to report a verdict at all.
+    if let Some(refusal) = refuse_incomplete_checkout() {
+        return refusal;
+    }
     let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
