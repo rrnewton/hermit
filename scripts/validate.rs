@@ -3982,7 +3982,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut peer_monitor = match controller_start {
         Some(controller_start) => {
             match validate_runtime::PeerSnapshotMonitor::start_production(
-                &tmp,
                 monitor_owner_pid,
                 controller_start,
             ) {
