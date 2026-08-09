@@ -5,8 +5,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# prelude-cache-key.sh — keep rust-script consumers rebuilding when the shared
-# prelude changes.
+# prelude-cache-key.sh — keep rust-script consumers rebuilding when ANY
+# `#[path]`-included module changes.
+#
+# SCOPE WIDENED 2026-08-08. This file was written for the shared prelude, which
+# was then the only `#[path]` module any consumer had. scripts/validate.rs now
+# includes SEVEN more (scripts/lib/validate_*.rs) and they were not covered, so
+# the key attested one input out of eight. Measured on validate.rs at
+# 0f90722a6, with `validate_runtime::self_test` mutated to return `Err`:
+#
+#   warm cache, mutated tree   -> --self-test EXIT 0, binary mtime UNCHANGED,
+#                                 the planted string absent from the output
+#   same mutated tree, binary deleted -> EXIT 2, "SELF-TEST FAILED: MUTANT"
+#
+# Only the cache differed. So the driver's own self-test can report GREEN over
+# source it never compiled — "we did not check" rendered as "we checked and it
+# was green", inside the checks meant to certify the driver. The name is kept
+# because every consumer's stamped line and the sigpipe gate reference this path;
+# the mechanism is now general.
 #
 # THE TRAP: rust-script (0.36) decides a cached binary is fresh by comparing the
 # built binary's mtime against ONLY the main script file's mtime (and the
@@ -59,7 +75,35 @@ TAG="rust-script cache-key:"
 [[ -f $PRELUDE ]] || { echo "prelude-cache-key.sh: missing $PRELUDE" >&2; exit 2; }
 command -v sha1sum >/dev/null 2>&1 || { echo "prelude-cache-key.sh: sha1sum required" >&2; exit 2; }
 
-digest() { sha1sum "$PRELUDE" | cut -c1-12; }
+# EVERY `#[path]`-included module of a consumer, resolved relative to the
+# including file, sorted for a stable digest. rust-script ignores all of them
+# equally -- the prelude was simply the first one we were bitten by -- so the key
+# must cover the whole set or it certifies only part of the source it compiles.
+included_modules() {
+  local f=$1 dir rel
+  dir="$(dirname "$f")"
+  grep -oE '#\[path = "[^"]+\.rs"\]' "$f" \
+    | sed -E 's/#\[path = "([^"]+)"\]/\1/' \
+    | while IFS= read -r rel; do printf '%s\n' "$dir/$rel"; done \
+    | sort -u
+}
+
+# Digest over the CONTENT of every included module. Hashing the per-file hashes
+# (rather than the concatenated bytes) keeps the result independent of file order
+# and immune to content shifting across a module boundary.
+digest_for() {
+  local f=$1 mods
+  mapfile -t mods < <(included_modules "$f")
+  if [[ ${#mods[@]} -eq 0 ]]; then
+    echo "prelude-cache-key.sh: $f includes no #[path] module" >&2
+    return 2
+  fi
+  local m
+  for m in "${mods[@]}"; do
+    [[ -f $m ]] || { echo "prelude-cache-key.sh: $f includes missing module $m" >&2; return 2; }
+  done
+  sha1sum "${mods[@]}" | sha1sum | cut -c1-12
+}
 
 # A consumer is a rust-script (shebang `#!/usr/bin/env rust-script`) that
 # `#[path]`-includes the prelude as a module. Discovered dynamically so a new
@@ -85,14 +129,14 @@ case "$mode" in
     ;;
 esac
 
-want="$(digest)"
 mapfile -t files < <(consumers)
 [[ ${#files[@]} -gt 0 ]] || { echo "prelude-cache-key.sh: no rust-script consumers found (looked for '$MARKER')" >&2; exit 2; }
 
 if [[ $mode == "--write" ]]; then
-  new_line="$(stamped_line "$want")"
   changed=0
   for f in "${files[@]}"; do
+    want="$(digest_for "$f")"
+    new_line="$(stamped_line "$want")"
     # Replace the whole marker line (bare or previously stamped) in place.
     tmp="$(mktemp)"
     awk -v marker="$MARKER" -v repl="$new_line" '
@@ -102,13 +146,14 @@ if [[ $mode == "--write" ]]; then
     if ! cmp -s "$f" "$tmp"; then cat "$tmp" > "$f"; changed=$((changed+1)); echo "stamped $f -> $want"; fi
     rm -f "$tmp"
   done
-  echo "prelude-cache-key.sh: OK — ${#files[@]} consumer(s), $changed updated, cache-key $want"
+  echo "prelude-cache-key.sh: OK — ${#files[@]} consumer(s), $changed updated"
   exit 0
 fi
 
 # --check
 stale=()
 for f in "${files[@]}"; do
+  want="$(digest_for "$f")"
   have="$(awk -v marker="$MARKER" -v tag="$TAG" '
     index($0, marker) == 1 {
       i = index($0, tag)
@@ -124,15 +169,15 @@ done
 
 if [[ ${#stale[@]} -gt 0 ]]; then
   {
-    echo "prelude-cache-key.sh: FAIL — prelude cache-key is stale in ${#stale[@]} consumer(s):"
+    echo "prelude-cache-key.sh: FAIL — module cache-key is stale in ${#stale[@]} consumer(s):"
     printf '  %s\n' "${stale[@]}"
-    echo "  $PRELUDE changed but consumers were not restamped, so rust-script would"
-    echo "  serve stale cached binaries on warm-cache machines."
+    echo "  A #[path]-included module changed but consumers were not restamped, so"
+    echo "  rust-script would serve stale cached binaries on warm-cache machines."
     echo "  Fix: scripts/lib/prelude-cache-key.sh --write   (then commit the result)"
   } >&2
   exit 1
 fi
-echo "prelude-cache-key.sh: OK — ${#files[@]} consumer(s) carry current cache-key $want"
+echo "prelude-cache-key.sh: OK — ${#files[@]} consumer(s) carry a current module cache-key"
 
 [[ $mode == "--check-runtime" ]] || exit 0
 
@@ -165,6 +210,7 @@ fresh=0
 cold=0
 runtime_stale=0
 for f in "${files[@]}"; do
+  want="$(digest_for "$f")"
   project="$(rust-script --package "$f")"
   manifest="$project/Cargo.toml"
   [[ -f $manifest ]] || {
@@ -193,17 +239,28 @@ for f in "${files[@]}"; do
   built="$(binary_build_time "$binary")"
   consumer_time="$(file_mtime "$f")"
   manifest_time="$(file_mtime "$manifest")"
-  prelude_time="$(file_mtime "$PRELUDE")"
   newest_input="$consumer_time"
   [[ $manifest_time > $newest_input ]] && newest_input="$manifest_time"
-  [[ $prelude_time > $newest_input ]] && newest_input="$prelude_time"
+  # EVERY included module counts, not just the prelude: each one is an input
+  # rust-script's own freshness check ignores.
+  newest_module=""
+  newest_module_time=""
+  while IFS= read -r m; do
+    mt="$(file_mtime "$m")"
+    if [[ -z $newest_module_time || $mt > $newest_module_time ]]; then
+      newest_module_time="$mt"
+      newest_module="$m"
+    fi
+  done < <(included_modules "$f")
+  [[ -n $newest_module_time && $newest_module_time > $newest_input ]] && newest_input="$newest_module_time"
 
-  if [[ $built < $consumer_time || $built < $manifest_time || $built < $prelude_time ]]; then
+  if [[ $built < $consumer_time || $built < $manifest_time || $built < $newest_module_time ]]; then
     {
       echo "STALE $f key=$want"
       echo "      binary=$binary"
       echo "      built=$built newest-input=$newest_input"
-      echo "      consumer=$consumer_time manifest=$manifest_time prelude=$prelude_time"
+      echo "      consumer=$consumer_time manifest=$manifest_time"
+      echo "      newest-module=$newest_module ($newest_module_time)"
     } >&2
     runtime_stale=$((runtime_stale + 1))
   else
