@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -97,6 +98,43 @@ def stop_test_env(tmpdir: Path, ledger: Path) -> dict[str, str]:
         TMPDIR=str(tmpdir),
     )
     return env
+
+
+def run_standalone_no_ledger_fixture() -> None:
+    """A standalone product check runs without claiming local authority."""
+    with tempfile.TemporaryDirectory(prefix="validate-standalone-no-ledger-") as tmp:
+        tmpdir = Path(tmp)
+        validate = tmpdir / "validate.sh"
+        shutil.copy2(VALIDATE, validate)
+        env = os.environ.copy()
+        for name in (
+            "DEV_HERMIT_PARENT",
+            "HERMIT_VALIDATE_ACTIVE",
+            "HERMIT_VALIDATE_LEDGER",
+            "VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON",
+        ):
+            env.pop(name, None)
+        env.update(
+            HERMIT_VALIDATE_STOP_TEST_MODE="1",
+            VALIDATE_RUN_ON_DIRTY_TREE="1",
+            VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
+            VALIDATE_STOP_TEST_EXIT_EARLY="1",
+            VALIDATE_LABEL_PR="0",
+            TMPDIR=str(tmpdir),
+        )
+        result = subprocess.run(
+            [str(validate), "full"],
+            cwd=tmpdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = result.stdout.decode(errors="replace")
+        assert result.returncode == 1, output
+        assert "VALIDATE_STOP_TEST_READY" in output, output
+        assert "canonical validate-lock authority unavailable" not in output, output
+        assert not list(tmpdir.rglob("*.jsonl")), list(tmpdir.rglob("*.jsonl"))
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
@@ -1495,6 +1533,7 @@ def run_schema5_receipt_fixtures() -> None:
 
 
 def main() -> None:
+    run_standalone_no_ledger_fixture()
     run_peer_identity_fixtures()
     run_peer_scan_completeness_fixtures()
     run_schema5_receipt_fixtures()
@@ -1515,6 +1554,7 @@ def main() -> None:
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: identity-bound peer fixtures; schema-5 admission/base fixtures; "
+        "standalone no-ledger path reached product gate with 0 receipts; "
         "forged sidecar/PID refusal 1 diagnostic/0 qualifying/0 publisher calls; "
         "unresolvable process refusal 1 diagnostic/0 qualifying/0 publisher calls; "
         "peer scan completeness: exit races 2/2 accepted, unresolved evidence 4/4 refused sticky, "

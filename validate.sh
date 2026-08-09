@@ -2520,7 +2520,13 @@ trap cleanup EXIT
 trap 'interrupted INT' INT
 trap 'interrupted TERM' TERM
 trap 'interrupted HUP' HUP
-if ((VALIDATION_NESTED == 0)); then
+# The canonical parent lock and peer proof authorize LOCAL ledger receipts.
+# A standalone checkout (including GitHub-hosted portable CI) has no parent
+# ci-hub and no local ledger, so it cannot mint that authority and must still be
+# able to run the product gates. Conversely, every ledger-producing top-level
+# run must establish the proof before executing any gate; a caller cannot evade
+# it by selecting a focused profile.
+if ((VALIDATION_NESTED == 0)) && [[ -n $VALIDATION_LEDGER_FILE ]]; then
     if ! start_validation_concurrency_monitor; then
         VALIDATION_CONCURRENCY_START_OK=0
     fi
