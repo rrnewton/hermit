@@ -379,6 +379,7 @@ function assert_parallel_portable_workflow {
     local run_dag_count run_node_count debug_inner_path release_inner_path
     local debug_outer_minutes release_outer_minutes debug_test_outer_minutes
     local strict_compat_timeout strict_compat_count rr_suite_timeout rr_suite_estimate
+    local strict_observation_seconds
     local debug_artifact_retention release_dbt_artifact_retention
     local release_artifact_retention cleanup_block
     # Two runs lost the hosted runner at ~45m under 2700s and 10800s node bounds.
@@ -503,8 +504,23 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must derive one e2e matrix from the audited plan"
     [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
-    [[ $(grep -Fxc "        if: startsWith(matrix.slug, 'strict-compat-')" "$workflow") == 2 ]] ||
+    [[ $(grep -Fxc '      - name: Install rust-script (strict-compat shard)' "$workflow") == 1 &&
+       $(grep -Fxc '      - name: Verify rust-script resolves (strict-compat shard)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must provision rust-script for every strict-compat partition"
+    [[ $(grep -Fxc '      - name: Start supervised strict shard (${{ matrix.slug }})' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must start strict shards through the observer"
+    [[ $(grep -Fc '          name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-' "$workflow") == 9 ]] ||
+        die "GitHub portable workflow must publish start, timed, and final strict evidence"
+    [[ $(grep -Fc '        run: ./ci/strict-shard-observer.sh observe ' "$workflow") == 7 ]] ||
+        die "GitHub portable workflow must snapshot strict evidence through the 32-minute bound"
+    strict_observation_seconds=$(grep -F '        run: ./ci/strict-shard-observer.sh observe ' "$workflow" |
+        awk '{sum += $(NF-1)} END {print sum + 0}')
+    [[ $strict_observation_seconds == 1920 ]] ||
+        die "GitHub portable strict observation window must remain 1920s, got ${strict_observation_seconds}s"
+    ((debug_test_outer_minutes * 60 > strict_observation_seconds + hosted_job_overhead_seconds)) ||
+        die "GitHub debug-test outer timeout must cover strict observation plus setup overhead"
+    [[ $(grep -Fxc '        if: always() && startsWith(matrix.slug, '\''strict-compat-'\'')' "$workflow") == 1 ]] ||
+        die "GitHub portable workflow must attempt the final strict evidence upload after failure"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run against merge-queue commits"
     [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbt.so \' "$workflow") == 1 ]] ||
@@ -992,6 +1008,13 @@ function audit_ci_correspondence {
         die "hosted strict watchdog must assert its linked agent-utils source"
     grep -Fq '"$ROOT_DIR/ci/run-strict-watchdog.rs"' "$ROOT_DIR/ci/run-node.sh" ||
         die "hosted strict nodes must enter the descendant-complete watchdog"
+    grep -Fq 'hosted strict composite requires STRICT_WATCHDOG_START_MARKER' "$ROOT_DIR/ci/run-node.sh" ||
+        die "hosted strict nodes must refuse to run without start evidence"
+    grep -Fq 'resolved_agent_utils_revision=' "$strict_watchdog" ||
+        die "hosted strict watchdog must publish its resolved agent-utils revision"
+    local strict_observer="$ROOT_DIR/ci/strict-shard-observer.sh"
+    [[ -x $strict_observer ]] || die "hosted strict observer must be executable"
+    "$strict_observer" self-test
 
     # Plant the exact mechanism that escaped both earlier supervisors: a TERM-
     # ignoring process that calls setsid, leaves the wrapper's process group, and
@@ -1000,12 +1023,13 @@ function audit_ci_correspondence {
     # a test-harness safety net, not the mechanism under test; phase assertions
     # distinguish its expiry from the watchdog's own verdict.
     (
-        local scratch identity_file raw_log phase_log watchdog_rc
+        local scratch identity_file raw_log phase_log start_marker watchdog_rc
         local escape_pid= escape_sid= escape_pgid=
         scratch=$(mktemp -d)
         identity_file="$scratch/setsid.identity"
         raw_log="$scratch/raw.log"
         phase_log="$scratch/phase.log"
+        start_marker="$scratch/start.marker"
         cleanup_strict_watchdog_fixture() {
             if [[ $escape_pid =~ ^[1-9][0-9]*$ ]] && kill -0 "$escape_pid" 2>/dev/null; then
                 kill -KILL -- "-$escape_pid" 2>/dev/null || kill -KILL "$escape_pid" 2>/dev/null || true
@@ -1015,6 +1039,7 @@ function audit_ci_correspondence {
         trap cleanup_strict_watchdog_fixture EXIT
         cd "$ROOT_DIR"
         set +e
+        STRICT_WATCHDOG_START_MARKER="$start_marker" \
         timeout --signal=TERM --kill-after=2s 15s "$strict_watchdog" \
             1 1 "$raw_log" "$phase_log" -- \
             bash -c 'setsid sh -c '\''trap "" TERM; sid=$(ps -o sid= -p $$); pgid=$(ps -o pgid= -p $$); printf "%s %s %s\n" "$$" "$sid" "$pgid" > "$1"; while :; do sleep 60; done'\'' _ "$1" & wait' \
@@ -1026,6 +1051,16 @@ function audit_ci_correspondence {
         [[ $escape_pid == "$escape_sid" && $escape_pid == "$escape_pgid" ]] ||
             die "strict watchdog fixture did not establish a distinct setsid session/process group"
         [[ $watchdog_rc == 124 ]] || die "strict watchdog setsid fixture returned $watchdog_rc, expected 124"
+        grep -Fxq 'entered=true' "$start_marker" ||
+            die "strict watchdog setsid fixture did not publish its start marker"
+        grep -Fxq 'resolved_agent_utils_revision=0f0d667a06f4e141879466caa77640344243f14d' "$start_marker" ||
+            die "strict watchdog start marker did not bind the agent-utils revision"
+        grep -Eq '^supervisor_pid=[1-9][0-9]*$' "$start_marker" ||
+            die "strict watchdog start marker did not bind the supervisor PID"
+        grep -Eq '^supervisor_starttime_ticks=[1-9][0-9]*$' "$start_marker" ||
+            die "strict watchdog start marker did not bind the supervisor identity"
+        grep -Fxq 'configured_timeout_seconds=1' "$start_marker" ||
+            die "strict watchdog start marker did not bind the configured timeout"
         ! kill -0 "$escape_pid" 2>/dev/null ||
             die "strict watchdog left setsid escapee pid $escape_pid alive"
         grep -Fq 'run-strict-watchdog: KILL reason=wall-timeout' "$phase_log" ||

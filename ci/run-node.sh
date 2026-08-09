@@ -164,6 +164,10 @@ if [[ -n ${GITHUB_ACTIONS:-} && $sel == test.strict_compat_* ]]; then
     watchdog_grace=60
     watchdog_timeout=$((inner_timeout + watchdog_grace))
     watchdog_term_grace=30
+    if [[ -z ${STRICT_WATCHDOG_START_MARKER:-} ]]; then
+        echo "run-node.sh: hosted strict composite requires STRICT_WATCHDOG_START_MARKER" >&2
+        exit 2
+    fi
     : >"$raw_log"
     : >"$phase_log"
     echo "run-node.sh: strict composite raw log: $raw_log" >&2

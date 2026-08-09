@@ -188,6 +188,41 @@ fn become_subreaper() -> Result<(), String> {
     Ok(())
 }
 
+fn write_start_marker(
+    path: &Path,
+    timeout_s: u64,
+    term_grace_s: u64,
+    worker_pid: u32,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create start-marker directory {}: {e}", parent.display()))?;
+    }
+    let supervisor_pid = std::process::id();
+    let supervisor_identity = read_identity(supervisor_pid as i32)?
+        .ok_or_else(|| format!("read supervisor identity for pid {supervisor_pid}"))?;
+    let worker_identity = read_identity(worker_pid as i32)?
+        .ok_or_else(|| format!("read worker identity for pid {worker_pid}"))?;
+    let started_unix_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tmp = PathBuf::from(format!("{}.tmp.{supervisor_pid}", path.display()));
+    let marker = format!(
+        "entered=true\nresolved_agent_utils_revision={EXPECTED_AGENT_UTILS_REV}\nsupervisor_pid={supervisor_pid}\nsupervisor_starttime_ticks={}\nworker_pid={worker_pid}\nworker_starttime_ticks={}\nconfigured_timeout_seconds={timeout_s}\nterm_grace_seconds={term_grace_s}\nstarted_unix_seconds={started_unix_s}\n",
+        supervisor_identity.starttime, worker_identity.starttime
+    );
+    fs::write(&tmp, marker).map_err(|e| format!("write start marker {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        format!(
+            "publish start marker {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn read_identity(pid: i32) -> Result<Option<ProcIdentity>, String> {
     let path = format!("/proc/{pid}/stat");
     let stat = match fs::read_to_string(&path) {
@@ -469,6 +504,16 @@ fn run() -> Result<i32, String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("launch {command}: {e}"))?;
+    if let Some(marker_path) = std::env::var_os("STRICT_WATCHDOG_START_MARKER") {
+        let marker_path = PathBuf::from(marker_path);
+        write_start_marker(&marker_path, timeout_s, term_grace_s, child.id())?;
+        tailer.record(&format!(
+            "run-strict-watchdog: start marker published path={} supervisor_pid={} worker_pid={}",
+            marker_path.display(),
+            std::process::id(),
+            child.id()
+        ))?;
+    }
     let started = Instant::now();
     let deadline = started + Duration::from_secs(timeout_s);
     let mut next_heartbeat = started + Duration::from_secs(60);
