@@ -1596,7 +1596,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             validation_tmp_dir: &tmp.to_string_lossy(),
             shell_build_dir: &shell_build.to_string_lossy(),
         };
-        let mut steps = pre;
+        // ORDERED BUDGET STACK: a focused compat plan runs as ONE node of an outer
+        // lane, so its preflight gates are re-bounded strictly BELOW that node's
+        // budget. Unbounded here, the three serial gates outlast the outer node AND
+        // the job, so the job is killed from outside before the scheduler prints a
+        // node table -- the reason this profile failed anonymously on 11 SHAs.
+        let mut steps = validate_plan::preflight_nodes_bounded(root, with_proxy);
+        drop(pre);
         // The corpus needs a release Hermit and the functional fixtures; both are
         // DAG nodes so they are boxed and timed like everything else.
         steps.push(build_release_hermit_node(gate, &hermit_bin));
@@ -2593,6 +2599,40 @@ fn read_log_settled(path: &Path) -> String {
 ///   it.** In the bash the retry happened INSIDE the gate, so downstream never
 ///   got skipped; reproducing that here means the retry DAG carries the skipped
 ///   and aborted nodes too, with dependencies restricted to the retry set.
+/// Write this run's per-node profile rows to `$RUN_NODE_PERF_DIR`.
+///
+/// # Why this exists
+///
+/// `perflog::append_step_profiles` had exactly ONE caller — the runner's own `cli`
+/// binary — so a LIBRARY-MODE consumer wrote no rows at all. `scripts/validate.rs`
+/// is such a consumer (it calls `run_dag_boxed_ordered` directly), and
+/// `ci/run-node.sh` is the only other reader of `RUN_NODE_PERF_DIR`. Net effect:
+/// when `test.strict_compat` re-enters validate as a NESTED run, the outer row can
+/// only ever name `test.strict_compat` itself, and the 190-odd inner nodes are
+/// invisible by construction. A profile store that cannot see the level where the
+/// time is spent is not observability, and this is precisely why the strict-compat
+/// regression went days without a named node.
+///
+/// Rows are written for BOTH outcomes. A row for a node that TIMED OUT is the
+/// single most valuable row here, so this is deliberately not gated on success.
+fn emit_step_profiles(result: &safe_ci_dag_runner::model::RunResult, jobs: i64) {
+    let Ok(dir) = std::env::var("RUN_NODE_PERF_DIR") else {
+        return;
+    };
+    if dir.is_empty() || result.step_profile_rows.is_empty() {
+        return;
+    }
+    safe_ci_dag_runner::append_step_profiles(
+        Path::new(&dir),
+        &result.step_profile_rows,
+        &git_sha(),
+        jobs,
+        None,
+        "validate-nested",
+        "validate",
+    );
+}
+
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -2603,6 +2643,7 @@ fn run_lane_with_env_retries(
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
     let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    emit_step_profiles(&first, jobs);
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -2668,6 +2709,7 @@ fn run_lane_with_env_retries(
         retry_cfg.steps = steps;
         let again =
             run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        emit_step_profiles(&again, jobs);
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());

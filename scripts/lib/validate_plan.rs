@@ -65,6 +65,31 @@ const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
 /// non-cap.
 const PREFLIGHT_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
+/// Wall budget for a preflight gate inside a FOCUSED plan (a compat matrix), where
+/// the whole run is itself one node of an outer lane.
+///
+/// # Why a focused plan needs its own, SMALLER ceiling
+///
+/// `PREFLIGHT_TIMEOUT_S` is sized for a top-level run that owns the whole job. A
+/// focused compat plan does not: `ci/dag/portable.json`'s `test.strict_compat`
+/// invokes `--portable-strict-compat-only` as ONE node, so this plan's budgets sit
+/// UNDER that node's budget, which sits under the job's `timeout-minutes`.
+///
+/// That stack was inverted. Three preflight gates run STRICTLY SERIALLY
+/// (`pre.submodules` -> `pre.reverie_pin` -> `gate.manifest`), each at 900 s, so the
+/// inner plan could legally consume 2700 s beneath a 1800 s outer node beneath a
+/// 900 s job. An inner budget that can never fire first is not a budget: the job is
+/// killed from OUTSIDE, mid-node, and the run dies before the scheduler reaches its
+/// node table — which is exactly why this profile produced 0 successes across 11
+/// distinct SHAs while never naming a single slow node.
+///
+/// Ordered inner-below-outer, the slow gate times out, NAMES ITSELF, and the outer
+/// node survives to write its profile row.
+const COMPAT_PREFLIGHT_TIMEOUT_S: i64 = 180;
+/// CPU budget for a preflight gate inside a focused plan. See
+/// [`COMPAT_PREFLIGHT_TIMEOUT_S`].
+const COMPAT_PREFLIGHT_CPU_TIMEOUT_S: i64 = 150;
+
 /// Per-lane-node CPU budget applied as the DAG-level default, closing the
 /// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
 /// the build spine legitimately burns many CPU-minutes; it exists to stop an
@@ -287,6 +312,23 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_MEM_BYTES,
         ),
     ]
+}
+
+/// [`preflight_nodes`] with every budget CLAMPED DOWNWARD for a focused plan.
+///
+/// `min` is deliberate and load-bearing: this can only ever LOWER a ceiling, never
+/// raise one. A future preflight gate that declares a tighter budget than
+/// [`COMPAT_PREFLIGHT_TIMEOUT_S`] keeps its own, and no edit here can loosen a
+/// containment bound — the failure mode that turns a visible red into a longer red.
+pub fn preflight_nodes_bounded(root: &Path, with_proxy: bool) -> Vec<Step> {
+    preflight_nodes(root, with_proxy)
+        .into_iter()
+        .map(|mut s| {
+            s.timeout = s.timeout.min(COMPAT_PREFLIGHT_TIMEOUT_S);
+            s.cpu_timeout = s.cpu_timeout.min(COMPAT_PREFLIGHT_CPU_TIMEOUT_S);
+            s
+        })
+        .collect()
 }
 
 /// THE one place a CI lane's file is resolved.

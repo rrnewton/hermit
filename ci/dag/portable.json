@@ -484,7 +484,7 @@
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
-      "timeout": 1800,
+      "timeout": 780,
       "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 600,
                "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}
