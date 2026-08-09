@@ -6,6 +6,9 @@
 # For this user-owned repository, a versioned context prevents an unmodified old
 # branch from satisfying a tightened gate. MERGE_GATE_V4_BLOB catches accidental
 # v4 drift that retains the guard; it is not a trusted-workflow signature.
+# The ruleset deliberately has no bypass actors: otherwise an administrator can
+# land a workflow change while its definition check is red, separating the blob
+# rotation from the change it authorizes.
 
 set -euo pipefail
 
@@ -128,6 +131,7 @@ required_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$current")
 legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$current")
 required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$current")
 legacy_integration=$(required_context_integration "$LEGACY_CONTEXT" <<<"$current")
+bypass_count=$(jq '.bypass_actors | length' <<<"$current")
 
 if [[ $mode == prepare ]]; then
     blob=$(gate_blob "$prepare_ref")
@@ -168,7 +172,7 @@ if [[ $mode == prepare ]]; then
                   else . + [{context: $context, integration_id: $integration}]
                   end
               else . end],
-            bypass_actors
+            bypass_actors: []
           }
         ' <<<"$current")
 
@@ -191,10 +195,12 @@ if [[ $mode == prepare ]]; then
     updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
     updated_required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
     updated_legacy_integration=$(required_context_integration "$LEGACY_CONTEXT" <<<"$updated")
+    updated_bypass_count=$(jq '.bypass_actors | length' <<<"$updated")
     if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
        [[ $updated_required_count != 1 || $updated_legacy_count != 1 ]] ||
        [[ $updated_required_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
        [[ $updated_legacy_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+       [[ $updated_bypass_count != 0 ]] ||
        [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$blob" ]] ||
        [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != true ]]; then
         printf 'configure-merge-gate-ruleset: overlap transition verification failed\n' >&2
@@ -218,6 +224,11 @@ if [[ $mode == check ]]; then
             "$ruleset_id" "$required_count" "${required_integration:-unset}" "$legacy_count" >&2
         failed=1
     fi
+    if [[ $bypass_count != 0 ]]; then
+        printf 'FAIL: ruleset %s has %s bypass actors; workflow-definition refusal must be non-bypassable.\n' \
+            "$ruleset_id" "$bypass_count" >&2
+        failed=1
+    fi
     if [[ $expected_blob != "$main_blob" ]]; then
         printf 'FAIL: %s=%s, main workflow blob=%s.\n' \
             "$EXPECTED_BLOB_VARIABLE" "${expected_blob:-unset}" "$main_blob" >&2
@@ -231,7 +242,7 @@ if [[ $mode == check ]]; then
     if ((failed != 0)); then
         exit 1
     fi
-    printf 'PASS: ruleset %s requires %s; main blob %s is bound; legacy shim is disabled.\n' \
+    printf 'PASS: ruleset %s requires non-bypassable %s; main blob %s is bound; legacy shim is disabled.\n' \
         "$ruleset_id" "$REQUIRED_CONTEXT" "$main_blob"
     exit 0
 fi
@@ -269,7 +280,7 @@ desired=$(jq \
           if .type == "required_status_checks" then
             .parameters.required_status_checks |= map(select(.context != $old))
           else . end],
-        bypass_actors
+        bypass_actors: []
       }
     ' <<<"$current")
 
@@ -292,14 +303,16 @@ updated=$(read_ruleset)
 updated_required_count=$(required_context_count "$REQUIRED_CONTEXT" <<<"$updated")
 updated_legacy_count=$(required_context_count "$LEGACY_CONTEXT" <<<"$updated")
 updated_required_integration=$(required_context_integration "$REQUIRED_CONTEXT" <<<"$updated")
+updated_bypass_count=$(jq '.bypass_actors | length' <<<"$updated")
 if [[ $(policy_fingerprint <<<"$updated") != $(policy_fingerprint <<<"$desired") ]] ||
    [[ $updated_required_count != 1 || $updated_legacy_count != 0 ]] ||
    [[ $updated_required_integration != "$GITHUB_ACTIONS_INTEGRATION_ID" ]] ||
+   [[ $updated_bypass_count != 0 ]] ||
    [[ $(read_variable "$EXPECTED_BLOB_VARIABLE") != "$main_blob" ]] ||
    [[ $(read_variable "$LEGACY_SHIM_VARIABLE") != false ]]; then
     printf 'configure-merge-gate-ruleset: GitHub accepted migration but verification failed\n' >&2
     exit 1
 fi
 
-printf 'APPLIED: ruleset %s now requires %s; main blob %s is bound; legacy shim disabled.\n' \
+printf 'APPLIED: ruleset %s now requires non-bypassable %s; main blob %s is bound; legacy shim disabled.\n' \
     "$ruleset_id" "$REQUIRED_CONTEXT" "$main_blob"
