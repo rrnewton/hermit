@@ -11,10 +11,10 @@ set -euo pipefail
 
 ROOT_DIR=${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 WORKFLOW="$ROOT_DIR/.github/workflows/merge-gate.yml"
-PRODUCER_AUTHORITY_REF=cb78bf76a498809c7b24b1a973574e7c863d5109
+PRODUCER_AUTHORITY_REF=070b504dce00f701e96d3bb04fb5928a2d488d32
 RECEIPT_VERIFIER_SHA256=1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
-QUALIFYING_RECEIPT_SHA256=09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
-PRODUCER_DEFINITION_SHA256=fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
+QUALIFYING_RECEIPT_SHA256=e0c1ec31c69fd2070f1b07957e721e9992143349b9083a2980b3a0a8582bc498
+PRODUCER_DEFINITION_SHA256=2deef4cead55fafcc1db2664e03680ca6b6045ee88aac16fb80b0ee1b266ee0f
 
 fail() {
     echo "check-merge-gate-policy.sh: $*" >&2
@@ -42,6 +42,10 @@ grep -Fq '[ "$job_found" != true ] && [ "$run_state" = FAILED ]' "$WORKFLOW" ||
     fail "a complete workflow failure must remain a failure fallback"
 grep -Fq '[ "$priv_job_found" != true ] && [ "$priv_run_state" = FAILED ]' "$WORKFLOW" ||
     fail "a complete privileged workflow failure must remain a failure fallback"
+grep -Fq 'portable_cancellation_absence "$run" "$jobs" "$regular_job" "$head_sha"' "$WORKFLOW" ||
+    fail "portable aggregate failure must use the exact cancellation-derived absence proof"
+grep -Fq 'portable_state=NO_RESULT' "$WORKFLOW" ||
+    fail "proved cancellation-derived portable absence must downgrade only to NO_RESULT"
 grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
     fail "local shell adapter must delegate to the parent status authority"
 grep -Fq 'from ci_hub_check_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
@@ -93,4 +97,62 @@ if grep -Eq 'success[[:space:]]*\|[[:space:]]*skipped|success[[:space:]]+or[[:sp
     fail "skipped must never satisfy a required check"
 fi
 
-echo "check-merge-gate-policy.sh: OK - PASSED/FAILED/NO_RESULT gate wiring enforced"
+# Execute the workflow's embedded classifier itself, rather than a test copy.
+# The markers are part of the policy contract so a workflow edit cannot silently
+# leave these adversarial fixtures exercising stale helper code.
+classifier_fixture=$(mktemp)
+trap 'rm -f -- "$classifier_fixture"' EXIT
+awk '
+    /# BEGIN portable-cancellation-absence-classifier/ { capture=1; next }
+    /# END portable-cancellation-absence-classifier/ { capture=0 }
+    capture { sub(/^          /, ""); print }
+' "$WORKFLOW" >"$classifier_fixture"
+grep -Fq 'portable_cancellation_absence()' "$classifier_fixture" ||
+    fail "could not extract the embedded cancellation-derived absence classifier"
+# shellcheck source=/dev/null
+source "$classifier_fixture"
+
+REPO=rrnewton/hermit
+head_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+aggregate='{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure"}'
+cancelled_run='{"id":1,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"completed","conclusion":"cancelled","name":"CI (GitHub-managed portable)","path":".github/workflows/ci-portable.yml"}'
+stale_run='{"id":1,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"completed","conclusion":"cancelled","name":"CI (GitHub-managed portable)","path":".github/workflows/ci-portable.yml"}'
+cancel_only_jobs='{"total_count":3,"jobs":[{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure"},{"id":3,"name":"test: strict-compat","status":"completed","conclusion":"cancelled"},{"id":4,"name":"test: unit","status":"completed","conclusion":"success"}]}'
+leaf_failure_jobs='{"total_count":4,"jobs":[{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure"},{"id":3,"name":"test: strict-compat","status":"completed","conclusion":"cancelled"},{"id":4,"name":"test: unit","status":"completed","conclusion":"success"},{"id":5,"name":"test: integration","status":"completed","conclusion":"failure"}]}'
+no_cancel_jobs='{"total_count":3,"jobs":[{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure"},{"id":3,"name":"test: strict-compat","status":"completed","conclusion":"success"},{"id":4,"name":"test: unit","status":"completed","conclusion":"skipped"}]}'
+
+gh() {
+    [[ $1 == api && $2 == repos/rrnewton/hermit/actions/jobs/2 ]] || return 1
+    case ${CANCELLATION_FIXTURE:-missing} in
+        cancel-only)
+            printf '%s\n' '{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure","steps":[{"name":"Set up job","status":"completed","conclusion":"success"},{"name":"Require every portable DAG job to succeed or be deselected","status":"completed","conclusion":"failure"},{"name":"Complete job","status":"completed","conclusion":"success"}]}'
+            ;;
+        aggregate-failure)
+            printf '%s\n' '{"id":2,"name":"Regular tests (GitHub-managed portable)","status":"completed","conclusion":"failure","steps":[{"name":"Verify completeness","status":"completed","conclusion":"failure"},{"name":"Require every portable DAG job to succeed or be deselected","status":"completed","conclusion":"failure"},{"name":"Complete job","status":"completed","conclusion":"success"}]}'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+run_cancellation_case() {
+    local expected=$1 label=$2 run=$3 jobs=$4 fixture=$5 rc=0
+    CANCELLATION_FIXTURE=$fixture \
+        portable_cancellation_absence "$run" "$jobs" "$aggregate" "$head_sha" || rc=$?
+    [[ $rc -eq $expected ]] ||
+        fail "$label expected classifier rc=$expected, got rc=$rc"
+}
+
+run_cancellation_case 0 "planted cancellation-only aggregate absence" \
+    "$cancelled_run" "$cancel_only_jobs" cancel-only
+run_cancellation_case 1 "genuine leaf failure" \
+    "$cancelled_run" "$leaf_failure_jobs" cancel-only
+run_cancellation_case 1 "independent aggregate failure" \
+    "$cancelled_run" "$cancel_only_jobs" aggregate-failure
+run_cancellation_case 1 "stale exact-head evidence" \
+    "$stale_run" "$cancel_only_jobs" cancel-only
+run_cancellation_case 1 "no cancelled leaf" \
+    "$cancelled_run" "$no_cancel_jobs" cancel-only
+run_cancellation_case 1 "missing aggregate detail" \
+    "$cancelled_run" "$cancel_only_jobs" missing
+
+echo "check-merge-gate-policy.sh: OK - registry pins 2/2; cancellation-only positive 1/1; leaf/aggregate/stale/absence negatives 5/5"

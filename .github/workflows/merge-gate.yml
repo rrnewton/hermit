@@ -206,8 +206,8 @@ jobs:
         # operation.
         env:
           GH_TOKEN: ${{ github.token }}
-          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
-          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          REGISTRY_REF: 070b504dce00f701e96d3bb04fb5928a2d488d32
+          VERIFIER_REF: 070b504dce00f701e96d3bb04fb5928a2d488d32
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
@@ -226,9 +226,9 @@ jobs:
           fetch ci-hub/validation/verify_receipt.sh "$verifier" \
             1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
           fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
-            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+            e0c1ec31c69fd2070f1b07957e721e9992143349b9083a2980b3a0a8582bc498
           fetch ci-hub/validate/producer-definition.json "$producer" \
-            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
+            2deef4cead55fafcc1db2664e03680ca6b6045ee88aac16fb80b0ee1b266ee0f
 
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
@@ -595,8 +595,8 @@ jobs:
         # operation.
         env:
           GH_TOKEN: ${{ github.token }}
-          REGISTRY_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
-          VERIFIER_REF: cb78bf76a498809c7b24b1a973574e7c863d5109
+          REGISTRY_REF: 070b504dce00f701e96d3bb04fb5928a2d488d32
+          VERIFIER_REF: 070b504dce00f701e96d3bb04fb5928a2d488d32
         run: |
           set -euo pipefail
           verifier="$RUNNER_TEMP/verify-local-validation-receipt.sh"
@@ -615,9 +615,9 @@ jobs:
           fetch ci-hub/validation/verify_receipt.sh "$verifier" \
             1b0792415134afed7066ee70e1bc35319a204c5192cac69d33a8ca96b2f01082
           fetch ci-hub/validate/qualifying-receipt.json "$predicate" \
-            09f01dd1435ac7cd6ebbcf28b619ff9ff739587b19bf88f1dd23a53f5c881760
+            e0c1ec31c69fd2070f1b07957e721e9992143349b9083a2980b3a0a8582bc498
           fetch ci-hub/validate/producer-definition.json "$producer" \
-            fab77f72485776a4bbd00e8674e0315d26443177d80d6a715743846814b5546c
+            2deef4cead55fafcc1db2664e03680ca6b6045ee88aac16fb80b0ee1b266ee0f
 
           chmod +x "$verifier"
           echo "RECEIPT_VERIFIER=$verifier" >>"$GITHUB_ENV"
@@ -665,6 +665,73 @@ jobs:
           classify_check() {
             "$CHECK_OUTCOME_AUTHORITY" --status "$1" --conclusion "$2"
           }
+
+          # BEGIN portable-cancellation-absence-classifier
+          # A cancelled portable workflow makes its fail-closed aggregate job
+          # report failure even when no test produced a negative verdict. Only
+          # downgrade that exact absence proof to NO_RESULT. Missing, stale, or
+          # additional failure evidence deliberately returns nonzero so the
+          # ordinary FAILED veto remains in force.
+          portable_cancellation_absence() {
+            local selected_run=$1 jobs_report=$2 selected_aggregate=$3 expected_sha=$4
+            local run_id aggregate_id aggregate_report
+
+            run_id=$(jq -r '.id // empty' <<<"$selected_run")
+            aggregate_id=$(jq -r '.id // empty' <<<"$selected_aggregate")
+            [[ $run_id =~ ^[1-9][0-9]*$ && $aggregate_id =~ ^[1-9][0-9]*$ ]] || return 1
+
+            jq -e --arg sha "$expected_sha" --argjson run_id "$run_id" '
+              .id == $run_id
+              and .head_sha == $sha
+              and .status == "completed" and .conclusion == "cancelled"
+              and .name == "CI (GitHub-managed portable)"
+              and (.path == ".github/workflows/ci-portable.yml"
+                   or .path == "ci-portable.yml")
+            ' <<<"$selected_run" >/dev/null 2>&1 || return 1
+
+            jq -e --argjson aggregate_id "$aggregate_id" '
+              .total_count == (.jobs | length)
+              and .total_count > 1 and .total_count <= 100
+              and ([.jobs[].id] | unique | length) == (.jobs | length)
+              and ([.jobs[] | select(.id == $aggregate_id)] | length) == 1
+              and ([.jobs[]
+                    | select(.name == "Regular tests (GitHub-managed portable)")]
+                   | length) == 1
+              and any(.jobs[];
+                  .id != $aggregate_id and .status == "completed"
+                  and .conclusion == "cancelled")
+              and all(.jobs[];
+                  if .id == $aggregate_id then
+                    .status == "completed" and .conclusion == "failure"
+                  else
+                    .status == "completed"
+                    and (.conclusion == "success"
+                         or .conclusion == "skipped"
+                         or .conclusion == "cancelled")
+                  end)
+            ' <<<"$jobs_report" >/dev/null 2>&1 || return 1
+
+            aggregate_report=$(
+              gh api "repos/${REPO}/actions/jobs/${aggregate_id}"
+            ) || return 1
+            jq -e --argjson aggregate_id "$aggregate_id" '
+              .id == $aggregate_id
+              and .name == "Regular tests (GitHub-managed portable)"
+              and .status == "completed" and .conclusion == "failure"
+              and (.steps | type == "array" and length > 0)
+              and ([.steps[] | select(.conclusion == "failure")] | length) == 1
+              and any(.steps[];
+                  .name == "Require every portable DAG job to succeed or be deselected"
+                  and .status == "completed" and .conclusion == "failure")
+              and all(.steps[];
+                  .status == "completed"
+                  and (.conclusion == "success"
+                       or .conclusion == "skipped"
+                       or (.name == "Require every portable DAG job to succeed or be deselected"
+                           and .conclusion == "failure")))
+            ' <<<"$aggregate_report" >/dev/null 2>&1
+          }
+          # END portable-cancellation-absence-classifier
 
           # Prove the exact predicate used by this gate on every invocation.
           [ "$(classify_check completed success)" = PASSED ]
@@ -878,6 +945,8 @@ jobs:
             job_conclusion=
             job_url="$(jq -r '.html_url // ""' <<< "$run")"
             job_found=false
+            jobs='{"total_count":0,"jobs":[]}'
+            regular_job='{}'
             if [ -n "$run_id" ]; then
               jobs="$(
                 gh api "repos/${REPO}/actions/runs/${run_id}/jobs?filter=latest&per_page=100"
@@ -897,6 +966,11 @@ jobs:
             portable_state=$(classify_check "$job_status" "$job_conclusion")
             if [ "$job_found" != true ] && [ "$run_state" = FAILED ]; then
               portable_state=FAILED
+            fi
+            if [ "$portable_state" = FAILED ] &&
+               portable_cancellation_absence "$run" "$jobs" "$regular_job" "$head_sha"; then
+              portable_state=NO_RESULT
+              echo "Hosted portable aggregate failure is cancellation-derived absence; treating it as NO_RESULT."
             fi
 
             priv_runs="$(
