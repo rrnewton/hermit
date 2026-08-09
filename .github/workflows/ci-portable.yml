@@ -289,6 +289,30 @@ jobs:
         with:
           shared-key: portable-parallel-debug
           cache-on-failure: true
+      # e2e.metadata runs `ci/test_harness.sh validate`, whose watchdog
+      # regression executes `ci/run-strict-watchdog.rs` through its rust-script
+      # shebang.  Do not rely on Swatinem/rust-cache incidentally restoring a
+      # developer's cached interpreter: a cold cache must provision the pinned
+      # runtime before the first DAG node starts.
+      - name: Install rust-script (debug build)
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # Keep this separate from installation so a missing or wrong interpreter
+      # is reported as a named provisioning failure, not as an opaque
+      # e2e.metadata build failure downstream.
+      - name: Verify rust-script resolves (debug build)
+        run: |
+          set -euo pipefail
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; e2e.metadata requires ci/run-strict-watchdog.rs."
+            exit 1
+          fi
+          actual=$(rust-script --version)
+          expected="rust-script ${RUST_SCRIPT_VERSION}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::rust-script version mismatch: expected '$expected', got '$actual'."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $actual"
       - name: Dependencies
         run: |
           sudo apt-get update

@@ -427,6 +427,20 @@ function assert_parallel_portable_workflow {
         die "GitHub debug-test outer timeout must exceed each strict shard's ${strict_compat_timeout}s node bound plus ${hosted_job_overhead_seconds}s setup overhead"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
+    local debug_rust_script_install_line debug_rust_script_verify_line debug_run_line
+    debug_rust_script_install_line=$(grep -nF '      - name: Install rust-script (debug build)' "$workflow" | cut -d: -f1)
+    debug_rust_script_verify_line=$(grep -nF '      - name: Verify rust-script resolves (debug build)' "$workflow" | cut -d: -f1)
+    debug_run_line=$(grep -nF '      - name: Run debug build nodes' "$workflow" | cut -d: -f1)
+    [[ $debug_rust_script_install_line =~ ^[1-9][0-9]*$ &&
+       $debug_rust_script_verify_line =~ ^[1-9][0-9]*$ &&
+       $debug_run_line =~ ^[1-9][0-9]*$ &&
+       $debug_rust_script_install_line -lt $debug_rust_script_verify_line &&
+       $debug_rust_script_verify_line -lt $debug_run_line ]] ||
+        die "GitHub debug build must install and verify rust-script before e2e.metadata"
+    [[ $(grep -Fxc '        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked' "$workflow") == 2 ]] ||
+        die "GitHub portable workflow must pin both debug-build and strict-shard rust-script installs"
+    [[ $(grep -Fxc '            echo "::error::rust-script is not on PATH; e2e.metadata requires ci/run-strict-watchdog.rs."' "$workflow") == 1 ]] ||
+        die "GitHub debug build must name a missing rust-script before entering the DAG"
     # Match the literal command embedded in workflow YAML.
     # shellcheck disable=SC2016
     [[ $(grep -Fxc '          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)' "$workflow") == 1 ]] ||
