@@ -93,7 +93,9 @@ use safe_ci_dag_runner::cgroup::reexec_in_scope;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
+use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
+use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
@@ -2146,6 +2148,23 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
     removed
 }
 
+/// Wall budget for the heavy compatibility PREP nodes, chosen to sit inside an ordered stack:
+///
+/// ```text
+///   inner prep node 420s  <  outer test.strict_compat 600s  <  job timeout 900s  <  observed ~1200s kill
+/// ```
+///
+/// Every bound above the first one destroys evidence when it fires, because per-step rows are
+/// written in a single pass after the DAG returns: a killed process writes NOTHING, and one
+/// missing row is indistinguishable from every missing row. Making the INNERMOST bound the one
+/// that fires is what turns a silent 20-minute cancellation into a normal failure that names the
+/// node it timed out. Keep this strictly below the `test.strict_compat` timeout in
+/// `ci/dag/portable.json`; raising either one without the other re-breaks the ordering.
+///
+/// The individual compatibility rows are unaffected — they come from
+/// `validate_plan::compat_nodes_for` at the corpus default (~60s each), already far inside this.
+const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;
+
 fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
@@ -2156,7 +2175,11 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         // for a reason that has nothing to do with compatibility.
         format!("test -x {}", validate_plan::shell_quote(bin))
     };
-    step_with_caps("compatprep", "hermit_release", "Release Hermit for compatibility", cmd, vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024)
+    // DIAGNOSTIC BUDGET, ordered BELOW the outer `test.strict_compat` node (600s) so the INNER
+    // runner is the one that fires. An inner timeout returns normally and emits a row for every
+    // step including the offender; an outer kill emits nothing at all, because rows are written
+    // once when the DAG returns. 3600s could never fire under a 900s job, so it was not a bound.
+    step_with_caps("compatprep", "hermit_release", "Release Hermit for compatibility", cmd, vec![gate.to_string()], COMPAT_DIAGNOSTIC_WALL_S, COMPAT_DIAGNOSTIC_WALL_S * 2, 16 * 1024 * 1024 * 1024)
 }
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
@@ -2181,8 +2204,9 @@ fn prepare_fixtures_node_dep(
             validate_plan::shell_quote(&fixtures.to_string_lossy())
         ),
         vec![dep.to_string()],
-        900,
-        900,
+        // Ordered below the outer node for the same reason as compatprep.hermit_release.
+        COMPAT_DIAGNOSTIC_WALL_S,
+        COMPAT_DIAGNOSTIC_WALL_S,
         4 * 1024 * 1024 * 1024,
     )
 }
@@ -2596,6 +2620,55 @@ fn read_log_settled(path: &Path) -> String {
 ///   it.** In the bash the retry happened INSIDE the gate, so downstream never
 ///   got skipped; reproducing that here means the retry DAG carries the skipped
 ///   and aborted nodes too, with dependencies restricted to the retry set.
+/// Forward one run's per-step measurement rows to the profile store, when a store is configured.
+///
+/// This driver calls the scheduler as a LIBRARY (`run_dag_boxed_ordered`), which is the whole
+/// reason the rows need forwarding by hand: the runner's CLI resolves a profile directory and
+/// writes the store itself, and the in-process entry point does neither. Without this the lane
+/// produces NO inner per-node rows at all, under any spelling or environment variable — which is
+/// why a hanging inner node could not be named.
+///
+/// The destination is `$RUN_NODE_PERF_DIR`, the directory `ci/run-node.sh` already uses and that
+/// the portable workflow uploads with `if: always()`, so a row set survives a FAILING job. A run
+/// with no such directory configured writes nothing and says nothing — this is diagnostics, not a
+/// gate, and it must never fail a lane that is otherwise fine.
+///
+/// Rows are emitted ONCE, when the DAG returns. A run killed from outside never reaches this and
+/// writes nothing at all, so the whole point of the surrounding budget ordering is to make the
+/// INNER runner the one that fires: it then returns normally with a row for EVERY step, including
+/// the one it timed out, carrying `timed_out=True`.
+fn forward_step_profiles(result: &RunResult, jobs: i64) {
+    let Ok(dir) = std::env::var("RUN_NODE_PERF_DIR") else {
+        return;
+    };
+    if dir.is_empty() || result.step_profile_rows.is_empty() {
+        return;
+    }
+    let git_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match append_step_profiles(
+        Path::new(&dir),
+        &result.step_profile_rows,
+        &git_sha,
+        jobs,
+        None,
+        "unverified",
+        "validate.rs",
+    ) {
+        Some(path) => eprintln!(
+            "validate: wrote {} inner step profile row(s) to {}",
+            result.step_profile_rows.len(),
+            path.display()
+        ),
+        None => eprintln!("validate: could not write inner step profile rows to {dir}"),
+    }
+}
+
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -2606,6 +2679,7 @@ fn run_lane_with_env_retries(
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
     let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    forward_step_profiles(&first, jobs);
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -2671,6 +2745,7 @@ fn run_lane_with_env_retries(
         retry_cfg.steps = steps;
         let again =
             run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        forward_step_profiles(&again, jobs);
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
