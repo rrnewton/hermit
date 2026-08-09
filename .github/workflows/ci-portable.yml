@@ -423,7 +423,10 @@ jobs:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: ${{ env.DEBUG_TARBALL }}
           if-no-files-found: error
-          retention-days: 1
+          # Successful runs delete this eagerly in cleanup. Failed runs retain
+          # it so GitHub's "Re-run failed jobs" attempt can consume the exact
+          # build that failed instead of dying at artifact download.
+          retention-days: 14
 
   # ---------------------- build (release: dbt + sabre + liteinst, ONE warm pass)
   # Consolidated from the former build-dbt-cache -> build-dbt -> build-aux serial
@@ -489,14 +492,14 @@ jobs:
           name: ${{ env.RELEASE_DBT_ARTIFACT }}
           path: ${{ env.RELEASE_TARBALL }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
       - name: Upload full release prebuilt tree (release + e2e + sabre)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
           path: ${{ env.RELEASE_TARBALL }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 14
 
   # ------------------------------------------------- test shards (debug-backed)
   test-debug:
@@ -514,13 +517,14 @@ jobs:
       && needs.build-debug.result == 'success'
       && (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
     runs-on: ubuntu-latest
-    # strict-compat is a 2700s DAG node, and this isolated hosted job must also
-    # cold-compile scripts/validate.rs through rust-script. The first two
-    # production Rust-path attempts (31288960248 and 31290117255) each occupied
-    # the job for 20m before the old 15m step ceiling cancelled them; the test is
-    # independently known to run beyond 16m. Give the measured job wall 3x
-    # headroom and keep the outer wall beyond the 45m node hang detector.
-    timeout-minutes: 60
+    # strict-compat has never been permitted to finish: production attempts hit
+    # the 15m job wall, the 40m job wall, and then the 2700s node wall exactly
+    # (45m17s including teardown). The last value is therefore a censored lower
+    # bound, not a duration estimate. Give the unknown distribution 4x that
+    # demonstrated floor (3h inner) and leave another hour for setup, artifact
+    # transfer, rust-script compilation, and teardown. A genuine hang now fails
+    # slowly; a healthy long run gets to determine its own duration.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
@@ -972,7 +976,17 @@ jobs:
     # Name every artifact consumer directly. In particular, test-debug is a
     # matrix job whose integration shard owns test.cli and the run_dbt_* tests.
     needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]
-    if: always()
+    # Keep the prebuilt inputs after any failed/cancelled consumer so GitHub's
+    # "Re-run failed jobs" path can replay only the failed shards. Successful
+    # and intentionally deselected consumers release them immediately; the
+    # uploads' 14-day retention is only the failure-path fallback.
+    if: >-
+      always()
+      && (needs.test-debug.result == 'success' || needs.test-debug.result == 'skipped')
+      && (needs.test-release.result == 'success' || needs.test-release.result == 'skipped')
+      && (needs.e2e.result == 'success' || needs.e2e.result == 'skipped')
+      && (needs.sabre_non_gated_parity.result == 'success' || needs.sabre_non_gated_parity.result == 'skipped')
+      && needs.regular.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

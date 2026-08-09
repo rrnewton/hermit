@@ -265,6 +265,24 @@ function workflow_job_timeout_minutes {
     ' "$workflow"
 }
 
+function workflow_job_block {
+    local workflow=$1 job=$2
+    awk -v start="  $job:" '
+        $0 == start { inside = 1 }
+        inside && $0 != start && /^  [a-zA-Z0-9_-]+:/ { exit }
+        inside { print }
+    ' "$workflow"
+}
+
+function workflow_artifact_retention_days {
+    local workflow=$1 artifact_name=$2
+    awk -v artifact="          name: $artifact_name" '
+        $0 == artifact { inside = 1; next }
+        inside && /^      - name:/ { exit }
+        inside && /^          retention-days: [0-9]+$/ { print $2; exit }
+    ' "$workflow"
+}
+
 # READ the inner DAG-launcher budget out of the workflow instead of keeping a
 # second copy of the number here.
 #
@@ -304,11 +322,13 @@ function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
     local debug_outer_minutes release_outer_minutes debug_test_outer_minutes
-    local strict_compat_timeout rr_suite_timeout rr_suite_estimate
-    # Terminal Rust-path attempts occupied the strict-compat job for 20m, and
-    # the workload itself is known to exceed 16m. Its 2700s node ceiling and
-    # 60m outer job now retain >2x measured headroom; keep deriving both values
-    # below so neither can silently drift back under the measured workload.
+    local strict_compat_timeout strict_compat_estimate rr_suite_timeout rr_suite_estimate
+    local debug_artifact_retention release_dbt_artifact_retention
+    local release_artifact_retention cleanup_block
+    # strict-compat hit its 2700s node ceiling exactly after earlier 15m and 40m
+    # outer kills. That makes 2700s a censored lower bound. Preserve the chosen
+    # 4x floor (10800s) and the one-hour outer-job allowance; deriving both from
+    # source prevents a stale guard from blessing a smaller deployed value.
     local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
@@ -348,6 +368,10 @@ function assert_parallel_portable_workflow {
     strict_compat_timeout=$(jq -r '
         .steps[] | select(.group == "test" and .job == "strict_compat") | .timeout
     ' "$DAG_ROOT/portable.json")
+    strict_compat_estimate=$(jq -r '
+        .steps[] | select(.group == "test" and .job == "strict_compat")
+        | .hint.est_duration_s
+    ' "$DAG_ROOT/portable.json")
     rr_suite_timeout=$(jq -r '
         .steps[] | select(.group == "test" and .job == "rr_suite_contract") | .timeout
     ' "$DAG_ROOT/portable.json")
@@ -367,10 +391,10 @@ function assert_parallel_portable_workflow {
         die "GitHub debug test shards have no numeric outer timeout"
     [[ $strict_compat_timeout =~ ^[1-9][0-9]*$ ]] ||
         die "portable strict-compat node has no numeric timeout"
-    ((strict_compat_timeout >= 2700)) ||
-        die "portable strict-compat node must retain its measured 2700s floor"
-    ((debug_test_outer_minutes >= 60)) ||
-        die "GitHub debug-test outer timeout must retain its measured 60m floor"
+    ((strict_compat_timeout >= 10800 && strict_compat_estimate >= 3600)) ||
+        die "portable strict-compat must retain its censored-floor-derived 10800s ceiling and 3600s estimate"
+    ((debug_test_outer_minutes >= 240)) ||
+        die "GitHub debug-test outer timeout must retain its 240m failure-path envelope"
     ((rr_suite_timeout >= 600 && rr_suite_estimate >= 120)) ||
         die "rr-suite contract must retain its measured 600s ceiling and 120s estimate"
     ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
@@ -415,6 +439,19 @@ function assert_parallel_portable_workflow {
         die "GitHub portable test shards must lift AppArmor's user-namespace restriction"
     [[ $(grep -Fxc '    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]' "$workflow") == 1 ]] ||
         die "GitHub portable artifact cleanup must wait for every test consumer"
+    debug_artifact_retention=$(workflow_artifact_retention_days "$workflow" '${{ env.DEBUG_ARTIFACT }}')
+    release_dbt_artifact_retention=$(workflow_artifact_retention_days "$workflow" '${{ env.RELEASE_DBT_ARTIFACT }}')
+    release_artifact_retention=$(workflow_artifact_retention_days "$workflow" '${{ env.RELEASE_ARTIFACT }}')
+    [[ $debug_artifact_retention == 14 && $release_dbt_artifact_retention == 14 && $release_artifact_retention == 14 ]] ||
+        die "GitHub portable prebuilt artifacts must survive failed-only reruns for 14 days"
+    cleanup_block=$(workflow_job_block "$workflow" cleanup)
+    for consumer in test-debug test-release e2e sabre_non_gated_parity; do
+        [[ $cleanup_block == *"needs.$consumer.result == 'success'"* &&
+           $cleanup_block == *"needs.$consumer.result == 'skipped'"* ]] ||
+            die "GitHub portable cleanup must retain artifacts when $consumer fails or is cancelled"
+    done
+    [[ $cleanup_block == *"needs.regular.result == 'success'"* ]] ||
+        die "GitHub portable cleanup must retain artifacts unless the required rollup succeeds"
     [[ $(grep -Fxc '  sabre_non_gated_parity:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must retain the SaBRe non-gating diagnostic job"
     [[ $(grep -Fxc '    continue-on-error: true' "$workflow") == 1 ]] ||
