@@ -1916,9 +1916,13 @@ EOF
         die "privileged job timeout (${privileged_job_timeout_minutes}m) must exceed ${privileged_inner_timeout_seconds}s DAG launcher plus ${privileged_non_dag_step_budget}s of other budgeted steps plus ${privileged_unbudgeted_step_allowance_seconds}s for unbudgeted steps (${privileged_job_floor_seconds}s)"
 
     [[ -f $EXPECTED_PLAN ]] || die "missing E2E denominator ratchet: ${EXPECTED_PLAN#"$ROOT_DIR/"}"
-    jq -e '.schema == 1 and (.cells | type == "array" and length > 0)' "$EXPECTED_PLAN" >/dev/null ||
+    jq -e '.schema == 1
+        and (.cells | type == "array" and length > 0)
+        and (.local_full_kvm_cells | type == "array" and length > 0)
+        and all(.local_full_kvm_cells[];
+            .lane == "privileged" and .backend == "kvm")' "$EXPECTED_PLAN" >/dev/null ||
         die "invalid E2E denominator ratchet"
-    local scratch current_plan expected_plan all_buckets
+    local scratch current_plan expected_plan current_local_full_kvm expected_local_full_kvm all_buckets
     scratch=$(mktemp -d)
     current_plan="$scratch/current-plan.json"
     expected_plan="$scratch/expected-plan.json"
@@ -1928,6 +1932,17 @@ EOF
     if ! diff -u "$expected_plan" "$current_plan"; then
         rm -rf "$scratch"
         die "required E2E plan changed; update ci/expected-e2e-plan.json in the same review"
+    fi
+    current_local_full_kvm="$scratch/current-local-full-kvm.json"
+    expected_local_full_kvm="$scratch/expected-local-full-kvm.json"
+    INCLUDE_OCCASIONAL=1 emit_required_plan |
+        jq -sS '[.[] | select(.lane == "privileged" and .backend == "kvm")]
+            | sort_by(.category,.test,.mode,.backend)' >"$current_local_full_kvm"
+    jq -S '.local_full_kvm_cells | sort_by(.category,.test,.mode,.backend)' \
+        "$EXPECTED_PLAN" >"$expected_local_full_kvm"
+    if ! diff -u "$expected_local_full_kvm" "$current_local_full_kvm"; then
+        rm -rf "$scratch"
+        die "local-full KVM plan changed; update ci/expected-e2e-plan.json in the same review"
     fi
     emit_manifest_buckets >"$all_buckets"
 
