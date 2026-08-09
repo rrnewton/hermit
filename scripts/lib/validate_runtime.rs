@@ -40,15 +40,23 @@
 //!   that describe nothing anybody ran.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 
 // ------------------------------------------------------------------ environmental blocks
 
@@ -480,6 +488,946 @@ pub fn claim_active_marker() {
     std::env::set_var(ACTIVE_ENV, std::process::id().to_string());
 }
 
+// ------------------------------------------------------------------ peer snapshot authority
+
+/// The peer-monitor protocol is versioned because its sequence/final-ack rules
+/// are part of the receipt proof, not an implementation detail.
+pub const PEER_MONITOR_PROTOCOL: &str = "sequence-final-ack-v1";
+
+const PF_KTHREAD: u64 = 0x0020_0000;
+
+/// A process existed in the snapshot but could not be classified safely.
+///
+/// This is deliberately distinct from "not a validate".  Unreadable or
+/// malformed evidence is UNKNOWN and must make the whole monitor sticky-
+/// indeterminate; otherwise a persistent unreadable peer is laundered into
+/// proved absence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotUnresolved(pub String);
+
+impl std::fmt::Display for SnapshotUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<SnapshotUnresolved> for String {
+    fn from(error: SnapshotUnresolved) -> Self {
+        error.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessRecord {
+    pid: i32,
+    state: char,
+    ppid: i32,
+    pgid: i32,
+    flags: u64,
+    start_ticks: u64,
+    cgroup: String,
+    cgroup_path: String,
+    systemd_unit: String,
+    systemd_unit_cgroup: String,
+    argv: Vec<String>,
+}
+
+/// Identity persisted for the lock owner and every candidate validate.
+/// Cgroup and unit are both carried because either one alone is a weaker proxy:
+/// a nested safe-ci scope remains owned by the enclosing validate service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerProcessIdentity {
+    pub pid: i32,
+    pub start_ticks: u64,
+    pub pgid: i32,
+    pub cgroup: String,
+    pub cgroup_path: String,
+    pub systemd_unit: String,
+    pub systemd_unit_cgroup: String,
+    pub classification: Option<&'static str>,
+}
+
+impl PeerProcessIdentity {
+    fn from_record(record: &ProcessRecord) -> Self {
+        Self {
+            pid: record.pid,
+            start_ticks: record.start_ticks,
+            pgid: record.pgid,
+            cgroup: record.cgroup.clone(),
+            cgroup_path: record.cgroup_path.clone(),
+            systemd_unit: record.systemd_unit.clone(),
+            systemd_unit_cgroup: record.systemd_unit_cgroup.clone(),
+            classification: None,
+        }
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pid": self.pid,
+            "start_ticks": self.start_ticks,
+            "pgid": self.pgid,
+            "cgroup": self.cgroup,
+            "cgroup_path": self.cgroup_path,
+            "systemd_unit": self.systemd_unit,
+            "systemd_unit_cgroup": self.systemd_unit_cgroup,
+            "classification": self.classification,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerSnapshot {
+    owner: PeerProcessIdentity,
+    same_service: Vec<PeerProcessIdentity>,
+    peers: Vec<PeerProcessIdentity>,
+}
+
+fn parse_proc_stat(text: &str) -> Result<(char, i32, i32, u64, u64), String> {
+    let close = text.rfind(')').ok_or_else(|| "missing stat comm terminator".to_string())?;
+    let fields: Vec<&str> = text[close + 1..].split_whitespace().collect();
+    if fields.len() < 20 {
+        return Err("short stat row".into());
+    }
+    let mut states = fields[0].chars();
+    let state = states.next().ok_or_else(|| "empty stat state".to_string())?;
+    if states.next().is_some() {
+        return Err("malformed stat state".into());
+    }
+    let parse = |index: usize, name: &str| {
+        fields[index]
+            .parse::<i64>()
+            .map_err(|e| format!("malformed stat {name}: {e}"))
+    };
+    let ppid = i32::try_from(parse(1, "ppid")?)
+        .map_err(|_| "stat ppid is outside i32".to_string())?;
+    let pgid = i32::try_from(parse(2, "pgid")?)
+        .map_err(|_| "stat pgid is outside i32".to_string())?;
+    let flags = fields[6]
+        .parse::<u64>()
+        .map_err(|e| format!("malformed stat flags: {e}"))?;
+    let start_ticks = fields[19]
+        .parse::<u64>()
+        .map_err(|e| format!("malformed stat start_ticks: {e}"))?;
+    Ok((state, ppid, pgid, flags, start_ticks))
+}
+
+fn cgroup_identity(text: &str) -> Result<(String, String, String, String), String> {
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    if lines.is_empty() {
+        return Err("empty cgroup identity".into());
+    }
+    let unified = lines.iter().copied().find(|line| line.starts_with("0::")).unwrap_or(lines[0]);
+    let mut pieces = unified.splitn(3, ':');
+    let _hierarchy = pieces.next();
+    let _controllers = pieces.next();
+    let path = pieces.next().ok_or_else(|| "malformed cgroup identity".to_string())?;
+    if !path.starts_with('/') {
+        return Err("malformed cgroup identity".into());
+    }
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    // `user@*.service` is the systemd user manager, not an application
+    // identity.  Prefer the last real application service.  Only when none
+    // exists may the innermost scope stand in for the owning unit.
+    let service = components.iter().enumerate().rev().find(|(_, component)| {
+        component.ends_with(".service") && !component.starts_with("user@")
+    });
+    let scope = components
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, component)| component.ends_with(".scope"));
+    let Some((index, unit)) = service.or(scope) else {
+        // Root/no-unit cgroups are legitimate for kernel threads.  The caller
+        // combines this with stat flags and cmdline before classifying it.
+        return Ok((unified.to_string(), path.to_string(), String::new(), String::new()));
+    };
+    Ok((
+        unified.to_string(),
+        path.to_string(),
+        (*unit).to_string(),
+        format!("/{}", components[..=index].join("/")),
+    ))
+}
+
+fn read_process_record(proc_root: &Path, pid: i32) -> std::io::Result<ProcessRecord> {
+    let process = proc_root.join(pid.to_string());
+    let stat_text = std::fs::read_to_string(process.join("stat"))?;
+    let (state, ppid, pgid, flags, start_ticks) = parse_proc_stat(&stat_text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let cmdline = std::fs::read(process.join("cmdline"))?;
+    let argv: Vec<String> = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            String::from_utf8(part.to_vec()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("cmdline is not UTF-8: {e}"),
+                )
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    if argv.is_empty() && !matches!(state, 'Z' | 'X' | 'x') && flags & PF_KTHREAD == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty cmdline for live userspace process",
+        ));
+    }
+    let cgroup_text = std::fs::read_to_string(process.join("cgroup"))?;
+    let (cgroup, cgroup_path, systemd_unit, systemd_unit_cgroup) =
+        cgroup_identity(&cgroup_text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(ProcessRecord {
+        pid,
+        state,
+        ppid,
+        pgid,
+        flags,
+        start_ticks,
+        cgroup,
+        cgroup_path,
+        systemd_unit,
+        systemd_unit_cgroup,
+        argv,
+    })
+}
+
+fn read_process_start_ticks(proc_root: &Path, pid: i32) -> std::io::Result<u64> {
+    let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))?;
+    parse_proc_stat(&text)
+        .map(|(_, _, _, _, start)| start)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Identity component used to bind the controller and the canonical lock owner
+/// against PID reuse.  Production is hard-bound to `/proc`.
+pub fn process_start_ticks(pid: i32) -> Option<u64> {
+    read_process_start_ticks(Path::new("/proc"), pid).ok()
+}
+
+fn numeric_pids(proc_root: &Path) -> Result<Vec<i32>, SnapshotUnresolved> {
+    let entries = std::fs::read_dir(proc_root)
+        .map_err(|e| SnapshotUnresolved(format!("cannot enumerate {}: {e}", proc_root.display())))?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            SnapshotUnresolved(format!("cannot enumerate {}: {e}", proc_root.display()))
+        })?;
+        if let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    Ok(pids)
+}
+
+fn vanished_after_enoent(proc_root: &Path, pid: i32) -> Result<bool, SnapshotUnresolved> {
+    Ok(!numeric_pids(proc_root)?.contains(&pid))
+}
+
+fn is_direct_validate(argv: &[String]) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    // rust-script preserves the source path in argv on the interpreted path;
+    // direct executable and legacy shell paths are covered too.  Matching a
+    // complete basename avoids treating a command that merely mentions the
+    // word "validate" as a peer.
+    if argv.iter().any(|arg| {
+        matches!(
+            Path::new(arg).file_name().and_then(|name| name.to_str()),
+            Some("validate.rs" | "validate.sh")
+        )
+    }) {
+        return true;
+    }
+    false
+}
+
+fn ancestry(pid: i32, records: &BTreeMap<i32, ProcessRecord>) -> (Vec<i32>, bool) {
+    let mut chain = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = pid;
+    while current > 0 {
+        if !seen.insert(current) {
+            return (chain, false);
+        }
+        chain.push(current);
+        let Some(record) = records.get(&current) else { return (chain, false) };
+        if record.ppid == 0 || record.ppid == current {
+            return (chain, true);
+        }
+        current = record.ppid;
+    }
+    (chain, true)
+}
+
+fn collect_peer_snapshot_with<R, S>(
+    proc_root: &Path,
+    owner_pid: i32,
+    mut record_reader: R,
+    mut start_reader: S,
+) -> Result<PeerSnapshot, SnapshotUnresolved>
+where
+    R: FnMut(&Path, i32) -> std::io::Result<ProcessRecord>,
+    S: FnMut(&Path, i32) -> std::io::Result<u64>,
+{
+    let mut records = BTreeMap::new();
+    for pid in numeric_pids(proc_root)? {
+        match record_reader(proc_root, pid) {
+            Ok(record) => {
+                records.insert(pid, record);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if vanished_after_enoent(proc_root, pid)? {
+                    continue;
+                }
+                return Err(SnapshotUnresolved(format!(
+                    "process PID {pid} evidence disappeared but PID remains visible: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(SnapshotUnresolved(format!(
+                    "process PID {pid} evidence is unreadable or malformed: {error}"
+                )));
+            }
+        }
+    }
+    if owner_pid <= 1 || !records.contains_key(&owner_pid) {
+        return Err(SnapshotUnresolved(format!(
+            "validate-lock owner PID {owner_pid} is not live"
+        )));
+    }
+    let owner_record = records.get(&owner_pid).expect("checked above");
+    if owner_record.systemd_unit.is_empty() || owner_record.systemd_unit_cgroup.is_empty() {
+        return Err(SnapshotUnresolved(format!(
+            "validate-lock owner PID {owner_pid} has no observable systemd unit"
+        )));
+    }
+    let actual: BTreeSet<i32> = records
+        .iter()
+        .filter_map(|(pid, record)| is_direct_validate(&record.argv).then_some(*pid))
+        .collect();
+    let roots: Vec<ProcessRecord> = actual
+        .iter()
+        .filter_map(|pid| {
+            let (chain, _) = ancestry(*pid, &records);
+            (!chain.iter().skip(1).any(|ancestor| actual.contains(ancestor)))
+                .then(|| records.get(pid).expect("actual came from records").clone())
+        })
+        .collect();
+    let owner = PeerProcessIdentity::from_record(owner_record);
+    let mut same_service = Vec::new();
+    let mut peers = Vec::new();
+    for record in roots {
+        if record.systemd_unit.is_empty() || record.systemd_unit_cgroup.is_empty() {
+            return Err(SnapshotUnresolved(format!(
+                "candidate PID {} has no observable systemd unit",
+                record.pid
+            )));
+        }
+        let observed = match start_reader(proc_root, record.pid) {
+            Ok(start) => start,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if vanished_after_enoent(proc_root, record.pid)? {
+                    continue;
+                }
+                return Err(SnapshotUnresolved(format!(
+                    "candidate PID {} identity disappeared but PID remains visible: {error}",
+                    record.pid
+                )));
+            }
+            Err(error) => {
+                return Err(SnapshotUnresolved(format!(
+                    "candidate PID {} identity is unreadable or malformed: {error}",
+                    record.pid
+                )));
+            }
+        };
+        if observed != record.start_ticks {
+            return Err(SnapshotUnresolved(format!(
+                "candidate PID {} changed start_ticks {}->{observed}",
+                record.pid, record.start_ticks
+            )));
+        }
+        let (chain, _) = ancestry(record.pid, &records);
+        let mut identity = PeerProcessIdentity::from_record(&record);
+        if chain.contains(&owner_pid) {
+            identity.classification = Some("owner-ancestry-self");
+            same_service.push(identity);
+        } else if record.systemd_unit == owner.systemd_unit
+            && record.systemd_unit_cgroup == owner.systemd_unit_cgroup
+        {
+            identity.classification = Some("reparented-same-service-self");
+            same_service.push(identity);
+        } else {
+            identity.classification = Some("different-systemd-unit-peer");
+            peers.push(identity);
+        }
+    }
+    Ok(PeerSnapshot { owner, same_service, peers })
+}
+
+fn collect_peer_snapshot(
+    proc_root: &Path,
+    owner_pid: i32,
+) -> Result<PeerSnapshot, SnapshotUnresolved> {
+    collect_peer_snapshot_with(proc_root, owner_pid, read_process_record, read_process_start_ticks)
+}
+
+/// Complete, sticky state carried from the initial scan through final ack.
+#[derive(Clone, Debug)]
+pub struct PeerMonitorState {
+    pub scan_complete: bool,
+    pub indeterminate: bool,
+    pub indeterminate_detail: Option<String>,
+    pub scan_count: u64,
+    pub monitor_ready: bool,
+    pub monitor_pid: i32,
+    pub monitor_sequence: u64,
+    pub final_ack_sequence: Option<u64>,
+    pub exclusion_held: bool,
+    pub owner: Option<PeerProcessIdentity>,
+    pub same_service: Vec<PeerProcessIdentity>,
+    pub peers: Vec<PeerProcessIdentity>,
+}
+
+fn lock_peer_state(state: &Mutex<PeerMonitorState>) -> std::sync::MutexGuard<'_, PeerMonitorState> {
+    // A monitor-thread panic is evidence failure, not permission to skip the
+    // ledger append. Recover the state so the controller can mark it sticky-
+    // indeterminate and persist the one diagnostic row.
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl PeerMonitorState {
+    fn new(monitor_pid: i32, exclusion_held: bool) -> Self {
+        Self {
+            scan_complete: false,
+            indeterminate: false,
+            indeterminate_detail: None,
+            scan_count: 0,
+            monitor_ready: false,
+            monitor_pid,
+            monitor_sequence: 0,
+            final_ack_sequence: None,
+            exclusion_held,
+            owner: None,
+            same_service: Vec::new(),
+            peers: Vec::new(),
+        }
+    }
+
+    pub fn mark_indeterminate(&mut self, detail: impl Into<String>) {
+        self.indeterminate = true;
+        if self.indeterminate_detail.is_none() {
+            self.indeterminate_detail = Some(detail.into());
+        }
+    }
+
+    fn merge_snapshot(&mut self, snapshot: PeerSnapshot) {
+        if self.owner.as_ref().is_some_and(|owner| owner != &snapshot.owner) {
+            self.mark_indeterminate("validate-lock-owner-identity-changed");
+        } else if self.owner.is_none() {
+            self.owner = Some(snapshot.owner);
+        }
+        let mut same: BTreeMap<(i32, u64), PeerProcessIdentity> = self
+            .same_service
+            .drain(..)
+            .map(|identity| ((identity.pid, identity.start_ticks), identity))
+            .collect();
+        for identity in snapshot.same_service {
+            same.insert((identity.pid, identity.start_ticks), identity);
+        }
+        self.same_service = same.into_values().collect();
+        let mut peers: BTreeMap<(i32, u64), PeerProcessIdentity> = self
+            .peers
+            .drain(..)
+            .map(|identity| ((identity.pid, identity.start_ticks), identity))
+            .collect();
+        for identity in snapshot.peers {
+            peers.insert((identity.pid, identity.start_ticks), identity);
+        }
+        self.peers = peers.into_values().collect();
+        self.scan_complete = true;
+        self.scan_count += 1;
+    }
+
+    fn scan(&mut self, proc_root: &Path, owner_pid: i32) {
+        self.monitor_sequence += 1;
+        match collect_peer_snapshot(proc_root, owner_pid) {
+            Ok(snapshot) => self.merge_snapshot(snapshot),
+            Err(error) => {
+                self.scan_complete = false;
+                self.mark_indeterminate(format!("snapshot-unresolved:{error}"));
+            }
+        }
+    }
+
+    pub fn monitor_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scan_complete": self.scan_complete,
+            "scan_count": self.scan_count,
+            "monitor_protocol": PEER_MONITOR_PROTOCOL,
+            "monitor_ready": self.monitor_ready,
+            "monitor_pid": self.monitor_pid,
+            "monitor_sequence": self.monitor_sequence,
+            "final_ack_sequence": self.final_ack_sequence,
+            "exclusion_kind": "kernel-flock",
+            "exclusion_held": self.exclusion_held,
+            "indeterminate": self.indeterminate,
+            "indeterminate_detail": self.indeterminate_detail,
+        })
+    }
+
+    pub fn owner_json(&self) -> serde_json::Value {
+        self.owner.as_ref().map(PeerProcessIdentity::json).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn same_service_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(self.same_service.iter().map(PeerProcessIdentity::json).collect())
+    }
+
+    pub fn peers_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(self.peers.iter().map(PeerProcessIdentity::json).collect())
+    }
+
+    /// A zero is authority-bearing only after a synchronous final scan, exact
+    /// sequence acknowledgement, held kernel exclusion, and no sticky unknown.
+    pub fn qualifies_exclusivity(&self) -> bool {
+        self.scan_complete
+            && !self.indeterminate
+            && self.scan_count >= 2
+            && self.monitor_ready
+            && self.monitor_sequence > 0
+            && self.final_ack_sequence == Some(self.monitor_sequence)
+            && self.exclusion_held
+            && self.owner.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerMonitorEvidence {
+    pub state: PeerMonitorState,
+    pub final_acknowledged: bool,
+}
+
+impl PeerMonitorEvidence {
+    pub fn diagnostic(detail: impl Into<String>) -> Self {
+        let mut state = PeerMonitorState::new(std::process::id() as i32, false);
+        state.mark_indeterminate(detail);
+        Self { state, final_acknowledged: false }
+    }
+}
+
+fn peer_credentials(fd: i32) -> std::io::Result<(i32, u32, u32)> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    if rc != 0 || length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((credentials.pid, credentials.uid, credentials.gid))
+}
+
+fn process_identity_matches(pid: i32, start_ticks: u64) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    read_process_start_ticks(Path::new("/proc"), pid).ok() == Some(start_ticks)
+}
+
+fn write_socket_json(stream: &mut UnixStream, value: serde_json::Value) {
+    let _ = stream.write_all(format!("{}\n", value).as_bytes());
+}
+
+fn handle_peer_request(
+    stream: &mut UnixStream,
+    state: &Arc<Mutex<PeerMonitorState>>,
+    proc_root: &Path,
+    owner_pid: i32,
+    controller_pid: i32,
+    controller_start_ticks: u64,
+    finalized: &mut bool,
+    shutdown: &AtomicBool,
+) {
+    let peer = peer_credentials(stream.as_raw_fd());
+    let authorized = peer.is_ok_and(|(pid, uid, _)| {
+        uid == unsafe { libc::getuid() }
+            && pid == controller_pid
+            && process_identity_matches(pid, controller_start_ticks)
+    });
+    if !authorized {
+        write_socket_json(
+            stream,
+            serde_json::json!({"ok": false, "error": "unauthorized-controller"}),
+        );
+        return;
+    }
+    let mut request = [0u8; 64];
+    let amount = stream.read(&mut request).unwrap_or(0);
+    let command = std::str::from_utf8(&request[..amount]).unwrap_or("").trim();
+    match command {
+        "probe" if !*finalized => {
+            let state = state.lock().expect("peer monitor state poisoned");
+            write_socket_json(
+                stream,
+                serde_json::json!({
+                    "ok": true,
+                    "protocol": PEER_MONITOR_PROTOCOL,
+                    "monitor_pid": state.monitor_pid,
+                    "sequence": state.monitor_sequence,
+                    "exclusion_held": state.exclusion_held,
+                }),
+            );
+        }
+        "final" if !*finalized => {
+            let mut state = state.lock().expect("peer monitor state poisoned");
+            state.scan(proc_root, owner_pid);
+            state.final_ack_sequence = Some(state.monitor_sequence);
+            *finalized = true;
+            write_socket_json(
+                stream,
+                serde_json::json!({
+                    "ok": true,
+                    "protocol": PEER_MONITOR_PROTOCOL,
+                    "monitor_pid": state.monitor_pid,
+                    "ack_sequence": state.monitor_sequence,
+                    "scan_complete": state.scan_complete,
+                    "indeterminate": state.indeterminate,
+                    "exclusion_held": state.exclusion_held,
+                }),
+            );
+        }
+        "shutdown" => {
+            shutdown.store(true, Ordering::Release);
+            write_socket_json(stream, serde_json::json!({"ok": true}));
+        }
+        _ => write_socket_json(
+            stream,
+            serde_json::json!({"ok": false, "error": "invalid-or-replayed-request"}),
+        ),
+    }
+}
+
+fn monitor_thread(
+    listener: UnixListener,
+    state: Arc<Mutex<PeerMonitorState>>,
+    proc_root: PathBuf,
+    owner_pid: i32,
+    controller_pid: i32,
+    controller_start_ticks: u64,
+    shutdown: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) {
+    {
+        let mut state = state.lock().expect("peer monitor state poisoned");
+        // Initial failure is sticky, but does not skip monitor setup: the live
+        // sequence and final refusal remain observable and auditable.
+        state.scan(&proc_root, owner_pid);
+        state.monitor_ready = true;
+    }
+    let _ = ready.send(());
+    let mut finalized = false;
+    let mut next_scan = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((mut stream, _)) => handle_peer_request(
+                &mut stream,
+                &state,
+                &proc_root,
+                owner_pid,
+                controller_pid,
+                controller_start_ticks,
+                &mut finalized,
+                &shutdown,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => {
+                state
+                    .lock()
+                    .expect("peer monitor state poisoned")
+                    .mark_indeterminate(format!("monitor-accept-failed:{error}"));
+                break;
+            }
+        }
+        if !finalized && std::time::Instant::now() >= next_scan {
+            state
+                .lock()
+                .expect("peer monitor state poisoned")
+                .scan(&proc_root, owner_pid);
+            next_scan = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Long-lived peer monitor.  Its kernel flock covers the interval between
+/// scans; its final sequence acknowledgement proves progress without guessing
+/// from elapsed time.
+pub struct PeerSnapshotMonitor {
+    socket: PathBuf,
+    state: Arc<Mutex<PeerMonitorState>>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    expected_monitor_pid: i32,
+    // Kept by the controller so exclusion coverage survives monitor-thread
+    // failure and remains held until after the ledger append.
+    _exclusion: File,
+}
+
+impl PeerSnapshotMonitor {
+    fn start_at(
+        proc_root: PathBuf,
+        exclusion_path: PathBuf,
+        socket: PathBuf,
+        owner_pid: i32,
+        controller_pid: i32,
+        controller_start_ticks: u64,
+    ) -> Result<Self, SnapshotUnresolved> {
+        if owner_pid <= 1 || controller_pid <= 1 || controller_start_ticks == 0 {
+            return Err(SnapshotUnresolved("invalid peer-monitor owner/controller identity".into()));
+        }
+        if socket.exists() {
+            return Err(SnapshotUnresolved(format!(
+                "peer monitor control socket already exists: {}",
+                socket.display()
+            )));
+        }
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SnapshotUnresolved(format!("cannot create peer monitor socket directory: {e}"))
+            })?;
+        }
+        if let Some(parent) = exclusion_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SnapshotUnresolved(format!("cannot create peer exclusion directory: {e}"))
+            })?;
+        }
+        let exclusion = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclusion_path)
+            .map_err(|e| SnapshotUnresolved(format!("cannot open peer exclusion lock: {e}")))?;
+        let exclusion_held = flock_nb(exclusion.as_raw_fd());
+        let listener = UnixListener::bind(&socket)
+            .map_err(|e| SnapshotUnresolved(format!("cannot bind peer monitor socket: {e}")))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| SnapshotUnresolved(format!("cannot set peer monitor nonblocking: {e}")))?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| SnapshotUnresolved(format!("cannot protect peer monitor socket: {e}")))?;
+        let monitor_pid = std::process::id() as i32;
+        let state = Arc::new(Mutex::new(PeerMonitorState::new(monitor_pid, exclusion_held)));
+        if !exclusion_held {
+            state
+                .lock()
+                .expect("peer monitor state poisoned")
+                .mark_indeterminate("peer-exclusion-lock-contended");
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let thread_state = state.clone();
+        let thread_shutdown = shutdown.clone();
+        let thread = std::thread::spawn(move || {
+            monitor_thread(
+                listener,
+                thread_state,
+                proc_root,
+                owner_pid,
+                controller_pid,
+                controller_start_ticks,
+                thread_shutdown,
+                ready_tx,
+            )
+        });
+        if ready_rx.recv_timeout(std::time::Duration::from_secs(600)).is_err() {
+            shutdown.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&socket);
+            let _ = thread.join();
+            let _ = std::fs::remove_file(&socket);
+            return Err(SnapshotUnresolved(
+                "peer monitor died or exceeded the operational ceiling before initial sequence acknowledgement"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            socket,
+            state,
+            shutdown,
+            thread: Some(thread),
+            expected_monitor_pid: monitor_pid,
+            _exclusion: exclusion,
+        })
+    }
+
+    /// Production hard-binds `/proc` and the uid-derived runtime lock.  There is
+    /// intentionally no environment override for either authority input.
+    pub fn start_production(
+        socket_dir: &Path,
+        owner_pid: i32,
+        controller_start_ticks: u64,
+    ) -> Result<Self, SnapshotUnresolved> {
+        let uid = unsafe { libc::getuid() };
+        let runtime = PathBuf::from(format!("/run/user/{uid}"));
+        if !runtime.is_dir() {
+            return Err(SnapshotUnresolved(format!(
+                "canonical runtime directory is unavailable: {}",
+                runtime.display()
+            )));
+        }
+        Self::start_at(
+            PathBuf::from("/proc"),
+            runtime.join("hermit-validate-peer-snapshot.lock"),
+            socket_dir.join("peer-monitor.sock"),
+            owner_pid,
+            std::process::id() as i32,
+            controller_start_ticks,
+        )
+    }
+
+    /// Explicit stop-test-only constructor.  The production call site never
+    /// accepts a proc root or lock path from the caller; this seam is reached
+    /// only after [`stop_test_requested`] has diverted execution away from the
+    /// product/authority path.
+    pub fn start_fixture(
+        proc_root: &Path,
+        exclusion_path: &Path,
+        socket: &Path,
+        owner_pid: i32,
+        controller_start_ticks: u64,
+    ) -> Result<Self, SnapshotUnresolved> {
+        Self::start_at(
+            proc_root.to_path_buf(),
+            exclusion_path.to_path_buf(),
+            socket.to_path_buf(),
+            owner_pid,
+            std::process::id() as i32,
+            controller_start_ticks,
+        )
+    }
+
+    fn request(&self, command: &str) -> Result<serde_json::Value, SnapshotUnresolved> {
+        let mut stream = UnixStream::connect(&self.socket).map_err(|e| {
+            SnapshotUnresolved(format!("peer monitor {command} connect failed: {e}"))
+        })?;
+        let ceiling = Some(std::time::Duration::from_secs(600));
+        stream.set_read_timeout(ceiling).map_err(|e| {
+            SnapshotUnresolved(format!("peer monitor {command} read timeout setup failed: {e}"))
+        })?;
+        stream.set_write_timeout(ceiling).map_err(|e| {
+            SnapshotUnresolved(format!("peer monitor {command} write timeout setup failed: {e}"))
+        })?;
+        let (server_pid, server_uid, _) = peer_credentials(stream.as_raw_fd())
+            .map_err(|e| SnapshotUnresolved(format!("peer monitor identity unavailable: {e}")))?;
+        if server_pid != self.expected_monitor_pid || server_uid != unsafe { libc::getuid() } {
+            return Err(SnapshotUnresolved("peer monitor kernel identity mismatch".into()));
+        }
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .map_err(|e| SnapshotUnresolved(format!("peer monitor {command} write failed: {e}")))?;
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|e| SnapshotUnresolved(format!("peer monitor {command} read failed: {e}")))?;
+        serde_json::from_str(response.trim()).map_err(|e| {
+            SnapshotUnresolved(format!("peer monitor {command} response malformed: {e}"))
+        })
+    }
+
+    pub fn probe(&self) -> Result<u64, SnapshotUnresolved> {
+        let value = self.request("probe")?;
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || value.get("protocol").and_then(serde_json::Value::as_str)
+                != Some(PEER_MONITOR_PROTOCOL)
+            || value.get("monitor_pid").and_then(serde_json::Value::as_i64)
+                != Some(self.expected_monitor_pid as i64)
+        {
+            return Err(SnapshotUnresolved("peer monitor probe response refused".into()));
+        }
+        value
+            .get("sequence")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| SnapshotUnresolved("peer monitor probe sequence missing".into()))
+    }
+
+    pub fn exclusion_held(&self) -> bool {
+        lock_peer_state(&self.state).exclusion_held
+    }
+
+    pub fn mark_indeterminate(&self, detail: impl Into<String>) {
+        lock_peer_state(&self.state).mark_indeterminate(detail);
+    }
+
+    fn request_final(&self) -> Result<u64, SnapshotUnresolved> {
+        let value = self.request("final")?;
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || value.get("protocol").and_then(serde_json::Value::as_str)
+                != Some(PEER_MONITOR_PROTOCOL)
+            || value.get("monitor_pid").and_then(serde_json::Value::as_i64)
+                != Some(self.expected_monitor_pid as i64)
+        {
+            return Err(SnapshotUnresolved("peer monitor final response refused".into()));
+        }
+        value
+            .get("ack_sequence")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| SnapshotUnresolved("peer monitor final ack missing".into()))
+    }
+
+    fn stop_thread(&mut self) {
+        // Wake the nonblocking loop promptly.  The request is authenticated by
+        // the kernel exactly like final/probe; failure is harmless because the
+        // loop also observes `shutdown` directly.
+        let _ = self.request("shutdown");
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                lock_peer_state(&self.state).mark_indeterminate("monitor-thread-panicked");
+            }
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+
+    /// Take the synchronous final snapshot but keep the monitor socket and
+    /// exclusion flock alive. The caller retains this guard through the ledger
+    /// append, closing the post-ack/pre-receipt peer-start window.
+    pub fn final_ack(&mut self) -> PeerMonitorEvidence {
+        let ack = self.request_final();
+        if let Err(error) = &ack {
+            lock_peer_state(&self.state)
+                .mark_indeterminate(format!("monitor-final-ack-missing:{error}"));
+        }
+        let mut state = lock_peer_state(&self.state).clone();
+        let acknowledged = ack.is_ok_and(|sequence| {
+            state.final_ack_sequence == Some(sequence) && state.monitor_sequence == sequence
+        });
+        if !self.thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            state.mark_indeterminate("monitor-died-after-final-ack");
+        }
+        if !acknowledged {
+            state.mark_indeterminate("monitor-final-sequence-mismatch");
+        }
+        PeerMonitorEvidence { state, final_acknowledged: acknowledged }
+    }
+
+}
+
+impl Drop for PeerSnapshotMonitor {
+    fn drop(&mut self) {
+        self.stop_thread();
+    }
+}
+
 // ------------------------------------------------------------------ per-checkout invocation lock
 
 /// A held, kernel-backed exclusive lock on this checkout's validate slot.
@@ -764,6 +1712,8 @@ pub const STOP_TEST_MAX_SECONDS_DEFAULT: f64 = 300.0;
 /// Why the stop-test fixture stopped parking.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StopTestExit {
+    /// Fixture-only clean release after synthetic gates passed.
+    SuccessReleased,
     /// `VALIDATE_STOP_TEST_EXIT_EARLY=1`: an ordinary incomplete exit, NOT a stop.
     EarlyExit,
     /// A stop signal arrived (the case the fixture exists to exercise).
@@ -783,6 +1733,13 @@ pub fn stop_test_park(interrupted: fn() -> Option<&'static str>) -> StopTestExit
     let max = env_f64("VALIDATE_STOP_TEST_MAX_SECONDS", STOP_TEST_MAX_SECONDS_DEFAULT);
     let start = std::time::Instant::now();
     loop {
+        if env_is("VALIDATE_STOP_TEST_SUCCESS_RELEASE", "1") {
+            if let Ok(path) = std::env::var("VALIDATE_STOP_TEST_RELEASE_FILE") {
+                if !path.is_empty() && Path::new(&path).is_file() {
+                    return StopTestExit::SuccessReleased;
+                }
+            }
+        }
         if interrupted().is_some() {
             return StopTestExit::Signalled;
         }
@@ -834,6 +1791,38 @@ pub fn enter_cleanup_critical_section() {
 }
 
 // ------------------------------------------------------------------ self-test
+
+#[allow(clippy::too_many_arguments)]
+fn write_fake_process(
+    root: &Path,
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    start_ticks: u64,
+    argv: &[&str],
+    cgroup: &str,
+    flags: u64,
+) -> Result<(), String> {
+    let process = root.join(pid.to_string());
+    std::fs::create_dir_all(&process).map_err(|e| format!("fake proc {pid}: {e}"))?;
+    let mut fields = vec!["0".to_string(); 20];
+    fields[0] = "S".into();
+    fields[1] = ppid.to_string();
+    fields[2] = pgid.to_string();
+    fields[6] = flags.to_string();
+    fields[19] = start_ticks.to_string();
+    std::fs::write(process.join("stat"), format!("{pid} (fixture) {}\n", fields.join(" ")))
+        .map_err(|e| format!("fake proc {pid} stat: {e}"))?;
+    let mut cmdline = argv.join("\0").into_bytes();
+    if !cmdline.is_empty() {
+        cmdline.push(0);
+    }
+    std::fs::write(process.join("cmdline"), cmdline)
+        .map_err(|e| format!("fake proc {pid} cmdline: {e}"))?;
+    std::fs::write(process.join("cgroup"), format!("0::{cgroup}\n"))
+        .map_err(|e| format!("fake proc {pid} cgroup: {e}"))?;
+    Ok(())
+}
 
 /// Inert two-sided brackets for everything in this module.
 ///
@@ -1011,6 +2000,197 @@ pub fn self_test() -> Result<String, String> {
         None => std::env::remove_var(ACTIVE_ENV),
     }
 
+    // ---- identity-safe /proc peer snapshots -------------------------------
+    let peer_sandbox = std::env::temp_dir().join(format!(
+        "validate-peer-snapshot-selftest-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&peer_sandbox);
+    let peer_proc = peer_sandbox.join("proc");
+    std::fs::create_dir_all(&peer_proc).map_err(|e| format!("peer fixture: {e}"))?;
+    write_fake_process(&peer_proc, 1, 0, 1, 1, &[], "/", PF_KTHREAD)?;
+    write_fake_process(
+        &peer_proc,
+        10,
+        1,
+        10,
+        10,
+        &["ci-hub", "validate-lock"],
+        "/user.slice/user@1000.service/app.slice/validate-X.service",
+        0,
+    )?;
+    // Realistic same-service case: a reparented validation nested under a
+    // safe-ci scope still belongs to validate-X.service and is SELF.
+    write_fake_process(
+        &peer_proc,
+        20,
+        1,
+        20,
+        20,
+        &["/slot/scripts/validate.rs", "full"],
+        "/user.slice/user@1000.service/app.slice/validate-X.service/safe-ci-A.scope",
+        0,
+    )?;
+    // Different application service is an external peer even under the same
+    // user manager.
+    write_fake_process(
+        &peer_proc,
+        40,
+        1,
+        40,
+        40,
+        &["/other/scripts/validate.rs", "full"],
+        "/user.slice/user@1000.service/app.slice/validate-Z.service/safe-ci-B.scope",
+        0,
+    )?;
+    let peer_snapshot = collect_peer_snapshot(&peer_proc, 10)?;
+    if peer_snapshot.owner.systemd_unit != "validate-X.service"
+        || peer_snapshot.same_service.len() != 1
+        || peer_snapshot.same_service[0].classification != Some("reparented-same-service-self")
+        || peer_snapshot.peers.len() != 1
+        || peer_snapshot.peers[0].systemd_unit != "validate-Z.service"
+    {
+        return Err(format!("
+            peer identity: expected 1 same-service self + 1 different-unit peer, got \
+             {peer_snapshot:?}"
+        ));
+    }
+
+    // Genuine exit race: the PID disappears from the numeric directory set
+    // after enumeration, so absence is proved and must NOT become indeterminate.
+    let exit_proc = peer_sandbox.join("exit-race-proc");
+    std::fs::create_dir_all(&exit_proc).map_err(|e| format!("exit fixture: {e}"))?;
+    for pid in [1, 10, 20, 40] {
+        let source = peer_proc.join(pid.to_string());
+        let target = exit_proc.join(pid.to_string());
+        std::fs::create_dir_all(&target).map_err(|e| format!("exit fixture {pid}: {e}"))?;
+        for name in ["stat", "cmdline", "cgroup"] {
+            std::fs::copy(source.join(name), target.join(name))
+                .map_err(|e| format!("exit fixture {pid}/{name}: {e}"))?;
+        }
+    }
+    let exit_snapshot = collect_peer_snapshot_with(
+        &exit_proc,
+        10,
+        |root, pid| {
+            if pid == 40 {
+                std::fs::remove_dir_all(root.join("40"))?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "planted genuine exit race",
+                ));
+            }
+            read_process_record(root, pid)
+        },
+        read_process_start_ticks,
+    )?;
+    if !exit_snapshot.peers.is_empty() {
+        return Err(format!("peer exit race: vanished PID remained a peer: {exit_snapshot:?}"));
+    }
+
+    // Persistent unreadable numeric PID: UNKNOWN, not absent.  A later clean
+    // snapshot cannot recover the sticky state to authority.
+    let unresolved = collect_peer_snapshot_with(
+        &peer_proc,
+        10,
+        |root, pid| {
+            if pid == 40 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted unreadable numeric PID",
+                ));
+            }
+            read_process_record(root, pid)
+        },
+        read_process_start_ticks,
+    )
+    .expect_err("persistent unreadable process must be unresolved");
+    if !unresolved.0.contains("PID 40") || !unresolved.0.contains("unreadable or malformed") {
+        return Err(format!("peer unresolved: wrong refusal detail: {unresolved}"));
+    }
+    let mut sticky = PeerMonitorState::new(std::process::id() as i32, true);
+    sticky.mark_indeterminate(format!("snapshot-unresolved:{unresolved}"));
+    sticky.merge_snapshot(peer_snapshot.clone());
+    if !sticky.indeterminate || sticky.indeterminate_detail.is_none() {
+        return Err("peer unresolved: later readable scan recovered sticky authority".into());
+    }
+
+    // ---- liveness protocol: sequence/final ack + SO_PEERCRED ---------------
+    let controller_pid = std::process::id() as i32;
+    let controller_start = read_process_start_ticks(Path::new("/proc"), controller_pid)
+        .map_err(|e| format!("peer monitor controller identity: {e}"))?;
+    // Remove the true external peer so the accepted final proves a zero.
+    std::fs::remove_dir_all(peer_proc.join("40"))
+        .map_err(|e| format!("peer monitor fixture remove external: {e}"))?;
+    let mut peer_monitor = PeerSnapshotMonitor::start_at(
+        peer_proc.clone(),
+        peer_sandbox.join("peer-exclusion.lock"),
+        peer_sandbox.join("peer-monitor.sock"),
+        10,
+        controller_pid,
+        controller_start,
+    )?;
+    if peer_monitor.probe()? == 0 {
+        return Err("peer monitor: initial sequence acknowledgement was zero".into());
+    }
+    // A separate process has the same uid but is not the expected controller.
+    // Its final request must be refused without consuming the sequence.
+    let attacker = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); \
+             s.sendall(b'final\\n'); print(s.recv(4096).decode()); s.close()",
+        )
+        .arg(&peer_monitor.socket)
+        .output()
+        .map_err(|e| format!("peer monitor same-uid negative: {e}"))?;
+    let attacker_response = String::from_utf8_lossy(&attacker.stdout);
+    if !attacker.status.success() || !attacker_response.contains("unauthorized-controller") {
+        return Err(format!(
+            "peer monitor: same-uid non-owner was not explicitly refused: status={} out={attacker_response:?} err={:?}",
+            attacker.status,
+            String::from_utf8_lossy(&attacker.stderr)
+        ));
+    }
+    if peer_monitor
+        .state
+        .lock()
+        .map_err(|_| "peer monitor state poisoned".to_string())?
+        .final_ack_sequence
+        .is_some()
+    {
+        return Err("peer monitor: unauthorized caller consumed final sequence".into());
+    }
+    let ack = peer_monitor.request_final()?;
+    let accepted_state = peer_monitor
+        .state
+        .lock()
+        .map_err(|_| "peer monitor state poisoned".to_string())?
+        .clone();
+    if accepted_state.final_ack_sequence != Some(ack) || !accepted_state.qualifies_exclusivity() {
+        return Err(format!(
+            "peer monitor: legitimate final did not qualify: {accepted_state:?}"
+        ));
+    }
+    let before_replay = (
+        accepted_state.monitor_sequence,
+        accepted_state.final_ack_sequence,
+    );
+    if peer_monitor.request_final().is_ok() {
+        return Err("peer monitor: replayed final request was accepted".into());
+    }
+    let after_replay = peer_monitor
+        .state
+        .lock()
+        .map_err(|_| "peer monitor state poisoned".to_string())?
+        .clone();
+    if (after_replay.monitor_sequence, after_replay.final_ack_sequence) != before_replay {
+        return Err("peer monitor: replay mutated the acknowledged sequence".into());
+    }
+    peer_monitor.stop_thread();
+    drop(peer_monitor);
+    let _ = std::fs::remove_dir_all(&peer_sandbox);
+
     // ---- the invocation lock, BOTH directions, in a private sandbox ----
     //
     // Both directions matter equally: a guard that refuses the sequential case
@@ -1106,6 +2286,8 @@ pub fn self_test() -> Result<String, String> {
          (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
-         registry census 1 live / 1 stale-reaped / 1 cpu-active"
+         registry census 1 live / 1 stale-reaped / 1 cpu-active, peer identity 1 same-service \
+         self / 1 different-unit peer, peer scan 1 genuine-exit accept / 1 persistent-unreadable \
+         sticky-refuse, monitor 1 legitimate final-ack / 1 same-uid non-owner refuse / 1 replay-refuse"
     ))
 }
