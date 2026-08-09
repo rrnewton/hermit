@@ -810,6 +810,16 @@ function emit_manifest_buckets {
     done | jq -sS 'unique | sort_by(.lane,.category)'
 }
 
+# A hermit-cli test binary CI never names is never executed, and nothing else
+# says so -- it neither fails nor passes, it is simply absent from the accounting.
+# The audit derives what EXISTS from `git ls-files`, never from its own
+# declarations file, so a new binary is refused on arrival whether or not anyone
+# remembers to declare it.
+function audit_test_binary_registration {
+    python3 "$ROOT_DIR/ci/audit-test-binary-registration.py" ||
+        die "undeclared hermit-cli test binaries (see above)"
+}
+
 function audit_ci_correspondence {
     local lane dag
 
@@ -2051,6 +2061,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_test_binary_registration
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
@@ -2082,6 +2093,9 @@ case "$subcommand" in
         ;;
     audit-ci)
         audit_ci_correspondence
+        ;;
+    audit-test-binary-registration)
+        audit_test_binary_registration
         ;;
     *)
         usage
