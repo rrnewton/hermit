@@ -1205,5 +1205,21 @@
       "test": "system-utils/uuidgen-random"
     }
   ],
+  "local_full_kvm_cells": [
+    {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-python-examples"
+    },
+    {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-shell-environment"
+    }
+  ],
   "schema": 1
 }
