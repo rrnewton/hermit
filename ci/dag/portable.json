@@ -478,14 +478,50 @@
                "classification": "latency-bound"}
     },
     {
-      "group": "test", "job": "strict_compat",
-      "desc": "Portable strict compatibility envelope (blocking L2 matrix with bounded diagnostics)",
-      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --no-label-pr --verbose \"${acf[@]}\"",
+      "group": "test", "job": "strict_compat_1",
+      "desc": "Portable strict compatibility shard 1/4 (blocking L2 matrix; 47/187 rows)",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --compat-shard 1/4 --no-label-pr --verbose \"${acf[@]}\"",
       "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
                "test.regular_crates",
                "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
-      "timeout": 10800,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 3600,
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 900,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "strict_compat_2",
+      "desc": "Portable strict compatibility shard 2/4 (blocking L2 matrix; 47/187 rows)",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --compat-shard 2/4 --no-label-pr --verbose \"${acf[@]}\"",
+      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates",
+               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 900,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "strict_compat_3",
+      "desc": "Portable strict compatibility shard 3/4 (blocking L2 matrix; 47/187 rows)",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --compat-shard 3/4 --no-label-pr --verbose \"${acf[@]}\"",
+      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates",
+               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 900,
+               "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
+               "classification": "latency-bound"}
+    },
+    {
+      "group": "test", "job": "strict_compat_4",
+      "desc": "Portable strict compatibility shard 4/4 (blocking L2 matrix; 46/187 rows)",
+      "cmd": "acf=(); if [ -n \"${GITHUB_ACTIONS:-}\" ] || [ -n \"${CI:-}\" ]; then acf=(--allow-cgroup-failure); fi; STRICT_COMPAT_HERMIT_BIN=$PWD/target/ci/hermit-strict ./scripts/validate.rs --portable-strict-compat-only --compat-shard 4/4 --no-label-pr --verbose \"${acf[@]}\"",
+      "deps": ["build.runtime_release", "lint.clippy", "doc.doctests", "doc.rustdoc",
+               "test.regular_crates",
+               "test.hermit_unit", "test.detcore_unit", "test.rr_suite_contract"],
+      "timeout": 1800,
+      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 900,
                "rss_baseline_bytes": 12884901888, "hard_mem_max_bytes": 25769803776,
                "classification": "latency-bound"}
     }

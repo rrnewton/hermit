@@ -85,7 +85,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "common/test-allocator/**/*.rs",
@@ -133,7 +136,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "detcore/**",
@@ -214,7 +220,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "detcore-model/**/*.rs",
@@ -282,7 +291,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "detcore/tests/testutils/**/*.rs",
@@ -345,7 +357,10 @@
         "test.liteinst_strict",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "hermit-cli/**",
@@ -391,7 +406,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "hermit-install/**",
@@ -437,7 +455,10 @@
         "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "paths": [
         "hermit-resources/**/*.rs",

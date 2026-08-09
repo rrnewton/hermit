@@ -115,16 +115,20 @@ deliberate exceptions, chosen to avoid duplicating script logic that has many
 moving parts:
 
 - **Composite envelope gates reuse `scripts/validate.rs`'s own standalone entrypoints**
-  so there is one source of truth: `test.strict_compat` runs
-  `./scripts/validate.rs --portable-strict-compat-only`, and (privileged) `rr.compat_baseline`
+  so there is one source of truth: `test.strict_compat_{1,2,3,4}` run the four
+  disjoint `./scripts/validate.rs --portable-strict-compat-only --compat-shard N/4`
+  partitions, and (privileged) `rr.compat_baseline`
   runs `./scripts/validate.rs --rr-compat-only`. The privileged selector builds release;
   portable strict compatibility reuses `STRICT_COMPAT_HERMIT_BIN` from the
   preceding workspace build. Without that override, the strict flag builds
-  release as before.
+  release as before. The driver asserts each shard's assigned denominator and
+  self-tests that the four-way union is exactly the unsharded 187-row portable
+  corpus with no overlap. GitHub's matrix result and the required `regular`
+  aggregate therefore fail closed if any partition is missing or incomplete.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
-- **Portable strict compatibility starts after every non-guest Cargo node** so
+- **Every portable strict compatibility shard starts after every non-guest Cargo node** so
   its `shell-build` run1/run2 comparison cannot observe concurrent target or
   cache mutation. Those short nodes still run in parallel before the barrier.
 - **Hermit integration targets use one Cargo invocation** with repeated

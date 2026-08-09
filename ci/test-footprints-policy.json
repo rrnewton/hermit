@@ -72,7 +72,10 @@
         "test.applications_e2e",
         "test.dbt_parity",
         "test.envelope_levels",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "e2e_all": true
     },
@@ -107,7 +110,10 @@
         "test.liteinst_strict",
         "test.rr_suite_contract",
         "test.sabre_examples",
-        "test.strict_compat"
+        "test.strict_compat_1",
+        "test.strict_compat_2",
+        "test.strict_compat_3",
+        "test.strict_compat_4"
       ],
       "e2e_all": true
     },

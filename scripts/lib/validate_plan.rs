@@ -95,6 +95,41 @@ pub enum CompatMode {
     Rr,
 }
 
+/// One deterministic partition of a compatibility corpus.
+///
+/// The public spelling is one-based (`1/4`), while `index` is stored zero-based
+/// so corpus ordinal `n` belongs to exactly one shard via `n % total`. Applying
+/// the partition only after mode-specific exclusions makes the shard union
+/// exactly equal to the unsharded executable denominator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CompatShard {
+    index: usize,
+    total: usize,
+}
+
+impl CompatShard {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let Some((index, total)) = spec.split_once('/') else {
+            return Err(format!("compat shard must be INDEX/TOTAL, got {spec:?}"));
+        };
+        let index = index.parse::<usize>()
+            .map_err(|_| format!("compat shard index must be an integer, got {index:?}"))?;
+        let total = total.parse::<usize>()
+            .map_err(|_| format!("compat shard total must be an integer, got {total:?}"))?;
+        if total < 2 {
+            return Err("compat shard total must be at least 2".into());
+        }
+        if index == 0 || index > total {
+            return Err(format!("compat shard index must be between 1 and {total}, got {index}"));
+        }
+        Ok(Self { index: index - 1, total })
+    }
+
+    pub fn one_based(self) -> usize { self.index + 1 }
+    pub fn total(self) -> usize { self.total }
+    pub fn selects(self, ordinal: usize) -> bool { ordinal % self.total == self.index }
+}
+
 impl CompatMode {
     /// The `ci/compat/corpus-<mode>.json` file this mode reads. `PortableStrict`
     /// shares `strict`'s corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the Hermit
@@ -361,8 +396,9 @@ pub fn compat_nodes(
     nsswitch: &str,
     paths: &CorpusPaths,
     gate_dep: Option<&str>,
+    shard: Option<CompatShard>,
 ) -> Result<Vec<Step>, String> {
-    compat_nodes_for(root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None)
+    compat_nodes_for(root, mode, hermit_bin, nsswitch, paths, gate_dep, None, None, shard)
 }
 
 /// [`compat_nodes`] with two extra knobs used by the `super` suite's
@@ -387,11 +423,13 @@ pub fn compat_nodes_for(
     gate_dep: Option<&str>,
     only: Option<&std::collections::BTreeSet<String>>,
     wall_override: Option<i64>,
+    shard: Option<CompatShard>,
 ) -> Result<Vec<Step>, String> {
     let rows = validate_corpus::load(root, mode.corpus_name(), paths)?;
     let rr_allowed: Vec<&str> = validate_corpus::RR_PASSING_LABELS.to_vec();
     let super_only = validate_corpus::portable_super_only();
     let mut out = Vec::new();
+    let mut eligible_ordinal = 0usize;
     for row in rows {
         if let Some(keep) = only {
             if !keep.contains(&row.label) {
@@ -412,6 +450,11 @@ pub fn compat_nodes_for(
         {
             continue;
         }
+        let ordinal = eligible_ordinal;
+        eligible_ordinal += 1;
+        if shard.is_some_and(|s| !s.selects(ordinal)) {
+            continue;
+        }
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
         argv.extend(mode.run_args(&row.label, nsswitch));
         argv.extend(row.argv.iter().cloned());
@@ -428,7 +471,11 @@ pub fn compat_nodes_for(
         ));
     }
     if out.is_empty() {
-        return Err(format!("compatibility mode {mode:?} selected zero probes"));
+        return Err(format!(
+            "compatibility mode {mode:?}{} selected zero probes",
+            shard.map(|s| format!(" shard {}/{}", s.one_based(), s.total()))
+                .unwrap_or_default()
+        ));
     }
     Ok(out)
 }

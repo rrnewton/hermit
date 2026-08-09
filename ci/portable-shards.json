@@ -84,10 +84,20 @@
       ]
     },
     {
-      "slug": "strict-compat",
-      "nodes": [
-        "test.strict_compat"
-      ]
+      "slug": "strict-compat-1",
+      "nodes": ["test.strict_compat_1"]
+    },
+    {
+      "slug": "strict-compat-2",
+      "nodes": ["test.strict_compat_2"]
+    },
+    {
+      "slug": "strict-compat-3",
+      "nodes": ["test.strict_compat_3"]
+    },
+    {
+      "slug": "strict-compat-4",
+      "nodes": ["test.strict_compat_4"]
     }
   ],
   "release_shards": [

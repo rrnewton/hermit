@@ -1021,14 +1021,23 @@ fn self_test() {
     check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity"));
     check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
     check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
-    check("dbt-only skips strict_compat", !dbt.nodes.contains("test.strict_compat"));
+    check(
+        "dbt-only skips strict_compat",
+        !dbt
+            .nodes
+            .iter()
+            .any(|node| node.starts_with("test.strict_compat_")),
+    );
     check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes"));
     check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
     check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
     let core = select(&fp, &dag, &vec!["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
-    check("detcore core runs strict_compat", core.nodes.contains("test.strict_compat"));
+    check(
+        "detcore core runs every strict_compat partition",
+        (1..=4).all(|shard| core.nodes.contains(&format!("test.strict_compat_{shard}"))),
+    );
     check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit"));
 
     let unknown = select(&fp, &dag, &vec!["some/brand/new/area/file.py".into()]);

@@ -322,13 +322,13 @@ function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
     local debug_outer_minutes release_outer_minutes debug_test_outer_minutes
-    local strict_compat_timeout strict_compat_estimate rr_suite_timeout rr_suite_estimate
+    local strict_compat_timeout strict_compat_count rr_suite_timeout rr_suite_estimate
     local debug_artifact_retention release_dbt_artifact_retention
     local release_artifact_retention cleanup_block
-    # strict-compat hit its 2700s node ceiling exactly after earlier 15m and 40m
-    # outer kills. That makes 2700s a censored lower bound. Preserve the chosen
-    # 4x floor (10800s) and the one-hour outer-job allowance; deriving both from
-    # source prevents a stale guard from blessing a smaller deployed value.
+    # Two runs lost the hosted runner at ~45m under 2700s and 10800s node bounds.
+    # The fix is four complete partitions, each bounded at 30m inside a 40m job,
+    # not another larger monolith. The source-derived checks below latch both the
+    # execution shape and the fail-closed four-way denominator.
     local hosted_job_overhead_seconds=300
     run_dag_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-dag[.]sh portable([[:space:]]|$)' "$workflow" || true)
     run_node_count=$(grep -Ec '^[[:space:]]+run: .*ci/run-node[.]sh portable([[:space:]]|$)' "$workflow" || true)
@@ -365,12 +365,13 @@ function assert_parallel_portable_workflow {
     debug_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-debug)
     release_outer_minutes=$(workflow_job_timeout_minutes "$workflow" build-release)
     debug_test_outer_minutes=$(workflow_job_timeout_minutes "$workflow" test-debug)
-    strict_compat_timeout=$(jq -r '
-        .steps[] | select(.group == "test" and .job == "strict_compat") | .timeout
+    strict_compat_count=$(jq '
+        [.steps[] | select(.group == "test" and (.job | test("^strict_compat_[1-4]$")))]
+        | length
     ' "$DAG_ROOT/portable.json")
-    strict_compat_estimate=$(jq -r '
-        .steps[] | select(.group == "test" and .job == "strict_compat")
-        | .hint.est_duration_s
+    strict_compat_timeout=$(jq '
+        [.steps[] | select(.group == "test" and (.job | test("^strict_compat_[1-4]$"))) | .timeout]
+        | max
     ' "$DAG_ROOT/portable.json")
     rr_suite_timeout=$(jq -r '
         .steps[] | select(.group == "test" and .job == "rr_suite_contract") | .timeout
@@ -390,11 +391,32 @@ function assert_parallel_portable_workflow {
     [[ $debug_test_outer_minutes =~ ^[1-9][0-9]*$ ]] ||
         die "GitHub debug test shards have no numeric outer timeout"
     [[ $strict_compat_timeout =~ ^[1-9][0-9]*$ ]] ||
-        die "portable strict-compat node has no numeric timeout"
-    ((strict_compat_timeout >= 10800 && strict_compat_estimate >= 3600)) ||
-        die "portable strict-compat must retain its censored-floor-derived 10800s ceiling and 3600s estimate"
-    ((debug_test_outer_minutes >= 240)) ||
-        die "GitHub debug-test outer timeout must retain its 240m failure-path envelope"
+        die "portable strict-compat shards have no numeric timeout"
+    ((strict_compat_count == 4 && strict_compat_timeout == 1800)) ||
+        die "portable strict-compat must remain four 1800s shards below the runner-loss horizon"
+    jq -e '
+        [.steps[] | select(.group == "test" and (.job | test("^strict_compat_[1-4]$")))] as $shards
+        | ($shards | length) == 4
+          and ([range(1; 5) as $i
+                | any($shards[];
+                    .job == "strict_compat_\($i)"
+                    and .timeout == 1800
+                    and .hint.est_duration_s == 900
+                    and (.cmd | contains("--compat-shard \($i)/4")))] | all)
+    ' "$DAG_ROOT/portable.json" >/dev/null ||
+        die "portable strict-compat DAG must contain exactly the four canonical shard commands"
+    jq -e '
+        [.debug_shards[] | select(.slug | test("^strict-compat-[1-4]$"))] as $shards
+        | ($shards | length) == 4
+          and ([range(1; 5) as $i
+                | any($shards[];
+                    .slug == "strict-compat-\($i)"
+                    and .nodes == ["test.strict_compat_\($i)"])] | all)
+          and (all(.debug_shards[].nodes[]; . != "test.strict_compat"))
+    ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
+        die "portable shard map must assign every strict-compat partition exactly once"
+    ((debug_test_outer_minutes == 40)) ||
+        die "GitHub debug-test outer timeout must remain below the observed 45m runner-loss horizon"
     ((rr_suite_timeout >= 600 && rr_suite_estimate >= 120)) ||
         die "rr-suite contract must retain its measured 600s ceiling and 120s estimate"
     ((debug_outer_minutes * 60 > debug_inner_path + hosted_job_overhead_seconds)) ||
@@ -402,7 +424,7 @@ function assert_parallel_portable_workflow {
     ((release_outer_minutes * 60 > release_inner_path + hosted_job_overhead_seconds)) ||
         die "GitHub release outer timeout must exceed ${release_inner_path}s selected path plus ${hosted_job_overhead_seconds}s overhead"
     ((debug_test_outer_minutes * 60 > strict_compat_timeout + hosted_job_overhead_seconds)) ||
-        die "GitHub debug-test outer timeout must exceed strict-compat's ${strict_compat_timeout}s node bound plus ${hosted_job_overhead_seconds}s setup overhead"
+        die "GitHub debug-test outer timeout must exceed each strict shard's ${strict_compat_timeout}s node bound plus ${hosted_job_overhead_seconds}s setup overhead"
     [[ $(grep -Fxc '        run: ./ci/check-shard-coverage.sh' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run the shard-coverage guard exactly once"
     # Match the literal command embedded in workflow YAML.
@@ -411,6 +433,8 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must derive one e2e matrix from the audited plan"
     [[ $(grep -Fxc '    name: Regular tests (GitHub-managed portable)' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must expose exactly one stable aggregate gate"
+    [[ $(grep -Fxc "        if: startsWith(matrix.slug, 'strict-compat-')" "$workflow") == 2 ]] ||
+        die "GitHub portable workflow must provision rust-script for every strict-compat partition"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run against merge-queue commits"
     [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbt.so \' "$workflow") == 1 ]] ||

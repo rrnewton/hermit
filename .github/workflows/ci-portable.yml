@@ -517,14 +517,13 @@ jobs:
       && needs.build-debug.result == 'success'
       && (needs.build-release.result == 'success' || needs.build-release.result == 'skipped')
     runs-on: ubuntu-latest
-    # strict-compat has never been permitted to finish: production attempts hit
-    # the 15m job wall, the 40m job wall, and then the 2700s node wall exactly
-    # (45m17s including teardown). The last value is therefore a censored lower
-    # bound, not a duration estimate. Give the unknown distribution 4x that
-    # demonstrated floor (3h inner) and leave another hour for setup, artifact
-    # transfer, rust-script compilation, and teardown. A genuine hang now fails
-    # slowly; a healthy long run gets to determine its own duration.
-    timeout-minutes: 240
+    # Two exact-head attempts lost their hosted runner at the same empirical
+    # horizon (45m17s and 45m20s) under radically different configured budgets.
+    # Four strict-compat matrix entries now run disjoint 47/47/47/46-row corpus
+    # partitions. Their 30m node bounds and this 40m outer bound both terminate
+    # before that external runner-loss horizon. The required `regular` job sees
+    # the aggregate matrix result, so any missing/lost partition remains red.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
@@ -564,14 +563,14 @@ jobs:
       # take an unverified fallback path. A pinned `cargo install` is slower but
       # its failure mode is legible, which is the whole point of this fix.
       - name: Install rust-script (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
+        if: startsWith(matrix.slug, 'strict-compat-')
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       # Fail with a diagnostic naming the interpreter rather than letting the
       # shard die at exec. `env` reports the missing program on stderr and the
       # shell exits 127, but neither string contains "error", so the standard
       # log triage grep misses it entirely.
       - name: Verify rust-script resolves (strict-compat shard)
-        if: matrix.slug == 'strict-compat'
+        if: startsWith(matrix.slug, 'strict-compat-')
         run: |
           if ! command -v rust-script >/dev/null; then
             echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."

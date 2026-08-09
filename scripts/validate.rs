@@ -34,8 +34,8 @@
 //!
 //! The flag surface preserves the former driver's CLI because in-tree callers
 //! depend on it — notably
-//! `ci/dag/portable.json`'s `test.strict_compat` node, which invokes
-//! `./scripts/validate.rs --portable-strict-compat-only`, plus
+//! `ci/dag/portable.json`'s four `test.strict_compat_*` nodes, which invoke
+//! `./scripts/validate.rs --portable-strict-compat-only --compat-shard N/4`, plus
 //! `.github/workflows/validation-levels.yml`, three `Makefile` targets, and
 //! `hermit-cli/tests/{analyze,rr_suite}.rs`. Changing the surface would have
 //! required touching all of them in the same change.
@@ -236,6 +236,7 @@ struct Args {
     level: Level,
     level_explicit: bool,
     focused: Option<Focused>,
+    compat_shard: Option<validate_plan::CompatShard>,
     force_full: bool,
     baseline: Option<String>,
     run_on_dirty_tree: bool,
@@ -268,6 +269,8 @@ fn usage() -> &'static str {
      Focused gates (run one matrix/lane and exit):\n\
      \x20 --strict-compat-only          Run the blocking L2 app matrix.\n\
      \x20 --portable-strict-compat-only Portable L2 matrix with bounded diagnostics.\n\
+     \x20 --compat-shard INDEX/TOTAL    Run one fail-closed partition of portable strict\n\
+     \x20                               compatibility (requires the preceding flag).\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch L2 apps.\n\
@@ -341,6 +344,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         level,
         level_explicit,
         focused: None,
+        compat_shard: None,
         force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
         baseline: None,
         run_on_dirty_tree: env_flag("VALIDATE_RUN_ON_DIRTY_TREE", "1"),
@@ -380,6 +384,24 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--portable" | "--portable-only" => set_level(&mut args, Level::PortableOnly)?,
             "--strict-compat-only" => focused.push(Focused::StrictCompat),
             "--portable-strict-compat-only" => focused.push(Focused::PortableStrictCompat),
+            "--compat-shard" => {
+                i += 1;
+                let Some(spec) = argv.get(i) else {
+                    eprintln!("validate: --compat-shard needs INDEX/TOTAL");
+                    return Err(2);
+                };
+                if args.compat_shard.is_some() {
+                    eprintln!("validate: --compat-shard may be specified only once");
+                    return Err(2);
+                }
+                args.compat_shard = match validate_plan::CompatShard::parse(spec) {
+                    Ok(shard) => Some(shard),
+                    Err(e) => {
+                        eprintln!("validate: {e}");
+                        return Err(2);
+                    }
+                };
+            }
             "--rr-compat-only" => focused.push(Focused::RrCompat),
             "--sabre-compat-only" => focused.push(Focused::SabreCompat),
             "--e9patch-compat-only" => focused.push(Focused::E9patchCompat),
@@ -478,6 +500,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     }
     args.show_plan = show_plan;
     args.focused = focused.pop();
+    if args.compat_shard.is_some()
+        && !matches!(args.focused, Some(Focused::PortableStrictCompat))
+    {
+        eprintln!("validate: --compat-shard requires --portable-strict-compat-only");
+        return Err(2);
+    }
     // `--privileged-only` and `--portable-only` are spelled as focused flags but
     // one of them is a LEVEL in validate.sh. Preserve that: --portable-only sets
     // the level, --privileged-only stays focused (validate.sh:169,189).
@@ -502,6 +530,15 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
 /// suite, so it accepts only the unfocused `full` level.
 fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str>) -> bool {
     !force_full || (level == Level::Full && focused.is_none())
+}
+
+fn validation_profile(args: &Args) -> String {
+    let mut profile = args.focused.as_ref().map(|focused| focused.profile())
+        .unwrap_or_else(|| args.level.name().to_string());
+    if let Some(shard) = args.compat_shard {
+        profile = format!("{profile}-shard-{}-of-{}", shard.one_based(), shard.total());
+    }
+    profile
 }
 
 /// Inert brackets for the policy predicate and the shell quoter.
@@ -653,6 +690,7 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    compat_shard_bracket(&root)?;
     coverage_schema_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
@@ -1509,6 +1547,10 @@ struct Plan {
     /// Set when this profile is a compatibility matrix, so the ratchet and the
     /// per-program summary are evaluated afterwards.
     compat: Option<CompatMode>,
+    /// Exact `compat.*` denominator this plan must produce. Each hosted shard
+    /// certifies only its mechanically assigned partition, but every outcome in
+    /// that partition is mandatory.
+    compat_expected: Option<usize>,
     /// True only for a complete `full` plan, authorizing `gates_expected` to be
     /// derived from what ran (validate.sh:718).
     suite_complete: bool,
@@ -1554,6 +1596,7 @@ impl Default for Plan {
             selection_mode: "full",
             planned_test_nodes: BTreeSet::new(),
             compat: None,
+            compat_expected: None,
             suite_complete: false,
             super_mode: false,
             envelope: None,
@@ -1614,8 +1657,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             &nsswitch.to_string_lossy(),
             &paths,
             Some("compatprep.fixtures"),
+            args.compat_shard,
         )?);
-        let profile = args.focused.as_ref().unwrap().profile();
+        let compat_expected = steps.iter()
+            .filter(|step| step.tag().starts_with("compat."))
+            .count();
+        let profile = validation_profile(args);
         let cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
@@ -1624,6 +1671,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             profile,
             selection_mode: "full",
             compat: Some(mode),
+            compat_expected: Some(compat_expected),
             ..Default::default()
         });
     }
@@ -1917,6 +1965,7 @@ fn super_plan(
                     Some("compatprep.fixtures"),
                     Some(&only),
                     Some(g.wall()),
+                    None,
                 )?);
             }
             Some("super_stress_suite") => {
@@ -2370,6 +2419,7 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
 /// Pure, so `--self-test` can bracket both directions without running a DAG.
 fn verdict_refusals(
     compat_measured: Option<usize>,
+    compat_expected: Option<usize>,
     structural_failures: usize,
     executed_tests: Option<i64>,
 ) -> Vec<String> {
@@ -2389,6 +2439,14 @@ fn verdict_refusals(
                 .to_string(),
         );
     }
+    if let (Some(measured), Some(expected)) = (compat_measured, compat_expected) {
+        if measured != expected {
+            out.push(format!(
+                "the compatibility matrix measured {measured}/{expected} assigned programs; \
+                 a missing shard outcome cannot certify a smaller denominator"
+            ));
+        }
+    }
     if executed_tests == Some(0) {
         out.push(
             "ZERO tests executed; a run that executed nothing cannot certify anything".to_string(),
@@ -2402,36 +2460,157 @@ fn verdict_refusals(
 fn verdict_refusal_bracket() -> Result<(), String> {
     // POSITIVE 1 — the exact shape measured on 2026-08-08 must fire, and must
     // fire for BOTH reasons rather than collapsing into one.
-    let observed = verdict_refusals(Some(0), 1, Some(20));
-    if observed.len() != 2 {
+    let observed = verdict_refusals(Some(0), Some(187), 1, Some(20));
+    if observed.len() != 3 {
         return Err(format!(
             "verdict: the observed fail-open shape (0 measured, 1 spine failure, 20 executed) \
-             must trip 2 refusals, tripped {}: {observed:?}",
+             must trip 3 refusals, tripped {}: {observed:?}",
             observed.len()
         ));
     }
     // POSITIVE 2 — zero executed tests alone, with nothing else wrong.
-    if verdict_refusals(None, 0, Some(0)).len() != 1 {
+    if verdict_refusals(None, None, 0, Some(0)).len() != 1 {
         return Err("verdict: zero executed tests must refuse on its own".into());
     }
     // POSITIVE 3 — a spine failure alone, with a fully measured matrix, still
     // refuses: 187/187 passing rows do not excuse a failed prep node.
-    if verdict_refusals(Some(187), 1, Some(862)).len() != 1 {
+    if verdict_refusals(Some(187), Some(187), 1, Some(862)).len() != 1 {
         return Err("verdict: a spine failure must refuse even with a full matrix".into());
+    }
+    // POSITIVE 4 — one missing outcome in a shard is a blocking denominator
+    // mismatch even when every outcome that did arrive passed.
+    if verdict_refusals(Some(46), Some(47), 0, Some(46)).len() != 1 {
+        return Err("verdict: an incomplete compatibility shard must refuse".into());
     }
     // NEGATIVE 1 — a genuinely complete run must stay inert, or the gate is a
     // blanket red rather than a predicate.
-    let clean = verdict_refusals(Some(187), 0, Some(862));
+    let clean = verdict_refusals(Some(187), Some(187), 0, Some(862));
     if !clean.is_empty() {
         return Err(format!("verdict: a complete run must NOT refuse, got {clean:?}"));
     }
     // NEGATIVE 2 — unknown counts are not a measured zero.
-    if !verdict_refusals(None, 0, None).is_empty() {
+    if !verdict_refusals(None, None, 0, None).is_empty() {
         return Err("verdict: unknown counts must not be read as a measured zero".into());
     }
     println!(
-        "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
+        "  verdict refusals: 4 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix, incomplete-shard), \
          2 negative(s) inert (complete run, unknown counts)"
+    );
+    Ok(())
+}
+
+/// Two-sided proof that the hosted portable-strict partitions preserve the
+/// monolith's complete denominator. This is inert: it only builds plans under
+/// a temporary directory and never executes a compatibility program.
+fn compat_shard_bracket(root: &Path) -> Result<(), String> {
+    const SHARDS: usize = 4;
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: "/nonexistent",
+        real_compat_fixtures: "/nonexistent",
+        validation_tmp_dir: "/nonexistent",
+        shell_build_dir: "/nonexistent",
+    };
+    let super_only = validate_corpus::portable_super_only();
+    let eligible: Vec<String> = validate_corpus::load(root, "strict", &paths)?
+        .into_iter()
+        .filter(|row| !super_only.contains_key(row.label.as_str()))
+        .map(|row| row.label)
+        .collect();
+    let expected: BTreeSet<String> = eligible.iter().cloned().collect();
+    if expected.len() != eligible.len() {
+        return Err("compat shard bracket: eligible corpus labels are not unique".into());
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "hermit-validate-compat-shard-bracket-{}",
+        std::process::id()
+    ));
+    let mut union = BTreeSet::new();
+    let mut sizes = Vec::new();
+    for one_based in 1..=SHARDS {
+        let spec = format!("{one_based}/{SHARDS}");
+        let shard = validate_plan::CompatShard::parse(&spec)?;
+        let selected: Vec<String> = eligible
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, _)| shard.selects(*ordinal))
+            .map(|(_, label)| label.clone())
+            .collect();
+        if selected.is_empty() {
+            return Err(format!("compat shard bracket: {spec} selected no programs"));
+        }
+        for label in &selected {
+            if !union.insert(label.clone()) {
+                return Err(format!(
+                    "compat shard bracket: {label:?} appeared in more than one partition"
+                ));
+            }
+        }
+
+        let argv = vec![
+            "--portable-strict-compat-only".to_string(),
+            "--compat-shard".to_string(),
+            spec.clone(),
+        ];
+        let args = parse_argv(&argv).map_err(|rc| {
+            format!("compat shard bracket: valid CLI {spec} was refused with rc {rc}")
+        })?;
+        let plan = build_plan(root, &args, &tmp)?;
+        if plan.compat_expected != Some(selected.len()) {
+            return Err(format!(
+                "compat shard bracket: {spec} planned denominator {:?}, expected {}",
+                plan.compat_expected,
+                selected.len()
+            ));
+        }
+        let planned = plan
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| step.tag().starts_with("compat."))
+            .count();
+        if planned != selected.len() {
+            return Err(format!(
+                "compat shard bracket: {spec} built {planned} compatibility nodes, expected {}",
+                selected.len()
+            ));
+        }
+        sizes.push(selected.len());
+    }
+
+    if union != expected {
+        return Err(format!(
+            "compat shard bracket: partition union has {} labels, monolith has {}",
+            union.len(),
+            expected.len()
+        ));
+    }
+    let min = sizes.iter().min().copied().unwrap_or(0);
+    let max = sizes.iter().max().copied().unwrap_or(0);
+    if max.saturating_sub(min) > 1 {
+        return Err(format!(
+            "compat shard bracket: partitions are imbalanced: {sizes:?}"
+        ));
+    }
+
+    for invalid in [
+        vec!["--compat-shard", "1/4"],
+        vec!["--strict-compat-only", "--compat-shard", "1/4"],
+        vec!["--portable-strict-compat-only", "--compat-shard", "0/4"],
+        vec!["--portable-strict-compat-only", "--compat-shard", "5/4"],
+        vec!["--portable-strict-compat-only", "--compat-shard", "1/1"],
+        vec!["--portable-strict-compat-only", "--compat-shard", "bad"],
+    ] {
+        let invalid: Vec<String> = invalid.into_iter().map(str::to_string).collect();
+        if parse_argv(&invalid).is_ok() {
+            return Err("compat shard bracket: invalid CLI shape was accepted".into());
+        }
+    }
+
+    println!(
+        "  compat shards: {}-row monolith preserved exactly as {:?}; disjoint, exhaustive, balanced; 6 invalid CLI shapes refused",
+        expected.len(),
+        sizes
     );
     Ok(())
 }
@@ -3439,13 +3618,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The profile name is needed by the admission gates below, which run BEFORE
     // the plan exists. It is derived exactly as `build_plan` derives it, so the
     // lock record and the ledger row can never disagree about what was running.
-    let profile_name =
-        args.focused.as_ref().map(|f| f.profile()).unwrap_or_else(|| level_name.clone());
+    let profile_name = validation_profile(&args);
 
     // ---- re-entrancy (validate.sh:460) ---------------------------------------
     //
-    // `ci/dag/portable.json`'s `test.strict_compat` node runs
-    // `./scripts/validate.rs --portable-strict-compat-only`, so re-entry is a DESIGNED
+    // `ci/dag/portable.json`'s `test.strict_compat_*` nodes run
+    // `./scripts/validate.rs --portable-strict-compat-only --compat-shard N/4`, so re-entry is a DESIGNED
     // path. What must never happen is a full driver inside a full driver: it pays
     // the whole preamble twice, appends a SECOND ledger row, and can publish a
     // SECOND receipt for one logical run. A nested FOCUSED invocation is a
@@ -4195,7 +4373,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
     // these conditions are checked separately and named individually.
-    let refusals = verdict_refusals(compat_measured, structural_failures, executed_tests);
+    let refusals = verdict_refusals(
+        compat_measured,
+        plan.compat_expected,
+        structural_failures,
+        executed_tests,
+    );
     if exit_code == 0 && !refusals.is_empty() {
         for why in &refusals {
             eprintln!("validate: ERROR: {why}");
