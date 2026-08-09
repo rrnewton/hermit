@@ -681,10 +681,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 5 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m05
       - name: Upload strict evidence at 5 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m05
@@ -692,10 +692,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 10 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m10
       - name: Upload strict evidence at 10 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m10
@@ -703,10 +703,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 15 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m15
       - name: Upload strict evidence at 15 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m15
@@ -714,10 +714,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 20 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m20
       - name: Upload strict evidence at 20 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m20
@@ -725,10 +725,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 25 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m25
       - name: Upload strict evidence at 25 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m25
@@ -736,10 +736,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard at 30 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 300 m30
       - name: Upload strict evidence at 30 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m30
@@ -747,10 +747,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Observe strict shard through its 32-minute bound
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh observe "${{ runner.temp }}/run-node-perf/strict-observer" 120 m32
       - name: Upload strict evidence at 32 minutes
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         uses: actions/upload-artifact@v4
         with:
           name: strict-evidence-${{ github.run_id }}-${{ matrix.slug }}-m32
@@ -758,7 +758,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Finalize supervised strict shard
-        if: startsWith(matrix.slug, 'strict-compat-')
+        if: always() && startsWith(matrix.slug, 'strict-compat-')
         run: ./ci/strict-shard-observer.sh finalize "${{ runner.temp }}/run-node-perf/strict-observer"
       - name: Upload final strict evidence
         if: always() && startsWith(matrix.slug, 'strict-compat-')

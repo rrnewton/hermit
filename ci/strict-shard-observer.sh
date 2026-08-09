@@ -28,34 +28,77 @@ state_paths() {
     launcher_log="$state_dir/launcher.log"
 }
 
+# Copy only the byte length observed before the read starts. Plain `cp` is not
+# a snapshot primitive for a live log: if the writer extends the file as fast as
+# it is read, cp keeps moving its EOF target and can run forever. The fixed byte
+# count plus an independent deadline makes every diagnostic read finite.
+copy_regular_prefix() {
+    local source=$1 destination=$2 size rc
+    [[ -f $source ]] || return 0
+    if ! size=$(timeout --signal=TERM --kill-after=1s 2s stat -c %s -- "$source"); then
+        printf 'stat timed out or failed for %s\n' "$source" >"$destination.error"
+        return 1
+    fi
+    [[ $size =~ ^[0-9]+$ ]] || {
+        printf 'invalid size %s for %s\n' "$size" "$source" >"$destination.error"
+        return 1
+    }
+    set +e
+    timeout --signal=TERM --kill-after=1s 5s head -c "$size" -- "$source" >"$destination.partial"
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+        mv "$destination.partial" "$destination"
+        return 0
+    fi
+    printf 'fixed-prefix read failed rc=%s source=%s latched_bytes=%s\n' \
+        "$rc" "$source" "$size" >"$destination.error"
+    return 1
+}
+
+copy_bounded_stream() {
+    local source=$1 destination=$2 rc
+    set +e
+    timeout --signal=TERM --kill-after=1s 2s head -c 1048576 -- "$source" >"$destination.partial"
+    rc=$?
+    set -e
+    if (( rc == 0 )); then
+        mv "$destination.partial" "$destination"
+        return 0
+    fi
+    printf 'bounded stream read failed rc=%s source=%s\n' "$rc" "$source" >"$destination.error"
+    return 1
+}
+
 snapshot() {
     local label=$1 snapshot_dir supervisor_pid= supervisor_alive=false launcher_pid= launcher_alive=false
     snapshot_dir="$state_dir/snapshots/$label"
     mkdir -p "$snapshot_dir"
     if [[ -f $marker ]]; then
-        cp "$marker" "$snapshot_dir/"
+        copy_regular_prefix "$marker" "$snapshot_dir/supervisor-start.txt" || true
         supervisor_pid=$(sed -n 's/^supervisor_pid=//p' "$marker")
     fi
     if [[ -f $status_file ]]; then
-        cp "$status_file" "$snapshot_dir/"
+        copy_regular_prefix "$status_file" "$snapshot_dir/terminal-status.txt" || true
     fi
     if [[ -f $launcher_pid_file ]]; then
-        cp "$launcher_pid_file" "$snapshot_dir/"
+        copy_regular_prefix "$launcher_pid_file" "$snapshot_dir/launcher-pid.txt" || true
         launcher_pid=$(<"$launcher_pid_file")
     fi
     if [[ -f $launcher_log ]]; then
-        cp "$launcher_log" "$snapshot_dir/"
+        copy_regular_prefix "$launcher_log" "$snapshot_dir/launcher.log" || true
     fi
     local evidence
     for evidence in "$perf_dir"/run-node-*.raw.log "$perf_dir"/run-node-*.timestamped.log; do
-        [[ -f $evidence ]] && cp "$evidence" "$snapshot_dir/"
+        [[ -f $evidence ]] &&
+            copy_regular_prefix "$evidence" "$snapshot_dir/${evidence##*/}" || true
     done
     if [[ $supervisor_pid =~ ^[1-9][0-9]*$ && -r /proc/$supervisor_pid/stat ]]; then
         supervisor_alive=true
-        cp "/proc/$supervisor_pid/stat" "$snapshot_dir/supervisor-proc-stat.txt"
-        cp "/proc/$supervisor_pid/status" "$snapshot_dir/supervisor-proc-status.txt"
-        tr '\0' ' ' <"/proc/$supervisor_pid/cmdline" >"$snapshot_dir/supervisor-proc-cmdline.txt" || true
-        cp "/proc/$supervisor_pid/cgroup" "$snapshot_dir/supervisor-proc-cgroup.txt" || true
+        copy_bounded_stream "/proc/$supervisor_pid/stat" "$snapshot_dir/supervisor-proc-stat.txt" || true
+        copy_bounded_stream "/proc/$supervisor_pid/status" "$snapshot_dir/supervisor-proc-status.txt" || true
+        copy_bounded_stream "/proc/$supervisor_pid/cmdline" "$snapshot_dir/supervisor-proc-cmdline.bin" || true
+        copy_bounded_stream "/proc/$supervisor_pid/cgroup" "$snapshot_dir/supervisor-proc-cgroup.txt" || true
     fi
     if [[ $launcher_pid =~ ^[1-9][0-9]*$ && -r /proc/$launcher_pid/stat ]]; then
         launcher_alive=true
@@ -129,7 +172,7 @@ start_command() {
     snapshot start
 }
 
-observe() {
+observe_worker() {
     local state=$1 wait_seconds=$2 label=$3
     [[ $wait_seconds =~ ^[0-9]+$ && $label =~ ^[a-z0-9-]+$ ]] || usage
     state_paths "$state"
@@ -145,6 +188,23 @@ observe() {
         sleep 5
     done
     snapshot "$label"
+}
+
+observe() {
+    local state=$1 wait_seconds=$2 label=$3 rc limit
+    [[ $wait_seconds =~ ^[0-9]+$ && $label =~ ^[a-z0-9-]+$ ]] || usage
+    limit=$((wait_seconds + 15))
+    set +e
+    timeout --signal=TERM --kill-after=2s "${limit}s" \
+        "$0" _observe "$state" "$wait_seconds" "$label"
+    rc=$?
+    set -e
+    if (( rc == 124 )); then
+        mkdir -p "$state/snapshots/$label"
+        printf 'observer exceeded hard bound: wait=%ss total_bound=%ss\n' \
+            "$wait_seconds" "$limit" >"$state/snapshots/$label/observer-timeout.txt"
+    fi
+    return "$rc"
 }
 
 finalize() {
@@ -164,7 +224,7 @@ finalize() {
 }
 
 self_test() (
-    local scratch
+    local scratch fixture_pid started elapsed deadline
     scratch=$(mktemp -d)
     trap 'rm -rf -- "$scratch"' EXIT
     start_command "$scratch/perf/strict-observer" bash -c '
@@ -181,13 +241,36 @@ self_test() (
           echo started_unix_seconds=1
         } >"$marker.tmp"
         mv "$marker.tmp" "$marker"
-        sleep 1
-        echo fixture-output
+        trap "exit 0" TERM
+        while :; do
+          echo fixture-output
+          sleep 0.05
+        done
     '
-    observe "$scratch/perf/strict-observer" 5 after
+    fixture_pid=$(sed -n 's/^supervisor_pid=//p' "$scratch/perf/strict-observer/supervisor-start.txt")
+    started=$SECONDS
+    observe "$scratch/perf/strict-observer" 1 after
+    elapsed=$((SECONDS - started))
+    (( elapsed <= 10 )) || {
+        echo "strict-shard-observer: hanging-target snapshot took ${elapsed}s" >&2
+        return 1
+    }
+    [[ -r /proc/$fixture_pid/stat ]] || {
+        echo "strict-shard-observer: planted hanging target was not alive after observation" >&2
+        return 1
+    }
+    [[ -s $scratch/perf/strict-observer/snapshots/after/launcher.log ]] || {
+        echo "strict-shard-observer: live growing log was not snapshotted" >&2
+        return 1
+    }
+    kill -TERM "$fixture_pid"
+    deadline=$((SECONDS + 10))
+    while [[ ! -f $scratch/perf/strict-observer/terminal-status.txt && $SECONDS -lt $deadline ]]; do
+        sleep 1
+    done
     finalize "$scratch/perf/strict-observer"
     [[ -f $scratch/perf/strict-observer/snapshots/start/supervisor-start.txt ]]
-    [[ -f $scratch/perf/strict-observer/snapshots/after/terminal-status.txt ]]
+    [[ -f $scratch/perf/strict-observer/snapshots/final/terminal-status.txt ]]
     echo "strict-shard-observer: self-test PASS"
 )
 
@@ -199,6 +282,10 @@ case ${1:-} in
     observe)
         [[ $# == 4 ]] || usage
         observe "$2" "$3" "$4"
+        ;;
+    _observe)
+        [[ $# == 4 ]] || usage
+        observe_worker "$2" "$3" "$4"
         ;;
     finalize)
         [[ $# == 2 ]] || usage

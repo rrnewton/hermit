@@ -517,10 +517,10 @@ function assert_parallel_portable_workflow {
         awk '{sum += $(NF-1)} END {print sum + 0}')
     [[ $strict_observation_seconds == 1920 ]] ||
         die "GitHub portable strict observation window must remain 1920s, got ${strict_observation_seconds}s"
-    ((debug_test_outer_minutes * 60 > strict_observation_seconds + hosted_job_overhead_seconds)) ||
+    ((debug_test_outer_minutes * 60 > strict_observation_seconds + 7 * 15 + hosted_job_overhead_seconds)) ||
         die "GitHub debug-test outer timeout must cover strict observation plus setup overhead"
-    [[ $(grep -Fxc '        if: always() && startsWith(matrix.slug, '\''strict-compat-'\'')' "$workflow") == 1 ]] ||
-        die "GitHub portable workflow must attempt the final strict evidence upload after failure"
+    [[ $(grep -Fxc '        if: always() && startsWith(matrix.slug, '\''strict-compat-'\'')' "$workflow") == 16 ]] ||
+        die "GitHub portable workflow must continue every timed/final evidence step after an observer failure"
     [[ $(grep -Fxc '  merge_group:' "$workflow") == 1 ]] ||
         die "GitHub portable workflow must run against merge-queue commits"
     [[ $(grep -Fxc '            target/install_pkg/rsrcs/libdetcore_dbt.so \' "$workflow") == 1 ]] ||
@@ -1014,6 +1014,10 @@ function audit_ci_correspondence {
         die "hosted strict watchdog must publish its resolved agent-utils revision"
     local strict_observer="$ROOT_DIR/ci/strict-shard-observer.sh"
     [[ -x $strict_observer ]] || die "hosted strict observer must be executable"
+    grep -Fq 'head -c "$size"' "$strict_observer" ||
+        die "hosted strict observer must latch live-log size before reading"
+    grep -Fq 'limit=$((wait_seconds + 15))' "$strict_observer" ||
+        die "hosted strict observer must carry an independent outer deadline"
     "$strict_observer" self-test
 
     # Plant the exact mechanism that escaped both earlier supervisors: a TERM-
