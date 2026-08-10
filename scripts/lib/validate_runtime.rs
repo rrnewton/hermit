@@ -98,7 +98,7 @@ fn has_any(line: &str, needles: &[&str]) -> bool {
 ///   *compiler* reporting it cannot open a header for a permission reason is
 ///   never legitimate product behaviour.
 /// * `third-party-build` - the vendored DynamoRIO/elfutils build under
-///   `reverie-dbi`. At `nproc=316` an unbounded dependency scan drives elfutils
+///   `reverie-dbt`. At `nproc=316` an unbounded dependency scan drives elfutils
 ///   into a concurrency-exposed `SIGABRT`; that is a HOST build flake, not a
 ///   Hermit defect (Hermit source is not what failed to compile).
 /// * `proxy-egress` - **NEW.** Egress through `fwdproxy` failed, so a networked
@@ -135,8 +135,8 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
     }
     // Form 4 (checked before the per-line scan because it is a whole-region
     // signature): the vendored third-party build script.
-    if (lower.contains("failed to run custom build command for") && lower.contains("reverie-dbi"))
-        || (lower.contains("panicked at") && lower.contains("reverie-dbi/build.rs"))
+    if (lower.contains("failed to run custom build command for") && lower.contains("reverie-dbt"))
+        || (lower.contains("panicked at") && lower.contains("reverie-dbt/build.rs"))
     {
         return Some("third-party-build");
     }
@@ -872,7 +872,12 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             "third-party-build",
-            "error: failed to run custom build command for `reverie-dbi v0.1.0`",
+            "error: failed to run custom build command for `reverie-dbt v0.1.0`",
+        ),
+        (
+            "third-party-build",
+            "thread 'main' panicked at /checkout/reverie-dbt/build.rs:42:5:\n\
+             DynamoRIO native build failed",
         ),
         // NEW class 1: the proxy/DNS failure measured in
         // /tmp/hermit-validate.WUrHlJ.log, which the old regex did NOT catch.
@@ -923,6 +928,8 @@ pub fn self_test() -> Result<String, String> {
         "thread 'tests::scheduler_is_deterministic' panicked at detcore/src/scheduler.rs:100:5:\n\
          assertion `left == right` failed",
         "error[E0308]: mismatched types",
+        "error: failed to run custom build command for `hermit v0.1.0`",
+        "thread 'main' panicked at hermit/build.rs:42:5:\nproduct build failed",
         // A test that merely PRINTS the words must not be excused.
         "test permission_denied_is_reported ... ok",
         "guest wrote: permission denied",
@@ -936,6 +943,15 @@ pub fn self_test() -> Result<String, String> {
             ));
         }
         refused += 1;
+    }
+    // A later port once copied the retired package token back into this
+    // classifier after the DBT rename had landed. Keep the token out of the
+    // source without spelling it contiguously in the guard itself.
+    let retired_package = ["reverie-", "dbi"].concat();
+    if include_str!("validate_runtime.rs").contains(&retired_package) {
+        return Err(format!(
+            "environmental: retired package token {retired_package:?} was reintroduced"
+        ));
     }
     // ---- node-detail extraction, both directions ----
     let log = "[build.workspace] ✗ FAIL   Workspace build (12s, exit 101)\n\
