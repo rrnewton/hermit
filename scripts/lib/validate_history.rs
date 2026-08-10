@@ -119,7 +119,39 @@ pub struct CacheKey<'a> {
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     match (i(row, "gates_expected"), i(row, "gates_run")) {
         (None, _) => true, // gates_expected null: no obligation was recorded
-        (Some(exp), Some(run)) => run >= exp,
+        (Some(exp), Some(run)) => {
+            let Some(raw_skips) = row.get("intentional_skipped_nodes") else {
+                // Historical rows predate typed skips and remain exact only when
+                // every expected gate actually ran.
+                return run >= exp;
+            };
+            let Some(skips) = raw_skips.as_array() else { return false };
+            let mut names = std::collections::BTreeSet::new();
+            for skip in skips {
+                let Some(object) = skip.as_object() else { return false };
+                if object.len() != 2
+                    || object.get("reason").and_then(serde_json::Value::as_str)
+                        != Some("empty-manifest-bucket")
+                {
+                    return false;
+                }
+                let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+                    return false;
+                };
+                if name.is_empty() || !names.insert(name) {
+                    return false;
+                }
+            }
+            let explicit_empty = |field: &str| {
+                row.get(field)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            };
+            explicit_empty("dependency_skipped_nodes")
+                && explicit_empty("unaccounted_nodes")
+                && i(row, "skipped_nodes") == i64::try_from(skips.len()).ok()
+                && run.checked_add(i64::try_from(skips.len()).unwrap_or(i64::MAX)) == Some(exp)
+        }
         (Some(_), None) => false,
     }
 }
@@ -139,6 +171,13 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     match s(row, "producer") {
         "validate.rs" => {
             if i(row, "executed_nodes").unwrap_or(0) <= 0 {
+                return false;
+            }
+            if i(row, "gates_run").is_some()
+                && i(row, "executed_nodes") != i(row, "gates_run")
+            {
+                // An intentional skip is never an executed node, even when it
+                // satisfies the plan's accounting obligation.
                 return false;
             }
             // Coverage is a first-class part of the claim: a run that PLANNED
