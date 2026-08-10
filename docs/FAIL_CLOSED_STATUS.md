@@ -1,12 +1,13 @@
 # Fail-Closed Test Status
 
-Status: fail-closed batches through PID and file-offset handling complete, 2026-07-22
+Status: historical ratchet baseline from 2026-07-22; policy updated 2026-08-10
 
-Hermit's fail-closed diagnostic converts an unsupported syscall that reaches
-Detcore into a panic instead of silently passing it through. The integration
-ratchet sets `HERMIT_FAIL_CLOSED=1`; `hermit run` consumes that internal test
-environment variable as if `--panic-on-unsupported-syscalls` had been passed.
-The normal command-line default remains unchanged.
+Ordinary `hermit run` now fails closed when an unsupported syscall reaches
+Detcore, rather than silently publishing an incomplete execution as successful.
+`--allow-unsupported-syscalls` is the explicit compatibility opt-out and warns
+that success is not qualifying determinism evidence. The integration ratchet
+still sets `HERMIT_FAIL_CLOSED=1` so its intent remains explicit. Counts below
+are the dated 2026-07-22 baseline, not current coverage claims.
 
 ## Baseline
 
@@ -97,16 +98,10 @@ enabled. Therefore:
 Portable CI runs the ratchet after the regular Hermit integration suite when
 mount namespaces are available.
 
-## Current Limitation
+## Current Subscription Boundary
 
-This metric is a lower bound on unsupported-syscall exposure, not a claim of
-complete fail-closed enforcement. Optimized Detcore runs subscribe to selected
-syscalls. An unsubscribed syscall executes in the kernel without reaching the
-unsupported-syscall panic. The current coverage audit identifies 291 such
-missing release entries; see
-[`ai_docs/syscall-coverage-map.md`](../ai_docs/syscall-coverage-map.md).
-
-A future true fail-closed mode must subscribe to all syscalls (or install an
-equivalent deny policy). Until then, the ratchet prevents regressions in the
-calls that Detcore does observe and provides a visible path from 69/89 to full
-coverage of the currently applicable integration inventory.
+The old 78-syscall release subscription premise is superseded. Default Detcore
+execution uses `Subscription::all()`, so unsupported syscalls reach the policy
+in every build profile. Only the explicit `--passthru-opt` performance mode uses
+the partial subscription set, and `hermit run` requires it to be paired with
+the explicit `--allow-unsupported-syscalls` compatibility opt-out.

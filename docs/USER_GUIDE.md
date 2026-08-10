@@ -639,9 +639,11 @@ time. Detcore counts retired conditional branches with the CPU PMU and uses a
 timer to end a time slice. At each scheduling point it chooses the next runnable
 thread deterministically; chaos mode makes that choice with a seeded PRNG.
 
-Some calls are fully emulated, some are forwarded and sanitized, and unsupported
-calls may pass through. This is why Hermit can run ordinary unmodified binaries
-but cannot guarantee determinism for every Linux interface.
+Some calls are fully emulated and some are forwarded and sanitized. Unsupported
+calls fail closed by default so a successful run cannot silently omit part of
+the guest's behavior. `--allow-unsupported-syscalls` restores host passthrough
+as an explicit, noisy compatibility diagnostic; success in that mode does not
+establish complete deterministic execution.
 
 ## Reproducibility Checklist
 
@@ -655,7 +657,9 @@ Before treating a result as reproducible:
 - Record all seeds used by chaos mode.
 - Confirm PMU preemption is available when exploring CPU-bound schedules.
 - Run once with `--verify` when the workload is idempotent.
-- Investigate unsupported syscall passthroughs for the target workload.
+- Treat an `unsupported syscall: ...` refusal as a determinism gap to model or
+  remove from the workload. Use `--allow-unsupported-syscalls` only to diagnose
+  compatibility, never as qualifying reproducibility evidence.
 
 ## Further Reference
 
