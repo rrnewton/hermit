@@ -121,7 +121,12 @@ impl CompatMode {
 
     /// The `hermit run ...` flags preceding `--`, reproducing the `run_args`
     /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
-    pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
+    pub fn run_args(
+        self,
+        label: &str,
+        nsswitch: &str,
+        verify_json: Option<&str>,
+    ) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
             CompatMode::Strict => vec![s("run"), s("--strict"), s("--verify"), s("--")],
@@ -152,9 +157,16 @@ impl CompatMode {
                 v
             }
             // rr rows are driven through `hermit record start --verify`, matching
-            // rr_compatibility_probe rather than the plain run path.
+            // rr_compatibility_probe rather than the plain run path. The report
+            // is the only verdict that distinguishes Matched-with-evidence from
+            // Matched-over-0/0-log-messages; the wrapper exit status cannot.
             CompatMode::Rr => {
-                vec![s("record"), s("start"), s("--verify"), s("--verify-strict"), s("--")]
+                let mut v = vec![s("record"), s("start"), s("--verify"), s("--verify-strict")];
+                if let Some(path) = verify_json {
+                    v.push(format!("--verify-json={path}"));
+                }
+                v.push(s("--"));
+                v
             }
         }
     }
@@ -224,6 +236,23 @@ pub fn shell_quote(arg: &str) -> String {
         return arg.to_string();
     }
     format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// Fail-closed R/R verdict over one `--verify-json` report.
+///
+/// Hermit's `bitwise_parity` field already combines a matched result, the full
+/// comparison policy, and nonzero compared-message counts. Consume that single
+/// authority rather than reconstructing it here. Slurping makes empty input an
+/// explicit empty array (false) and rejects concatenated JSON documents; the
+/// type checks also reject truthy non-boolean substitutes.
+pub fn rr_verdict_check(report: &str) -> String {
+    let q = shell_quote(report);
+    format!(
+        "test -s {q} && jq -s -e 'length == 1 and (.[0] \
+         | type == \"object\" \
+         and (.bitwise_parity | type == \"boolean\") \
+         and .bitwise_parity == true)' {q} >/dev/null"
+    )
 }
 
 /// Join an argv into a shell command string.
@@ -412,15 +441,42 @@ pub fn compat_nodes_for(
         {
             continue;
         }
+        // Each R/R row gets an isolated report. The report, not the wrapper's
+        // status, is authoritative: a matched 0/0 comparison exits zero, while
+        // genuine parity inherits a nonzero guest status.
+        let report = (mode == CompatMode::Rr).then(|| {
+            format!(
+                "{}/rr-{}/verify.json",
+                paths.validation_tmp_dir,
+                sanitize_job(&row.label)
+            )
+        });
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch));
+        argv.extend(mode.run_args(&row.label, nsswitch, report.as_deref()));
         argv.extend(row.argv.iter().cloned());
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
+        // Deliberately use `;`, not `&&`, between Hermit and the report check:
+        // the report remains authoritative when a parity-matched guest exits
+        // nonzero. Missing, stale, empty, malformed, or negative reports fail.
+        let cmd = match &report {
+            Some(path) => format!(
+                "mkdir -p {} && rm -f {} && {{ {} </dev/null; {}; }}",
+                shell_quote(&format!(
+                    "{}/rr-{}",
+                    paths.validation_tmp_dir,
+                    sanitize_job(&row.label)
+                )),
+                shell_quote(path),
+                shell_join(&argv),
+                rr_verdict_check(path),
+            ),
+            None => format!("{} </dev/null", shell_join(&argv)),
+        };
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.assurance(), row.label),
-            format!("{} </dev/null", shell_join(&argv)),
+            cmd,
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
