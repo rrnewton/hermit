@@ -8,22 +8,27 @@ silently changed by an upstream push).
 
 The pin has two distinct purposes. For an old checkout it is an archival record:
 `cargo build` can reproduce the Reverie revision that checkout used. For current
-testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.
-Being an ancestor of main is not sufficient. A Hermit validation or pre-land
-test against an older Reverie is blocked because it can miss already-landed
-correctness fixes and produce evidence for a dependency version we no longer
-ship.
+testing it is a monotonic pointer into `rrnewton/reverie:main` history. It must
+be an ancestor of the live main tip, and a change may keep or advance the pin
+recorded by the Hermit base it will land on; it may never move backward or
+sideways. Exact equality with the live tip is allowed but is not required.
 
-## Currency gate
+These two clauses work together. Ancestry rejects abandoned, rewritten, and
+unmerged Reverie commits. Monotonicity rejects an ancient-but-still-ancestral
+commit and makes conflict resolution unambiguous: when two sides carry different
+pins, always choose the newer side.
+
+## Policy gate
 
 `scripts/check-reverie-pin.rs` is the canonical verifier source. The tracked
 `ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`, derives its
 scope from `git ls-files`, and checks every tracked `Cargo.toml` and
-`Cargo.lock`. Every Reverie revision in that
-tracked Cargo dependency metadata must be identical and must equal the live
-`rrnewton/reverie:main` tip. The checker reports the manifest, lockfile,
-pinned-file, and revision-entry counts on every run so a green result states its
-coverage.
+`Cargo.lock`. Every Reverie revision in that tracked Cargo dependency metadata
+must be identical. The common pin must be an ancestor of the live
+`rrnewton/reverie:main` tip and must contain the pin recorded by the Hermit base
+ref (normally `origin/main`). The checker reports the manifest, lockfile,
+pinned-file, revision-entry, and main-history relationship on every run so a
+green result states its coverage.
 Tracked vendored Cargo metadata is included. Untracked/generated files and
 nested submodule contents are excluded because Hermit does not track their
 contents. Non-Cargo files are also outside this dependency-consistency check;
@@ -41,11 +46,13 @@ Install the tracked pre-commit gate once per clone/worktree repository:
 scripts/setup-hooks.sh
 ```
 
-There is no stale-pin override in testing. Local validate, both committed DAGs,
-hosted portable CI, the merge gate, and validate receipt production all invoke
-the same fail-closed rule. Historical source remains buildable at its recorded
-revision; it does not create current validation evidence until rebased and
-updated to latest Reverie main.
+There is no ancestry or regression override in testing. Local validate, both
+committed DAGs, hosted portable CI, the merge gate, and validate receipt
+production all invoke the same fail-closed rule. Historical source remains
+buildable at its recorded revision; current validation evidence requires the
+recorded pin to be on Reverie main history and no older than the Hermit base's
+pin. Reverie main may advance after the Hermit commit without invalidating that
+evidence.
 
 ## Where the pin lives
 
@@ -86,25 +93,27 @@ earlier revisions in short form inside its `CARRY TO` prose; the audit in
 `ci/test_harness.sh` counts full-length occurrences only, so keep prose in short
 form or the count breaks.
 
-## How to bump
+## How to advance the pin
 
-Update every derived manifest and lockfile site in one command:
+Advance every derived manifest and lockfile site to the current Reverie main tip
+in one command:
 
 ```bash
 with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest
 ```
 
-The checker derives every manifest from `git ls-files`, replaces the old
-revision in those manifests, and asks Cargo to re-resolve both tracked lockfiles.
-LiteInst staging derives its cache suffix from that same recorded revision, so
-there is no cache-key list to update. Review the resulting diff, then run the
-test suite; a Reverie change can alter interception behavior even when it
-compiles.
+This is a convenient forward-update operation, not the gate's acceptance
+criterion. The checker derives every manifest from `git ls-files`, replaces the
+old revision in those manifests, and asks Cargo to re-resolve both tracked
+lockfiles. LiteInst staging derives its cache suffix from that same recorded
+revision, so there is no cache-key list to update. Review the resulting diff,
+then run the test suite; a Reverie change can alter interception behavior even
+when it compiles.
 
 **That command is not the whole bump.** It covers Cargo metadata only, and it
-prints `Reverie pin updated to latest main <sha>` while the CI sites above still
-hold the old revision — so a bump that stops here leaves the tree inconsistent
-and `./ci/run-reverie-pin-check.sh` still BLOCKED. Three separate agents
+prints `Reverie pin advanced to main tip <sha>` while the CI sites above still
+hold the old revision — so an advance that stops here leaves the tree
+inconsistent and `./ci/run-reverie-pin-check.sh` still BLOCKED. Three separate agents
 rediscovered this on 2026-08-08. After running it, carry the CI sites too:
 
 1. **Decide whether the build budget still applies.** This is the only step
@@ -139,7 +148,7 @@ rediscovered this on 2026-08-08. After running it, carry the CI sites too:
 3. **Confirm the tree is consistent** before committing:
 
    ```bash
-   ./ci/run-reverie-pin-check.sh          # expect rc=0, "Reverie pin is current"
+   ./ci/run-reverie-pin-check.sh          # expect rc=0 and an ancestry/monotonicity verdict
    ./ci/test_harness.sh audit-ci          # expect the budget-site counts to hold
    ```
 
@@ -151,6 +160,9 @@ is a judgement and should stay a human decision that the tool refuses to skip.
 - `Cargo.lock` and `liteinst-runtime-build/Cargo.lock` are tracked. The runtime
   builder is an isolated workspace, so update and commit both lockfiles with
   every pin change.
+- When a merge or rebase conflicts in any pin-bearing manifest or lockfile,
+  resolve every site to the newer Reverie commit. The policy gate rejects the
+  older side as a regression even when that older commit is still on main.
 - To point at a fork instead of upstream (e.g. for the experimental
   `reverie-dbt` / `reverie-kvm` backends), change the `git =` URL as well as the
   `rev`, and keep all Reverie crates on the same source.
