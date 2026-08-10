@@ -73,9 +73,9 @@ A successful PR run on 2026-07-26 provided the baseline:
 
 The diagnostics now run in the scheduled `super` tier. The required lane uses a 14 GiB memory budget, which the current model
 maps to `-j 2` on the 16 GiB portable runner. Compile, lint, documentation, unit,
-and contract nodes may overlap when dependencies allow, while Hermit guest
-executions retain the
-`hermit_guest: 1` exclusion. Per-node performance reports are uploaded from
+and contract nodes may overlap when dependencies allow. Hermit guest executions
+share a measured `hermit_guest: 16` outer cap, still bounded by the lane's
+overall job and memory limits. Per-node performance reports are uploaded from
 every required run so estimates can be replaced with measurements.
 
 ## How gates map onto the DAG
@@ -143,11 +143,12 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` keeps
-  `{"hermit_guest": 1}` for legacy guest gates, so they run **one at a time**
-  (they share the working filesystem, are mutually nondeterministic, and on a
-  PMU host contend for the counter). Manifest buckets use disjoint cell trees
-  and portable timing relaxations, so they use a separate
+- `resource_caps` gates *scarce* resources. `portable.json` gives Hermit guest
+  gates a candidate `{"hermit_guest": 16}` pool. This removes the historical
+  one-at-a-time semaphore at the current-regime CPA recommendation; the lane's
+  overall `-j` and memory model remain independent upper bounds. Manifest
+  buckets use disjoint cell trees and portable timing
+  relaxations, so they use a separate
   `{"manifest_guest": 4}` pool after the shared build barrier. Non-guest gates
   carry no scarce resource and parallelize freely. `privileged.json` caps only
   `{"kvm": 1}`. The PMU is **not** a scarce resource and carries no cap: reverie
@@ -180,13 +181,21 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 > run's `--perf-dir` CSVs (`ci/run-dag.sh portable --perf-dir ./perf`) before
 > relying on tight memory budgets.
 
-## Conservatism and how to relax it
+## Hermit guest concurrency derivation
 
-The `hermit_guest: 1` serialization faithfully reproduces `scripts/validate.rs`, which
-ran these gates strictly one-after-another. It is intentionally conservative: as
-individual guest gates are shown to be safe to co-run (e.g. distinct scratch
-directories, no shared fixture), drop their `resources` hint (or raise the cap)
-to unlock more parallelism. The DAG shape and dependencies stay the same.
+The historical `hermit_guest: 1` setting reproduced the old serial driver, but
+made 16 guest nodes consume 444.350 node-seconds serially in a current-main
+608-second full run. The current-regime strict-compat sweep in
+`experiments/strict_compat_parallel_scaling_20260810` (with agent-utils reap fix
+`b295d50` in ancestry) recommended 16 in a contended collection: raw median wall
+was 19.148 seconds at width 16, versus 21.113 seconds at width 32. Because the
+collection observed 44.60–108.20 external cores and overlapping validators, 16
+is a conservative lower bound; exclusive admission may establish a higher
+useful width. The cap therefore rises to 16 as a candidate pending that
+confirmation. This is a scheduler setting, not a claim that the
+whole DAG is 8.767x faster: the sweep's raw width-1 wall was 167.880 seconds,
+while a full-DAG speedup requires its own same-SHA raw wall measurement and
+complete node accounting.
 
 The former `pmu: 1` cap (and the matching `flock /tmp/hermit-privileged-pmu.lock`
 in the workflows, plus the `pmu-serial` runner label) were retired: they guarded

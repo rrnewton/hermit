@@ -498,7 +498,7 @@ pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
 /// It used to be `DagConfig { steps, ..Default::default() }`, which loaded a DAG
 /// file, kept its steps, and threw its configuration away. That is not a
 /// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
-/// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 1,
+/// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 16,
 /// manifest_guest: 4}`; dropping them left `res_free` evaluating
 /// `unwrap_or(0) >= 1` for the 16 steps demanding `hermit_guest` and the 13
 /// demanding `manifest_guest`, so none could ever be admitted. The scheduler's
