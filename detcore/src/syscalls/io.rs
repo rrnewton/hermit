@@ -1078,10 +1078,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // hermit's own scheduler log ends at `COMMIT turn N, dettid <parent>`
         // injecting `epoll_pwait(..., -1, NULL, 8)` with `queue len 2`.
         //
-        // glibc implements `epoll_wait(2)` as `epoll_pwait` with a NULL
-        // sigmask, so ordinary programs never reached `handle_epoll_wait`,
-        // which has always handled this correctly. With a NULL sigmask the two
-        // are semantically identical, so route them together.
+        // WHO ACTUALLY REACHES THIS, measured rather than assumed. It is NOT
+        // glibc's `epoll_wait(2)` on this architecture: glibc calls
+        // `SYS_epoll_pwait` only where `__NR_epoll_wait` does not exist (arm64
+        // and friends). x86_64 has it, and `strace` on glibc 2.34/x86_64 shows
+        // a plain `epoll_wait` syscall, which `handle_epoll_wait` has always
+        // handled correctly. The callers that land here are programs issuing
+        // `epoll_pwait` DIRECTLY -- libuv does, which is how the original
+        // `cmake` hang was found. With a NULL sigmask the two calls are
+        // semantically identical, so route them together.
         //
         // A NON-NULL sigmask keeps the previous behavior: its whole purpose is
         // to swap the signal mask atomically for the duration of the wait, and

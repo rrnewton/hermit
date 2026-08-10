@@ -7,8 +7,24 @@
  */
 
 /*
- * Regression guest: a zero-timeout `epoll_pwait` polling loop must not starve
- * the producer it is polling for.
+ * Regression guest for BOTH `epoll_pwait` scheduler defects in #1850. It takes
+ * one optional argument selecting the scenario:
+ *
+ *   (none)     zero-timeout polling loop must not STARVE its producer.
+ *   blocking   infinite-timeout wait must not DEADLOCK the scheduler.
+ *
+ * The two are different failure modes with different causes and they need
+ * separate brackets. The zero-timeout case spins and is rescued by ordinary
+ * timer preemption unless preemption is disabled, so its test must pass
+ * `--max-timeslice=disabled` to detect anything. The blocking case is stuck
+ * inside the kernel where no preemption can reach it, so it reproduces under
+ * plain `--strict` and needs no special flag.
+ *
+ * The blocking scenario is the defect this PR is named for -- routing a
+ * NULL-sigmask `epoll_pwait` away from inject-and-block. It was previously
+ * unbracketed: reverting `handle_epoll_pwait` to its pre-#1850 body left the
+ * entire suite green, including this file's zero-timeout tests, so nothing in
+ * the repository detected the headline regression.
  *
  * A zero-timeout `epoll_pwait` cannot block, so it is tempting to inject it
  * straight into Linux with no scheduler interaction. Under sequentialized
@@ -44,6 +60,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PUBLISHED_VALUE 0x5eed1234ULL
@@ -75,7 +92,82 @@ static void* worker(void* arg) {
   return NULL;
 }
 
-int main(void) {
+/* ---- Mode 2: the INFINITE-timeout deadlock, i.e. the defect #1850 is named
+ * after. ----
+ *
+ * A blocking `epoll_pwait` that is injected raw and waited on holds the
+ * scheduler turn inside the kernel, while the only thread that could satisfy
+ * the wait sits in the run queue waiting for a turn that never comes. Nothing
+ * breaks the cycle: unlike the zero-timeout case, timer preemption cannot
+ * rescue it, because the waiter is blocked in the kernel rather than spinning.
+ *
+ * THE WORKER'S SLEEP IS LOAD-BEARING, not padding. Without it the worker wins
+ * the race, writes before the main thread ever reaches `epoll_pwait`, and the
+ * call returns immediately without blocking -- so the guest completes even with
+ * the fix reverted and the test guards nothing. Measured while building this:
+ * two earlier drafts without the sleep passed against the pre-#1850 handler.
+ * Do not "simplify" it away.
+ */
+static void* sleeping_worker(void* arg) {
+  (void)arg;
+  struct timespec delay = {0, 50 * 1000 * 1000}; /* 50ms: the waiter must block first. */
+  nanosleep(&delay, NULL);
+
+  atomic_store(&g_value, PUBLISHED_VALUE);
+  uint64_t one = 1;
+  if (write(g_event_fd, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+    perror("write eventfd");
+    _exit(1);
+  }
+  return NULL;
+}
+
+static int run_blocking_mode(int epfd) {
+  pthread_t tid;
+  if (pthread_create(&tid, NULL, sleeping_worker, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+
+  /* Infinite timeout, NULL sigmask: the exact call `cmake` issues through
+   * libuv, and the one that used to wedge the whole guest. */
+  struct epoll_event got;
+  for (;;) {
+    int n = (int)syscall(SYS_epoll_pwait, epfd, &got, 1, /*timeout=*/-1, /*sigmask=*/NULL,
+                         /*sigsetsize=*/(size_t)8);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      perror("epoll_pwait(-1)");
+      return 1;
+    }
+    if (n > 0) {
+      break;
+    }
+  }
+
+  uint64_t drained = 0;
+  if (read(g_event_fd, &drained, sizeof(drained)) != (ssize_t)sizeof(drained)) {
+    perror("read eventfd");
+    return 1;
+  }
+  if (pthread_join(tid, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  unsigned long long value = atomic_load(&g_value);
+  if (value != PUBLISHED_VALUE) {
+    fprintf(stderr, "unexpected published value: %llu\n", value);
+    return 1;
+  }
+  printf("epoll-pwait-blocking-progress-ok %llu\n", value);
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  const int blocking_mode = argc > 1 && strcmp(argv[1], "blocking") == 0;
+
   g_event_fd = eventfd(0, 0);
   if (g_event_fd < 0) {
     perror("eventfd");
@@ -95,6 +187,13 @@ int main(void) {
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, g_event_fd, &ev) != 0) {
     perror("epoll_ctl");
     return 1;
+  }
+
+  if (blocking_mode) {
+    int rc = run_blocking_mode(epfd);
+    close(epfd);
+    close(g_event_fd);
+    return rc;
   }
 
   pthread_t tid;

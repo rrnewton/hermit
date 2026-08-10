@@ -75,6 +75,12 @@ fn guest() -> &'static Path {
 /// record/replay: those arms already took a scheduler turn before the fix, so
 /// exercising them would not detect the regression.
 fn run_plain_strict(extra: &[&str]) {
+    run_guest(extra, &[], SUCCESS_MARKER);
+}
+
+/// Shared driver. `extra` are hermit flags; `guest_args` select the scenario
+/// inside the guest; `marker` is the success line that scenario prints.
+fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
@@ -88,7 +94,8 @@ fn run_plain_strict(extra: &[&str]) {
         ])
         .args(extra)
         .arg("--")
-        .arg(guest());
+        .arg(guest())
+        .args(guest_args);
 
     let rendered = format!("{command:?}");
     let output = command
@@ -115,7 +122,7 @@ fn run_plain_strict(extra: &[&str]) {
 
     let stdout = String::from_utf8(output.stdout).expect("guest stdout should be UTF-8");
     assert!(
-        stdout.contains(SUCCESS_MARKER),
+        stdout.contains(marker),
         "guest did not report progress: {rendered}\nstdout:\n{stdout}"
     );
 }
@@ -147,4 +154,26 @@ fn zero_timeout_epoll_pwait_yields_without_timer_preemption() {
 #[test]
 fn zero_timeout_epoll_pwait_ordinary_strict_smoke() {
     run_plain_strict(&[]);
+}
+
+/// THE BRACKET FOR THE HEADLINE FIX, and the reason this file exists in its
+/// current shape.
+///
+/// An infinite-timeout `epoll_pwait` that is injected raw and waited on holds
+/// the scheduler turn inside the kernel while the only thread that could
+/// satisfy it waits for a turn that never comes. That deadlock is the defect
+/// #1850 is named after, and until this test it was the ONE change in the PR
+/// with no guard: reverting `handle_epoll_pwait` to its exact pre-#1850 body
+/// left everything green -- both zero-timeout tests in this file 2/2,
+/// `epoll_determinism` 7/7, and `hermit-detcore --lib` 388/388.
+///
+/// Measured both ways against this exact guest, plain `--strict`, ptrace:
+/// with the pre-#1850 handler the guest is killed at 60s (`timeout` exit 124);
+/// at this head it exits 0. No flag is needed to expose it, unlike the
+/// zero-timeout case -- a thread blocked in the kernel is beyond the reach of
+/// timer preemption, which is exactly why this failure is a hard hang rather
+/// than starvation.
+#[test]
+fn blocking_epoll_pwait_does_not_deadlock_the_scheduler() {
+    run_guest(&[], &["blocking"], "epoll-pwait-blocking-progress-ok");
 }
