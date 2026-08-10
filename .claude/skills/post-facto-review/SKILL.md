@@ -1,6 +1,6 @@
 ---
 name: post-facto-review
-description: "Current Hermit post-facto human-review protocol: exact trigger set, dual Claude+Codex adversarial review for triggered changes, exact-head validation, and fix-forward human review after landing."
+description: "Current Hermit post-facto human-review protocol: one exact-head adversarial review on every PR, dual Claude+Codex review for triggered changes, exact-head validation, and fix-forward human review after landing."
 ---
 
 # Post-facto human review
@@ -28,10 +28,35 @@ recreate obsolete review labels under the current owner directive.
 
 ## Adversarial review and evidence
 
-A triggered PR requires independent exact-head approval from one Claude-family
-reviewer and one Codex-family reviewer. Neither is the author. Role-tagged review
-comments carrying the full head SHA are authority; numbered review and
-`passed-review-*` labels are caches. Any push invalidates both approvals.
+Every PR requires at least one independent adversarial review at its exact head
+before landing. A triggered PR requires two: one Claude-family reviewer and one
+Codex-family reviewer. No reviewer is the author. Role-tagged review comments
+carrying the full head SHA are authority; numbered review and `passed-review-*`
+labels are caches. Any push invalidates the approvals for the old head.
+
+### Timeout and budget anti-evasion
+
+Reject by default any PR that raises a validation timeout, per-node budget, or
+other execution cap. It may proceed only when explicit owner approval and the
+substantive justification for the increase are recorded on the PR. "CI was
+timing out" is not a justification; it is the regression signal the cap exists
+to surface. A receipt produced only because the candidate changed the threshold
+that judges it does not authorize that candidate.
+
+Apply the same default rejection to quieter ways of hiding the regression:
+
+- widening or disabling a cap without calling it a timeout increase;
+- raising parallelism to mask increased per-node cost;
+- moving work or a node outside the timed path;
+- marking a formerly blocking step non-blocking, optional, skipped, or
+  allowed-to-fail; or
+- increasing, regenerating, or rebasing a recorded performance baseline so the
+  candidate compares against its own slower behavior.
+
+Review these controls against the trusted base and owner-approved policy, not
+only the candidate tree. The exception record must explain why the workload or
+cost model legitimately changed and include evidence that distinguishes that
+change from a performance regression.
 
 Every PR contains `Summary`, `Determinism`, `Linux Semantics`, and `Validation`.
 KVM changes also contain `Relationship to gVisor`; a triggered PR contains
