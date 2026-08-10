@@ -89,12 +89,13 @@ use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope;
+use safe_ci_dag_runner::cgroup::reexec_in_scope_with_limits;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
+use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
+use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
 use validate_plan::CompatMode;
@@ -242,6 +243,8 @@ struct Args {
     jobs: Option<i64>,
     keep_going: bool,
     allow_cgroup_failure: bool,
+    /// OUTER wall budget for the WHOLE validate invocation, in seconds.
+    run_timeout: Option<i64>,
     merge_lanes: bool,
     reuse_parent_manifest_gate: bool,
     self_test: bool,
@@ -288,7 +291,7 @@ fn usage() -> &'static str {
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
-     \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
+     \x20 --run-timeout SEC OUTER wall budget for the WHOLE invocation (across lanes and\n     \x20                  retries). On breach, in-flight nodes are cut and the run still\n     \x20                  reports, instead of being killed from outside with its log\n     \x20                  discarded. Also sets the systemd scope's RuntimeMaxSec to a\n     \x20                  strictly later value. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n     \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
@@ -348,6 +351,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
+        run_timeout: None,
         merge_lanes: true,
         reuse_parent_manifest_gate: false,
         self_test: false,
@@ -425,6 +429,18 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+            "--run-timeout" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(v) if v > 0 => args.run_timeout = Some(v),
+                    _ => {
+                        eprintln!(
+                            "validate: --run-timeout needs a positive number of SECONDS"
+                        );
+                        return Err(2);
+                    }
+                }
+            }
             "--baseline" => {
                 i += 1;
                 match argv.get(i) {
@@ -1236,7 +1252,16 @@ fn default_jobs() -> i64 {
 /// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
 /// run) or `Err(exit_code)`. On the default path this re-execs into a transient
 /// `systemd --user` scope and does not return on success.
-fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
+/// How much longer than validate's own budget the SCOPE may live.
+///
+/// The scope bound is a backstop for the driver itself wedging, so it must never be the level
+/// that fires: validate needs this window to reap its nodes, write its rows, and append its
+/// ledger entry. Sized as the larger of 60s and a tenth of the budget.
+fn scope_grace_s(run_timeout_s: i64) -> i64 {
+    60.max(run_timeout_s / 10)
+}
+
+fn resolve_cgroups(allow_failure: bool, run_timeout_s: Option<i64>) -> Result<BoxedCgroups, u8> {
     if is_in_scope() {
         let mgr = Cgroups::new();
         if mgr.enabled() {
@@ -1264,7 +1289,11 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         );
         return Ok(None);
     }
-    let reexeced_or_skipped = reexec_in_scope(None, None);
+    let reexeced_or_skipped = reexec_in_scope_with_limits(
+        None,
+        None,
+        run_timeout_s.map(|s| s + scope_grace_s(s)),
+    );
     let detail = if reexeced_or_skipped {
         "boxing was skipped (e.g. CI without a systemd --user scope)"
     } else {
@@ -2796,6 +2825,10 @@ struct LaneResult {
     /// that only survived because the host was retried is never mistaken for a
     /// green that passed first time.
     env_retries: usize,
+    /// The OUTER run budget expired during this lane, so its work was cut short.
+    /// A reader must be able to tell "this lane judged the tree" from "this lane
+    /// ran out of time", and `ok == false` alone cannot say which.
+    run_timed_out: bool,
 }
 
 /// Read the durable log once it has stopped growing.
@@ -2846,6 +2879,22 @@ fn read_log_settled(path: &Path) -> String {
 ///   it.** In the bash the retry happened INSIDE the gate, so downstream never
 ///   got skipped; reproducing that here means the retry DAG carries the skipped
 ///   and aborted nodes too, with dependencies restricted to the retry set.
+/// Seconds left before `deadline`, or `None` when the run is unbounded.
+///
+/// Returns `Some(0)` once the deadline has passed, which callers treat as "spend nothing more":
+/// the budget covers the WHOLE invocation, so lanes and retries draw down one shared clock rather
+/// than each getting a fresh copy of it.
+fn remaining_budget_s(deadline: Option<std::time::Instant>) -> Option<i64> {
+    let deadline = deadline?;
+    let now = std::time::Instant::now();
+    Some(if now >= deadline {
+        0
+    } else {
+        (deadline - now).as_secs() as i64
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -2853,9 +2902,20 @@ fn run_lane_with_env_retries(
     verbosity: i64,
     cgroups: BoxedCgroups,
     log_path: &Path,
+    deadline: Option<std::time::Instant>,
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
-    let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    let first = run_dag_boxed_deadline(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups.clone(),
+        None,
+        None,
+        remaining_budget_s(deadline),
+    );
+    let mut run_timed_out = first.run_timed_out;
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -2919,8 +2979,28 @@ fn run_lane_with_env_retries(
         retry_cfg.description =
             format!("{} — environmental retry {env_retries}/{max}", cfg.description);
         retry_cfg.steps = steps;
-        let again =
-            run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        // A RETRY MUST NOT GET A FRESH BUDGET. Retries draw down the same invocation clock, so a
+        // node that blocks environmentally cannot walk the run past its outer bound one retry at
+        // a time — which is exactly how a bounded run turns back into an unbounded one.
+        if remaining_budget_s(deadline) == Some(0) {
+            eprintln!(
+                "validate: outer run budget exhausted; NOT starting environmental retry \
+                 {env_retries}/{max}."
+            );
+            run_timed_out = true;
+            break;
+        }
+        let again = run_dag_boxed_deadline(
+            &retry_cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            None,
+            None,
+            remaining_budget_s(deadline),
+        );
+        run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
@@ -2951,7 +3031,7 @@ fn run_lane_with_env_retries(
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
     let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries }
+    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -4106,7 +4186,58 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
+    // OUTER RUN BUDGET. The one bound that can stop a runaway AND still leave evidence: per-step
+    // budgets cannot bound a run (any number of legal nodes can sum past any ceiling), and the
+    // only thing that stopped one before was the CI provider's job kill, which discards a
+    // cancelled job's logs and therefore destroys the very record that would explain it.
+    //
+    // NOT DEFAULTED TO A GUESS. The number that matters is the external limit this run has to
+    // finish inside, and only the caller knows it: a workflow knows its own timeout-minutes, an
+    // operator knows how long they will wait. A hard-coded default would either strangle a
+    // legitimate local run or sit uselessly above the job kill it is supposed to pre-empt. So it
+    // is explicit — and its ABSENCE is stated, because an unbounded run that nobody noticed is
+    // how this became a P0.
+    let run_timeout = args
+        .run_timeout
+        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+    match run_timeout {
+        Some(secs) => eprintln!(
+            "validate: outer run budget {secs}s (whole invocation, across lanes and retries); nodes are cut and rows written if it expires."
+        ),
+        None => eprintln!(
+            "validate: WARNING: NO outer run budget (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS). Per-node budgets still apply, but nothing bounds this invocation as a whole; if it overruns, the only thing that will stop it is an external kill, and an external kill discards the log that would explain it."
+        ),
+    }
+    // FAIL CLOSED ON A MIS-ORDERED BUDGET, before anything runs. A node allowed to run as long as
+    // the whole invocation can only ever be terminated by the outer bound, which attributes the
+    // overrun to "validate" instead of to the gate that caused it — the exact report that made a
+    // real regression unexplainable for days.
+    if let Some(secs) = run_timeout {
+        let mut bad = steps_violating_run_timeout(&plan.cfg, secs);
+        if let Some(second) = &plan.second {
+            bad.extend(steps_violating_run_timeout(second, secs));
+        }
+        if !bad.is_empty() {
+            bad.sort();
+            bad.dedup();
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "outer run budget is not larger than every node's own budget",
+                std::iter::once(format!(
+                    "{} node(s) declare a wall budget >= the {secs}s run budget, so the run bound would fire before theirs and the overrun could not be attributed to a node:",
+                    bad.len()
+                ))
+                .chain(bad.iter().take(8).map(|(tag, t)| format!("  {tag} ({t}s)")))
+                .chain(std::iter::once(
+                    "lower those node budgets (VALIDATE_GATE_TIMEOUT_SECONDS) or raise --run-timeout".to_string(),
+                ))
+                .collect(),
+            );
+        }
+    }
+
+    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure, run_timeout) {
         Ok(c) => {
             // Claim the re-entrancy marker HERE, not before resolve_cgroups.
             // On the default path resolve_cgroups re-execs into a transient
@@ -4229,15 +4360,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut ok = true;
     let mut env_retries = 0usize;
 
+    // ONE clock for the WHOLE invocation, started here rather than per lane, so no combination
+    // of lanes and environmental retries can walk past the bound a few minutes at a time.
+    let deadline = run_timeout
+        .map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s as u64));
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_with_env_retries(cfg, jobs, keep_going, verbosity, cgroups.clone(), &log_path)
+        run_lane_with_env_retries(
+            cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            &log_path,
+            deadline,
+        )
     };
+    let mut run_timed_out = false;
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
     env_retries += r.env_retries;
+    run_timed_out = run_timed_out || r.run_timed_out;
 
     if let Some(second) = &plan.second {
         if ok || keep_going {
@@ -4246,12 +4391,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
             env_retries += r2.env_retries;
+            run_timed_out = run_timed_out || r2.run_timed_out;
         } else {
             eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
         }
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
+    // SAY IT PLAINLY, because a run cut by its own budget is NOT a verdict about the tree. It is
+    // a complete result (the run finished and wrote its evidence) but an incomplete judgement,
+    // and a consumer that cannot tell the two apart will read a budget breach as a product red.
+    if run_timed_out {
+        println!(
+            "\u{23f1} VALIDATE RUN BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work \
+             was cut short so this run could still report. This is NOT a verdict that the tree is \
+             broken \u{2014} it is a statement that the run did not finish inside its bound.",
+            run_timeout.unwrap_or(0)
+        );
+    }
     print_cost_table(&outcomes, &skipped);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
