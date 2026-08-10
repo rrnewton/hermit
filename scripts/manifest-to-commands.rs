@@ -237,6 +237,31 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
     format!("{guest} {rendered}")
 }
 
+/// The whole-invocation exit status a cell must reproduce, from
+/// `modes.verify.expect_status`. `0` means the default success contract.
+///
+/// A guest whose deterministic outcome is a crash or a deliberate non-zero exit
+/// needs `--verify-allow both`, because `--verify` otherwise refuses the second
+/// run and never compares anything. Emitting it here keeps an out-of-tree
+/// harness on the same command as `ci/test_harness.sh`; without it the generated
+/// line reproduces the NO_RESULT rather than the cell.
+fn mode_expect_status(spec: &Value, mode: &str, id: &str) -> i64 {
+    let Some(value) = spec.get("expect_status") else {
+        return 0;
+    };
+    if mode != "verify" {
+        fail(format!(
+            "{id}.modes.{mode}.expect_status is only meaningful for the verify mode"
+        ));
+    }
+    match value.as_integer() {
+        Some(status) if (1..=255).contains(&status) => status,
+        other => fail(format!(
+            "{id}.modes.verify.expect_status must be 1..=255, got {other:?}"
+        )),
+    }
+}
+
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -245,6 +270,7 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     guest: &str,
+    expect_status: i64,
 ) -> String {
     let portable = lane == "portable";
     let profile = if portable {
@@ -252,9 +278,14 @@ fn hermit_command(
     } else {
         ""
     };
+    let verify_allow = if expect_status == 0 {
+        ""
+    } else {
+        " --verify-allow both"
+    };
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{verify_allow}{profile} -- {guest}",
             shell_quote(backend)
         ),
         "replay" => format!(
@@ -347,20 +378,42 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             vec![0]
         };
 
+        // Per-MODE, unlike guest_args: the guest's terminal status is a property
+        // of the program under the deterministic schedule, not of the backend
+        // that hosts it.
+        let expect_status = mode_expect_status(spec, mode, &id);
+
         for backend in backends {
             let guest_args = mode_guest_args(spec, mode, &backend, &id);
             let guest = guest_with_args(&guest, &guest_args);
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
-                let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
+                let command = hermit_command(
+                    mode,
+                    &backend,
+                    lane,
+                    timeout,
+                    seed,
+                    &extra,
+                    &guest,
+                    expect_status,
+                );
                 let runs = match mode {
                     "chaos" => 2,
                     "custom" => custom_runs,
                     _ => 1,
                 };
                 let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
+                // A cell with a declared terminal status EXITS non-zero on
+                // success, so the note has to say so or a reader (or a shell
+                // `|| exit`) reads the reproduction as a failure.
+                let status_note = if expect_status == 0 {
+                    String::new()
+                } else {
+                    format!(" expect_status={expect_status}")
+                };
                 lines.push(format!(
-                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
+                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}{status_note}",
                     repeat(&command, runs)
                 ));
             }
@@ -409,16 +462,49 @@ fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
     lines
 }
 
+/// Emit every declared terminal status as TSV on stdout:
+/// `<test-id>\t<mode>\t<expect-status>`, sorted, one line per declaring cell.
+///
+/// Same rationale as `guest_args_tsv`: an out-of-tree harness (the compat
+/// scorecard) must not keep a second copy of this policy. Without it, such a
+/// harness scores a deterministically-crashing guest as a determinism failure
+/// even though the run is bitwise reproducible. Cells that declare nothing are
+/// omitted rather than emitted as 0, so a consumer can tell "declared nothing"
+/// from "declared success".
+fn expect_status_tsv(tests: &[(String, Value)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (bucket, test) in tests {
+        let id = test_id(test, bucket);
+        let Some(modes) = test.get("modes").and_then(Value::as_table) else {
+            continue;
+        };
+        let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
+        mode_names.sort_unstable();
+        for mode in mode_names {
+            let status = mode_expect_status(&modes[mode], mode, &id);
+            if status == 0 {
+                continue;
+            }
+            lines.push(format!("{id}\t{mode}\t{status}"));
+        }
+    }
+    lines.sort();
+    lines
+}
+
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
 const USAGE: &str = "\
-Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
+Usage: manifest-to-commands.rs [-h|--help] [--guest-args] [--expect-status]
 
 Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
 TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
-  --guest-args  Write nothing; print the declared per-backend guest arguments as
-                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
+  --guest-args     Write nothing; print the declared per-backend guest arguments
+                   as TSV (`<test-id> <mode> <backend> <arg>...`) on stdout.
+  --expect-status  Write nothing; print the declared terminal exit status as TSV
+                   (`<test-id> <mode> <status>`) on stdout. Only declaring cells
+                   appear; every other cell must exit 0.";
 
 /// Parse every manifest under `manifests`, validating schema and bucket naming,
 /// and return `(bucket, test)` pairs in file order.
@@ -485,6 +571,12 @@ fn main() -> ExitCode {
     let manifests = root.join("tests/e2e/manifests");
     if std::env::args().skip(1).any(|a| a == "--guest-args") {
         for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
+            println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if std::env::args().skip(1).any(|a| a == "--expect-status") {
+        for line in expect_status_tsv(&load_manifest_tests(&manifests)) {
             println!("{line}");
         }
         return ExitCode::SUCCESS;
@@ -658,6 +750,83 @@ backends_enabled = ["ptrace"]
         assert!(
             !lines.iter().any(|line| line.starts_with("c-programs/bare")),
             "a cell declaring no guest_args must not appear in the dump"
+        );
+    }
+
+    const CRASHER: &str = r#"
+[[test]]
+id = "c-programs/crasher"
+program = "tests/c/crasher.c"
+[test.modes.verify]
+expect_status = 139
+backends_enabled = ["ptrace"]
+"#;
+
+    /// POSITIVE side: a declared terminal status must reach the generated line
+    /// as `--verify-allow both`. Without it Hermit refuses the second run, so
+    /// the reproduction command measures a NO_RESULT instead of the cell.
+    #[test]
+    fn declared_terminal_status_emits_verify_allow_both() {
+        let tests = manifest(CRASHER);
+        let spec = &tests[0].1["modes"]["verify"];
+        let status = mode_expect_status(spec, "verify", "c-programs/crasher");
+        assert_eq!(status, 139);
+        let command = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "\"$cell/guest\"",
+            status,
+        );
+        assert!(
+            command.contains("--verify --verify-allow both --no-virtualize-cpuid"),
+            "expected the allowance next to --verify, got: {command}"
+        );
+    }
+
+    /// NEGATIVE side: an undeclared cell must keep the historical command
+    /// exactly. If the allowance leaked in unconditionally, every cell would
+    /// stop enforcing the success contract Hermit applies by default.
+    #[test]
+    fn undeclared_terminal_status_leaves_the_command_untouched() {
+        let tests = manifest(
+            r#"
+[[test]]
+id = "c-programs/bare"
+program = "tests/c/bare.c"
+[test.modes.verify]
+backends_enabled = ["ptrace"]
+"#,
+        );
+        let spec = &tests[0].1["modes"]["verify"];
+        let status = mode_expect_status(spec, "verify", "c-programs/bare");
+        assert_eq!(status, 0);
+        let command = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "\"$cell/guest\"",
+            status,
+        );
+        assert!(!command.contains("--verify-allow"));
+    }
+
+    /// The TSV dump is the out-of-tree harness's only source for this policy,
+    /// so like `guest_args`, undeclared cells are omitted rather than reported
+    /// as 0 — a consumer must be able to tell "declared nothing" apart.
+    #[test]
+    fn expect_status_tsv_emits_only_declaring_cells() {
+        let mut tests = manifest(CRASHER);
+        tests.extend(manifest(DECLARED));
+        assert_eq!(
+            expect_status_tsv(&tests),
+            vec!["c-programs/crasher\tverify\t139"]
         );
     }
 }

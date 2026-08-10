@@ -599,6 +599,45 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
+/// Validate `modes.verify.expect_status`, the guest's declared TERMINAL status.
+///
+/// A guest whose deterministic outcome is a crash or a deliberate non-zero exit
+/// could not be expressed before this key existed. `hermit run --verify` defaults
+/// to `--verify-allow success`: when the first run's status is not success it
+/// refuses the second run, so the determinism comparison never happens and the
+/// cell reports a NO_RESULT that says nothing about determinism. Such guests were
+/// therefore left at `ci = false`, i.e. outside the measured envelope, even when
+/// they reproduce bitwise. This is the same class of gap that `guest_args` closed
+/// for guests that need arguments (rrnewton/hermit#1815).
+///
+/// Declaring the status does not relax the cell: the harness widens
+/// `--verify-allow` so the two-run comparison actually runs, and then requires
+/// the observed status to equal this value EXACTLY, which is stricter than
+/// Hermit's coarse success/failure gate. `139` (128+SIGSEGV) is the shape used by
+/// a guest that deterministically dies of a signal.
+fn validate_expect_status(id: &str, mode: &str, spec: &toml::value::Table) {
+    let Some(value) = spec.get("expect_status") else {
+        return;
+    };
+    // `ensure_keys` already rejects the key outside `verify`; keep the guard so a
+    // future `allowed` edit cannot silently create a declaration nothing reads.
+    if mode != "verify" {
+        die(format!(
+            "{id}: modes.{mode}.expect_status is only meaningful for the verify mode"
+        ));
+    }
+    match value.as_integer() {
+        Some(status) if (1..=255).contains(&status) => {}
+        Some(0) => die(format!(
+            "{id}: modes.verify.expect_status=0 is the default; omit it rather than \
+             restating the success contract"
+        )),
+        other => die(format!(
+            "{id}: modes.verify.expect_status must be 1..=255 (128+N for signal N), got {other:?}"
+        )),
+    }
+}
+
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -616,9 +655,11 @@ fn validate_mode(
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert"]),
         "custom" => allowed.extend(["args", "assert"]),
+        "verify" => allowed.push("expect_status"),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
+    validate_expect_status(id, mode, spec);
     let ci = spec
         .get("ci")
         .and_then(Value::as_bool)
@@ -898,6 +939,91 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    /// A verify cell whose guest deterministically dies must be able to say so.
+    /// The declared status is what lets the harness widen `--verify-allow` and
+    /// then require that exact status; without it the cell can only be excluded.
+    #[test]
+    fn accepts_declared_terminal_status_on_verify() {
+        let spec = parse_mode(
+            r#"
+ci = true
+expect_status = 139
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: only `verify` runs a single Hermit invocation whose status is
+    /// the cell's whole observation. Accepting the key elsewhere would create a
+    /// declaration that silently changes nothing.
+    #[test]
+    #[should_panic(expected = "unknown keys")]
+    fn rejects_declared_terminal_status_outside_verify() {
+        let spec = parse_mode(
+            r#"
+ci = false
+expect_status = 139
+backends_enabled = []
+seeds = [1, 2]
+
+[backends_disabled]
+ptrace = "unsupported"
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "chaos",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: `expect_status = 0` restates the default. Allowing it would let
+    /// a reader believe a cell had been examined and declared successful when
+    /// nothing distinguishes it from every undeclared cell.
+    #[test]
+    #[should_panic(expected = "omit it rather than restating")]
+    fn rejects_redundant_zero_terminal_status() {
+        validate_expect_status(
+            "bucket/test",
+            "verify",
+            parse_mode("expect_status = 0\n").as_table().unwrap(),
+        );
+    }
+
+    /// NEGATIVE: a wait status cannot exceed 255, so a raw signal number written
+    /// as, say, `11` is fine but `256` is a typo the schema must catch rather
+    /// than hand to a comparison that can never match.
+    #[test]
+    #[should_panic(expected = "must be 1..=255")]
+    fn rejects_out_of_range_terminal_status() {
+        validate_expect_status(
+            "bucket/test",
+            "verify",
+            parse_mode("expect_status = 256\n").as_table().unwrap(),
+        );
     }
 
     #[test]

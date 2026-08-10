@@ -1469,6 +1469,17 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
+# The whole-invocation exit status this cell must reproduce. 0 is the default
+# contract (Hermit and the guest both succeeded). A manifest may declare
+# `modes.verify.expect_status = <1..=255>` for a guest whose deterministic
+# outcome is a crash (128+N for signal N) or a deliberate non-zero exit; the
+# manifest validator rejects the key on every other mode, so this resolves to 0
+# everywhere else.
+function cell_expect_status {
+    local metadata=$1 mode=$2
+    jq -r --arg mode "$mode" '.modes[$mode].expect_status // 0' <<<"$metadata"
+}
+
 function observation_hash {
     local metadata=$1
     local status=$2
@@ -1721,8 +1732,17 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
+            # A guest whose deterministic outcome is a crash or a deliberate
+            # non-zero exit needs `--verify-allow both`, otherwise Hermit refuses
+            # the second run and never compares anything. Widening the allowance
+            # does not loosen the cell: run_cell requires the observed status to
+            # equal the declared expect_status EXACTLY, which is stricter than
+            # Hermit's coarse success/failure gate.
+            local -a verify_allow=()
+            [[ $(cell_expect_status "$metadata" "$mode") == 0 ]] ||
+                verify_allow=(--verify-allow both)
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${profile[@]}" -- "${guest_command[@]}")
+                "${verify_allow[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -1787,8 +1807,14 @@ function append_result {
             log_level=
             ;;
         verify)
+            # Record exactly what execute_attempt runs: a declared terminal
+            # status adds `--verify-allow both`, so the evidence must carry it.
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]')
+                --argjson allow_both \
+                "$([[ $(cell_expect_status "${METADATA_BY_ID[$test_id]}" verify) == 0 ]] &&
+                    echo false || echo true)" \
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
+                 + (if $allow_both then ["--verify-allow","both"] else [] end)')
             log_level=info
             ;;
         replay)
@@ -1929,12 +1955,15 @@ function run_cell {
             reason="custom output identical across $runs runs"
         fi
     else
-        local row status
+        local row status expect_status
+        expect_status=$(cell_expect_status "$metadata" "$mode")
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
         IFS=$'\t' read -r status _ _ _ <<<"$row"
-        if [[ $status != 0 ]]; then
+        if [[ $status != "$expect_status" ]]; then
             outcome=FAIL
-            reason="$mode exited with status $status"
+            reason="$mode exited with status $status, expected $expect_status"
+        elif [[ $expect_status != 0 ]]; then
+            reason="$mode reproduced its declared terminal status $expect_status"
         fi
     fi
 

@@ -116,6 +116,41 @@ guest_args = { ptrace = ["multi"], kvm = ["multi"] }
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
+### Declaring a guest's terminal status
+
+A `verify` cell defaults to requiring the whole Hermit invocation to exit `0`.
+A guest whose *deterministic* outcome is a crash or a deliberate non-zero exit
+declares that status instead:
+
+```toml
+[test.modes.verify]
+ci = true
+expect_status = 139   # 128 + SIGSEGV
+backends_enabled = ["ptrace"]
+```
+
+This exists because `hermit run --verify` defaults to `--verify-allow success`:
+when the first run's status is not success it refuses the second run, so the
+determinism comparison never happens and the cell reports a NO_RESULT that says
+nothing about determinism. Such guests previously had to stay at `ci = false`,
+outside the measured envelope, even when they reproduce bitwise — the same class
+of gap that `guest_args` closed for guests that need arguments.
+
+Declaring the status does **not** relax the cell. The harness widens
+`--verify-allow` so the two-run comparison actually runs, and then requires the
+observed status to equal the declared value **exactly**, which is stricter than
+Hermit's coarse success/failure gate: a Hermit-side error (exit 1) no longer
+passes as "some failure". The status is part of the cell's observation, so it
+binds the cell to one exact schedule and a legitimate scheduler change must
+update the declaration in the same review.
+
+The key is accepted only on `verify` — the only mode whose cell is a single
+Hermit invocation whose status is the whole observation — must be `1..=255`, and
+must be omitted rather than written as `0`. `scripts/manifest-to-commands.rs`
+emits the matching `--verify-allow both` in its generated command and exposes
+the declarations as TSV via `--expect-status`, so an out-of-tree harness runs the
+same command instead of keeping a second copy of this policy.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;

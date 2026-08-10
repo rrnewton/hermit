@@ -3355,7 +3355,16 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
-ci = false
+ci = true
+# This guest is a deliberate data race: the spawned thread nulls the pointer
+# that main dereferences after the same 1s sleep. Natively main wins and the
+# program exits 0; Hermit's deterministic schedule resolves the race the other
+# way every time, so the guest dies of SIGSEGV and the whole invocation exits
+# 139. That terminal status IS the observation: it binds the cell to one exact
+# schedule, and any change to that schedule must update this declaration in the
+# same review. Do NOT drop the declaration to make the cell green -- without it
+# `--verify` refuses the second run and the cell measures nothing.
+expect_status = 139
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
