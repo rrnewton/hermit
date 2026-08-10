@@ -22,9 +22,10 @@
 //! * **Boxing is fail-closed.** Default path re-execs into a transient
 //!   `systemd --user` scope; if two-level cgroup-v2 boxing cannot be established
 //!   the driver exits 3 rather than running unboxed.
-//! * **Per-node output is live.** Verbosity is floored at 2 so the runner streams
-//!   each node's `[tag]`-prefixed stdout/stderr as it happens. You should never be
-//!   looking at a silent terminal wondering which node is running.
+//! * **Output is bounded by default.** Verbosity 1 prints O(1) lifecycle lines per
+//!   DAG step. Verbosity 2 streams tagged step output, and verbosity 5 additionally
+//!   carries the deepest test identity the runner can observe on every streamed line.
+//!   Failures always print their complete captured detail at every level.
 //! * **Every claim carries its conditions.** One ledger write point emits the
 //!   profile, the executed/skipped/failed counts, commit anchoring, the tree hash,
 //!   the toolchain, and the absolute durable log path together, so a downstream
@@ -248,7 +249,7 @@ struct Args {
     run_on_dirty_tree: bool,
     ignore_cache: bool,
     label_pr: bool,
-    verbose: bool,
+    verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
     allow_cgroup_failure: bool,
@@ -294,7 +295,9 @@ fn usage() -> &'static str {
      \x20 --all, --full-run             Assert the COMPLETE suite explicitly.\n\
      \n\
      Other options:\n\
-     \x20 --verbose        Extra per-gate detail (per-node output is always streamed).\n\
+     \x20 --verbose        Verbosity level 2: stream tagged per-step output.\n\
+     \x20 --verbosity N    Output level 1..5 (default 1; levels 3/4 currently equal 2;\n\
+     \x20                  level 5 prefixes every streamed line with test identity).\n\
      \x20 --run-on-dirty-tree  Escape hatch; AGENTS SHOULD NOT USE THIS.\n\
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
@@ -313,13 +316,30 @@ fn usage() -> &'static str {
      \x20 -h, --help       Show this help and exit.\n\
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
-     VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL, CI_DAG_JOBS,\n\
+     VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
      HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
      HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
     std::env::var(name).map(|v| v == want).unwrap_or(false)
+}
+
+fn parse_verbosity(value: &str) -> Result<i64, u8> {
+    match value.parse::<i64>() {
+        Ok(v @ 1..=5) => Ok(v),
+        _ => {
+            eprintln!("validate: verbosity must be an integer from 1 through 5, got {value:?}");
+            Err(2)
+        }
+    }
+}
+
+fn env_verbosity() -> Result<i64, u8> {
+    match std::env::var("VALIDATE_VERBOSITY") {
+        Ok(v) if !v.is_empty() => parse_verbosity(&v),
+        _ => Ok(if env_flag("VALIDATE_VERBOSE", "1") { 2 } else { 1 }),
+    }
 }
 
 fn parse_args() -> Result<Args, u8> {
@@ -351,6 +371,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         }
     }
     let mut focused: Vec<Focused> = Vec::new();
+    let verbosity = env_verbosity()?;
     let mut args = Args {
         level,
         level_explicit,
@@ -360,7 +381,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         run_on_dirty_tree: env_flag("VALIDATE_RUN_ON_DIRTY_TREE", "1"),
         ignore_cache: env_flag("VALIDATE_IGNORE_CACHE", "1"),
         label_pr: !env_flag("VALIDATE_LABEL_PR", "0"),
-        verbose: env_flag("VALIDATE_VERBOSE", "1"),
+        verbosity,
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
@@ -431,7 +452,17 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--ignore-cache" => args.ignore_cache = true,
             "--label-pr" => args.label_pr = true,
             "--no-label-pr" => args.label_pr = false,
-            "--verbose" => args.verbose = true,
+            "--verbose" => args.verbosity = 2,
+            "--verbosity" => {
+                i += 1;
+                args.verbosity = match argv.get(i) {
+                    Some(v) => parse_verbosity(v)?,
+                    None => {
+                        eprintln!("validate: --verbosity needs a level from 1 through 5");
+                        return Err(2);
+                    }
+                };
+            }
             "--merge-lanes" => args.merge_lanes = true,
             "--sequential-lanes" => args.merge_lanes = false,
             // Internal nested-payload optimization. The outer full DAG has
@@ -798,6 +829,7 @@ fn self_test() -> Result<(), String> {
     // The `--envelope-*` CLI shape is a CONTRACT with scripts/progress-report.sh
     // and the progress-rubric skill, so it is asserted rather than assumed.
     envelope_cli_bracket()?;
+    verbosity_cli_bracket(&root)?;
     super_plan_bracket()?;
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
@@ -806,6 +838,7 @@ fn self_test() -> Result<(), String> {
     // insufficient because a matched comparison can contain zero evidence.
     rr_verdict_bracket()?;
     coverage_schema_bracket()?;
+    typed_libtest_count_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -1481,6 +1514,7 @@ fn super_plan_bracket() -> Result<(), String> {
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
+            skip_reason: None,
         }],
         "caps-audit negative bracket",
     );
@@ -1495,6 +1529,67 @@ fn super_plan_bracket() -> Result<(), String> {
         "  super plan: {} boxed node(s), all capped; caps audit bracketed 1 accept / 1 refusal",
         plan.cfg.steps.len()
     );
+    Ok(())
+}
+
+fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
+    let level = |args: &[&str]| -> Result<i64, String> {
+        parse_argv(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+            .map(|a| a.verbosity)
+            .map_err(|code| format!("verbosity argv {args:?} refused with exit {code}"))
+    };
+    if level(&["--verbose"])? != 2 {
+        return Err("verbosity: --verbose must select level 2".into());
+    }
+    for expected in 1..=5 {
+        if level(&["--verbosity", &expected.to_string()])? != expected {
+            return Err(format!("verbosity: --verbosity {expected} did not round-trip"));
+        }
+    }
+    for bad in ["0", "6", "loud"] {
+        if parse_verbosity(bad).is_ok() {
+            return Err(format!("verbosity: invalid level {bad:?} was accepted"));
+        }
+    }
+    let args = parse_argv(&["full".into(), "--no-label-pr".into()])
+        .map_err(|code| format!("verbosity: full-plan argv refused with exit {code}"))?;
+    let mut plan = build_plan(root, &args, &std::env::temp_dir().join("validate-verbosity-bracket"))?;
+    let envelope = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "test.envelope_levels")
+        .ok_or("verbosity: full plan lost test.envelope_levels")?;
+    for fixture in [
+        "run_probe true '/bin/true'",
+        "run_probe echo '/bin/echo hermit-envelope'",
+        "run_probe date '/bin/date -u +%Y'",
+    ] {
+        if !envelope.cmd.contains(fixture) {
+            return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
+        }
+    }
+    if envelope.cmd.matches("\"$id\"").count() != 2 {
+        return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
+    }
+    if envelope.cmd.matches("\"$id\" >&2").count() != 2
+        || envelope.cmd.matches("</dev/null >&2").count() != 4
+    {
+        return Err(
+            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
+        );
+    }
+    propagate_verbosity(&mut plan, 5);
+    let missing = plan
+        .cfg
+        .steps
+        .iter()
+        .chain(plan.second.iter().flat_map(|cfg| cfg.steps.iter()))
+        .filter(|step| step.env.get("VALIDATE_VERBOSITY").map(String::as_str) != Some("5"))
+        .count();
+    if missing != 0 {
+        return Err(format!("verbosity: {missing} DAG child(ren) lost level 5"));
+    }
     Ok(())
 }
 
@@ -2996,6 +3091,7 @@ fn step_with_caps(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        skip_reason: None,
     }
 }
 
@@ -3221,6 +3317,18 @@ fn clamp_cpu(plan: &mut Plan, cap: i64) {
         };
         for s in cfg.steps.iter_mut() {
             s.cpu_timeout = if s.cpu_timeout > 0 { s.cpu_timeout.min(cap) } else { cap };
+        }
+    }
+}
+
+fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
+    let value = verbosity.to_string();
+    for step in &mut plan.cfg.steps {
+        step.env.insert("VALIDATE_VERBOSITY".into(), value.clone());
+    }
+    if let Some(second) = &mut plan.second {
+        for step in &mut second.steps {
+            step.env.insert("VALIDATE_VERBOSITY".into(), value.clone());
         }
     }
 }
@@ -3688,7 +3796,7 @@ struct LedgerCtx {
     /// row itself so a reader never has to infer from a bare `pass` that the
     /// archival pin was proved current; the receipt verifier keys on it.
     reverie_pin_current: bool,
-    /// libtest counts parsed from the durable log; `None` is UNKNOWN.
+    /// Libtest counts aggregated from typed step outcomes; `None` is UNKNOWN.
     executed_tests: Option<i64>,
     filtered_tests: Option<i64>,
 }
@@ -3839,7 +3947,7 @@ fn canonical_validate_lock_admission(
     validate_runtime::identity_in_ancestry(pid, start_ticks)
 }
 
-/// Parse the libtest `executed` / `filtered` counts out of the durable log.
+/// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.
 ///
 /// **This is the field the whole receipt rests on.** A row whose
 /// `executed_tests` is null is a NON-VERDICT: every downstream completeness
@@ -3849,32 +3957,56 @@ fn canonical_validate_lock_admission(
 /// filtered, and a port that cannot reproduce that number has not preserved the
 /// thing validate exists to do.
 ///
-/// Deliberately NOT re-implemented here: the banner parser lives once, in the
-/// parent (`ci-hub/remediation/nonzero_result.py --ledger-fields`), and every
-/// consumer calls that one. A second in-tree parser would be a second authority
-/// that can disagree. A missing helper, an unreadable log, or unparseable output
-/// all yield `None` (UNKNOWN) — never a fabricated zero.
-fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64>) {
-    let Some(parent) = parent else { return (None, None) };
-    let helper = parent.join("ci-hub/remediation/nonzero_result.py");
-    if !helper.is_file() || log.as_os_str().is_empty() {
-        return (None, None);
+/// The runner derives these values from each step's COMPLETE captured bytes
+/// before verbosity filters presentation. Thus level 1 can stay O(steps)
+/// without erasing the receipt's evidence. `None` remains UNKNOWN and `Some(0)`
+/// remains a demonstrated vacuous run; neither is coerced.
+fn sum_typed_count(
+    outcomes: &[StepOutcome],
+    select: fn(&StepOutcome) -> Option<u64>,
+) -> Option<i64> {
+    let mut seen = false;
+    let mut total = 0u64;
+    for outcome in outcomes {
+        if let Some(value) = select(outcome) {
+            seen = true;
+            total = total.checked_add(value)?;
+        }
     }
-    let Ok(out) = Command::new("python3")
-        .arg(&helper)
-        .arg("--ledger-fields")
-        .arg(log)
-        .output()
-    else {
-        return (None, None);
+    seen.then(|| i64::try_from(total).ok()).flatten()
+}
+
+fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
+    (
+        sum_typed_count(outcomes, |o| o.executed_tests),
+        sum_typed_count(outcomes, |o| o.filtered_tests),
+    )
+}
+
+fn typed_libtest_count_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, executed_tests, filtered_tests| StepOutcome {
+        tag: tag.into(),
+        ok: true,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests,
+        filtered_tests,
+        returncode: Some(0),
+        reason: String::new(),
+        aborted: false,
     };
-    if !out.status.success() {
-        return (None, None);
+    let full = vec![outcome("test.a", Some(398), Some(0)), outcome("test.b", Some(475), Some(350))];
+    if libtest_counts(&full) != (Some(873), Some(350)) {
+        return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut it = text.split_whitespace();
-    let parse = |v: Option<&str>| v.and_then(|v| v.parse::<i64>().ok());
-    (parse(it.next()), parse(it.next()))
+    if libtest_counts(&[outcome("test.zero", Some(0), Some(0))]) != (Some(0), Some(0)) {
+        return Err("typed libtest counts: demonstrated zero was not preserved".into());
+    }
+    if libtest_counts(&[outcome("build.only", None, None)]) != (None, None) {
+        return Err("typed libtest counts: unknown bannerless output was coerced".into());
+    }
+    println!("  typed libtest counts: 873/350 complete accepted; 0/0 preserved; unknown stayed null");
+    Ok(())
 }
 
 /// Write one validation record through the single configured authority.
@@ -3980,8 +4112,8 @@ fn write_ledger(
         // because the host was retried must be distinguishable from a first-pass
         // green.
         "env_block_retries": ctx.env_block_retries,
-        // LIBTEST counts parsed from the durable log by the parent's single-
-        // sourced banner parser, exactly as validate.sh:1671 recorded them.
+        // LIBTEST counts aggregated from the runner's typed step outcomes before
+        // verbosity filters their human-facing presentation.
         // `null` is UNKNOWN and stays UNKNOWN: the receipt publisher fails closed
         // rather than turning missing evidence into a zero or a pass. These are
         // the counts every downstream `is_clean_full_pass` predicate keys on, so
@@ -3998,7 +4130,8 @@ fn write_ledger(
         // NODE counts, deliberately NOT named executed_tests/filtered_tests: a
         // schema<5 consumer keys is_clean_full_pass on those libtest-count names,
         // and a ~47-NODE DAG run must never be readable as a 47-TEST pass. The
-        // counted receipt is minted by finalize_receipt.py --scan off the log.
+        // counted receipt consumes the explicit test fields above rather than
+        // treating this node count as test evidence.
         "executed_nodes": gates_run,
         "real_seconds": wall_s,
         "log_file": log_file,
@@ -4616,6 +4749,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
+    // Nested validate payloads are ordinary DAG children. Carry the selected
+    // level through the plan so `--verbosity 5` does not become level 1 at the
+    // nested strict-compat boundary (and default level 1 stays bounded there).
+    propagate_verbosity(&mut plan, args.verbosity);
+
     // Per-gate budget overrides, preserved from validate.sh
     // (VALIDATE_GATE_TIMEOUT_SECONDS / VALIDATE_GATE_CPU_TIMEOUT_SECONDS). These
     // LOWER a node's ceiling, never raise it: a caller tightening budgets to
@@ -4957,9 +5095,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Verbosity floored at 2: the runner streams each node's tagged output, so
-    // the operator always sees which node is running. Never blind.
-    let verbosity = if args.verbose { 3 } else { 2 };
+    // Level 1 is deliberately O(1) per step. The runner still captures every
+    // byte and prints COMPLETE detail on failure; only passing chatter is
+    // suppressed. Levels 2-4 stream tagged step output, while level 5 adds the
+    // deepest observed test identity to every streamed line.
+    let verbosity = args.verbosity;
     // The envelope profile is a MEASUREMENT: an eager exit on the first probe
     // failure would truncate the very vector it exists to produce.
     let keep_going = args.keep_going || plan.force_keep_going;
@@ -5037,7 +5177,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, filtered_tests) = libtest_counts(parent.as_deref(), &log_path);
+    let (executed_tests, filtered_tests) = libtest_counts(&outcomes);
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -5327,7 +5467,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             let _ = validate_receipt::publish();
         }
         Err(why) => {
-            if args.verbose {
+            if args.verbosity >= 2 {
                 eprintln!("validate: not publishing a receipt-backed label: {why}");
             }
         }
@@ -5400,8 +5540,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     match executed_tests {
         Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} filtered (parsed from the durable log by the parent's \
-             single-sourced banner parser)",
+            "{n} test(s) executed, {} filtered (aggregated from typed step outcomes)",
             filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
@@ -5459,6 +5598,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         ok,
         duration_s: 0.0,
         summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
         returncode: Some(if ok { 0 } else { 1 }),
         reason: if ok { String::new() } else { "stop-test synthetic failure".into() },
         aborted: false,

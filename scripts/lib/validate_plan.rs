@@ -217,6 +217,7 @@ pub fn node(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        skip_reason: None,
     }
 }
 
