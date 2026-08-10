@@ -1944,11 +1944,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The emulation covers the IDENTITY half only. Root privilege
             // waives the ownership permission check; it does not waive pathname,
             // descriptor, or flag errors, so handle_ownership_change_noop
-            // reissues the guest's own call with both ids set to (uid_t)-1 and
-            // returns 0 only if that validating call succeeds. ENOENT, EBADF,
-            // EFAULT, ENOTDIR, EROFS and the fchownat flag EINVAL therefore
+            // translates the target arguments into a side-effect-free metadata
+            // lookup and returns 0 only if that validation succeeds. ENOENT,
+            // EBADF, EFAULT, ENOTDIR and the fchownat flag EINVAL therefore
             // still reach the guest; the host-identity-dependent EPERM/EINVAL
-            // cannot be produced at all. Host ownership is never modified, and
+            // cannot be produced at all. No setattr is attempted, so host
+            // ownership, mode bits, and timestamps are never modified, and
             // Detcore does not model per-file ownership, so the success is not
             // observable through a later stat -- see
             // is_ownership_change_noop_syscall and handle_ownership_change_noop
