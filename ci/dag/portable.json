@@ -423,7 +423,7 @@
       "cmd": "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh cargo test -p hermit --features third-party-backends --test sabre_examples -- --test-threads=1",
       "deps": ["build.e2e_artifact"],
       "timeout": 900,
-      "hint": {"resources": {"hermit_guest": 1}, "est_duration_s": 90,
+      "hint": {"resources": {"hermit_guest": 2}, "est_duration_s": 90,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
     },
