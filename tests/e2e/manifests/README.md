@@ -116,40 +116,70 @@ guest_args = { ptrace = ["multi"], kvm = ["multi"] }
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
-### Declaring a guest's terminal status
+### Declaring a guest's deterministic termination
 
 A `verify` cell defaults to requiring the whole Hermit invocation to exit `0`.
 A guest whose *deterministic* outcome is a crash or a deliberate non-zero exit
-declares that status instead:
+declares that termination instead — exactly one of:
 
 ```toml
 [test.modes.verify]
 ci = true
-expect_status = 139   # 128 + SIGSEGV
+expect_signal = 11        # the GUEST is killed by this signal
+# expect_exit_code = 7    # ...or the GUEST exits with this non-zero code
 backends_enabled = ["ptrace"]
 ```
 
 This exists because `hermit run --verify` defaults to `--verify-allow success`:
 when the first run's status is not success it refuses the second run, so the
-determinism comparison never happens and the cell reports a NO_RESULT that says
-nothing about determinism. Such guests previously had to stay at `ci = false`,
+determinism comparison never happens and the record says
+`verdict: "no_result"`. Such guests previously had to stay at `ci = false`,
 outside the measured envelope, even when they reproduce bitwise — the same class
 of gap that `guest_args` closed for guests that need arguments.
 
-Declaring the status does **not** relax the cell. The harness widens
-`--verify-allow` so the two-run comparison actually runs, and then requires the
-observed status to equal the declared value **exactly**, which is stricter than
-Hermit's coarse success/failure gate: a Hermit-side error (exit 1) no longer
-passes as "some failure". The status is part of the cell's observation, so it
-binds the cell to one exact schedule and a legitimate scheduler change must
-update the declaration in the same review.
+**The declaration names a termination, never a raw wait status, and the pass is
+bound to the verification record rather than to the process exit code.** One
+8-bit number cannot be a safety boundary: `139` is the same for a guest
+`exit(139)`, a guest killed by SIGSEGV, and *Hermit itself* dying of SIGSEGV,
+and the last is a Hermit defect that must never satisfy a cell. So a declaring
+cell runs with
 
-The key is accepted only on `verify` — the only mode whose cell is a single
-Hermit invocation whose status is the whole observation — must be `1..=255`, and
-must be omitted rather than written as `0`. `scripts/manifest-to-commands.rs`
-emits the matching `--verify-allow both` in its generated command and exposes
-the declarations as TSV via `--expect-status`, so an out-of-tree harness runs the
-same command instead of keeping a second copy of this policy.
+```
+--verify-allow both --verify-strict --verify-json <cell>/verify.json
+```
+
+and passes only when **all** of the following hold:
+
+- the observed whole-invocation status equals the derived one (`128+N`, or the
+  exit code);
+- the record exists and reports `verdict: "matched"`, `verified: true`, and
+  `bitwise_parity: true` — the canonical L2 comparison, not the default
+  stripped one, because "it reproduces bitwise" is the entire reason a non-zero
+  exit is being accepted;
+- the record's own provenance matches: `guest_signal: N` with
+  `guest_exit_code: null`, or `guest_exit_code: N` with `guest_signal: null`.
+  Hermit derives those from the **guest's** wait status, and stamps the record
+  `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
+  behind instead of a stale pass.
+
+This is strictly stronger than the exit-0 default, so the termination is part
+of the cell's observation: it binds the cell to one exact schedule, and a
+legitimate scheduler change must update the declaration in the same review.
+
+`expect_signal` must be `1..=64` (a signal number — `139` is rejected as the
+wait status it is); `expect_exit_code` must be `1..=255` and be omitted rather
+than written as `0`; setting both is an error; and both are rejected on every
+mode except `verify`, the only mode whose cell is a single Hermit invocation.
+
+**One derivation, three consumers.** `ci/manifest-plan` is the only place this
+policy exists. It validates the keys and emits the normalized contract two
+ways: inside `--format harness-json` at `modes.verify.verify_contract` (which
+`ci/test_harness.sh` consumes) and as `--format verify-contracts` TSV
+(`<test-id> <shell-status> <extra-args> <required-record JSON>`), which
+`scripts/manifest-to-commands.rs` and any out-of-tree harness consume. The
+runners hold no policy: `test_harness.sh` only asserts the observed record is a
+superset of the required object, and `manifest-to-commands.rs` only transports
+the flags into its generated line.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

@@ -27,9 +27,11 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitCode;
 
 use toml::Value;
@@ -237,29 +239,87 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
     format!("{guest} {rendered}")
 }
 
-/// The whole-invocation exit status a cell must reproduce, from
-/// `modes.verify.expect_status`. `0` means the default success contract.
+/// The normalized verify contract for one cell, as produced by
+/// `hermit-manifest-plan --format verify-contracts`.
 ///
-/// A guest whose deterministic outcome is a crash or a deliberate non-zero exit
-/// needs `--verify-allow both`, because `--verify` otherwise refuses the second
-/// run and never compares anything. Emitting it here keeps an out-of-tree
-/// harness on the same command as `ci/test_harness.sh`; without it the generated
-/// line reproduces the NO_RESULT rather than the cell.
-fn mode_expect_status(spec: &Value, mode: &str, id: &str) -> i64 {
-    let Some(value) = spec.get("expect_status") else {
-        return 0;
-    };
-    if mode != "verify" {
+/// THIS SCRIPT DERIVES NONE OF THIS. A guest whose deterministic outcome is a
+/// crash or a deliberate non-zero exit needs `--verify-allow both` (otherwise
+/// `--verify` refuses the second run and compares nothing), `--verify-strict`
+/// (the canonical comparator the acceptance rests on), and `--verify-json` (the
+/// only artifact carrying guest-termination provenance). Choosing that set is
+/// policy, and policy re-implemented in three places drifts even while the
+/// copies agree, so the plan crate owns it and this script only transports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VerifyContract {
+    shell_status: i64,
+    extra_args: Vec<String>,
+    require_record: String,
+}
+
+impl VerifyContract {
+    fn declared(&self) -> bool {
+        !self.extra_args.is_empty()
+    }
+}
+
+/// Parse the plan crate's TSV. Kept separate from the subprocess call so the
+/// wire format is testable without a build.
+fn parse_verify_contracts(tsv: &str) -> BTreeMap<String, VerifyContract> {
+    let mut contracts = BTreeMap::new();
+    for line in tsv.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            fail(format!(
+                "hermit-manifest-plan --format verify-contracts emitted {} field(s), expected 4: {line:?}",
+                fields.len()
+            ));
+        }
+        let shell_status = fields[1].parse::<i64>().unwrap_or_else(|_| {
+            fail(format!("verify-contracts shell status is not an integer: {line:?}"))
+        });
+        contracts.insert(
+            fields[0].to_owned(),
+            VerifyContract {
+                shell_status,
+                extra_args: fields[2]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+                require_record: fields[3].to_owned(),
+            },
+        );
+    }
+    contracts
+}
+
+/// Ask the plan crate for the contracts. Failing loudly matters: silently
+/// treating every cell as undeclared would regenerate commands that reproduce a
+/// NO_RESULT instead of the cell, which is exactly the bug this channel exists
+/// to prevent.
+fn load_verify_contracts(root: &Path) -> BTreeMap<String, VerifyContract> {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "hermit-manifest-plan",
+            "--",
+            "--format",
+            "verify-contracts",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|error| {
+            fail(format!("cannot run hermit-manifest-plan: {error}"))
+        });
+    if !output.status.success() {
         fail(format!(
-            "{id}.modes.{mode}.expect_status is only meaningful for the verify mode"
+            "hermit-manifest-plan --format verify-contracts failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    match value.as_integer() {
-        Some(status) if (1..=255).contains(&status) => status,
-        other => fail(format!(
-            "{id}.modes.verify.expect_status must be 1..=255, got {other:?}"
-        )),
-    }
+    parse_verify_contracts(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn hermit_command(
@@ -270,7 +330,7 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     guest: &str,
-    expect_status: i64,
+    contract: &VerifyContract,
 ) -> String {
     let portable = lane == "portable";
     let profile = if portable {
@@ -278,14 +338,19 @@ fn hermit_command(
     } else {
         ""
     };
-    let verify_allow = if expect_status == 0 {
-        ""
-    } else {
-        " --verify-allow both"
-    };
+    // Transported verbatim from hermit-manifest-plan, plus the record path this
+    // script owns (the plan crate cannot know where a reproduction writes it).
+    let mut declared = String::new();
+    if contract.declared() {
+        for argument in &contract.extra_args {
+            declared.push(' ');
+            declared.push_str(&shell_quote(argument));
+        }
+        declared.push_str(" --verify-json \"$cell/verify.json\"");
+    }
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{verify_allow}{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{declared}{profile} -- {guest}",
             shell_quote(backend)
         ),
         "replay" => format!(
@@ -325,7 +390,11 @@ fn repeat(command: &str, count: i64) -> String {
     format!("for _run in {iterations}; do {command} || exit; done")
 }
 
-fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+fn commands_for_test(
+    test: &Value,
+    bucket: &str,
+    contracts: &BTreeMap<String, VerifyContract>,
+) -> Vec<String> {
     let id = test_id(test, bucket);
     let lane = test
         .get("lane")
@@ -361,7 +430,13 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             &format!("{id}.modes.{mode}.backends_enabled"),
         );
         if backends.is_empty() {
-            fail(format!("{id}: mode `{mode}` has no enabled backend"));
+            // Schema v2 explicitly allows a mode with zero enabled backends
+            // (`ci = false` plus a reason per disabled backend), and
+            // hermit-manifest-plan accepts it. Aborting here made the whole
+            // generator unusable: on the tree this comment was written, it died
+            // on the FIRST manifest at applications/timed-progress-bar's
+            // single-threaded chaos gap. There is simply no command to emit.
+            continue;
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
         // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
@@ -378,10 +453,14 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             vec![0]
         };
 
-        // Per-MODE, unlike guest_args: the guest's terminal status is a property
-        // of the program under the deterministic schedule, not of the backend
-        // that hosts it.
-        let expect_status = mode_expect_status(spec, mode, &id);
+        // Per-MODE, unlike guest_args: the guest's termination is a property of
+        // the program under the deterministic schedule, not of the backend that
+        // hosts it. Only `verify` has a contract; every other mode exits 0.
+        let contract = if mode == "verify" {
+            contracts.get(&id).cloned().unwrap_or_default()
+        } else {
+            VerifyContract::default()
+        };
 
         for backend in backends {
             let guest_args = mode_guest_args(spec, mode, &backend, &id);
@@ -389,14 +468,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
                 let command = hermit_command(
-                    mode,
-                    &backend,
-                    lane,
-                    timeout,
-                    seed,
-                    &extra,
-                    &guest,
-                    expect_status,
+                    mode, &backend, lane, timeout, seed, &extra, &guest, &contract,
                 );
                 let runs = match mode {
                     "chaos" => 2,
@@ -404,13 +476,17 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
                     _ => 1,
                 };
                 let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
-                // A cell with a declared terminal status EXITS non-zero on
-                // success, so the note has to say so or a reader (or a shell
-                // `|| exit`) reads the reproduction as a failure.
-                let status_note = if expect_status == 0 {
-                    String::new()
+                // A declaring cell EXITS non-zero on success, so the note has
+                // to say so or a reader (or a shell `|| exit`) reads the
+                // reproduction as a failure -- and the record, not the status,
+                // is what certifies it.
+                let status_note = if contract.declared() {
+                    format!(
+                        " expect_shell_status={} require_record={}",
+                        contract.shell_status, contract.require_record
+                    )
                 } else {
-                    format!(" expect_status={expect_status}")
+                    String::new()
                 };
                 lines.push(format!(
                     "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}{status_note}",
@@ -462,49 +538,21 @@ fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
     lines
 }
 
-/// Emit every declared terminal status as TSV on stdout:
-/// `<test-id>\t<mode>\t<expect-status>`, sorted, one line per declaring cell.
-///
-/// Same rationale as `guest_args_tsv`: an out-of-tree harness (the compat
-/// scorecard) must not keep a second copy of this policy. Without it, such a
-/// harness scores a deterministically-crashing guest as a determinism failure
-/// even though the run is bitwise reproducible. Cells that declare nothing are
-/// omitted rather than emitted as 0, so a consumer can tell "declared nothing"
-/// from "declared success".
-fn expect_status_tsv(tests: &[(String, Value)]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (bucket, test) in tests {
-        let id = test_id(test, bucket);
-        let Some(modes) = test.get("modes").and_then(Value::as_table) else {
-            continue;
-        };
-        let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
-        mode_names.sort_unstable();
-        for mode in mode_names {
-            let status = mode_expect_status(&modes[mode], mode, &id);
-            if status == 0 {
-                continue;
-            }
-            lines.push(format!("{id}\t{mode}\t{status}"));
-        }
-    }
-    lines.sort();
-    lines
-}
-
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
 const USAGE: &str = "\
-Usage: manifest-to-commands.rs [-h|--help] [--guest-args] [--expect-status]
+Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
 
 Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
 TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
-  --guest-args     Write nothing; print the declared per-backend guest arguments
-                   as TSV (`<test-id> <mode> <backend> <arg>...`) on stdout.
-  --expect-status  Write nothing; print the declared terminal exit status as TSV
-                   (`<test-id> <mode> <status>`) on stdout. Only declaring cells
-                   appear; every other cell must exit 0.";
+  --guest-args  Write nothing; print the declared per-backend guest arguments as
+                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.
+
+Verify contracts (the flags and required --verify-json record for a guest that
+deterministically crashes or exits non-zero) are NOT derived here; they come
+from `cargo run -p hermit-manifest-plan -- --format verify-contracts`, which is
+also the channel an out-of-tree harness should read.";
 
 /// Parse every manifest under `manifests`, validating schema and bucket naming,
 /// and return `(bucket, test)` pairs in file order.
@@ -575,12 +623,6 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    if std::env::args().skip(1).any(|a| a == "--expect-status") {
-        for line in expect_status_tsv(&load_manifest_tests(&manifests)) {
-            println!("{line}");
-        }
-        return ExitCode::SUCCESS;
-    }
     let output = root.join("ignored/e2e-commands");
     fs::create_dir_all(&output)
         .unwrap_or_else(|e| fail(format!("cannot create {}: {e}", output.display())));
@@ -595,9 +637,10 @@ fn main() -> ExitCode {
         }
     }
 
+    let contracts = load_verify_contracts(&root);
     let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
     for (bucket, test) in load_manifest_tests(&manifests) {
-        let lines = commands_for_test(&test, &bucket);
+        let lines = commands_for_test(&test, &bucket, &contracts);
         match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
             Some((_, existing)) => existing.extend(lines),
             None => by_bucket.push((bucket, lines)),
@@ -753,24 +796,21 @@ backends_enabled = ["ptrace"]
         );
     }
 
-    const CRASHER: &str = r#"
-[[test]]
-id = "c-programs/crasher"
-program = "tests/c/crasher.c"
-[test.modes.verify]
-expect_status = 139
-backends_enabled = ["ptrace"]
-"#;
+    const CONTRACT_TSV: &str = "c-programs/crasher\t139\t--verify-allow both --verify-strict\t{\"bitwise_parity\":true,\"guest_exit_code\":null,\"guest_signal\":11,\"verdict\":\"matched\",\"verified\":true}\n";
 
-    /// POSITIVE side: a declared terminal status must reach the generated line
-    /// as `--verify-allow both`. Without it Hermit refuses the second run, so
-    /// the reproduction command measures a NO_RESULT instead of the cell.
+    /// POSITIVE side: the plan crate's contract must reach the generated line
+    /// intact — the allowance, the canonical comparator, AND the record path.
+    /// Missing any one makes the reproduction measure something weaker than the
+    /// cell: without the allowance a NO_RESULT, without `--verify-strict` only
+    /// the stripped comparator, without the record no guest provenance at all.
     #[test]
-    fn declared_terminal_status_emits_verify_allow_both() {
-        let tests = manifest(CRASHER);
-        let spec = &tests[0].1["modes"]["verify"];
-        let status = mode_expect_status(spec, "verify", "c-programs/crasher");
-        assert_eq!(status, 139);
+    fn declared_contract_reaches_the_generated_command() {
+        let contracts = parse_verify_contracts(CONTRACT_TSV);
+        let contract = contracts
+            .get("c-programs/crasher")
+            .expect("crasher contract");
+        assert_eq!(contract.shell_status, 139);
+        assert!(contract.declared());
         let command = hermit_command(
             "verify",
             "ptrace",
@@ -779,31 +819,24 @@ backends_enabled = ["ptrace"]
             None,
             &[],
             "\"$cell/guest\"",
-            status,
+            contract,
         );
         assert!(
-            command.contains("--verify --verify-allow both --no-virtualize-cpuid"),
-            "expected the allowance next to --verify, got: {command}"
+            command.contains(
+                "--verify --verify-allow both --verify-strict --verify-json \"$cell/verify.json\" \
+                 --no-virtualize-cpuid"
+            ),
+            "expected the full contract next to --verify, got: {command}"
         );
     }
 
     /// NEGATIVE side: an undeclared cell must keep the historical command
-    /// exactly. If the allowance leaked in unconditionally, every cell would
-    /// stop enforcing the success contract Hermit applies by default.
+    /// exactly. If any of it leaked in unconditionally, every cell would stop
+    /// enforcing the success contract Hermit applies by default.
     #[test]
-    fn undeclared_terminal_status_leaves_the_command_untouched() {
-        let tests = manifest(
-            r#"
-[[test]]
-id = "c-programs/bare"
-program = "tests/c/bare.c"
-[test.modes.verify]
-backends_enabled = ["ptrace"]
-"#,
-        );
-        let spec = &tests[0].1["modes"]["verify"];
-        let status = mode_expect_status(spec, "verify", "c-programs/bare");
-        assert_eq!(status, 0);
+    fn undeclared_cell_leaves_the_command_untouched() {
+        let contract = VerifyContract::default();
+        assert!(!contract.declared());
         let command = hermit_command(
             "verify",
             "ptrace",
@@ -812,21 +845,28 @@ backends_enabled = ["ptrace"]
             None,
             &[],
             "\"$cell/guest\"",
-            status,
+            &contract,
         );
         assert!(!command.contains("--verify-allow"));
+        assert!(!command.contains("--verify-strict"));
+        assert!(!command.contains("--verify-json"));
     }
 
-    /// The TSV dump is the out-of-tree harness's only source for this policy,
-    /// so like `guest_args`, undeclared cells are omitted rather than reported
-    /// as 0 — a consumer must be able to tell "declared nothing" apart.
+    /// This script transports the plan crate's policy and derives none of it,
+    /// so the wire format is the contract between them. A field-count change
+    /// must fail loudly rather than silently downgrade a declaring cell to the
+    /// exit-0 default, which would regenerate a command that measures a
+    /// NO_RESULT.
     #[test]
-    fn expect_status_tsv_emits_only_declaring_cells() {
-        let mut tests = manifest(CRASHER);
-        tests.extend(manifest(DECLARED));
+    fn contract_tsv_round_trips_every_field() {
+        let contracts = parse_verify_contracts(CONTRACT_TSV);
+        let contract = &contracts["c-programs/crasher"];
         assert_eq!(
-            expect_status_tsv(&tests),
-            vec!["c-programs/crasher\tverify\t139"]
+            contract.extra_args,
+            vec!["--verify-allow", "both", "--verify-strict"]
         );
+        assert!(contract.require_record.contains("\"guest_signal\":11"));
+        assert!(contract.require_record.contains("\"bitwise_parity\":true"));
+        assert!(parse_verify_contracts("").is_empty());
     }
 }

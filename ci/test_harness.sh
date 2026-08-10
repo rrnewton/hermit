@@ -1469,15 +1469,134 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
-# The whole-invocation exit status this cell must reproduce. 0 is the default
-# contract (Hermit and the guest both succeeded). A manifest may declare
-# `modes.verify.expect_status = <1..=255>` for a guest whose deterministic
-# outcome is a crash (128+N for signal N) or a deliberate non-zero exit; the
-# manifest validator rejects the key on every other mode, so this resolves to 0
-# everywhere else.
-function cell_expect_status {
-    local metadata=$1 mode=$2
-    jq -r --arg mode "$mode" '.modes[$mode].expect_status // 0' <<<"$metadata"
+# The normalized verify contract for a cell, as emitted by hermit-manifest-plan
+# at `modes.verify.verify_contract`. This harness holds NO policy of its own: it
+# reads `extra_args`, `verify_json`, `shell_status`, and `require_record` from
+# the single derivation in ci/manifest-plan so the runner, the validator, and
+# scripts/manifest-to-commands.rs cannot drift apart. `verify` is the only mode
+# with a contract; every other mode keeps the exit-0 default.
+function cell_contract {
+    local metadata=$1 mode=$2 field=$3
+    if [[ $mode != verify ]]; then
+        case "$field" in
+            shell_status) printf '0' ;;
+            verify_json | declared) printf 'false' ;;
+            *) printf '' ;;
+        esac
+        return 0
+    fi
+    jq -r --arg field "$field" '
+        (.modes.verify.verify_contract
+         // error("manifest-plan emitted no verify_contract; rebuild hermit-manifest-plan"))
+        | .[$field]
+        | if type == "array" then .[] elif . == null then "" else tostring end
+    ' <<<"$metadata"
+}
+
+# Assert a `--verify-json` record satisfies the contract's required object.
+#
+# WHY THIS EXISTS. A declaring cell is allowed to exit non-zero, so its process
+# status is bound to nothing: `139` is the same number for a guest `exit(139)`,
+# a guest killed by SIGSEGV, and HERMIT ITSELF dying of SIGSEGV. Only the
+# verification record carries provenance -- `guest_signal` / `guest_exit_code`
+# come from the GUEST's wait status -- plus the `verified` and `bitwise_parity`
+# facts the cell's rationale actually rests on. Hermit stamps that record
+# `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
+# behind rather than a stale pass.
+#
+# The required object comes entirely from hermit-manifest-plan. This function
+# implements one generic operation -- observed record MUST be a superset of the
+# required object, key present AND value equal -- and therefore encodes no
+# policy that could drift from the manifest. Prints the mismatch and returns 1.
+function verify_record_mismatch {
+    local record_file=$1 require_json=$2 record
+    if [[ ! -s $record_file ]]; then
+        printf 'no --verify-json record (Hermit reached no verdict)'
+        return 1
+    fi
+    record=$(tail -n 1 "$record_file")
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$record"; then
+        printf 'unparsable --verify-json record'
+        return 1
+    fi
+    local bad
+    # `$e` binds the required entry before `.` is rebound to the observed record;
+    # writing `$got | has(.key)` instead makes jq resolve `.key` against $got and
+    # abort, which would turn every comparison into a spurious refusal.
+    bad=$(jq -r --argjson want "$require_json" '
+        . as $got
+        | $want
+        | to_entries
+        | map(. as $e
+              | select(($got | has($e.key) | not) or ($got[$e.key] != $e.value))
+              | "\($e.key)="
+                + (if ($got | has($e.key)) then ($got[$e.key] | tojson) else "absent" end)
+                + " want " + ($e.value | tojson))
+        | join(", ")
+    ' <<<"$record") || {
+        printf 'could not compare --verify-json record'
+        return 1
+    }
+    if [[ -n $bad ]]; then
+        printf '%s' "$bad"
+        return 1
+    fi
+    return 0
+}
+
+# Prove `verify_record_mismatch` both accepts the qualifying record and refuses
+# every impersonation of it. Pure: synthetic records, no Hermit run, so it is
+# cheap enough to gate `validate` and can never rot into a decorative check.
+#
+# Cases 3-6 are the reason a declaring cell may not be gated on its process exit
+# status: all four produce the SAME shell status 139 as the qualifying record.
+function verify_record_selftest {
+    local dir want_sigsegv want_exit7 cases=0 failures=0
+    dir=$(mktemp -d)
+    want_sigsegv='{"verdict":"matched","verified":true,"bitwise_parity":true,"guest_signal":11,"guest_exit_code":null}'
+    want_exit7='{"verdict":"matched","verified":true,"bitwise_parity":true,"guest_signal":null,"guest_exit_code":7}'
+
+    # name | required object | record contents | expect accept?
+    local -a table=(
+        "qualifying-sigsegv|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"comparison\":{\"strictness\":\"canonical\"},\"compared_log_messages\":{\"left\":147,\"right\":147},\"guest_exit_code\":null,\"guest_signal\":11}|accept"
+        "qualifying-exit-code|$want_exit7|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":7,\"guest_signal\":null}|accept"
+        "hermit-abort-no-result|$want_sigsegv|{\"verified\":false,\"bitwise_parity\":false,\"verdict\":\"no_result\",\"comparison\":null,\"guest_exit_code\":null,\"guest_signal\":null}|refuse"
+        "guest-exited-139-not-signalled|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":139,\"guest_signal\":null}|refuse"
+        "different-signal|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":null,\"guest_signal\":6}|refuse"
+        "stripped-comparator-only|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":false,\"verdict\":\"matched\",\"guest_exit_code\":null,\"guest_signal\":11}|refuse"
+        "diverged|$want_sigsegv|{\"verified\":false,\"bitwise_parity\":true,\"verdict\":\"diverged\",\"guest_exit_code\":null,\"guest_signal\":11}|refuse"
+        "signal-and-code-both-set|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":139,\"guest_signal\":11}|refuse"
+        "missing-provenance-key|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":null}|refuse"
+        "unparsable|$want_sigsegv|not json at all|refuse"
+        "empty|$want_sigsegv||refuse"
+    )
+    local row name want record expectation record_file got
+    for row in "${table[@]}"; do
+        IFS='|' read -r name want record expectation <<<"$row"
+        cases=$((cases + 1))
+        record_file="$dir/$name.json"
+        printf '%s' "$record" >"$record_file"
+        if verify_record_mismatch "$record_file" "$want" >/dev/null 2>&1; then
+            got=accept
+        else
+            got=refuse
+        fi
+        if [[ $got != "$expectation" ]]; then
+            echo "verify_record_selftest: $name expected $expectation, got $got" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    # A missing file is distinct from an empty one: an aborted Hermit may never
+    # create the path at all.
+    cases=$((cases + 1))
+    if verify_record_mismatch "$dir/absent.json" "$want_sigsegv" >/dev/null 2>&1; then
+        echo "verify_record_selftest: absent-file expected refuse, got accept" >&2
+        failures=$((failures + 1))
+    fi
+    rm -rf "$dir"
+    ((failures == 0)) ||
+        die "verify_record_selftest: $failures of $cases case(s) failed"
+    echo "PASS: verify-record contract refuses every non-qualifying record ($cases cases: 2 accept, $((cases - 2)) refuse)"
 }
 
 function observation_hash {
@@ -1667,9 +1786,11 @@ function execute_attempt {
     local attempt=$6
     local seed=${7:-}
     local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
+    local record_file
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
+    record_file="$cell_dir/captures/${mode}-${attempt}.verify.json"
     kind=$(jq -r .program_kind <<<"$metadata")
     guest_backend=${backend:-native}
 
@@ -1732,17 +1853,21 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
-            # A guest whose deterministic outcome is a crash or a deliberate
-            # non-zero exit needs `--verify-allow both`, otherwise Hermit refuses
-            # the second run and never compares anything. Widening the allowance
-            # does not loosen the cell: run_cell requires the observed status to
-            # equal the declared expect_status EXACTLY, which is stricter than
-            # Hermit's coarse success/failure gate.
-            local -a verify_allow=()
-            [[ $(cell_expect_status "$metadata" "$mode") == 0 ]] ||
-                verify_allow=(--verify-allow both)
+            # A declaring cell needs `--verify-allow both` (otherwise Hermit
+            # refuses the second run and compares nothing), `--verify-strict`
+            # (the canonical L2 comparator its rationale rests on), and
+            # `--verify-json` (the only artifact that carries guest-termination
+            # provenance). All three come from the manifest-plan contract.
+            local -a verify_extra=()
+            mapfile -t verify_extra < <(cell_contract "$metadata" "$mode" extra_args)
+            if [[ $(cell_contract "$metadata" "$mode" verify_json) == true ]]; then
+                # A stale record from an earlier attempt must never be readable
+                # as this attempt's verdict.
+                rm -f "$record_file"
+                verify_extra+=(--verify-json "$record_file")
+            fi
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_allow[@]}" "${profile[@]}" -- "${guest_command[@]}")
+                "${verify_extra[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -1772,7 +1897,7 @@ function execute_attempt {
 
     local hash
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    printf '%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file" "$record_file"
 }
 
 function append_result {
@@ -1807,14 +1932,18 @@ function append_result {
             log_level=
             ;;
         verify)
-            # Record exactly what execute_attempt runs: a declared terminal
-            # status adds `--verify-allow both`, so the evidence must carry it.
+            # Record exactly what execute_attempt runs, from the same contract
+            # it ran from: a declaring cell adds `--verify-allow both
+            # --verify-strict --verify-json`, so the evidence must carry them or
+            # the JSONL would misdescribe the command that produced the verdict.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson allow_both \
-                "$([[ $(cell_expect_status "${METADATA_BY_ID[$test_id]}" verify) == 0 ]] &&
-                    echo false || echo true)" \
+                --argjson extra "$(jq -c '.modes.verify.verify_contract.extra_args // []' \
+                    <<<"${METADATA_BY_ID[$test_id]}")" \
+                --argjson verify_json "$(jq -c '.modes.verify.verify_contract.verify_json // false' \
+                    <<<"${METADATA_BY_ID[$test_id]}")" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $allow_both then ["--verify-allow","both"] else [] end)')
+                 + $extra
+                 + (if $verify_json then ["--verify-json","<cell>/verify.json"] else [] end)')
             log_level=info
             ;;
         replay)
@@ -1955,15 +2084,25 @@ function run_cell {
             reason="custom output identical across $runs runs"
         fi
     else
-        local row status expect_status
-        expect_status=$(cell_expect_status "$metadata" "$mode")
+        local row status record_file expect_status require_record mismatch
+        expect_status=$(cell_contract "$metadata" "$mode" shell_status)
+        require_record=$(cell_contract "$metadata" "$mode" require_record)
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _ _ _ <<<"$row"
+        IFS=$'\t' read -r status _ _ _ record_file <<<"$row"
         if [[ $status != "$expect_status" ]]; then
             outcome=FAIL
             reason="$mode exited with status $status, expected $expect_status"
-        elif [[ $expect_status != 0 ]]; then
-            reason="$mode reproduced its declared terminal status $expect_status"
+        elif [[ -z $require_record ]]; then
+            : # Exit-0 contract: `--verify`'s own non-zero-on-divergence binds it.
+        elif ! mismatch=$(verify_record_mismatch "$record_file" "$require_record"); then
+            # The status matched but the record does not certify what the status
+            # is being accepted FOR. This is the check that keeps a Hermit-side
+            # crash, a stripped-comparator pass, or a guest `exit(128+N)` from
+            # impersonating a guest killed by signal N.
+            outcome=FAIL
+            reason="$mode status $status matched but the verification record did not: $mismatch"
+        else
+            reason="$mode reproduced its declared guest termination and the verification record certifies it (status $status; $require_record)"
         fi
     fi
 
@@ -2081,6 +2220,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        verify_record_selftest
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test

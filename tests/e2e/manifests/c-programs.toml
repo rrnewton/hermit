@@ -3359,12 +3359,16 @@ ci = true
 # This guest is a deliberate data race: the spawned thread nulls the pointer
 # that main dereferences after the same 1s sleep. Natively main wins and the
 # program exits 0; Hermit's deterministic schedule resolves the race the other
-# way every time, so the guest dies of SIGSEGV and the whole invocation exits
-# 139. That terminal status IS the observation: it binds the cell to one exact
-# schedule, and any change to that schedule must update this declaration in the
-# same review. Do NOT drop the declaration to make the cell green -- without it
-# `--verify` refuses the second run and the cell measures nothing.
-expect_status = 139
+# way every time, so the GUEST dies of SIGSEGV. Declaring the signal (not a raw
+# 139 wait status) is what makes that checkable: the cell also requires the
+# verification record's own `guest_signal: 11` / `guest_exit_code: null` beside
+# `verified` and `bitwise_parity`, so a Hermit-side crash -- which can produce
+# the same 139 -- can never satisfy it. The termination IS part of the
+# observation: it binds the cell to one exact schedule, and a legitimate
+# scheduler change must update this declaration in the same review. Do NOT drop
+# the declaration to make the cell green -- without it `--verify` refuses the
+# second run and the cell measures nothing.
+expect_signal = 11
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
