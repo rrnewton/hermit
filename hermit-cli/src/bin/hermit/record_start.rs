@@ -466,10 +466,12 @@ impl StartOpts {
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
+                summary: None,
             },
             ComparedRun {
                 output: &replay,
                 log: log2.into_temp_path(),
+                summary: None,
             },
             ComparisonOptions {
                 success_message: "Success: replay matched recording.",

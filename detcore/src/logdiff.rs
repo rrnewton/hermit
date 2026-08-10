@@ -700,6 +700,99 @@ fn git_diff(
     }
 }
 
+/// One exact engine checkpoint parsed from a scheduler `COMMIT` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerCheckpoint {
+    /// Zero-based scheduler turn printed by the last common `COMMIT` event.
+    pub turn: u64,
+    /// Absolute virtual time at that commit, in nanoseconds since the configured epoch origin.
+    pub virtual_time_ns: u64,
+}
+
+fn parse_logical_time_ns(value: &str) -> Option<u64> {
+    if let Some(nanos) = value.strip_suffix("ns") {
+        return nanos.replace('_', "").parse().ok();
+    }
+
+    let seconds = value.strip_suffix('s')?.replace('_', "");
+    let (whole, fractional) = seconds.split_once('.').unwrap_or((&seconds, ""));
+    if fractional.len() > 9 || !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let whole_ns = whole.parse::<u64>().ok()?.checked_mul(1_000_000_000)?;
+    let mut fractional_ns = fractional.parse::<u64>().unwrap_or(0);
+    for _ in fractional.len()..9 {
+        fractional_ns = fractional_ns.checked_mul(10)?;
+    }
+    whole_ns.checked_add(fractional_ns)
+}
+
+fn scheduler_checkpoint(message: &str) -> Option<SchedulerCheckpoint> {
+    static COMMIT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)\bCOMMIT turn ([0-9]+),.*?on previously committed ([0-9][0-9_.]*(?:ns|s))")
+            .unwrap()
+    });
+    let captures = COMMIT.captures(message)?;
+    Some(SchedulerCheckpoint {
+        turn: captures.get(1)?.as_str().parse().ok()?,
+        virtual_time_ns: parse_logical_time_ns(captures.get(2)?.as_str())?,
+    })
+}
+
+/// Return the last engine checkpoint in the exact common prefix that precedes
+/// the first compared-message divergence.
+///
+/// This deliberately refuses the lossy stripped comparison: stripping erases
+/// the very turn/time values this metric claims to measure. `git diff` has its
+/// own whitespace semantics, so it also remains unqualified rather than
+/// emitting a checkpoint computed under a different comparator.
+fn last_common_scheduler_checkpoint(
+    left: &[(usize, &str)],
+    right: &[(usize, &str)],
+    opts: &LogDiffOpts,
+) -> Option<SchedulerCheckpoint> {
+    if opts.strip_lines || opts.git_diff {
+        return None;
+    }
+
+    let (canonical_left, canonical_right): (Vec<String>, Vec<String>) =
+        if opts.canonicalize_addresses {
+            let mut left_map = HashMap::new();
+            let mut left_next = 1usize;
+            let mut right_map = HashMap::new();
+            let mut right_next = 1usize;
+            (
+                left.iter()
+                    .map(|(_, line)| {
+                        canonicalize_addresses_in_line(line, &mut left_map, &mut left_next)
+                    })
+                    .collect(),
+                right
+                    .iter()
+                    .map(|(_, line)| {
+                        canonicalize_addresses_in_line(line, &mut right_map, &mut right_next)
+                    })
+                    .collect(),
+            )
+        } else {
+            (
+                left.iter().map(|(_, line)| (*line).to_owned()).collect(),
+                right.iter().map(|(_, line)| (*line).to_owned()).collect(),
+            )
+        };
+
+    let shared = canonical_left.len().min(canonical_right.len());
+    let first_divergence = (0..shared)
+        .find(|index| canonical_left[*index] != canonical_right[*index])
+        .or_else(|| (canonical_left.len() != canonical_right.len()).then_some(shared))?;
+
+    (0..first_divergence).rev().find_map(|index| {
+        let left_checkpoint = scheduler_checkpoint(left[index].1)?;
+        let right_checkpoint = scheduler_checkpoint(right[index].1)?;
+        (left_checkpoint == right_checkpoint).then_some(left_checkpoint)
+    })
+}
+
 /// What a log comparison actually compared, alongside whether it differed.
 ///
 /// A bare "no difference found" boolean cannot distinguish *"the two message
@@ -715,6 +808,10 @@ pub struct LogDiffSummary {
     pub compared_left: usize,
     /// Number of messages actually selected for comparison from the second run.
     pub compared_right: usize,
+    /// Last exact scheduler checkpoint common to both selected streams before
+    /// their first divergence. `None` for matches, stripped comparisons, and
+    /// divergences before any common scheduler commit.
+    pub last_common_scheduler_checkpoint: Option<SchedulerCheckpoint>,
 }
 
 impl LogDiffSummary {
@@ -864,6 +961,9 @@ fn log_diff_summary_from_strs(
         diff_found,
         compared_left: compared_a.len(),
         compared_right: compared_b.len(),
+        last_common_scheduler_checkpoint: diff_found
+            .then(|| last_common_scheduler_checkpoint(compared_a, compared_b, opts))
+            .flatten(),
     };
 
     if diff_found {
@@ -1095,6 +1195,93 @@ mod test {
         let debug_diverged =
             super::log_diff_summary_from_strs(left, right, &full_trace, &mut Vec::new())?;
         assert!(debug_diverged.diff_found);
+        Ok(())
+    }
+
+    fn scheduler_commit(turn: u64, virtual_time: &str) -> String {
+        format!(
+            "2026-08-10T01:00:00.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn {turn}, dettid 3 using resources {{}}, on previously committed {virtual_time}\n"
+        )
+    }
+
+    #[test]
+    fn logical_time_parser_preserves_units_and_fraction_scale() {
+        assert_eq!(super::parse_logical_time_ns("17ns"), Some(17));
+        assert_eq!(super::parse_logical_time_ns("2s"), Some(2_000_000_000));
+        assert_eq!(super::parse_logical_time_ns("2.5s"), Some(2_500_000_000));
+        assert_eq!(
+            super::parse_logical_time_ns("1_767_225_606.242_625_000s"),
+            Some(1_767_225_606_242_625_000)
+        );
+        assert_eq!(super::parse_logical_time_ns("2.0000000001s"), None);
+    }
+
+    #[test]
+    fn divergence_reports_last_exact_common_scheduler_checkpoint() -> std::io::Result<()> {
+        let common = scheduler_commit(41, "1_767_225_606.242_625_000s");
+        let left = format!(
+            "{common}2026-08-10T01:00:00.000001Z INFO detcore: DETLOG [syscall] write(fd=1, count=7)\n"
+        );
+        let right = format!(
+            "{common}2026-08-10T01:00:00.000002Z INFO detcore: DETLOG [syscall] write(fd=1, count=8)\n"
+        );
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let summary = super::log_diff_summary_from_strs(left, right, &canonical, &mut Vec::new())?;
+        assert!(summary.diff_found);
+        assert_eq!(
+            summary.last_common_scheduler_checkpoint,
+            Some(super::SchedulerCheckpoint {
+                turn: 41,
+                virtual_time_ns: 1_767_225_606_242_625_000,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_is_absent_for_green_stripped_and_precommit_red() -> std::io::Result<()> {
+        let common = scheduler_commit(4, "946_684_800.000_000_125s");
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let green =
+            super::log_diff_summary_from_strs(&common, &common, &canonical, &mut Vec::new())?;
+        assert!(!green.diff_found);
+        assert_eq!(green.last_common_scheduler_checkpoint, None);
+
+        let left =
+            format!("{common}2026-08-10T01:00:00.000001Z INFO detcore: DETLOG value=alpha\n");
+        let right =
+            format!("{common}2026-08-10T01:00:00.000002Z INFO detcore: DETLOG value=beta\n");
+        let stripped = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            strip_lines: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let stripped_red =
+            super::log_diff_summary_from_strs(left, right, &stripped, &mut Vec::new())?;
+        assert!(stripped_red.diff_found);
+        assert_eq!(stripped_red.last_common_scheduler_checkpoint, None);
+
+        let precommit_red = super::log_diff_summary_from_strs(
+            "2026-08-10T01:00:00.000001Z INFO detcore: DETLOG value=7\n",
+            "2026-08-10T01:00:00.000002Z INFO detcore: DETLOG value=8\n",
+            &canonical,
+            &mut Vec::new(),
+        )?;
+        assert!(precommit_red.diff_found);
+        assert_eq!(precommit_red.last_common_scheduler_checkpoint, None);
         Ok(())
     }
 

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use colored::Colorize;
 use detcore::logdiff;
 use detcore::logdiff::LogComparisonMode;
+use detcore_model::summary::RunSummary;
 use hermit::Context;
 use hermit::Error;
 use pretty_assertions::Comparison;
@@ -29,6 +30,7 @@ use super::global_opts::GlobalOpts;
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
     pub log: TempPath,
+    pub summary: Option<&'a RunSummary>,
 }
 
 pub(crate) struct ComparisonOptions<'a> {
@@ -370,6 +372,72 @@ pub struct ComparedLogCounts {
     pub right: usize,
 }
 
+/// Engine progress observed before the first compared-log divergence in one run.
+///
+/// Both numerator and denominator are carried for each unit. A larger bare
+/// numerator can be caused merely by a longer execution; consumers must compare
+/// the complete pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RunDivergenceProgress {
+    pub scheduler_turns_before_divergence: u64,
+    pub scheduler_turns_total: u64,
+    pub virtual_ns_before_divergence: u64,
+    pub virtual_ns_total: u64,
+}
+
+/// Comparable, non-authoritative progress attached only to a red verification.
+///
+/// This never changes [`Verdict`], [`VerificationReport::verified`], or
+/// [`VerificationReport::bitwise_parity`]. It says only how far both runs had
+/// progressed at their last exact common scheduler commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DivergenceProgress {
+    pub method: &'static str,
+    pub run1: RunDivergenceProgress,
+    pub run2: RunDivergenceProgress,
+}
+
+const LAST_COMMON_SCHEDULER_COMMIT_V1: &str = "last-common-scheduler-commit/v1";
+
+fn run_divergence_progress(
+    checkpoint: logdiff::SchedulerCheckpoint,
+    summary: &RunSummary,
+) -> Option<RunDivergenceProgress> {
+    // Scheduler turns are zero-based in COMMIT messages. If turn 41 is the last
+    // common commit, 42 turns have been admitted before the streams part.
+    let turns_before = checkpoint.turn.checked_add(1)?;
+    if turns_before > summary.sched_turns {
+        return None;
+    }
+
+    let epoch_ns = summary
+        .virttime_final
+        .checked_sub(summary.virttime_elapsed)?;
+    let virtual_ns_before = checkpoint.virtual_time_ns.checked_sub(epoch_ns)?;
+    if virtual_ns_before > summary.virttime_elapsed {
+        return None;
+    }
+
+    Some(RunDivergenceProgress {
+        scheduler_turns_before_divergence: turns_before,
+        scheduler_turns_total: summary.sched_turns,
+        virtual_ns_before_divergence: virtual_ns_before,
+        virtual_ns_total: summary.virttime_elapsed,
+    })
+}
+
+fn divergence_progress(
+    checkpoint: logdiff::SchedulerCheckpoint,
+    run1: Option<&RunSummary>,
+    run2: Option<&RunSummary>,
+) -> Option<DivergenceProgress> {
+    Some(DivergenceProgress {
+        method: LAST_COMMON_SCHEDULER_COMMIT_V1,
+        run1: run_divergence_progress(checkpoint, run1?)?,
+        run2: run_divergence_progress(checkpoint, run2?)?,
+    })
+}
+
 impl ComparedLogCounts {
     /// True when both sides actually contributed messages to the comparison.
     pub fn is_nonzero(&self) -> bool {
@@ -391,6 +459,8 @@ pub struct VerificationOutcome {
     /// the log comparison was not run at all (output-only fallback). `None` and
     /// `Some(0/0)` are both "no log evidence" and neither can support parity.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Non-authoritative red-cell progress. Always `None` for a match.
+    pub divergence_progress: Option<DivergenceProgress>,
 }
 
 impl VerificationOutcome {
@@ -454,6 +524,10 @@ pub struct VerificationReport {
     /// not proof that the configured comparison had data, so this count is what makes
     /// [`Self::bitwise_parity`] falsifiable.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Engine progress before divergence, with both terms for each unit and
+    /// each run. `null` for green/no-result and for reds without a qualified
+    /// scheduler checkpoint.
+    pub divergence_progress: Option<DivergenceProgress>,
     /// The guest's exit code, if it exited normally.
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
@@ -505,6 +579,7 @@ impl VerificationReport {
             verdict: Verdict::NoResult,
             comparison: None,
             compared_log_messages: None,
+            divergence_progress: None,
             guest_exit_code: None,
             guest_signal: None,
             terminating_action: None,
@@ -534,6 +609,9 @@ impl From<&VerificationOutcome> for VerificationReport {
             verdict: outcome.verdict,
             comparison: Some(outcome.comparison),
             compared_log_messages: outcome.compared_log_messages,
+            divergence_progress: (outcome.verdict == Verdict::Diverged)
+                .then_some(outcome.divergence_progress)
+                .flatten(),
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
             // Deliberately not set here. The verdict is published long before
@@ -761,16 +839,19 @@ pub fn compare_two_runs(
     let ComparedRun {
         output: out1,
         log: log1,
+        summary: summary1,
     } = first;
     let ComparedRun {
         output: out2,
         log: log2,
+        summary: summary2,
     } = second;
     let mut failed = false;
     // None until the log comparison actually runs; stays None on the
     // output-only (KVM concurrent) fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
+    let mut measured_divergence_progress: Option<DivergenceProgress> = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -848,6 +929,9 @@ pub fn compare_two_runs(
         });
         if summary.diff_found {
             failed = true;
+            measured_divergence_progress = summary
+                .last_common_scheduler_checkpoint
+                .and_then(|checkpoint| divergence_progress(checkpoint, summary1, summary2));
             eprintln!(":: {}", "Log differences found between runs.".red().bold());
             eprintln!(
                 ":: {}: {} {}",
@@ -884,6 +968,7 @@ pub fn compare_two_runs(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            divergence_progress: measured_divergence_progress,
         })
     } else {
         // Allow the NamedTempFiles to be deleted in this case:
@@ -898,6 +983,7 @@ pub fn compare_two_runs(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            divergence_progress: None,
         })
     }
 }
@@ -1040,10 +1126,12 @@ mod tests {
             ComparedRun {
                 output: left,
                 log: left_log,
+                summary: None,
             },
             ComparedRun {
                 output: right,
                 log: right_log,
+                summary: None,
             },
             ComparisonOptions {
                 success_message: "verified",
@@ -1078,6 +1166,14 @@ mod tests {
     fn detlog_with_value(value: u64) -> String {
         format!(
             "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value})\n"
+        )
+    }
+
+    fn scheduler_commit(turn: u64, virtual_time_ns: u64) -> String {
+        let seconds = virtual_time_ns / 1_000_000_000;
+        let nanos = virtual_time_ns % 1_000_000_000;
+        format!(
+            "2026-08-06T01:00:00.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn {turn}, dettid 2 using resources {{}}, on previously committed {seconds}.{nanos:09}s\n"
         )
     }
 
@@ -1158,10 +1254,12 @@ mod tests {
             ComparedRun {
                 output: &left,
                 log: left_log,
+                summary: None,
             },
             ComparedRun {
                 output: &right,
                 log: right_log,
+                summary: None,
             },
             ComparisonOptions {
                 success_message: "verified",
@@ -1204,6 +1302,117 @@ mod tests {
             let _ = fs::remove_file(path1);
             let _ = fs::remove_file(path2);
         }
+    }
+
+    #[test]
+    fn red_report_carries_both_progress_terms_without_softening_verdict() {
+        const EPOCH: u64 = 946_684_800_000_000_000;
+        let output = output(0, b"same output\n", b"");
+        let (left_log, right_log) = empty_logs();
+        let common = scheduler_commit(41, EPOCH + 200);
+        fs::write(&left_log, format!("{common}{}", detlog_with_value(7))).unwrap();
+        fs::write(&right_log, format!("{common}{}", detlog_with_value(8))).unwrap();
+        let summary1 = RunSummary {
+            sched_turns: 100,
+            virttime_elapsed: 500,
+            virttime_final: EPOCH + 500,
+            ..Default::default()
+        };
+        let summary2 = RunSummary {
+            sched_turns: 120,
+            virttime_elapsed: 700,
+            virttime_final: EPOCH + 700,
+            ..Default::default()
+        };
+
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left_log,
+                summary: Some(&summary1),
+            },
+            ComparedRun {
+                output: &output,
+                log: right_log,
+                summary: Some(&summary2),
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert!(!outcome.verified());
+        assert_eq!(
+            outcome.divergence_progress,
+            Some(DivergenceProgress {
+                method: LAST_COMMON_SCHEDULER_COMMIT_V1,
+                run1: RunDivergenceProgress {
+                    scheduler_turns_before_divergence: 42,
+                    scheduler_turns_total: 100,
+                    virtual_ns_before_divergence: 200,
+                    virtual_ns_total: 500,
+                },
+                run2: RunDivergenceProgress {
+                    scheduler_turns_before_divergence: 42,
+                    scheduler_turns_total: 120,
+                    virtual_ns_before_divergence: 200,
+                    virtual_ns_total: 700,
+                },
+            })
+        );
+
+        let report = VerificationReport::from(&outcome);
+        assert!(!report.verified, "less-red must remain red");
+        assert!(!report.bitwise_parity, "progress must never qualify a red");
+        assert_eq!(report.divergence_progress, outcome.divergence_progress);
+    }
+
+    #[test]
+    fn green_and_no_result_reports_have_no_divergence_progress() {
+        let output = output(0, b"same output\n", b"");
+        let (left_log, right_log) = empty_logs();
+        let common = scheduler_commit(4, 946_684_800_000_000_125);
+        fs::write(&left_log, &common).unwrap();
+        fs::write(&right_log, &common).unwrap();
+        let summary = RunSummary {
+            sched_turns: 5,
+            virttime_elapsed: 125,
+            virttime_final: 946_684_800_000_000_125,
+            ..Default::default()
+        };
+        let matched = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left_log,
+                summary: Some(&summary),
+            },
+            ComparedRun {
+                output: &output,
+                log: right_log,
+                summary: Some(&summary),
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(matched.verdict, Verdict::Matched);
+        assert_eq!(matched.divergence_progress, None);
+        assert_eq!(VerificationReport::from(&matched).divergence_progress, None);
+        assert_eq!(VerificationReport::no_result().divergence_progress, None);
     }
 
     #[test]
@@ -1290,10 +1499,12 @@ mod tests {
             ComparedRun {
                 output: &out,
                 log: left,
+                summary: None,
             },
             ComparedRun {
                 output: &out,
                 log: right,
+                summary: None,
             },
             ComparisonOptions {
                 success_message: "verified",
@@ -1671,6 +1882,7 @@ mod tests {
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
+            divergence_progress: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }
