@@ -803,6 +803,52 @@ function dag_critical_path_seconds {
     ' "$dag"
 }
 
+function audit_validate_timing_gate {
+    local gate="$ROOT_DIR/ci/validate-timing-gate.py"
+    local baseline="$ROOT_DIR/ci/validate-timing-baseline.json"
+    local shards="$ROOT_DIR/ci/portable-shards.json"
+    [[ -x $gate ]] || die "portable timing gate must be executable"
+
+    # The baseline's node set must exactly cover the profiled hosted fan-out.
+    # A newly selected node with no baseline is a gate failure, never an
+    # implicit exemption. The manifest-category matrix is separately audited by
+    # validate_dag_correspondence below and intentionally has no runner profile.
+    jq -e --slurpfile shards "$shards" '
+        ($shards[0]
+          | [.preflight_nodes[], .build_debug_nodes[], .build_dbt_nodes[],
+             .build_aux_nodes[], .debug_shards[].nodes[], .release_shards[].nodes[]]
+          | sort) as $selected
+        | (.nodes | keys | sort) == $selected
+        and .coverage.node_count == ($selected | length)
+        and .policy.minimum_samples >= 5
+        and .policy.percentile == 0.9
+        and .policy.max_node_p90_seconds <= 540
+    ' "$baseline" >/dev/null ||
+        die "timing baseline must cover every profiled portable shard under the audited policy"
+
+    python3 "$gate" --self-test >/dev/null ||
+        die "portable timing gate positive/negative brackets failed"
+    python3 "$gate" --replay-incident >/dev/null ||
+        die "portable timing gate did not reject the motivating 92aaed5d0 incident"
+
+    # Missing timing is the load-bearing negative: an empty profile directory
+    # must not be interpreted as a node that did not regress.
+    (
+        local empty
+        empty=$(mktemp -d)
+        trap 'rm -rf -- "$empty"' EXIT
+        ! python3 "$gate" \
+            --candidate-dir "$empty" \
+            --sha 1111111111111111111111111111111111111111 \
+            --nodes test.strict_compat >/dev/null 2>&1
+    ) || die "portable timing gate accepted missing candidate timing"
+
+    [[ $(grep -Fc 'python3 "$ROOT_DIR/ci/validate-timing-gate.py"' "$ROOT_DIR/ci/run-node.sh") == 1 ]] ||
+        die "hosted portable node runner must invoke the timing verifier exactly once"
+    [[ $(grep -Fc 'enforce_portable_timing_gate(&root, &tmp, &commit, &outcomes)' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "complete local validation must invoke the same timing verifier exactly once"
+}
+
 function emit_manifest_buckets {
     local test
     for test in "${TESTS[@]}"; do
@@ -2057,6 +2103,7 @@ case "$subcommand" in
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
         audit_ci_correspondence
+        audit_validate_timing_gate
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         validate_dag_correspondence
