@@ -3121,60 +3121,6 @@
       "why": "tests/c/dbt_wait_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_copied_tiocgpgrp.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_copied_tiocgpgrp.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_exec_failure.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_exec_failure.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_execveat_unsupported.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_execveat_unsupported.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_mmap_exec.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_mmap_exec.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_pid_virtualization.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_pid_virtualization.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_prlimit_self.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_prlimit_self.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_self_sigqueue.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_self_sigqueue.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_unsupported_syscall.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_unsupported_syscall.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/c/dbi_wait_lifecycle.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/dbi_wait_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
-    },
-    {
       "path": "tests/c/signal_waitstatus_identity.c",
       "disposition": "manifest-test",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
@@ -3209,6 +3155,12 @@
       "path": "tests/backend-parity/fixtures/host_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbi)",
       "why": "tests/backend-parity/fixtures/host_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbi): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/e2e/lib/applications/test_verdict_discrimination.sh",
+      "runner": "tests/e2e/lib/applications maintainers (standalone self-test; run directly)",
+      "why": "tests/e2e/lib/applications/test_verdict_discrimination.sh is owned by tests/e2e/lib/applications maintainers (standalone self-test; run directly): Standalone self-test that brackets run_hermit_verify's verdict reader from BOTH sides using synthetic --verify-json reports and a fake Hermit: one positive strict-parity case proves the reader still accepts genuine success, and seven negative cases prove it refuses a stripped banner match, zero or null compared counts, a missing result stamp, divergence, launch refusal and malformed JSON. It drives no real guest and is not a manifest-discovered program."
     }
   ],
   "schema": 2
