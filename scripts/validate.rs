@@ -667,6 +667,9 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    // R/R must consume a machine verdict for every real row. Process success is
+    // insufficient because a matched comparison can contain zero evidence.
+    rr_verdict_bracket()?;
     coverage_schema_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
@@ -859,6 +862,197 @@ cleared-caps refusal names {} starved step(s)",
         );
     }
 
+    Ok(())
+}
+
+/// Bracket the R/R report classifier and its wiring into the real corpus.
+///
+/// The fixture checks are deliberately two-sided: refusing every report would
+/// satisfy the negative cases while destroying the lane. Coverage is derived
+/// from the current corpus, never copied from historical task counts.
+fn rr_verdict_bracket() -> Result<(), String> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "rr-verdict-bracket-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|e| format!("rr verdict bracket: mkdir: {e}"))?;
+    let judge = |name: &str| -> Result<bool, String> {
+        let path = dir.join(name);
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(validate_plan::rr_verdict_check(&path.to_string_lossy()))
+            .output()
+            .map_err(|e| format!("rr verdict bracket: cannot run bash: {e}"))?;
+        Ok(out.status.success())
+    };
+    let plant = |name: &str, body: &str| -> Result<(), String> {
+        fs::write(dir.join(name), format!("{body}\n"))
+            .map_err(|e| format!("rr verdict bracket: write {name}: {e}"))
+    };
+
+    let refuse: &[(&str, &str)] = &[
+        ("missing.json", ""),
+        ("no-result.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}"#),
+        ("diverged.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        ("stripped.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":true},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        // The defining regression: matched configuration over no compared rows.
+        ("zero-counts.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}"#),
+        ("truthy-string.json", r#"{"bitwise_parity":"true"}"#),
+        ("not-an-object.json", r#"[{"bitwise_parity":true}]"#),
+        ("whitespace-only.json", ""),
+        ("truncated.json", r#"{"verified":true,"bitwise_pari"#),
+        ("two-documents.json", "{\"bitwise_parity\":false}\n{\"bitwise_parity\":true}"),
+    ];
+    let mut refused = 0usize;
+    for (name, body) in refuse {
+        if *name != "missing.json" {
+            plant(name, body)?;
+        }
+        if judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} must be REFUSED; the lane would certify no parity evidence"
+            ));
+        }
+        refused += 1;
+    }
+
+    let accept: &[(&str, &str)] = &[
+        ("matched.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        // The report remains authoritative when the guest/wrapper exits nonzero.
+        ("nonzero-guest.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":3,"guest_signal":null}"#),
+    ];
+    let mut accepted = 0usize;
+    for (name, body) in accept {
+        plant(name, body)?;
+        if !judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} is genuine parity and must be ACCEPTED"
+            ));
+        }
+        accepted += 1;
+    }
+
+    let rr = validate_plan::CompatMode::Rr.run_args(
+        "echo",
+        "/nonexistent",
+        Some("/tmp/x.json"),
+    );
+    if !rr.iter().any(|a| a == "--verify-json=/tmp/x.json") {
+        return Err(format!("rr verdict: argv does not request a report: {rr:?}"));
+    }
+    if !rr.iter().any(|a| a == "--verify-strict") {
+        return Err("rr verdict: argv lost --verify-strict".into());
+    }
+
+    let tmp_dir = dir.to_string_lossy().to_string();
+    let fake_hermit = dir.join("fake-hermit");
+    let fake_hermit_text = fake_hermit.to_string_lossy().to_string();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: "/nonexistent",
+        real_compat_fixtures: "/nonexistent",
+        validation_tmp_dir: &tmp_dir,
+        shell_build_dir: "/nonexistent",
+    };
+    let rr_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Rr,
+        &fake_hermit_text,
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    if rr_nodes.is_empty() {
+        return Err("rr verdict: real R/R corpus produced zero nodes".into());
+    }
+    let unjudged: Vec<&str> = rr_nodes
+        .iter()
+        .filter(|s| {
+            !(s.cmd.contains("--verify-json=")
+                && s.cmd.contains("bitwise_parity == true"))
+        })
+        .map(|s| s.job.as_str())
+        .collect();
+    if !unjudged.is_empty() {
+        return Err(format!(
+            "rr verdict: {} of {} real R/R node(s) lack report judgement, e.g. {:?}",
+            unjudged.len(),
+            rr_nodes.len(),
+            &unjudged[..unjudged.len().min(3)]
+        ));
+    }
+
+    // Exercise the generated shell, not only the JSON predicate. A genuine
+    // report remains authoritative when Hermit inherits guest exit 3; then a
+    // second invocation that writes nothing must delete and refuse that old
+    // green report rather than reusing stale evidence.
+    let writer = format!(
+        "#!/bin/sh\nreport=\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --verify-json=*) report=${{arg#*=}} ;;\n  esac\ndone\nprintf '%s\\n' '{}' > \"$report\"\nexit 3\n",
+        accept[0].1
+    );
+    fs::write(&fake_hermit, writer)
+        .map_err(|e| format!("rr verdict bracket: write fake hermit: {e}"))?;
+    fs::set_permissions(&fake_hermit, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("rr verdict bracket: chmod fake hermit: {e}"))?;
+    let run = || -> Result<bool, String> {
+        Command::new("bash")
+            .arg("-c")
+            .arg(&rr_nodes[0].cmd)
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| format!("rr verdict bracket: run generated command: {e}"))
+    };
+    if !run()? {
+        return Err(
+            "rr verdict: generated command rejected a genuine report from exit-3 guest".into(),
+        );
+    }
+    fs::write(&fake_hermit, "#!/bin/sh\nexit 0\n")
+        .map_err(|e| format!("rr verdict bracket: rewrite fake hermit: {e}"))?;
+    if run()? {
+        return Err(
+            "rr verdict: generated command reused a stale green report after no new evidence"
+                .into(),
+        );
+    }
+
+    let strict_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Strict,
+        "/nonexistent/hermit",
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    let leaked = strict_nodes
+        .iter()
+        .filter(|s| s.cmd.contains("--verify-json="))
+        .count();
+    if leaked != 0 {
+        return Err(format!(
+            "rr verdict: {leaked} of {} strict node(s) acquired an R/R report",
+            strict_nodes.len()
+        ));
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    println!(
+        "  rr verdict: {accepted}/{} genuine parity report(s) accepted; \
+         {refused}/{} non-parity report(s) refused; {}/{} real R/R node(s) \
+         judged by report; {leaked}/{} strict node(s) contaminated; generated \
+         command accepted 1/1 exit-3 report and refused 1/1 stale report",
+        accept.len(),
+        refuse.len(),
+        rr_nodes.len(),
+        rr_nodes.len(),
+        strict_nodes.len()
+    );
     Ok(())
 }
 
