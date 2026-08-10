@@ -89,7 +89,7 @@ use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope_with_limits;
+use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
@@ -1289,16 +1289,11 @@ fn resolve_cgroups(allow_failure: bool, run_timeout_s: Option<i64>) -> Result<Bo
         );
         return Ok(None);
     }
-    let reexeced_or_skipped = reexec_in_scope_with_limits(
-        None,
-        None,
-        run_timeout_s.map(|s| s + scope_grace_s(s)),
-    );
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
-    } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
+    // The typed outcome, not a bool: the bool this replaced returned true for BOTH
+    // already-contained and skipped-never-attempted, so the message below could assert a cause
+    // nothing had tested. `describe()` states which of the four actually happened.
+    let attempt = attempt_scope_reexec(None, None, run_timeout_s.map(|s| s + scope_grace_s(s)));
+    let detail = attempt.describe();
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
          this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
