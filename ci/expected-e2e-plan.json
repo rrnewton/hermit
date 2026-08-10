@@ -215,6 +215,13 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "backend-parity-c/inline-syscall-sites"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
       "test": "backend-parity-c/inotify-watch"
     },
     {
@@ -272,6 +279,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/mincore-residency"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mixed-inline-and-libc-syscalls"
     },
     {
       "backend": "ptrace",
@@ -411,6 +425,13 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "backend-parity-c/readdir-order-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
       "test": "backend-parity-c/record-lock"
     },
     {
@@ -517,6 +538,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/statfs-free-determinism"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/static-nolibc-syscall-sites"
     },
     {
       "backend": "ptrace",
@@ -1489,6 +1517,13 @@
       "category": "data-handling",
       "lane": "portable",
       "mode": "verify",
+      "test": "data-handling/dd-partial-transfers"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
+      "mode": "verify",
       "test": "data-handling/jq-json-transform"
     },
     {
@@ -1511,6 +1546,41 @@
       "lane": "portable",
       "mode": "verify",
       "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/thread-interleaving"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
     },
     {
       "backend": "ptrace",
@@ -1560,41 +1630,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/order-violation"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/process-chains"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "determinism-stress/thread-interleaving"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-output"
     },
     {
       "backend": "ptrace",
@@ -1723,6 +1758,13 @@
       "test": "language-runtimes/tcl-rand-clock"
     },
     {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/auxv-loader-dump"
+    },
+    {
       "backend": "liteinst",
       "category": "system-utils",
       "lane": "portable",
@@ -1847,6 +1889,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/proc-uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/ps-proc-table"
     },
     {
       "backend": "ptrace",
