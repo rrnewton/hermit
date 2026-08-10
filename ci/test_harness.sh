@@ -31,7 +31,8 @@ readonly -a LANES=(portable privileged)
 DAG_DIR="$ROOT_DIR/ci/dag"
 readonly DAG_DIR
 MANIFEST_PLAN_BIN_DEFAULT="$ROOT_DIR/target/debug/hermit-manifest-plan"
-readonly MANIFEST_PLAN_BIN_DEFAULT
+MANIFEST_PLAN_POINTER_DEFAULT="$ROOT_DIR/target/ci/manifest-plan.path"
+readonly MANIFEST_PLAN_BIN_DEFAULT MANIFEST_PLAN_POINTER_DEFAULT
 
 function usage {
     cat <<'USAGE'
@@ -242,98 +243,223 @@ DAG_ENTRY
     rm -rf "$scratch"
 }
 
-# Prove the manifest consumers cannot be serialized behind Cargo's build lock.
+# Prove that NO metadata consumer can be serialized behind Cargo's build lock,
+# and that a published document can never be consumed once it stops matching its
+# inputs.
 #
-# The load-bearing property is NEGATIVE -- "this path never executes cargo" --
-# so a passing structural read of the script would prove nothing. Instead put a
-# marking, failing `cargo` shim first on PATH and exercise the real harness:
-# the prebuilt path must complete without ever touching the shim, and the
-# non-prebuilt path must hit it, which is what shows the shim is live rather
-# than inert. Also compare the prebuilt binary's bytes against the Cargo
-# producer's, so "cheaper" can never quietly become "different".
+# Scope is the whole invariant, not one call site. An earlier revision of this
+# audit enumerated only the fifteen `run` steps in ci/dag/*.json and therefore
+# certified two paths that were still broken: build.manifest_guests (a `build`
+# consumer released into the same Cargo wave) and the hosted portable matrix
+# (which carries no producer at all). Every metadata consumer reaches
+# load_tests, so this audit enumerates consumers from BOTH DAGs AND the
+# workflows, checks that each DAG consumer transitively depends on the
+# publishing producer, and dynamically exercises every subcommand shape those
+# consumers actually use.
+#
+# The load-bearing properties are NEGATIVE -- "this path never executes cargo",
+# "this stale document is never served" -- so a structural read of the script
+# would prove nothing. A marking, failing `cargo` shim goes first on PATH and
+# the real harness runs against it.
 function audit_manifest_plan_cargo_independence {
-    local scratch marker reference direct fixture_docs output status
-    local entered_reason='cargo shim: the prebuilt manifest path must not take the Cargo build lock'
+    local scratch marker bundle reference published status output lane dag
     scratch=$(mktemp -d)
     marker="$scratch/cargo-was-invoked"
     mkdir -p "$scratch/bin"
-    cat >"$scratch/bin/cargo" <<CARGO_SHIM
+    # Per-invocation marker path, so shapes can be exercised concurrently and a
+    # cargo invocation is still attributed to the exact caller that made it.
+    cat >"$scratch/bin/cargo" <<'CARGO_SHIM'
 #!/usr/bin/env bash
-: >"$marker"
-echo '$entered_reason' >&2
+: >"${CARGO_SHIM_MARKER:?cargo shim invoked without a marker path}"
+echo 'cargo shim: a published-document consumer must not take the Cargo build lock' >&2
 exit 97
 CARGO_SHIM
     chmod 755 "$scratch/bin/cargo"
+    # `run` shapes assert an executable Hermit before selecting cells. This
+    # audit is about metadata resolution, and it runs in a node that precedes
+    # the Hermit build, so stand in a stub: the selected cell set is empty, so
+    # nothing ever executes it.
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$scratch/bin/hermit-stub"
+    chmod 755 "$scratch/bin/hermit-stub"
 
-    # `load_tests` already ran the Cargo producer, so the debug binary is current.
+    # ---- coverage: which consumers exist, and are they all reachable? --------
+    # Every subcommand runs load_tests, so the shapes below are the complete set
+    # of metadata consumers. `validate` is excluded from the DYNAMIC brackets
+    # only because it is this function's own caller and would recurse; it is
+    # still covered structurally, and it shares the single resolver.
+    local -a consumer_shapes=(run build plan)
+    local dag_consumers=0 workflow_consumers=0 shape uncovered=""
+    while IFS= read -r shape; do
+        [[ -n $shape ]] || continue
+        contains "$shape" "${consumer_shapes[@]}" || contains "$shape" validate ||
+            uncovered+=" $shape"
+    done < <(
+        jq -r '.steps[].cmd' "$DAG_ROOT"/*.json |
+            grep -oE '\./ci/test_harness\.sh [a-z-]+' | awk '{print $2}' | sort -u
+        grep -rhoE '\./ci/test_harness\.sh [a-z-]+' "$ROOT_DIR/.github/workflows/" |
+            awk '{print $2}' | sort -u
+    )
+    [[ -z $uncovered ]] ||
+        die "metadata consumer subcommand(s) outside this audit's scope:$uncovered"
+    dag_consumers=$(jq -r '[.steps[] | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate) "))] | length' \
+        "$DAG_ROOT"/*.json | paste -sd+ - | bc)
+    workflow_consumers=$(grep -rcoE '\./ci/test_harness\.sh (run|build|plan|validate) ' \
+        "$ROOT_DIR/.github/workflows/" | awk -F: '{s+=$2} END {print s+0}')
+    ((dag_consumers > 0)) || die "no DAG metadata consumers found"
+    ((workflow_consumers > 0)) || die "no workflow metadata consumers found"
+
+    # ---- C1: every DAG consumer must sit downstream of the publisher ---------
+    # build.manifest_guests is the proof case: it is a `build` consumer, it is
+    # released alongside build.workspace, and nothing about `run` covered it.
+    for lane in "${LANES[@]}"; do
+        dag="$DAG_ROOT/$lane.json"
+        jq -e '[.steps[] | select((.group + "." + .job) == "setup.manifest_plan")
+               | select(.cmd | contains("ci/publish-manifest-plan.sh"))] | length == 1' \
+            "$dag" >/dev/null ||
+            die "$lane setup.manifest_plan does not publish the manifest-plan document"
+        local orphaned
+        orphaned=$(jq -r '
+            . as $dag
+            | ([$dag.steps[] | {key: (.group + "." + .job), value: .deps}] | from_entries) as $deps
+            | def reaches($tag; $seen):
+                if ($seen | index($tag)) then false
+                elif $tag == "setup.manifest_plan" then true
+                else (($deps[$tag] // []) | any(reaches(.; $seen + [$tag])))
+                end;
+              [ $dag.steps[]
+                | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate) "))
+                | (.group + "." + .job) ]
+              | map(select(reaches(.; [])| not)) | join(", ")' "$dag")
+        [[ -z $orphaned ]] ||
+            die "$lane metadata consumer(s) do not transitively depend on setup.manifest_plan and can still block on the Cargo build lock: $orphaned"
+    done
+
+    # ---- identity: the published document IS the Cargo producer's output ----
+    # Cargo is the one producer independent of everything under test here, so
+    # this is the check that stops "cheaper" from quietly becoming "different".
     [[ -x $MANIFEST_PLAN_BIN_DEFAULT ]] ||
-        die "manifest-plan binary missing after metadata load: $MANIFEST_PLAN_BIN_DEFAULT"
+        cargo build --quiet -p hermit-manifest-plan --bins
     reference=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json)
-    direct=$("$MANIFEST_PLAN_BIN_DEFAULT" --format harness-json)
-    [[ $direct == "$reference" ]] ||
-        die "prebuilt manifest-plan output differs from the Cargo producer: $MANIFEST_PLAN_BIN_DEFAULT"
+    published="$scratch/published"
+    "$ROOT_DIR/ci/publish-manifest-plan.sh" "$MANIFEST_PLAN_BIN_DEFAULT" \
+        "$published" "$scratch/manifest-plan.path" >/dev/null
+    bundle=$("$ROOT_DIR/ci/verify-manifest-plan.sh" "$scratch/manifest-plan.path")
+    [[ $(<"$bundle/harness.json") == "$reference" ]] ||
+        die "published manifest-plan document differs from the Cargo producer: $bundle"
 
-    # One real bucket keeps the fixture schema-valid by construction and keeps
-    # this bracket cheap enough to live inside the metadata node's budget.
-    jq -c '[{bucket: .[0].bucket, test: [.[0].test[0]]}]' <<<"$reference" >"$scratch/documents.json"
-    printf '#!/usr/bin/env bash\nexec cat %q\n' "$scratch/documents.json" >"$scratch/plan-bin"
-    chmod 755 "$scratch/plan-bin"
+    # ---- POSITIVE: every consumer shape runs with zero cargo invocations -----
+    # Run the shapes concurrently: they are independent, each owns its own
+    # marker, and serializing them would spend this node's budget on three
+    # repetitions of the same 315-test metadata load.
+    local -a shape_args shape_pids=()
+    local covered=""
+    for shape in "${consumer_shapes[@]}"; do
+        case "$shape" in
+            run)   shape_args=(run --lane privileged --category applications --ci-only --allow-empty --prebuilt
+                               --results "$scratch/$shape.jsonl" --junit "$scratch/$shape.xml") ;;
+            build) shape_args=(build --lane privileged --category applications --ci-only --allow-empty) ;;
+            plan)  shape_args=(plan --lane privileged --format json) ;;
+        esac
+        (
+            # `set +e` is load-bearing: inherited errexit would kill this
+            # subshell on a failing shape BEFORE the status file is written,
+            # turning a precise "shape X invoked cargo" report into an
+            # unreadable "no such file" from the reader below.
+            set +e
+            env PATH="$scratch/bin:$PATH" \
+                CARGO_SHIM_MARKER="$scratch/cargo-$shape" \
+                HERMIT_MANIFEST_PLAN_POINTER="$scratch/manifest-plan.path" \
+                HERMIT_BIN="$scratch/bin/hermit-stub" \
+                "$ROOT_DIR/ci/test_harness.sh" "${shape_args[@]}" >"$scratch/$shape.out" 2>&1
+            printf '%s\n' "$?" >"$scratch/$shape.rc"
+        ) &
+        shape_pids+=($!)
+    done
+    local pid
+    for pid in "${shape_pids[@]}"; do
+        wait "$pid" || true
+    done
+    for shape in "${consumer_shapes[@]}"; do
+        status=$(<"$scratch/$shape.rc")
+        ((status == 0)) ||
+            die "consumer shape '$shape' failed against a published document with a cargo shim on PATH (rc=$status): $(<"$scratch/$shape.out")"
+        [[ ! -e $scratch/cargo-$shape ]] ||
+            die "consumer shape '$shape' invoked cargo and can still be blocked by the build lock"
+        covered+=" $shape"
+    done
 
-    # POSITIVE: the prebuilt path completes and never reaches the shim.
+    # ---- NEGATIVE (the shim is live, not inert) -----------------------------
     set +e
-    output=$(PATH="$scratch/bin:$PATH" HERMIT_MANIFEST_PLAN_BIN="$scratch/plan-bin" \
-        "$ROOT_DIR/ci/test_harness.sh" plan --prebuilt --format json 2>&1)
+    output=$(env PATH="$scratch/bin:$PATH" CARGO_SHIM_MARKER="$marker" HERMIT_MANIFEST_PLAN_POINTER="$scratch/absent.path" \
+        "$ROOT_DIR/ci/test_harness.sh" plan --lane privileged --format json 2>&1)
+    status=$?
+    set -e
+    ((status != 0)) || die "absent-document path ignored the failing cargo shim; the bracket is inert"
+    [[ -e $marker ]] || die "cargo shim never fired, so the positive cases prove nothing: $output"
+    [[ $output == *"regenerating metadata through Cargo"* ]] ||
+        die "absent-document fallback did not say why it was rebuilding: $output"
+
+    # ---- NEGATIVE (C2: an absent document must NOT refuse a real consumer) ---
+    # This is the hosted portable matrix's exact shape. It carries no published
+    # document, so a fail-closed resolver would turn a slow job into a red one.
+    set +e
+    output=$(env HERMIT_MANIFEST_PLAN_POINTER="$scratch/absent.path" HERMIT_BIN="$scratch/bin/hermit-stub" \
+        "$ROOT_DIR/ci/test_harness.sh" run --lane privileged --category applications \
+        --ci-only --allow-empty --prebuilt --results "$scratch/c2.jsonl" --junit "$scratch/c2.xml" 2>&1)
     status=$?
     set -e
     ((status == 0)) ||
-        die "prebuilt manifest path failed with a cargo shim on PATH (rc=$status): $output"
-    [[ ! -e $marker ]] ||
-        die "prebuilt manifest path invoked cargo and can still be blocked by the build lock"
-    jq -e 'type == "array" and length > 0' <<<"$output" >/dev/null ||
-        die "prebuilt manifest path produced no usable plan: $output"
+        die "a consumer with no published document was refused instead of rebuilding (rc=$status): $output"
 
-    # NEGATIVE (shim is live, not inert): the non-prebuilt path really does
-    # invoke cargo, which is the wait that produced the silent stall.
+    # ---- NEGATIVE (a drifted input set is never served) ---------------------
+    # Plant a bundle whose recorded inputs no longer describe the tree. It must
+    # be rejected as stale and rebuilt; with the shim on PATH that rebuild
+    # fails, which is what proves the stale document was NOT consumed.
+    # The fixture must stay INTERNALLY consistent -- re-addressed to its own
+    # altered inputs -- or the verifier would reject it as tampered and this
+    # would silently stop testing staleness at all.
+    local stale_inputs_hash stale_documents_hash stale_identity stale="$scratch/stale/pending"
+    mkdir -p "$(dirname "$stale")"
+    cp -a "$bundle" "$stale"
+    printf '%s  %s\n' "$(printf deadbeef | sha256sum | cut -d' ' -f1)" tests/e2e/manifests/planted-drift.toml \
+        >>"$stale/inputs.sha256"
+    stale_inputs_hash=$(sha256sum "$stale/inputs.sha256" | cut -d' ' -f1)
+    stale_documents_hash=$(sha256sum "$stale/harness.json" | cut -d' ' -f1)
+    stale_identity=$(printf '%s\n%s\n' "$stale_inputs_hash" "$stale_documents_hash" | sha256sum | cut -d' ' -f1)
+    mv "$stale" "$scratch/stale/$stale_identity"
+    stale="$scratch/stale/$stale_identity"
+    printf '%s\n' "$stale" >"$scratch/stale.path"
     rm -f "$marker"
     set +e
-    output=$(PATH="$scratch/bin:$PATH" "$ROOT_DIR/ci/test_harness.sh" plan --format json 2>&1)
+    output=$(env PATH="$scratch/bin:$PATH" CARGO_SHIM_MARKER="$marker" HERMIT_MANIFEST_PLAN_POINTER="$scratch/stale.path" \
+        "$ROOT_DIR/ci/test_harness.sh" plan --lane privileged --format json 2>&1)
     status=$?
     set -e
-    ((status != 0)) ||
-        die "non-prebuilt manifest path ignored the failing cargo shim; the bracket is inert"
-    [[ -e $marker ]] ||
-        die "cargo shim never fired, so the positive case proves nothing: $output"
+    ((status != 0)) || die "a drifted manifest-plan document was served instead of rebuilt: $output"
+    [[ -e $marker ]] || die "drifted document did not fall through to a rebuild: $output"
 
-    # NEGATIVE (fail closed): a missing prebuilt producer must refuse by name
-    # rather than silently falling back to the Cargo build-lock path.
+    # ---- NEGATIVE (a tampered document fails closed, it does NOT rebuild) ---
+    # Corruption means a broken publisher, not a missing one; papering over it
+    # with a rebuild would hide the very thing worth knowing.
+    local tampered="$scratch/tampered/${bundle##*/}"
+    mkdir -p "$(dirname "$tampered")"
+    cp -a "$bundle" "$tampered"
+    printf '[]' >"$tampered/harness.json"
+    printf '%s\n' "$tampered" >"$scratch/tampered.path"
     rm -f "$marker"
     set +e
-    output=$(PATH="$scratch/bin:$PATH" HERMIT_MANIFEST_PLAN_BIN="$scratch/absent-plan-bin" \
-        "$ROOT_DIR/ci/test_harness.sh" plan --prebuilt --format json 2>&1)
+    output=$(env PATH="$scratch/bin:$PATH" CARGO_SHIM_MARKER="$marker" HERMIT_MANIFEST_PLAN_POINTER="$scratch/tampered.path" \
+        "$ROOT_DIR/ci/test_harness.sh" plan --lane privileged --format json 2>&1)
     status=$?
     set -e
     ((status == 2)) ||
-        die "absent prebuilt manifest producer returned $status, expected 2: $output"
-    [[ $output == *"needs the binary from setup.manifest_plan"* ]] ||
-        die "absent prebuilt manifest producer did not name its missing producer: $output"
+        die "a tampered manifest-plan document returned $status, expected a fail-closed 2: $output"
+    [[ $output == *"failed verification"* ]] ||
+        die "tampered document was not reported as a verification failure: $output"
     [[ ! -e $marker ]] ||
-        die "absent prebuilt manifest producer fell back to cargo instead of failing closed"
+        die "tampered document fell back to a rebuild instead of failing closed"
 
-    # Every DAG manifest consumer must actually take the cargo-free path.
-    local lane dag consumers unguarded
-    for lane in "${LANES[@]}"; do
-        dag="$DAG_ROOT/$lane.json"
-        consumers=$(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$dag")
-        ((consumers > 0)) || die "no manifest consumers found in $lane.json"
-        unguarded=$(jq -r '[.steps[]
-            | select(.cmd | contains("./ci/test_harness.sh run "))
-            | select(.cmd | contains(" --prebuilt") | not)
-            | .group + "." + .job] | join(", ")' "$dag")
-        [[ -z $unguarded ]] ||
-            die "$lane manifest consumer(s) omit --prebuilt and can block on the Cargo build lock: $unguarded"
-    done
-
-    echo "manifest-plan lock independence: prebuilt output byte-identical to the Cargo producer; prebuilt path cargo_invocations=0 with a failing shim first on PATH; non-prebuilt path cargo_invocations=1 (shim live); absent producer refused rc=2 with cargo_invocations=0; $(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$DAG_ROOT/portable.json") portable + $(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$DAG_ROOT/privileged.json") privileged consumers all pass --prebuilt"
+    echo "manifest-plan lock independence: $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s), shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0"
     rm -rf "$scratch"
 }
 
@@ -388,37 +514,61 @@ function metadata_json {
     printf '%s\n' "${METADATA_BY_ID[$id]}"
 }
 
-# Emit the harness-json manifest documents WITHOUT taking Cargo's shared build
-# lock when the caller declared its inputs prebuilt.
+# Emit the harness-json manifest documents, preferring a published document over
+# an invocation of Cargo.
 #
-# `cargo run` acquires Cargo's EXCLUSIVE build-directory lock. Every manifest
-# consumer node in ci/dag/*.json is released into the same wave as the DAG's
-# Cargo fan-out (clippy, doctests, rustdoc, nextest, detcore unit tests), so
-# routing metadata loading through Cargo serializes a node whose own work costs
-# ~6s behind whatever compile currently owns target/debug/.cargo-lock. `--quiet`
+# `cargo run` acquires Cargo's EXCLUSIVE build-directory lock. EVERY caller of
+# load_tests -- the e2e.manifest_* consumers, build.manifest_guests, and
+# e2e.metadata alike -- is released into the same wave as the DAG's Cargo fan-out
+# (clippy, doctests, rustdoc, nextest, detcore unit tests), so routing metadata
+# loading through Cargo serializes a node whose own work costs ~6s behind
+# whatever compile currently owns target/debug/.cargo-lock. `--quiet`
 # additionally suppresses Cargo's "Blocking waiting for file lock" status line,
 # so that wait produced NO output at all and looked like a hang rather than a
-# queue. On 2026-08-10 that put all five e2e.manifest_* consumers over their
-# wall budget: the node emitted its artifact-verification line, went silent, and
-# was killed with "no test boundaries were recognized in this step's output;
+# queue. On 2026-08-10 that put all five e2e.manifest_* consumers over their wall
+# budget: the node emitted its artifact-verification line, went silent, and was
+# killed with "no test boundaries were recognized in this step's output;
 # 0 test(s) completed" (task p0_privileged_e2e_manifest).
 #
-# A `--prebuilt` consumer therefore executes the binary `setup.manifest_plan`
-# already built, and never invokes Cargo. It fails closed when that binary is
-# absent instead of silently falling back to the locking path, because a silent
-# fallback would reintroduce exactly the invisible stall this replaces.
+# setup.manifest_plan therefore publishes the DOCUMENT, content-addressed and
+# bound to a per-file hash of its exact input set. Three outcomes, three
+# behaviors -- the distinction is the point:
+#
+#   verified -> read it; no Cargo, so no build lock, so no wave contention.
+#   invalid  -> FAIL CLOSED. A corrupt or tampered bundle is a broken publisher,
+#               not a missing one, and must never be papered over by a rebuild.
+#   stale or absent -> rebuild through Cargo, saying so on stderr. This keeps
+#               local checkouts and hosted matrix jobs (which carry no published
+#               bundle, and run one job per runner so nothing contends the lock)
+#               working exactly as before, and it is the reason a drifted input
+#               set can never be served from a stale document.
 function manifest_plan_documents {
-    local producer
-    if ((PREBUILT == 1)) || [[ -n ${HERMIT_MANIFEST_PLAN_BIN:-} ]]; then
-        producer=${HERMIT_MANIFEST_PLAN_BIN:-$MANIFEST_PLAN_BIN_DEFAULT}
-        [[ -x $producer ]] ||
-            die "prebuilt manifest metadata needs the binary from setup.manifest_plan: $producer"
-        "$producer" --format harness-json
+    local pointer bundle reason status
+    pointer=${HERMIT_MANIFEST_PLAN_POINTER:-$MANIFEST_PLAN_POINTER_DEFAULT}
+    reason=$(mktemp)
+    status=0
+    bundle=$("$ROOT_DIR/ci/verify-manifest-plan.sh" "$pointer" 2>"$reason") || status=$?
+    if ((status == 0)); then
+        rm -f "$reason"
+        cat "$bundle/harness.json"
         return
     fi
-    # Local, non-prebuilt path: build on demand. Deliberately NOT `--quiet`, so
-    # that a Cargo lock wait is reported as "Blocking waiting for file lock"
-    # instead of presenting as an unexplained hang.
+    if ((status == 2)); then
+        local detail
+        detail=$(<"$reason")
+        rm -f "$reason"
+        die "published manifest-plan document failed verification: $detail"
+    fi
+    if ((status != 3 && status != 4)); then
+        local detail
+        detail=$(<"$reason")
+        rm -f "$reason"
+        die "verify-manifest-plan.sh returned $status: $detail"
+    fi
+    echo "test_harness.sh: $(<"$reason"); regenerating metadata through Cargo (this can block on the Cargo build lock)" >&2
+    rm -f "$reason"
+    # Deliberately NOT `--quiet`, so a Cargo lock wait is reported as "Blocking
+    # waiting for file lock" instead of presenting as an unexplained hang.
     cargo run -p hermit-manifest-plan -- --format harness-json
 }
 

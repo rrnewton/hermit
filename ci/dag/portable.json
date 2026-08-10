@@ -100,7 +100,7 @@
       "group": "setup", "job": "manifest_plan",
       "desc": "Build the manifest-plan binaries the metadata validation runs",
       "description": "MOVED OUT OF e2e.metadata 2026-08-08. e2e.metadata is a DAG ROOT whose first action is `cargo run -p hermit-manifest-plan` -- twice: load_tests uses the default bin, audit_test_footprints uses generate-test-footprints. It therefore COMPILES, upstream of every build node. That made the old metadata budget BIMODAL: 16.5s warm, 57s cold, 2 slow in 9 sampled CI runs. The compile remains HERE under a build-shaped budget so metadata inherits a warm artifact. The later 180s metadata budget is independent: by 2026-08-09 the non-build audit workload itself consumed 71.44-73.84s wall and 58.36-60.38s CPU across three warm samples, exceeding the former 60s ceiling even after this compile split.",
-      "cmd": "cargo build -p hermit-manifest-plan --bins",
+      "cmd": "cargo build -p hermit-manifest-plan --bins && ./ci/publish-manifest-plan.sh target/debug/hermit-manifest-plan target/ci/manifest-plan target/ci/manifest-plan.path",
       "timeout": 180,
       "hint": {"est_duration_s": 60, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "cpu-bound"}
