@@ -448,7 +448,13 @@ jobs:
             prefix="$inputs_dir/pr-${pr_number}"
             git diff --no-ext-diff --no-textconv --no-renames \
               --unified=0 "$base_sha" "$head_sha" -- >"${prefix}.diff"
-            git show -s --format=%B "$head_sha" >"${prefix}.commit-message"
+            merge_base="$(git merge-base "$base_sha" "$head_sha")"
+            git rev-list --reverse "${merge_base}..${head_sha}" |
+              while read -r commit_sha; do
+                commit_message="$(git show -s --format=%B "$commit_sha")"
+                jq -cn --arg sha "$commit_sha" --arg message "$commit_message" \
+                  '{sha:$sha,message:$message}'
+              done | jq -s . >"${prefix}.commit-messages.json"
             gh api "repos/${REPO}/issues/${pr_number}/comments" \
               --paginate --slurp | jq 'add' >"${prefix}.comments.json"
             gh api "repos/${REPO}/pulls/${pr_number}/reviews" \
@@ -469,7 +475,7 @@ jobs:
                PR_COMMENTS_FILE="${prefix}.comments.json" \
                PR_REVIEWS_FILE="${prefix}.reviews.json" \
                PR_DIFF_FILE="${prefix}.diff" \
-               PR_COMMIT_MESSAGE_FILE="${prefix}.commit-message" \
+               PR_COMMIT_MESSAGES_FILE="${prefix}.commit-messages.json" \
                bash scripts/core-review-protocol-lint.sh; then
               :
             else

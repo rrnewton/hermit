@@ -18,7 +18,7 @@ owner_login="${OWNER_LOGIN:-rrnewton}"
 comments_file="${PR_COMMENTS_FILE-}"
 reviews_file="${PR_REVIEWS_FILE-}"
 diff_file="${PR_DIFF_FILE-}"
-commit_message_file="${PR_COMMIT_MESSAGE_FILE-}"
+commit_messages_file="${PR_COMMIT_MESSAGES_FILE-}"
 
 die() {
     echo "::error::PR #${pr}: $*" >&2
@@ -27,11 +27,19 @@ die() {
 
 [[ $head_sha =~ ^[0-9a-f]{40}$ ]] || die "PR_HEAD_SHA must be an exact 40-hex commit."
 [[ -n $author_login ]] || die "PR_AUTHOR_LOGIN is required."
-for input in "$comments_file" "$reviews_file" "$diff_file" "$commit_message_file"; do
+for input in "$comments_file" "$reviews_file" "$diff_file" "$commit_messages_file"; do
     [[ -n $input && -f $input ]] || die "review inputs and PR_DIFF_FILE must name readable files."
 done
 jq -e 'type == "array"' "$comments_file" >/dev/null || die "PR_COMMENTS_FILE is not a JSON array."
 jq -e 'type == "array"' "$reviews_file" >/dev/null || die "PR_REVIEWS_FILE is not a JSON array."
+jq -e '
+    type == "array" and length > 0
+    and all(
+        type == "object"
+        and (.sha | type == "string" and test("^[0-9a-f]{40}$"))
+        and (.message | type == "string")
+    )
+' "$commit_messages_file" >/dev/null || die "PR_COMMIT_MESSAGES_FILE is not a nonempty commit-message array."
 
 errors=0
 fail() {
@@ -50,19 +58,43 @@ has_section() {
 }
 
 team_tag() {
-    sed -nE '1s/^\[[^]]+\][[:space:]]+\[([^]]+)\].*$/\1/p'
+    sed -nE '1s/^\[[^]]+\][[:space:]]+\[([^],]+),[[:space:]]*devbig[0-9]+\]$/\1/p'
 }
 
-author_first_line=$(awk 'NF { line=$0 } END { print line }' "$commit_message_file")
 author_identity=
-if [[ $author_first_line == \[Human\]* ]]; then
-    author_identity="human:${author_login,,}"
-elif grep -Eq '^\[(impl agent|coordinator),[^]]+\][[:space:]]+\[[^]]+\]' <<< "$author_first_line"; then
-    author_team=$(printf '%s\n' "$author_first_line" | team_tag)
-    author_identity="agent:${author_team,,}"
-else
-    fail "exact-head commit message must end with a role and team tag so reviewer independence can be checked."
-fi
+declare -A seen_commit_shas=()
+commit_count=0
+head_count=0
+while IFS= read -r item; do
+    commit_sha=$(jq -r '.sha' <<< "$item")
+    commit_message=$(jq -r '.message' <<< "$item")
+    commit_tag=$(awk 'NF { line=$0 } END { print line }' <<< "$commit_message")
+    if [[ -n ${seen_commit_shas[$commit_sha]+x} ]]; then
+        fail "commit-message input repeats ${commit_sha}."
+        continue
+    fi
+    seen_commit_shas[$commit_sha]=1
+    commit_count=$((commit_count + 1))
+
+    commit_identity=
+    if [[ $commit_tag == \[Human\] ]]; then
+        commit_identity="human:${author_login,,}"
+    elif grep -Eq '^\[(impl agent|coordinator),[^]]+\][[:space:]]+\[[a-z0-9][a-z0-9-]*,[[:space:]]+devbig[0-9]+\]$' <<< "$commit_tag"; then
+        commit_team=$(printf '%s\n' "$commit_tag" | team_tag)
+        commit_identity="agent:${commit_team,,}"
+    else
+        fail "commit ${commit_sha} must end with a standalone role tag and comma-delimited team/machine tag."
+    fi
+
+    if [[ $commit_sha == "$head_sha" ]]; then
+        head_count=$((head_count + 1))
+        author_identity=$commit_identity
+    fi
+done < <(jq -c '.[]' "$commit_messages_file")
+
+((commit_count > 0)) || fail "base-to-head commit range is empty."
+((head_count == 1)) || fail "base-to-head commit range must contain exact head ${head_sha} once."
+[[ -n $author_identity ]] || fail "exact-head author identity is unavailable."
 
 positive_verdict() {
     local review_body=$1 verdict
@@ -79,8 +111,9 @@ consider_review() {
 
     [[ $reviewer_association =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] || return 0
     first_line=$(printf '%s\n' "$review_body" | sed -n '1p')
-    grep -Eiq '^\[adversarial-reviewer agent,[^]]+\][[:space:]]+\[[^]]+\]' <<< "$first_line" || return 0
+    grep -Eiq '^\[adversarial-reviewer agent,[^]]+\][[:space:]]+\[[a-z0-9][a-z0-9-]*,[[:space:]]+devbig[0-9]+\]$' <<< "$first_line" || return 0
     reviewer_team=$(printf '%s\n' "$first_line" | team_tag)
+    [[ -n $reviewer_team ]] || return 0
     if [[ -n $reviewer_login && ${reviewer_login,,} != "${author_login,,}" ]]; then
         reviewer_identity="github:${reviewer_login,,}"
     else
@@ -150,9 +183,10 @@ fi
 sensitive_classes=$(
     awk '
         function control_path(p) {
-            if (p ~ /^scripts\/core-review-protocol-lint(-test)?\.sh$/)
-                return 0
             return p ~ /^(\.github\/workflows\/|ci\/|scripts\/|validate\.sh$|Makefile$)/
+        }
+        function review_guard(p) {
+            return p ~ /^scripts\/core-review-protocol-lint(-test)?\.sh$/
         }
         /^diff --git a\// {
             path=$4
@@ -163,6 +197,8 @@ sensitive_classes=$(
         /^[+-]/ {
             if (!control_path(path)) next
             line=tolower(substr($0, 2))
+            if (review_guard(path))
+                print "review-policy"
             if (line ~ /(^|[^a-z])(timeout|timeouts|budget|budgets|cap|caps|limit|limits)([^a-z]|$)|resource_caps|max_(wall|cpu|seconds|duration)/)
                 print "timeout-or-cap"
             if (line ~ /(^|[^a-z])(parallel|parallelism|concurrency|jobs|workers|threads)([^a-z]|$)|max-parallel|--jobs|-[jJ][0-9]/)

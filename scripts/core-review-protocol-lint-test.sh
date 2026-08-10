@@ -32,21 +32,24 @@ readonly KVM_BODY="${FULL_BODY}
 ## Relationship to gVisor
 No gVisor analog applies."
 
-readonly CODEX_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+readonly CODEX_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, devbig998]
 
 PASS at exact head ${HEAD_SHA}. Independent review found no blocker."
-readonly CLAUDE_REVIEW="[adversarial-reviewer agent, claude-opus] [claude-reviewer, testbox]
+readonly CLAUDE_REVIEW="[adversarial-reviewer agent, claude-opus] [claude-reviewer, devbig997]
 
 APPROVE at exact head ${HEAD_SHA}. Independent review found no blocker."
-readonly SELF_REVIEW="[adversarial-reviewer agent, CODEX] [author-agent, testbox]
+readonly SELF_REVIEW="[adversarial-reviewer agent, CODEX] [author-agent, devbig999]
 
 PASS at exact head ${HEAD_SHA}."
-readonly STALE_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+readonly STALE_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, devbig998]
 
 PASS at stale head ${OLD_SHA}."
-readonly BLOCK_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+readonly BLOCK_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, devbig998]
 
 REQUEST CHANGES at exact head ${HEAD_SHA}."
+readonly MALFORMED_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer@devbig998]
+
+PASS at exact head ${HEAD_SHA}."
 readonly OWNER_EXCEPTION="[Human]
 
 TIMEOUT-CAP-EXCEPTION: APPROVED
@@ -72,6 +75,12 @@ readonly POLICY_SELF_EDIT='diff --git a/scripts/core-review-protocol-lint.sh b/s
 @@ -1 +1 @@
 -require_independent_review
 +exit 0 # permit timeout increases without review'
+readonly POLICY_TEST_SELF_EDIT='diff --git a/scripts/core-review-protocol-lint-test.sh b/scripts/core-review-protocol-lint-test.sh
+--- a/scripts/core-review-protocol-lint-test.sh
++++ b/scripts/core-review-protocol-lint-test.sh
+@@ -1 +1 @@
+-run_case "timeout increase blocks" 1
++run_case "timeout increase blocks" 0'
 readonly TIMEOUT_INCREASE='diff --git a/.github/workflows/ci-portable.yml b/.github/workflows/ci-portable.yml
 --- a/.github/workflows/ci-portable.yml
 +++ b/.github/workflows/ci-portable.yml
@@ -118,23 +127,34 @@ comments_json() {
 pass=0
 fail=0
 
-# run_case NAME EXPECTED LABELS BODY IS_KVM COMMENTS_JSON REVIEWS_JSON DIFF [COMMIT_MESSAGE]
+# run_case NAME EXPECTED LABELS BODY IS_KVM COMMENTS_JSON REVIEWS_JSON DIFF
+#          [HEAD_COMMIT_MESSAGE] [PRIOR_COMMIT_MESSAGE]
 run_case() {
     local name=$1 expected=$2 labels=$3 pr_body=$4 is_kvm=$5 comments=$6 reviews=$7 diff=$8
     local commit_message=${9:-}
+    local prior_commit_message=${10:-}
     local actual=0
     printf '%s\n' "$comments" >"$tmp/comments.json"
     printf '%s\n' "$reviews" >"$tmp/reviews.json"
     printf '%s\n' "$diff" >"$tmp/pr.diff"
     if [[ -n $commit_message ]]; then
-        printf '%s\n' "$commit_message" >"$tmp/commit-message"
+        :
     else
-        printf '%s\n\n[impl agent, CODEX] [author-agent, testbox]\n' "Test candidate" >"$tmp/commit-message"
+        commit_message=$'Test candidate\n\n[impl agent, CODEX] [author-agent, devbig999]'
+    fi
+    if [[ -n $prior_commit_message ]]; then
+        jq -cn --arg prior_sha "$OLD_SHA" --arg prior "$prior_commit_message" \
+            --arg head_sha "$HEAD_SHA" --arg head "$commit_message" \
+            '[{sha:$prior_sha,message:$prior},{sha:$head_sha,message:$head}]' \
+            >"$tmp/commit-messages.json"
+    else
+        jq -cn --arg sha "$HEAD_SHA" --arg message "$commit_message" \
+            '[{sha:$sha,message:$message}]' >"$tmp/commit-messages.json"
     fi
     PR_LABELS="$labels" PR_BODY="$pr_body" PR_IS_KVM="$is_kvm" PR_NUMBER=test \
         PR_HEAD_SHA="$HEAD_SHA" PR_AUTHOR_LOGIN="$AUTHOR_LOGIN" OWNER_LOGIN="$TEST_OWNER_LOGIN" \
         PR_COMMENTS_FILE="$tmp/comments.json" PR_REVIEWS_FILE="$tmp/reviews.json" \
-        PR_DIFF_FILE="$tmp/pr.diff" PR_COMMIT_MESSAGE_FILE="$tmp/commit-message" \
+        PR_DIFF_FILE="$tmp/pr.diff" PR_COMMIT_MESSAGES_FILE="$tmp/commit-messages.json" \
         bash "$LINT" >/dev/null 2>&1 || actual=$?
     if [[ $actual -eq $expected ]]; then
         echo "ok   - ${name} (exit ${actual})"
@@ -158,8 +178,13 @@ run_case "unlabeled PR without review blocks" 1 "" "$FULL_BODY" false "$empty" "
 run_case "ordinary PR with independent exact-head review passes" 0 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"
 run_case "formal exact-head approval satisfies mandatory review" 0 "" "$FULL_BODY" false "$empty" "$formal_codex" "$ORDINARY_DIFF"
 run_case "untrusted commenter cannot manufacture approval" 1 "" "$FULL_BODY" false "$unauthorized_codex" "$empty" "$ORDINARY_DIFF"
+run_case "malformed reviewer team tag cannot manufacture approval" 1 "" "$FULL_BODY" false \
+    "$(comments_json "$MALFORMED_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "malformed exact-head author trailer blocks" 1 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
     'Test candidate\n\n[impl agent, CODEX] [author-agent, testbox]'
+run_case "malformed historical author trailer blocks" 1 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
+    $'Test candidate\n\n[impl agent, CODEX] [author-agent, devbig999]' \
+    'Historical candidate\n\n[impl agent, CODEX] [author-agent@devbig999]'
 run_case "self-review does not satisfy independence" 1 "" "$FULL_BODY" false "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "stale-head review does not count" 1 "" "$FULL_BODY" false "$(comments_json "$STALE_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "request-changes verdict does not authorize landing" 1 "" "$FULL_BODY" false "$(comments_json "$BLOCK_REVIEW")" "$empty" "$ORDINARY_DIFF"
@@ -173,7 +198,10 @@ run_case "KVM PR with gVisor section passes" 0 "" "$KVM_BODY" true "$codex" "$em
 
 # The candidate may edit policy, but the base-owned executable still decides.
 run_case "candidate policy self-edit cannot remove mandatory review" 1 "" "$FULL_BODY" false "$empty" "$empty" "$POLICY_SELF_EDIT"
-run_case "reviewed policy edit remains reviewable" 0 "" "$FULL_BODY" false "$codex" "$empty" "$POLICY_SELF_EDIT"
+run_case "reviewed policy edit still requires owner exception" 1 "" "$FULL_BODY" false "$codex" "$empty" "$POLICY_SELF_EDIT"
+run_case "reviewed test self-edit still requires owner exception" 1 "" "$FULL_BODY" false "$codex" "$empty" "$POLICY_TEST_SELF_EDIT"
+run_case "owner exact-head exception permits policy edit" 0 "" "$FULL_BODY" false \
+    "$(comments_json "$CODEX_REVIEW" "$OWNER_EXCEPTION")" "$empty" "$POLICY_SELF_EDIT"
 
 # All six accepted evasions are now explicit negative brackets.
 run_case "direct timeout increase is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$TIMEOUT_INCREASE"
