@@ -266,6 +266,16 @@
    ]
   },
   {
+   "label": "python3-deep",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "python3-deep"
+   ]
+  },
+  {
    "label": "curl",
    "argv": [
     "/usr/bin/curl",
@@ -343,6 +353,16 @@
     "bash",
     "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
     "make"
+   ]
+  },
+  {
+   "label": "make-parallel",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "make-parallel"
    ]
   },
   {
