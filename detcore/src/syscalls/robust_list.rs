@@ -28,12 +28,32 @@
 //! * it removes an ordering race — Detcore issues the wake before the guest's
 //!   `exit` reaches the kernel, so a waiter that is woken and re-reads the word
 //!   must already see `FUTEX_OWNER_DIED`;
-//! * it makes the behavior backend-independent — the KVM backend's guest pages
-//!   are not the host task's robust list, so no host kernel would ever perform
-//!   this transition for it;
+//! * it makes the behavior backend-independent — on the KVM backend nothing
+//!   performs this transition at all. Measured on the `robust_futex_test` guest,
+//!   the futex word after owner death reads `0x40000000` natively and on base
+//!   ptrace (the host kernel wrote it) but `0x00000004` on base KVM;
 //! * it is idempotent with respect to the host kernel. After Detcore clears the
 //!   owner TID field, the kernel's later `handle_futex_death()` sees
 //!   `(uval & FUTEX_TID_MASK) != task_pid_vnr(curr)` and does nothing.
+//!
+//! # Scope: voluntary thread exit only
+//!
+//! Detcore replays this walk from the `exit`/`exit_group` syscall handlers,
+//! which is strictly narrower than Linux, and narrower in a way that matters for
+//! process-shared robust mutexes. See `handle_exit_group` in
+//! [`crate::syscalls::threads`] for the exact constraint and why no other hook
+//! can carry it.
+//!
+//! # Structure
+//!
+//! [`exit_robust_list`] is the whole algorithm, written against the
+//! [`RobustDeathEffects`] trait rather than against a `Guest`, so the walk —
+//! ordering, the pending slot, the fault-abort rules and the
+//! `ROBUST_LIST_LIMIT` bound — is unit-testable over fake guest memory with no
+//! backend, no scheduler and no tracee. `threads.rs` supplies the one real
+//! implementation.
+
+use tracing::trace;
 
 /// `FUTEX_WAITERS` from `include/uapi/linux/futex.h`.
 pub(crate) const FUTEX_WAITERS: u32 = 0x8000_0000;
@@ -124,14 +144,293 @@ pub(crate) fn futex_death_transition(
     })
 }
 
+/// What `handle_futex_death()` told the walk to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeathStep {
+    /// The kernel's `return 0`: this entry is finished, keep walking.
+    Continue,
+    /// The kernel's `return -1`. `exit_robust_list()` propagates it with a bare
+    /// `return`, so nothing further is touched — not the remaining entries and
+    /// not the trailing `list_op_pending` slot.
+    Abort,
+}
+
+/// Guest-memory and wake effects the walk needs.
+///
+/// Splitting these out is what makes [`exit_robust_list`] testable: the walk
+/// never mentions `Guest`, `Detcore` or the scheduler, so a test can drive the
+/// real algorithm over a map of bytes and assert the exact sequence of writes
+/// and wakes.
+pub(crate) trait RobustDeathEffects {
+    /// Read a `u64` from guest memory. `None` models `get_user()` faulting.
+    fn read_u64(&mut self, address: usize) -> Option<u64>;
+
+    /// Read the 32-bit futex word. `None` models `get_user()` faulting.
+    fn read_u32(&mut self, address: usize) -> Option<u32>;
+
+    /// Apply the owner-death transition to the futex word. `false` models an
+    /// unrecoverable `futex_cmpxchg_value_locked()` fault.
+    fn mark_dead(&mut self, address: usize, before: u32, after: u32) -> bool;
+
+    /// Wake exactly one waiter on the futex word, as the kernel's
+    /// `futex_wake(uaddr, 1, ...)` does.
+    ///
+    /// `observed` is the word's value at this point, carried so the caller can
+    /// pass it to the scheduler RPC and log it.
+    async fn wake_one(&mut self, address: usize, observed: u32);
+}
+
+/// Why a walk stopped, for logging and for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WalkOutcome {
+    /// Entries handed to `handle_futex_death()`, including the pending slot.
+    pub entries_visited: usize,
+    /// A `robust_list_head` field could not be read; nothing was touched.
+    pub head_unreadable: bool,
+    /// `handle_futex_death()` returned `-1`, abandoning the walk.
+    pub aborted: bool,
+    /// A `next` pointer faulted, ending the walk after the current entry.
+    pub next_faulted: bool,
+    /// `ROBUST_LIST_LIMIT` entries were followed without reaching the head.
+    pub truncated: bool,
+}
+
+/// Replay Linux's `exit_robust_list()` (`kernel/futex/core.c`) over `effects`.
+///
+/// `owner_tid` is the dying thread's guest-visible TID: the value that must
+/// appear in a futex word's `FUTEX_TID_MASK` field for that word to be marked.
+pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
+    effects: &mut E,
+    head: usize,
+    owner_tid: u32,
+) -> WalkOutcome {
+    let mut outcome = WalkOutcome::default();
+
+    // `exit_robust_list()` fetches list.next, futex_offset and list_op_pending
+    // up front and returns immediately if any of the three faults.
+    let (Some(first_raw), Some(futex_offset), Some(pending_raw)) = (
+        head.checked_add(HEAD_LIST_OFFSET)
+            .and_then(|at| effects.read_u64(at)),
+        head.checked_add(HEAD_FUTEX_OFFSET_OFFSET)
+            .and_then(|at| effects.read_u64(at)),
+        head.checked_add(HEAD_LIST_OP_PENDING_OFFSET)
+            .and_then(|at| effects.read_u64(at)),
+    ) else {
+        outcome.head_unreadable = true;
+        return outcome;
+    };
+    let futex_offset = futex_offset as i64;
+    let mut entry = RobustEntry::decode(first_raw);
+    let pending = {
+        let decoded = RobustEntry::decode(pending_raw);
+        (!decoded.is_null()).then_some(decoded)
+    };
+
+    let mut limit = ROBUST_LIST_LIMIT;
+    while entry.address != head {
+        // `fetch_robust_entry(&next_entry, &entry->next, &next_pi)` runs BEFORE
+        // this entry is handled, because handling it can rewrite guest memory.
+        // `struct robust_list` is a single `next` pointer at offset 0.
+        let next = effects.read_u64(entry.address).map(RobustEntry::decode);
+
+        // The kernel skips `pending` here and handles it once at the end.
+        if pending.map(|slot| slot.address) != Some(entry.address) {
+            outcome.entries_visited += 1;
+            if handle_futex_death(effects, entry, futex_offset, owner_tid, false).await
+                == DeathStep::Abort
+            {
+                outcome.aborted = true;
+                return outcome;
+            }
+        }
+
+        // The kernel tests `fetch_robust_entry`'s `rc` only after handling the
+        // current entry, so a faulting `next` still lets this entry run.
+        let Some(next) = next else {
+            outcome.next_faulted = true;
+            return outcome;
+        };
+        entry = next;
+        limit -= 1;
+        if limit == 0 {
+            outcome.truncated = true;
+            break;
+        }
+    }
+
+    // `list_op_pending` covers the window in which the guest has claimed or
+    // released a mutex but not yet linked or unlinked it, so the kernel handles
+    // it last and with `pending_op` set.
+    if let Some(pending) = pending {
+        outcome.entries_visited += 1;
+        if handle_futex_death(effects, pending, futex_offset, owner_tid, true).await
+            == DeathStep::Abort
+        {
+            outcome.aborted = true;
+        }
+    }
+
+    outcome
+}
+
+/// Replay the kernel's `handle_futex_death()` for one list entry.
+async fn handle_futex_death<E: RobustDeathEffects>(
+    effects: &mut E,
+    entry: RobustEntry,
+    futex_offset: i64,
+    owner_tid: u32,
+    pending_op: bool,
+) -> DeathStep {
+    let Some(word) = futex_word_address(entry.address, futex_offset) else {
+        // The kernel computes the same wild address and faults in `get_user()`,
+        // which is a `-1` return, not a skip.
+        return DeathStep::Abort;
+    };
+    // "Futex address must be 32bit aligned" is `handle_futex_death()`'s first
+    // statement, before any read: Linux refuses a misaligned word outright
+    // rather than performing an unaligned read-modify-write on it.
+    if word % std::mem::size_of::<u32>() != 0 {
+        trace!("robust-list entry has a misaligned futex word {:#x}", word);
+        return DeathStep::Abort;
+    }
+    let Some(uval) = effects.read_u32(word) else {
+        return DeathStep::Abort;
+    };
+
+    // The pending-op special case. The owner died between releasing the futex
+    // word and issuing its wake, or after being woken but before taking the
+    // lock, so a waiter may be parked on an already-free futex. Linux wakes one
+    // waiter WITHOUT marking the word: setting `FUTEX_OWNER_DIED` on a zero
+    // word would create exactly the inconsistent state that user-space
+    // owner-died handling cannot recover from.
+    if pending_op && !entry.is_pi && uval == 0 {
+        effects.wake_one(word, uval).await;
+        return DeathStep::Continue;
+    }
+
+    let Some(transition) = futex_death_transition(uval, owner_tid, entry.is_pi) else {
+        return DeathStep::Continue;
+    };
+    if !effects.mark_dead(word, uval, transition.new_value) {
+        return DeathStep::Abort;
+    }
+    if transition.wake_one {
+        effects.wake_one(word, transition.new_value).await;
+    }
+    DeathStep::Continue
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// glibc's `futex_offset` is
     /// `offsetof(pthread_mutex_t, __data.__lock) - offsetof(pthread_mutex_t, __data.__list.__next)`,
     /// i.e. -32 on x86-64.
     const GLIBC_FUTEX_OFFSET: i64 = -32;
+
+    const OWNER: u32 = 5;
+
+    /// Byte-addressed fake guest memory plus a recorder for every effect the
+    /// walk performs, so a test can assert the exact sequence.
+    #[derive(Debug, Default)]
+    struct FakeGuest {
+        bytes: BTreeMap<usize, u8>,
+        /// Addresses whose read faults.
+        unreadable: BTreeSet<usize>,
+        /// Addresses whose write faults.
+        unwritable: BTreeSet<usize>,
+        /// `(word, before, after)` for each applied transition, in order.
+        marks: Vec<(usize, u32, u32)>,
+        /// `(word, observed)` for each wake, in order.
+        wakes: Vec<(usize, u32)>,
+    }
+
+    impl FakeGuest {
+        fn put_u64(&mut self, address: usize, value: u64) {
+            for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                self.bytes.insert(address + i, byte);
+            }
+        }
+
+        fn put_u32(&mut self, address: usize, value: u32) {
+            for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                self.bytes.insert(address + i, byte);
+            }
+        }
+
+        fn get_u32(&self, address: usize) -> Option<u32> {
+            let mut buf = [0u8; 4];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = *self.bytes.get(&(address + i))?;
+            }
+            Some(u32::from_le_bytes(buf))
+        }
+
+        /// Lay down a `robust_list_head` with glibc's field layout.
+        fn head(&mut self, head: usize, first: u64, pending: u64) {
+            self.put_u64(head + HEAD_LIST_OFFSET, first);
+            self.put_u64(head + HEAD_FUTEX_OFFSET_OFFSET, GLIBC_FUTEX_OFFSET as u64);
+            self.put_u64(head + HEAD_LIST_OP_PENDING_OFFSET, pending);
+        }
+
+        /// Lay down one list node at `node` whose `next` is `next`, with a
+        /// glibc-shaped futex word 32 bytes below it holding `word`.
+        fn node(&mut self, node: usize, next: u64, word: u32) {
+            self.put_u64(node, next);
+            self.put_u32(node - 32, word);
+        }
+
+        fn marked_words(&self) -> Vec<usize> {
+            self.marks.iter().map(|mark| mark.0).collect()
+        }
+
+        fn woken_words(&self) -> Vec<usize> {
+            self.wakes.iter().map(|wake| wake.0).collect()
+        }
+    }
+
+    impl RobustDeathEffects for FakeGuest {
+        fn read_u64(&mut self, address: usize) -> Option<u64> {
+            if self.unreadable.contains(&address) {
+                return None;
+            }
+            let mut buf = [0u8; 8];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = *self.bytes.get(&(address + i))?;
+            }
+            Some(u64::from_le_bytes(buf))
+        }
+
+        fn read_u32(&mut self, address: usize) -> Option<u32> {
+            if self.unreadable.contains(&address) {
+                return None;
+            }
+            self.get_u32(address)
+        }
+
+        fn mark_dead(&mut self, address: usize, before: u32, after: u32) -> bool {
+            if self.unwritable.contains(&address) {
+                return false;
+            }
+            self.put_u32(address, after);
+            self.marks.push((address, before, after));
+            true
+        }
+
+        async fn wake_one(&mut self, address: usize, observed: u32) {
+            self.wakes.push((address, observed));
+        }
+    }
+
+    fn walk(guest: &mut FakeGuest, head: usize, owner: u32) -> WalkOutcome {
+        futures::executor::block_on(exit_robust_list(guest, head, owner))
+    }
+
+    // ---- pure helpers -----------------------------------------------------
 
     #[test]
     fn pi_bit_is_carried_in_the_pointer_low_bit() {
@@ -218,5 +517,292 @@ mod tests {
         let uval = FUTEX_WAITERS | FUTEX_OWNER_DIED | 0x0000_1234;
         assert!(futex_death_transition(uval, 0x0000_1234, false).is_some());
         assert!(futex_death_transition(uval, 0x0000_1235, false).is_none());
+    }
+
+    // ---- the walk itself --------------------------------------------------
+
+    #[test]
+    fn an_empty_list_touches_nothing() {
+        let mut guest = FakeGuest::default();
+        // A registered but empty list points `list.next` back at the head.
+        guest.head(0x1000, 0x1000, 0);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome, WalkOutcome::default());
+        assert!(guest.marks.is_empty());
+        assert!(guest.wakes.is_empty());
+    }
+
+    #[test]
+    fn one_held_mutex_with_a_waiter_is_marked_then_woken() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 1);
+        assert!(!outcome.aborted && !outcome.truncated && !outcome.next_faulted);
+        assert_eq!(
+            guest.marks,
+            vec![(
+                0x2000,
+                FUTEX_WAITERS | OWNER,
+                FUTEX_WAITERS | FUTEX_OWNER_DIED
+            )]
+        );
+        assert_eq!(
+            guest.wakes,
+            vec![(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED)]
+        );
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(FUTEX_WAITERS | FUTEX_OWNER_DIED)
+        );
+    }
+
+    #[test]
+    fn several_entries_are_marked_in_guest_pointer_order() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | OWNER);
+        guest.node(0x3020, 0x4020, OWNER);
+        guest.node(0x4020, 0x1000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 3);
+        // Order follows the guest's own pointers, which is deterministic; the
+        // uncontended entry is marked but issues no wake.
+        assert_eq!(guest.marked_words(), vec![0x2000, 0x3000, 0x4000]);
+        assert_eq!(guest.woken_words(), vec![0x2000, 0x4000]);
+    }
+
+    #[test]
+    fn entries_owned_by_another_thread_are_skipped_without_stopping_the_walk() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | 7);
+        guest.node(0x3020, 0x1000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 2);
+        assert_eq!(guest.marked_words(), vec![0x3000]);
+        assert_eq!(guest.get_u32(0x2000), Some(FUTEX_WAITERS | 7));
+    }
+
+    #[test]
+    fn a_pi_entry_is_marked_but_not_woken_during_a_walk() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2021, 0); // low bit set => PI entry
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 1);
+        assert_eq!(guest.marks.len(), 1);
+        assert!(guest.wakes.is_empty());
+    }
+
+    #[test]
+    fn the_pending_slot_is_handled_last_and_only_once() {
+        let mut guest = FakeGuest::default();
+        // `list_op_pending` also appears in the list, as it does while glibc is
+        // mid-enqueue. The kernel skips it in the loop and handles it at the end.
+        guest.head(0x1000, 0x2020, 0x3020);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | OWNER);
+        guest.node(0x3020, 0x1000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 2);
+        assert_eq!(
+            guest.marked_words(),
+            vec![0x2000, 0x3000],
+            "the pending word must be marked exactly once, after the list"
+        );
+    }
+
+    #[test]
+    fn a_pending_op_on_a_zero_word_wakes_without_marking_it_dead() {
+        let mut guest = FakeGuest::default();
+        // The owner died between releasing the futex and waking its waiter.
+        guest.head(0x1000, 0x1000, 0x3020);
+        guest.node(0x3020, 0x1000, 0);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 1);
+        assert_eq!(guest.wakes, vec![(0x3000, 0)]);
+        assert!(
+            guest.marks.is_empty(),
+            "setting FUTEX_OWNER_DIED on a free word would corrupt user-space state"
+        );
+        assert_eq!(guest.get_u32(0x3000), Some(0));
+    }
+
+    #[test]
+    fn a_zero_word_in_the_list_body_is_not_a_pending_op_wake() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, 0);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 1);
+        assert!(
+            guest.wakes.is_empty(),
+            "pending_op is false for entries reached through the list body"
+        );
+        assert!(guest.marks.is_empty());
+    }
+
+    #[test]
+    fn a_pi_pending_op_on_a_zero_word_does_not_wake() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x1000, 0x3021); // PI bit on the pending slot
+        guest.node(0x3020, 0x1000, 0);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.entries_visited, 1);
+        assert!(guest.wakes.is_empty(), "the kernel guards this on `!pi`");
+        assert!(guest.marks.is_empty());
+    }
+
+    #[test]
+    fn a_cycle_is_bounded_by_robust_list_limit() {
+        let mut guest = FakeGuest::default();
+        // Two nodes pointing at each other, never reaching the head.
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | 7);
+        guest.node(0x3020, 0x2020, FUTEX_WAITERS | 7);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.truncated);
+        assert_eq!(outcome.entries_visited, ROBUST_LIST_LIMIT);
+    }
+
+    #[test]
+    fn an_unreadable_head_aborts_before_any_effect() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.unreadable.insert(0x1000 + HEAD_FUTEX_OFFSET_OFFSET);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.head_unreadable);
+        assert_eq!(outcome.entries_visited, 0);
+        assert!(guest.marks.is_empty() && guest.wakes.is_empty());
+    }
+
+    #[test]
+    fn a_head_with_no_backing_memory_aborts() {
+        // The `execve` hazard in miniature: were a stale head ever consulted in
+        // a brand new address space, it reads as nothing and the walk must touch
+        // nothing. `ThreadState::take_robust_list_for_exec` is what stops the
+        // stale head from being consulted at all.
+        let mut guest = FakeGuest::default();
+
+        let outcome = walk(&mut guest, 0x7fff_0000, OWNER);
+
+        assert!(outcome.head_unreadable);
+        assert!(guest.marks.is_empty() && guest.wakes.is_empty());
+    }
+
+    #[test]
+    fn a_misaligned_futex_word_is_refused_and_aborts_the_walk() {
+        let mut guest = FakeGuest::default();
+        // futex_offset -31 puts the word at 0x2001, which Linux rejects before
+        // reading it. The later entry must not be reached.
+        guest.put_u64(0x1000 + HEAD_LIST_OFFSET, 0x2020);
+        guest.put_u64(0x1000 + HEAD_FUTEX_OFFSET_OFFSET, (-31i64) as u64);
+        guest.put_u64(0x1000 + HEAD_LIST_OP_PENDING_OFFSET, 0);
+        guest.put_u64(0x2020, 0x3020);
+        guest.put_u32(0x2001, FUTEX_WAITERS | OWNER);
+        guest.put_u64(0x3020, 0x1000);
+        guest.put_u32(0x3001, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.aborted);
+        assert_eq!(outcome.entries_visited, 1);
+        assert!(
+            guest.marks.is_empty() && guest.wakes.is_empty(),
+            "an unaligned word must not be read-modify-written"
+        );
+    }
+
+    #[test]
+    fn a_faulting_futex_word_aborts_the_rest_of_the_walk() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | OWNER);
+        guest.node(0x3020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.unreadable.insert(0x2000);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.aborted);
+        assert_eq!(outcome.entries_visited, 1);
+        assert!(
+            guest.marks.is_empty() && guest.wakes.is_empty(),
+            "Linux returns from the whole walk; it does not continue fail-open"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_futex_word_aborts_the_rest_of_the_walk() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | OWNER);
+        guest.node(0x3020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.unwritable.insert(0x2000);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.aborted);
+        assert!(guest.marks.is_empty());
+        assert!(guest.wakes.is_empty());
+        assert_eq!(guest.get_u32(0x3000), Some(FUTEX_WAITERS | OWNER));
+    }
+
+    #[test]
+    fn an_abort_also_skips_the_pending_slot() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0x4020);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.node(0x4020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.unreadable.insert(0x2000);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.aborted);
+        assert!(
+            guest.wakes.is_empty() && guest.marks.is_empty(),
+            "Linux's bare `return` skips the trailing pending handling too"
+        );
+    }
+
+    #[test]
+    fn a_faulting_next_pointer_still_handles_the_current_entry() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x3020, FUTEX_WAITERS | OWNER);
+        guest.unreadable.insert(0x2020);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(outcome.next_faulted);
+        assert_eq!(outcome.entries_visited, 1);
+        assert_eq!(
+            guest.marked_words(),
+            vec![0x2000],
+            "the kernel checks fetch_robust_entry's rc only after handling the entry"
+        );
     }
 }
