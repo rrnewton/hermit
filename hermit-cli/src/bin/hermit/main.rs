@@ -338,17 +338,22 @@ fn main() {
     // the same disposition the guest had. That makes Hermit's wait status
     // ambiguous in exactly one direction a consumer cares about: a run whose
     // guest died of SIGSEGV and a run where HERMIT died of SIGSEGV both exit
-    // 139, and the `--verify-json` verdict is already written and green by then
-    // (measured: the verdict is published ~28% of a run's wall time before the
-    // process ends). A consumer that accepts a non-zero Hermit exit therefore
-    // cannot distinguish them from the wait status or from the verdict as it
-    // stood a moment ago.
+    // 139. A consumer that accepts a non-zero Hermit exit therefore cannot
+    // distinguish them, and the `--verify-json` verdict cannot help it: every
+    // field in the verdict describes the GUEST.
     //
     // Recording the intent here -- one atomic rename before the `raise` -- is
     // what makes the two distinguishable. A Hermit-side death leaves the field
     // absent, which the consumer reads as a refusal. Failure to stamp is
     // deliberately not fatal: the absent field already means refusal, and
     // aborting here would replace a clean guest result with a Hermit error.
+    //
+    // Measured on this binary, the binding is not merely untested but hard to
+    // defeat: Hermit CATCHES SIGSEGV (`SigCgt: 0000000000000440`, i.e. SIGBUS
+    // and SIGSEGV -- the Rust runtime's stack-guard handler), so an externally
+    // delivered SIGSEGV does not terminate it at all, and every external signal
+    // that does (ABRT 134, KILL 137, TERM 143) yields both a non-139 status and
+    // an unstamped `no_result`, refused on either count.
     if let Some(path) = command.verification_json_path() {
         match status {
             ExitStatus::Signaled(signal, _) => {

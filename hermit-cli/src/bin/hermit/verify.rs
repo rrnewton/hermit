@@ -464,10 +464,16 @@ pub struct VerificationReport {
     /// Every other field here describes the GUEST, and a consumer that accepts a
     /// non-zero Hermit exit needs one more fact: that Hermit exited that way ON
     /// PURPOSE. `139` is the same number for a guest killed by SIGSEGV *and for
-    /// Hermit itself dying of SIGSEGV*, and the whole record above is already
-    /// written and green by the time Hermit re-raises -- measured at ~28% of a
-    /// run's wall time. So a Hermit crash in that window would leave a record
-    /// that looks exactly like a clean, deterministic, guest-crashing run.
+    /// Hermit itself dying of SIGSEGV*, so for such a consumer the invocation's
+    /// wait status is unbound: nothing in the record, which is published before
+    /// Hermit ends and describes only the guest, attests Hermit's own
+    /// disposition.
+    ///
+    /// (The gap between publishing the verdict and exiting is NOT the exposure,
+    /// and an earlier revision of this comment was wrong to imply it was: the
+    /// process spends that tail in state `S` on every 2ms sample, executing
+    /// nothing, before and after this change alike. The exposure is the
+    /// ambiguous number, not a window.)
     ///
     /// `Some("reraise-guest-signal:11")` / `Some("exit-guest-code:7")` is Hermit
     /// declaring the intent one instruction before acting on it, which is what

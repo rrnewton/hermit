@@ -2091,15 +2091,13 @@ function assert_bitwise_parity_verdict {
             return 1
             ;;
     esac
-    # Everything checked so far describes the GUEST, and the whole record is
-    # already written and green well before Hermit itself ends (~28% of a run's
-    # wall time). A declaring cell accepts a non-zero Hermit exit, so the wait
-    # status cannot tell "Hermit re-raised the guest's SIGSEGV" from "Hermit
-    # segfaulted after publishing a clean verdict" -- both are 139. Hermit
-    # records the intent one atomic rename before acting on it; absence means it
-    # never got to, so absence is a refusal. Only a declaring cell needs this:
-    # an exit-0 cell is still bound by its status check, which a Hermit crash
-    # breaks all by itself.
+    # Everything checked so far describes the GUEST. A declaring cell accepts a
+    # non-zero Hermit exit, so its wait status is unbound: 139 is the same
+    # number for "Hermit re-raised the guest's SIGSEGV" and "Hermit itself died
+    # of SIGSEGV". Hermit records the intent one atomic rename before acting on
+    # it; absence means it never got to, so absence is a refusal. Only a
+    # declaring cell needs this -- an exit-0 cell is still bound by its status
+    # check, which any Hermit crash breaks all by itself.
     if [[ -n ${action:-} ]]; then
         if [[ $(jq -r --arg want "$action" '(.terminating_action // null) == $want' "$verdict") != true ]]; then
             printf 'verify did not record Hermit terminating deliberately as %s (got %s): %s\n' \
