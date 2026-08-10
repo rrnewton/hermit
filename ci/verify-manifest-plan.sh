@@ -27,8 +27,17 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # hashed recursively; `target` directories are pruned so a generated tree can
 # never make every consumer look stale (which would silently restore the Cargo
 # build-lock stall this whole mechanism exists to remove).
+#
+# ci/matrix-symmetry-baseline.json is here because main() calls
+# validate_front_door() on EVERY format including harness-json: a drifted
+# baseline makes the producer die, so a document published before that drift is
+# not merely old, it is wrong. rust-toolchain.toml pins the compiler that built
+# the producer. Cargo.lock covers the dependency closure; the producer has no
+# path dependencies, so no other crate's sources can change its behavior.
+# audit_manifest_plan_cargo_independence re-derives this list from the
+# producer's own declared path constants and fails if one is missing.
 readonly -a MANIFEST_PLAN_INPUT_DIRS=(tests/e2e/manifests ci/manifest-plan)
-readonly -a MANIFEST_PLAN_INPUT_FILES=(Cargo.lock)
+readonly -a MANIFEST_PLAN_INPUT_FILES=(Cargo.lock rust-toolchain.toml ci/matrix-symmetry-baseline.json)
 
 function fail {
     local code=$1
