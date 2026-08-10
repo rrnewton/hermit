@@ -642,6 +642,7 @@ fn self_test() -> Result<(), String> {
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
+        validate_plan::node_accounting_self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
     ] {
@@ -1742,6 +1743,39 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .map(|s| s.tag())
         .filter(|t| t.starts_with("test.") || t.contains(":test."))
         .collect()
+}
+
+fn planned_node_tags(plan: &Plan) -> Vec<String> {
+    plan.cfg.steps.iter()
+        .chain(plan.second.iter().flat_map(|cfg| cfg.steps.iter()))
+        .map(|step| step.tag())
+        .collect()
+}
+
+fn print_node_accounting(accounting: &validate_plan::NodeAccounting) {
+    println!(
+        "node accounting: {} executed + {} skipped + {} unaccounted = {} planned{}",
+        accounting.executed, accounting.skipped.len(), accounting.unaccounted.len(),
+        accounting.planned,
+        if accounting.identity_holds() { "" } else { " — IDENTITY ERROR" }
+    );
+    let mut skipped_by_reason: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for node in &accounting.skipped {
+        skipped_by_reason.entry(&node.reason).or_default().push(&node.tag);
+    }
+    for (reason, tags) in skipped_by_reason {
+        println!("skipped ({reason}): {}", tags.join(", "));
+    }
+    let mut unaccounted_by_reason: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for node in &accounting.unaccounted {
+        unaccounted_by_reason.entry(&node.reason).or_default().push(&node.tag);
+    }
+    for (reason, tags) in unaccounted_by_reason {
+        println!("unaccounted ({reason}): {}", tags.join(", "));
+    }
+    for error in &accounting.errors {
+        eprintln!("validate: NODE ACCOUNTING ERROR: {error}");
+    }
 }
 
 /// Build the execution plan for the selected level/mode.
@@ -3260,7 +3294,7 @@ fn libtest_counts(parent: Option<&Path>, log: &Path) -> (Option<i64>, Option<i64
 fn write_ledger(
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
-    skipped: &[String],
+    accounting: &validate_plan::NodeAccounting,
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
@@ -3283,7 +3317,7 @@ fn write_ledger(
     // append-only and safe to union across machines.
     let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
     let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run)
+        serde_json::json!(accounting.planned)
     } else {
         serde_json::Value::Null
     };
@@ -3299,6 +3333,12 @@ fn write_ledger(
                 "real_seconds": o.duration_s,
             })
         })
+        .collect();
+    let skipped_node_details: Vec<serde_json::Value> = accounting.skipped.iter()
+        .map(|node| serde_json::json!({"name": node.tag, "reason": node.reason}))
+        .collect();
+    let unaccounted_nodes: Vec<serde_json::Value> = accounting.unaccounted.iter()
+        .map(|node| serde_json::json!({"name": node.tag, "reason": node.reason}))
         .collect();
     let record = serde_json::json!({
         "schema_version": ledger_schema,
@@ -3362,7 +3402,13 @@ fn write_ledger(
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
-        "skipped_nodes": skipped.len(),
+        "planned_nodes": accounting.planned,
+        "skipped_nodes": accounting.skipped.len(),
+        "skipped_node_details": skipped_node_details,
+        "unaccounted_node_count": accounting.unaccounted.len(),
+        "unaccounted_nodes": unaccounted_nodes,
+        "node_accounting_complete": accounting.is_complete(),
+        "node_accounting_errors": accounting.errors,
         // A timeout is a RESULT, so it is recorded rather than dropped, and it is
         // named so a reader can separate "the tree is broken" from "a gate blew
         // its budget". Operator interrupts never reach this function at all.
@@ -3587,6 +3633,7 @@ struct RunSummary {
     nodes_executed: usize,
     nodes_failed: usize,
     nodes_skipped: usize,
+    node_accounting: Option<validate_plan::NodeAccounting>,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -3611,6 +3658,7 @@ impl RunSummary {
             nodes_executed: 0,
             nodes_failed: 0,
             nodes_skipped: 0,
+            node_accounting: None,
             wall_s: None,
             jobs: None,
             log: None,
@@ -3649,16 +3697,31 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
     // rather than an absent line a reader has to interpret.
-    match s.wall_s {
-        Some(wall) => println!(
-            "   nodes: {} executed, {} failed, {} skipped in {}{}",
-            s.nodes_executed,
-            s.nodes_failed,
-            s.nodes_skipped,
-            human_duration(wall),
+    match (s.wall_s, &s.node_accounting) {
+        (Some(wall), Some(accounting)) => {
+            println!(
+                "   nodes: {} executed ({} failed) + {} skipped + {} unaccounted = {} planned in {}{}",
+                s.nodes_executed, s.nodes_failed, s.nodes_skipped,
+                accounting.unaccounted.len(), accounting.planned, human_duration(wall),
+                s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
+            );
+            let mut by_reason: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for node in &accounting.unaccounted {
+                by_reason.entry(&node.reason).or_default().push(&node.tag);
+            }
+            for (reason, tags) in by_reason {
+                println!("   unaccounted ({reason}): {}", tags.join(", "));
+            }
+            for error in &accounting.errors {
+                println!("   NODE ACCOUNTING ERROR: {error}");
+            }
+        }
+        (Some(wall), None) => println!(
+            "   nodes: {} executed ({} failed), {} skipped in {}{}",
+            s.nodes_executed, s.nodes_failed, s.nodes_skipped, human_duration(wall),
             s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
         ),
-        None => println!("   nodes: none executed (stopped before the DAG ran)"),
+        (None, _) => println!("   nodes: none executed (stopped before the DAG ran)"),
     }
     match &s.log {
         Some(p) => println!("   durable log: {}", p.display()),
@@ -4205,7 +4268,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let started_at = utc_now();
     let started_epoch = epoch_now();
     let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
+    let planned_nodes = planned_node_tags(&plan);
+    let node_count = planned_nodes.len();
 
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
     println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
@@ -4235,6 +4299,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut explicit_unaccounted: Vec<validate_plan::UnaccountedNode> = Vec::new();
     let mut ok = true;
     let mut env_retries = 0usize;
 
@@ -4257,11 +4322,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             env_retries += r2.env_retries;
         } else {
             eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
+            explicit_unaccounted.extend(second.steps.iter().map(|step| {
+                validate_plan::UnaccountedNode {
+                    tag: step.tag(),
+                    reason: "second lane not dispatched after first-lane failure".to_string(),
+                }
+            }));
         }
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
     print_cost_table(&outcomes, &skipped);
+    let accounting = validate_plan::reconcile_node_accounting(
+        planned_nodes,
+        outcomes.iter().map(|outcome| outcome.tag.clone()),
+        skipped.iter().cloned(),
+        explicit_unaccounted,
+        "runner returned no terminal state after lane execution",
+    );
+    print_node_accounting(&accounting);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -4363,7 +4442,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             write_ledger(
                 &ctx,
                 &outcomes,
-                &skipped,
+                &accounting,
                 wall,
                 130,
                 &log_path.to_string_lossy(),
@@ -4387,6 +4466,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
         s.nodes_skipped = skipped.len();
+        s.node_accounting = Some(accounting.clone());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -4505,6 +4585,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
+    if !accounting.is_complete() {
+        eprintln!(
+            "validate: ERROR: node accounting is incomplete: {} executed + {} skipped + {} \
+             unaccounted = {} planned ({} structural accounting error(s)).",
+            accounting.executed, accounting.skipped.len(), accounting.unaccounted.len(),
+            accounting.planned, accounting.errors.len(),
+        );
+        exit_code = 1;
+    }
 
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
@@ -4546,7 +4635,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         write_ledger(
             &ctx,
             &outcomes,
-            &skipped,
+            &accounting,
             wall,
             exit_code,
             &log_path.to_string_lossy(),
@@ -4627,6 +4716,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
     }
+    if !accounting.unaccounted.is_empty() {
+        detail.push(format!(
+            "{} planned node(s) were explicitly UNACCOUNTED and the verdict was forced RED; \
+             names and reasons follow in the node-accounting summary",
+            accounting.unaccounted.len()
+        ));
+    }
+    if !accounting.errors.is_empty() {
+        detail.push(format!(
+            "{} structural node-accounting error(s) broke the planned-state identity",
+            accounting.errors.len()
+        ));
+    }
     for why in &refusals {
         detail.push(format!("REFUSED ON COMPLETENESS: {why}"));
     }
@@ -4664,6 +4766,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
     s.nodes_skipped = skipped.len();
+    s.node_accounting = Some(accounting);
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
@@ -4768,7 +4871,16 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    let fixture_tags: Vec<String> = outcomes.iter().map(|outcome| outcome.tag.clone()).collect();
+    let fixture_accounting = validate_plan::reconcile_node_accounting(
+        fixture_tags.clone(), fixture_tags, Vec::<String>::new(),
+        Vec::<validate_plan::UnaccountedNode>::new(),
+        "stop fixture returned no terminal state",
+    );
+    write_ledger(
+        &ctx, &outcomes, &fixture_accounting, wall, exit_code, "", false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
@@ -4800,6 +4912,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     );
     s.nodes_executed = outcomes.len();
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
+    s.nodes_skipped = fixture_accounting.skipped.len();
+    s.node_accounting = Some(fixture_accounting);
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
     s.ledger = Some(ledger);

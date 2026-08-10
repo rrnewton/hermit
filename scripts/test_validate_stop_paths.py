@@ -112,6 +112,17 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    # The stop fixture plans exactly the two synthetic gates it reports. This
+    # brackets the ledger side of node accounting: no terminal state may vanish
+    # between the summary and the durable row.
+    assert row["planned_nodes"] == 2, row
+    assert row["executed_nodes"] == 2, row
+    assert row["skipped_nodes"] == 0, row
+    assert row["skipped_node_details"] == [], row
+    assert row["unaccounted_node_count"] == 0, row
+    assert row["unaccounted_nodes"] == [], row
+    assert row["node_accounting_complete"] is True, row
+    assert row["node_accounting_errors"] == [], row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row
