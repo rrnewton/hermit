@@ -71,6 +71,35 @@ function die {
     exit 2
 }
 
+# Run one audit probe without letting errexit discard its captured diagnostics.
+# An unexpected status is still fatal: report the named probe and its complete
+# combined output first, then return the child's status for `set -e` to unwind.
+function run_captured_audit_probe {
+    local probe_name=$1 output_var=$2 expected_status=$3
+    shift 3
+    local output status
+
+    if output=$("$@" 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    printf -v "$output_var" '%s' "$output"
+
+    if ((status != expected_status)); then
+        printf 'test_harness.sh: probe %s returned exit %d; expected %d\n' \
+            "$probe_name" "$status" "$expected_status" >&2
+        if [[ -n $output ]]; then
+            printf '%s\n' "$output" >&2
+        fi
+        # An unexpected success must also fail closed.
+        if ((status == 0)); then
+            return 2
+        fi
+        return "$status"
+    fi
+}
+
 function require_executable_hermit {
     local path=$1
     [[ -x $path ]] || die "Hermit binary is not executable: $path"
@@ -1208,8 +1237,9 @@ function audit_ci_correspondence {
     (
         local scratch fake_runner privileged_env privileged_node_env name
         local budget_probe budget_tuple clamp_boundaries cpu_boundaries
-        local hosted_wrapper_log boxed_wrapper_log wrong_pin_log wrong_pin_status
-        local configured_jobs fixture wrong_pin
+        local hosted_wrapper_log boxed_wrapper_log wrong_pin_log
+        local configured_jobs fixture wrong_pin probe_success probe_panic
+        local probe_control_log probe_failure_log probe_failure_status
         local -a clean_budget_env budget_names planted_budget_env
         scratch=$(mktemp -d)
         trap 'rm -rf -- "$scratch"' EXIT
@@ -1311,16 +1341,42 @@ function audit_ci_correspondence {
         [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
             die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
 
-        hosted_wrapper_log=$(
-            PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                CARGO_BUILD_JOBS=8 "$budget_wrapper" true 2>&1
-        )
+        probe_success="$scratch/probe-success"
+        probe_panic="$scratch/probe-panic"
+        printf '#!/usr/bin/env bash\nprintf "probe-success-output\\n" >&2\n' >"$probe_success"
+        printf '#!/usr/bin/env bash\nprintf "probe-panic-stderr\\n" >&2\nexit 101\n' >"$probe_panic"
+        chmod 755 "$probe_success" "$probe_panic"
+        run_captured_audit_probe \
+            'Reverie-pin diagnostic success control' probe_control_log 0 "$probe_success"
+        [[ $probe_control_log == 'probe-success-output' ]] ||
+            die "captured-probe success control lost output: $probe_control_log"
+        if probe_failure_log=$(
+            run_captured_audit_probe \
+                'Reverie-pin diagnostic panic mutation' ignored_probe_log 0 "$probe_panic" 2>&1
+        ); then
+            die "captured-probe panic mutation was accepted"
+        else
+            probe_failure_status=$?
+        fi
+        [[ $probe_failure_status == 101 ]] ||
+            die "captured-probe panic mutation returned $probe_failure_status instead of 101"
+        [[ $(grep -Fxc \
+            'test_harness.sh: probe Reverie-pin diagnostic panic mutation returned exit 101; expected 0' \
+            <<<"$probe_failure_log") == 1 ]] ||
+            die "captured-probe panic mutation lost its exact named diagnostic: $probe_failure_log"
+        [[ $(grep -Fxc 'probe-panic-stderr' <<<"$probe_failure_log") == 1 ]] ||
+            die "captured-probe panic mutation lost its exact stderr: $probe_failure_log"
+
+        run_captured_audit_probe \
+            'hosted Reverie-pin budget wrapper' hosted_wrapper_log 0 \
+            env PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
+                CARGO_BUILD_JOBS=8 "$budget_wrapper" true
         [[ $hosted_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
-        boxed_wrapper_log=$(
-            PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true 2>&1
-        )
+        run_captured_audit_probe \
+            'boxed Reverie-pin budget wrapper' boxed_wrapper_log 0 \
+            env PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
+                SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true
         [[ $boxed_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
@@ -1357,16 +1413,10 @@ function audit_ci_correspondence {
             "$wrong_pin" >"$fixture/Cargo.toml"
         git -C "$fixture" init -q
         git -C "$fixture" add Cargo.toml ci scripts
-        if wrong_pin_log=$(
-            PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
-                "$fixture/ci/run-with-reverie-dbt-budget.sh" true 2>&1
-        ); then
-            wrong_pin_status=0
-        else
-            wrong_pin_status=$?
-        fi
-        [[ $wrong_pin_status == 2 ]] ||
-            die "uncalibrated Reverie pin returned $wrong_pin_status instead of 2: $wrong_pin_log"
+        run_captured_audit_probe \
+            'uncalibrated Reverie-pin refusal fixture' wrong_pin_log 2 \
+            env PATH="$scratch/nproc-4:$PATH" CARGO_BUILD_JOBS=8 \
+                "$fixture/ci/run-with-reverie-dbt-budget.sh" true
         [[ $wrong_pin_log == *"no calibrated budget for Reverie pin $wrong_pin"* ]] ||
             die "uncalibrated Reverie pin refusal lost its binding: $wrong_pin_log"
 
