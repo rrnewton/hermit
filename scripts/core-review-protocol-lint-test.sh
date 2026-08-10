@@ -118,14 +118,19 @@ comments_json() {
 pass=0
 fail=0
 
-# run_case NAME EXPECTED LABELS BODY IS_KVM COMMENTS_JSON REVIEWS_JSON DIFF
+# run_case NAME EXPECTED LABELS BODY IS_KVM COMMENTS_JSON REVIEWS_JSON DIFF [COMMIT_MESSAGE]
 run_case() {
     local name=$1 expected=$2 labels=$3 pr_body=$4 is_kvm=$5 comments=$6 reviews=$7 diff=$8
+    local commit_message=${9:-}
     local actual=0
     printf '%s\n' "$comments" >"$tmp/comments.json"
     printf '%s\n' "$reviews" >"$tmp/reviews.json"
     printf '%s\n' "$diff" >"$tmp/pr.diff"
-    printf '%s\n\n[impl agent, CODEX] [author-agent, testbox]\n' "Test candidate" >"$tmp/commit-message"
+    if [[ -n $commit_message ]]; then
+        printf '%s\n' "$commit_message" >"$tmp/commit-message"
+    else
+        printf '%s\n\n[impl agent, CODEX] [author-agent, testbox]\n' "Test candidate" >"$tmp/commit-message"
+    fi
     PR_LABELS="$labels" PR_BODY="$pr_body" PR_IS_KVM="$is_kvm" PR_NUMBER=test \
         PR_HEAD_SHA="$HEAD_SHA" PR_AUTHOR_LOGIN="$AUTHOR_LOGIN" OWNER_LOGIN="$TEST_OWNER_LOGIN" \
         PR_COMMENTS_FILE="$tmp/comments.json" PR_REVIEWS_FILE="$tmp/reviews.json" \
@@ -153,6 +158,8 @@ run_case "unlabeled PR without review blocks" 1 "" "$FULL_BODY" false "$empty" "
 run_case "ordinary PR with independent exact-head review passes" 0 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"
 run_case "formal exact-head approval satisfies mandatory review" 0 "" "$FULL_BODY" false "$empty" "$formal_codex" "$ORDINARY_DIFF"
 run_case "untrusted commenter cannot manufacture approval" 1 "" "$FULL_BODY" false "$unauthorized_codex" "$empty" "$ORDINARY_DIFF"
+run_case "malformed exact-head author trailer blocks" 1 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
+    'Test candidate\n\n[impl agent, CODEX] [author-agent, testbox]'
 run_case "self-review does not satisfy independence" 1 "" "$FULL_BODY" false "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "stale-head review does not count" 1 "" "$FULL_BODY" false "$(comments_json "$STALE_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "request-changes verdict does not authorize landing" 1 "" "$FULL_BODY" false "$(comments_json "$BLOCK_REVIEW")" "$empty" "$ORDINARY_DIFF"
