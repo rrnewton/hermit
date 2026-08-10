@@ -221,10 +221,10 @@ def run_mode_activation_contract() -> None:
         assert len(ledger_rows(ledger)) == 1, output
         assert "stop-path fixture" in output, output
 
-    # Negative: a present variable with value 0, and a present-but-empty
-    # variable, must both follow the ordinary inert plan path. Poisoned stop
-    # controls remain set so accidental presence/truthiness activation would
-    # enter the seam and write a fixture row instead.
+    # Negative integration bracket for the root seam: a present variable with
+    # value 0, and a present-but-empty variable, must both follow the ordinary
+    # inert plan path. The Rust --self-test directly brackets the ledger tool
+    # and root resolvers because --show-plan deliberately never calls them.
     for mode, label in (("0", "zero"), ("", "empty")):
         with tempfile.TemporaryDirectory(prefix=f"validate-stop-mode-{label}-") as tmp:
             tmpdir = Path(tmp)

@@ -655,6 +655,7 @@ fn self_test() -> Result<(), String> {
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
     coverage_schema_bracket()?;
+    ledger_path_resolution_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -897,6 +898,53 @@ fn coverage_schema_bracket() -> Result<(), String> {
     println!(
         "  coverage schema: 1/1 real judgement -> schema 5; 4/4 unresolved shapes -> schema 5/null"
     );
+    Ok(())
+}
+
+/// Exercise the exact pure resolver used by the production ledger tool/root
+/// accessors. Poisoned fixture overrides must be authoritative only for the
+/// exact mode value `1`; a merely present `0` or empty value must resolve both
+/// paths from HOME.
+fn ledger_path_resolution_bracket() -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    let fixture_tool = OsStr::new("/poison/fixture/validate_rows.py");
+    let fixture_root = OsStr::new("/poison/fixture/root");
+    let home = OsStr::new("/normal/home");
+    let fixture = resolve_ledger_paths(
+        Some(OsStr::new("1")),
+        Some(fixture_tool),
+        Some(fixture_root),
+        Some(home),
+    );
+    let expected_fixture = LedgerPaths {
+        tool: PathBuf::from(fixture_tool),
+        root: PathBuf::from(fixture_root).join("ledger"),
+    };
+    if fixture != expected_fixture {
+        return Err(format!(
+            "ledger seam: MODE=1 must select both fixture overrides, got {fixture:?}"
+        ));
+    }
+
+    let expected_normal = LedgerPaths {
+        tool: PathBuf::from(home).join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
+        root: PathBuf::from(home).join("work/dev-hermit/ledger"),
+    };
+    for mode in ["0", ""] {
+        let resolved = resolve_ledger_paths(
+            Some(OsStr::new(mode)),
+            Some(fixture_tool),
+            Some(fixture_root),
+            Some(home),
+        );
+        if resolved != expected_normal {
+            return Err(format!(
+                "ledger seam: MODE={mode:?} must ignore poisoned overrides, got {resolved:?}"
+            ));
+        }
+    }
+    println!("  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty selected HOME tool+root");
     Ok(())
 }
 
@@ -3090,7 +3138,7 @@ fn canonical_validate_lock_admission(
     ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
     }
-    let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
+    let status = if stop_test_mode_enabled() {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
             return false;
         };
@@ -3388,28 +3436,57 @@ fn short_hostname() -> String {
 /// Every Hermit checkout for this account writes the same per-machine file;
 /// ci-hub is the only component that unions it with other machines and the
 /// published append-only shards.
-fn ledger_tool_path() -> PathBuf {
-    if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
-        if let Some(path) = std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL") {
-            return PathBuf::from(path);
+#[derive(Debug, Eq, PartialEq)]
+struct LedgerPaths {
+    tool: PathBuf,
+    root: PathBuf,
+}
+
+fn stop_test_mode_active(mode: Option<&std::ffi::OsStr>) -> bool {
+    mode == Some(std::ffi::OsStr::new("1"))
+}
+
+fn stop_test_mode_enabled() -> bool {
+    stop_test_mode_active(std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").as_deref())
+}
+
+fn resolve_ledger_paths(
+    mode: Option<&std::ffi::OsStr>,
+    fixture_tool: Option<&std::ffi::OsStr>,
+    fixture_root: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> LedgerPaths {
+    let home = home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/nonexistent-home"));
+    let mut resolved = LedgerPaths {
+        tool: home.join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
+        root: home.join("work/dev-hermit/ledger"),
+    };
+    if stop_test_mode_active(mode) {
+        if let Some(path) = fixture_tool {
+            resolved.tool = PathBuf::from(path);
+        }
+        if let Some(path) = fixture_root {
+            resolved.root = PathBuf::from(path).join("ledger");
         }
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
-        .join("work/dev-hermit/ci-hub/ledger/validate_rows.py")
+    resolved
+}
+
+fn ledger_paths_from_env() -> LedgerPaths {
+    resolve_ledger_paths(
+        std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").as_deref(),
+        std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL").as_deref(),
+        std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn ledger_tool_path() -> PathBuf {
+    ledger_paths_from_env().tool
 }
 
 fn canonical_ledger_root() -> PathBuf {
-    if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
-        if let Some(root) = std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT") {
-            return PathBuf::from(root).join("ledger");
-        }
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/nonexistent-home"))
-        .join("work/dev-hermit/ledger")
+    ledger_paths_from_env().root
 }
 
 fn canonical_ledger_rows() -> Vec<serde_json::Value> {
