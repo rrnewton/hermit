@@ -2567,12 +2567,14 @@ fn compat_disposition(
     mode: CompatMode,
     label: &str,
     ok: bool,
-    known_reason: Option<&str>,
-    diagnostic_reason: Option<&str>,
+    known: &BTreeMap<&str, &str>,
+    diagnostic: &BTreeMap<&str, &str>,
 ) -> CompatDisposition {
-    let strict_known = matches!(mode, CompatMode::Strict | CompatMode::PortableStrict)
-        .then_some(known_reason)
-        .flatten();
+    let strict_known = if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+        known.get(label).copied()
+    } else {
+        None
+    };
     if ok {
         return CompatDisposition {
             blocking: false,
@@ -2593,7 +2595,7 @@ fn compat_disposition(
         };
     }
     if mode == CompatMode::PortableStrict {
-        if let Some(reason) = diagnostic_reason {
+        if let Some(reason) = diagnostic.get(label).copied() {
             return CompatDisposition {
                 blocking: false,
                 warning: Some(format!("{label} is a bounded portable diagnostic: {reason}")),
@@ -2606,12 +2608,17 @@ fn compat_disposition(
 /// Two-sided bracket for the known-failclosed consumer, plus a blocking control.
 fn compat_known_failclosed_bracket() -> Result<(), String> {
     let reason = "planted known-failclosed expectation";
+    let known = BTreeMap::from([
+        ("planted-known-failure", reason),
+        ("planted-stale-expectation", reason),
+    ]);
+    let diagnostic = BTreeMap::new();
     let expected = compat_disposition(
         CompatMode::PortableStrict,
         "planted-known-failure",
         false,
-        Some(reason),
-        None,
+        &known,
+        &diagnostic,
     );
     if expected.blocking
         || !expected
@@ -2629,8 +2636,8 @@ fn compat_known_failclosed_bracket() -> Result<(), String> {
         CompatMode::PortableStrict,
         "planted-stale-expectation",
         true,
-        Some(reason),
-        None,
+        &known,
+        &diagnostic,
     );
     if stale.blocking
         || !stale
@@ -2647,17 +2654,73 @@ fn compat_known_failclosed_bracket() -> Result<(), String> {
         CompatMode::PortableStrict,
         "planted-unlisted-failure",
         false,
-        None,
-        None,
+        &known,
+        &diagnostic,
     );
     if !control.blocking || control.warning.is_some() {
         return Err(format!(
             "known-failclosed bracket: unlisted failure must remain blocking: {control:?}"
         ));
     }
+
+    // The defect this bracket exists for lived on the MODE axis, so discriminate
+    // there. Exercising only one strict mode leaves the sibling mode free to
+    // regress the same way, and leaves the exemption free to spread to modes
+    // that were never meant to inherit it.
+    let sibling_strict =
+        compat_disposition(CompatMode::Strict, "planted-known-failure", false, &known, &diagnostic);
+    if sibling_strict.blocking || sibling_strict.warning.is_none() {
+        return Err(format!(
+            "known-failclosed bracket: strict mode stopped honoring the table: {sibling_strict:?}"
+        ));
+    }
+
+    let non_strict =
+        compat_disposition(CompatMode::Sabre, "planted-known-failure", false, &known, &diagnostic);
+    if !non_strict.blocking || non_strict.warning.is_some() {
+        return Err(format!(
+            "known-failclosed bracket: a non-strict mode inherited the strict exemption, which \
+             would silently unblock its failures: {non_strict:?}"
+        ));
+    }
+
+    // The bounded portable diagnostic shares this predicate now, so bracket its
+    // exemption too, including the negative that it stays portable-only.
+    let empty = BTreeMap::new();
+    let diagnostic_only = BTreeMap::from([("planted-diagnostic", "planted bounded diagnostic")]);
+    let bounded = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-diagnostic",
+        false,
+        &empty,
+        &diagnostic_only,
+    );
+    if bounded.blocking
+        || !bounded.warning.as_deref().is_some_and(|w| w.contains("bounded portable diagnostic"))
+    {
+        return Err(format!(
+            "known-failclosed bracket: bounded portable diagnostic was not announced and \
+             nonblocking: {bounded:?}"
+        ));
+    }
+    let bounded_elsewhere = compat_disposition(
+        CompatMode::Strict,
+        "planted-diagnostic",
+        false,
+        &empty,
+        &diagnostic_only,
+    );
+    if !bounded_elsewhere.blocking || bounded_elsewhere.warning.is_some() {
+        return Err(format!(
+            "known-failclosed bracket: the portable diagnostic exemption leaked outside \
+             PortableStrict: {bounded_elsewhere:?}"
+        ));
+    }
+
     println!(
         "  known-failclosed: 1 expected failure nonblocking + warned; 1 unexpected pass warned; \
-         1 unlisted failure blocking"
+         1 unlisted failure blocking; mode axis 1 sibling-strict honored / 1 non-strict refused; \
+         diagnostic 1 portable-exempt / 1 refused outside portable"
     );
     Ok(())
 }
@@ -2683,8 +2746,8 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             mode,
             label,
             o.ok,
-            known.get(label).copied(),
-            diag.get(label).copied(),
+            &known,
+            &diag,
         );
         if let Some(warning) = disposition.warning {
             println!("  WARN {warning}");
