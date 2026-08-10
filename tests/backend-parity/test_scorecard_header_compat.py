@@ -210,6 +210,57 @@ check(
 )
 check("divergent producer consumed 1 reference + 1 candidate run", not remaining, repr(remaining))
 
+
+def run_dynamic_producer(reference_stdout: bytes, candidate_stdout: bytes):
+    """Exercise a marker-only case whose output is not fixed by the catalog."""
+    responses = [
+        run_matrix.subprocess.CompletedProcess([], 0, reference_stdout, b""),
+        *(
+            run_matrix.subprocess.CompletedProcess([], 0, candidate_stdout, b"")
+            for _ in range(run_matrix.RUNS)
+        ),
+    ]
+    original = run_matrix.run_with_timeout
+
+    def planted_run(_command):
+        return responses.pop(0)
+
+    evidence: dict[str, str] = {}
+    try:
+        run_matrix.run_with_timeout = planted_run
+        result = run_matrix.run_case(
+            Path("/planted/hermit"),
+            "dbt",
+            "virtual_pid",
+            run_matrix.CatalogFixtures(),
+            strict=True,
+            evidence=evidence,
+            capture_stdout_parity=True,
+        )
+    finally:
+        run_matrix.run_with_timeout = original
+    return result, evidence, responses
+
+
+result, dynamic_diff, remaining = run_dynamic_producer(b"pid=111\n", b"pid=222\n")
+check(
+    "dynamic-output divergence is RED even when all candidate runs are stable",
+    result[0] == "FAIL"
+    and result[1] == "run 1 stdout differed from ptrace reference",
+    repr(result),
+)
+check(
+    "dynamic-output divergence emits unequal operands and parity=0",
+    dynamic_diff.get("stdout_parity") == "0"
+    and dynamic_diff.get("output_hash") != dynamic_diff.get("ref_output_hash"),
+    repr(dynamic_diff),
+)
+check(
+    "dynamic-output divergence stops after 1 reference + 1 candidate run",
+    len(remaining) == run_matrix.RUNS - 1,
+    repr(remaining),
+)
+
 original = run_matrix.run_with_timeout
 try:
     run_matrix.run_with_timeout = lambda _command: None
