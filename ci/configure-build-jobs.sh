@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99437f05e82377a80ad1edb9e501d89a38c91ecb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 99437f05e82377a80ad1edb9e501d89a38c91ecb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4664b5e5e0f5cf1de59e2105b26fbfe7970db4b9 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 4664b5e5e0f5cf1de59e2105b26fbfe7970db4b9" >&2
     return 2
 fi
 
@@ -364,6 +364,16 @@ fi
 # outside the DynamoRIO content-key recipe. MAX_PARALLEL_JOBS=16 and the 1050
 # effective-job-second threshold carry unchanged. Fresh validation is still
 # required; this carry does not authorize receipt reuse.
+#
+# CARRY TO 4664b5e5 (2026-08-10). rrnewton/reverie#431 changes the cache
+# location, completeness/provenance checks, and atomic publication around a
+# content-key miss. It does not change the measured inner DynamoRIO source
+# build: the vendored source tree remains de352475846e385002c1e4e54604fa0a7647b2de,
+# and build_dynamorio() is byte-identical across 99437f05..4664b5e5 (SHA-256
+# 72e3d35e7dc4bd82435587d41c781f7138b427e248b926194752bcfda466570f).
+# MAX_PARALLEL_JOBS=16 and the 1050 effective-job-second threshold therefore
+# carry unchanged. Fresh validation is still required; this carry does not
+# authorize receipt reuse.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
