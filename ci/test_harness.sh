@@ -301,9 +301,9 @@ CARGO_SHIM
     )
     [[ -z $uncovered ]] ||
         die "metadata consumer subcommand(s) outside this audit's scope:$uncovered"
-    dag_consumers=$(jq -r '[.steps[] | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate) "))] | length' \
+    dag_consumers=$(jq -r '[.steps[] | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate)( |$)"))] | length' \
         "$DAG_ROOT"/*.json | paste -sd+ - | bc)
-    workflow_consumers=$(grep -rcoE '\./ci/test_harness\.sh (run|build|plan|validate) ' \
+    workflow_consumers=$(grep -rcoE '\./ci/test_harness\.sh (run|build|plan|validate)( |$)' \
         "$ROOT_DIR/.github/workflows/" | awk -F: '{s+=$2} END {print s+0}')
     ((dag_consumers > 0)) || die "no DAG metadata consumers found"
     ((workflow_consumers > 0)) || die "no workflow metadata consumers found"
@@ -327,7 +327,7 @@ CARGO_SHIM
                 else (($deps[$tag] // []) | any(reaches(.; $seen + [$tag])))
                 end;
               [ $dag.steps[]
-                | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate) "))
+                | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate)( |$)"))
                 | (.group + "." + .job) ]
               | map(select(reaches(.; [])| not)) | join(", ")' "$dag")
         [[ -z $orphaned ]] ||
@@ -368,15 +368,46 @@ CARGO_SHIM
     [[ -z $missing_inputs ]] ||
         die "the producer reads file(s) the published content address does not hash, so a drift in them would be served as fresh:$missing_inputs"
 
+    # ---- the harness's WHOLE executable Cargo surface is pinned -------------
+    # `validate` DOES invoke Cargo, and deliberately so: audit_test_footprints
+    # runs a DIFFERENT binary (generate-test-footprints) to regenerate a
+    # different artifact, and the identity check above uses Cargo precisely
+    # because it is the one producer independent of everything under test. The
+    # invariant worth enforcing is therefore NOT "nothing runs Cargo" -- buying
+    # that would mean deleting real coverage -- but "the METADATA LOAD never
+    # runs Cargo when a verified document exists, for every subcommand".
+    #
+    # That leaves one way for the invariant to rot without the dynamic shapes
+    # noticing: somebody adds a new Cargo execution to a path they did not
+    # realize was a consumer. So pin the surface. Any new executable `cargo`
+    # line in this file fails here until it is listed and justified, which is
+    # strictly stronger than re-asserting today's resolver path.
+    # This function names both the resolver and Cargo, so any count over the
+    # whole file matches its own text. Delete this function's body first.
+    local body
+    body=$(sed '/^function audit_manifest_plan_cargo_independence {$/,/^}$/d' "$ROOT_DIR/ci/test_harness.sh")
+    local -a expected_cargo_surface=(
+        # The resolver's own stale/absent rebuild. The point of this whole
+        # mechanism is that a verified document skips it.
+        "cargo run -p hermit-manifest-plan -- --format harness-json"
+        # audit_test_footprints, a different binary producing ci/test-footprints.json.
+        "cargo run --quiet -p hermit-manifest-plan"
+    )
+    local actual_cargo_surface expected_cargo_listing
+    actual_cargo_surface=$(grep -E '^[[:space:]]*cargo ' <<<"$body" |
+        sed -E 's/^[[:space:]]+//; s/[[:space:]]+/ /g; s/ \\$//' | LC_ALL=C sort)
+    expected_cargo_listing=$(printf '%s\n' "${expected_cargo_surface[@]}" | LC_ALL=C sort)
+    [[ $actual_cargo_surface == "$expected_cargo_listing" ]] ||
+        die "the harness's executable Cargo surface changed; a new Cargo call can serialize a metadata consumer behind the build lock. Expected:
+$expected_cargo_listing
+Found:
+$actual_cargo_surface"
+
     # ---- coverage: `validate` shares the one resolver, so it cannot diverge --
     # `validate` is this function's own caller and cannot be re-entered without
     # recursing, so instead prove there is nothing subcommand-specific to miss:
     # exactly one call site, reached unconditionally before dispatch.
-    # This function NAMES the resolver, so counting references across the whole
-    # file would match its own text and always report extra call sites. Delete
-    # this function's body before counting.
-    local body resolver_calls resolver_mentions load_line case_line
-    body=$(sed '/^function audit_manifest_plan_cargo_independence {$/,/^}$/d' "$ROOT_DIR/ci/test_harness.sh")
+    local resolver_calls resolver_mentions load_line case_line
     resolver_calls=$(grep -cE '^\s*documents=\$\(manifest_plan_documents\)' <<<"$body")
     resolver_mentions=$(grep -cE '\bmanifest_plan_documents\b' <<<"$body")
     ((resolver_calls == 1)) ||
@@ -512,7 +543,7 @@ CARGO_SHIM
     [[ ! -e $marker ]] ||
         die "tampered document fell back to a rebuild instead of failing closed"
 
-    echo "manifest-plan lock independence: $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s), shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0"
+    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (the harness's whole executable Cargo surface is pinned to ${#expected_cargo_surface[@]} named non-metadata site(s), so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant the producer declares; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0"
     rm -rf "$scratch"
 }
 
