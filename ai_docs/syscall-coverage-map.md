@@ -2,6 +2,15 @@
 
 Status: research snapshot, 2026-07-21
 
+> **Superseded subscription premise (2026-08-10):** the classification counts
+> below remain a historical snapshot, but release-vs-debug interception no
+> longer differs as described. Default Detcore execution now uses
+> `Subscription::all()` in every build profile. The old partial set is reachable
+> only through explicit `--passthru-opt`, which requires the explicit
+> `--allow-unsupported-syscalls` compatibility opt-out. Consequently an
+> unsupported default-run syscall reaches the fail-closed policy instead of
+> bypassing Detcore.
+
 ## Executive summary
 
 This audit uses Hermit revision
