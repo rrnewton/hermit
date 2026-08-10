@@ -89,7 +89,7 @@ use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope;
+use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
@@ -714,8 +714,21 @@ fn self_test() -> Result<(), String> {
                     "carry bracket: lane {lane} rebuilt from Default::default() compared EQUAL to \
                      its file config -- the assertion cannot detect the bug it exists for"));
             }
+            // NEGATIVE 3: isolate the new field. A broad defaulted-config
+            // mismatch could stay red even if write-domain policy silently
+            // disappeared, so mutate only that field and require it by name.
+            let mut dropped_domains = carried.clone();
+            dropped_domains.write_domain_policy = Default::default();
+            let domain_drop = validate_plan::assert_config_carried(&base, &dropped_domains)
+                .expect_err("carry bracket: dropped write-domain policy was accepted");
+            if !domain_drop.contains("write_domain_policy") {
+                return Err(format!(
+                    "carry bracket: dropped write-domain policy refusal did not name the field: \
+                     {domain_drop}"
+                ));
+            }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
-cleared-caps refusal names {} starved step(s)",
+cleared-caps refusal names {} starved step(s); write-domain policy 1 carry / 1 isolated-drop refusal",
                      base.resource_caps.len(), base.default_step_timeout, starved.len());
         }
     }
@@ -1152,6 +1165,8 @@ fn super_plan_bracket() -> Result<(), String> {
             timeout: 0,
             cpu_timeout: 0,
             jobs_flag: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -1314,12 +1329,10 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         );
         return Ok(None);
     }
-    let reexeced_or_skipped = reexec_in_scope(None, None);
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
-    } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
+    // Carry #2047's typed migration rather than reintroducing the deleted bool:
+    // the old value conflated already-contained with skipped-never-attempted.
+    let attempt = attempt_scope_reexec(None, None, None);
+    let detail = attempt.describe();
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
          this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
@@ -2136,6 +2149,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         .collect::<Result<_, _>>()?;
     let mut fused = bases[0].clone();
     for b in bases.iter().skip(1) {
+        if b.write_domain_policy != fused.write_domain_policy {
+            return Err(format!(
+                "--merge-lanes refused: write-domain policies differ: {:?} != {:?}",
+                fused.write_domain_policy, b.write_domain_policy
+            ));
+        }
         fused.default_step_timeout = fused.default_step_timeout.min(b.default_step_timeout);
         for (r, n) in &b.resource_caps {
             if let Some(prev) = fused.resource_caps.get(r) {
@@ -2149,6 +2168,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
     }
     let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
+    let domain_errors = safe_ci_dag_runner::model::write_domain_violations(&cfg);
+    if !domain_errors.is_empty() {
+        return Err(format!(
+            "--merge-lanes refused before execution: fused write-domain policy violation(s): {}",
+            domain_errors.join("; ")
+        ));
+    }
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -2598,6 +2624,8 @@ fn step_with_caps(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        write_domains: Some(Vec::new()),
+        write_domain_guarantee: None,
     }
 }
 

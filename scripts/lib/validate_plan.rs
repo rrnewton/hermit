@@ -205,6 +205,11 @@ pub fn node(
         timeout,
         cpu_timeout,
         jobs_flag: None,
+        // Synthesized preflight/compatibility nodes do not write any of the
+        // lane policy's protected artifact domains. Declare that explicitly so
+        // in-memory fusion cannot bypass a require_explicit policy.
+        write_domains: Some(Vec::new()),
+        write_domain_guarantee: None,
     }
 }
 
@@ -562,6 +567,12 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     }
     if base.default_step_cpu_count != derived.default_step_cpu_count {
         bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
+    }
+    if base.write_domain_policy != derived.write_domain_policy {
+        bad.push(format!(
+            "write_domain_policy {:?} != {:?}",
+            base.write_domain_policy, derived.write_domain_policy
+        ));
     }
     if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
 }
