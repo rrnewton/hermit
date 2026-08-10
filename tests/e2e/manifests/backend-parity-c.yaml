@@ -6290,3 +6290,263 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: backend-parity-c/mixed-inline-and-libc-syscalls
+    description: Patched inline sites and unpatched libc.so syscalls interleaved in one run
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Not yet qualified for this guest; ratchet separately
+          kvm: KVM livelocks at guest startup on the current host; qualify separately
+          sabre: Not yet qualified for this guest; ratchet separately
+          liteinst: LiteInst preload runtime is not built beside the binary on this host
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native is the uninstrumented baseline; the contract is the hermit run
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from strict verification
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Syscall-site reach is not schedule-derived, so chaos adds no discriminating power
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: backend-parity-c/inline-syscall-sites
+    description: Inline syscall instructions in the main ELF, so a main-ELF rewriter has sites to patch
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/inline_syscall_sites.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Not yet qualified for this guest; ratchet separately
+          kvm: KVM livelocks at guest startup on the current host; qualify separately
+          sabre: Not yet qualified for this guest; ratchet separately
+          liteinst: LiteInst preload runtime is not built beside the binary on this host
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native is the uninstrumented baseline; the contract is the hermit run
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from strict verification
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Syscall-site reach is not schedule-derived, so chaos adds no discriminating power
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: backend-parity-c/readdir-order-identity
+    description: Strict verification for tests/backend-parity/fixtures/readdir_order_identity.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/readdir_order_identity.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        guest_args:
+          ptrace:
+            - --require-small-determinized
+        backends_disabled:
+          dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
+          kvm: KVM livelocks at guest startup on the current host; qualify KVM separately
+          sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
+          liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: 'Native creation-order leakage is the PREMISE of this guest (measured: order_identical=0, seams_rev=n-1), recorded in the fixture header rather than gated here'
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from strict verification
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Enumeration order is filesystem-derived, not schedule-derived, so chaos adds no discriminating power here
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: backend-parity-c/static-nolibc-syscall-sites
+    description: 'Freestanding static guest: no PLT, no interpreter, whole program in the main ELF'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 90
+    occasional: false
+    program: tests/backend-parity/fixtures/static_nolibc_syscall_sites.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -static
+        - -nostdlib
+        - -nostartfiles
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Not yet qualified for this guest; ratchet separately
+          kvm: KVM livelocks at guest startup on the current host; qualify separately
+          sabre: Not yet qualified for this guest; ratchet separately
+          liteinst: LiteInst preload runtime is not built beside the binary on this host
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Native is the uninstrumented baseline; the contract is the hermit run
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from strict verification
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Syscall-site reach is not schedule-derived, so chaos adds no discriminating power
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
