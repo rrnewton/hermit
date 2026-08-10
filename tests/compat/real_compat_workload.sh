@@ -167,6 +167,97 @@ case "$PROGRAM" in
     curl-localhost)
         fetch_localhost_payload curl
         ;;
+    # AUTONOMOUS-BOT-IMPLEMENTED
+    # TODO-HUMAN-REVIEW(#1849-followup): The three cases below add guest-program
+    # CLASSES the real-program corpus did not have, rather than more programs of
+    # a class it already had. Rationale, with counts measured at main b5a4748e:
+    # of 214 distinct corpus labels, ZERO requested parallelism (no -j/-P/
+    # --parallel/nproc in any argv or in this script), and the two managed
+    # runtimes with the widest real-world use were represented by
+    # `node -e console.log(42)` and `python3 -c print(42)` -- runtime-startup
+    # smoke, not workloads. A corpus can be at 100% on single-threaded CLI tools
+    # and say almost nothing about deterministic scheduling, which is Hermit's
+    # entire value.
+    make-parallel)
+        # DELIBERATE parallelism: four independent targets built concurrently,
+        # so `make` forks a job per target instead of running one recipe. This
+        # is the class the corpus was missing outright -- `make` above runs
+        # `-s` with no `-j`, and `xargs` runs `-n1` with no `-P`.
+        printf '%s\n' 'all: a.out b.out c.out d.out' >"$WORK_DIR/Makefile"
+        for target in a b c d; do
+            printf '%s.out:\n\t@printf "%s:%%s\\n" $$(expr 6 \\* 7) > %s.out\n' \
+                "$target" "$target" "$target" >>"$WORK_DIR/Makefile"
+        done
+        make --no-print-directory -s -C "$WORK_DIR" -j4
+        # Sorted so the ASSERTION does not depend on completion order while the
+        # EXECUTION still does -- the point is to schedule four jobs, not to
+        # smuggle in an order-sensitive check that would flake under chaos.
+        output=$(cat "$WORK_DIR"/[abcd].out | sort | tr '\n' ' ')
+        test "$output" = 'a:42 b:42 c:42 d:42 '
+        printf 'make-parallel:four-jobs-ok\n'
+        ;;
+    node-deep)
+        # A managed runtime doing real work: 16 concurrent async writes then 16
+        # concurrent async reads through the libuv threadpool, then a digest and
+        # a JSON round-trip. Measured: 7 tasks in /proc/self/task under Hermit,
+        # so the concurrency survives into the guest rather than being collapsed.
+        # Contrast the pre-existing `node` row, which is `-e console.log(42)`.
+        cat >"$WORK_DIR/node_deep.js" <<'JS'
+const fs = require('fs').promises;
+const crypto = require('crypto');
+const path = require('path');
+(async () => {
+    const dir = await fs.mkdtemp('nodedeep-');
+    const names = [...Array(16).keys()].map((i) => path.join(dir, `f${i}.txt`));
+    // Promise.all is what puts these on the libuv threadpool; a sequential
+    // await loop would run them one at a time and exercise nothing.
+    await Promise.all(names.map((n, i) => fs.writeFile(n, 'x'.repeat(1024 * (i + 1)))));
+    const buffers = await Promise.all(names.map((n) => fs.readFile(n)));
+    const total = buffers.reduce((acc, b) => acc + b.length, 0);
+    const digest = crypto.createHash('sha256');
+    buffers.forEach((b) => digest.update(b));
+    const obj = { total, count: buffers.length, digest: digest.digest('hex') };
+    if (JSON.parse(JSON.stringify(obj)).total !== total) {
+        throw new Error('json round-trip');
+    }
+    await Promise.all(names.map((n) => fs.unlink(n)));
+    await fs.rmdir(dir);
+    console.log(`node-deep:${obj.count}:${obj.total}:${obj.digest}`);
+})().catch((error) => {
+    console.error(error);
+    process.exit(1);
+});
+JS
+        (cd "$WORK_DIR" && node node_deep.js)
+        ;;
+    python3-deep)
+        # The SAME 16-file sha256 as node-deep, deliberately: the two workloads
+        # differ in runtime, not in work, so a divergence between them is
+        # attributable to the runtime. Single-threaded CPython is the control.
+        python3 - <<'PY'
+import hashlib, json, os, re, tempfile, decimal
+with tempfile.TemporaryDirectory(dir=os.getcwd()) as d:
+    names = [os.path.join(d, f'f{i}.txt') for i in range(16)]
+    for i, n in enumerate(names):
+        with open(n, 'w') as fh:
+            fh.write('x' * (1024 * (i + 1)))
+    digest = hashlib.sha256()
+    total = 0
+    for n in names:
+        with open(n, 'rb') as fh:
+            b = fh.read()
+        total += len(b)
+        digest.update(b)
+    obj = {'total': total, 'count': len(names), 'digest': digest.hexdigest()}
+    assert json.loads(json.dumps(obj)) == obj, 'json round-trip'
+    primes = [p for p in range(2, 200)
+              if all(p % q for q in range(2, int(p ** 0.5) + 1))]
+    harmonic = sum(decimal.Decimal(1) / decimal.Decimal(p) for p in primes)
+    assert re.fullmatch(r'[0-9a-f]{64}', obj['digest']), 'digest shape'
+    print(f"python3-deep:{obj['count']}:{obj['total']}:{obj['digest']}:"
+          f"{len(primes)}:{str(harmonic)[:12]}")
+PY
+        ;;
     cargo)
         mkdir -p "$WORK_DIR/src"
         cat >"$WORK_DIR/Cargo.toml" <<'EOF'
