@@ -20,8 +20,17 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
+	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
+	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
 		-p hermit --features third-party-backends
+	@bin=target/debug/hermit; \
+		if [ -x "$$bin" ]; then \
+			echo "make: BUILD OK -- $$bin (dev profile, third-party-backends)"; \
+		else \
+			echo "make: BUILD INCOMPLETE -- cargo reported success but $$bin is absent" >&2; \
+			exit 1; \
+		fi
 
 # `install-deps` is the "install everything this repo needs to build" entrypoint,
 # so it opts into best-effort auto-installation of the native build toolchain via
@@ -30,8 +39,11 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
 install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
+	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
+	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbt -p detcore-sabre -p hermit-install
+	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
@@ -56,12 +68,16 @@ release-core: check-submodules ## Build the lean core-only release binary (ptrac
 # any existing release binary is treated as stale and removed.
 prune-stale-release: ## Remove target/release/hermit if stale (not built from current HEAD/worktree)
 	@bin=target/release/hermit; \
-	[ -x "$$bin" ] || exit 0; \
+	if [ ! -x "$$bin" ]; then \
+		echo "make: prune-stale-release: none present (no $$bin to prune)"; \
+		exit 0; \
+	fi; \
 	head=$$(git rev-parse --short=12 HEAD 2>/dev/null || true); \
 	ver=$$("$$bin" --version 2>/dev/null || true); \
 	if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then \
 		reason="worktree has uncommitted changes"; \
 	elif [ -n "$$head" ] && printf '%s' "$$ver" | grep -q "$$head" && ! printf '%s' "$$ver" | grep -q -- '-dirty'; then \
+		echo "make: prune-stale-release: kept $$bin (built from current HEAD, worktree clean)"; \
 		exit 0; \
 	else \
 		reason="built from '$$ver', HEAD is g$$head"; \
@@ -166,7 +182,8 @@ check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler)
 		echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
 		echo "  or run 'make install-deps', which installs them automatically." >&2; \
 		exit 1; \
-	fi
+	fi; \
+	echo "make: build tools OK -- cmake, a C compiler and a C++ compiler are all on PATH"
 
 # Best-effort install of the native build toolchain via the platform package
 # manager. Invoked only from the `install-deps` path (INSTALL_BUILD_TOOLS=1).
@@ -199,10 +216,15 @@ checkout-all: check-build-tools ## Initialize every pinned submodule before buil
 check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
 	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
 		printf '%s\n' "$$status"; \
-		if printf '%s\n' "$$status" | grep -Eq '^[-+U]'; then \
-			echo 'error: a required submodule is missing or not at its pinned revision' >&2; \
+		total=$$(printf '%s\n' "$$status" | grep -c .); \
+		bad=$$(printf '%s\n' "$$status" | grep -Ec '^[-+U]' || true); \
+		if [ "$$bad" -gt 0 ]; then \
+			echo "error: $$bad of $$total submodule(s) missing or not at the pinned revision:" >&2; \
+			printf '%s\n' "$$status" | grep -E '^[-+U]' >&2; \
+			echo "  leading '-' = not initialized, '+' = checked out at a different revision, 'U' = merge conflict" >&2; \
 			exit 1; \
-		fi
+		fi; \
+		echo "make: submodules OK -- $$total/$$total at their pinned revision"
 	@test -f agent-utils/README.md || { echo 'error: agent-utils submodule is missing' >&2; exit 1; }
 	@test -f third-party/rr/CMakeLists.txt || { echo 'error: rr submodule is missing' >&2; exit 1; }
 
