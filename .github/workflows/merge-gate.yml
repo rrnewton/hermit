@@ -63,18 +63,43 @@ permissions:
   contents: read
   pull-requests: read
 
-# All merge-gate jobs run on the dedicated `gate` self-hosted runner pool rather
-# than `ubuntu-latest`. They are pure control-plane work — `gh api` reads, `jq`,
-# a shallow trusted-ref checkout, and one bash lint — with no Rust build, PMU, or
-# ptrace needs. On 2026-08-03 the public-repo GitHub-hosted concurrency cap left
-# ci-portable's ~34-min build flood saturating the hosted pool, so even this ~5s
-# stamp-check queued behind 40-min builds and NOTHING landed. Routing to
-# `[self-hosted, gate]` targets an always-idle lightweight runner
-# (selected by the `gate` label only) that picks these jobs up in seconds;
-# the three PMU runners also carry the `gate` label as fallback, so a single-node
-# outage cannot block landing. Because the required-check context is the job name
-# (`merge-gate-v4`), changing `runs-on` does not change the ruleset requirement.
+# The authoritative merge-gate jobs remain on the dedicated `gate` self-hosted
+# runner pool. The independent label-presence report below is deliberately
+# GitHub-hosted: it needs only the pull-request API and must remain observable
+# when every `gate` runner is offline. It is NOT a required landing context and
+# does not inspect or replace the local validation ledger.
 jobs:
+  local-validation-label-presence:
+    name: local-validation-label-presence
+    if: >-
+      github.repository == 'rrnewton/hermit' &&
+      (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Report locally-validated label presence only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "::notice::This report checks only whether the locally-validated label exists. It does not read the validation ledger, prove that a run occurred, or authorize landing."
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = null ]; then
+            echo "::error::No pull request number is available for the label-presence report."
+            exit 1
+          fi
+          if gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+              --jq 'any(.labels[]?; .name == "locally-validated")' | grep -Fxq true; then
+            echo "PR #${PR_NUMBER}: locally-validated label PRESENT. This is a guard against forgetting the label, not evidence that its validation receipt is genuine."
+          else
+            echo "::error::PR #${PR_NUMBER}: locally-validated label MISSING. This reports label hygiene only; the ledger remains the landing authority."
+            exit 1
+          fi
+
   refire-on-ci-completion:
     name: refire-on-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
