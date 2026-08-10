@@ -790,6 +790,16 @@ EOF
         die "merge-gate must inspect the exact PR head"
     grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
         die "merge-gate must run the canonical live-query checker on the exact PR head"
+    [[ $(grep -Fxc '          ref: main' "$merge_workflow") -ge 1 ]] ||
+        die "merge-gate must execute the review policy from trusted main"
+    grep -Fq 'git diff --no-ext-diff --no-textconv --no-renames' "$merge_workflow" ||
+        die "merge-gate must expose the exact base-to-head diff to review policy"
+    grep -Fq 'PR_COMMENTS_FILE="${prefix}.comments.json"' "$merge_workflow" ||
+        die "merge-gate must bind review authority to GitHub comments"
+    grep -Fq 'PR_HEAD_SHA="$head_sha"' "$merge_workflow" ||
+        die "merge-gate must bind review authority to the exact PR head"
+    grep -Fq 'PR_COMMIT_MESSAGE_FILE="${prefix}.commit-message"' "$merge_workflow" ||
+        die "merge-gate must bind author identity to the exact-head commit trailer"
 }
 
 function dag_critical_path_seconds {
@@ -2052,6 +2062,7 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        "$ROOT_DIR/scripts/core-review-protocol-lint-test.sh"
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
