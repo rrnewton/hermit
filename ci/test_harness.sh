@@ -70,6 +70,8 @@ readonly -a BACKENDS=(ptrace dbt kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
 DAG_DIR="$ROOT_DIR/ci/dag"
 readonly DAG_DIR
+MANIFEST_PLAN_BIN_DEFAULT="$ROOT_DIR/target/debug/hermit-manifest-plan"
+readonly MANIFEST_PLAN_BIN_DEFAULT
 
 function usage {
     cat <<'USAGE'
@@ -313,6 +315,101 @@ DAG_ENTRY
     rm -rf "$scratch"
 }
 
+# Prove the manifest consumers cannot be serialized behind Cargo's build lock.
+#
+# The load-bearing property is NEGATIVE -- "this path never executes cargo" --
+# so a passing structural read of the script would prove nothing. Instead put a
+# marking, failing `cargo` shim first on PATH and exercise the real harness:
+# the prebuilt path must complete without ever touching the shim, and the
+# non-prebuilt path must hit it, which is what shows the shim is live rather
+# than inert. Also compare the prebuilt binary's bytes against the Cargo
+# producer's, so "cheaper" can never quietly become "different".
+function audit_manifest_plan_cargo_independence {
+    local scratch marker reference direct fixture_docs output status
+    local entered_reason='cargo shim: the prebuilt manifest path must not take the Cargo build lock'
+    scratch=$(mktemp -d)
+    marker="$scratch/cargo-was-invoked"
+    mkdir -p "$scratch/bin"
+    cat >"$scratch/bin/cargo" <<CARGO_SHIM
+#!/usr/bin/env bash
+: >"$marker"
+echo '$entered_reason' >&2
+exit 97
+CARGO_SHIM
+    chmod 755 "$scratch/bin/cargo"
+
+    # `load_tests` already ran the Cargo producer, so the debug binary is current.
+    [[ -x $MANIFEST_PLAN_BIN_DEFAULT ]] ||
+        die "manifest-plan binary missing after metadata load: $MANIFEST_PLAN_BIN_DEFAULT"
+    reference=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json)
+    direct=$("$MANIFEST_PLAN_BIN_DEFAULT" --format harness-json)
+    [[ $direct == "$reference" ]] ||
+        die "prebuilt manifest-plan output differs from the Cargo producer: $MANIFEST_PLAN_BIN_DEFAULT"
+
+    # One real bucket keeps the fixture schema-valid by construction and keeps
+    # this bracket cheap enough to live inside the metadata node's budget.
+    jq -c '[{bucket: .[0].bucket, test: [.[0].test[0]]}]' <<<"$reference" >"$scratch/documents.json"
+    printf '#!/usr/bin/env bash\nexec cat %q\n' "$scratch/documents.json" >"$scratch/plan-bin"
+    chmod 755 "$scratch/plan-bin"
+
+    # POSITIVE: the prebuilt path completes and never reaches the shim.
+    set +e
+    output=$(PATH="$scratch/bin:$PATH" HERMIT_MANIFEST_PLAN_BIN="$scratch/plan-bin" \
+        "$ROOT_DIR/ci/test_harness.sh" plan --prebuilt --format json 2>&1)
+    status=$?
+    set -e
+    ((status == 0)) ||
+        die "prebuilt manifest path failed with a cargo shim on PATH (rc=$status): $output"
+    [[ ! -e $marker ]] ||
+        die "prebuilt manifest path invoked cargo and can still be blocked by the build lock"
+    jq -e 'type == "array" and length > 0' <<<"$output" >/dev/null ||
+        die "prebuilt manifest path produced no usable plan: $output"
+
+    # NEGATIVE (shim is live, not inert): the non-prebuilt path really does
+    # invoke cargo, which is the wait that produced the silent stall.
+    rm -f "$marker"
+    set +e
+    output=$(PATH="$scratch/bin:$PATH" "$ROOT_DIR/ci/test_harness.sh" plan --format json 2>&1)
+    status=$?
+    set -e
+    ((status != 0)) ||
+        die "non-prebuilt manifest path ignored the failing cargo shim; the bracket is inert"
+    [[ -e $marker ]] ||
+        die "cargo shim never fired, so the positive case proves nothing: $output"
+
+    # NEGATIVE (fail closed): a missing prebuilt producer must refuse by name
+    # rather than silently falling back to the Cargo build-lock path.
+    rm -f "$marker"
+    set +e
+    output=$(PATH="$scratch/bin:$PATH" HERMIT_MANIFEST_PLAN_BIN="$scratch/absent-plan-bin" \
+        "$ROOT_DIR/ci/test_harness.sh" plan --prebuilt --format json 2>&1)
+    status=$?
+    set -e
+    ((status == 2)) ||
+        die "absent prebuilt manifest producer returned $status, expected 2: $output"
+    [[ $output == *"needs the binary from setup.manifest_plan"* ]] ||
+        die "absent prebuilt manifest producer did not name its missing producer: $output"
+    [[ ! -e $marker ]] ||
+        die "absent prebuilt manifest producer fell back to cargo instead of failing closed"
+
+    # Every DAG manifest consumer must actually take the cargo-free path.
+    local lane dag consumers unguarded
+    for lane in "${LANES[@]}"; do
+        dag="$DAG_ROOT/$lane.json"
+        consumers=$(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$dag")
+        ((consumers > 0)) || die "no manifest consumers found in $lane.json"
+        unguarded=$(jq -r '[.steps[]
+            | select(.cmd | contains("./ci/test_harness.sh run "))
+            | select(.cmd | contains(" --prebuilt") | not)
+            | .group + "." + .job] | join(", ")' "$dag")
+        [[ -z $unguarded ]] ||
+            die "$lane manifest consumer(s) omit --prebuilt and can block on the Cargo build lock: $unguarded"
+    done
+
+    echo "manifest-plan lock independence: prebuilt output byte-identical to the Cargo producer; prebuilt path cargo_invocations=0 with a failing shim first on PATH; non-prebuilt path cargo_invocations=1 (shim live); absent producer refused rc=2 with cargo_invocations=0; $(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$DAG_ROOT/portable.json") portable + $(jq '[.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | length' "$DAG_ROOT/privileged.json") privileged consumers all pass --prebuilt"
+    rm -rf "$scratch"
+}
+
 function contains {
     local needle=$1
     shift
@@ -364,13 +461,47 @@ function metadata_json {
     printf '%s\n' "${METADATA_BY_ID[$id]}"
 }
 
+# Emit the harness-json manifest documents WITHOUT taking Cargo's shared build
+# lock when the caller declared its inputs prebuilt.
+#
+# `cargo run` acquires Cargo's EXCLUSIVE build-directory lock. Every manifest
+# consumer node in ci/dag/*.json is released into the same wave as the DAG's
+# Cargo fan-out (clippy, doctests, rustdoc, nextest, detcore unit tests), so
+# routing metadata loading through Cargo serializes a node whose own work costs
+# ~6s behind whatever compile currently owns target/debug/.cargo-lock. `--quiet`
+# additionally suppresses Cargo's "Blocking waiting for file lock" status line,
+# so that wait produced NO output at all and looked like a hang rather than a
+# queue. On 2026-08-10 that put all five e2e.manifest_* consumers over their
+# wall budget: the node emitted its artifact-verification line, went silent, and
+# was killed with "no test boundaries were recognized in this step's output;
+# 0 test(s) completed" (task p0_privileged_e2e_manifest).
+#
+# A `--prebuilt` consumer therefore executes the binary `setup.manifest_plan`
+# already built, and never invokes Cargo. It fails closed when that binary is
+# absent instead of silently falling back to the locking path, because a silent
+# fallback would reintroduce exactly the invisible stall this replaces.
+function manifest_plan_documents {
+    local producer
+    if ((PREBUILT == 1)) || [[ -n ${HERMIT_MANIFEST_PLAN_BIN:-} ]]; then
+        producer=${HERMIT_MANIFEST_PLAN_BIN:-$MANIFEST_PLAN_BIN_DEFAULT}
+        [[ -x $producer ]] ||
+            die "prebuilt manifest metadata needs the binary from setup.manifest_plan: $producer"
+        "$producer" --format harness-json
+        return
+    fi
+    # Local, non-prebuilt path: build on demand. Deliberately NOT `--quiet`, so
+    # that a Cargo lock wait is reported as "Blocking waiting for file lock"
+    # instead of presenting as an unexplained hang.
+    cargo run -p hermit-manifest-plan -- --format harness-json
+}
+
 function load_tests {
     TESTS=()
     TEST_BY_ID=()
     ID_BY_TEST=()
     METADATA_BY_ID=()
     local documents raw metadata id test relative kind
-    documents=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json) ||
+    documents=$(manifest_plan_documents) ||
         die "TOML manifest validation failed"
     while IFS= read -r raw; do
         id=$(jq -r .id <<<"$raw")
@@ -3085,6 +3216,7 @@ case "$subcommand" in
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract
+        audit_manifest_plan_cargo_independence
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
