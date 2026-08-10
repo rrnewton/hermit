@@ -332,6 +332,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/inline_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/inline_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): places raw inline syscall instructions in the main ELF so a main-ELF binary rewriter has sites to patch, and pins that the rewritten program still produces identical output under strict verification"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/inotify_watch.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/inotify_watch.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -395,6 +401,12 @@
       "path": "tests/backend-parity/fixtures/mincore_residency.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/mincore_residency.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): interleaves patchable inline syscall sites with unpatched libc.so syscalls in one run, pinning that a partially rewritten program is still deterministic under strict verification"
     },
     {
       "disposition": "manifest-test",
@@ -530,6 +542,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/readdir_order_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/readdir_order_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): pins directory-enumeration order across a double strict run, asserting the small (single-buffer) case is determinized via --require-small-determinized while the large per-buffer-sort gap stays reported-only; the 90s budget is set from four measured 7.59-7.99s verify runs"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/record_lock.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/record_lock.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -641,6 +659,12 @@
       "path": "tests/backend-parity/fixtures/statfs_free_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/statfs_free_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): is a freestanding static guest with no PLT and no interpreter, so the whole program including every syscall site lives in the main ELF, pinning the rewriter's coverage of that layout"
     },
     {
       "disposition": "manifest-test",
@@ -2024,6 +2048,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/data-handling/dd-partial-transfers.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/data-handling/dd-partial-transfers.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/data-handling/jq-json-transform.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/data-handling/jq-json-transform.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
@@ -2600,6 +2630,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/auxv-loader-dump.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/auxv-loader-dump.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/date-nanoseconds.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/date-nanoseconds.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
@@ -2657,6 +2693,12 @@
       "path": "tests/e2e/system-utils/proc-uptime.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/proc-uptime.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/ps-proc-table.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/ps-proc-table.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "manifest-test",
