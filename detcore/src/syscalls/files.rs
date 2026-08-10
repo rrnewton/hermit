@@ -1729,9 +1729,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// into a side-effect-free metadata lookup with the same target-selection
     /// arguments, and reports success only if that lookup succeeds:
     ///
-    /// * `fstat` validates `fchown`'s descriptor; `newfstatat` performs the
-    ///   corresponding path walk for the three pathname variants, preserving
-    ///   `ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, `EFAULT`, and `EBADF`;
+    /// * `F_GETFL` validates `fchown`'s descriptor and distinguishes an
+    ///   `O_PATH` descriptor (valid for `fstat`, invalid for `fchown`);
+    ///   `newfstatat` performs the corresponding path walk for the three
+    ///   pathname variants, preserving `ENOENT`, `ENOTDIR`, `ELOOP`,
+    ///   `ENAMETOOLONG`, `EFAULT`, and `EBADF`;
     /// * `fchownat` flags are checked explicitly before the lookup, so an
     ///   unsupported flag still returns `EINVAL` rather than being accepted by
     ///   a metadata syscall with a wider flag vocabulary;
@@ -1767,6 +1769,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        let call = match call {
+            Syscall::Fchown(c) => {
+                let flags = self
+                    .record_or_replay(
+                        guest,
+                        syscalls::Fcntl::new().with_fd(c.fd()).with_cmd(F_GETFL),
+                    )
+                    .await?;
+                if flags & i64::from(OFlag::O_PATH.bits()) != 0 {
+                    return Err(Error::Errno(Errno::EBADF));
+                }
+                return Ok(0);
+            }
+            other => other,
+        };
+
         if let Syscall::Fchownat(c) = &call {
             let allowed = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
             if c.flags().bits() & !allowed.bits() != 0 {
@@ -1785,11 +1803,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_path(c.path())
                     .with_stat(Some(statptr))
                     .with_flags(AtFlags::empty()),
-            ),
-            Syscall::Fchown(c) => Syscall::Fstat(
-                syscalls::Fstat::new()
-                    .with_fd(c.fd())
-                    .with_stat(Some(statptr)),
             ),
             Syscall::Lchown(c) => Syscall::Newfstatat(
                 syscalls::Newfstatat::new()
