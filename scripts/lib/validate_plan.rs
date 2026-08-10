@@ -43,6 +43,7 @@
 //! a load-immune budget without editing 55 JSON rows.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use safe_ci_dag_runner::io::dag_from_json;
@@ -93,6 +94,182 @@ pub enum CompatMode {
     Sabre,
     E9patch,
     Rr,
+}
+
+/// A planned node that never reached an executed terminal state.
+///
+/// This is deliberately distinct from the runner's `skipped` bucket. A skipped
+/// node was considered by the runner and rejected because a dependency failed;
+/// an unaccounted node was never returned by the runner at all, or belonged to
+/// a later lane that the driver never dispatched. Collapsing those states made
+/// an incomplete 58-node run look like a complete 42-node run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnaccountedNode {
+    pub tag: String,
+    pub reason: String,
+}
+
+/// Closed accounting over every node in a validation plan.
+///
+/// Failed nodes are a subset of `executed`, not a fourth additive bucket. The
+/// load-bearing identity is `executed + skipped + unaccounted == planned`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeAccounting {
+    pub planned: usize,
+    pub executed: usize,
+    pub skipped: Vec<UnaccountedNode>,
+    pub unaccounted: Vec<UnaccountedNode>,
+    pub errors: Vec<String>,
+}
+
+impl NodeAccounting {
+    pub fn identity_holds(&self) -> bool {
+        self.errors.is_empty()
+            && self.executed + self.skipped.len() + self.unaccounted.len() == self.planned
+    }
+
+    /// A run with named unaccounted nodes is honest, but is not complete and
+    /// must never mint a passing receipt.
+    pub fn is_complete(&self) -> bool {
+        self.identity_holds() && self.unaccounted.is_empty()
+    }
+}
+
+/// Reconcile the plan with the runner and driver terminal states.
+///
+/// `explicit_unaccounted` names nodes the driver knowingly did not dispatch.
+/// Any remaining plan residue is still named with `missing_reason`. Unknown
+/// tags, duplicates, and overlapping terminal buckets fail the identity closed.
+pub fn reconcile_node_accounting(
+    planned: impl IntoIterator<Item = String>,
+    executed: impl IntoIterator<Item = String>,
+    skipped: impl IntoIterator<Item = String>,
+    explicit_unaccounted: impl IntoIterator<Item = UnaccountedNode>,
+    missing_reason: &str,
+) -> NodeAccounting {
+    let mut errors = Vec::new();
+    let mut planned_set = BTreeSet::new();
+    for tag in planned {
+        if !planned_set.insert(tag.clone()) {
+            errors.push(format!("planned node appears more than once: {tag}"));
+        }
+    }
+
+    let mut executed_set = BTreeSet::new();
+    for tag in executed {
+        if !executed_set.insert(tag.clone()) {
+            errors.push(format!("executed node appears more than once: {tag}"));
+        }
+        if !planned_set.contains(&tag) {
+            errors.push(format!("executed node was not planned: {tag}"));
+        }
+    }
+
+    let mut skipped_set = BTreeSet::new();
+    for tag in skipped {
+        if !skipped_set.insert(tag.clone()) {
+            errors.push(format!("skipped node appears more than once: {tag}"));
+        }
+        if !planned_set.contains(&tag) {
+            errors.push(format!("skipped node was not planned: {tag}"));
+        }
+        if executed_set.contains(&tag) {
+            errors.push(format!("node is both executed and skipped: {tag}"));
+        }
+    }
+
+    let mut unaccounted = BTreeMap::new();
+    for node in explicit_unaccounted {
+        if !planned_set.contains(&node.tag) {
+            errors.push(format!("unaccounted node was not planned: {}", node.tag));
+        }
+        if executed_set.contains(&node.tag) || skipped_set.contains(&node.tag) {
+            errors.push(format!("unaccounted node overlaps another terminal bucket: {}", node.tag));
+        }
+        if unaccounted.insert(node.tag.clone(), node.reason).is_some() {
+            errors.push(format!("unaccounted node appears more than once: {}", node.tag));
+        }
+    }
+
+    for tag in &planned_set {
+        if !executed_set.contains(tag)
+            && !skipped_set.contains(tag)
+            && !unaccounted.contains_key(tag)
+        {
+            unaccounted.insert(tag.clone(), missing_reason.to_string());
+        }
+    }
+
+    NodeAccounting {
+        planned: planned_set.len(),
+        executed: executed_set.len(),
+        skipped: skipped_set
+            .into_iter()
+            .map(|tag| UnaccountedNode {
+                tag,
+                reason: "dependency failed before dispatch".to_string(),
+            })
+            .collect(),
+        unaccounted: unaccounted
+            .into_iter()
+            .map(|(tag, reason)| UnaccountedNode { tag, reason })
+            .collect(),
+        errors,
+    }
+}
+
+/// Inert two-sided bracket for the 58/42/0 incident at
+/// `a77d386935aafc813c96f6cee09fdecfbd3983d7`.
+pub fn node_accounting_self_test() -> Result<String, String> {
+    let runner_residue = [
+        "test.applications_e2e", "test.arbitrary_binaries", "test.detcore_misc",
+        "test.detcore_parallel", "test.envelope_levels", "test.ignored_syscall_regressions",
+        "test.liteinst_strict", "test.sabre_examples",
+    ];
+    let second_lane = [
+        "check.reverie_pin", "build.privileged_tests", "cpuid.faulting", "pmu.preemption",
+        "e2e.metadata", "build.manifest_guests", "e2e.manifest_applications",
+        "e2e.manifest_backend_parity_c",
+    ];
+    let executed: Vec<String> = (0..42).map(|n| format!("executed.{n:02}")).collect();
+    let mut planned = executed.clone();
+    planned.extend(runner_residue.iter().map(|tag| (*tag).to_string()));
+    planned.extend(second_lane.iter().map(|tag| (*tag).to_string()));
+    let explicit = second_lane.iter().map(|tag| UnaccountedNode {
+        tag: (*tag).to_string(),
+        reason: "second lane not dispatched after first-lane failure".to_string(),
+    });
+    let negative = reconcile_node_accounting(
+        planned.clone(), executed, Vec::<String>::new(), explicit,
+        "runner returned no terminal state after eager stop",
+    );
+    if !negative.identity_holds() || negative.is_complete() || negative.planned != 58
+        || negative.executed != 42 || !negative.skipped.is_empty()
+        || negative.unaccounted.len() != 16
+    {
+        return Err(format!("node accounting negative did not close 42 + 0 + 16 = 58: {negative:?}"));
+    }
+    let got: BTreeSet<&str> = negative.unaccounted.iter().map(|n| n.tag.as_str()).collect();
+    let expected: BTreeSet<&str> = runner_residue.iter().chain(second_lane.iter()).copied().collect();
+    if got != expected {
+        return Err(format!("node accounting lost incident identities: got={got:?} expected={expected:?}"));
+    }
+    let runner_reasons = negative.unaccounted.iter()
+        .filter(|n| n.reason == "runner returned no terminal state after eager stop").count();
+    let lane_reasons = negative.unaccounted.iter()
+        .filter(|n| n.reason == "second lane not dispatched after first-lane failure").count();
+    if (runner_reasons, lane_reasons) != (8, 8) {
+        return Err(format!("node accounting collapsed causes: runner={runner_reasons} lane={lane_reasons}"));
+    }
+
+    let positive = reconcile_node_accounting(
+        planned.clone(), planned, Vec::<String>::new(), Vec::<UnaccountedNode>::new(),
+        "must not be used",
+    );
+    if !positive.is_complete() || positive.planned != 58 || positive.executed != 58 {
+        return Err(format!("node accounting positive was not complete: {positive:?}"));
+    }
+    Ok("node accounting: positive 58+0+0=58; incident 42+0+16=58 (8 runner residue, 8 second-lane not-dispatched)".to_string())
 }
 
 impl CompatMode {
