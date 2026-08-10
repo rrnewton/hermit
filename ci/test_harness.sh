@@ -30,6 +30,7 @@ readonly -a BACKENDS=(ptrace dbt kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
 DAG_DIR="$ROOT_DIR/ci/dag"
 readonly DAG_DIR
+readonly MANIFEST_PLANNER_INNER_TIMEOUT_SECONDS=30
 
 function usage {
     cat <<'USAGE'
@@ -52,6 +53,7 @@ Filters:
   --ci-only               select only cells explicitly marked ci=true
   --prebuilt              require artifacts produced by the build command
   --allow-empty           permit an empty selection (DAG build/bucket nodes only)
+  --manifest-planner PATH use this trusted prebuilt manifest planner (DAG descendants only)
   --include-occasional    include tests marked occasional
   --include-manual        include a ci=false cell; requires exact --test and --mode
   --probe-disabled        run one explicitly disabled backend cell; requires exact
@@ -297,8 +299,7 @@ function load_tests {
     ID_BY_TEST=()
     METADATA_BY_ID=()
     local documents raw metadata id test relative kind
-    documents=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json) ||
-        die "TOML manifest validation failed"
+    documents=$(load_manifest_documents) || return $?
     while IFS= read -r raw; do
         id=$(jq -r .id <<<"$raw")
         relative=$(jq -r '.program // ""' <<<"$raw")
@@ -321,6 +322,102 @@ function load_tests {
         TESTS+=("$test")
     done < <(jq -c '.[] as $manifest | $manifest.test[] | . + {category:$manifest.bucket}' <<<"$documents")
     ((${#TESTS[@]} > 0)) || die "no tests discovered below $MANIFEST_ROOT"
+}
+
+function run_prebuilt_manifest_planner {
+    local planner=$1 timeout_seconds=${2:-$MANIFEST_PLANNER_INNER_TIMEOUT_SECONDS}
+    [[ -e $planner ]] || die "explicit manifest planner is missing: $planner"
+    [[ -x $planner ]] || die "explicit manifest planner is not executable: $planner"
+    [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] && ((timeout_seconds < 120)) ||
+        die "manifest planner inner timeout must be 1..119 seconds, got: $timeout_seconds"
+
+    local output status
+    if output=$(timeout --kill-after=5s "${timeout_seconds}s" \
+        "$planner" --format harness-json); then
+        status=0
+    else
+        status=$?
+    fi
+    case $status in
+        0) printf '%s\n' "$output" ;;
+        124|137) die "explicit manifest planner exceeded ${timeout_seconds}s inner timeout: $planner" ;;
+        *) die "explicit manifest planner failed with status $status: $planner" ;;
+    esac
+}
+
+function load_manifest_documents {
+    if [[ -n $MANIFEST_PLANNER ]]; then
+        run_prebuilt_manifest_planner "$MANIFEST_PLANNER"
+    else
+        cargo run --quiet -p hermit-manifest-plan -- --format harness-json ||
+            die "TOML manifest validation failed"
+    fi
+}
+
+function audit_manifest_planner_selection {
+    local scratch original_path output error status started elapsed
+    scratch=$(mktemp -d)
+    original_path=$PATH
+
+    cat >"$scratch/planner" <<'EOF'
+#!/usr/bin/env bash
+printf 'invoked\n' >"${PLANNER_MARKER:?}"
+printf '{"source":"explicit"}\n'
+EOF
+    cat >"$scratch/hung-planner" <<'EOF'
+#!/usr/bin/env bash
+sleep 10
+EOF
+    cat >"$scratch/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"${CARGO_MARKER:?}"
+printf '{"source":"cargo"}\n'
+EOF
+    chmod +x "$scratch/planner" "$scratch/hung-planner" "$scratch/cargo"
+    : >"$scratch/not-executable"
+
+    output=$(MANIFEST_PLANNER="$scratch/planner" PLANNER_MARKER="$scratch/planner.marker" \
+        CARGO_MARKER="$scratch/cargo.marker" PATH="$scratch:$original_path" \
+        load_manifest_documents)
+    [[ $output == '{"source":"explicit"}' ]] ||
+        die "explicit manifest planner output was not propagated verbatim"
+    [[ -f $scratch/planner.marker && ! -e $scratch/cargo.marker ]] ||
+        die "explicit manifest planner did not bypass the Cargo fallback"
+
+    set +e
+    error=$(MANIFEST_PLANNER="$scratch/missing" load_manifest_documents 2>&1)
+    status=$?
+    set -e
+    [[ $status == 2 && $error == "test_harness.sh: explicit manifest planner is missing: $scratch/missing" ]] ||
+        die "missing explicit manifest planner did not fail with the bound diagnostic: rc=$status error=$error"
+
+    set +e
+    error=$(MANIFEST_PLANNER="$scratch/not-executable" load_manifest_documents 2>&1)
+    status=$?
+    set -e
+    [[ $status == 2 && $error == "test_harness.sh: explicit manifest planner is not executable: $scratch/not-executable" ]] ||
+        die "non-executable manifest planner did not fail with the bound diagnostic: rc=$status error=$error"
+
+    started=$(date +%s)
+    set +e
+    error=$(run_prebuilt_manifest_planner "$scratch/hung-planner" 1 2>&1)
+    status=$?
+    set -e
+    elapsed=$(($(date +%s) - started))
+    [[ $status == 2 && $error == "test_harness.sh: explicit manifest planner exceeded 1s inner timeout: $scratch/hung-planner" ]] ||
+        die "hung manifest planner did not fail with the bound diagnostic: rc=$status error=$error"
+    ((elapsed < 5)) || die "hung manifest planner exceeded its inner timeout bracket: ${elapsed}s"
+
+    rm -f "$scratch/cargo.marker"
+    output=$(MANIFEST_PLANNER='' CARGO_MARKER="$scratch/cargo.marker" \
+        PATH="$scratch:$original_path" load_manifest_documents)
+    [[ $output == '{"source":"cargo"}' ]] ||
+        die "standalone Cargo manifest planner output was not propagated"
+    [[ $(<"$scratch/cargo.marker") == 'run --quiet -p hermit-manifest-plan -- --format harness-json' ]] ||
+        die "standalone manifest discovery did not invoke the Cargo fallback"
+
+    rm -rf "$scratch"
+    echo "PASS: explicit manifest planner is bounded and bypasses Cargo; standalone discovery retains the Cargo fallback"
 }
 
 function audit_inventory {
@@ -1060,6 +1157,8 @@ function emit_manifest_buckets {
 function audit_ci_correspondence {
     local lane dag
 
+    audit_manifest_planner_selection
+
     # Both DAG launch surfaces use the explicit ordinary-launcher mode; the DBT
     # wrapper is the sole child-budget caller.
     # shellcheck disable=SC2016
@@ -1340,7 +1439,7 @@ function audit_ci_correspondence {
             [.steps[] | select(
                 .group == "e2e"
                 and .job == "metadata"
-                and .cmd == "./ci/test_harness.sh validate"
+                and .cmd == "./ci/test_harness.sh validate --manifest-planner target/debug/hermit-manifest-plan"
                 and .timeout == 180
                 and .hint.est_duration_s == 75
                 and .hint.hard_mem_max_bytes == 1073741824
@@ -1407,7 +1506,7 @@ function audit_ci_correspondence {
                 (if $m.lane == "portable"
                  then "./ci/run-with-hermit-e2e-artifact.sh --require-install "
                  else "./ci/run-with-hermit-e2e-artifact.sh " end)
-                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
+                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --manifest-planner target/debug/hermit-manifest-plan --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
             def artifact_producer($lane):
                 if $lane == "portable" then "build.e2e_artifact" else "build.privileged_tests" end;
             ([.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | all(has("manifest")))
@@ -1438,7 +1537,9 @@ function audit_ci_correspondence {
             and ([.steps[] | select(has("manifest")) | .manifest.category] | unique | length)
                 == ([.steps[] | select(has("manifest"))] | length)
             and ([.steps[] | select(.group == "build" and .job == "manifest_guests"
-                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only --allow-empty"))] | length) == 1
+                    and .cmd == ("./ci/test_harness.sh build --lane " + $lane + " --ci-only --allow-empty --manifest-planner target/debug/hermit-manifest-plan"))] | length) == 1
+            and ([.steps[] | select(.cmd | contains("./ci/test_harness.sh "))]
+                | all(.cmd | contains("--manifest-planner target/debug/hermit-manifest-plan")))
         ' "$dag" >/dev/null || {
             rm -rf "$scratch"
             die "$lane DAG manifest nodes do not match the fail-closed build/run contract"
@@ -1582,6 +1683,7 @@ PROBE_DISABLED=0
 CI_ONLY=0
 PREBUILT=0
 ALLOW_EMPTY=0
+MANIFEST_PLANNER=
 
 function parse_options {
     while (($#)); do
@@ -1594,6 +1696,7 @@ function parse_options {
             --ci-only) CI_ONLY=1; shift ;;
             --prebuilt) PREBUILT=1; shift ;;
             --allow-empty) ALLOW_EMPTY=1; shift ;;
+            --manifest-planner) MANIFEST_PLANNER=${2:?missing manifest planner path}; shift 2 ;;
             --format) FORMAT=${2:?missing format}; shift 2 ;;
             --results) RESULTS=${2:?missing result path}; shift 2 ;;
             --junit) JUNIT=${2:?missing JUnit path}; shift 2 ;;
