@@ -475,8 +475,20 @@ CARGO_SHIM
     # ---- NEGATIVE (C2: an absent document must NOT refuse a real consumer) ---
     # This is the hosted portable matrix's exact shape. It carries no published
     # document, so a fail-closed resolver would turn a slow job into a red one.
+    #
+    # The rebuild runs against a SUCCEEDING cargo stand-in rather than real
+    # Cargo, for two reasons: this audit runs inside a DAG node that is
+    # concurrent with build.workspace, and an audit defending against the Cargo
+    # build lock must not take that lock itself; and the real Cargo producer is
+    # already exercised by the identity check above. The property under test is
+    # "absence falls through instead of refusing", which a refusal would fail
+    # before ever reaching the stand-in.
+    mkdir -p "$scratch/bin-ok"
+    printf '#!/usr/bin/env bash\nexec cat %q\n' "$bundle/harness.json" >"$scratch/bin-ok/cargo"
+    chmod 755 "$scratch/bin-ok/cargo"
     set +e
-    output=$(env HERMIT_MANIFEST_PLAN_POINTER="$scratch/absent.path" HERMIT_BIN="$scratch/bin/hermit-stub" \
+    output=$(env PATH="$scratch/bin-ok:$PATH" HERMIT_MANIFEST_PLAN_POINTER="$scratch/absent.path" \
+        HERMIT_BIN="$scratch/bin/hermit-stub" \
         "$ROOT_DIR/ci/test_harness.sh" run --lane privileged --category applications \
         --ci-only --allow-empty --prebuilt --results "$scratch/c2.jsonl" --junit "$scratch/c2.xml" 2>&1)
     status=$?
