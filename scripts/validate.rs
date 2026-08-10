@@ -3389,7 +3389,7 @@ fn short_hostname() -> String {
 /// ci-hub is the only component that unions it with other machines and the
 /// published append-only shards.
 fn ledger_tool_path() -> PathBuf {
-    if std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").is_some() {
+    if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         if let Some(path) = std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL") {
             return PathBuf::from(path);
         }
@@ -3401,7 +3401,7 @@ fn ledger_tool_path() -> PathBuf {
 }
 
 fn canonical_ledger_root() -> PathBuf {
-    if std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").is_some() {
+    if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
         if let Some(root) = std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT") {
             return PathBuf::from(root).join("ledger");
         }

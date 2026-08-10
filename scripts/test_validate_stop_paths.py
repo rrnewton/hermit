@@ -11,7 +11,6 @@ import socket
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,13 +21,14 @@ TEST_ROOTS: list[Path] = []
 def stop_test_env(
     tmpdir: Path,
     *,
+    mode: str = "1",
     lock_proven: bool = False,
     forged_owner: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
     env.update(
-        HERMIT_VALIDATE_STOP_TEST_MODE="1",
+        HERMIT_VALIDATE_STOP_TEST_MODE=mode,
         VALIDATE_STOP_TEST_LEDGER_TOOL=os.environ.get(
             "VALIDATE_STOP_TEST_LEDGER_TOOL",
             str(ROOT.parents[2] / "ci-hub" / "ledger" / "validate_rows.py"),
@@ -83,16 +83,17 @@ def stop_test_env(
     return env
 
 
-def ledger_path(tmpdir: Path) -> Path:
-    host = socket.gethostname().split(".", 1)[0]
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return tmpdir / "ledger" / "hermit" / host / f"{month}.jsonl"
+def ledger_events(root: Path) -> list[dict]:
+    """Read the adapter's live spool plus any already-published test shards."""
+    paths = [
+        *root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl"),
+        *root.glob("ledger/hermit/*/*.jsonl"),
+    ]
+    return [json.loads(line) for path in paths for line in path.read_text().splitlines()]
 
 
-def ledger_rows(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    return [json.loads(line)["legacy_row"] for line in path.read_text().splitlines()]
+def ledger_rows(root: Path) -> list[dict]:
+    return [event["legacy_row"] for event in ledger_events(root)]
 
 
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
@@ -132,7 +133,7 @@ def run_signal(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
         tmpdir = Path(tmp)
-        ledger = ledger_path(tmpdir)
+        ledger = tmpdir
         log = tmpdir / "validate.log"
         env = stop_test_env(tmpdir, lock_proven=lock_proven, forged_owner=forged_owner)
         env.update(
@@ -171,7 +172,7 @@ def run_signal(
 def run_incomplete_exit() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-incomplete-") as tmp:
         tmpdir = Path(tmp)
-        ledger = ledger_path(tmpdir)
+        ledger = tmpdir
         env = stop_test_env(tmpdir)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
@@ -194,6 +195,55 @@ def run_incomplete_exit() -> None:
         assert row["result"] == "fail", row
         assert row["gates_run"] == 2 and row["gates_expected"] is None, row
         assert row["interruption_signal"] is None, row
+
+
+def run_mode_activation_contract() -> None:
+    """Only the exact value 1 activates the seam and its path overrides."""
+    # Positive: MODE=1 must enter the seam and route its row through both
+    # fixture-only overrides. run_incomplete_exit() proves the full row shape;
+    # this compact bracket makes the activation contract explicit beside both
+    # negative values.
+    with tempfile.TemporaryDirectory(prefix="validate-stop-mode-one-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir
+        env = stop_test_env(tmpdir, mode="1")
+        env["VALIDATE_STOP_TEST_EXIT_EARLY"] = "1"
+        process = subprocess.run(
+            [str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+        assert len(ledger_rows(ledger)) == 1, output
+        assert "stop-path fixture" in output, output
+
+    # Negative: a present variable with value 0, and a present-but-empty
+    # variable, must both follow the ordinary inert plan path. Poisoned stop
+    # controls remain set so accidental presence/truthiness activation would
+    # enter the seam and write a fixture row instead.
+    for mode, label in (("0", "zero"), ("", "empty")):
+        with tempfile.TemporaryDirectory(prefix=f"validate-stop-mode-{label}-") as tmp:
+            tmpdir = Path(tmp)
+            ledger = tmpdir
+            env = stop_test_env(tmpdir, mode=mode)
+            env["VALIDATE_STOP_TEST_EXIT_EARLY"] = "1"
+            process = subprocess.run(
+                [str(VALIDATE), "--show-plan", "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            output = process.stdout.decode(errors="replace")
+            assert process.returncode == 0, (mode, output)
+            assert "PLAN ONLY (nothing executed)" in output, (mode, output)
+            assert "VALIDATE_STOP_TEST_READY" not in output, (mode, output)
+            assert not ledger_rows(ledger), (mode, ledger_rows(ledger), output)
 
 
 def run_canonical_adapter_contract(*, refuse: bool) -> None:
@@ -236,12 +286,10 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
         if refuse:
-            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert not ledger_events(canonical_root), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            events = ledger_events(canonical_root)
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
@@ -251,7 +299,7 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
 def run_cleanup_signal_race() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-cleanup-race-") as tmp:
         tmpdir = Path(tmp)
-        ledger = ledger_path(tmpdir)
+        ledger = tmpdir
         log = tmpdir / "validate.log"
         cleanup_ready = tmpdir / "cleanup-ready"
         env = stop_test_env(tmpdir)
@@ -300,6 +348,7 @@ def main() -> None:
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
+    run_mode_activation_contract()
     run_canonical_adapter_contract(refuse=False)
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
@@ -308,7 +357,7 @@ def main() -> None:
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
-        "accept/refuse bracketed; cleanup is signal-atomic"
+        "accept/refuse bracketed; MODE=1/0/empty activation bracketed; cleanup is signal-atomic"
     )
 
 
