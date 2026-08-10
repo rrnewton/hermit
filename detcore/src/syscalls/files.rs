@@ -60,14 +60,14 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 
-/// Linux reduces the default capacity of newly-created pipes from sixteen pages to two
+/// Linux reduces the default capacity of newly-created pipes from sixteen pages to one or two
 /// pages after the creating user crosses `pipe-user-pages-soft`.  That host-global pressure
 /// must not decide how many guest writes complete before a pipeline peer closes its end.
 ///
-/// Two x86_64 pages is the kernel's pressure-mode default and can be applied by an
-/// unprivileged process even after the soft limit is crossed.  Pin scheduler-managed pipes
+/// One x86_64 page can always be applied as a shrink (or no-op) by an unprivileged process,
+/// including after the soft limit is crossed.  Pin scheduler-managed pipes
 /// before either endpoint is exposed to the guest so every run starts from the same state.
-const DETERMINISTIC_PIPE_CAPACITY: i32 = 8 * 1024;
+const DETERMINISTIC_PIPE_CAPACITY: i32 = 4 * 1024;
 
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
@@ -1821,15 +1821,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
             if internally_nonblocking {
-                let applied_capacity = guest
+                let capacity_result = guest
                     .inject(
                         syscalls::Fcntl::new()
                             .with_fd(fds[1])
                             .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY)),
                     )
-                    .await?;
-                if applied_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY) {
-                    return Err(Errno::EIO);
+                    .await;
+                let capacity_error = match capacity_result {
+                    Ok(applied) if applied == i64::from(DETERMINISTIC_PIPE_CAPACITY) => None,
+                    Ok(_) => Some(Errno::EIO),
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = capacity_error {
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fds[0])).await;
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fds[1])).await;
+                    return Err(error);
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
