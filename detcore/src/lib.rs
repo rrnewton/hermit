@@ -1931,7 +1931,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Ok(0)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#1849): The file-ownership mutation family
+            // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
             // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
             // identity that the credential query (#1549) and credential set
             // (#787) families already implement. A real root process's chown
