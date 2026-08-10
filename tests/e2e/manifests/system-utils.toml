@@ -1054,3 +1054,345 @@ dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
+
+[[test]]
+id = "system-utils/startup-surface-identity"
+description = "argv, environ order, the full auxv vector (incl. AT_RANDOM bytes and the raw vDSO base) and initial stack layout are identical across repeated Hermit runs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/startup_surface_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: AT_RANDOM, the vDSO base and stack addresses differ every run by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+kvm = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+liteinst = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+ptrace = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+sabre = "The startup surface is fixed before main() and is not what chaos scheduling perturbs"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+kvm = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+liteinst = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+ptrace = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+sabre = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+kvm = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+liteinst = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+ptrace = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+sabre = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
+
+[[test]]
+id = "system-utils/errno-path-identity"
+description = "syscall FAILURE paths return identical errno across repeated Hermit runs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/errno_path_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "A single run cannot observe run-to-run identity; verify's double run is the contract"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "These failures are argument-intrinsic and not what chaos scheduling perturbs"
+kvm = "These failures are argument-intrinsic and not what chaos scheduling perturbs"
+liteinst = "These failures are argument-intrinsic and not what chaos scheduling perturbs"
+ptrace = "These failures are argument-intrinsic and not what chaos scheduling perturbs"
+sabre = "These failures are argument-intrinsic and not what chaos scheduling perturbs"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+kvm = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+liteinst = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+ptrace = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of error paths is a separate contract"
+kvm = "Record/replay identity of error paths is a separate contract"
+liteinst = "Record/replay identity of error paths is a separate contract"
+ptrace = "Record/replay identity of error paths is a separate contract"
+sabre = "Record/replay identity of error paths is a separate contract"
+
+[[test]]
+id = "system-utils/auxv-loader-dump"
+description = "LD_SHOW_AUXV loader dump: AT_RANDOM, vdso base and the rest of the auxiliary vector"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/system-utils/auxv-loader-dump.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "AT_RANDOM and the vdso base vary on every native execution by design; native repetition is not a contract"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Established on ptrace first; other backends ratchet against this shared entry"
+kvm = "KVM requires the privileged runner and does not start on the validation host"
+sabre = "Established on ptrace first; other backends ratchet against this shared entry"
+liteinst = "Established on ptrace first; other backends ratchet against this shared entry"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is tracked separately from this strict-verify entry"
+dbt = "Record/replay is unsupported by DBT"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "The dump is produced once at startup and has no schedule-diversity oracle"
+dbt = "Chaos scheduling is unsupported by DBT"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this entry"
+dbt = "No custom edge-case arguments have been calibrated for this entry"
+kvm = "No custom edge-case arguments have been calibrated for this entry"
+sabre = "No custom edge-case arguments have been calibrated for this entry"
+liteinst = "No custom edge-case arguments have been calibrated for this entry"
+
+[[test]]
+id = "system-utils/ps-proc-table"
+description = "ps walking the virtualized /proc process table: getdents plus per-pid stat parsing"
+lane = "portable"
+requires = ["linux","x86_64","userns","ptrace"]
+timeout_seconds = 90
+occasional = false
+program = "tests/e2e/system-utils/ps-proc-table.sh"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "The host process table changes continuously, so native repetition is not a contract"
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Established on ptrace first; other backends ratchet against this shared entry"
+kvm = "KVM requires the privileged runner and does not start on the validation host"
+sabre = "Established on ptrace first; other backends ratchet against this shared entry"
+liteinst = "Established on ptrace first; other backends ratchet against this shared entry"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is tracked separately from this strict-verify entry"
+dbt = "Record/replay is unsupported by DBT"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling perturbs the guest process tree that this entry reports"
+dbt = "Chaos scheduling is unsupported by DBT"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this entry"
+dbt = "No custom edge-case arguments have been calibrated for this entry"
+kvm = "No custom edge-case arguments have been calibrated for this entry"
+sabre = "No custom edge-case arguments have been calibrated for this entry"
+liteinst = "No custom edge-case arguments have been calibrated for this entry"
+
+[[test]]
+id = "system-utils/file-timestamp-identity"
+description = "timestamps and metadata on guest-created files are identical across repeated Hermit runs"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/file_timestamp_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: real filesystem timestamps differ every run by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "File timestamps are set on write and are not what chaos scheduling perturbs"
+kvm = "File timestamps are set on write and are not what chaos scheduling perturbs"
+liteinst = "File timestamps are set on write and are not what chaos scheduling perturbs"
+ptrace = "File timestamps are set on write and are not what chaos scheduling perturbs"
+sabre = "File timestamps are set on write and are not what chaos scheduling perturbs"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+kvm = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+liteinst = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+ptrace = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of file timestamps is a separate contract"
+kvm = "Record/replay identity of file timestamps is a separate contract"
+liteinst = "Record/replay identity of file timestamps is a separate contract"
+ptrace = "Record/replay identity of file timestamps is a separate contract"
+sabre = "Record/replay identity of file timestamps is a separate contract"
+
+[[test]]
+id = "system-utils/shm-coherency-identity"
+description = "what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 120
+occasional = false
+program = "tests/c/shm_coherency_identity.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.build]
+cflags = ["-O0", "-D_GNU_SOURCE"]
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+kvm = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+liteinst = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+sabre = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native is the NEGATIVE control: the reader catches a different prefix of the writer's record run to run, by design, so this cell must never be enabled"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+dbt = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+kvm = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+liteinst = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+ptrace = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+sabre = "Chaos deliberately perturbs the interleaving this fixture pins; a difference there would not be a regression"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+dbt = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+kvm = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+liteinst = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+ptrace = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+dbt = "Record/replay identity of shared-memory observation is a separate contract"
+kvm = "Record/replay identity of shared-memory observation is a separate contract"
+liteinst = "Record/replay identity of shared-memory observation is a separate contract"
+ptrace = "Record/replay identity of shared-memory observation is a separate contract"
+sabre = "Record/replay identity of shared-memory observation is a separate contract"

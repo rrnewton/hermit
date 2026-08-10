@@ -3113,6 +3113,108 @@
       "path": "tests/c/dbt_wait_lifecycle.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/dbt_wait_lifecycle.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/startup_surface_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/startup_surface_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"
+    },
+    {
+      "path": "tests/c/signal_waitstatus_identity.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/signal_waitstatus_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend wait-status identity (WIFSIGNALED/WTERMSIG/WCOREDUMP/WIFEXITED) with ptrace and dbt measured byte-identical to native; SaBRe is disabled on a measured SIGILL hang"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/short_io_split_identity.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM does not start"
+    },
+    {
+      "path": "tests/c/hardware_trap_identity.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/hardware_trap_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend identity of HARDWARE-generated traps (#UD, #DE, #PF) by both wait status and siginfo si_code, with ptrace and dbt measured identical to native; SaBRe is disabled on a measured undelivered #UD and a hang on #DE"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/errno_path_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/errno_path_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: exercises 40 syscall failure cases chosen to fail for argument-intrinsic reasons and prints each errno, so verify's double run asserts that failure is as deterministic as success"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/data-handling/dd-partial-transfers.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/data-handling/dd-partial-transfers.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/auxv-loader-dump.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/auxv-loader-dump.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/ps-proc-table.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/ps-proc-table.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/file_timestamp_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/file_timestamp_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/shm_coherency_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml",
+      "why": "tests/c/shm_coherency_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml: forks a writer and samples MAP_SHARED anonymous, MAP_SHARED file-backed and memfd mappings without any added barrier, printing the observed words and the branch taken including whether a partial update was caught, plus MAP_PRIVATE COW isolation and msync writeback, so verify's double run asserts that what each process OBSERVES is reproducible"
+    },
+    {
+      "path": "tests/backend-parity/fixtures/event_delivery_ordering.c",
+      "disposition": "manifest-test",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM omits the inotify family"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/inline_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/inline_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): places raw inline syscall instructions in the main ELF so a main-ELF binary rewriter has sites to patch, and pins that the rewritten program still produces identical output under strict verification"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): is a freestanding static guest with no PLT and no interpreter, so the whole program including every syscall site lives in the main ELF, pinning the rewriter's coverage of that layout"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): interleaves patchable inline syscall sites with unpatched libc.so syscalls in one run, pinning that a partially rewritten program is still deterministic under strict verification"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/static_libc_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/static_libc_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): is statically linked against glibc so libc's own syscall instructions live in the main ELF, pinning the rewriter against real libc syscall sequences rather than hand-written ones"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/stat_metadata_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/backend-parity/fixtures/stat_metadata_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins that stat/fstat/lstat/statx metadata (st_ino, st_dev, st_nlink, st_blocks and the timestamps including statx btime) does not leak host state and that timestamps come from continuous virtual time -- identical across a double run yet still advancing within one run -- with a branch taken on an inode comparison so the decision is pinned too"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/readdir_order_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/readdir_order_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): pins directory-enumeration order across a double strict run, asserting the small (single-buffer) case is determinized via --require-small-determinized while the large per-buffer-sort gap stays reported-only; the 90s budget is set from four measured 7.59-7.99s verify runs"
     }
   ],
   "schema": 2
