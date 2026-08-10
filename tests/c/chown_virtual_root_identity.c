@@ -24,8 +24,8 @@
  *   - a plain pass-through satisfies the error half and reintroduces the
  *     host-dependent EPERM/EINVAL the determinization exists to remove.
  *
- * Only an implementation that emulates the identity half while forwarding the
- * argument half passes all of the checks below.
+ * Only an implementation that emulates the identity half while validating the
+ * argument half without entering setattr passes all of the checks below.
  *
  * Success is printing "chown-virtual-root-identity-ok" and exiting 0. Every
  * failure prints the exact call, what was expected, and what was observed.
@@ -98,6 +98,25 @@ int main(void) {
     return 1;
   }
 
+  /* Arm a host-visible side-effect canary. Linux chown_common() strips these
+   * privilege bits even when both requested ids are -1, so a validating chown
+   * is not a no-op. The determinized path must not enter setattr at all. */
+  if (fchmod(fd, 04755) != 0) {
+    perror("fchmod(setuid canary)");
+    return 1;
+  }
+  struct stat before;
+  if (fstat(fd, &before) != 0) {
+    perror("fstat(before)");
+    return 1;
+  }
+  const mode_t mode_before = before.st_mode & 07777;
+  if (mode_before != 04755) {
+    printf("FAIL     %-42s expected mode=4755, got mode=%04o\n", "setuid canary armed",
+           mode_before);
+    return 1;
+  }
+
   /* ---- Identity half: these all failed before #1849. ---- */
   expect_ok("chown(file, FOREIGN)", chown(path, FOREIGN_UID, FOREIGN_GID));
   expect_ok("chown(file, 0, 0)", chown(path, 0, 0));
@@ -147,6 +166,23 @@ int main(void) {
   } else {
     printf("ok       %-42s owner unchanged (%u:%u), as documented\n", "stat(file) read-back",
            (unsigned)st.st_uid, (unsigned)st.st_gid);
+  }
+  const mode_t mode_after = st.st_mode & 07777;
+  if (mode_after != mode_before) {
+    printf("FAIL     %-42s mode changed %04o -> %04o\n", "stat(file) mode read-back", mode_before,
+           mode_after);
+    failures++;
+  } else {
+    printf("ok       %-42s mode unchanged (%04o)\n", "stat(file) mode read-back", mode_after);
+  }
+  if (st.st_ctim.tv_sec != before.st_ctim.tv_sec || st.st_ctim.tv_nsec != before.st_ctim.tv_nsec) {
+    printf("FAIL     %-42s ctime changed %lld.%09ld -> %lld.%09ld\n", "stat(file) ctime read-back",
+           (long long)before.st_ctim.tv_sec, before.st_ctim.tv_nsec, (long long)st.st_ctim.tv_sec,
+           st.st_ctim.tv_nsec);
+    failures++;
+  } else {
+    printf("ok       %-42s ctime unchanged (%lld.%09ld)\n", "stat(file) ctime read-back",
+           (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
   }
 
   close(fd);
