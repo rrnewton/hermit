@@ -800,14 +800,46 @@ fn self_test() -> Result<(), String> {
             missing.len()
         ));
     }
+    let rr_failures = validate_corpus::rr_known_failures();
+    let rr_unqualifiable = validate_corpus::rr_attempted_unqualifiable();
+    for label in rr_failures.keys().chain(rr_unqualifiable.keys()) {
+        if !present.contains(label) {
+            return Err(format!(
+                "R/R named exclusion {label:?} is absent from the rr corpus"
+            ));
+        }
+        if validate_corpus::RR_PASSING_LABELS.contains(label) {
+            return Err(format!(
+                "R/R named exclusion {label:?} is also listed as passing"
+            ));
+        }
+    }
+    let overlap: Vec<&&str> = rr_failures
+        .keys()
+        .filter(|label| rr_unqualifiable.contains_key(*label))
+        .collect();
+    if !overlap.is_empty() {
+        return Err(format!(
+            "R/R exclusions cannot be both FAIL and ATTEMPTED_UNQUALIFIABLE: {overlap:?}"
+        ));
+    }
     // e9patch admits a superset of its gated total (rows gate only when the
     // program is installed), so the invariant is >=, not ==.
-    let e9 = count("e9patch")?;
+    let e9_rows = validate_corpus::load(&root, "e9patch", &paths)?;
+    let e9 = e9_rows.len();
     if e9 < validate_corpus::E9PATCH_COMPAT_TOTAL {
         return Err(format!(
             "e9patch corpus has {e9} rows, below E9PATCH_COMPAT_TOTAL {}",
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
+    }
+    let e9_present: BTreeSet<&str> = e9_rows.iter().map(|r| r.label.as_str()).collect();
+    for label in ["curl-localhost", "wget-localhost"] {
+        if !e9_present.contains(label) {
+            return Err(format!(
+                "measured e9patch localhost L2 pass {label:?} is absent from the e9patch corpus"
+            ));
+        }
     }
     println!(
         "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
@@ -3201,6 +3233,14 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             excluded.len()
         );
         for (label, why) in &excluded {
+            println!("  - {label}: {why}");
+        }
+        let unqualifiable = validate_corpus::rr_attempted_unqualifiable();
+        println!(
+            "R/R ratchet additionally excludes {} ATTEMPTED_UNQUALIFIABLE program(s) that never reached replay comparison:",
+            unqualifiable.len()
+        );
+        for (label, why) in &unqualifiable {
             println!("  - {label}: {why}");
         }
     }
