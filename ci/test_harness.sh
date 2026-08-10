@@ -1879,6 +1879,16 @@ function validate_dag_correspondence {
         [[ -f $dag ]] || die "missing committed DAG: ci/dag/$lane.json"
         jq -e . >/dev/null <"$dag" || die "invalid DAG JSON: ci/dag/$lane.json"
 
+        if [[ $lane == portable ]]; then
+            jq -e '
+                .resource_caps.hermit_guest as $cap
+                | $cap >= 2
+                and ([.steps[] | select(.group == "test" and .job == "sabre_examples")
+                      | .hint.resources.hermit_guest] == [$cap])
+            ' "$dag" >/dev/null ||
+                die "ci/dag/portable.json: test.sabre_examples must reserve the complete hermit_guest capacity"
+        fi
+
         # --- (1) Referential integrity of the committed DAG. ---
         local node_ids dup dep_id
         node_ids=$(jq -r '.steps[] | .group + "." + .job' "$dag" | LC_ALL=C sort)
