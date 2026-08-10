@@ -42,7 +42,7 @@
  * Mixed entry types (regular files, subdirectories, symlinks) are included so
  * the contract covers d_type variation and not just names.
  *
- * MEASURED AT THE TIME OF WRITING (hermit ptrace, --strict, devbig014):
+ * MEASURED AT THE TIME OF WRITING (hermit ptrace, --strict, on a shared dev host):
  *   native   small order_identical=0 seams_rev=23   large order_identical=0 seams_rev=1999
  *   hermit   small order_identical=1 seams_rev=0    large order_identical=0 seams_rev=1
  * SMALL is fully determinized. LARGE is NOT, and seams_rev=1 is the precise
