@@ -2090,6 +2090,24 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// Clear the robust-list head for a candidate `execve` image, returning the
+    /// previous value so a *failed* exec can put it back.
+    ///
+    /// Linux clears `task->robust_list` when `execve` succeeds, and doing the
+    /// same is load-bearing rather than tidy: a head recorded against the old
+    /// address space is a wild pointer in the new one, and consulting it at
+    /// thread exit would walk unrelated guest memory and write
+    /// `FUTEX_OWNER_DIED` into whatever happened to look like a futex word.
+    pub(crate) fn take_robust_list_for_exec(&mut self) -> Option<usize> {
+        self.robust_list_head.take()
+    }
+
+    /// Restore the head after an `execve` that failed and left the old address
+    /// space intact.
+    pub(crate) fn restore_robust_list_after_failed_exec(&mut self, previous: Option<usize>) {
+        self.robust_list_head = previous;
+    }
+
     /// Resolve a futex key from its opcode mode and virtual address.
     pub(crate) fn futex_id(&self, address: usize, is_private: bool) -> FutexID {
         if is_private {
@@ -2652,6 +2670,41 @@ mod timeslice_tests {
     use super::*;
     use crate::DEFAULT_PRIORITY;
     use crate::preemptions::ThreadHistory;
+
+    /// A stale robust-list head must never survive into a new address space.
+    /// `run_robust_list_owner_death` walks from whatever this field holds, so if
+    /// `execve` left the old image's head here, thread exit would follow a wild
+    /// pointer through the *new* image and write `FUTEX_OWNER_DIED` into
+    /// whatever happened to sit at the computed word address.
+    #[test]
+    fn a_successful_exec_clears_the_robust_list_head() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        assert_eq!(state.robust_list_head, None, "a fresh thread has no list");
+
+        state.robust_list_head = Some(0x7ffff7bff920);
+        assert_eq!(
+            state.take_robust_list_for_exec(),
+            Some(0x7ffff7bff920),
+            "the previous head is handed back for the failure path"
+        );
+        assert_eq!(
+            state.robust_list_head, None,
+            "the candidate exec image starts with no robust list, as after copy_process"
+        );
+    }
+
+    /// `execve` returns only on failure, and then the old address space -- and
+    /// so the old head -- is still valid.
+    #[test]
+    fn a_failed_exec_restores_the_robust_list_head() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        state.robust_list_head = Some(0x404100);
+
+        let saved = state.take_robust_list_for_exec();
+        state.restore_robust_list_after_failed_exec(saved);
+
+        assert_eq!(state.robust_list_head, Some(0x404100));
+    }
 
     #[test]
     fn regular_file_opens_do_not_shift_socket_cookie_identity() {
