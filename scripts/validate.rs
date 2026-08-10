@@ -805,6 +805,7 @@ fn self_test() -> Result<(), String> {
     coverage_schema_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
+    managed_worktree_front_door_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -1810,6 +1811,166 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
         if !cur.pop() || cur.as_os_str().is_empty() {
             return None;
         }
+    }
+}
+
+/// Return the slot name only for the canonical managed-worktree layout.
+///
+/// This is deliberately an exact path-shape check, not a substring search:
+/// `<dev-hermit>/worktrees/<slot>/hermit` has exactly three components below
+/// the already-verified dev-hermit parent.  The primary checkout
+/// `<dev-hermit>/hermit`, standalone clones, and lookalike paths therefore do
+/// not inherit managed-slot policy accidentally.
+fn managed_worktree_slot<'a>(root: &'a Path, parent: &Path) -> Option<&'a str> {
+    let relative = root.strip_prefix(parent).ok()?;
+    let mut components = relative.components();
+    let worktrees = components.next()?.as_os_str().to_str()?;
+    let slot = components.next()?.as_os_str().to_str()?;
+    let hermit = components.next()?.as_os_str().to_str()?;
+    if components.next().is_some()
+        || worktrees != "worktrees"
+        || hermit != "hermit"
+        || slot.is_empty()
+        || !slot.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    Some(slot)
+}
+
+/// Decide whether a managed-slot product run must be sent through ci-hub.
+///
+/// `canonically_admitted` is supplied only by
+/// [`canonical_validate_lock_admission`] in production.  Keeping the path and
+/// message construction pure makes both sides bracketable without acquiring a
+/// real box-exclusive lock in `--self-test`.
+fn managed_worktree_front_door_refusal(
+    parent: &Path,
+    root: &Path,
+    commit: &str,
+    requested_args: &str,
+    canonically_admitted: bool,
+) -> Option<String> {
+    managed_worktree_slot(root, parent)?;
+    if canonically_admitted {
+        return None;
+    }
+    let ci_hub = validate_plan::shell_quote(&parent.join("ci-hub/ci-hub").to_string_lossy());
+    let checkout = validate_plan::shell_quote(&root.to_string_lossy());
+    Some(format!(
+        "validate: REFUSED — managed worktree product validation must enter through the canonical ci-hub admission.\n\
+         A naked run from {checkout} can consume the validation box without holding the exact\n\
+         validate-lock owner ancestry, starving owner-watch and other admitted work.\n\
+         \n\
+         Run this exact command instead:\n\
+         \n\
+           {ci_hub} validate-run --checkout {checkout} --agent '<registered-agent-name>' --target {commit} -- {requested_args}"
+    ))
+}
+
+/// Reproduce the caller's validated argv after ci-hub's `--` separator.
+/// An empty argv means the driver's default full profile.
+fn requested_validate_args() -> String {
+    let args = std::env::args()
+        .skip(1)
+        .map(|arg| validate_plan::shell_quote(&arg))
+        .collect::<Vec<_>>();
+    if args.is_empty() { "full".into() } else { args.join(" ") }
+}
+
+/// Four-way bracket for the owner-watch front door.  It is intentionally pure:
+/// no validate lock is acquired and no product command, ledger writer, or
+/// receipt publisher can run from this test.
+fn managed_worktree_front_door_bracket() -> Result<(), String> {
+    let parent = PathBuf::from("/srv/dev-hermit");
+    let primary = parent.join("hermit");
+    let managed = parent.join("worktrees/slot07/hermit");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let requested = "--strict-compat-only";
+
+    // Primary naked validate remains allowed and therefore continues into the
+    // existing common run/ledger path below the guard.
+    if managed_worktree_front_door_refusal(
+        &parent, &primary, commit, requested, false,
+    )
+    .is_some()
+    {
+        return Err("owner-watch front door refused the primary checkout".into());
+    }
+
+    // A naked managed-slot product run is refused with one copy-pasteable,
+    // exact command shape: real parent tool, checkout, explicit registered-agent
+    // placeholder (slot names are not agent identities), target and argv.
+    let refusal = managed_worktree_front_door_refusal(
+        &parent, &managed, commit, requested, false,
+    )
+    .ok_or_else(|| "owner-watch front door accepted a naked managed-slot run".to_string())?;
+    let exact = format!(
+        "/srv/dev-hermit/ci-hub/ci-hub validate-run --checkout \
+         /srv/dev-hermit/worktrees/slot07/hermit --agent '<registered-agent-name>' --target \
+         {commit} -- {requested}"
+    );
+    if !refusal.contains(&exact) || !refusal.contains("starving owner-watch") {
+        return Err(format!(
+            "owner-watch refusal omitted its exact remediation or consequence: {refusal}"
+        ));
+    }
+
+    // The same exact path, including a nested focused payload, is allowed only
+    // when the caller has already proved canonical validate-lock owner ancestry.
+    if managed_worktree_front_door_refusal(
+        &parent, &managed, commit, requested, true,
+    )
+    .is_some()
+    {
+        return Err("owner-watch front door refused canonical lock admission".into());
+    }
+
+    // Lookalikes must not be classified by substring or prefix.
+    for decoy in [
+        parent.join("worktrees/slot07/hermit/child"),
+        parent.join("worktrees/slot07/hermit-copy"),
+        parent.join("scratch/worktrees/slot07/hermit"),
+        parent.join("worktrees/SLOT07/hermit"),
+    ] {
+        if managed_worktree_slot(&decoy, &parent).is_some() {
+            return Err(format!(
+                "owner-watch front door classified noncanonical path {} as managed",
+                decoy.display()
+            ));
+        }
+    }
+
+    // The retired producer environment marker is not an input to the decision.
+    // Bracket that explicitly because a forgeable env exemption was the defect
+    // in the historical implementation.
+    let saved = std::env::var_os("CI_HUB_VALIDATE_PRODUCER");
+    std::env::set_var("CI_HUB_VALIDATE_PRODUCER", "forged");
+    let forged = managed_worktree_front_door_refusal(
+        &parent, &managed, commit, requested, false,
+    )
+    .is_some();
+    match saved {
+        Some(value) => std::env::set_var("CI_HUB_VALIDATE_PRODUCER", value),
+        None => std::env::remove_var("CI_HUB_VALIDATE_PRODUCER"),
+    }
+    if !forged {
+        return Err("owner-watch front door trusted forged CI_HUB_VALIDATE_PRODUCER".into());
+    }
+
+    println!(
+        "  owner-watch front door: primary 1 allowed / naked slot 1 refused / canonical \
+         admission 1 allowed / lookalikes 4 ignored / forged env 1 refused"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod owner_watch_front_door_tests {
+    #[test]
+    fn primary_slot_admission_and_forged_env_are_bracketed() {
+        super::managed_worktree_front_door_bracket()
+            .expect("owner-watch managed-worktree front-door bracket");
     }
 }
 
@@ -4291,6 +4452,47 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
+    }
+
+    // ---- owner-watch front door --------------------------------------------
+    //
+    // A managed slot may start product work only beneath the box-global
+    // validate-lock owner.  Do not trust CI_HUB_VALIDATE_PRODUCER (or any other
+    // caller-supplied marker): the existing authority query binds the live lock
+    // owner PID/start-time to this process's real ancestry, exact commit and
+    // host.  Primary and standalone checkouts retain their historical naked-run
+    // behavior, including the common ledger writer below.  Inert help,
+    // self-test, stop-test and show-plan paths bypass this product-work guard.
+    if !args.show_plan {
+        if let Some(parent) = parent.as_deref() {
+            if managed_worktree_slot(&root, parent).is_some() {
+                let commit = git_sha();
+                let host = short_hostname();
+                let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+                if let Some(refusal) = managed_worktree_front_door_refusal(
+                    parent,
+                    &root,
+                    &commit,
+                    &requested_validate_args(),
+                    admitted,
+                ) {
+                    eprintln!("{refusal}");
+                    return RunSummary::refused(
+                        4,
+                        &profile_name,
+                        "the owner-watch managed-worktree front door",
+                        vec![
+                            "this exact worktree is managed by dev-hermit, but this process is not \
+                             descended from the canonical validate-lock owner"
+                                .into(),
+                            "use the exact ci-hub validate-run command printed above; environment \
+                             markers cannot authorize product work"
+                                .into(),
+                        ],
+                    );
+                }
+            }
+        }
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
