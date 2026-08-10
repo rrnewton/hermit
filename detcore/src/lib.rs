@@ -1116,6 +1116,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::uname,
                 Sysno::exit_group,
                 Sysno::exit,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // Rare (once per thread) but load-bearing: without it the exit
+                // hook cannot replay `exit_robust_list()` and robust-mutex
+                // waiters are never woken.
+                Sysno::set_robust_list,
                 Sysno::dup,
                 Sysno::dup2,
                 Sysno::dup3,
@@ -1586,6 +1591,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // We only get to the point of creating child threads if we're past the first execve.
                     past_global_first_execve: true,
                     interrupt_at: self.cfg.interrupts_for_thread(dettid),
+
+                    // `copy_process()` sets `p->robust_list = NULL` for every
+                    // new task, thread or process alike. The child re-registers
+                    // its own head before it can own a robust futex.
+                    robust_list_head: None,
                 }
             }
         }
@@ -2660,6 +2670,19 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-robust-futex-owner-death): Review observing
+            // the robust-list registration without changing its pass-through
+            // classification. This is still a pass-through — Linux owns the
+            // registration and supplies its result — but Detcore remembers the
+            // head address so thread exit can replay `exit_robust_list()`
+            // against its own futex waiter pool.
+            SyscallClassification::PassThrough if call.number() == Sysno::set_robust_list => {
+                match call {
+                    Syscall::SetRobustList(s) => self.handle_set_robust_list(guest, s).await,
+                    _ => self.passthrough(guest, call).await,
+                }
+            }
             // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
             // reviewed classification table routes them, and every other reviewed
             // PassThrough syscall, through the blanket arm below.

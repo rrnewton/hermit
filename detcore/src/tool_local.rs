@@ -1778,6 +1778,17 @@ pub struct ThreadState<T> {
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
+
+    /// Guest address of this thread's `struct robust_list_head`, as last
+    /// registered by a successful `set_robust_list(2)`.
+    ///
+    /// Linux clears `task->robust_list` in `copy_process()` and in `execve`, so
+    /// this is never inherited: every thread re-registers its own head (glibc
+    /// does so in `start_thread`). Detcore replays the kernel's
+    /// `exit_robust_list()` walk from this address when the thread exits; see
+    /// `crate::syscalls::robust_list`.
+    #[serde(default)]
+    pub(crate) robust_list_head: Option<usize>,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -2075,6 +2086,7 @@ impl<T> ThreadState<T> {
             preemption_points: None,
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
+            robust_list_head: None,
         }
     }
 
