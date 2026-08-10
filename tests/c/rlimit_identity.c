@@ -52,7 +52,7 @@
  * The guest-chosen soft limits (64, then 32) are clamped to the observed hard
  * limit and so remain host-independent on any host whose limit is at least 64.
  * It uses no threads, no blocking I/O, and no signal delivery, so it is safe
- * under the DBI no-preemption scheduler.
+ * under the DBT no-preemption scheduler.
  */
 
 #include <errno.h>

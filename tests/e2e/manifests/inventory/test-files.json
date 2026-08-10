@@ -232,7 +232,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/event_delivery_ordering.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI)",
-      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM omits the inotify family"
+      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM omits the inotify family"
     },
     {
       "disposition": "manifest-test",
@@ -574,7 +574,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/short_io_split_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI)",
-      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM does not start"
+      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM does not start"
     },
     {
       "disposition": "manifest-test",
