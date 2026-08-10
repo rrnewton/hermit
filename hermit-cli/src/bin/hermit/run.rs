@@ -27,6 +27,7 @@ use clap::Parser;
 use colored::Colorize;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
+use detcore_model::summary::RunSummary;
 use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
@@ -70,6 +71,36 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn read_run_summary_for_progress(path: &Path) -> Option<RunSummary> {
+    let result = fs::read(path)
+        .with_context(|| format!("reading verification run summary {}", path.display()))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing verification run summary {}", path.display()))
+        });
+    match result {
+        Ok(summary) => Some(summary),
+        Err(error) => {
+            // This summary feeds only the non-authoritative "less red" metric.
+            // Losing it must be visible, but must never manufacture a binary
+            // no-result after the two runs themselves completed successfully.
+            eprintln!(
+                "WARNING: divergence progress unavailable; binary verification will continue: {error:#}"
+            );
+            None
+        }
+    }
+}
+
+fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
+    tempfile::Builder::new()
+        .prefix(".hermit-verify-summary-")
+        // Keep the file in the checkout: Hermit's isolated /tmp is intentionally
+        // not the host /tmp, while the checkout is visible to both run containers.
+        .tempfile_in(std::env::current_dir()?)
+        .context("creating private verification run summary")
 }
 
 fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
@@ -356,7 +387,8 @@ pub struct RunOpts {
     /// "deterministic"|"info"|"full_trace","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
-    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
+    /// "skip_commit":bool,"skip_detlog":bool},"divergence_progress":object|null,
+    /// "guest_exit_code":int|null,
     /// "guest_signal":int|null}`. This is the exit-code-independent verdict
     /// channel: `verified` reflects whether the two runs matched, regardless of
     /// what the guest exited with, so a caller need not (and must not) infer the
@@ -2712,9 +2744,30 @@ impl RunOpts {
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
+        // A divergence ratio needs BOTH runs' engine totals. Historically both
+        // runs used `self.summary_json`, so run 2 overwrote run 1. Preserve the
+        // public path's existing run-2 meaning while capturing run 1 privately;
+        // when no public path was requested, capture run 2 privately as well.
+        let summary1_file = private_verify_summary()?;
+        let summary2_file = self
+            .summary_json
+            .is_none()
+            .then(private_verify_summary)
+            .transpose()?;
+        let summary2_path = self
+            .summary_json
+            .as_deref()
+            .or_else(|| summary2_file.as_ref().map(|file| file.path()))
+            .expect("a public or private second-run summary path");
+
+        let mut run1_options = self.clone();
+        run1_options.summary_json = Some(summary1_file.path().to_owned());
+        let mut run2_options = self.clone();
+        run2_options.summary_json = Some(summary2_path.to_owned());
+
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let mut out1: Output = self.run_verify(log1_file, global)?;
+        let mut out1: Output = run1_options.run_verify(log1_file, global)?;
         let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
             .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
             .transpose()?;
@@ -2746,7 +2799,7 @@ impl RunOpts {
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let mut out2 = self.run_verify(log2_file, global)?;
+        let mut out2 = run2_options.run_verify(log2_file, global)?;
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
             let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
@@ -2759,15 +2812,20 @@ impl RunOpts {
             );
         }
 
+        let summary1 = read_run_summary_for_progress(summary1_file.path());
+        let summary2 = read_run_summary_for_progress(summary2_path);
+
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
+                summary: summary1.as_ref(),
             },
             ComparedRun {
                 output: &out2,
                 log: log2_path,
+                summary: summary2.as_ref(),
             },
             ComparisonOptions {
                 success_message: if kvm_output_only {
