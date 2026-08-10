@@ -56,7 +56,12 @@ Apply the same default rejection to quieter ways of hiding the regression:
 Review these controls against the trusted base and owner-approved policy, not
 only the candidate tree. The exception record must explain why the workload or
 cost model legitimately changed and include evidence that distinguishes that
-change from a performance regression.
+change from a performance regression. Candidate-editable PR prose is not an
+exception. The owner must post an exact-head comment or formal review beginning
+with `[Human]` and containing `TIMEOUT-CAP-EXCEPTION: APPROVED`, a substantive
+`JUSTIFICATION:`, and substantive `EVIDENCE:`. The trusted-main
+`core-review-protocol` gate compares the base and head and verifies this record;
+the candidate never executes or edits the policy that judges it.
 
 Every PR contains `Summary`, `Determinism`, `Linux Semantics`, and `Validation`.
 KVM changes also contain `Relationship to gVisor`; a triggered PR contains

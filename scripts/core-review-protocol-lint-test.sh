@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# Self-test for core-review-protocol-lint.sh.
-#
-# Feeds the linter a set of fixture PRs (labels + body + KVM flag) and asserts
-# the exit status. Run locally or in CI:
-#
-#     scripts/core-review-protocol-lint-test.sh
-#
-# Exits 0 when every case matches its expected status, 1 otherwise.
+# Two-way fixtures for the trusted-base review/budget linter.
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LINT="$SCRIPT_DIR/core-review-protocol-lint.sh"
+readonly HEAD_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+readonly OLD_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+readonly AUTHOR_LOGIN=rrnewton
+readonly TEST_OWNER_LOGIN=rrnewton
 
-# A complete, valid non-KVM PR body containing every required section.
-readonly FULL_BODY='## Summary
+readonly FULL_BODY='[impl agent, CODEX] [author-agent, testbox]
+
+## Summary
 Adds a thing.
 
 ## Determinism
@@ -24,28 +22,116 @@ Deterministic because reasons and an informal proof.
 Matches the kernel behavior described here.
 
 ## Validation
-`cargo test -p hermit-detcore` passed at L2 (ptrace).
+Focused tests passed.
 
 ## Human Review Required
 Trigger 4: core DetCore scheduling change.'
 
-# The label set for a fully reviewed + approved PR (round 1).
-readonly FULL_LABELS='post-facto-human-review
-adversarial-review-codex1
-adversarial-review-claude1
-passed-review-codex
-passed-review-claude'
+readonly KVM_BODY="${FULL_BODY}
+
+## Relationship to gVisor
+No gVisor analog applies."
+
+readonly CODEX_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+
+PASS at exact head ${HEAD_SHA}. Independent review found no blocker."
+readonly CLAUDE_REVIEW="[adversarial-reviewer agent, claude-opus] [claude-reviewer, testbox]
+
+APPROVE at exact head ${HEAD_SHA}. Independent review found no blocker."
+readonly SELF_REVIEW="[adversarial-reviewer agent, CODEX] [author-agent, testbox]
+
+PASS at exact head ${HEAD_SHA}."
+readonly STALE_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+
+PASS at stale head ${OLD_SHA}."
+readonly BLOCK_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, testbox]
+
+REQUEST CHANGES at exact head ${HEAD_SHA}."
+readonly OWNER_EXCEPTION="[Human]
+
+TIMEOUT-CAP-EXCEPTION: APPROVED
+Exact head: ${HEAD_SHA}
+JUSTIFICATION: The validated workload intentionally doubled after adding a required full-corpus lane.
+EVIDENCE: Same-host measurements show unchanged per-test cost and exactly twice the selected test population."
+readonly WEAK_OWNER_EXCEPTION="[Human]
+
+TIMEOUT-CAP-EXCEPTION: APPROVED
+Exact head: ${HEAD_SHA}
+JUSTIFICATION: CI timed out.
+EVIDENCE: green"
+
+readonly ORDINARY_DIFF='diff --git a/docs/example.md b/docs/example.md
+--- a/docs/example.md
++++ b/docs/example.md
+@@ -1 +1 @@
+-old
++new'
+readonly POLICY_SELF_EDIT='diff --git a/scripts/core-review-protocol-lint.sh b/scripts/core-review-protocol-lint.sh
+--- a/scripts/core-review-protocol-lint.sh
++++ b/scripts/core-review-protocol-lint.sh
+@@ -1 +1 @@
+-require_independent_review
++exit 0 # permit timeout increases without review'
+readonly TIMEOUT_INCREASE='diff --git a/.github/workflows/ci-portable.yml b/.github/workflows/ci-portable.yml
+--- a/.github/workflows/ci-portable.yml
++++ b/.github/workflows/ci-portable.yml
+@@ -1 +1 @@
+-    timeout-minutes: 30
++    timeout-minutes: 240'
+readonly CAP_INCREASE='diff --git a/ci/dag/portable.json b/ci/dag/portable.json
+--- a/ci/dag/portable.json
++++ b/ci/dag/portable.json
+@@ -1 +1 @@
+-    "cpu_budget_seconds": 300,
++    "cpu_budget_seconds": 2100,'
+readonly PARALLELISM_INCREASE='diff --git a/ci/run-dag.sh b/ci/run-dag.sh
+--- a/ci/run-dag.sh
++++ b/ci/run-dag.sh
+@@ -1 +1 @@
+-exec safe-ci-dag-runner --jobs 8
++exec safe-ci-dag-runner --jobs 64'
+readonly OFF_TIMED_PATH='diff --git a/ci/dag/portable.json b/ci/dag/portable.json
+--- a/ci/dag/portable.json
++++ b/ci/dag/portable.json
+@@ -10 +10,0 @@
+-    {"group":"test","job":"slow-node","timeout":300}'
+readonly NON_BLOCKING='diff --git a/.github/workflows/ci-portable.yml b/.github/workflows/ci-portable.yml
+--- a/.github/workflows/ci-portable.yml
++++ b/.github/workflows/ci-portable.yml
+@@ -1 +1 @@
+-      continue-on-error: false
++      continue-on-error: true'
+readonly BASELINE_BUMP='diff --git a/ci/performance-baseline.json b/ci/performance-baseline.json
+--- a/ci/performance-baseline.json
++++ b/ci/performance-baseline.json
+@@ -1 +1 @@
+-  "expected_seconds": 100,
++  "expected_seconds": 700,'
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+comments_json() {
+    jq -cn '$ARGS.positional | map({body:., user:{login:"rrnewton"}, author_association:"OWNER"})' --args "$@"
+}
 
 pass=0
 fail=0
 
-# run_case NAME EXPECTED_EXIT LABELS BODY IS_KVM
+# run_case NAME EXPECTED LABELS BODY IS_KVM COMMENTS_JSON REVIEWS_JSON DIFF
 run_case() {
-    local name=$1 expected=$2 labels=$3 body=$4 is_kvm=${5:-false}
+    local name=$1 expected=$2 labels=$3 pr_body=$4 is_kvm=$5 comments=$6 reviews=$7 diff=$8
     local actual=0
-    PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" PR_NUMBER="test" \
+    printf '%s\n' "$comments" >"$tmp/comments.json"
+    printf '%s\n' "$reviews" >"$tmp/reviews.json"
+    printf '%s\n' "$diff" >"$tmp/pr.diff"
+    printf '%s\n\n[impl agent, CODEX] [author-agent, testbox]\n' "Test candidate" >"$tmp/commit-message"
+    PR_LABELS="$labels" PR_BODY="$pr_body" PR_IS_KVM="$is_kvm" PR_NUMBER=test \
+        PR_HEAD_SHA="$HEAD_SHA" PR_AUTHOR_LOGIN="$AUTHOR_LOGIN" OWNER_LOGIN="$TEST_OWNER_LOGIN" \
+        PR_COMMENTS_FILE="$tmp/comments.json" PR_REVIEWS_FILE="$tmp/reviews.json" \
+        PR_DIFF_FILE="$tmp/pr.diff" PR_COMMIT_MESSAGE_FILE="$tmp/commit-message" \
         bash "$LINT" >/dev/null 2>&1 || actual=$?
-    if [ "$actual" -eq "$expected" ]; then
+    if [[ $actual -eq $expected ]]; then
         echo "ok   - ${name} (exit ${actual})"
         pass=$((pass + 1))
     else
@@ -54,81 +140,53 @@ run_case() {
     fi
 }
 
-# --- Not applicable: no post-facto-human-review label always passes. ----------
-run_case "unlabeled PR passes even with empty body" 0 \
-    $'random-label\nlocally-validated' ""
-run_case "unlabeled PR passes even missing everything the protocol wants" 0 \
-    "" ""
+empty='[]'
+codex=$(comments_json "$CODEX_REVIEW")
+dual=$(comments_json "$CODEX_REVIEW" "$CLAUDE_REVIEW")
+formal_codex=$(jq -cn --arg body "$CODEX_REVIEW" --arg sha "$HEAD_SHA" \
+    '[{body:$body, user:{login:"rrnewton"}, author_association:"OWNER", state:"APPROVED", commit_id:$sha}]')
+unauthorized_codex=$(jq -cn --arg body "$CODEX_REVIEW" \
+    '[{body:$body, user:{login:"stranger"}, author_association:"NONE"}]')
 
-# --- Happy paths -------------------------------------------------------------
-run_case "labeled + full labels + all sections (non-KVM) passes" 0 \
-    "$FULL_LABELS" "$FULL_BODY"
+# Mandatory review and exact-head/identity binding.
+run_case "unlabeled PR without review blocks" 1 "" "$FULL_BODY" false "$empty" "$empty" "$ORDINARY_DIFF"
+run_case "ordinary PR with independent exact-head review passes" 0 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"
+run_case "formal exact-head approval satisfies mandatory review" 0 "" "$FULL_BODY" false "$empty" "$formal_codex" "$ORDINARY_DIFF"
+run_case "untrusted commenter cannot manufacture approval" 1 "" "$FULL_BODY" false "$unauthorized_codex" "$empty" "$ORDINARY_DIFF"
+run_case "self-review does not satisfy independence" 1 "" "$FULL_BODY" false "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "stale-head review does not count" 1 "" "$FULL_BODY" false "$(comments_json "$STALE_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "request-changes verdict does not authorize landing" 1 "" "$FULL_BODY" false "$(comments_json "$BLOCK_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "triggered PR with only Codex review blocks" 1 post-facto-human-review "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"
+run_case "triggered PR with both independent families passes" 0 post-facto-human-review "$FULL_BODY" false "$dual" "$empty" "$ORDINARY_DIFF"
 
-run_case "later review round (round 2 labels) still passes" 0 \
-    $'post-facto-human-review\nadversarial-review-codex2\nadversarial-review-claude3\npassed-review-codex\npassed-review-claude' \
-    "$FULL_BODY"
+# Body contracts remain enforced for every PR.
+run_case "missing Linux Semantics blocks" 1 "" "${FULL_BODY/Linux Semantics/Other}" false "$codex" "$empty" "$ORDINARY_DIFF"
+run_case "KVM PR missing gVisor section blocks" 1 "" "$FULL_BODY" true "$codex" "$empty" "$ORDINARY_DIFF"
+run_case "KVM PR with gVisor section passes" 0 "" "$KVM_BODY" true "$codex" "$empty" "$ORDINARY_DIFF"
 
-run_case "KVM PR with Relationship to gVisor section passes" 0 \
-    "$FULL_LABELS" "${FULL_BODY}"$'\n\n## Relationship to gVisor\nN/A: no gVisor analog.' \
-    true
+# The candidate may edit policy, but the base-owned executable still decides.
+run_case "candidate policy self-edit cannot remove mandatory review" 1 "" "$FULL_BODY" false "$empty" "$empty" "$POLICY_SELF_EDIT"
+run_case "reviewed policy edit remains reviewable" 0 "" "$FULL_BODY" false "$codex" "$empty" "$POLICY_SELF_EDIT"
 
-run_case "bold-style headings are accepted" 0 \
-    "$FULL_LABELS" \
-    $'**Summary** foo\n**Determinism** bar\n**Linux Semantics** baz\n**Validation** qux\n**Human Review Required** trigger 4'
+# All six accepted evasions are now explicit negative brackets.
+run_case "direct timeout increase is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$TIMEOUT_INCREASE"
+run_case "wider budget cap is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$CAP_INCREASE"
+run_case "higher parallelism is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$PARALLELISM_INCREASE"
+run_case "moving node off timed path is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$OFF_TIMED_PATH"
+run_case "marking step non-blocking is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$NON_BLOCKING"
+run_case "recorded baseline bump is default-rejected" 1 "" "$FULL_BODY" false "$codex" "$empty" "$BASELINE_BUMP"
 
-# --- Missing review labels blocks --------------------------------------------
-run_case "missing adversarial-review-codex blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
-    "$FULL_BODY"
+# Owner exceptions are comments/reviews, never candidate-editable PR prose.
+run_case "owner exact-head exception with evidence permits cap change" 0 "" "$FULL_BODY" false \
+    "$(comments_json "$CODEX_REVIEW" "$OWNER_EXCEPTION")" "$empty" "$TIMEOUT_INCREASE"
+run_case "weak owner exception is refused" 1 "" "$FULL_BODY" false \
+    "$(comments_json "$CODEX_REVIEW" "$WEAK_OWNER_EXCEPTION")" "$empty" "$TIMEOUT_INCREASE"
+run_case "candidate prose cannot mint owner approval" 1 "" "${FULL_BODY}
 
-run_case "missing adversarial-review-claude blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-codex1\npassed-review-codex\npassed-review-claude' \
-    "$FULL_BODY"
-
-run_case "missing passed-review-codex blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1\npassed-review-claude' \
-    "$FULL_BODY"
-
-run_case "missing passed-review-claude blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1\npassed-review-codex' \
-    "$FULL_BODY"
-
-run_case "adversarial review present but not approved blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-codex1\nadversarial-review-claude1' \
-    "$FULL_BODY"
-
-run_case "round label out of range (round 5) does not count, blocks" 1 \
-    $'post-facto-human-review\nadversarial-review-codex5\nadversarial-review-claude5\npassed-review-codex\npassed-review-claude' \
-    "$FULL_BODY"
-
-# --- Missing body sections blocks --------------------------------------------
-run_case "missing Summary section blocks" 1 \
-    "$FULL_LABELS" \
-    $'## Determinism\nx\n## Linux Semantics\ny\n## Validation\nz\n## Human Review Required\nt'
-
-run_case "missing Linux Semantics section blocks" 1 \
-    "$FULL_LABELS" \
-    $'## Summary\nx\n## Determinism\ny\n## Validation\nz\n## Human Review Required\nt'
-
-run_case "missing Human Review Required section blocks" 1 \
-    "$FULL_LABELS" \
-    $'## Summary\nx\n## Determinism\ny\n## Linux Semantics\nl\n## Validation\nz'
-
-run_case "empty body blocks a labeled PR" 1 \
-    "$FULL_LABELS" ""
-
-# --- KVM-specific section -----------------------------------------------------
-run_case "KVM PR without Relationship to gVisor section blocks" 1 \
-    "$FULL_LABELS" "$FULL_BODY" true
-
-run_case "non-KVM PR does not require Relationship to gVisor" 0 \
-    "$FULL_LABELS" "$FULL_BODY" false
-
-# --- Prose must not satisfy a section ----------------------------------------
-run_case "prose mention of a section keyword does not satisfy it" 1 \
-    "$FULL_LABELS" \
-    $'## Summary\nIn summary, this changes determinism and validation broadly.\n## Determinism\nd\n## Validation\nv\n## Human Review Required\nt'
+${OWNER_EXCEPTION}" false "$codex" "$empty" "$TIMEOUT_INCREASE"
+run_case "stale-head owner exception is refused" 1 "" "$FULL_BODY" false \
+    "$(comments_json "$CODEX_REVIEW" "${OWNER_EXCEPTION//$HEAD_SHA/$OLD_SHA}")" "$empty" "$TIMEOUT_INCREASE"
 
 echo
 echo "core-review-protocol-lint self-test: ${pass} passed, ${fail} failed."
-[ "$fail" -eq 0 ]
+[[ $fail -eq 0 ]]
