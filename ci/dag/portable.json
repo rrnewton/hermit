@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1, "manifest_guest": 4},
+  "resource_caps": {"hermit_guest": 2, "manifest_guest": 4},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
