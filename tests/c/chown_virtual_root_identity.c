@@ -142,6 +142,16 @@ int main(void) {
   errno = 0;
   expect_errno("fchown(9999)", fchown(9999, 0, 0), EBADF);
   errno = 0;
+  /* O_PATH is valid for fstat but not fchown. A validator that substitutes
+   * fstat without checking the descriptor kind silently swallows this EBADF. */
+  int path_fd = open(path, O_PATH | O_CLOEXEC);
+  if (path_fd < 0) {
+    perror("open(O_PATH)");
+    return 1;
+  }
+  expect_errno("fchown(O_PATH fd)", fchown(path_fd, 0, 0), EBADF);
+  close(path_fd);
+  errno = 0;
   /* A regular file used as a directory component. */
   expect_errno("chown(file/child)", chown("chown_virtual_root_target/child", 0, 0), ENOTDIR);
   errno = 0;
@@ -159,9 +169,10 @@ int main(void) {
     perror("stat");
     return 1;
   }
-  if (st.st_uid == FOREIGN_UID && st.st_gid == FOREIGN_GID) {
-    printf("FAIL     %-42s host ownership was actually changed to %u:%u\n", "stat(file) read-back",
-           (unsigned)st.st_uid, (unsigned)st.st_gid);
+  if (st.st_uid != before.st_uid || st.st_gid != before.st_gid) {
+    printf("FAIL     %-42s owner changed %u:%u -> %u:%u\n", "stat(file) read-back",
+           (unsigned)before.st_uid, (unsigned)before.st_gid, (unsigned)st.st_uid,
+           (unsigned)st.st_gid);
     failures++;
   } else {
     printf("ok       %-42s owner unchanged (%u:%u), as documented\n", "stat(file) read-back",

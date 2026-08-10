@@ -23,6 +23,8 @@
 //!   `Ok(0)` fails here;
 //! * the side-effect boundary — host ownership, set-id mode bits, and ctime
 //!   remain unchanged, so a "validator" that reissues `chown(-1, -1)` fails.
+//!   Metadata virtualization is disabled for this guest so the ctime assertion
+//!   observes the host value instead of comparing two canonical epochs.
 //!
 //! Run under both namespace configurations, because the pre-#1849 failure mode
 //! was different in each: `EPERM` for everything with `--no-namespace`, and
@@ -95,6 +97,7 @@ fn run_guest(tag: &str, extra: &[&str]) {
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
+            "--no-virtualize-metadata",
             "--strict",
         ])
         .args(extra)
