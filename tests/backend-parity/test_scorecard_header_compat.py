@@ -213,6 +213,15 @@ check("divergent producer consumed 1 reference + 1 candidate run", not remaining
 original = run_matrix.run_with_timeout
 try:
     run_matrix.run_with_timeout = lambda _command: None
+    missing_reference = run_matrix.run_case(
+        Path("/planted/hermit"),
+        "dbt",
+        "hello_stdout",
+        run_matrix.CatalogFixtures(),
+        strict=True,
+        evidence={},
+        capture_stdout_parity=True,
+    )
     preserved = run_matrix.run_case(
         Path("/planted/hermit"),
         "dbt",
@@ -223,6 +232,12 @@ try:
     )
 finally:
     run_matrix.run_with_timeout = original
+check(
+    "a requested stdout comparison with no reference is RED",
+    missing_reference[0] == "FAIL"
+    and missing_reference[1] == "ptrace reference timed out",
+    repr(missing_reference),
+)
 check(
     "DBT random_sources still requires its pre-existing ptrace reference "
     "when scorecard capture is off",

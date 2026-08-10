@@ -964,6 +964,11 @@ def run_case(
         # functional comparison may not.
         if requires_ptrace_reference and reference_stdout is None:
             return "FAIL", reference_problem, time.monotonic() - started
+        if capture_stdout_parity and reference_stdout is None:
+            # The requested comparison itself is part of this cell's contract.
+            # A missing side or comparator failure is RED, not an unmeasured
+            # success: no equality verdict exists to support a green row.
+            return "FAIL", reference_problem, time.monotonic() - started
     ptrace_random = (
         root_random_output(reference_stdout)
         if backend == "dbt" and name == "random_sources" and reference_stdout is not None
@@ -1044,8 +1049,6 @@ def run_case(
                     time.monotonic() - started,
                 )
     detail = f"{RUNS}/{RUNS} runs matched"
-    if capture_stdout_parity and backend != "ptrace" and reference_problem:
-        detail += f"; stdout parity unmeasured: {reference_problem}"
     return "PASS", detail, time.monotonic() - started
 
 
