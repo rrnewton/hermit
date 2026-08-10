@@ -60,6 +60,15 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 
+/// Linux reduces the default capacity of newly-created pipes from sixteen pages to two
+/// pages after the creating user crosses `pipe-user-pages-soft`.  That host-global pressure
+/// must not decide how many guest writes complete before a pipeline peer closes its end.
+///
+/// Two x86_64 pages is the kernel's pressure-mode default and can be applied by an
+/// unprivileged process even after the soft limit is crossed.  Pin scheduler-managed pipes
+/// before either endpoint is exposed to the guest so every run starts from the same state.
+const DETERMINISTIC_PIPE_CAPACITY: i32 = 8 * 1024;
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -1811,6 +1820,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
+            if internally_nonblocking {
+                let applied_capacity = guest
+                    .inject(
+                        syscalls::Fcntl::new()
+                            .with_fd(fds[1])
+                            .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY)),
+                    )
+                    .await?;
+                if applied_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY) {
+                    return Err(Errno::EIO);
+                }
+            }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
