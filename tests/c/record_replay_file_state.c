@@ -36,21 +36,70 @@ static int write_all(int fd, const char* bytes, size_t length) {
   return 0;
 }
 
+static int sendfile_through_regular_sink(int sink_fd, int source_fd,
+                                         off_t source_offset,
+                                         const char* expected, size_t length) {
+  if (ftruncate(sink_fd, 0) != 0 || lseek(sink_fd, 0, SEEK_SET) != 0) {
+    return -1;
+  }
+
+  off_t offset = source_offset;
+  if (sendfile(sink_fd, source_fd, &offset, length) != (ssize_t)length ||
+      lseek(sink_fd, 0, SEEK_SET) != 0) {
+    return -1;
+  }
+
+  char bytes[64];
+  if (length > sizeof(bytes)) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  size_t copied = 0;
+  while (copied < length) {
+    const ssize_t count = read(sink_fd, bytes + copied, length - copied);
+    if (count <= 0) {
+      if (count == 0) {
+        errno = EIO;
+      }
+      return -1;
+    }
+    copied += (size_t)count;
+  }
+  if (memcmp(bytes, expected, length) != 0) {
+    errno = EIO;
+    return -1;
+  }
+  if (write_all(STDOUT_FILENO, bytes, length) != 0 ||
+      write_all(STDOUT_FILENO, "\n", 1) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
 int main(void) {
   const char* dir = "/var/tmp/hermit-record-file-state";
   const char* file = "/var/tmp/hermit-record-file-state/data";
   const char* source = "/var/tmp/hermit-record-file-state/source";
   const char* clone = "/var/tmp/hermit-record-file-state/clone";
+  const char* sendfile_sink =
+      "/var/tmp/hermit-record-file-state/sendfile-sink";
   const char* write_only_clone =
       "/var/tmp/hermit-record-file-state/write-only-clone";
 
   unlink(write_only_clone);
+  unlink(sendfile_sink);
   unlink(clone);
   unlink(source);
   unlink(file);
   rmdir(dir);
   if (mkdir(dir, 0700) != 0) {
     return fail("mkdir");
+  }
+
+  const int sendfile_sink_fd =
+      open(sendfile_sink, O_CREAT | O_TRUNC | O_RDWR, 0600);
+  if (sendfile_sink_fd < 0) {
+    return fail("open(sendfile sink)");
   }
 
   int fd = open(file, O_CREAT | O_TRUNC | O_RDWR, 0600);
@@ -113,12 +162,9 @@ int main(void) {
   if (lseek(fd, 0, SEEK_END) < 0 || write_all(fd, "B", 1) != 0) {
     return fail("write(unlinked file)");
   }
-  off_t unlinked_offset = 0;
-  if (sendfile(STDOUT_FILENO, fd, &unlinked_offset, 6) != 6) {
+  if (sendfile_through_regular_sink(sendfile_sink_fd, fd, 0, "parenB", 6) !=
+      0) {
     return fail("sendfile(unlinked file)");
-  }
-  if (write_all(STDOUT_FILENO, "\n", 1) != 0) {
-    return fail("write(unlinked separator)");
   }
   if (close(fd) != 0) {
     return fail("close(reopened)");
@@ -160,12 +206,9 @@ int main(void) {
       return fail("seek cloned extent");
     }
     printf("clone extent: %lld %lld\n", (long long)data, (long long)hole);
-    off_t clone_offset = 4096;
-    if (sendfile(STDOUT_FILENO, clone_fd, &clone_offset, 7) != 7) {
+    if (sendfile_through_regular_sink(sendfile_sink_fd, clone_fd, 4096,
+                                      "payload", 7) != 0) {
       return fail("sendfile(clone)");
-    }
-    if (write_all(STDOUT_FILENO, "\n", 1) != 0) {
-      return fail("write(clone separator)");
     }
   } else if (errno == EOPNOTSUPP || errno == ENOTTY || errno == EXDEV ||
              errno == EINVAL) {
@@ -217,8 +260,12 @@ int main(void) {
   if (close(source_fd) != 0) {
     return fail("close(clone files)");
   }
+  if (close(sendfile_sink_fd) != 0) {
+    return fail("close(sendfile sink)");
+  }
   if ((clone_supported && unlink(write_only_clone) != 0) ||
-      unlink(clone) != 0 || unlink(source) != 0 || rmdir(dir) != 0) {
+      unlink(sendfile_sink) != 0 || unlink(clone) != 0 ||
+      unlink(source) != 0 || rmdir(dir) != 0) {
     return fail("cleanup");
   }
 
