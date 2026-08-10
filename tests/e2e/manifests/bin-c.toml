@@ -74,12 +74,9 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "dbt", "kvm", "sabre"]
 [test.modes.verify.backends_disabled]
-dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
-kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
-sabre = "Robust-futex owner-death wakeup exercises core Detcore scheduling and currently times out under SaBRe; owner review is required"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+liteinst = "The LiteInst host-hybrid backend refuses clone3 with ENOTSUPP before the guest creates its first thread, so this multi-threaded guest cannot run there yet; unrelated to robust-futex owner death"
 
 [test.modes.naked]
 ci = false
