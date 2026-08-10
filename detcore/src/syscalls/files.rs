@@ -1696,7 +1696,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#1849): Determinized ownership mutation. Emulate the
+    // TODO-HUMAN-REVIEW(#1851): Determinized ownership mutation. Emulate the
     // IDENTITY half of the call and let Linux answer the ARGUMENT half.
     /// The `chown` family (`chown`, `fchown`, `fchownat`, `lchown`).
     ///
