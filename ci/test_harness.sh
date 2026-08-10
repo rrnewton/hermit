@@ -790,15 +790,23 @@ $direct_references"
         die "LiteInst staging must obtain its cache pin through the exact-repository launcher"
 
     local dag
-    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
-        jq -e '
+    local reverie_pin_desc="Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin"
+    local stale_reverie_pin_desc="Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main"
+    local -a dag_files=("$DAG_ROOT"/*.json)
+    for dag in "${dag_files[@]}"; do
+        jq -e --arg desc "$reverie_pin_desc" '
             [.steps[] | select(
                 .group == "check"
                 and .job == "reverie_pin"
                 and .cmd == "./ci/run-reverie-pin-check.sh"
+                and .desc == $desc
             )] | length == 1
         ' "$dag" >/dev/null ||
-            die "${dag#"$ROOT_DIR/"} must contain exactly one Reverie-pin ancestor-and-monotonic gate"
+            die "${dag#"$ROOT_DIR/"} must contain exactly one accurately described Reverie-pin ancestor-and-monotonic gate"
+        jq -e --arg stale "$stale_reverie_pin_desc" '
+            [.steps[] | select(.desc == $stale)] | length == 0
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must not restore the superseded live-tip equality description"
     done
 
     # Execute the same rustc wrapper with a PATH that deliberately excludes
