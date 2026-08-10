@@ -667,6 +667,7 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    compat_known_failclosed_bracket()?;
     coverage_schema_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
@@ -2550,6 +2551,117 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
 
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
+#[derive(Debug, PartialEq, Eq)]
+struct CompatDisposition {
+    blocking: bool,
+    warning: Option<String>,
+}
+
+/// Classify one measured compatibility row without printing or mutating state.
+///
+/// `PortableStrict` shares the strict corpus and still passes `--strict`, so the
+/// fail-closed expectations apply to both strict modes. Keeping this predicate
+/// pure lets `--self-test` prove the expected-failure, stale-expectation, and
+/// ordinary-blocking directions without launching a compatibility workload.
+fn compat_disposition(
+    mode: CompatMode,
+    label: &str,
+    ok: bool,
+    known_reason: Option<&str>,
+    diagnostic_reason: Option<&str>,
+) -> CompatDisposition {
+    let strict_known = matches!(mode, CompatMode::Strict | CompatMode::PortableStrict)
+        .then_some(known_reason)
+        .flatten();
+    if ok {
+        return CompatDisposition {
+            blocking: false,
+            warning: strict_known.map(|reason| {
+                format!(
+                    "{label} unexpectedly passed its known fail-closed expectation ({reason}); \
+                     drop it from the known-failure table"
+                )
+            }),
+        };
+    }
+    if let Some(reason) = strict_known {
+        return CompatDisposition {
+            blocking: false,
+            warning: Some(format!(
+                "{label} failed as expected by the known fail-closed table ({reason}; nonblocking)"
+            )),
+        };
+    }
+    if mode == CompatMode::PortableStrict {
+        if let Some(reason) = diagnostic_reason {
+            return CompatDisposition {
+                blocking: false,
+                warning: Some(format!("{label} is a bounded portable diagnostic: {reason}")),
+            };
+        }
+    }
+    CompatDisposition { blocking: true, warning: None }
+}
+
+/// Two-sided bracket for the known-failclosed consumer, plus a blocking control.
+fn compat_known_failclosed_bracket() -> Result<(), String> {
+    let reason = "planted known-failclosed expectation";
+    let expected = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-known-failure",
+        false,
+        Some(reason),
+        None,
+    );
+    if expected.blocking
+        || !expected
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("failed as expected") && w.contains("nonblocking"))
+    {
+        return Err(format!(
+            "known-failclosed bracket: expected failure was not announced and nonblocking: \
+             {expected:?}"
+        ));
+    }
+
+    let stale = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-stale-expectation",
+        true,
+        Some(reason),
+        None,
+    );
+    if stale.blocking
+        || !stale
+            .warning
+            .as_deref()
+            .is_some_and(|w| w.contains("unexpectedly passed") && w.contains("drop it"))
+    {
+        return Err(format!(
+            "known-failclosed bracket: unexpected pass did not announce the stale entry: {stale:?}"
+        ));
+    }
+
+    let control = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-unlisted-failure",
+        false,
+        None,
+        None,
+    );
+    if !control.blocking || control.warning.is_some() {
+        return Err(format!(
+            "known-failclosed bracket: unlisted failure must remain blocking: {control:?}"
+        ));
+    }
+    println!(
+        "  known-failclosed: 1 expected failure nonblocking + warned; 1 unexpected pass warned; \
+         1 unlisted failure blocking"
+    );
+    Ok(())
+}
+
 fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
     let known = validate_corpus::known_failclosed();
     let diag = validate_corpus::portable_diagnostic();
@@ -2566,14 +2678,18 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
         if o.ok {
             e.0 += 1;
             passed += 1;
-            if mode == CompatMode::Strict && known.contains_key(label) {
-                println!("  WARN {label} unexpectedly passed fail-closed --strict; drop it from the known-failure table");
-            }
-        } else if mode == CompatMode::Strict && known.contains_key(label) {
-            println!("  WARN {label} known fail-closed under --strict ({}; nonblocking)", known[label]);
-        } else if mode == CompatMode::PortableStrict && diag.contains_key(label) {
-            println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
-        } else {
+        }
+        let disposition = compat_disposition(
+            mode,
+            label,
+            o.ok,
+            known.get(label).copied(),
+            diag.get(label).copied(),
+        );
+        if let Some(warning) = disposition.warning {
+            println!("  WARN {warning}");
+        }
+        if disposition.blocking {
             blocking_failures.push(label.to_string());
         }
     }
