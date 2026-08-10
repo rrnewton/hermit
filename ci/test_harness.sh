@@ -420,6 +420,47 @@ CARGO_SHIM
     [[ $(<"$bundle/harness.json") == "$reference" ]] ||
         die "published manifest-plan document differs from the Cargo producer: $bundle"
 
+    # ---- completeness: the hashed input set covers what the producer READS ---
+    # Enumerating inputs by hand is how a content address silently stops
+    # binding: ci/matrix-symmetry-baseline.json was missed on the first pass,
+    # and because main() calls validate_front_door() on every format including
+    # harness-json, a document published before that file drifted would not
+    # have been merely old, it would have been wrong. Re-derive the list from
+    # the producer's OWN declared path constants instead of trusting the list.
+    # Scope is the default bin's sources only: src/bin/* are different binaries
+    # whose inputs include GENERATED files, and hashing those would make every
+    # consumer look stale and quietly restore the stall.
+    local declared missing_inputs=""
+    while IFS= read -r declared; do
+        [[ -n $declared ]] || continue
+        [[ -e $ROOT_DIR/$declared ]] || continue
+        grep -qE "^[0-9a-f]{64}  ${declared//./\\.}(/|$)" "$bundle/inputs.sha256" ||
+            missing_inputs+=" $declared"
+    done < <(grep -hoE '^\s*const [A-Z_]+: &str = "[^"]*/[^"]*";' "$ROOT_DIR"/ci/manifest-plan/src/*.rs |
+        sed -E 's/.*"([^"]*)".*/\1/' | sort -u)
+    [[ -z $missing_inputs ]] ||
+        die "the producer reads file(s) the published content address does not hash, so a drift in them would be served as fresh:$missing_inputs"
+
+    # ---- coverage: `validate` shares the one resolver, so it cannot diverge --
+    # `validate` is this function's own caller and cannot be re-entered without
+    # recursing, so instead prove there is nothing subcommand-specific to miss:
+    # exactly one call site, reached unconditionally before dispatch.
+    # This function NAMES the resolver, so counting references across the whole
+    # file would match its own text and always report extra call sites. Delete
+    # this function's body before counting.
+    local body resolver_calls resolver_mentions load_line case_line
+    body=$(sed '/^function audit_manifest_plan_cargo_independence {$/,/^}$/d' "$ROOT_DIR/ci/test_harness.sh")
+    resolver_calls=$(grep -cE '^\s*documents=\$\(manifest_plan_documents\)' <<<"$body")
+    resolver_mentions=$(grep -cE '\bmanifest_plan_documents\b' <<<"$body")
+    ((resolver_calls == 1)) ||
+        die "expected exactly one manifest_plan_documents call site, found $resolver_calls"
+    ((resolver_mentions == resolver_calls + 1)) ||
+        die "manifest_plan_documents is referenced $resolver_mentions times outside this audit (expected its definition plus one call); the exercised shapes no longer cover every subcommand"
+    load_line=$(grep -nE '^load_tests$' "$ROOT_DIR/ci/test_harness.sh" | head -1 | cut -d: -f1)
+    case_line=$(grep -nE '^case "\$subcommand" in$' "$ROOT_DIR/ci/test_harness.sh" | head -1 | cut -d: -f1)
+    [[ -n $load_line && -n $case_line ]] && ((load_line < case_line)) ||
+        die "load_tests is no longer an unconditional pre-dispatch call, so subcommands can diverge on metadata loading"
+
     # ---- POSITIVE: every consumer shape runs with zero cargo invocations -----
     # Run the shapes concurrently: they are independent, each owns its own
     # marker, and serializing them would spend this node's budget on three
