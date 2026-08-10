@@ -693,6 +693,10 @@ function assert_reverie_pin_enforcement {
     local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
     local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
     local liteinst_stage="$ROOT_DIR/scripts/stage-liteinst-runtime.sh"
+    [[ $(grep -Fxc '        "BLOCKED. The pin must be on rrnewton/reverie:main history and must not regress the landing base."' "$checker") == 1 ]] ||
+        die "Reverie pin checker must describe the ancestry-and-monotonicity refusal exactly once"
+    ! grep -Fq 'Testing must use the latest rrnewton/reverie:main.' "$checker" ||
+        die "Reverie pin checker must not restore the superseded live-tip equality rule"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
         die "Reverie ancestor-and-monotonic checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||

@@ -896,7 +896,9 @@ fn loud_header(title: &str) {
 
 fn blocked_instructions() {
     eprintln!();
-    eprintln!("BLOCKED. Testing must use the latest rrnewton/reverie:main.");
+    eprintln!(
+        "BLOCKED. The pin must be on rrnewton/reverie:main history and must not regress the landing base."
+    );
     eprintln!("Update every derived manifest and lockfile site with:");
     eprintln!("  with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
     eprintln!("Policy and recovery details: docs/updating-reverie.md");
