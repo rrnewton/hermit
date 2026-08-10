@@ -1472,6 +1472,27 @@ function audit_ci_correspondence {
             rm -rf "$scratch"
             die "$lane DAG manifest nodes do not select the exact ratcheted cells"
         fi
+
+        # A static intentional skip is valid only when the exact ratcheted plan
+        # selects zero CI cells for that (lane, category). Conversely, every
+        # non-empty bucket must remain executable. This makes the typed reason
+        # a checked consequence of the manifest plan rather than a hand-written
+        # escape hatch that could silently suppress real coverage.
+        jq -e --arg lane "$lane" --slurpfile cells "$current_plan" '
+            [.steps[] | select(has("manifest"))
+             | . as $step
+             | ([$cells[0][]
+                 | select(.lane == $lane)
+                 | select(.category == $step.manifest.category)] | length) as $selected
+             | if $selected == 0
+               then .skip_reason == "empty-manifest-bucket"
+               else (.skip_reason // null) == null
+               end]
+            | all
+        ' "$dag" >/dev/null || {
+            rm -rf "$scratch"
+            die "$lane DAG typed empty-bucket skips do not match the exact ratcheted cell plan"
+        }
     done
 
     local portable_fingerprint privileged_fingerprint e2e_cells
