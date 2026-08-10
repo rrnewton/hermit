@@ -123,48 +123,6 @@ and the reason is documented.
 - Install rust-script with `cargo install rust-script` if it is not already
   available.
 
-### Editing `scripts/lib/` — rust-script will re-run a STALE binary
-
-**rust-script keys its build cache on the MAIN SCRIPT ONLY.** `scripts/validate.rs`
-pulls its modules in with `#[path = "lib/validate_runtime.rs"] mod validate_runtime;`
-(and seven siblings), and those files are invisible to the cache key. A change
-confined to `scripts/lib/*.rs` therefore **re-runs the previously built binary**:
-no rebuild, no warning, no error.
-
-This surfaces as a **FALSE PASS**, which is why it is easy to miss. Measured
-2026-08-08: a deliberately wrong verdict planted in `validate_runtime.rs` produced
-`validate SELF-TEST (exit 0)`. The same mutation under `--force` correctly failed.
-A self-test that "passes" because it never rebuilt certifies exactly the thing it
-did not test.
-
-So after **any** edit under `scripts/lib/`, force the rebuild, and never quote a
-non-`--force` green as evidence:
-
-```bash
-rust-script --force scripts/validate.rs --self-test
-```
-
-Arguments go **after the script path**; `rust-script scripts/validate.rs -- --self-test`
-is parsed as rust-script's own flags and exits 2 with `arguments not parsed`.
-
-### `agent-utils` is a submodule, and symlinking it breaks `git status`
-
-`scripts/validate.rs` path-depends on `../agent-utils/rs/safe-ci-dag-runner`, and
-`agent-utils` is a git submodule of this repository. A fresh or detached worktree
-has it uninitialized, so any script build fails with
-`failed to read .../agent-utils/rs/safe-ci-dag-runner/Cargo.toml`.
-
-Initialize it from a local checkout — no network needed:
-
-```bash
-git -c submodule.agent-utils.url=<path-to-an-initialized-hermit>/agent-utils \
-    -c protocol.file.allow=always submodule update --init agent-utils
-```
-
-**Do not substitute a symlink.** git then refuses the path outright and
-`git status` itself fails with `expected submodule path 'agent-utils' not to be a
-symbolic link` — you lose the ability to inspect the tree, not just to build it.
-
 ## Workspace Map
 
 The root Cargo workspace has thirteen members:
