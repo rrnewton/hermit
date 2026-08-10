@@ -2410,7 +2410,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 }
             },
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-robust-futex-owner-death): Review observing
+            // TODO-HUMAN-REVIEW(PR-2078): Review observing
             // the robust-list registration without changing its pass-through
             // classification. This is still a pass-through — Linux owns the
             // registration and supplies its result — but Detcore remembers the
