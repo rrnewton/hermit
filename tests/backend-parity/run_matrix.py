@@ -987,6 +987,12 @@ def run_case(
             evidence.update(stdout_parity_evidence(result.stdout, reference_stdout))
             if "stdout_parity" in evidence:
                 evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_STDOUT_ONLY
+            if evidence.get("stdout_parity") == "0":
+                return (
+                    "FAIL",
+                    "run 1 stdout differed from ptrace reference",
+                    time.monotonic() - started,
+                )
 
         if result.returncode != expected_status:
             diagnostic = result.stderr.decode(errors="replace").strip()
