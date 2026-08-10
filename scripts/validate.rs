@@ -8,14 +8,16 @@
 //! validate.rs — Hermit's validation driver.
 //!
 //! This is the sole validation driver. Every production caller invokes it
-//! directly; the former shell entrypoint has been removed.
+//! directly; the former shell implementation has been removed. The repository-
+//! root `validate.sh` is an audited reminder alias with no independent behavior.
 //!
 //! # Contract
 //!
 //! * **Everything runs as a `safe-ci-dag-runner` node.** Preflight, the manifest
 //!   gate, every CI-lane node, and every compatibility probe. The driver makes
-//!   exactly one kind of call — `run_dag_boxed_ordered` — and never spawns a gate
-//!   itself. See `lib/validate_plan.rs` for why that rule is load-bearing and for
+//!   exactly one kind of call — `run_dag_boxed_deadline` (unbounded when no
+//!   whole-run budget is supplied) — and never spawns a gate itself. See
+//!   `lib/validate_plan.rs` for why that rule is load-bearing and for
 //!   the measured evidence that an undeclared node is unboxed.
 //! * **Boxing is fail-closed.** Default path re-execs into a transient
 //!   `systemd --user` scope; if two-level cgroup-v2 boxing cannot be established
@@ -89,13 +91,20 @@ use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope;
+use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
+use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
+use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
+use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
+use safe_ci_dag_runner::perflog::append_step_profiles;
+use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
+use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
+use safe_ci_dag_runner::scheduler::monotonic_now_ns;
+use safe_ci_dag_runner::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 
 use validate_plan::CompatMode;
 
@@ -113,6 +122,7 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
+const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 
 /// Standalone-only in-repo ledger directory.
 ///
@@ -242,6 +252,8 @@ struct Args {
     jobs: Option<i64>,
     keep_going: bool,
     allow_cgroup_failure: bool,
+    /// Wall budget for the whole validate invocation, across lanes and retries.
+    run_timeout: Option<i64>,
     merge_lanes: bool,
     reuse_parent_manifest_gate: bool,
     self_test: bool,
@@ -288,6 +300,10 @@ fn usage() -> &'static str {
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
      \x20 -j N             Scheduler width (default: host_cpus/8, floor 2, cap 16).\n\
+     \x20 --run-timeout SEC  Wall budget for the WHOLE invocation (across lanes and\n\
+     \x20                  retries). On breach, in-flight nodes are cut and the run still\n\
+     \x20                  reports instead of being killed externally. Also sets a later\n\
+     \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
@@ -348,6 +364,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         jobs: None,
         keep_going: false,
         allow_cgroup_failure: false,
+        run_timeout: None,
         merge_lanes: true,
         reuse_parent_manifest_gate: false,
         self_test: false,
@@ -425,6 +442,16 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+            "--run-timeout" => {
+                i += 1;
+                match argv.get(i).and_then(|v| v.parse::<i64>().ok()) {
+                    Some(v) if v > 0 => args.run_timeout = Some(v),
+                    _ => {
+                        eprintln!("validate: --run-timeout needs a positive number of SECONDS");
+                        return Err(2);
+                    }
+                }
+            }
             "--baseline" => {
                 i += 1;
                 match argv.get(i) {
@@ -526,6 +553,114 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // CLI bracket: a real positive budget reaches the typed field, while zero,
+    // negative, malformed, and missing values are all refused.
+    let parsed = parse_argv(&["--run-timeout".into(), "600".into(), "--self-test".into()])
+        .map_err(|code| format!("run-timeout parser refused 600s with exit {code}"))?;
+    if parsed.run_timeout != Some(600) {
+        return Err(format!(
+            "run-timeout parser produced {:?}, expected 600s",
+            parsed.run_timeout
+        ));
+    }
+    for bad in ["0", "-1", "not-seconds"] {
+        if parse_argv(&["--run-timeout".into(), bad.into(), "--self-test".into()]).is_ok() {
+            return Err(format!("run-timeout parser accepted invalid value {bad:?}"));
+        }
+    }
+    if parse_argv(&["--run-timeout".into()]).is_ok() {
+        return Err("run-timeout parser accepted a missing value".into());
+    }
+    if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
+        return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
+    }
+    // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
+    // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
+    // missing, future, and contradictory sources are refused.
+    let now_ns = 10_000_000_000u64;
+    let started_ns = 5_000_000_000u64;
+    let allowance_ns = 600_000_000_000u64;
+    let d1 = started_ns + allowance_ns;
+    if deadline_from_sources(Some(600), true, false, None, None, now_ns).is_ok() {
+        return Err("nested timeout accepted a missing scheduler-owned start epoch".into());
+    }
+    if deadline_from_sources(
+        Some(600),
+        true,
+        false,
+        Some(now_ns + 1),
+        None,
+        now_ns,
+    )
+    .is_ok()
+    {
+        return Err("nested timeout accepted a future scheduler-owned start epoch".into());
+    }
+    for nested in [false, true] {
+        if deadline_from_sources(
+            Some(600),
+            nested,
+            false,
+            Some(started_ns),
+            None,
+            now_ns,
+        )? != Some(d1)
+        {
+            return Err("scheduler epoch did not bind both top-level and nested deadlines".into());
+        }
+    }
+    if deadline_from_sources(
+        Some(600),
+        true,
+        true,
+        Some(started_ns),
+        Some(d1 - 1),
+        now_ns,
+    )? != Some(d1)
+    {
+        return Err("nested payload consumed its parent's scope deadline marker".into());
+    }
+    if deadline_from_sources(Some(600), false, true, None, Some(d1), now_ns)? != Some(d1) {
+        return Err("boxed re-exec reset D1 instead of preserving it".into());
+    }
+    if deadline_from_sources(
+        Some(600),
+        false,
+        true,
+        Some(started_ns),
+        Some(d1 + 1),
+        now_ns,
+    )
+    .is_ok()
+    {
+        return Err("contradictory scheduler and scope deadline sources were accepted".into());
+    }
+    if deadline_from_sources(Some(600), false, false, None, Some(d1), now_ns)?
+        != Some(now_ns + allowance_ns)
+    {
+        return Err("an out-of-scope marker forged deadline ownership".into());
+    }
+    let saved_scope_deadline = std::env::var_os(OWN_SCOPE_DEADLINE_ENV);
+    for non_owner in [None, Some(""), Some("0"), Some("99"), Some("malformed")] {
+        match non_owner {
+            Some(v) => std::env::set_var(OWN_SCOPE_DEADLINE_ENV, v),
+            None => std::env::remove_var(OWN_SCOPE_DEADLINE_ENV),
+        }
+        if owns_scope_request(Some(100)) {
+            return Err(format!(
+                "scope request ownership accepted non-owner marker {non_owner:?}"
+            ));
+        }
+    }
+    std::env::set_var(OWN_SCOPE_DEADLINE_ENV, "100");
+    if !owns_scope_request(Some(100)) || owns_scope_request(None) {
+        return Err("scope request ownership failed its exact positive bracket".into());
+    }
+    match saved_scope_deadline {
+        Some(v) => std::env::set_var(OWN_SCOPE_DEADLINE_ENV, v),
+        None => std::env::remove_var(OWN_SCOPE_DEADLINE_ENV),
+    }
+
     // Positive: the one qualifying case must be ACCEPTED (guards against a
     // predicate that refuses everything and looks correct).
     if !force_full_policy_allows(true, Level::Full, None) {
@@ -779,10 +914,58 @@ cleared-caps refusal names {} starved step(s)",
             || !portable_build.cmd.contains("cargo build -p hermit")
             || !portable_build.cmd.contains("--bin hermit")
         {
+            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
+        }
+        let artifact = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "build.e2e_artifact")
+            .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
+        if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
+            || !artifact.cmd.ends_with(" target/install_pkg")
+            || !["build.workspace", "build.runtime_release"]
+                .iter()
+                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+        {
             return Err(
-                "full-plan bracket: fat build does not finish target/debug/hermit before fanout"
+                "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
                     .into(),
             );
+        }
+        let manifest_consumers: Vec<_> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains("./ci/test_harness.sh run --lane "))
+            .collect();
+        if manifest_consumers.is_empty() {
+            return Err("full-plan bracket: no manifest consumers were inspected".into());
+        }
+        for consumer in manifest_consumers {
+            if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
+                return Err(format!(
+                    "full-plan bracket: {} still consumes a mutable Hermit path: {}",
+                    consumer.tag(), consumer.cmd
+                ));
+            }
+            let producer = if consumer.cmd.contains("--lane portable ") {
+                if !consumer.cmd.contains("--require-install") {
+                    return Err(format!(
+                        "full-plan bracket: portable consumer {} did not require the backend-resource bundle",
+                        consumer.tag()
+                    ));
+                }
+                "build.e2e_artifact"
+            } else {
+                "privileged-build.privileged_tests"
+            };
+            if !consumer.deps.iter().any(|d| d == producer) {
+                return Err(format!(
+                    "full-plan bracket: {} does not declare immutable artifact producer {producer}",
+                    consumer.tag()
+                ));
+            }
         }
         let privileged_build = full
             .cfg
@@ -793,7 +976,7 @@ cleared-caps refusal names {} starved step(s)",
         if !privileged_build
             .deps
             .iter()
-            .any(|d| d == "build.workspace")
+            .any(|d| d == "build.e2e_artifact")
         {
             return Err(
                 "full-plan bracket: privileged build can race the portable artifact producer"
@@ -801,7 +984,9 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         if privileged_build.cmd.contains("cargo ")
-            || !privileged_build.cmd.contains("target/debug/hermit")
+            || !privileged_build
+                .cmd
+                .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
             || !privileged_build.cmd.contains("tests_misc-*")
         {
             return Err(
@@ -1232,12 +1417,59 @@ fn default_jobs() -> i64 {
 
 // --------------------------------------------------------------------------- boxing
 
+/// How much longer than validate's own budget the scope may live.
+///
+/// The scope is only a backstop for the driver itself wedging. Validate needs
+/// this later window to reap nodes and flush its rows, so it must not be the
+/// level that normally fires. At the strict-compat 600s run budget this is 60s,
+/// establishing the configured 600 < 660 portion of the nesting ladder.
+fn scope_grace_s(run_timeout_s: i64) -> i64 {
+    60.max(run_timeout_s / 10)
+}
+
+fn owns_scope_request(deadline_ns: Option<u64>) -> bool {
+    deadline_ns.is_some_and(|deadline| {
+        std::env::var(OWN_SCOPE_DEADLINE_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            == Some(deadline)
+    })
+}
+
 /// Establish two-level cgroup-v2 boxing, mirroring the runner's own
 /// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
 /// run) or `Err(exit_code)`. On the default path this re-execs into a transient
 /// `systemd --user` scope and does not return on success.
-fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
+fn resolve_cgroups(
+    allow_failure: bool,
+    run_timeout_s: Option<i64>,
+    deadline_ns: Option<u64>,
+) -> Result<BoxedCgroups, u8> {
     if is_in_scope() {
+        // A RuntimeMaxSec request is only this invocation's backstop when the marker carries this
+        // invocation's absolute deadline. Nested validates inherit an outer scope and its env;
+        // treating that inherited request as the nested 660s rung would compare unrelated clocks.
+        if owns_scope_request(deadline_ns) {
+            let verified = expected_scope_runtime_max_s()
+                .is_some_and(verify_scope_runtime_max);
+            if !verified {
+                let msg = "this invocation's outer RuntimeMaxSec readback failed; the requested \
+                           scope backstop is not proven on the live unit";
+                if allow_failure {
+                    eprintln!(
+                        "validate: WARNING: {msg}; running UNBOXED (--allow-cgroup-failure)."
+                    );
+                    return Ok(None);
+                }
+                eprintln!("validate: ERROR: {msg}.");
+                return Err(3);
+            }
+        } else if run_timeout_s.is_some() {
+            eprintln!(
+                "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+                 the anchored in-process deadline remains inside the enclosing DAG node limit"
+            );
+        }
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
@@ -1264,12 +1496,16 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         );
         return Ok(None);
     }
-    let reexeced_or_skipped = reexec_in_scope(None, None);
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
+    let scope_runtime_s = run_timeout_s.and_then(|run| {
+        remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
+    });
+    if let Some(deadline) = deadline_ns {
+        std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
     } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
+        std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+    }
+    let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
+    let detail = attempt.describe();
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
          this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
@@ -1981,35 +2217,45 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
     if lanes.len() == 2 {
-        // Sequential full validation implicitly warmed the privileged focused
-        // build with build.workspace. `cargo build --all-targets`
-        // emits the Hermit bin target as a test harness under target/debug/deps,
-        // not as target/debug/hermit. Finish that producer with the warm,
-        // ordinary bin build before releasing its dependents: otherwise an E2E
-        // bucket can observe the absent executable. Keeping both invocations in
-        // the producer also prevents the warm build from starving behind all of
-        // the other Cargo consumers once the fat build releases the graph.
-        let producer = "build.workspace";
+        // The artifact barrier waits for both initial Cargo producers, verifies
+        // binary and resource identities, then publishes a content-addressed
+        // bundle. Every later Cargo writer and manifest consumer runs only after
+        // that barrier, so no writer can mutate either source during publication
+        // and no consumer reads a mutable Cargo path afterward.
+        let producer = "build.e2e_artifact";
+        let debug_producer = "build.workspace";
         let consumer = "privileged-build.privileged_tests";
         let portable_build = steps
-            .iter_mut()
-            .find(|s| s.tag() == producer)
-            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends";
+            .iter()
+            .find(|s| s.tag() == debug_producer)
+            .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
         if portable_build.cmd != expected_fat_build {
             return Err(format!(
-                "fused artifact producer command drifted; re-prove the bin completion: {}",
+                "fused debug producer command drifted; re-prove the artifact barrier: {}",
                 portable_build.cmd
             ));
         }
-        portable_build.cmd.push_str(
-            " && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
-        );
+        let artifact = steps
+            .iter()
+            .find(|s| s.tag() == producer)
+            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
+        let expected_artifact = "./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg";
+        if artifact.cmd != expected_artifact
+            || ![debug_producer, "build.runtime_release"]
+                .iter()
+                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
+        {
+            return Err(format!(
+                "fused artifact barrier drifted; re-prove binary+resource publication: {} deps={:?}",
+                artifact.cmd, artifact.deps
+            ));
+        }
         let privileged_build = steps
             .iter_mut()
             .find(|s| s.tag() == consumer)
             .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
+        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run";
         if privileged_build.cmd != expected_build {
             return Err(format!(
                 "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
@@ -2044,7 +2290,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "test -x target/debug/hermit || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
@@ -2426,6 +2672,15 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
     removed
 }
 
+/// Heavy compatibility preparation is the innermost bound in the validation ladder:
+///
+/// `420 prep < 480 gate clamp < 600 whole run < 660 local scope < 720 node < 900 job`.
+///
+/// A 3600s preparation allowance inside a 900s job was unreachable by
+/// construction. This bound fires while the scheduler can still name the node
+/// and flush its profile row.
+const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;
+
 fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
@@ -2436,7 +2691,16 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         // for a reason that has nothing to do with compatibility.
         format!("test -x {}", validate_plan::shell_quote(bin))
     };
-    step_with_caps("compatprep", "hermit_release", "Release Hermit for compatibility", cmd, vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024)
+    step_with_caps(
+        "compatprep",
+        "hermit_release",
+        "Release Hermit for compatibility",
+        cmd,
+        vec![gate.to_string()],
+        COMPAT_DIAGNOSTIC_WALL_S,
+        COMPAT_DIAGNOSTIC_WALL_S * 2,
+        16 * 1024 * 1024 * 1024,
+    )
 }
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
@@ -2461,8 +2725,8 @@ fn prepare_fixtures_node_dep(
             validate_plan::shell_quote(&fixtures.to_string_lossy())
         ),
         vec![dep.to_string()],
-        900,
-        900,
+        COMPAT_DIAGNOSTIC_WALL_S,
+        COMPAT_DIAGNOSTIC_WALL_S,
         4 * 1024 * 1024 * 1024,
     )
 }
@@ -2826,6 +3090,8 @@ struct LaneResult {
     /// that only survived because the host was retried is never mistaken for a
     /// green that passed first time.
     env_retries: usize,
+    /// The whole-invocation deadline expired during this lane.
+    run_timed_out: bool,
 }
 
 /// Read the durable log once it has stopped growing.
@@ -2851,6 +3117,143 @@ fn read_log_settled(path: &Path) -> String {
         last = now;
     }
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Forward nested scheduler rows to the directory uploaded by the hosted shard.
+///
+/// `validate.rs` invokes the scheduler as a library, bypassing the runner CLI's
+/// profile writer. Without this explicit forwarding an inner deadline can name
+/// the cut probe on stdout yet leave no per-probe artifact. The workflow uploads
+/// `$RUN_NODE_PERF_DIR` under `if: always()`, so these rows survive a red job.
+fn forward_step_profiles(result: &RunResult, jobs: i64) {
+    let Ok(dir) = std::env::var("RUN_NODE_PERF_DIR") else {
+        return;
+    };
+    if dir.is_empty() || result.step_profile_rows.is_empty() {
+        return;
+    }
+    let git_sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match append_step_profiles(
+        Path::new(&dir),
+        &result.step_profile_rows,
+        &git_sha,
+        jobs,
+        None,
+        "unverified",
+        "validate.rs",
+    ) {
+        Some(path) => eprintln!(
+            "validate: wrote {} inner step profile row(s) to {}",
+            result.step_profile_rows.len(),
+            path.display()
+        ),
+        None => eprintln!("validate: could not write inner step profile rows to {dir}"),
+    }
+}
+
+/// Absolute monotonic deadline for one logical invocation.
+///
+/// A nested validate must spend from the enclosing scheduler step's clock. Starting a new
+/// `Instant` after re-exec and setup made `600 < 720` numerically true but temporally false.
+fn env_u64(name: &str) -> Result<Option<u64>, String> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let text = raw
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
+    text.parse::<u64>()
+        .map(Some)
+        .map_err(|_| format!("{name}={text:?} is not an unsigned integer"))
+}
+
+fn deadline_from_sources(
+    run_timeout_s: Option<i64>,
+    nested: bool,
+    in_scope: bool,
+    step_started_ns: Option<u64>,
+    owned_scope_deadline_ns: Option<u64>,
+    now_ns: u64,
+) -> Result<Option<u64>, String> {
+    let Some(timeout_s) = run_timeout_s else {
+        return Ok(None);
+    };
+    let allowance_ns = (timeout_s as u64)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
+    let scheduler_deadline = match step_started_ns {
+        Some(start) if start > now_ns => {
+            return Err(format!(
+                "scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV} is in the future"
+            ));
+        }
+        Some(start) => Some(
+            start
+                .checked_add(allowance_ns)
+                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?,
+        ),
+        None => None,
+    };
+    // Only the top-level same-logical-run re-exec owns this marker. A nested focused payload
+    // inherits its parent's scope marker but owns the scheduler epoch for its own enclosing node.
+    if in_scope && !nested {
+        if let Some(owned) = owned_scope_deadline_ns {
+            let latest = now_ns
+                .checked_add(allowance_ns)
+                .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))?;
+            if owned > latest {
+                return Err("invocation-owned scope deadline exceeds a fresh full allowance".into());
+            }
+            if scheduler_deadline.is_some_and(|scheduler| scheduler != owned) {
+                return Err("scheduler epoch and invocation-owned scope deadline disagree".into());
+            }
+            return Ok(Some(owned));
+        }
+    }
+    if let Some(deadline) = scheduler_deadline {
+        return Ok(Some(deadline));
+    }
+    if nested {
+        return Err(format!(
+            "nested timed validate lacks the scheduler-owned {STEP_STARTED_MONOTONIC_NS_ENV}; \
+             refusing to start a fresh clock that could outlive its enclosing node"
+        ));
+    }
+    now_ns
+        .checked_add(allowance_ns)
+        .map(Some)
+        .ok_or_else(|| format!("run timeout {timeout_s}s overflows the monotonic deadline"))
+}
+
+fn invocation_deadline_ns(run_timeout_s: Option<i64>, nested: bool) -> Result<Option<u64>, String> {
+    let now_ns = monotonic_now_ns().ok_or_else(|| "CLOCK_MONOTONIC is unavailable".to_string())?;
+    deadline_from_sources(
+        run_timeout_s,
+        nested,
+        is_in_scope(),
+        env_u64(STEP_STARTED_MONOTONIC_NS_ENV)?,
+        env_u64(OWN_SCOPE_DEADLINE_ENV)?,
+        now_ns,
+    )
+}
+
+/// Seconds left on one shared invocation clock, floored so a child cannot outlive it.
+fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
+    let deadline_ns = deadline_ns?;
+    // Clock-read failure cannot turn a bounded invocation into `None` (unbounded). Expire it in
+    // the safe direction instead.
+    let now_ns = monotonic_now_ns().unwrap_or(deadline_ns);
+    Some(if now_ns >= deadline_ns {
+        0
+    } else {
+        ((deadline_ns - now_ns) / 1_000_000_000) as i64
+    })
 }
 
 /// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
@@ -2883,9 +3286,34 @@ fn run_lane_with_env_retries(
     verbosity: i64,
     cgroups: BoxedCgroups,
     log_path: &Path,
+    deadline: Option<u64>,
 ) -> LaneResult {
     let max = validate_runtime::env_block_max_retries();
-    let first = run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+    if remaining_budget_s(deadline) == Some(0) {
+        eprintln!(
+            "validate: whole-run budget expired during setup; no DAG node will be started \
+             unbounded, and every planned node is recorded as not attempted"
+        );
+        return LaneResult {
+            outcomes: Vec::new(),
+            skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            ok: false,
+            env_retries: 0,
+            run_timed_out: true,
+        };
+    }
+    let first = run_dag_boxed_deadline(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups.clone(),
+        None,
+        None,
+        remaining_budget_s(deadline),
+    );
+    forward_step_profiles(&first, jobs);
+    let mut run_timed_out = first.run_timed_out;
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
@@ -2949,8 +3377,28 @@ fn run_lane_with_env_retries(
         retry_cfg.description =
             format!("{} — environmental retry {env_retries}/{max}", cfg.description);
         retry_cfg.steps = steps;
-        let again =
-            run_dag_boxed_ordered(&retry_cfg, jobs, keep_going, verbosity, cgroups.clone(), None, None);
+        // Retries draw down the same clock. Giving every retry a fresh budget
+        // would turn a bounded invocation back into an unbounded one.
+        if remaining_budget_s(deadline) == Some(0) {
+            eprintln!(
+                "validate: whole-run budget exhausted; NOT starting environmental retry \
+                 {env_retries}/{max}."
+            );
+            run_timed_out = true;
+            break;
+        }
+        let again = run_dag_boxed_deadline(
+            &retry_cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            None,
+            None,
+            remaining_budget_s(deadline),
+        );
+        forward_step_profiles(&again, jobs);
+        run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
@@ -2980,8 +3428,11 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
-    let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries }
+    // Eager-exit aborts after a genuine peer failure are neutral, but steps cut
+    // by the whole-run clock are not a green. Without the typed run bit here an
+    // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
+    let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
+    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -3842,6 +4293,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
     }
 
+    // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
+    // durable-log setup, and registration.  A nested focused payload inherits the enclosing
+    // safe-ci step's scheduler-owned epoch; a top-level run owns its epoch here.
+    let run_timeout = args
+        .run_timeout
+        .or_else(|| env_positive("HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS"));
+    let deadline_ns = if args.show_plan {
+        None
+    } else {
+        match invocation_deadline_ns(run_timeout, nesting.nested) {
+            Ok(deadline) => deadline,
+            Err(msg) => {
+                eprintln!("validate: REFUSED — {msg}");
+                return RunSummary::refused(
+                    3,
+                    &profile_name,
+                    "the shared timeout epoch",
+                    vec![msg],
+                );
+            }
+        }
+    };
+
     // ---- concurrent invocation (validate.sh:492) -----------------------------
     //
     // A second validate in the SAME checkout is unambiguously wrong: both drive
@@ -4019,6 +4493,38 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
+    // The whole-run budget is the first boundary able to stop cumulative cost
+    // while preserving evidence. Per-node caps cannot bound a sequence of legal
+    // nodes, and the hosted job kill discards the diagnostic tail.
+    // Refuse an inverted ladder before even `--show-plan` succeeds. A node with
+    // an allowance at least as large as the run budget can only be cut by the
+    // less-specific outer clock, losing attribution to the node.
+    if let Some(secs) = run_timeout {
+        let mut bad = steps_violating_run_timeout(&plan.cfg, secs);
+        if let Some(second) = &plan.second {
+            bad.extend(steps_violating_run_timeout(second, secs));
+        }
+        if !bad.is_empty() {
+            bad.sort();
+            bad.dedup();
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "whole-run budget is not larger than every node budget",
+                std::iter::once(format!(
+                    "{} node(s) declare a wall budget >= the {secs}s whole-run budget:",
+                    bad.len()
+                ))
+                .chain(bad.iter().take(8).map(|(tag, t)| format!("  {tag} ({t}s)")))
+                .chain(std::iter::once(
+                    "lower the named node budgets so each can diagnose itself before the whole-run boundary"
+                        .to_string(),
+                ))
+                .collect(),
+            );
+        }
+    }
+
     // Print the plan and exit. This makes "what will actually run, and under what
     // caps" reviewable without spending a validate slot — and it is how the
     // declared-caps claim above can be checked by eye rather than trusted.
@@ -4136,33 +4642,43 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
-        Ok(c) => {
-            // Claim the re-entrancy marker HERE, not before resolve_cgroups.
-            // On the default path resolve_cgroups re-execs into a transient
-            // systemd scope and does not return, so the process that reaches
-            // this line is the one that will actually drive the run -- and it is
-            // the only one whose pid a nested payload should see. Claiming
-            // earlier made the driver read its own boxing re-exec as a nested
-            // invocation and refuse itself.
-            validate_runtime::claim_active_marker();
-            c
-        }
-        Err(code) => {
-            return RunSummary::refused(
-                code,
-                &plan.profile,
-                "cgroup boxing (fail-closed)",
-                vec![
-                    "two-level cgroup-v2 boxing could not be established; see the message above"
-                        .into(),
-                    "resource boxing is this tool's primary purpose — re-run with \
-                     --allow-cgroup-failure to accept an UNBOXED run"
-                        .into(),
-                ],
-            )
-        }
-    };
+    match run_timeout {
+        Some(secs) => eprintln!(
+            "validate: whole-run budget {secs}s across lanes and retries; in-flight nodes are cut and rows flushed on breach"
+        ),
+        None => eprintln!(
+            "validate: WARNING: no whole-run budget (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS); per-node caps do not bound cumulative wall time"
+        ),
+    }
+
+    let cgroups: BoxedCgroups =
+        match resolve_cgroups(args.allow_cgroup_failure, run_timeout, deadline_ns) {
+            Ok(c) => {
+                // Claim the re-entrancy marker HERE, not before resolve_cgroups.
+                // On the default path resolve_cgroups re-execs into a transient
+                // systemd scope and does not return, so the process that reaches
+                // this line is the one that will actually drive the run -- and it is
+                // the only one whose pid a nested payload should see. Claiming
+                // earlier made the driver read its own boxing re-exec as a nested
+                // invocation and refuse itself.
+                validate_runtime::claim_active_marker();
+                c
+            }
+            Err(code) => {
+                return RunSummary::refused(
+                    code,
+                    &plan.profile,
+                    "cgroup boxing (fail-closed)",
+                    vec![
+                        "two-level cgroup-v2 boxing could not be established; see the message above"
+                            .into(),
+                        "resource boxing is this tool's primary purpose — re-run with \
+                         --allow-cgroup-failure to accept an UNBOXED run"
+                            .into(),
+                    ],
+                )
+            }
+        };
 
     let commit = git_sha();
     match setup_durable_log(&root, &plan.profile, &commit) {
@@ -4259,15 +4775,28 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut ok = true;
     let mut env_retries = 0usize;
 
+    // One clock for the whole invocation. Sequential lanes and retries spend
+    // from the same allowance rather than each receiving a fresh 600 seconds.
+    let deadline = deadline_ns;
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_with_env_retries(cfg, jobs, keep_going, verbosity, cgroups.clone(), &log_path)
+        run_lane_with_env_retries(
+            cfg,
+            jobs,
+            keep_going,
+            verbosity,
+            cgroups.clone(),
+            &log_path,
+            deadline,
+        )
     };
+    let mut run_timed_out = false;
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
     env_retries += r.env_retries;
+    run_timed_out = run_timed_out || r.run_timed_out;
 
     if let Some(second) = &plan.second {
         if ok || keep_going {
@@ -4276,12 +4805,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
             env_retries += r2.env_retries;
+            run_timed_out = run_timed_out || r2.run_timed_out;
         } else {
             eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
         }
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
+    if run_timed_out {
+        println!(
+            "⏱ VALIDATE RUN BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work was \
+             cut so its node identities and rows could still be reported. This is an incomplete \
+             judgement, not a product verdict.",
+            run_timeout.unwrap_or(0)
+        );
+    }
     print_cost_table(&outcomes, &skipped);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
