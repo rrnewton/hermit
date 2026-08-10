@@ -43,6 +43,8 @@ use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::robust_list;
+use crate::syscalls::robust_list::RobustEntry;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::await_exact_child_physical_exit;
@@ -983,6 +985,206 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(child_dettid.as_raw() as i64)
     }
 
+    /// `set_robust_list` system call.
+    ///
+    /// Still a pass-through: Linux owns the registration, and Detcore only
+    /// records the head address so it can replay `exit_robust_list()` when the
+    /// thread dies (see [`Self::run_robust_list_owner_death`]). Recording
+    /// happens only after the kernel accepts the call, so a rejected length or
+    /// address never becomes Detcore state.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    pub async fn handle_set_robust_list<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SetRobustList,
+    ) -> Result<i64, Error> {
+        let head = call.head().map(AddrMut::as_raw);
+        let len = call.len();
+        let res = guest.inject(call).await?;
+        // TODO-HUMAN-REVIEW(PR-robust-futex-owner-death): Review robust-list
+        // head tracking used to drive owner-death wakeups.
+        let recorded = match head {
+            // `set_robust_list(NULL, ...)` unregisters the list.
+            None => None,
+            Some(_) if len != robust_list::ROBUST_LIST_HEAD_LEN => None,
+            Some(addr) => Some(addr),
+        };
+        guest.thread_state_mut().robust_list_head = recorded;
+        trace!(
+            "[detcore, dtid {}] robust-list head registered: {:?}",
+            guest.thread_state().dettid,
+            recorded,
+        );
+        Ok(res)
+    }
+
+    /// Replay Linux's `exit_robust_list()` for the calling thread.
+    ///
+    /// Linux runs this from `mm_release()` while a task dies. Detcore performs
+    /// the same walk, applies the same word transition, and issues the wake
+    /// against its own modeled waiter pool, which is where precise-mode futex
+    /// waiters actually live. See `crate::syscalls::robust_list` for why the
+    /// word write is done here rather than left to the host kernel.
+    ///
+    /// Only the precise futex model needs this. Polling and external modes park
+    /// waiters in the host kernel, which performs its own robust-list cleanup;
+    /// and without thread sequentialization Detcore does not model futexes at
+    /// all.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-robust-futex-owner-death): Review owner-death wakeup
+    // emulation, which changes how a dying thread's peers are scheduled.
+    async fn run_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+            return;
+        }
+        let Some(head) = guest.thread_state().robust_list_head else {
+            return;
+        };
+        let dettid = guest.thread_state().dettid;
+
+        // `exit_robust_list()` reads the three head fields up front and gives
+        // up entirely if any read faults.
+        let Some((first, futex_offset, pending)) = Self::read_robust_list_head(guest, head) else {
+            trace!(
+                "[detcore, dtid {}] unreadable robust-list head at {:#x}; no owner-death wakeups",
+                dettid, head,
+            );
+            return;
+        };
+
+        let mut entry = first;
+        let mut limit = robust_list::ROBUST_LIST_LIMIT;
+        while entry.address != head && limit > 0 {
+            // `struct robust_list` is a single `next` pointer at offset 0.
+            let next = Addr::<u64>::from_raw(entry.address)
+                .and_then(|addr| guest.memory().read_value::<_, u64>(addr).ok())
+                .map(RobustEntry::decode);
+            if Some(entry.address) != pending.map(|p| p.address) {
+                self.handle_robust_futex_death(guest, entry, futex_offset)
+                    .await;
+            }
+            // A faulting `next` pointer terminates the walk, exactly as the
+            // kernel's `fetch_robust_entry()` failure does.
+            let Some(next) = next else { break };
+            entry = next;
+            limit -= 1;
+        }
+        if limit == 0 {
+            trace!(
+                "[detcore, dtid {}] robust list exceeded ROBUST_LIST_LIMIT; truncating walk",
+                dettid,
+            );
+        }
+
+        // `list_op_pending` covers the window in which glibc has claimed a
+        // mutex but not yet linked it, so the kernel handles it last.
+        if let Some(pending) = pending {
+            self.handle_robust_futex_death(guest, pending, futex_offset)
+                .await;
+        }
+    }
+
+    /// Read `robust_list_head.{list.next, futex_offset, list_op_pending}`.
+    fn read_robust_list_head<G: Guest<Self>>(
+        guest: &mut G,
+        head: usize,
+    ) -> Option<(RobustEntry, i64, Option<RobustEntry>)> {
+        let memory = guest.memory();
+        let read_u64 = |offset: usize| -> Option<u64> {
+            memory
+                .read_value::<_, u64>(Addr::<u64>::from_raw(head.checked_add(offset)?)?)
+                .ok()
+        };
+        let first = RobustEntry::decode(read_u64(robust_list::HEAD_LIST_OFFSET)?);
+        let futex_offset = read_u64(robust_list::HEAD_FUTEX_OFFSET_OFFSET)? as i64;
+        let pending = RobustEntry::decode(read_u64(robust_list::HEAD_LIST_OP_PENDING_OFFSET)?);
+        Some((first, futex_offset, (!pending.is_null()).then_some(pending)))
+    }
+
+    /// Detcore's `handle_futex_death()`: mark one owned futex word dead and, for
+    /// a non-PI futex with waiters, wake exactly one of them.
+    async fn handle_robust_futex_death<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        entry: RobustEntry,
+        futex_offset: i64,
+    ) {
+        let dettid = guest.thread_state().dettid;
+        let Some(word) = robust_list::futex_word_address(entry.address, futex_offset) else {
+            return;
+        };
+        let Some(word_addr) = AddrMut::<u32>::from_raw(word) else {
+            return;
+        };
+        let Ok(uval) = guest.memory().read_value::<_, u32>(word_addr) else {
+            return;
+        };
+        // The value glibc stores in the futex word is the TID the guest itself
+        // observed, and Detcore hands the guest `dettid` from clone/gettid, so
+        // `dettid` is the identity to compare against on every backend.
+        let Some(transition) =
+            robust_list::futex_death_transition(uval, dettid.as_raw() as u32, entry.is_pi)
+        else {
+            return;
+        };
+        // The dying thread holds the scheduler turn here, so no other guest
+        // thread can observe or race this read-modify-write; it is the
+        // deterministic equivalent of the kernel's cmpxchg loop.
+        if guest
+            .memory()
+            .write_value(word_addr, &transition.new_value)
+            .is_err()
+        {
+            return;
+        }
+        debug!(
+            "[detcore, dtid {}] robust-list owner death: futex word {:#x} {:#x} -> {:#x}{}",
+            dettid,
+            word,
+            uval,
+            transition.new_value,
+            if transition.wake_one {
+                ", waking one waiter"
+            } else {
+                ""
+            },
+        );
+        if !transition.wake_one {
+            return;
+        }
+        // glibc always issues robust-mutex futex operations with the shared
+        // flag, and so does the kernel's owner-death wake; resolve the same key.
+        let futexid = guest.thread_state().futex_id(word, false);
+        let woken = match futex_action(
+            guest,
+            FutexAction::WakeRequest(1),
+            &futexid,
+            transition.new_value as i32,
+            u32::MAX,
+        )
+        .await
+        {
+            Some(SchedValue::Value(count)) => count,
+            // A wake never carries a timeout, and a cancelled RPC wakes nobody.
+            Some(SchedValue::TimeOut) | None => 0,
+        };
+        // Guest-level identities only: dettid, the modeled futex key, and a
+        // count. No host pointers and no iteration order leak into this line,
+        // which is compared exactly under `--verify-strict`.
+        info!(
+            "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?}",
+            dettid, woken, futexid,
+        );
+        let _ = futex_action(
+            guest,
+            FutexAction::WakeFinished(0),
+            &futexid,
+            transition.new_value as i32,
+            u32::MAX,
+        )
+        .await;
+    }
+
     /// Exit system call
     pub async fn handle_exit<G: Guest<Self>>(
         &self,
@@ -998,6 +1200,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        self.run_robust_list_owner_death(guest).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -1017,6 +1220,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // Linux runs `exit_robust_list()` for every task in the group; Detcore
+        // only sees the caller's `exit_group`, so it replays the caller's list.
+        // The siblings' lists are covered when they reach their own `exit`.
+        self.run_robust_list_owner_death(guest).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -1288,11 +1495,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        // A successful execve replaces the address space, and Linux clears
+        // `task->robust_list` with it; the new image re-registers its own.
+        let old_robust_list_head = guest.thread_state().robust_list_head;
+
         {
             let thread_state = guest.thread_state_mut();
             thread_state.file_metadata = Arc::new(Mutex::new(new_metadata));
             thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
             thread_state.mm_id = old_mm_id.for_exec(detpid);
+            thread_state.robust_list_head = None;
         }
 
         // execve(2) doesn't return upon success.
@@ -1303,6 +1515,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.file_metadata = old_metadata;
             thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;
+            thread_state.robust_list_head = old_robust_list_head;
         }
 
         cancel_exec(guest).await;
