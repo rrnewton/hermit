@@ -297,14 +297,45 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
         if refuse:
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert not list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            ), output
             assert not ledger_events(canonical_root), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
+            # Producers make a row immediately visible through the ignored
+            # spool. Publication into a tracked ledger shard is a separate
+            # serialized operation and must not happen on this path.
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            spools = list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            )
+            assert len(spools) == 1, (spools, output)
             events = ledger_events(canonical_root)
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
             assert "ledger event appended" in output, output
+
+
+def run_composed_writer_source_contract() -> None:
+    """Bind canonical routing and typed node accounting in the same writer."""
+    src = VALIDATE.read_text()
+    tail = src.split("fn write_ledger(", 1)[1]
+    signature, body = tail.split(") {", 1)
+    body = body.split("\nfn ", 1)[0]
+    assert "accounting: &validate_plan::NodeAccounting" in signature, signature
+    assert "ledger:" not in signature and "skipped:" not in signature, signature
+    assert "let tool = ledger_tool_path();" in body, body
+    for field in (
+        '"planned_nodes": accounting.planned',
+        '"skipped_node_details": skipped_node_details',
+        '"unaccounted_nodes": unaccounted_nodes',
+        '"node_accounting_complete": accounting.is_complete()',
+        '"node_accounting_errors": accounting.errors',
+    ):
+        assert field in body, field
 
 
 def run_cleanup_signal_race() -> None:
@@ -362,13 +393,15 @@ def main() -> None:
     run_mode_activation_contract()
     run_canonical_adapter_contract(refuse=False)
     run_canonical_adapter_contract(refuse=True)
+    run_composed_writer_source_contract()
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
-        "accept/refuse bracketed; MODE=1/0/empty activation bracketed; cleanup is signal-atomic"
+        "accept/refuse bracketed; path-free typed writer bound; MODE=1/0/empty activation "
+        "bracketed; cleanup is signal-atomic"
     )
 
 
