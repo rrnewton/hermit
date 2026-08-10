@@ -2044,7 +2044,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selects, so "any one of nine" would let it silently test a STALE
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
-        privileged_build.cmd = "test -x target/debug/hermit || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        privileged_build.cmd = "test -x target/debug/hermit || { echo \"REFUSED: prebuilt target/debug/hermit is absent; expected it from build.workspace. This is a missing PRECONDITION, not a test failure.\" >&2; exit 1; }; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\" || { echo \"REFUSED: no executable target/debug/deps/tests_misc-* found; expected it from build.workspace. This is a missing PRECONDITION, not a test failure.\" >&2; exit 1; }; echo \"selected $newest\"".to_string();
 
         let cpuid = steps
             .iter_mut()
@@ -2063,7 +2063,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // selection must be the NEWEST rather than an arbitrary survivor of a
         // `-ge 1` relaxation -- running a stale `tests_misc` would report a
         // CPUID verdict about an artifact that is not the one under test.
-        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
+        cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\" || { echo \"REFUSED: no executable target/debug/deps/tests_misc-* found; expected it from build.privileged_tests. This is a missing PRECONDITION, not a CPUID failure.\" >&2; exit 1; }; echo \"selected $newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
     }
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
