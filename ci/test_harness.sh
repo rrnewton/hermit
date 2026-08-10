@@ -69,6 +69,177 @@ function die {
     exit 2
 }
 
+function require_executable_hermit {
+    local path=$1
+    [[ -x $path ]] || die "Hermit binary is not executable: $path"
+}
+
+# Exercise the real publisher/verifier/consumer wrapper. The writer and reader
+# handshake over three observed mutable-source states; every reader invocation
+# must execute the original published identity. Four negative fixtures then
+# prove the wrapper refuses before invoking its consumer.
+function audit_immutable_hermit_binary {
+    local scratch mutable pointer bundles consumer writer_pid state cycle checks=0 refusals=0
+    local complete_source complete_pointer complete_bundle fake fake_pointer output status path expected_reason
+    local incomplete_pointer incomplete_bundle negative_dag negative_entry_marker negative_marker
+    local dag_entry_marker dag_entry
+    local dag_command dag_output dag_detail dag_status starts failures exact_refusal refusal_count
+    scratch=$(mktemp -d)
+    mutable="$scratch/target/debug/hermit"
+    pointer="$scratch/target/ci/artifact.path"
+    bundles="$scratch/target/ci/artifacts"
+    consumer="$scratch/consumer.sh"
+    mkdir -p "$(dirname "$mutable")"
+    printf '#!/usr/bin/env bash\nprintf "expected-identity\\n"\n' >"$mutable"
+    chmod 755 "$mutable"
+    "$ROOT_DIR/ci/publish-hermit-e2e-artifact.sh" "$mutable" "$bundles" "$pointer" >/dev/null
+    cat >"$consumer" <<'CONSUMER'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -z ${CONSUMER_ENTRY_MARKER:-} ]] || : >"$CONSUMER_ENTRY_MARKER"
+[[ $("$HERMIT_BIN") == expected-identity ]]
+[[ -z ${CONSUMER_MARKER:-} ]] || : >"$CONSUMER_MARKER"
+CONSUMER
+    chmod 755 "$consumer"
+
+    (
+        for cycle in 1 2 3; do
+            mv "$mutable" "$mutable.absent-$cycle"
+            : >"$scratch/state-$cycle-absent"
+            while [[ ! -e $scratch/ack-$cycle-absent ]]; do sleep 0.01; done
+            printf '#!/usr/bin/env bash\nprintf "wrong-nonexec\\n"\n' >"$mutable"
+            chmod 644 "$mutable"
+            : >"$scratch/state-$cycle-nonexec"
+            while [[ ! -e $scratch/ack-$cycle-nonexec ]]; do sleep 0.01; done
+            printf '#!/usr/bin/env bash\nprintf "wrong-relinked-%s\\n"\n' "$cycle" >"$mutable.next"
+            chmod 755 "$mutable.next"
+            mv "$mutable.next" "$mutable"
+            : >"$scratch/state-$cycle-relinked"
+            while [[ ! -e $scratch/ack-$cycle-relinked ]]; do sleep 0.01; done
+        done
+    ) &
+    writer_pid=$!
+    for cycle in 1 2 3; do
+        for state in absent nonexec relinked; do
+            while [[ ! -e $scratch/state-$cycle-$state ]]; do sleep 0.01; done
+            for _ in {1..8}; do
+                HERMIT_E2E_ARTIFACT_POINTER="$pointer" \
+                    "$ROOT_DIR/ci/run-with-hermit-e2e-artifact.sh" "$consumer" >/dev/null 2>&1
+                checks=$((checks + 1))
+            done
+            : >"$scratch/ack-$cycle-$state"
+        done
+    done
+    wait "$writer_pid"
+
+    complete_source="$scratch/install_pkg"
+    for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so libreverie_liteinst.so; do
+        mkdir -p "$complete_source/rsrcs/$(dirname "$path")"
+        printf 'fixture-%s\n' "$path" >"$complete_source/rsrcs/$path"
+    done
+    for path in dynamorio/bin64/drrun sabre e9patch e9tool; do
+        mkdir -p "$complete_source/rsrcs/$(dirname "$path")"
+        printf '#!/usr/bin/env bash\nexit 0\n' >"$complete_source/rsrcs/$path"
+        chmod 755 "$complete_source/rsrcs/$path"
+    done
+    complete_pointer="$scratch/complete.path"
+    "$ROOT_DIR/ci/publish-hermit-e2e-artifact.sh" "$mutable.absent-1" \
+        "$scratch/complete-artifacts" "$complete_pointer" "$complete_source" >/dev/null
+    complete_bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$complete_pointer")
+
+    for state in missing nonexec wrong-hash incomplete; do
+        fake_pointer="$scratch/$state.path"
+        expected_reason=
+        case "$state" in
+            missing)
+                printf '%s\n' "$scratch/does-not-exist" >"$fake_pointer"
+                expected_reason="published artifact directory is missing"
+                ;;
+            nonexec|wrong-hash)
+                fake="$scratch/$state/${complete_bundle##*/}"
+                mkdir -p "$(dirname "$fake")"
+                cp -a "$complete_bundle" "$fake"
+                if [[ $state == nonexec ]]; then
+                    chmod 644 "$fake/hermit"
+                    expected_reason="published Hermit is missing, empty, or non-executable"
+                else
+                    printf corruption >>"$fake/hermit"
+                    expected_reason="published Hermit hash mismatch"
+                fi
+                printf '%s\n' "$fake" >"$fake_pointer"
+                ;;
+            incomplete)
+                fake="$scratch/$state/${complete_bundle##*/}"
+                mkdir -p "$(dirname "$fake")"
+                cp -a "$complete_bundle" "$fake"
+                rm "$fake/install/rsrcs/sabre"
+                printf '%s\n' "$fake" >"$fake_pointer"
+                incomplete_pointer=$fake_pointer
+                incomplete_bundle=$fake
+                expected_reason="resource bundle executable is missing, empty, or non-executable"
+                ;;
+        esac
+        set +e
+        output=$(CONSUMER_ENTRY_MARKER="$scratch/$state.consumer-entered" \
+            CONSUMER_MARKER="$scratch/$state.consumer-executed" \
+            HERMIT_E2E_ARTIFACT_POINTER="$fake_pointer" \
+            "$ROOT_DIR/ci/run-with-hermit-e2e-artifact.sh" --require-install "$consumer" 2>&1)
+        status=$?
+        set -e
+        [[ $status == 2 ]] || die "immutable artifact negative '$state' returned $status, expected 2: $output"
+        [[ $output == *"$expected_reason"* ]] ||
+            die "immutable artifact negative '$state' did not name '$expected_reason': $output"
+        [[ ! -e $scratch/$state.consumer-entered ]] ||
+            die "immutable artifact negative '$state' entered the protected consumer after refusal"
+        [[ ! -e $scratch/$state.consumer-executed ]] ||
+            die "immutable artifact negative '$state' executed the consumer after refusal"
+        refusals=$((refusals + 1))
+    done
+
+    negative_dag="$scratch/bad-artifact-dag.json"
+    negative_entry_marker="$scratch/dag-consumer-entered"
+    negative_marker="$scratch/dag-consumer-executed"
+    dag_entry_marker="$scratch/dag-entry"
+    dag_entry="$scratch/dag-entry.sh"
+    cat >"$dag_entry" <<'DAG_ENTRY'
+#!/usr/bin/env bash
+set -euo pipefail
+: >"$DAG_ENTRY_MARKER"
+exec "$RUN_WITH_ARTIFACT" --require-install "$PROTECTED_CONSUMER"
+DAG_ENTRY
+    chmod 755 "$dag_entry"
+    dag_command="DAG_ENTRY_MARKER=$dag_entry_marker RUN_WITH_ARTIFACT=$ROOT_DIR/ci/run-with-hermit-e2e-artifact.sh PROTECTED_CONSUMER=$consumer CONSUMER_ENTRY_MARKER=$negative_entry_marker CONSUMER_MARKER=$negative_marker HERMIT_E2E_ARTIFACT_POINTER=$incomplete_pointer $dag_entry"
+    exact_refusal="[e2e.bad_artifact] verify-hermit-e2e-artifact.sh: resource bundle executable is missing, empty, or non-executable: $incomplete_bundle/install/rsrcs/sabre"
+    jq -n --arg cmd "$dag_command" '{
+        resource_caps: {}, default_step_timeout: 30,
+        steps: [{group:"e2e",job:"bad_artifact",desc:"Reject one incomplete published artifact",
+                 cmd:$cmd,timeout:30,
+                 hint:{est_duration_s:1,rss_baseline_bytes:67108864,
+                       hard_mem_max_bytes:268435456,classification:"light"}}]
+    }' >"$negative_dag"
+    set +e
+    dag_output=$(RUN_DAG_FILE_OVERRIDE="$negative_dag" \
+        "$ROOT_DIR/ci/run-dag.sh" portable -j 1 --allow-cgroup-failure \
+        --perf-dir "$scratch/perf" --profile -v 2>&1)
+    dag_status=$?
+    set -e
+    starts=$(grep -Fc '[e2e.bad_artifact] ▶ START' <<<"$dag_output" || true)
+    failures=$(grep -Fc '[e2e.bad_artifact] ✗ FAIL' <<<"$dag_output" || true)
+    dag_detail=$(sed -n \
+        '/^\[e2e\.bad_artifact\] ----- detail -----$/,/^\[e2e\.bad_artifact\] ----- end detail -----$/p' \
+        <<<"$dag_output")
+    refusal_count=$(grep -Fxc -- "$exact_refusal" <<<"$dag_detail" || true)
+    [[ $dag_status != 0 && $starts == 1 && $failures == 1 ]] ||
+        die "bad-artifact DAG did not execute exactly one failing node (rc=$dag_status starts=$starts failures=$failures): $dag_output"
+    [[ -e $dag_entry_marker ]] || die "bad-artifact DAG failed before entering its verifier command: $dag_output"
+    [[ $refusal_count == 1 ]] ||
+        die "bad-artifact DAG emitted $refusal_count exact verifier-refusal lines, expected 1 ('$exact_refusal'): $dag_output"
+    [[ ! -e $negative_entry_marker ]] || die "bad-artifact DAG entered its protected consumer"
+    [[ ! -e $negative_marker ]] || die "bad-artifact DAG executed its protected consumer"
+    echo "immutable artifact bracket: $checks expected-identity executions across 3 repeated absent/nonexec/relinked cycles; $refusals/4 direct bad artifacts refused; bad-artifact DAG rc=$dag_status executed_nodes=$starts failed_nodes=$failures verifier_entered=1 exact_refusal_lines=$refusal_count consumer_entered=0 consumer_executed=0"
+    rm -rf "$scratch"
+}
+
 function contains {
     local needle=$1
     shift
@@ -300,6 +471,50 @@ function workflow_non_dag_step_budget_seconds {
     ' "$workflow"
 }
 
+# The strict-compat lane used to permit 1800s internally inside a 900s hosted
+# job. The external kill necessarily won, leaving neither a named probe nor its
+# per-probe rows. Assert the deployed values, not hand-copied policy numbers.
+function assert_strict_compat_budget_ladder {
+    local workflow=$1
+    local cmd gate_seconds run_seconds node_seconds job_seconds
+    cmd=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .cmd' \
+        "$DAG_ROOT/portable.json")
+    gate_seconds=$(sed -n 's/.*VALIDATE_GATE_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
+    run_seconds=$(sed -n 's/.*HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS=\([0-9][0-9]*\).*/\1/p' <<<"$cmd")
+    node_seconds=$(jq -r '.steps[] | select(.group == "test" and .job == "strict_compat") | .timeout' \
+        "$DAG_ROOT/portable.json")
+    job_seconds=$(( $(workflow_job_timeout_minutes "$workflow" test-debug) * 60 ))
+
+    [[ $gate_seconds =~ ^[1-9][0-9]*$ && $run_seconds =~ ^[1-9][0-9]*$ && \
+       $node_seconds =~ ^[1-9][0-9]*$ && $job_seconds =~ ^[1-9][0-9]*$ ]] ||
+        die "strict-compat must expose numeric gate/run/node/job budgets"
+    ((gate_seconds < run_seconds && run_seconds < node_seconds && node_seconds < job_seconds)) ||
+        die "strict-compat budget ladder must satisfy gate < whole-run < node < hosted job; got ${gate_seconds} < ${run_seconds} < ${node_seconds} < ${job_seconds}"
+
+    # The scope backstop is derived as run + max(60, run/10), so the deployed
+    # 600s run yields 660s. Keep that strictly below the 720s node boundary.
+    ((run_seconds + 60 < node_seconds)) ||
+        die "strict-compat scope backstop must fit between whole-run and node budgets"
+    [[ $(grep -Fxc 'const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
+        die "strict-compat heavy prep must retain its measured 420s inner bound"
+    grep -Fq 'run_dag_boxed_deadline' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat whole-run budget has no in-process deadline consumer"
+    grep -Fq 'STEP_STARTED_MONOTONIC_NS_ENV' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat starts a fresh inner clock instead of inheriting the outer node epoch"
+    grep -Fq 'expected_scope_runtime_max_s' "$ROOT_DIR/scripts/validate.rs" &&
+        grep -Fq 'verify_scope_runtime_max' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat requests a scope RuntimeMaxSec without reading the live value back"
+    grep -Fq 'forward_step_profiles(&first, jobs)' "$ROOT_DIR/scripts/validate.rs" ||
+        die "strict-compat inner rows are not forwarded to the hosted artifact directory"
+    [[ $cmd == *'SAFE_CI_DAG_RUNNER_LOG_DIR="${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs"'* ]] ||
+        die "strict-compat per-probe logs are not routed into the always-uploaded shard artifact"
+    [[ $(grep -Fxc '        if: always()' "$workflow") -ge 1 ]] ||
+        die "portable workflow must upload diagnostic artifacts on failed shards"
+    grep -Fq 'pub fn run_dag_boxed_deadline' \
+        "$ROOT_DIR/agent-utils/rs/safe-ci-dag-runner/src/scheduler.rs" ||
+        die "the pinned safe-ci runner does not implement the whole-run deadline"
+}
+
 function assert_parallel_portable_workflow {
     local workflow=$1
     local run_dag_count run_node_count debug_inner_path release_inner_path
@@ -312,6 +527,8 @@ function assert_parallel_portable_workflow {
         die "GitHub portable workflow must not retain the serial ci/run-dag.sh entrypoint"
     ((run_node_count == 5)) ||
         die "GitHub portable workflow must have five audited ci/run-node.sh entrypoints"
+
+    assert_strict_compat_budget_ladder "$workflow"
 
     # The hosted job is the outer kill boundary. Compute the critical path for
     # each exact run-node selection, retaining dependencies among selected nodes
@@ -381,6 +598,12 @@ function assert_parallel_portable_workflow {
         die "GitHub portable debug shards must verify the DynamoRIO launcher"
     [[ $(grep -Fxc '          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so' "$workflow") == 1 ]] ||
         die "GitHub portable debug shards must verify the DynamoRIO client"
+    [[ $(grep -Fxc '        run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg' "$workflow") == 1 ]] ||
+        die "GitHub portable e2e cells must publish one verified immutable Hermit artifact after unpack"
+    [[ $(grep -Fxc '          ./ci/run-with-hermit-e2e-artifact.sh --require-install "${args[@]}" \' "$workflow") == 1 ]] ||
+        die "GitHub portable e2e cells must consume the verified immutable Hermit artifact"
+    [[ $(grep -Fxc '      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit' "$workflow") == 1 ]] ||
+        die "only the non-gating SaBRe diagnostic may use the mutable release Hermit directly"
     [[ $(grep -Fxc '      - name: Enable unprivileged user and mount namespaces' "$workflow") == 4 ]] ||
         die "GitHub portable debug, release, e2e, and SaBRe diagnostics must enable user namespaces"
     [[ $(grep -Fxc '            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$workflow") == 4 ]] ||
@@ -402,9 +625,12 @@ function assert_parallel_portable_workflow {
     jq -e '
         .debug_shards[]
         | select(.slug == "integration")
-        | .nodes | index("test.cli") != null
+        | .nodes
+        | index("test.cli") != null
+          and index("build.e2e_artifact") != null
+          and index("test.applications_e2e") != null
     ' "$ROOT_DIR/ci/portable-shards.json" >/dev/null ||
-        die "GitHub portable integration shard must retain the run_dbt_* CLI tests"
+        die "GitHub portable integration shard must retain CLI tests and execute the immutable artifact producer with its applications consumer"
 }
 
 function assert_privileged_diagnostics {
@@ -854,7 +1080,7 @@ function audit_ci_correspondence {
         [.steps[] | select(
             .group == "build" and .job == "privileged_tests"
             and .timeout == 120
-            and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"
+            and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"
         )] | length == 1
     ' "$DAG_ROOT/privileged.json" >/dev/null ||
         die "portable-only DBT override must not alter the privileged command or timeout"
@@ -1157,14 +1383,37 @@ function audit_ci_correspondence {
         dag="$DAG_ROOT/$lane.json"
         jq -e --arg lane "$lane" '
             def expected_command($m):
-                "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
-            ([.steps[] | select(.cmd | startswith("./ci/test_harness.sh run "))] | all(has("manifest")))
+                (if $m.lane == "portable"
+                 then "./ci/run-with-hermit-e2e-artifact.sh --require-install "
+                 else "./ci/run-with-hermit-e2e-artifact.sh " end)
+                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
+            def artifact_producer($lane):
+                if $lane == "portable" then "build.e2e_artifact" else "build.privileged_tests" end;
+            ([.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | all(has("manifest")))
             and ([.steps[] | select(has("manifest"))] | all(
                 . as $step
                 | ($step.manifest | (keys | sort) == ["category","lane"] and .lane == $lane and (.category | length > 0))
                 and ($step.cmd == expected_command($step.manifest))
                 and ($step.deps | index("e2e.metadata") != null)
-                and ($step.deps | index("build.manifest_guests") != null)))
+                and ($step.deps | index("build.manifest_guests") != null)
+                and ($step.deps | index(artifact_producer($lane)) != null)))
+            and ([.steps[]
+                    | select((.group + "." + .job) == artifact_producer($lane))
+                    | select(.cmd | contains("ci/publish-hermit-e2e-artifact.sh target/debug/hermit"))
+                    | select(if $lane == "portable"
+                             then (.deps | index("build.workspace") != null)
+                                  and (.deps | index("build.runtime_release") != null)
+                                  and (.cmd | endswith(" target/install_pkg"))
+                             else true end)]
+                | length) == 1
+            and (if $lane == "portable" then
+                    ([.steps[]
+                        | select(.cmd | contains("cargo "))
+                        | select((.group + "." + .job) as $tag
+                            | ["setup.nextest","setup.manifest_plan","build.workspace","build.runtime_release","lint.rustfmt"]
+                            | index($tag) == null)]
+                     | all(.deps | index("build.e2e_artifact") != null))
+                 else true end)
             and ([.steps[] | select(has("manifest")) | .manifest.category] | unique | length)
                 == ([.steps[] | select(has("manifest"))] | length)
             and ([.steps[] | select(.group == "build" and .job == "manifest_guests"
@@ -2283,6 +2532,7 @@ case "$subcommand" in
     validate)
         (($# == 0)) || true
         verify_provenance_selftest
+        audit_immutable_hermit_binary
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
@@ -2300,7 +2550,7 @@ case "$subcommand" in
         build_required
         ;;
     run)
-        [[ -x $HERMIT_BIN || $MODE_FILTER == naked ]] || die "Hermit binary is not executable: $HERMIT_BIN"
+        [[ $MODE_FILTER == naked ]] || require_executable_hermit "$HERMIT_BIN"
         run_required
         ;;
     audit-gaps)
