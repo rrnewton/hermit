@@ -537,7 +537,7 @@ $direct_references"
                 and .cmd == "./ci/run-reverie-pin-check.sh"
             )] | length == 1
         ' "$dag" >/dev/null ||
-            die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
+            die "${dag#"$ROOT_DIR/"} must contain exactly one Reverie-pin ancestry-and-monotonicity gate"
     done
 
     # Execute the same rustc wrapper with a PATH that deliberately excludes
@@ -759,17 +759,17 @@ EOF
     # node waits on it: the archival pin is proved current BEFORE anything is
     # built or tested, on every profile.
     [[ $(grep -Fc '"Reverie pin consistency",' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate driver must plan the latest-Reverie gate exactly once"
+        die "the validate driver must plan the Reverie-pin ancestry-and-monotonicity gate exactly once"
     [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate manifest gate must depend on the latest-Reverie gate"
+        die "the validate manifest gate must depend on the Reverie-pin ancestry-and-monotonicity gate"
     [[ $(grep -Fc 'reverie_pin_current: pin_gate_passed' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
-        die "the Rust validate receipt must derive pin currency from the observed gate"
+        die "the Rust validate receipt must derive pin ancestry and monotonicity from the observed gate"
     [[ $(grep -Fc '"reverie_pin_current": ctx.reverie_pin_current' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
-        die "the Rust validate receipt must state whether the latest-Reverie gate passed"
+        die "the Rust validate receipt must state whether the Reverie-pin ancestry-and-monotonicity gate passed"
 
     local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
-    [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
-        die "portable CI must expose exactly one latest-Reverie job"
+    [[ $(grep -Fxc '    name: Reverie pin satisfies ancestry and monotonicity' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one Reverie-pin ancestry-and-monotonicity job"
     [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
         die "the authoritative portable aggregate must depend on the Reverie pin job"
     [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
@@ -780,7 +780,7 @@ EOF
         die "portable CI must not retain a stale-Reverie override"
 
     local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
-    [[ $(grep -Fxc '    name: reverie-pin-is-latest-main' "$merge_workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    name: reverie-pin-ancestry-and-monotonicity' "$merge_workflow") == 1 ]] ||
         die "merge-gate must check exact PR heads with the trusted pin checker"
     [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
         die "merge-gate must depend on its exact-head Reverie pin job"

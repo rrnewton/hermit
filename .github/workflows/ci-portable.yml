@@ -184,7 +184,7 @@ jobs:
   # Exact dependency currency is part of the authoritative product-test result:
   # an old Reverie pin cannot produce current Hermit validation evidence.
   reverie-pin:
-    name: Reverie pin is latest main
+    name: Reverie pin satisfies ancestry and monotonicity
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
