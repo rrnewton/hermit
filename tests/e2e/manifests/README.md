@@ -116,70 +116,61 @@ guest_args = { ptrace = ["multi"], kvm = ["multi"] }
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
-### Declaring a guest's deterministic termination
+### `verify` assertions: L2 parity and guest termination
 
-A `verify` cell defaults to requiring the whole Hermit invocation to exit `0`.
-A guest whose *deterministic* outcome is a crash or a deliberate non-zero exit
-declares that termination instead — exactly one of:
+A `verify` cell defaults to plain `hermit run --strict --verify`, which uses the
+lossy `Stripped` comparator and per `AGENTS.md` **cannot establish L2**, and
+requires the whole invocation to exit `0`. Its `assert` table upgrades both:
 
 ```toml
 [test.modes.verify]
 ci = true
-expect_signal = 11        # the GUEST is killed by this signal
-# expect_exit_code = 7    # ...or the GUEST exits with this non-zero code
+assert = { bitwise_parity = true, guest_signal = 11 }
 backends_enabled = ["ptrace"]
 ```
 
-This exists because `hermit run --verify` defaults to `--verify-allow success`:
-when the first run's status is not success it refuses the second run, so the
-determinism comparison never happens and the record says
-`verdict: "no_result"`. Such guests previously had to stay at `ci = false`,
-outside the measured envelope, even when they reproduce bitwise — the same class
-of gap that `guest_args` closed for guests that need arguments.
+- **`bitwise_parity = true`** runs the cell with `--verify-strict --verify-json`
+  and requires the run's own verdict to report `verified` **and**
+  `bitwise_parity`. Without it, a cell justified by a hand-measured L2 result
+  does not actually ratchet L2.
+- **`guest_signal = N`** or **`guest_exit_code = N`** (at most one, and only
+  beside `bitwise_parity = true`) declares that the guest's *deterministic*
+  outcome is a crash or a deliberate non-zero exit. The cell then also runs with
+  `--verify-allow both` — otherwise Hermit refuses the second run, publishes
+  `verdict: "no_result"`, and the cell measures nothing, which is why such
+  guests previously had to stay at `ci = false`, outside the envelope, even when
+  they reproduce bitwise.
 
-**The declaration names a termination, never a raw wait status, and the pass is
-bound to the verification record rather than to the process exit code.** One
-8-bit number cannot be a safety boundary: `139` is the same for a guest
-`exit(139)`, a guest killed by SIGSEGV, and *Hermit itself* dying of SIGSEGV,
-and the last is a Hermit defect that must never satisfy a cell. So a declaring
-cell runs with
+**A termination is declared as a termination, never as a wait status, and the
+pass is bound to the verdict rather than to the process exit code.** One 8-bit
+number cannot be a safety boundary: `139` is the same for a guest `exit(139)`, a
+guest killed by SIGSEGV, and *Hermit itself* dying of SIGSEGV, and only the last
+is a product defect that must never satisfy a cell. So a declaring cell passes
+only when all of the following hold:
 
-```
---verify-allow both --verify-strict --verify-json <cell>/verify.json
-```
-
-and passes only when **all** of the following hold:
-
-- the observed whole-invocation status equals the derived one (`128+N`, or the
-  exit code);
-- the record exists and reports `verdict: "matched"`, `verified: true`, and
-  `bitwise_parity: true` — the canonical L2 comparison, not the default
-  stripped one, because "it reproduces bitwise" is the entire reason a non-zero
-  exit is being accepted;
-- the record's own provenance matches: `guest_signal: N` with
+- the observed whole-invocation status equals `128+N` (signal) or `N` (exit
+  code);
+- the verdict exists and reports `verified: true` and `bitwise_parity: true` —
+  a missing, unparsable, or `no_result` verdict is a FAIL, never a pass;
+- the verdict's own provenance matches: `guest_signal: N` with
   `guest_exit_code: null`, or `guest_exit_code: N` with `guest_signal: null`.
-  Hermit derives those from the **guest's** wait status, and stamps the record
+  Hermit derives those from the **guest's** wait status and stamps the record
   `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
   behind instead of a stale pass.
 
-This is strictly stronger than the exit-0 default, so the termination is part
-of the cell's observation: it binds the cell to one exact schedule, and a
+This is strictly stronger than the exit-0 default, so the termination is part of
+the cell's observation: it binds the cell to one exact schedule, and a
 legitimate scheduler change must update the declaration in the same review.
+`guest_signal` must be `1..=64` (`139` is rejected as the wait status it is);
+`guest_exit_code` must be `1..=255` and omitted rather than written as `0`; and
+both are refused on every mode except `verify`, the only mode whose cell is a
+single Hermit invocation.
 
-`expect_signal` must be `1..=64` (a signal number — `139` is rejected as the
-wait status it is); `expect_exit_code` must be `1..=255` and be omitted rather
-than written as `0`; setting both is an error; and both are rejected on every
-mode except `verify`, the only mode whose cell is a single Hermit invocation.
-
-**One derivation, three consumers.** `ci/manifest-plan` is the only place this
-policy exists. It validates the keys and emits the normalized contract two
-ways: inside `--format harness-json` at `modes.verify.verify_contract` (which
-`ci/test_harness.sh` consumes) and as `--format verify-contracts` TSV
-(`<test-id> <shell-status> <extra-args> <required-record JSON>`), which
-`scripts/manifest-to-commands.rs` and any out-of-tree harness consume. The
-runners hold no policy: `test_harness.sh` only asserts the observed record is a
-superset of the required object, and `manifest-to-commands.rs` only transports
-the flags into its generated line.
+`ci/test_harness.sh` is the authority for the flags these assertions imply.
+`scripts/manifest-to-commands.rs` carries a transport copy so its generated
+reproduction command reproduces the cell rather than a weaker run, and
+`./ci/test_harness.sh validate` cross-checks the two (plus a self-test of the
+verdict check against every impersonating record shape), so they cannot drift.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

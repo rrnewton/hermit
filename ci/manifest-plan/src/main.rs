@@ -10,7 +10,6 @@
 //!   cargo run -p hermit-manifest-plan -- --format text
 //!   cargo run -p hermit-manifest-plan -- --format json
 //!   cargo run -p hermit-manifest-plan -- --format harness-json
-//!   cargo run -p hermit-manifest-plan -- --format verify-contracts
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -42,11 +41,6 @@ enum Format {
     Text,
     Json,
     HarnessJson,
-    /// TSV of the normalized verify contract for every DECLARING cell. This is
-    /// the authoritative channel for any runner outside `ci/test_harness.sh`
-    /// (which consumes the same derivation embedded in `harness-json`), so no
-    /// consumer has to re-read `expect_signal` / `expect_exit_code` itself.
-    VerifyContracts,
 }
 
 #[cfg(not(test))]
@@ -76,7 +70,6 @@ fn parse_format() -> Format {
             "text" => Format::Text,
             "json" => Format::Json,
             "harness-json" => Format::HarnessJson,
-            "verify-contracts" => Format::VerifyContracts,
             _ => die(format!("unknown format: {value}")),
         };
     }
@@ -160,7 +153,6 @@ fn main() {
 
     match format {
         Format::HarnessJson => {
-            attach_verify_contracts(&mut documents);
             println!(
                 "{}",
                 serde_json::to_string(&documents)
@@ -186,11 +178,6 @@ fn main() {
                 serde_json::to_string(&output)
                     .unwrap_or_else(|error| die(format!("cannot encode plan: {error}")))
             );
-        }
-        Format::VerifyContracts => {
-            for line in verify_contract_tsv(&documents) {
-                println!("{line}");
-            }
         }
         Format::Text => {
             println!(
@@ -612,264 +599,69 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
-/// How a verify cell's guest is declared to terminate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GuestTermination {
-    /// The default: the guest ran to completion and exited 0.
-    Success,
-    /// The guest was killed by this signal (`modes.verify.expect_signal`).
-    Signal(i64),
-    /// The guest exited with this non-zero code (`modes.verify.expect_exit_code`).
-    ExitCode(i64),
-}
-
-/// The normalized verify-mode contract for one cell.
-///
-/// THIS FUNCTION IS THE ONLY PLACE THE POLICY IS DERIVED. It is emitted verbatim
-/// into `--format harness-json` at `modes.verify.verify_contract`, and both
-/// `ci/test_harness.sh` and `scripts/manifest-to-commands.rs` consume that
-/// emission rather than re-reading the raw keys. Three independent
-/// re-derivations of the same policy is a drift hazard even while they agree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifyContract {
-    termination: GuestTermination,
-    /// Hermit flags the cell must be run with, beyond the harness defaults.
-    extra_args: Vec<&'static str>,
-    /// Whether the runner must pass `--verify-json` and check the record.
-    verify_json: bool,
-    /// The whole-invocation status the runner must observe.
-    shell_status: i64,
-    /// Required `guest_signal` in the verification record; `None` means the
-    /// record must carry JSON `null` there.
-    require_guest_signal: Option<i64>,
-    /// Required `guest_exit_code`; `None` means the record must carry `null`.
-    require_guest_exit_code: Option<i64>,
-}
-
-/// Derive (and validate) the verify contract from `modes.verify`.
+/// Validate `modes.verify.assert.guest_signal` / `.guest_exit_code`, the cell's
+/// declaration of HOW ITS GUEST TERMINATES.
 ///
 /// A guest whose deterministic outcome is a crash or a deliberate non-zero exit
-/// could not be expressed before these keys existed. `hermit run --verify`
-/// defaults to `--verify-allow success`: when the first run's status is not
-/// success it refuses the second run, so the determinism comparison never happens
-/// and the record says `verdict: "no_result"`. Such guests had to stay at
-/// `ci = false`, outside the measured envelope, even when they reproduce
-/// bitwise. This is the same class of gap `guest_args` closed for guests that
+/// could not be a `verify` cell at all before this: `hermit run --verify`
+/// defaults to `--verify-allow success`, refuses the second run when the first
+/// does not exit 0, and publishes `verdict: "no_result"` -- so the cell measured
+/// nothing and had to stay at `ci = false`, outside the envelope, even when it
+/// reproduces bitwise. Same class of gap `guest_args` closed for guests that
 /// need arguments (rrnewton/hermit#1815).
 ///
-/// The declaration names the guest's TERMINATION, never a raw wait status.
-/// A single 8-bit number cannot be a safety boundary here: `139` is
-/// indistinguishable between a guest `exit(139)`, a guest killed by SIGSEGV, and
-/// HERMIT ITSELF dying of SIGSEGV — and the last is a Hermit defect that must
-/// never be able to satisfy a cell. So the contract additionally requires the
-/// `--verify-json` record's own provenance fields (`guest_signal` /
-/// `guest_exit_code`, which Hermit derives from the GUEST's wait status) plus
-/// `verified` and `bitwise_parity`. A Hermit-side abort cannot forge those: the
-/// record is stamped `no_result` before any fallible work, so a run that dies
-/// before a verdict leaves a refusal behind, not a stale pass.
-fn verify_contract(id: &str, spec: &toml::value::Table) -> VerifyContract {
-    let signal = spec.get("expect_signal");
-    let exit_code = spec.get("expect_exit_code");
-    let termination = match (signal, exit_code) {
-        (Some(_), Some(_)) => die(format!(
-            "{id}: modes.verify must set at most one of expect_signal / expect_exit_code"
-        )),
-        (None, None) => GuestTermination::Success,
-        (Some(value), None) => match value.as_integer() {
-            // 1..=64 covers the standard and real-time signals on Linux/x86_64.
-            Some(number) if (1..=64).contains(&number) => GuestTermination::Signal(number),
+/// The declaration names a TERMINATION, never a wait status, because one 8-bit
+/// number is not a safety boundary: `139` is indistinguishable between a guest
+/// `exit(139)`, a guest killed by SIGSEGV, and HERMIT ITSELF dying of SIGSEGV.
+/// Only the last is a product defect, and it must never be able to satisfy a
+/// cell. `ci/test_harness.sh` therefore checks this against the run's own
+/// `--verify-json` verdict, whose `guest_signal` / `guest_exit_code` Hermit
+/// derives from the GUEST's wait status -- and which is stamped `no_result`
+/// before any fallible work, so a Hermit-side abort leaves a refusal behind
+/// rather than a stale pass.
+fn validate_guest_termination_assertion(id: &str, assert: &Value) {
+    let signal = assert.get("guest_signal");
+    let exit_code = assert.get("guest_exit_code");
+    if signal.is_none() && exit_code.is_none() {
+        return;
+    }
+    if signal.is_some() && exit_code.is_some() {
+        die(format!(
+            "{id}: modes.verify.assert must set at most one of guest_signal / guest_exit_code"
+        ));
+    }
+    if let Some(value) = signal {
+        // 1..=64 is the Linux/x86_64 signal range. Rejecting 139 here is the
+        // point: that is `128 + SIGSEGV`, a wait status, not a signal.
+        match value.as_integer() {
+            Some(number) if (1..=64).contains(&number) => {}
             other => die(format!(
-                "{id}: modes.verify.expect_signal must be a signal number 1..=64 \
-                 (11 = SIGSEGV), got {other:?}"
+                "{id}: modes.verify.assert.guest_signal must be a signal number 1..=64 \
+                 (11 = SIGSEGV; 139 is a wait status, not a signal), got {other:?}"
             )),
-        },
-        (None, Some(value)) => match value.as_integer() {
-            Some(number) if (1..=255).contains(&number) => GuestTermination::ExitCode(number),
+        }
+    }
+    if let Some(value) = exit_code {
+        match value.as_integer() {
+            Some(number) if (1..=255).contains(&number) => {}
             Some(0) => die(format!(
-                "{id}: modes.verify.expect_exit_code=0 is the default; omit it rather \
-                 than restating the success contract"
+                "{id}: modes.verify.assert.guest_exit_code=0 is the default; omit it \
+                 rather than restating the success contract"
             )),
             other => die(format!(
-                "{id}: modes.verify.expect_exit_code must be 1..=255, got {other:?}"
+                "{id}: modes.verify.assert.guest_exit_code must be 1..=255, got {other:?}"
             )),
-        },
-    };
-
-    match termination {
-        GuestTermination::Success => VerifyContract {
-            termination,
-            extra_args: Vec::new(),
-            // An exit-0 cell needs no record: `--verify` already returns non-zero
-            // on divergence, so its status IS causally bound to the verdict. The
-            // record becomes load-bearing exactly when that binding breaks.
-            verify_json: false,
-            shell_status: 0,
-            require_guest_signal: None,
-            require_guest_exit_code: Some(0),
-        },
-        // `--verify-strict` is mandatory for a declaring cell, not optional: the
-        // justification for accepting a non-zero exit is that the run reproduces
-        // BITWISE, and only the canonical comparator can certify that. The
-        // default stripped comparator cannot, so a declaring cell that ran
-        // without it would assert less than its own rationale claims.
-        GuestTermination::Signal(number) => VerifyContract {
-            termination,
-            extra_args: vec!["--verify-allow", "both", "--verify-strict"],
-            verify_json: true,
-            shell_status: 128 + number,
-            require_guest_signal: Some(number),
-            require_guest_exit_code: None,
-        },
-        GuestTermination::ExitCode(number) => VerifyContract {
-            termination,
-            extra_args: vec!["--verify-allow", "both", "--verify-strict"],
-            verify_json: true,
-            shell_status: number,
-            require_guest_signal: None,
-            require_guest_exit_code: Some(number),
-        },
-    }
-}
-
-/// The exact subset of `--verify-json` fields a declaring cell's record must
-/// carry, as a JSON object literal.
-///
-/// Emitted as a STRING because TOML has no `null`, and `null` is load-bearing
-/// here: "the guest was killed by a signal" is `guest_signal: 11` **together
-/// with** `guest_exit_code: null`, and a record that reports both would not be
-/// the thing we claim. The consumer's whole job is then one generic operation —
-/// assert the observed record is a superset of this object — so it holds no
-/// policy of its own and cannot drift from this function.
-fn require_record_json(contract: &VerifyContract) -> String {
-    let mut required = serde_json::Map::new();
-    // `verified` is the determinism verdict; `bitwise_parity` is the L2 claim
-    // this whole feature's rationale rests on; `matched` refuses `no_result`
-    // explicitly rather than by implication.
-    required.insert("verdict".to_owned(), JsonValue::from("matched"));
-    required.insert("verified".to_owned(), JsonValue::Bool(true));
-    required.insert("bitwise_parity".to_owned(), JsonValue::Bool(true));
-    required.insert(
-        "guest_signal".to_owned(),
-        match contract.require_guest_signal {
-            Some(number) => JsonValue::from(number),
-            None => JsonValue::Null,
-        },
-    );
-    required.insert(
-        "guest_exit_code".to_owned(),
-        match contract.require_guest_exit_code {
-            Some(number) => JsonValue::from(number),
-            None => JsonValue::Null,
-        },
-    );
-    serde_json::to_string(&JsonValue::Object(required))
-        .unwrap_or_else(|error| die(format!("cannot encode verify contract: {error}")))
-}
-
-/// Render the contract for `--format harness-json`.
-fn verify_contract_value(contract: &VerifyContract) -> Value {
-    let mut table = toml::value::Table::new();
-    let declared = contract.termination != GuestTermination::Success;
-    table.insert("declared".to_owned(), Value::Boolean(declared));
-    table.insert(
-        "extra_args".to_owned(),
-        Value::Array(
-            contract
-                .extra_args
-                .iter()
-                .map(|argument| Value::String((*argument).to_owned()))
-                .collect(),
-        ),
-    );
-    table.insert(
-        "verify_json".to_owned(),
-        Value::Boolean(contract.verify_json),
-    );
-    table.insert(
-        "shell_status".to_owned(),
-        Value::Integer(contract.shell_status),
-    );
-    if contract.verify_json {
-        table.insert(
-            "require_record".to_owned(),
-            Value::String(require_record_json(contract)),
-        );
-    }
-    Value::Table(table)
-}
-
-/// One TSV line per DECLARING verify cell, sorted by test id:
-/// `<test-id>\t<shell-status>\t<extra-args, space-joined>\t<require-record JSON>`.
-///
-/// This is the authoritative channel for runners that do not read
-/// `harness-json`: `scripts/manifest-to-commands.rs` and any out-of-tree
-/// harness (the compat scorecard). Same derivation, different envelope, so a
-/// consumer never re-reads `expect_signal` / `expect_exit_code` itself. Cells
-/// with the default exit-0 contract are omitted rather than emitted, so a
-/// consumer can distinguish "declared nothing" from "declared success".
-fn verify_contract_tsv(documents: &[Value]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for document in documents {
-        let Some(tests) = document.get("test").and_then(Value::as_array) else {
-            continue;
-        };
-        for test in tests {
-            let id = test
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let Some(verify) = test
-                .get("modes")
-                .and_then(Value::as_table)
-                .and_then(|modes| modes.get("verify"))
-                .and_then(Value::as_table)
-            else {
-                continue;
-            };
-            let contract = verify_contract(id, verify);
-            if contract.termination == GuestTermination::Success {
-                continue;
-            }
-            lines.push(format!(
-                "{id}\t{}\t{}\t{}",
-                contract.shell_status,
-                contract.extra_args.join(" "),
-                require_record_json(&contract)
-            ));
         }
     }
-    lines.sort();
-    lines
-}
-
-/// Inject the normalized contract into every test's `modes.verify` so
-/// `--format harness-json` carries the single derivation to its consumers.
-///
-/// Runs after full validation, so the keys it reads are already known-good and
-/// `ensure_keys` has already run against the un-injected document.
-fn attach_verify_contracts(documents: &mut [Value]) {
-    for document in documents.iter_mut() {
-        let Some(tests) = document.get_mut("test").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for test in tests.iter_mut() {
-            let id = test
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>")
-                .to_owned();
-            let verify = test
-                .get_mut("modes")
-                .and_then(Value::as_table_mut)
-                .and_then(|modes| modes.get_mut("verify"))
-                .and_then(Value::as_table_mut)
-                .unwrap_or_else(|| die(format!("{id}: modes.verify must be a table")));
-            let contract = verify_contract(&id, verify);
-            verify.insert(
-                "verify_contract".to_owned(),
-                verify_contract_value(&contract),
-            );
-        }
+    // A non-zero exit is accepted only BECAUSE the run reproduces bitwise, and
+    // only the canonical comparator can certify that. Allowing the termination
+    // assertion without the parity assertion would accept a non-zero exit on the
+    // lossy default comparator, which per AGENTS.md cannot establish L2.
+    if assert.get("bitwise_parity").and_then(Value::as_bool) != Some(true) {
+        die(format!(
+            "{id}: modes.verify.assert declares a guest termination, which also requires \
+             bitwise_parity = true -- a non-zero exit is acceptable only with canonical parity"
+        ));
     }
 }
 
@@ -890,15 +682,45 @@ fn validate_mode(
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert"]),
         "custom" => allowed.extend(["args", "assert"]),
-        "verify" => allowed.extend(["expect_signal", "expect_exit_code"]),
+        // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
+        // cell from the lossy default comparator to the L2 parity comparator and
+        // requires the run's own verdict JSON to report parity. Without it a
+        // `verify` cell runs `--strict --verify` only, which per
+        // AGENTS.md "cannot establish L2" -- so a cell justified by a
+        // hand-measured `bitwise_parity: true` does not actually ratchet it.
+        "verify" => allowed.push("assert"),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
     if mode == "verify" {
-        // Derive here purely to VALIDATE: the same function is what later
-        // normalizes the contract into `--format harness-json`, so a manifest
-        // the plan accepts is exactly a manifest the runners can execute.
-        let _ = verify_contract(id, spec);
+        if let Some(assert) = spec.get("assert") {
+            ensure_keys(
+                assert,
+                &["bitwise_parity", "guest_signal", "guest_exit_code"],
+                &format!("{id}.modes.verify.assert"),
+            );
+            if let Some(value) = assert.get("bitwise_parity") {
+                if value.as_bool().is_none() {
+                    die(format!(
+                        "{id}: modes.verify.assert.bitwise_parity must be a boolean"
+                    ));
+                }
+            }
+            validate_guest_termination_assertion(id, assert);
+        }
+    } else if let Some(assert) = spec.get("assert") {
+        // Every other mode's per-mode `assert` key check runs only when that
+        // mode has an enabled backend, so a termination key smuggled into a
+        // fully-disabled mode's assert table would be accepted and then read by
+        // nothing. Refuse it unconditionally: "only meaningful for verify" has
+        // to mean refused everywhere else, not merely ignored.
+        for key in ["guest_signal", "guest_exit_code"] {
+            if assert.get(key).is_some() {
+                die(format!(
+                    "{id}: modes.{mode}.assert.{key} is only meaningful for the verify mode"
+                ));
+            }
+        }
     }
     let ci = spec
         .get("ci")
@@ -1181,70 +1003,131 @@ liteinst = "unsupported"
         assert!(rows[0].ci);
     }
 
-    /// A verify cell whose guest deterministically dies must be able to say so,
-    /// and the derived contract must demand the evidence that makes the claim
-    /// checkable: the canonical comparator plus the record's own provenance.
+    fn verify_mode(assert_line: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = true
+{assert_line}
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    /// POSITIVE: a guest that deterministically dies must be declarable, and
+    /// the declaration names WHICH PROCESS DIED AND HOW.
     #[test]
-    fn signal_declaration_requires_canonical_parity_and_provenance() {
-        let spec = parse_mode("expect_signal = 11\n");
-        let contract = verify_contract("bucket/test", spec.as_table().unwrap());
-        assert_eq!(contract.termination, GuestTermination::Signal(11));
-        assert_eq!(contract.shell_status, 139);
-        assert!(contract.verify_json);
-        assert_eq!(
-            contract.extra_args,
-            vec!["--verify-allow", "both", "--verify-strict"]
+    fn accepts_a_guest_signal_declaration_beside_parity() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_signal = 11 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
         );
-        let required: JsonValue =
-            serde_json::from_str(&require_record_json(&contract)).expect("required record is JSON");
-        assert_eq!(required["verified"], JsonValue::Bool(true));
-        assert_eq!(required["bitwise_parity"], JsonValue::Bool(true));
-        assert_eq!(required["verdict"], JsonValue::from("matched"));
-        assert_eq!(required["guest_signal"], JsonValue::from(11));
-        // `null`, not absent: a record reporting BOTH a signal and an exit code
-        // is not the thing the cell claims, so the requirement must say so.
-        assert_eq!(required["guest_exit_code"], JsonValue::Null);
     }
 
-    /// The mirror case, so a deliberate non-zero exit cannot be satisfied by a
-    /// guest that was KILLED with the same number.
+    /// POSITIVE: the exit-code half of the same declaration.
     #[test]
-    fn exit_code_declaration_requires_a_null_signal() {
-        let spec = parse_mode("expect_exit_code = 7\n");
-        let contract = verify_contract("bucket/test", spec.as_table().unwrap());
-        assert_eq!(contract.termination, GuestTermination::ExitCode(7));
-        assert_eq!(contract.shell_status, 7);
-        let required: JsonValue =
-            serde_json::from_str(&require_record_json(&contract)).expect("required record is JSON");
-        assert_eq!(required["guest_exit_code"], JsonValue::from(7));
-        assert_eq!(required["guest_signal"], JsonValue::Null);
+    fn accepts_a_guest_exit_code_declaration_beside_parity() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_exit_code = 7 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
-    /// The default must stay exactly as it was: no extra flags, no record. An
-    /// exit-0 cell's status is already causally bound to the verdict because
-    /// `--verify` returns non-zero on divergence.
+    /// NEGATIVE — THE CENTRAL ONE. `139` is `128 + SIGSEGV`, a wait status, and
+    /// a wait status is exactly what cannot be a safety boundary here: the same
+    /// number covers a guest `exit(139)`, a guest killed by SIGSEGV, and Hermit
+    /// itself dying of SIGSEGV.
     #[test]
-    fn undeclared_verify_cell_keeps_the_exit_zero_contract() {
-        let spec = parse_mode("ci = false\n");
-        let contract = verify_contract("bucket/test", spec.as_table().unwrap());
-        assert_eq!(contract.termination, GuestTermination::Success);
-        assert_eq!(contract.shell_status, 0);
-        assert!(!contract.verify_json);
-        assert!(contract.extra_args.is_empty());
+    #[should_panic(expected = "must be a signal number 1..=64")]
+    fn rejects_a_wait_status_in_the_signal_slot() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_signal = 139 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
-    /// NEGATIVE: only `verify` runs a single Hermit invocation whose status and
-    /// verification record are the cell's whole observation. Accepting the key
-    /// elsewhere would create a declaration that silently changes nothing.
+    /// NEGATIVE: the two keys mean different things; a cell setting both would
+    /// have no single checkable termination.
     #[test]
-    #[should_panic(expected = "unknown keys")]
-    fn rejects_declared_termination_outside_verify() {
+    #[should_panic(expected = "at most one of guest_signal")]
+    fn rejects_both_termination_keys() {
+        let spec = verify_mode(
+            "assert = { bitwise_parity = true, guest_signal = 11, guest_exit_code = 7 }",
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: a non-zero exit is accepted only BECAUSE the run reproduces
+    /// bitwise. Without the parity assertion the cell would accept a crash on
+    /// the lossy default comparator, which cannot establish L2 at all.
+    #[test]
+    #[should_panic(expected = "also requires")]
+    fn rejects_a_termination_without_the_parity_assertion() {
+        let spec = verify_mode("assert = { guest_signal = 11 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: `guest_exit_code = 0` restates the default, so a reader could
+    /// not tell an examined cell from every unexamined one.
+    #[test]
+    #[should_panic(expected = "omit it rather than restating")]
+    fn rejects_a_redundant_zero_exit_code() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_exit_code = 0 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: only `verify` is a single Hermit invocation whose status and
+    /// verdict are the cell's whole observation.
+    #[test]
+    #[should_panic(expected = "only meaningful for the verify mode")]
+    fn rejects_a_termination_declaration_outside_verify() {
         let spec = parse_mode(
             r#"
 ci = false
-expect_signal = 11
 backends_enabled = []
 seeds = [1, 2]
+assert = { min_distinct = 2, guest_signal = 11 }
 
 [backends_disabled]
 ptrace = "unsupported"
@@ -1262,41 +1145,6 @@ liteinst = "unsupported"
             &spec,
             &mut Vec::new(),
         );
-    }
-
-    /// NEGATIVE: the two keys mean different things and a cell that set both
-    /// would have no single checkable termination.
-    #[test]
-    #[should_panic(expected = "at most one of expect_signal")]
-    fn rejects_both_termination_keys() {
-        let spec = parse_mode("expect_signal = 11\nexpect_exit_code = 7\n");
-        verify_contract("bucket/test", spec.as_table().unwrap());
-    }
-
-    /// NEGATIVE: `expect_exit_code = 0` restates the default. Allowing it would
-    /// let a reader believe a cell had been examined and declared successful
-    /// when nothing distinguishes it from every undeclared cell.
-    #[test]
-    #[should_panic(expected = "omit it rather than restating")]
-    fn rejects_redundant_zero_exit_code() {
-        let spec = parse_mode("expect_exit_code = 0\n");
-        verify_contract("bucket/test", spec.as_table().unwrap());
-    }
-
-    /// NEGATIVE: a raw wait status in the signal slot is the exact confusion
-    /// this schema exists to prevent — 139 is `128 + SIGSEGV`, not a signal.
-    #[test]
-    #[should_panic(expected = "must be a signal number 1..=64")]
-    fn rejects_a_wait_status_in_the_signal_slot() {
-        let spec = parse_mode("expect_signal = 139\n");
-        verify_contract("bucket/test", spec.as_table().unwrap());
-    }
-
-    #[test]
-    #[should_panic(expected = "must be 1..=255")]
-    fn rejects_out_of_range_exit_code() {
-        let spec = parse_mode("expect_exit_code = 256\n");
-        verify_contract("bucket/test", spec.as_table().unwrap());
     }
 
     #[test]

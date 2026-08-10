@@ -1469,136 +1469,6 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
-# The normalized verify contract for a cell, as emitted by hermit-manifest-plan
-# at `modes.verify.verify_contract`. This harness holds NO policy of its own: it
-# reads `extra_args`, `verify_json`, `shell_status`, and `require_record` from
-# the single derivation in ci/manifest-plan so the runner, the validator, and
-# scripts/manifest-to-commands.rs cannot drift apart. `verify` is the only mode
-# with a contract; every other mode keeps the exit-0 default.
-function cell_contract {
-    local metadata=$1 mode=$2 field=$3
-    if [[ $mode != verify ]]; then
-        case "$field" in
-            shell_status) printf '0' ;;
-            verify_json | declared) printf 'false' ;;
-            *) printf '' ;;
-        esac
-        return 0
-    fi
-    jq -r --arg field "$field" '
-        (.modes.verify.verify_contract
-         // error("manifest-plan emitted no verify_contract; rebuild hermit-manifest-plan"))
-        | .[$field]
-        | if type == "array" then .[] elif . == null then "" else tostring end
-    ' <<<"$metadata"
-}
-
-# Assert a `--verify-json` record satisfies the contract's required object.
-#
-# WHY THIS EXISTS. A declaring cell is allowed to exit non-zero, so its process
-# status is bound to nothing: `139` is the same number for a guest `exit(139)`,
-# a guest killed by SIGSEGV, and HERMIT ITSELF dying of SIGSEGV. Only the
-# verification record carries provenance -- `guest_signal` / `guest_exit_code`
-# come from the GUEST's wait status -- plus the `verified` and `bitwise_parity`
-# facts the cell's rationale actually rests on. Hermit stamps that record
-# `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
-# behind rather than a stale pass.
-#
-# The required object comes entirely from hermit-manifest-plan. This function
-# implements one generic operation -- observed record MUST be a superset of the
-# required object, key present AND value equal -- and therefore encodes no
-# policy that could drift from the manifest. Prints the mismatch and returns 1.
-function verify_record_mismatch {
-    local record_file=$1 require_json=$2 record
-    if [[ ! -s $record_file ]]; then
-        printf 'no --verify-json record (Hermit reached no verdict)'
-        return 1
-    fi
-    record=$(tail -n 1 "$record_file")
-    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$record"; then
-        printf 'unparsable --verify-json record'
-        return 1
-    fi
-    local bad
-    # `$e` binds the required entry before `.` is rebound to the observed record;
-    # writing `$got | has(.key)` instead makes jq resolve `.key` against $got and
-    # abort, which would turn every comparison into a spurious refusal.
-    bad=$(jq -r --argjson want "$require_json" '
-        . as $got
-        | $want
-        | to_entries
-        | map(. as $e
-              | select(($got | has($e.key) | not) or ($got[$e.key] != $e.value))
-              | "\($e.key)="
-                + (if ($got | has($e.key)) then ($got[$e.key] | tojson) else "absent" end)
-                + " want " + ($e.value | tojson))
-        | join(", ")
-    ' <<<"$record") || {
-        printf 'could not compare --verify-json record'
-        return 1
-    }
-    if [[ -n $bad ]]; then
-        printf '%s' "$bad"
-        return 1
-    fi
-    return 0
-}
-
-# Prove `verify_record_mismatch` both accepts the qualifying record and refuses
-# every impersonation of it. Pure: synthetic records, no Hermit run, so it is
-# cheap enough to gate `validate` and can never rot into a decorative check.
-#
-# Cases 3-6 are the reason a declaring cell may not be gated on its process exit
-# status: all four produce the SAME shell status 139 as the qualifying record.
-function verify_record_selftest {
-    local dir want_sigsegv want_exit7 cases=0 failures=0
-    dir=$(mktemp -d)
-    want_sigsegv='{"verdict":"matched","verified":true,"bitwise_parity":true,"guest_signal":11,"guest_exit_code":null}'
-    want_exit7='{"verdict":"matched","verified":true,"bitwise_parity":true,"guest_signal":null,"guest_exit_code":7}'
-
-    # name | required object | record contents | expect accept?
-    local -a table=(
-        "qualifying-sigsegv|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"comparison\":{\"strictness\":\"canonical\"},\"compared_log_messages\":{\"left\":147,\"right\":147},\"guest_exit_code\":null,\"guest_signal\":11}|accept"
-        "qualifying-exit-code|$want_exit7|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":7,\"guest_signal\":null}|accept"
-        "hermit-abort-no-result|$want_sigsegv|{\"verified\":false,\"bitwise_parity\":false,\"verdict\":\"no_result\",\"comparison\":null,\"guest_exit_code\":null,\"guest_signal\":null}|refuse"
-        "guest-exited-139-not-signalled|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":139,\"guest_signal\":null}|refuse"
-        "different-signal|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":null,\"guest_signal\":6}|refuse"
-        "stripped-comparator-only|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":false,\"verdict\":\"matched\",\"guest_exit_code\":null,\"guest_signal\":11}|refuse"
-        "diverged|$want_sigsegv|{\"verified\":false,\"bitwise_parity\":true,\"verdict\":\"diverged\",\"guest_exit_code\":null,\"guest_signal\":11}|refuse"
-        "signal-and-code-both-set|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":139,\"guest_signal\":11}|refuse"
-        "missing-provenance-key|$want_sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_exit_code\":null}|refuse"
-        "unparsable|$want_sigsegv|not json at all|refuse"
-        "empty|$want_sigsegv||refuse"
-    )
-    local row name want record expectation record_file got
-    for row in "${table[@]}"; do
-        IFS='|' read -r name want record expectation <<<"$row"
-        cases=$((cases + 1))
-        record_file="$dir/$name.json"
-        printf '%s' "$record" >"$record_file"
-        if verify_record_mismatch "$record_file" "$want" >/dev/null 2>&1; then
-            got=accept
-        else
-            got=refuse
-        fi
-        if [[ $got != "$expectation" ]]; then
-            echo "verify_record_selftest: $name expected $expectation, got $got" >&2
-            failures=$((failures + 1))
-        fi
-    done
-    # A missing file is distinct from an empty one: an aborted Hermit may never
-    # create the path at all.
-    cases=$((cases + 1))
-    if verify_record_mismatch "$dir/absent.json" "$want_sigsegv" >/dev/null 2>&1; then
-        echo "verify_record_selftest: absent-file expected refuse, got accept" >&2
-        failures=$((failures + 1))
-    fi
-    rm -rf "$dir"
-    ((failures == 0)) ||
-        die "verify_record_selftest: $failures of $cases case(s) failed"
-    echo "PASS: verify-record contract refuses every non-qualifying record ($cases cases: 2 accept, $((cases - 2)) refuse)"
-}
-
 function observation_hash {
     local metadata=$1
     local status=$2
@@ -1777,6 +1647,205 @@ function prepare_test {
     fi
 }
 
+# Prove assert_bitwise_parity_verdict accepts the qualifying verdict and refuses
+# every impersonation of it. Pure -- synthetic verdicts, no Hermit run -- so it
+# is cheap enough to gate `validate` and cannot rot into a decorative check.
+#
+# Cases 2, 5 and 6 are the reason a declaring cell may not be gated on its
+# process status: ALL of them exit 139, exactly like the qualifying run.
+function verify_provenance_selftest {
+    local dir cases=0 failures=0 name verdict termination expectation got
+    dir=$(mktemp -d)
+    local -a table=(
+        # name | verdict JSON | declared termination | expectation
+        "qualifying-sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null}|signal:11|accept"
+        "guest-exited-139-not-signalled|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":null,\"guest_exit_code\":139}|signal:11|refuse"
+        "different-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":6,\"guest_exit_code\":null}|signal:11|refuse"
+        "declared-that-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":6,\"guest_exit_code\":null}|signal:6|accept"
+        "hermit-reached-no-verdict|{\"verified\":false,\"bitwise_parity\":false,\"verdict\":\"no_result\",\"guest_signal\":null,\"guest_exit_code\":null}|signal:11|refuse"
+        "stripped-comparator-only|{\"verified\":true,\"bitwise_parity\":false,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null}|signal:11|refuse"
+        "signal-and-code-both-set|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":139}|signal:11|refuse"
+        "exit-code-declared|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":null,\"guest_exit_code\":7}|exit_code:7|accept"
+        "exit-code-was-a-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":7,\"guest_exit_code\":null}|exit_code:7|refuse"
+        "unparsable|not json at all|signal:11|refuse"
+    )
+    local row
+    for row in "${table[@]}"; do
+        IFS='|' read -r name verdict termination expectation <<<"$row"
+        cases=$((cases + 1))
+        printf '%s' "$verdict" >"$dir/$name.json"
+        if assert_bitwise_parity_verdict "$dir/$name.json" "$termination" >/dev/null 2>&1; then
+            got=accept
+        else
+            got=refuse
+        fi
+        [[ $got == "$expectation" ]] || {
+            echo "verify_provenance_selftest: $name expected $expectation, got $got" >&2
+            failures=$((failures + 1))
+        }
+    done
+    # A verdict file that was never created is distinct from an empty one: an
+    # aborted Hermit may never reach the path at all.
+    cases=$((cases + 1))
+    if assert_bitwise_parity_verdict "$dir/absent.json" "signal:11" >/dev/null 2>&1; then
+        echo "verify_provenance_selftest: absent-file expected refuse, got accept" >&2
+        failures=$((failures + 1))
+    fi
+    rm -rf "$dir"
+    ((failures == 0)) || die "verify_provenance_selftest: $failures of $cases case(s) failed"
+    echo "PASS: verify verdict check refuses every impersonation ($cases cases: 3 accept, $((cases - 3)) refuse)"
+}
+
+# Cross-check that scripts/manifest-to-commands.rs derives the SAME extra flags
+# and expected status from a verify `assert` table as this harness does.
+#
+# The exporter is a standalone rust-script; it cannot share a module with this
+# shell harness, so it necessarily carries a transport copy of the policy. That
+# copy is only safe if drift is mechanically detectable, which is what this
+# gate is: for every cell whose `assert` asks for anything, the exporter's
+# `--verify-flags` line must equal what execute_attempt/run_cell would use. A
+# reproduction command that quietly omits `--verify-allow both` measures a
+# `no_result`, and one that omits `--verify-strict` measures the lossy
+# comparator -- both look like the cell and are not.
+function audit_verify_flag_correspondence {
+    local exporter="$ROOT_DIR/scripts/manifest-to-commands.rs"
+    if [[ ! -x $exporter ]] || ! command -v rust-script >/dev/null 2>&1; then
+        echo "SKIP: verify-flag correspondence (rust-script or exporter unavailable)" >&2
+        return 0
+    fi
+    local exported id metadata flags status expected_flags expected_status mismatches=0 checked=0
+    exported=$("$exporter" --verify-flags) || die "exporter --verify-flags failed"
+    while IFS=$'\t' read -r id flags status; do
+        [[ -n $id ]] || continue
+        checked=$((checked + 1))
+        metadata=${METADATA_BY_ID[$id]:-}
+        [[ -n $metadata ]] || {
+            echo "verify-flag correspondence: exporter names unknown test $id" >&2
+            mismatches=$((mismatches + 1))
+            continue
+        }
+        expected_flags=""
+        if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+            expected_flags='--verify-strict --verify-json "$cell/verify.json"'
+        fi
+        if [[ -n $(verify_declared_termination "$metadata" verify) ]]; then
+            expected_flags="${expected_flags:+$expected_flags }--verify-allow both"
+        fi
+        expected_status=$(termination_shell_status "$(verify_declared_termination "$metadata" verify)")
+        if [[ $flags != "$expected_flags" || $status != "$expected_status" ]]; then
+            echo "verify-flag correspondence: $id exporter=[$flags|$status] harness=[$expected_flags|$expected_status]" >&2
+            mismatches=$((mismatches + 1))
+        fi
+    done <<<"$exported"
+    ((mismatches == 0)) ||
+        die "scripts/manifest-to-commands.rs and ci/test_harness.sh disagree on $mismatches verify cell(s)"
+    echo "PASS: exporter and harness derive identical verify flags for $checked asserting cell(s)"
+}
+
+# Does this test's verify mode opt into the L2 parity assertion?
+function verify_asserts_bitwise_parity {
+    local metadata=$1
+    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+}
+
+# Where a verify attempt writes its machine-readable verdict.
+function verify_verdict_path {
+    local cell_dir=$1 attempt=$2
+    printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
+}
+
+# How this cell's guest is declared to terminate: `signal:N`, `exit_code:N`, or
+# empty for the default "ran to completion and exited 0".
+#
+# A guest whose deterministic outcome is a crash or a deliberate non-zero exit
+# could not be a verify cell at all: `--verify` defaults to
+# `--verify-allow success`, refuses the second run, and publishes
+# `verdict: "no_result"`, so the cell measured nothing. The manifest validator
+# rejects these keys outside `modes.verify.assert` and requires
+# `bitwise_parity = true` beside them.
+function verify_declared_termination {
+    local metadata=$1 mode=$2
+    [[ $mode == verify ]] || return 0
+    jq -r '
+        (.modes.verify.assert // {}) as $a
+        | if   ($a.guest_signal    | type) == "number" then "signal:\($a.guest_signal)"
+          elif ($a.guest_exit_code | type) == "number" then "exit_code:\($a.guest_exit_code)"
+          else "" end
+    ' <<<"$metadata"
+}
+
+# The whole-invocation status a declared termination must produce.
+function termination_shell_status {
+    local termination=$1
+    case "$termination" in
+        signal:*) printf '%s' "$((128 + ${termination#signal:}))" ;;
+        exit_code:*) printf '%s' "${termination#exit_code:}" ;;
+        *) printf '0' ;;
+    esac
+}
+
+# Fail closed on anything short of a full parity verdict: a missing, unparsable,
+# or non-parity verdict is NOT a pass. Echoes a reason on failure.
+#
+# With a declared termination this ALSO checks the verdict's provenance, and
+# that is the load-bearing part. A declaring cell is allowed to exit non-zero,
+# so its process status is bound to nothing: `139` is the same number for a
+# guest `exit(139)`, a guest killed by SIGSEGV, and HERMIT ITSELF dying of
+# SIGSEGV -- and only the last is a product defect that must never pass. Only
+# the verdict carries which process died and how: Hermit derives
+# `guest_signal` / `guest_exit_code` from the GUEST's wait status, and stamps
+# the record `no_result` before any fallible work, so a Hermit-side abort leaves
+# a refusal behind rather than a stale pass. `null` is meaningful on the other
+# field: a record reporting both a signal and an exit code is not this claim.
+function assert_bitwise_parity_verdict {
+    local verdict=$1 termination=${2:-}
+    if [[ ! -f $verdict ]]; then
+        printf 'verify wrote no parity verdict to %s\n' "${verdict##*/}"
+        return 1
+    fi
+    local summary
+    if ! summary=$(jq -er '
+        "verified=\(.verified) bitwise_parity=\(.bitwise_parity) "
+        + "verdict=\(.verdict) strictness=\(.comparison.strictness // "none") "
+        + "compared=\(.comparison.compare_logs // false) "
+        + "messages=\(.compared_log_messages.left // 0)/\(.compared_log_messages.right // 0) "
+        + "guest_signal=\(.guest_signal|tojson) guest_exit_code=\(.guest_exit_code|tojson)"
+    ' "$verdict" 2>/dev/null); then
+        printf 'verify parity verdict %s is not readable JSON\n' "${verdict##*/}"
+        return 1
+    fi
+    if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
+        printf 'verify did not reach L2 parity: %s\n' "$summary"
+        return 1
+    fi
+    local want
+    case "$termination" in
+        '') ;;
+        signal:*)
+            want=${termination#signal:}
+            if [[ $(jq -r --argjson want "$want" \
+                '(.guest_signal == $want) and (.guest_exit_code == null)' "$verdict") != true ]]; then
+                printf 'verify did not show the guest killed by signal %s: %s\n' "$want" "$summary"
+                return 1
+            fi
+            ;;
+        exit_code:*)
+            want=${termination#exit_code:}
+            if [[ $(jq -r --argjson want "$want" \
+                '(.guest_exit_code == $want) and (.guest_signal == null)' "$verdict") != true ]]; then
+                printf 'verify did not show the guest exiting %s: %s\n' "$want" "$summary"
+                return 1
+            fi
+            ;;
+        *)
+            printf 'unrecognized declared termination %s\n' "$termination"
+            return 1
+            ;;
+    esac
+    printf 'L2 parity: %s\n' "$summary"
+    return 0
+}
+
 function execute_attempt {
     local test=$1
     local metadata=$2
@@ -1786,11 +1855,9 @@ function execute_attempt {
     local attempt=$6
     local seed=${7:-}
     local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
-    local record_file
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
     stderr_file="$cell_dir/captures/${mode}-${attempt}.stderr"
-    record_file="$cell_dir/captures/${mode}-${attempt}.verify.json"
     kind=$(jq -r .program_kind <<<"$metadata")
     guest_backend=${backend:-native}
 
@@ -1853,21 +1920,27 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
-            # A declaring cell needs `--verify-allow both` (otherwise Hermit
-            # refuses the second run and compares nothing), `--verify-strict`
-            # (the canonical L2 comparator its rationale rests on), and
-            # `--verify-json` (the only artifact that carries guest-termination
-            # provenance). All three come from the manifest-plan contract.
-            local -a verify_extra=()
-            mapfile -t verify_extra < <(cell_contract "$metadata" "$mode" extra_args)
-            if [[ $(cell_contract "$metadata" "$mode" verify_json) == true ]]; then
-                # A stale record from an earlier attempt must never be readable
-                # as this attempt's verdict.
-                rm -f "$record_file"
-                verify_extra+=(--verify-json "$record_file")
+            # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
+            # which normalizes numbers/addresses/paths away wholesale and so
+            # "cannot establish L2" (AGENTS.md). A cell that opts into
+            # `assert = { bitwise_parity = true }` is upgraded to the canonical
+            # parity comparator and made to emit a machine-readable verdict, which
+            # run_cell then checks -- otherwise the cell would be justified by a
+            # parity measurement it never actually performs.
+            local verify_strict_flags=()
+            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+                verify_strict_flags=(--verify-strict --verify-json
+                    "$(verify_verdict_path "$cell_dir" "$attempt")")
+            fi
+            # A guest that deterministically dies needs the allowance, or Hermit
+            # refuses the SECOND run and there is no comparison to assert on.
+            # This widens what Hermit itself gates on; run_cell replaces that
+            # gate with a stricter one (exact status AND verdict provenance).
+            if [[ -n $(verify_declared_termination "$metadata" "$mode") ]]; then
+                verify_strict_flags+=(--verify-allow both)
             fi
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_extra[@]}" "${profile[@]}" -- "${guest_command[@]}")
+                "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -1897,7 +1970,7 @@ function execute_attempt {
 
     local hash
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    printf '%s\t%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file" "$record_file"
+    printf '%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file"
 }
 
 function append_result {
@@ -1932,18 +2005,16 @@ function append_result {
             log_level=
             ;;
         verify)
-            # Record exactly what execute_attempt runs, from the same contract
-            # it ran from: a declaring cell adds `--verify-allow both
-            # --verify-strict --verify-json`, so the evidence must carry them or
-            # the JSONL would misdescribe the command that produced the verdict.
+            # The receipt must record the flags that actually ran. Reporting a
+            # bare `--strict --verify` for a cell that ran the parity comparator
+            # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson extra "$(jq -c '.modes.verify.verify_contract.extra_args // []' \
-                    <<<"${METADATA_BY_ID[$test_id]}")" \
-                --argjson verify_json "$(jq -c '.modes.verify.verify_contract.verify_json // false' \
-                    <<<"${METADATA_BY_ID[$test_id]}")" \
+                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
+                --argjson allow_both "$([[ -n $(verify_declared_termination \
+                    "${METADATA_BY_ID[$test_id]}" verify) ]] && echo true || echo false)" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + $extra
-                 + (if $verify_json then ["--verify-json","<cell>/verify.json"] else [] end)')
+                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)
+                 + (if $allow_both then ["--verify-allow","both"] else [] end)')
             log_level=info
             ;;
         replay)
@@ -2084,25 +2155,26 @@ function run_cell {
             reason="custom output identical across $runs runs"
         fi
     else
-        local row status record_file expect_status require_record mismatch
-        expect_status=$(cell_contract "$metadata" "$mode" shell_status)
-        require_record=$(cell_contract "$metadata" "$mode" require_record)
+        local row status termination expect_shell_status
+        termination=$(verify_declared_termination "$metadata" "$mode")
+        expect_shell_status=$(termination_shell_status "$termination")
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _ _ _ record_file <<<"$row"
-        if [[ $status != "$expect_status" ]]; then
+        IFS=$'\t' read -r status _ _ _ <<<"$row"
+        if [[ $status != "$expect_shell_status" ]]; then
             outcome=FAIL
-            reason="$mode exited with status $status, expected $expect_status"
-        elif [[ -z $require_record ]]; then
-            : # Exit-0 contract: `--verify`'s own non-zero-on-divergence binds it.
-        elif ! mismatch=$(verify_record_mismatch "$record_file" "$require_record"); then
-            # The status matched but the record does not certify what the status
-            # is being accepted FOR. This is the check that keeps a Hermit-side
-            # crash, a stripped-comparator pass, or a guest `exit(128+N)` from
-            # impersonating a guest killed by signal N.
-            outcome=FAIL
-            reason="$mode status $status matched but the verification record did not: $mismatch"
-        else
-            reason="$mode reproduced its declared guest termination and the verification record certifies it (status $status; $require_record)"
+            reason="$mode exited with status $status, expected $expect_shell_status"
+        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+            # A zero exit only means the comparator this run used was satisfied.
+            # For an L2 cell, read the verdict the run itself published and
+            # require full parity; anything else is a FAIL, not a PASS.
+            local parity_reason
+            if parity_reason=$(assert_bitwise_parity_verdict \
+                "$(verify_verdict_path "$cell_dir" 1)" "$termination"); then
+                reason=$parity_reason
+            else
+                outcome=FAIL
+                reason=$parity_reason
+            fi
         fi
     fi
 
@@ -2220,7 +2292,8 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
-        verify_record_selftest
+        verify_provenance_selftest
+        audit_verify_flag_correspondence
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
