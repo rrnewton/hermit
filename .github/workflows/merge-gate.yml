@@ -347,10 +347,11 @@ jobs:
           # self-hosted runner, so checking out PR-controlled code and executing
           # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
           # code on our infrastructure. The linter reads only environment inputs
-          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER), so main's copy is the correct
-          # and safe version to run — and a PR cannot weaken its own gate by
-          # editing the lint script.
+          # plus an inert base-to-head diff, so main's copy is the correct and
+          # safe version to run — and a PR cannot weaken its own gate by editing
+          # the lint script or reviewer skill.
           ref: main
+          fetch-depth: 0
           persist-credentials: false
       - name: Enforce the core-change review protocol
         env:
@@ -417,12 +418,47 @@ jobs:
           fi
 
           failed=0
+          inputs_dir=$(mktemp -d)
+          trap 'rm -rf "$inputs_dir"' EXIT
           while read -r pr_number; do
             [ -n "$pr_number" ] || continue
 
             pr_json="$(gh api "repos/${REPO}/pulls/${pr_number}")"
             labels="$(jq -r '.labels[].name' <<< "$pr_json")"
             body="$(jq -r '.body // ""' <<< "$pr_json")"
+            head_sha="$(jq -r '.head.sha' <<< "$pr_json")"
+            base_sha="$(jq -r '.base.sha' <<< "$pr_json")"
+            author_login="$(jq -r '.user.login // ""' <<< "$pr_json")"
+
+            # Fetch the candidate as inert Git data into a namespaced ref. Diff
+            # exact SHAs only: never execute candidate code and never read
+            # FETCH_HEAD or another moving ref.
+            head_ref="refs/remotes/review-head/${pr_number}"
+            git fetch --no-tags origin \
+              "pull/${pr_number}/head:${head_ref}"
+            fetched_head="$(git rev-parse "$head_ref")"
+            if [ "$fetched_head" != "$head_sha" ]; then
+              echo "::error::PR #${pr_number}: fetched head ${fetched_head} != API head ${head_sha}."
+              failed=1
+              continue
+            fi
+            git cat-file -e "${base_sha}^{commit}" \
+              || { echo "::error::PR #${pr_number}: base ${base_sha} is unavailable."; failed=1; continue; }
+
+            prefix="$inputs_dir/pr-${pr_number}"
+            git diff --no-ext-diff --no-textconv --no-renames \
+              --unified=0 "$base_sha" "$head_sha" -- >"${prefix}.diff"
+            merge_base="$(git merge-base "$base_sha" "$head_sha")"
+            git rev-list --reverse "${merge_base}..${head_sha}" |
+              while read -r commit_sha; do
+                commit_message="$(git show -s --format=%B "$commit_sha")"
+                jq -cn --arg sha "$commit_sha" --arg message "$commit_message" \
+                  '{sha:$sha,message:$message}'
+              done | jq -s . >"${prefix}.commit-messages.json"
+            gh api "repos/${REPO}/issues/${pr_number}/comments" \
+              --paginate --slurp | jq 'add' >"${prefix}.comments.json"
+            gh api "repos/${REPO}/pulls/${pr_number}/reviews" \
+              --paginate --slurp | jq 'add' >"${prefix}.reviews.json"
 
             # A PR "touches KVM" when a changed file path or a label mentions kvm.
             files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
@@ -434,7 +470,12 @@ jobs:
             fi
 
             if PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
-               PR_NUMBER="$pr_number" \
+               PR_NUMBER="$pr_number" PR_HEAD_SHA="$head_sha" \
+               PR_AUTHOR_LOGIN="$author_login" OWNER_LOGIN="${REPO%%/*}" \
+               PR_COMMENTS_FILE="${prefix}.comments.json" \
+               PR_REVIEWS_FILE="${prefix}.reviews.json" \
+               PR_DIFF_FILE="${prefix}.diff" \
+               PR_COMMIT_MESSAGES_FILE="${prefix}.commit-messages.json" \
                bash scripts/core-review-protocol-lint.sh; then
               :
             else
