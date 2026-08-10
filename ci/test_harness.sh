@@ -718,6 +718,16 @@ function assert_reverie_pin_enforcement {
         die "Reverie pin checker must describe the ancestry-and-monotonicity refusal exactly once"
     ! grep -Fq 'Testing must use the latest rrnewton/reverie:main.' "$checker" ||
         die "Reverie pin checker must not restore the superseded live-tip equality rule"
+    [[ $(grep -Fxc '//!                    and tip equality is allowed but not required. A lagging' "$checker") == 1 ]] ||
+        die "Reverie pin checker must state exactly that tip equality is allowed but not required"
+    ! grep -Fq 'not equal to its tip' "$checker" ||
+        die "Reverie pin checker must not falsely forbid equality with the tip"
+    [[ $(grep -Fxc '    fn exact_latest_pin_passes() {' "$checker") == 1 ]] ||
+        die "Reverie pin checker must retain the exact-tip positive bracket"
+    [[ $(grep -Fxc '    fn regressed_pin_is_refused() {' "$checker") == 1 ]] ||
+        die "Reverie pin checker must retain the backward-pin negative bracket"
+    [[ $(grep -Fxc '        assert_eq!(code, 1, "a pin that REGRESSES below its base must be REFUSED");' "$checker") == 1 ]] ||
+        die "Reverie pin backward-pin bracket must assert the exact fail-closed result"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
         die "Reverie ancestor-and-monotonic checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||

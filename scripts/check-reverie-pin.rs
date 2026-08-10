@@ -11,9 +11,10 @@
 //! OWNER-APPROVED RULE, 2026-08-08, replacing equality-to-the-tip:
 //!
 //!   1. ANCESTRY   -- the pin must be an ancestor of `rrnewton/reverie:main`,
-//!                    not equal to its tip. Lagging is legitimate; a pin that
-//!                    must equal the tip is not a pin, and made the verdict a
-//!                    property of WHEN you looked rather than of the tree.
+//!                    and tip equality is allowed but not required. A lagging
+//!                    ancestor is legitimate; requiring the tip made the
+//!                    verdict a property of WHEN you looked rather than of
+//!                    the tree.
 //!   2. MONOTONIC  -- the pin may only advance. Ancestry ALONE would accept a
 //!                    pin walked backwards, because an ancient commit is also
 //!                    an ancestor.
@@ -1130,10 +1131,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(0);
     }
 
-    // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY, not equality.
+    // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY; equality is
+    // allowed but not required.
     //
-    // Equality made the comparand a LIVE MOVING REF, so the verdict was a
-    // property of the tree AND THE INSTANT YOU LOOKED: two runs over a
+    // Requiring equality made the comparand a LIVE MOVING REF, so the verdict
+    // was a property of the tree AND THE INSTANT YOU LOOKED: two runs over a
     // byte-identical tree disagreed with nothing changed locally, and the pin
     // went stale whenever anyone pushed to Reverie (~16.6 commits/day). A pin
     // that must equal the tip is not a pin.
