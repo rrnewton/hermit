@@ -7,21 +7,22 @@ tests pass, the exact Reverie commit is recorded in the manifests (and is not
 silently changed by an upstream push).
 
 The pin has two distinct purposes. For an old checkout it is an archival record:
-`cargo build` can reproduce the Reverie revision that checkout used. For current
-testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.
-Being an ancestor of main is not sufficient. A Hermit validation or pre-land
-test against an older Reverie is blocked because it can miss already-landed
-correctness fixes and produce evidence for a dependency version we no longer
-ship.
+`cargo build` can reproduce the Reverie revision that checkout used.
+For current testing, the pin is an ancestor pointer into Reverie's linear main history.
+It may lag the live tip, but it must be an ancestor of `rrnewton/reverie:main`.
+Relative to the landing-base pin, it may only advance forward or remain unchanged.
+When resolving a pin conflict, choose the newer side; choosing the older side is a regression.
+An off-history, backward, or sideways pin cannot produce current validation evidence.
 
 ## Currency gate
 
 `scripts/check-reverie-pin.rs` is the canonical verifier source. The tracked
 `ci/run-reverie-pin-check.sh` launcher compiles it with `rustc`, derives its
 scope from `git ls-files`, and checks every tracked `Cargo.toml` and
-`Cargo.lock`. Every Reverie revision in that
-tracked Cargo dependency metadata must be identical and must equal the live
-`rrnewton/reverie:main` tip. The checker reports the manifest, lockfile,
+`Cargo.lock`. Every Reverie revision in that tracked Cargo dependency metadata
+must be identical and must point into the live `rrnewton/reverie:main` history.
+For pre-land checks, the candidate pin must also be equal to or newer than the
+landing-base pin. The checker reports the manifest, lockfile,
 pinned-file, and revision-entry counts on every run so a green result states its
 coverage.
 Tracked vendored Cargo metadata is included. Untracked/generated files and
@@ -44,8 +45,8 @@ scripts/setup-hooks.sh
 There is no stale-pin override in testing. Local validate, both committed DAGs,
 hosted portable CI, the merge gate, and validate receipt production all invoke
 the same fail-closed rule. Historical source remains buildable at its recorded
-revision; it does not create current validation evidence until rebased and
-updated to latest Reverie main.
+revision; it does not create current validation evidence until its pin satisfies
+the forward-only main-history rule.
 
 ## Where the pin lives
 

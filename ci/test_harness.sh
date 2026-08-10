@@ -685,7 +685,7 @@ function assert_validate_driver_entrypoint {
         die "the validate driver must refuse an unplannable profile, never substitute one"
 }
 
-# Keep the latest-Reverie invariant attached to every testing evidence path.
+# Keep the Reverie ancestor-and-monotonic invariant attached to every testing evidence path.
 # The checker unit tests plant stale/current pins; these structural assertions
 # prove that those same fail-closed semantics cannot be bypassed by selecting a
 # different local, DAG, hosted-CI, merge-gate, or receipt path.
@@ -694,15 +694,15 @@ function assert_reverie_pin_enforcement {
     local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
     local liteinst_stage="$ROOT_DIR/scripts/stage-liteinst-runtime.sh"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
-        die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
+        die "Reverie ancestor-and-monotonic checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||
-        die "latest-Reverie checker must not accept a pre-recorded main SHA"
+        die "Reverie ancestor-and-monotonic checker must not accept a pre-recorded main SHA"
     ! grep -Fq -- '--reverie-remote' "$checker" ||
-        die "production callers must not redirect the latest-Reverie authority"
+        die "production callers must not redirect the Reverie ancestor-and-monotonic authority"
     [[ -x $runner ]] ||
-        die "latest-Reverie CI runner must be executable"
+        die "Reverie ancestor-and-monotonic CI runner must be executable"
     [[ $(grep -Fxc '"$checker" "$@"' "$runner") == 1 ]] ||
-        die "latest-Reverie runner must forward every verifier argument exactly"
+        die "Reverie ancestor-and-monotonic runner must forward every verifier argument exactly"
 
     # Exhaustive tracked-reference audit. Any new direct source reference fails
     # until it is classified in this explicit trusted allowlist; checking a few
@@ -721,7 +721,7 @@ $direct_references"
     # and merge-gate's trusted-main compiler. The harness is this audit; the
     # remaining allowlisted references are documentation or checker source.
     [[ $(grep -Fxc '        scripts/check-reverie-pin.rs -o "$checker"' "$runner") == 2 ]] ||
-        die "latest-Reverie runner must compile the canonical source in both modes"
+        die "Reverie ancestor-and-monotonic runner must compile the canonical source in both modes"
     [[ $(grep -Fxc $'\t$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh' "$ROOT_DIR/Makefile") == 1 ]] ||
         die "Makefile lint must use the canonical Reverie-pin launcher"
     [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
@@ -763,7 +763,7 @@ $direct_references"
                 and .cmd == "./ci/run-reverie-pin-check.sh"
             )] | length == 1
         ' "$dag" >/dev/null ||
-            die "${dag#"$ROOT_DIR/"} must contain exactly one Reverie-pin ancestry-and-monotonicity gate"
+            die "${dag#"$ROOT_DIR/"} must contain exactly one Reverie-pin ancestor-and-monotonic gate"
     done
 
     # Execute the same rustc wrapper with a PATH that deliberately excludes
@@ -985,17 +985,17 @@ EOF
     # node waits on it: the archival pin is proved current BEFORE anything is
     # built or tested, on every profile.
     [[ $(grep -Fc '"Reverie pin consistency",' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate driver must plan the Reverie-pin ancestry-and-monotonicity gate exactly once"
+        die "the validate driver must plan the Reverie-pin ancestor-and-monotonic gate exactly once"
     [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate manifest gate must depend on the Reverie-pin ancestry-and-monotonicity gate"
+        die "the validate manifest gate must depend on the Reverie-pin ancestor-and-monotonic gate"
     [[ $(grep -Fc 'reverie_pin_current: pin_gate_passed' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
         die "the Rust validate receipt must derive pin ancestry and monotonicity from the observed gate"
     [[ $(grep -Fc '"reverie_pin_current": ctx.reverie_pin_current' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
-        die "the Rust validate receipt must state whether the Reverie-pin ancestry-and-monotonicity gate passed"
+        die "the Rust validate receipt must state whether the Reverie-pin ancestor-and-monotonic gate passed"
 
     local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
-    [[ $(grep -Fxc '    name: Reverie pin satisfies ancestry and monotonicity' "$portable_workflow") == 1 ]] ||
-        die "portable CI must expose exactly one Reverie-pin ancestry-and-monotonicity job"
+    [[ $(grep -Fxc '    name: Reverie pin is an ancestor and advances monotonically' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one Reverie-pin ancestor-and-monotonic job"
     [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
         die "the authoritative portable aggregate must depend on the Reverie pin job"
     [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
@@ -1006,7 +1006,7 @@ EOF
         die "portable CI must not retain a stale-Reverie override"
 
     local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
-    [[ $(grep -Fxc '    name: reverie-pin-ancestry-and-monotonicity' "$merge_workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    name: reverie-pin-ancestor-and-monotonic' "$merge_workflow") == 1 ]] ||
         die "merge-gate must check exact PR heads with the trusted pin checker"
     [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
         die "merge-gate must depend on its exact-head Reverie pin job"
@@ -1016,6 +1016,23 @@ EOF
         die "merge-gate must inspect the exact PR head"
     grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
         die "merge-gate must run the canonical live-query checker on the exact PR head"
+
+    local updating_guide="$ROOT_DIR/docs/updating-reverie.md"
+    local -a guide_contract=(
+        "For current testing, the pin is an ancestor pointer into Reverie's linear main history."
+        'It may lag the live tip, but it must be an ancestor of `rrnewton/reverie:main`.'
+        'Relative to the landing-base pin, it may only advance forward or remain unchanged.'
+        'When resolving a pin conflict, choose the newer side; choosing the older side is a regression.'
+    )
+    local contract_line
+    for contract_line in "${guide_contract[@]}"; do
+        [[ $(grep -Fxc "$contract_line" "$updating_guide") == 1 ]] ||
+            die "Reverie pin guide must carry exactly one full-line contract: $contract_line"
+    done
+    ! grep -Fqx 'testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.' "$updating_guide" ||
+        die "Reverie pin guide must not restore live-tip equality"
+    ! grep -Fqx 'Being an ancestor of main is not sufficient. A Hermit validation or pre-land' "$updating_guide" ||
+        die "Reverie pin guide must not reject a valid lagging main-history pointer"
 }
 
 function dag_critical_path_seconds {
