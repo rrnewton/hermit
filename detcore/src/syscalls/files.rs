@@ -69,6 +69,30 @@ const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 /// before either endpoint is exposed to the guest so every run starts from the same state.
 const DETERMINISTIC_PIPE_CAPACITY: i32 = 4 * 1024;
 
+#[derive(Debug, PartialEq, Eq)]
+struct PipeCapacityFailure {
+    created_fds: [i32; 2],
+    original_pipefd: [i32; 2],
+    error: Errno,
+}
+
+fn pipe_capacity_failure(
+    created_fds: [i32; 2],
+    original_pipefd: [i32; 2],
+    capacity_result: Result<i64, Errno>,
+) -> Option<PipeCapacityFailure> {
+    let error = match capacity_result {
+        Ok(applied) if applied == i64::from(DETERMINISTIC_PIPE_CAPACITY) => return None,
+        Ok(_) => Errno::EIO,
+        Err(error) => error,
+    };
+    Some(PipeCapacityFailure {
+        created_fds,
+        original_pipefd,
+        error,
+    })
+}
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -1815,6 +1839,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             call
         };
+        // Linux leaves pipefd unchanged when pipe2 fails. Capacity pinning happens after the
+        // kernel has created the pipe, so preserve the caller's bytes before that call in case
+        // the synthetic postcondition fails and we must turn the apparent success into an error.
+        let original_pipefd = if internally_nonblocking {
+            call.pipefd()
+                .map(|pipefd| guest.memory().read_value(pipefd))
+                .transpose()?
+        } else {
+            None
+        };
         let res = self.record_or_replay(guest, injected).await?;
         let memory = guest.memory();
 
@@ -1828,15 +1862,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY)),
                     )
                     .await;
-                let capacity_error = match capacity_result {
-                    Ok(applied) if applied == i64::from(DETERMINISTIC_PIPE_CAPACITY) => None,
-                    Ok(_) => Some(Errno::EIO),
-                    Err(error) => Some(error),
-                };
-                if let Some(error) = capacity_error {
-                    let _ = guest.inject(syscalls::Close::new().with_fd(fds[0])).await;
-                    let _ = guest.inject(syscalls::Close::new().with_fd(fds[1])).await;
-                    return Err(error);
+                let original_pipefd = original_pipefd.ok_or(Errno::EFAULT)?;
+                if let Some(failure) = pipe_capacity_failure(fds, original_pipefd, capacity_result)
+                {
+                    let _ = guest
+                        .inject(syscalls::Close::new().with_fd(failure.created_fds[0]))
+                        .await;
+                    let _ = guest
+                        .inject(syscalls::Close::new().with_fd(failure.created_fds[1]))
+                        .await;
+                    // Preserve Linux's unchanged-on-failure output contract. A kernel errno is
+                    // returned unchanged; an impossible successful-but-wrong capacity is EIO.
+                    guest
+                        .memory()
+                        .write_value(pipefd, &failure.original_pipefd)?;
+                    return Err(failure.error);
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
@@ -2754,8 +2794,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod test {
     use nix::fcntl::OFlag;
 
+    use super::Errno;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::pipe_capacity_failure;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
@@ -2767,6 +2809,23 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn pipe_capacity_failure_preserves_output_and_errno_policy() {
+        let created = [17, 18];
+        let original = [0x1234, 0x5678];
+        assert_eq!(pipe_capacity_failure(created, original, Ok(4096)), None);
+
+        let mismatch = pipe_capacity_failure(created, original, Ok(8192)).unwrap();
+        assert_eq!(mismatch.created_fds, created);
+        assert_eq!(mismatch.original_pipefd, original);
+        assert_eq!(mismatch.error, Errno::EIO);
+
+        let denied = pipe_capacity_failure(created, original, Err(Errno::EPERM)).unwrap();
+        assert_eq!(denied.created_fds, created);
+        assert_eq!(denied.original_pipefd, original);
+        assert_eq!(denied.error, Errno::EPERM);
     }
 
     #[test]
