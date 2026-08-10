@@ -931,20 +931,27 @@ fn ledger_path_resolution_bracket() -> Result<(), String> {
         tool: PathBuf::from(home).join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
         root: PathBuf::from(home).join("work/dev-hermit/ledger"),
     };
-    for mode in ["0", ""] {
+    for (label, mode) in [
+        ("0", Some(OsStr::new("0"))),
+        ("empty", Some(OsStr::new(""))),
+        ("unrelated", Some(OsStr::new("unrelated"))),
+        ("unset", None),
+    ] {
         let resolved = resolve_ledger_paths(
-            Some(OsStr::new(mode)),
+            mode,
             Some(fixture_tool),
             Some(fixture_root),
             Some(home),
         );
         if resolved != expected_normal {
             return Err(format!(
-                "ledger seam: MODE={mode:?} must ignore poisoned overrides, got {resolved:?}"
+                "ledger seam: MODE={label} must ignore poisoned overrides, got {resolved:?}"
             ));
         }
     }
-    println!("  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty selected HOME tool+root");
+    println!(
+        "  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty/unrelated/unset selected HOME tool+root"
+    );
     Ok(())
 }
 
