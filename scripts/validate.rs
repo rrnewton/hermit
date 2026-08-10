@@ -59,7 +59,7 @@
 #![recursion_limit = "512"]
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 4ea6fe1b4393 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude; // rust-script cache-key: c0d79bc617a5 (regen: scripts/lib/prelude-cache-key.sh --write)
 
 #[path = "lib/validate_corpus.rs"]
 mod validate_corpus;
