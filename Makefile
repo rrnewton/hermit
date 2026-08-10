@@ -15,7 +15,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules check-skill-discovery validate validate-plan \
+	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
@@ -132,6 +132,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 	@git diff --check
 	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(MAKE) --no-print-directory verify-submodules
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
@@ -211,9 +212,37 @@ install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the
 		fi
 
 checkout-all: check-build-tools ## Initialize every pinned submodule before builds and validation
-	@$(SUBMODULE_GIT) submodule update --init --recursive
+	@before="$$($(SUBMODULE_GIT) submodule status --recursive 2>/dev/null || true)"; \
+		$(SUBMODULE_GIT) submodule update --init --recursive; \
+		inited="$$(printf '%s\n' "$$before" | grep -E '^-' | awk '{print $$2}' | tr '\n' ' ')"; \
+		repaired="$$(printf '%s\n' "$$before" | grep -E '^[+U]' | awk '{print $$2}' | tr '\n' ' ')"; \
+		if [ -n "$$inited" ] || [ -n "$$repaired" ]; then \
+			[ -n "$$inited" ] && echo "make: checkout-all: INITIALIZED (were absent): $$inited"; \
+			if [ -n "$$repaired" ]; then \
+				echo "make: checkout-all: REPAIRED DRIFT (were at a different revision): $$repaired"; \
+				echo "  this is a SILENT CORRECTION on the build path -- run 'make verify-submodules'"; \
+				echo "  to see drift REFUSED instead of repaired."; \
+			fi; \
+		else \
+			echo "make: checkout-all: nothing to initialize or repair (all submodules already at their pin)"; \
+		fi
 
-check-submodules: checkout-all ## Verify every pinned submodule is checked out at its recorded revision
+# VERIFY-ONLY, and deliberately WITHOUT the `checkout-all` prerequisite.
+#
+# `check-submodules` below keeps that prerequisite so a fresh clone still just
+# works, but that makes it STRUCTURALLY INCAPABLE OF FAILING on revision drift:
+# `git submodule update` resets the submodule to its pin, so by the time the
+# status check runs there is nothing left to catch. Measured 2026-08-10 at
+# b5a4748e by planting `+068ac92` on agent-utils: the verify LOGIC alone sees
+# the offending line, and `make check-submodules` returns 0 having repaired it.
+# The gate was verify-only for a few hours on 2026-08-02 (01836071c, subject
+# "drop redundant checkout-all, verify-only submodules") and 51996c19b restored
+# automatic initialisation the same day, silently taking the guarantee back.
+# Neither commit is wrong on its own terms; the interaction is the defect.
+#
+# So verification lives here, where it cannot change what it is verifying, and
+# initialisation lives in `checkout-all`, which now says what it repaired.
+verify-submodules: ## Verify submodule pins WITHOUT initializing or repairing them (a gate that can fail)
 	@status="$$($(SUBMODULE_GIT) submodule status --recursive)"; \
 		printf '%s\n' "$$status"; \
 		total=$$(printf '%s\n' "$$status" | grep -c .); \
@@ -222,11 +251,15 @@ check-submodules: checkout-all ## Verify every pinned submodule is checked out a
 			echo "error: $$bad of $$total submodule(s) missing or not at the pinned revision:" >&2; \
 			printf '%s\n' "$$status" | grep -E '^[-+U]' >&2; \
 			echo "  leading '-' = not initialized, '+' = checked out at a different revision, 'U' = merge conflict" >&2; \
+			echo "  NOT repaired: this target verifies and never mutates. Run 'make checkout-all' to reset to the pins." >&2; \
 			exit 1; \
 		fi; \
-		echo "make: submodules OK -- $$total/$$total at their pinned revision"
-	@test -f agent-utils/README.md || { echo 'error: agent-utils submodule is missing' >&2; exit 1; }
-	@test -f third-party/rr/CMakeLists.txt || { echo 'error: rr submodule is missing' >&2; exit 1; }
+		echo "make: submodules OK -- $$total/$$total at their pinned revision (verified, not repaired)"
+	@test -f agent-utils/README.md || { echo 'error: agent-utils submodule is missing its contents' >&2; exit 1; }
+	@test -f third-party/rr/CMakeLists.txt || { echo 'error: rr submodule is missing its contents' >&2; exit 1; }
+
+check-submodules: checkout-all ## Initialize if needed, then verify (the build path; see verify-submodules for a gate that can fail)
+	@$(MAKE) --no-print-directory verify-submodules
 
 # ---------------------------------------------------------------------------
 # Per-backend validation targets.
