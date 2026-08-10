@@ -13,14 +13,16 @@
 //! measured, both mutating the arm's body to `Err(EPERM)` and deleting the arm
 //! outright leave those tests green. This test is what fails.
 //!
-//! It asserts both halves of the contract in one guest run:
+//! It asserts all three parts of the contract in one guest run:
 //!
 //! * the identity half — a virtual root's ownership change succeeds for any
 //!   uid, so an arm that returns `EPERM` (or that never emulates at all) fails
 //!   here;
 //! * the argument half — `ENOENT`, `EBADF`, `ENOTDIR` and the `fchownat` flag
 //!   `EINVAL` still reach the guest, so an arm that returns an unconditional
-//!   `Ok(0)` fails here.
+//!   `Ok(0)` fails here;
+//! * the side-effect boundary — host ownership, set-id mode bits, and ctime
+//!   remain unchanged, so a "validator" that reissues `chown(-1, -1)` fails.
 //!
 //! Run under both namespace configurations, because the pre-#1849 failure mode
 //! was different in each: `EPERM` for everything with `--no-namespace`, and
