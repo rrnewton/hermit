@@ -311,9 +311,26 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            # Production records are visible immediately through the canonical
+            # tracked-plus-live union.  Publication to a tracked shard is
+            # asynchronous, so requiring a shard here would reject a genuine
+            # accepted write while bypassing the reader every consumer uses.
+            adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
+            reader = subprocess.run(
+                ["python3", str(adapter), "events"],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            reader_output = reader.stdout.decode(errors="replace")
+            assert reader.returncode == 0, reader_output
+            events = [
+                json.loads(line)
+                for line in reader_output.splitlines()
+                if line.strip()
+            ]
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
