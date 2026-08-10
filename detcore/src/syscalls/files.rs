@@ -12,6 +12,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use nix::fcntl::OFlag;
 use rand::RngExt as _;
 use reverie::Error;
@@ -91,6 +92,44 @@ fn pipe_capacity_failure(
         original_pipefd,
         error,
     })
+}
+
+#[async_trait]
+trait PipeCapacityRollback<T> {
+    async fn close_created_fd(&mut self, fd: i32);
+    fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno>;
+}
+
+async fn apply_pipe_capacity_failure<T, R: PipeCapacityRollback<T>>(
+    rollback: &mut R,
+    failure: PipeCapacityFailure,
+) -> Result<i64, Errno> {
+    rollback.close_created_fd(failure.created_fds[0]).await;
+    rollback.close_created_fd(failure.created_fds[1]).await;
+    rollback.restore_pipefd(failure.original_pipefd)?;
+    Err(failure.error)
+}
+
+struct GuestPipeCapacityRollback<'guest, 'addr, G> {
+    guest: &'guest mut G,
+    pipefd: AddrMut<'addr, [i32; 2]>,
+}
+
+#[async_trait]
+impl<T, G> PipeCapacityRollback<T> for GuestPipeCapacityRollback<'_, '_, G>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>> + Send,
+{
+    async fn close_created_fd(&mut self, fd: i32) {
+        let _ = self.guest.inject(syscalls::Close::new().with_fd(fd)).await;
+    }
+
+    fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno> {
+        self.guest
+            .memory()
+            .write_value(self.pipefd, &original_pipefd)
+    }
 }
 
 fn should_tag_sabre_internal_pipe_io(
@@ -1865,18 +1904,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let original_pipefd = original_pipefd.ok_or(Errno::EFAULT)?;
                 if let Some(failure) = pipe_capacity_failure(fds, original_pipefd, capacity_result)
                 {
-                    let _ = guest
-                        .inject(syscalls::Close::new().with_fd(failure.created_fds[0]))
-                        .await;
-                    let _ = guest
-                        .inject(syscalls::Close::new().with_fd(failure.created_fds[1]))
-                        .await;
                     // Preserve Linux's unchanged-on-failure output contract. A kernel errno is
                     // returned unchanged; an impossible successful-but-wrong capacity is EIO.
-                    guest
-                        .memory()
-                        .write_value(pipefd, &failure.original_pipefd)?;
-                    return Err(failure.error);
+                    let mut rollback = GuestPipeCapacityRollback { guest, pipefd };
+                    return apply_pipe_capacity_failure(&mut rollback, failure).await;
                 }
             }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
@@ -2795,7 +2826,10 @@ mod test {
     use nix::fcntl::OFlag;
 
     use super::Errno;
+    use super::PipeCapacityFailure;
+    use super::PipeCapacityRollback;
     use super::UNIX_AUTOBIND_NAME_LEN;
+    use super::apply_pipe_capacity_failure;
     use super::canonicalize_tcp_info;
     use super::pipe_capacity_failure;
     use super::should_tag_sabre_internal_pipe_io;
@@ -2826,6 +2860,41 @@ mod test {
         assert_eq!(denied.created_fds, created);
         assert_eq!(denied.original_pipefd, original);
         assert_eq!(denied.error, Errno::EPERM);
+    }
+
+    #[derive(Default)]
+    struct RecordingPipeCapacityRollback {
+        closed: Vec<i32>,
+        restored: Option<[i32; 2]>,
+    }
+
+    #[async_trait::async_trait]
+    impl PipeCapacityRollback<()> for RecordingPipeCapacityRollback {
+        async fn close_created_fd(&mut self, fd: i32) {
+            self.closed.push(fd);
+        }
+
+        fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno> {
+            self.restored = Some(original_pipefd);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_capacity_failure_applies_fd_and_output_rollback() {
+        let failure = PipeCapacityFailure {
+            created_fds: [17, 18],
+            original_pipefd: [0x1234, 0x5678],
+            error: Errno::EPERM,
+        };
+        let mut rollback = RecordingPipeCapacityRollback::default();
+
+        assert_eq!(
+            apply_pipe_capacity_failure(&mut rollback, failure).await,
+            Err(Errno::EPERM)
+        );
+        assert_eq!(rollback.closed, [17, 18]);
+        assert_eq!(rollback.restored, Some([0x1234, 0x5678]));
     }
 
     #[test]
