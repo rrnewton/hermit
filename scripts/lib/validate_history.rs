@@ -409,23 +409,48 @@ pub fn self_test() -> Result<String, String> {
     };
     let key = CacheKey { tree: "T", profile: "full", host: "h1", toolchain: "rustc 1.0" };
 
-    // POSITIVE, both producers. A predicate that refuses everything would look
-    // correct with negatives alone, so each authority gets a counted accept.
+    // POSITIVE, both producers plus the typed-skip form. A predicate that
+    // refuses everything would look correct with negatives alone, so each
+    // authority gets a counted accept and the Rust authority proves that an
+    // intentional skip accounts for a node without becoming an executed gate.
     let rs_pass = base(serde_json::json!({
         "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 47,
         "gates_expected": 47, "gates_run": 47,
+        "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+    }));
+    let rs_typed_skip_pass = base(serde_json::json!({
+        "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 46,
+        "gates_expected": 47, "gates_run": 46, "skipped_nodes": 1,
+        "intentional_skipped_nodes": [{
+            "name": "privileged-e2e.manifest_applications",
+            "reason": "empty-manifest-bucket"
+        }],
+        "dependency_skipped_nodes": [], "unaccounted_nodes": [],
         "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
     }));
     let sh_pass = base(serde_json::json!({
         "producer": "validate.sh", "executed_tests": 1234, "gates_expected": 12, "gates_run": 12,
     }));
     let mut accepted = 0usize;
-    for (why, row) in [("validate.rs row", &rs_pass), ("validate.sh row", &sh_pass)] {
+    for (why, row) in [
+        ("validate.rs row", &rs_pass),
+        ("validate.rs row with one typed empty-bucket skip", &rs_typed_skip_pass),
+        ("validate.sh row", &sh_pass),
+    ] {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
             return Err(format!("cache: a fully qualifying {why} must be a HIT"));
         }
         accepted += 1;
     }
+
+    let altered = |mut row: serde_json::Value, extra: serde_json::Value| {
+        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                row.insert(key.clone(), value.clone());
+            }
+        }
+        row
+    };
 
     // NEGATIVE: every single missing condition must REFUSE. Each row below is
     // the positive row with exactly one field spoiled, so a refusal is
@@ -445,6 +470,11 @@ pub fn self_test() -> Result<String, String> {
         ("absent coverage block", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5}))),
         ("planned node never ran", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}))),
         ("gates_run below gates_expected", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}))),
+        ("typed skip with unknown reason", altered(rs_typed_skip_pass.clone(), serde_json::json!({"intentional_skipped_nodes": [{"name": "privileged-e2e.manifest_applications", "reason": "looks-empty"}]}))),
+        ("typed skip also counted as executed", altered(rs_typed_skip_pass.clone(), serde_json::json!({"executed_nodes": 47}))),
+        ("typed skip plus dependency skip", altered(rs_typed_skip_pass.clone(), serde_json::json!({"dependency_skipped_nodes": ["test.lost"]}))),
+        ("typed skip plus unaccounted node", altered(rs_typed_skip_pass.clone(), serde_json::json!({"unaccounted_nodes": ["test.lost"]}))),
+        ("typed skip count mismatch", altered(rs_typed_skip_pass.clone(), serde_json::json!({"skipped_nodes": 0}))),
         ("bash row with zero executed_tests", base(serde_json::json!({"producer": "validate.sh", "executed_tests": 0}))),
         ("bash row with no executed_tests", base(serde_json::json!({"producer": "validate.sh"}))),
         // The cross-producer trap this module exists to close: a validate.rs row
