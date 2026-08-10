@@ -3308,6 +3308,8 @@ fn intentional_skip_accounting_bracket() -> Result<(), String> {
         ok: true,
         duration_s: 0.01,
         summary: "ran".into(),
+        executed_tests: None,
+        filtered_tests: None,
         returncode: Some(0),
         reason: String::new(),
         aborted: false,
