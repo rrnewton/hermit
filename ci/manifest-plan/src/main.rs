@@ -41,6 +41,9 @@ enum Format {
     Text,
     Json,
     HarnessJson,
+    /// The single derivation of verify-mode flags, for runners that do not read
+    /// `harness-json`.
+    VerifyFlags,
 }
 
 #[cfg(not(test))]
@@ -70,6 +73,7 @@ fn parse_format() -> Format {
             "text" => Format::Text,
             "json" => Format::Json,
             "harness-json" => Format::HarnessJson,
+            "verify-flags" => Format::VerifyFlags,
             _ => die(format!("unknown format: {value}")),
         };
     }
@@ -152,7 +156,13 @@ fn main() {
     });
 
     match format {
+        Format::VerifyFlags => {
+            for line in verify_flags_tsv(&documents) {
+                println!("{line}");
+            }
+        }
         Format::HarnessJson => {
+            attach_verify_flags(&mut documents);
             println!(
                 "{}",
                 serde_json::to_string(&documents)
@@ -663,6 +673,108 @@ fn validate_guest_termination_assertion(id: &str, assert: &Value) {
              bitwise_parity = true -- a non-zero exit is acceptable only with canonical parity"
         ));
     }
+}
+
+/// The extra Hermit flags a verify cell's `assert` table requires, and the
+/// whole-invocation status it must produce.
+///
+/// SINGLE SOURCE. Both runners consume this: `ci/test_harness.sh` reads it out
+/// of `--format harness-json` (injected at `modes.verify.verify_flags` /
+/// `.verify_shell_status`), and `scripts/manifest-to-commands.rs` reads the same
+/// derivation through `--format verify-flags`. Neither re-derives it, so there
+/// is nothing to drift and nothing to cross-check. A cross-check would have to
+/// be one-directional -- it can only iterate cells some consumer already names,
+/// so a consumer that names none looks identical to a consumer that agrees.
+///
+/// `--verify-json` is deliberately absent: only the runner knows where its cell
+/// writes the record, so it appends the path itself.
+fn verify_assert_flags(assert: Option<&Value>) -> (Vec<&'static str>, i64) {
+    let Some(assert) = assert.and_then(Value::as_table) else {
+        return (Vec::new(), 0);
+    };
+    let mut flags = Vec::new();
+    if assert.get("bitwise_parity").and_then(Value::as_bool) == Some(true) {
+        flags.push("--verify-strict");
+        flags.push("--verify-json");
+    }
+    let mut shell_status = 0;
+    if let Some(signal) = assert.get("guest_signal").and_then(Value::as_integer) {
+        shell_status = 128 + signal;
+    } else if let Some(code) = assert.get("guest_exit_code").and_then(Value::as_integer) {
+        shell_status = code;
+    }
+    if shell_status != 0 {
+        // Without the allowance Hermit refuses the SECOND run, so the cell
+        // measures a `no_result` instead of the guest.
+        flags.push("--verify-allow");
+        flags.push("both");
+    }
+    (flags, shell_status)
+}
+
+/// Inject the single derivation into every test's `modes.verify` so
+/// `--format harness-json` carries it to `ci/test_harness.sh`.
+fn attach_verify_flags(documents: &mut [Value]) {
+    for document in documents.iter_mut() {
+        let Some(tests) = document.get_mut("test").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for test in tests.iter_mut() {
+            let Some(verify) = test
+                .get_mut("modes")
+                .and_then(Value::as_table_mut)
+                .and_then(|modes| modes.get_mut("verify"))
+                .and_then(Value::as_table_mut)
+            else {
+                continue;
+            };
+            let (flags, shell_status) = verify_assert_flags(verify.get("assert"));
+            verify.insert(
+                "verify_flags".to_owned(),
+                Value::Array(
+                    flags
+                        .iter()
+                        .map(|flag| Value::String((*flag).to_owned()))
+                        .collect(),
+                ),
+            );
+            verify.insert(
+                "verify_shell_status".to_owned(),
+                Value::Integer(shell_status),
+            );
+        }
+    }
+}
+
+/// `<test-id>\t<space-joined flags>\t<shell status>` for every verify cell whose
+/// `assert` asks for anything. The channel `scripts/manifest-to-commands.rs`
+/// and any out-of-tree harness read, so they never parse `assert` themselves.
+fn verify_flags_tsv(documents: &[Value]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for document in documents {
+        let Some(tests) = document.get("test").and_then(Value::as_array) else {
+            continue;
+        };
+        for test in tests {
+            let id = test
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let assert = test
+                .get("modes")
+                .and_then(Value::as_table)
+                .and_then(|modes| modes.get("verify"))
+                .and_then(Value::as_table)
+                .and_then(|verify| verify.get("assert"));
+            let (flags, shell_status) = verify_assert_flags(assert);
+            if flags.is_empty() {
+                continue;
+            }
+            lines.push(format!("{id}\t{}\t{shell_status}", flags.join(" ")));
+        }
+    }
+    lines.sort();
+    lines
 }
 
 fn validate_mode(

@@ -180,6 +180,9 @@ use self::record::RecordOpts;
 use self::replay::ReplayOpts;
 use self::run::RunOpts;
 use self::strace::StraceOpts;
+use self::verify::exit_guest_code_action;
+use self::verify::reraise_guest_signal_action;
+use self::verify::stamp_terminating_action;
 use self::verify::write_pending_verification_json;
 use self::version::Version;
 
@@ -324,13 +327,40 @@ fn main() {
         mut command,
     } = Args::parse();
 
-    command
-        .main(&global)
-        .unwrap_or_else(|err| {
-            display_error(err);
-            ExitStatus::Exited(1)
-        })
-        .raise_or_exit();
+    let status = command.main(&global).unwrap_or_else(|err| {
+        display_error(err);
+        ExitStatus::Exited(1)
+    });
+
+    // LAST STATEMENT BEFORE HERMIT MIRRORS THE GUEST'S TERMINATION ONTO ITSELF.
+    //
+    // `raise_or_exit` re-raises the guest's signal so Hermit's own parent sees
+    // the same disposition the guest had. That makes Hermit's wait status
+    // ambiguous in exactly one direction a consumer cares about: a run whose
+    // guest died of SIGSEGV and a run where HERMIT died of SIGSEGV both exit
+    // 139, and the `--verify-json` verdict is already written and green by then
+    // (measured: the verdict is published ~28% of a run's wall time before the
+    // process ends). A consumer that accepts a non-zero Hermit exit therefore
+    // cannot distinguish them from the wait status or from the verdict as it
+    // stood a moment ago.
+    //
+    // Recording the intent here -- one atomic rename before the `raise` -- is
+    // what makes the two distinguishable. A Hermit-side death leaves the field
+    // absent, which the consumer reads as a refusal. Failure to stamp is
+    // deliberately not fatal: the absent field already means refusal, and
+    // aborting here would replace a clean guest result with a Hermit error.
+    if let Some(path) = command.verification_json_path() {
+        match status {
+            ExitStatus::Signaled(signal, _) => {
+                let _ = stamp_terminating_action(path, &reraise_guest_signal_action(signal as i32));
+            }
+            ExitStatus::Exited(code) => {
+                let _ = stamp_terminating_action(path, &exit_guest_code_action(code));
+            }
+        }
+    }
+
+    status.raise_or_exit();
 }
 
 fn display_error(error: Error) {

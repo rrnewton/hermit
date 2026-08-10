@@ -156,7 +156,14 @@ only when all of the following hold:
   `guest_exit_code: null`, or `guest_exit_code: N` with `guest_signal: null`.
   Hermit derives those from the **guest's** wait status and stamps the record
   `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
-  behind instead of a stale pass.
+  behind instead of a stale pass;
+- the verdict carries `terminating_action: "reraise-guest-signal:N"` (or
+  `"exit-guest-code:N"`). Every other field describes the GUEST, and the whole
+  record is published while Hermit is still alive, so none of them can say that
+  Hermit exited that way **on purpose** rather than having crashed afterwards
+  with the same wait status. Hermit writes this field as the last thing it does
+  before mirroring the guest's termination onto itself; a Hermit-side death
+  while it is still executing leaves the field absent, which is a refusal.
 
 This is strictly stronger than the exit-0 default, so the termination is part of
 the cell's observation: it binds the cell to one exact schedule, and a
@@ -166,11 +173,15 @@ legitimate scheduler change must update the declaration in the same review.
 both are refused on every mode except `verify`, the only mode whose cell is a
 single Hermit invocation.
 
-`ci/test_harness.sh` is the authority for the flags these assertions imply.
-`scripts/manifest-to-commands.rs` carries a transport copy so its generated
-reproduction command reproduces the cell rather than a weaker run, and
-`./ci/test_harness.sh validate` cross-checks the two (plus a self-test of the
-verdict check against every impersonating record shape), so they cannot drift.
+**One derivation, two transports.** `ci/manifest-plan` is the only place the
+flag set is chosen. It emits the result into `--format harness-json` at
+`modes.verify.verify_flags` / `.verify_shell_status` (which `ci/test_harness.sh`
+reads) and as `--format verify-flags` TSV (which `scripts/manifest-to-commands.rs`
+and any out-of-tree harness read). Neither runner parses `assert` itself, so
+there is nothing to drift — and nothing that a cross-check could have policed
+anyway: a cross-check can only iterate cells some consumer names, so a consumer
+that names none is indistinguishable from one that agrees. `validate` still
+self-tests the verdict check against every impersonating record shape.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
