@@ -362,7 +362,20 @@ pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
+    #[serde(default)]
+    timer_slack_identity: Option<(u64, u64)>,
     contents: Option<Vec<u8>>,
+    offset: usize,
+}
+
+/// A non-mutating candidate for one sequential timer-slack read.
+///
+/// The snapshot and cursor are committed only after the guest-memory copy
+/// succeeds. This mirrors seq_file: an `EFAULT` must leave both untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimerSlackReadPreview {
+    pub(crate) bytes: Vec<u8>,
+    snapshot: Vec<u8>,
     offset: usize,
 }
 
@@ -552,6 +565,7 @@ impl ProcfsFile {
             kind,
             target_fd,
             bound_thread_identity: None,
+            timer_slack_identity: None,
             contents: None,
             offset: 0,
         })
@@ -721,14 +735,67 @@ impl ProcfsFile {
         }
     }
 
-    /// Read from the open file description's current timer-slack snapshot.
-    /// Linux keeps a partial-read snapshot until the description is rewound.
-    pub(crate) fn take_timer_slack(&mut self, value: u64, maximum: usize) -> Option<Vec<u8>> {
+    /// Bind a timer-slack procfs file to the raw inode resolved by its open.
+    pub(crate) fn bind_timer_slack_identity(&mut self, device: u64, inode: u64) {
+        self.timer_slack_target()
+            .expect("only timer-slack procfs files have task identities");
+        self.timer_slack_identity = Some((device, inode));
+    }
+
+    /// Return the task and raw proc inode captured by the successful open.
+    pub(crate) fn timer_slack_binding(&self) -> Option<(i32, u64, u64)> {
+        let target = self.timer_slack_target()?;
+        let (device, inode) = self
+            .timer_slack_identity
+            .expect("timer-slack procfs file lacks open-time inode identity");
+        Some((target, device, inode))
+    }
+
+    /// Preview bytes from the open file description's timer-slack snapshot.
+    /// Linux keeps a partial-read snapshot until the description is rewound,
+    /// but does not create or consume that snapshot when copying to userspace
+    /// fails.
+    pub(crate) fn preview_timer_slack(
+        &self,
+        value: u64,
+        maximum: usize,
+    ) -> Option<TimerSlackReadPreview> {
         self.timer_slack_target()?;
-        if self.contents.is_none() {
-            self.contents = Some(format!("{value}\n").into_bytes());
+        let snapshot = self
+            .contents
+            .clone()
+            .unwrap_or_else(|| format!("{value}\n").into_bytes());
+        let start = self.offset.min(snapshot.len());
+        let end = start.saturating_add(maximum).min(snapshot.len());
+        Some(TimerSlackReadPreview {
+            bytes: snapshot[start..end].to_vec(),
+            snapshot,
+            offset: self.offset,
+        })
+    }
+
+    /// Commit only bytes successfully copied from a sequential preview.
+    pub(crate) fn commit_timer_slack_read(
+        &mut self,
+        preview: &TimerSlackReadPreview,
+        copied: usize,
+    ) {
+        assert!(copied <= preview.bytes.len());
+        if copied == 0 {
+            return;
         }
-        self.take(maximum)
+        assert_eq!(
+            self.offset, preview.offset,
+            "timer-slack cursor changed between preview and commit"
+        );
+        match &self.contents {
+            Some(contents) => assert_eq!(
+                contents, &preview.snapshot,
+                "timer-slack snapshot changed between preview and commit"
+            ),
+            None => self.contents = Some(preview.snapshot.clone()),
+        }
+        self.offset = self.offset.saturating_add(copied);
     }
 
     /// A positioned procfs read regenerates the scalar and does not change the
@@ -3652,18 +3719,26 @@ mod tests {
     #[test]
     fn timer_slack_snapshot_rewinds_and_positioned_reads_are_fresh() {
         let mut procfs = ProcfsFile::from_path(Path::new("/proc/202/timerslack_ns")).unwrap();
-        assert_eq!(procfs.take_timer_slack(111, 2).unwrap(), b"11");
+        let failed = procfs.preview_timer_slack(111, 2).unwrap();
+        assert_eq!(failed.bytes, b"11");
+        assert_eq!(procfs.position(), (0, None));
+
+        let first = procfs.preview_timer_slack(222, 2).unwrap();
+        assert_eq!(first.bytes, b"22");
+        procfs.commit_timer_slack_read(&first, first.bytes.len());
         assert_eq!(
-            procfs.take_timer_slack(999, usize::MAX).unwrap(),
-            b"1\n",
+            procfs.preview_timer_slack(999, usize::MAX).unwrap().bytes,
+            b"2\n",
             "a partial sequential read retains its original scalar"
         );
 
         procfs.set_offset(0);
-        assert_eq!(procfs.take_timer_slack(222, usize::MAX).unwrap(), b"222\n");
+        let rewound = procfs.preview_timer_slack(333, usize::MAX).unwrap();
+        assert_eq!(rewound.bytes, b"333\n");
+        procfs.commit_timer_slack_read(&rewound, rewound.bytes.len());
         assert_eq!(procfs.take_timer_slack_at(333, 1, 2).unwrap(), b"33");
         assert_eq!(
-            procfs.take_timer_slack(444, usize::MAX).unwrap(),
+            procfs.preview_timer_slack(444, usize::MAX).unwrap().bytes,
             b"",
             "positioned reads do not change the shared cursor"
         );
