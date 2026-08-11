@@ -135,6 +135,8 @@ const CLASSIFIED: &[Classified] = &[
     // undeclared heuristic.
     Classified { flag: "--no-color", relaxes: false,
         why: "logdiff.rs: terminal colour only" },
+    Classified { flag: "--no-base", relaxes: false,
+        why: "check-reverie-pin.rs:1324: CI pin-gate tooling, not the guest CLI.               Declares that an invocation has no monotonicity base so an               unresolvable base is an intended skip instead of a silent one;               it reaches no scheduler, virtual clock, or syscall path" },
 ];
 
 fn main() {
