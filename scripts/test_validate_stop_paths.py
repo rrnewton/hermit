@@ -102,7 +102,7 @@ def stop_test_env(
             str(ROOT.parents[2] / "ci-hub" / "ledger" / "validate_rows.py"),
         ),
         CI_HUB_VALIDATE_LEDGER_TEST_ROOT=str(tmpdir),
-        DEV_HERMIT_PARENT=str(ROOT.parent),
+        DEV_HERMIT_PARENT=str(DEV_HERMIT),
         VALIDATE_RUN_ON_DIRTY_TREE="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
         TMPDIR=str(tmpdir),

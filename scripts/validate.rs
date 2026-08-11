@@ -1172,18 +1172,18 @@ fn coverage_schema_bracket() -> Result<(), String> {
 /// Exercise the exact pure resolver used by the production ledger tool/root
 /// accessors. Poisoned fixture overrides must be authoritative only for the
 /// exact mode value `1`; a merely present `0` or empty value must resolve both
-/// paths from HOME.
+/// paths from the admitted dev-hermit parent.
 fn ledger_path_resolution_bracket() -> Result<(), String> {
     use std::ffi::OsStr;
 
     let fixture_tool = OsStr::new("/poison/fixture/validate_rows.py");
     let fixture_root = OsStr::new("/poison/fixture/root");
-    let home = OsStr::new("/normal/home");
+    let parent = OsStr::new("/srv/dev-hermit4");
     let fixture = resolve_ledger_paths(
         Some(OsStr::new("1")),
         Some(fixture_tool),
         Some(fixture_root),
-        Some(home),
+        Some(parent),
     );
     let expected_fixture = LedgerPaths {
         tool: PathBuf::from(fixture_tool),
@@ -1196,8 +1196,8 @@ fn ledger_path_resolution_bracket() -> Result<(), String> {
     }
 
     let expected_normal = LedgerPaths {
-        tool: PathBuf::from(home).join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
-        root: PathBuf::from(home).join("work/dev-hermit/ledger"),
+        tool: PathBuf::from(parent).join("ci-hub/ledger/validate_rows.py"),
+        root: PathBuf::from(parent).join("ledger"),
     };
     for (label, mode) in [
         ("0", Some(OsStr::new("0"))),
@@ -1209,7 +1209,7 @@ fn ledger_path_resolution_bracket() -> Result<(), String> {
             mode,
             Some(fixture_tool),
             Some(fixture_root),
-            Some(home),
+            Some(parent),
         );
         if resolved != expected_normal {
             return Err(format!(
@@ -1218,7 +1218,7 @@ fn ledger_path_resolution_bracket() -> Result<(), String> {
         }
     }
     println!(
-        "  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty/unrelated/unset selected HOME tool+root"
+        "  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty/unrelated/unset selected the admitted dev-hermit parent"
     );
     Ok(())
 }
@@ -1948,28 +1948,42 @@ fn has_cmd(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Locate the dev-hermit parent by walking up for a `.gitmodules` whose `hermit`
-/// submodule path is `hermit` (validate.sh:19).
-fn find_parent(root: &Path) -> Option<PathBuf> {
-    let mut cur = root.to_path_buf();
-    loop {
-        if cur.join(".gitmodules").is_file() {
-            if let Some(p) = sh(
+fn is_dev_hermit_parent(path: &Path) -> bool {
+    path.is_absolute()
+        && path.join("ci-hub/ci-hub").is_file()
+        && path.join(".gitmodules").is_file()
+        && path.to_str().is_some_and(|path| {
+            sh(
                 "git",
                 &[
                     "-C",
-                    cur.to_str()?,
+                    path,
                     "config",
                     "-f",
                     ".gitmodules",
                     "--get",
                     "submodule.hermit.path",
                 ],
-            ) {
-                if p == "hermit" {
-                    return Some(cur);
-                }
-            }
+            )
+            .as_deref()
+                == Some("hermit")
+        })
+}
+
+/// Locate the exact dev-hermit parent used by both lock admission and ledger
+/// routing. The coordinator supplies `DEV_HERMIT_PARENT`; ancestor discovery is
+/// retained for primary/slot checkouts and inert local brackets.
+fn find_parent(root: &Path) -> Option<PathBuf> {
+    if let Ok(parent) = std::env::var(PARENT_ENV) {
+        let parent = PathBuf::from(parent);
+        if is_dev_hermit_parent(&parent) {
+            return Some(parent);
+        }
+    }
+    let mut cur = root.to_path_buf();
+    loop {
+        if is_dev_hermit_parent(&cur) {
+            return Some(cur);
         }
         if !cur.pop() || cur.as_os_str().is_empty() {
             return None;
@@ -2871,8 +2885,8 @@ fn selective_plan(
         // parent, so selection fails safe to the full lane (validate.sh:4369).
         sh("git", &["rev-parse", "--verify", "HEAD~1"])
     } else {
-        let rows = canonical_ledger_rows();
         let parent = find_parent(root);
+        let rows = canonical_ledger_rows(parent.as_deref());
         let slot = slot_name(root, parent.as_deref());
         validate_history::selective_baseline(&rows, args.baseline.as_deref(), &slot, &commit_exists)
     };
@@ -4480,6 +4494,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn write_ledger(
     ctx: &LedgerCtx,
+    parent: Option<&Path>,
     outcomes: &[StepOutcome],
     accounting: &validate_plan::NodeAccounting,
     wall_s: f64,
@@ -4631,7 +4646,7 @@ fn write_ledger(
         record["non_qualifying_reason"] = serde_json::json!("historical-debug");
     }
     use std::io::Write;
-    let tool = ledger_tool_path();
+    let tool = ledger_tool_path(parent);
     let mut child = match Command::new("python3")
         .arg(&tool)
         .arg("record")
@@ -4714,12 +4729,14 @@ fn resolve_ledger_paths(
     mode: Option<&std::ffi::OsStr>,
     fixture_tool: Option<&std::ffi::OsStr>,
     fixture_root: Option<&std::ffi::OsStr>,
-    home: Option<&std::ffi::OsStr>,
+    parent: Option<&std::ffi::OsStr>,
 ) -> LedgerPaths {
-    let home = home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/nonexistent-home"));
+    let parent = parent
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/nonexistent-dev-hermit-parent"));
     let mut resolved = LedgerPaths {
-        tool: home.join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
-        root: home.join("work/dev-hermit/ledger"),
+        tool: parent.join("ci-hub/ledger/validate_rows.py"),
+        root: parent.join("ledger"),
     };
     if stop_test_mode_active(mode) {
         if let Some(path) = fixture_tool {
@@ -4732,25 +4749,25 @@ fn resolve_ledger_paths(
     resolved
 }
 
-fn ledger_paths_from_env() -> LedgerPaths {
+fn ledger_paths(parent: Option<&Path>) -> LedgerPaths {
     resolve_ledger_paths(
         std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").as_deref(),
         std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL").as_deref(),
         std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        parent.map(Path::as_os_str),
     )
 }
 
-fn ledger_tool_path() -> PathBuf {
-    ledger_paths_from_env().tool
+fn ledger_tool_path(parent: Option<&Path>) -> PathBuf {
+    ledger_paths(parent).tool
 }
 
-fn canonical_ledger_root() -> PathBuf {
-    ledger_paths_from_env().root
+fn canonical_ledger_root(parent: Option<&Path>) -> PathBuf {
+    ledger_paths(parent).root
 }
 
-fn canonical_ledger_rows() -> Vec<serde_json::Value> {
-    let tool = ledger_tool_path();
+fn canonical_ledger_rows(parent: Option<&Path>) -> Vec<serde_json::Value> {
+    let tool = ledger_tool_path(parent);
     let Ok(output) = Command::new("python3").arg(&tool).arg("rows").output() else {
         eprintln!("validate: warning: cannot execute canonical ledger reader {}", tool.display());
         return Vec::new();
@@ -5106,32 +5123,45 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // real ancestry, exact commit and host.  Inert help, self-test, stop-test and
     // show-plan paths bypass this product-work guard.
     if !args.show_plan {
-        if let Some(parent) = parent.as_deref() {
-            let commit = git_sha();
-            let host = short_hostname();
-            let admitted = canonical_validate_lock_authority(Some(parent), &commit, &host).is_ok();
-            if let Some(refusal) = product_front_door_refusal(
-                parent,
-                &root,
-                &commit,
-                &requested_validate_args(),
-                admitted,
-            ) {
-                eprintln!("{refusal}");
-                return RunSummary::refused(
-                    4,
-                    &profile_name,
-                    "the dev-hermit product front door",
-                    vec![
-                        "this checkout is inside dev-hermit, but this process is not descended \
-                         from the canonical validate-lock owner"
-                            .into(),
-                        "use the exact ci-hub validate-run command printed above; environment \
-                         markers cannot authorize product work"
-                            .into(),
-                    ],
-                );
-            }
+        let Some(parent) = parent.as_deref() else {
+            return RunSummary::refused(
+                4,
+                &profile_name,
+                "the dev-hermit product front door",
+                vec![
+                    "no dev-hermit parent was found, so neither canonical validate-lock admission \
+                     nor the canonical ledger adapter can be bound"
+                        .into(),
+                    "run product validation through the coordinator's dev-hermit ci-hub flow; \
+                     standalone product runs are diagnostic no-results"
+                        .into(),
+                ],
+            );
+        };
+        let commit = git_sha();
+        let host = short_hostname();
+        let admitted = canonical_validate_lock_authority(Some(parent), &commit, &host).is_ok();
+        if let Some(refusal) = product_front_door_refusal(
+            parent,
+            &root,
+            &commit,
+            &requested_validate_args(),
+            admitted,
+        ) {
+            eprintln!("{refusal}");
+            return RunSummary::refused(
+                4,
+                &profile_name,
+                "the dev-hermit product front door",
+                vec![
+                    "this checkout is inside dev-hermit, but this process is not descended from \
+                     the canonical validate-lock owner"
+                        .into(),
+                    "use the exact ci-hub validate-run command printed above; environment markers \
+                     cannot authorize product work"
+                        .into(),
+                ],
+            );
         }
     }
 
@@ -5427,8 +5457,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the commit would re-run it. `--ignore-cache` forces a real run; a focused
     // or selective profile is never cached because `selection_mode == "full"` is
     // part of the key.
-    let ledger = canonical_ledger_root();
-    let ledger_rows = canonical_ledger_rows();
+    let ledger = canonical_ledger_root(parent.as_deref());
+    let ledger_rows = canonical_ledger_rows(parent.as_deref());
     let tree = git_tree();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
@@ -5925,6 +5955,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         if !nesting.nested {
             write_ledger(
                 &ctx,
+                parent.as_deref(),
                 &outcomes,
                 &accounting,
                 wall,
@@ -6118,6 +6149,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !nesting.nested {
         write_ledger(
             &ctx,
+            parent.as_deref(),
             &outcomes,
             &accounting,
             wall,
@@ -6317,7 +6349,7 @@ fn stop_test_seam(
     let outcomes =
         vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
 
-    let ledger = canonical_ledger_root();
+    let ledger = canonical_ledger_root(parent);
     let host = short_hostname();
     let commit = git_sha();
     let authority_start = canonical_validate_lock_authority(parent, &commit, &host);
@@ -6479,7 +6511,7 @@ fn stop_test_seam(
         "stop fixture returned no terminal state",
     );
     write_ledger(
-        &ctx, &outcomes, &fixture_accounting, wall, exit_code, "", false,
+        &ctx, parent, &outcomes, &fixture_accounting, wall, exit_code, "", false,
         serde_json::json!({}),
     );
 
