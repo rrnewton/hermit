@@ -10,6 +10,7 @@
 
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
@@ -256,10 +257,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // recycled TID a different proc inode, while the original open file
         // description remains bound to the exited task's inode.
         let path = format!("/proc/{target}/timerslack_ns");
-        let path = path.as_bytes();
+        let path_bytes = path.as_bytes();
         let mut path_buffer = [0_u8; 64];
-        assert!(path.len() < path_buffer.len());
-        path_buffer[..path.len()].copy_from_slice(path);
+        assert!(path_bytes.len() < path_buffer.len());
+        path_buffer[..path_bytes.len()].copy_from_slice(path_bytes);
 
         let mut stack = guest.stack().await;
         let path_address = stack.push(path_buffer).cast::<libc::c_char>();
@@ -272,7 +273,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))
             .with_stat(Some(statptr))
             .with_flags(AtFlags::empty());
-        let identity = match guest.inject_with_retry(call).await {
+        let mut identity = match guest.inject_with_retry(call).await {
             Ok(_) => {
                 let stat = statptr.read(&guest.memory())?;
                 Some((stat.st_dev, stat.st_ino))
@@ -281,6 +282,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(error) => return Err(error.into()),
         };
         drop(stack_guard);
+        // Replayer runs the guest in a filesystem chroot whose `/proc` path is
+        // intentionally absent, while the tracing process remains in the same
+        // PID namespace and can resolve the task through its own proc mount.
+        // Use that equivalent view only for record/replay; other backends keep
+        // the guest-path result above as their sole authority.
+        if identity.is_none()
+            && guest.config().recordreplay_modes
+            && let Ok(metadata) = std::fs::metadata(path)
+        {
+            identity = Some((metadata.dev(), metadata.ino()));
+        }
         Ok(identity)
     }
 
@@ -704,14 +716,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .and_then(ProcfsFile::timer_slack_target)
                     .is_some()
                 {
+                    let target = procfs
+                        .as_ref()
+                        .and_then(ProcfsFile::timer_slack_target)
+                        .expect("timer-slack target disappeared");
                     let stat = match guest.thread_state().with_detfd(fd, |detfd| detfd.stat())? {
                         Some(stat) => libc::stat::from(&stat),
                         None => self.inject_fstat(guest, fd).await?,
                     };
+                    // Recorder opens a real proc inode, while Replayer reserves
+                    // the recorded descriptor number with an anonymous eventfd.
+                    // A real proc descriptor is the strongest open-time task
+                    // incarnation witness. For a virtual replay descriptor,
+                    // bind the live numeric proc path instead; every operation
+                    // re-resolves that same path, so exit or TID reuse still
+                    // changes the inode and returns ESRCH.
+                    let identity = if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                        (stat.st_dev, stat.st_ino)
+                    } else {
+                        self.observe_timer_slack_identity(guest, target)
+                            .await?
+                            .unwrap_or((stat.st_dev, stat.st_ino))
+                    };
                     procfs
                         .as_mut()
                         .expect("timer-slack classification disappeared")
-                        .bind_timer_slack_identity(stat.st_dev, stat.st_ino);
+                        .bind_timer_slack_identity(identity.0, identity.1);
                 }
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&observed_path);
