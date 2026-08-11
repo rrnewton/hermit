@@ -3479,6 +3479,19 @@ fn run_lane_with_env_retries(
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
     let mut env_retries = 0usize;
+    // THE RETRY IS THE EXPERIMENT. `environmental_block_class` binds by
+    // COLOCATION: a banner somewhere in the failing node's detail region. That
+    // establishes contemporaneity, not causation. The retry — same commit, same
+    // code, fresh environment — is the differential that settles it, and we were
+    // already paying for it in full and then discarding the verdict.
+    //
+    // Retain the two facts the loop otherwise destroys (`by_tag` is overwritten
+    // by each retry outcome): which nodes were ever CLASSIFIED, and which were
+    // actually RE-RUN. Without the second, "still failing" cannot be told apart
+    // from "never retried" — and that collapse is exactly what would let an
+    // unconfirmed excuse stand.
+    let mut classified: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut retried: BTreeSet<String> = BTreeSet::new();
 
     while env_retries < max {
         let failed: Vec<&StepOutcome> = by_tag.values().filter(|o| !o.ok && !o.aborted).collect();
@@ -3506,6 +3519,9 @@ fn run_lane_with_env_retries(
             break;
         }
         env_retries += 1;
+        for (tag, class) in &blocked {
+            classified.insert(tag.clone(), class);
+        }
         for (tag, class) in &blocked {
             println!(
                 "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
@@ -3560,6 +3576,12 @@ fn run_lane_with_env_retries(
         forward_step_profiles(&again, jobs);
         run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
+            // An aborted retry outcome means the node never executed a second
+            // time. Recording it as "retried" would let a node that was never
+            // re-run masquerade as one whose hypothesis was tested.
+            if !o.aborted {
+                retried.insert(o.tag.clone());
+            }
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
             }
@@ -3568,21 +3590,95 @@ fn run_lane_with_env_retries(
         skipped = again.skipped.clone();
     }
 
-    // Retries exhausted with an environmental block still standing is a RED, but
-    // one whose cause is named. The verdict is unchanged; only its label is.
-    if env_retries == max && by_tag.values().any(|o| !o.ok && !o.aborted) {
-        let log = read_log_settled(log_path);
-        for o in by_tag.values().filter(|o| !o.ok && !o.aborted) {
-            if let Some(class) = validate_runtime::extract_node_detail(&log, &o.tag)
-                .and_then(|d| validate_runtime::environmental_block_class(&d))
-            {
+    // A node can carry a banner and never be classified inside the loop: a zero
+    // retry budget, or a break (unreadable log, empty retry set) before its round.
+    // Classify those here so they are reported as UNCONFIRMED rather than not at
+    // all — the silent case is the one that lets an unexamined excuse stand.
+    let unexamined: Vec<String> = by_tag
+        .values()
+        .filter(|o| !o.ok && !o.aborted && !classified.contains_key(&o.tag))
+        .map(|o| o.tag.clone())
+        .collect();
+    let final_log = if unexamined.is_empty() && classified.is_empty() {
+        String::new()
+    } else {
+        read_log_settled(log_path)
+    };
+    for tag in unexamined {
+        if let Some(class) = validate_runtime::extract_node_detail(&final_log, &tag)
+            .and_then(|d| validate_runtime::environmental_block_class(&d))
+        {
+            classified.insert(tag, class);
+        }
+    }
+
+    // THREE-STATE ENVIRONMENTAL VERDICT.
+    //
+    // Classification — a banner colocated with a failing node's detail region —
+    // is a HYPOTHESIS about cause. The retry is the experiment that settles it:
+    // same commit, same code, fresh environment. Every classified node lands in
+    // exactly one of three states, and none of them is a default:
+    //
+    //   CONFIRMED    re-run and PASSED. The environment was the difference.
+    //   REFUTED      re-run and FAILED AGAIN. The retry did not clear it, so the
+    //                class's claim — a TRANSIENT host condition — is refuted.
+    //   UNCONFIRMED  never re-run (zero budget, unreadable log, empty retry set,
+    //                aborted in the retry). No experiment ran, so there is no
+    //                verdict — and it must read as neither of the other two.
+    //
+    // On REFUTED, be precise about WHAT was refuted. A failing re-run proves the
+    // failure reproduces at this commit in this host state; it does not by itself
+    // prove a product bug, because a PERSISTENT host denial also reproduces. So
+    // compare the newest attempt's signature against the original class, which
+    // splits REFUTED into the two cases a triager actually needs — and note that
+    // the excuse is withdrawn in BOTH, since a persistent condition is not the
+    // transient flake this retry budget exists to absorb.
+    //
+    // The verdict of the lane is unchanged by any of this; only the label is. A
+    // REFUTED node was already RED and stays RED, an UNCONFIRMED node likewise.
+    for (tag, class) in &classified {
+        let passed = by_tag.get(tag).map(|o| o.ok).unwrap_or(false);
+        use validate_runtime::EnvBlockVerdict as V;
+        match V::settle(retried.contains(tag), passed) {
+            V::Confirmed => println!(
+                "✅ {tag}: ENVIRONMENTAL CONFIRMED ({class}) — failed, then PASSED on re-run at the \
+                 same commit ({env_retries} retry round(s)). The environment was the difference."
+            ),
+            V::Refuted => {
+                // `extract_node_detail` returns the LAST detail region, so this is
+                // the newest attempt's signature, not the one that classified.
+                let latest = validate_runtime::extract_node_detail(&final_log, tag)
+                    .and_then(|d| validate_runtime::environmental_block_class(&d));
+                use validate_runtime::RefutedShape as S;
+                let because = match S::of(class, latest) {
+                    S::BannerGone => format!(
+                        "the {class} banner is GONE from the newest attempt and the node failed \
+                         anyway — coincidence, not cause: report this as a PRODUCT FAILURE"
+                    ),
+                    S::Persistent => format!(
+                        "the newest attempt still shows {class}, so this is a PERSISTENT condition, \
+                         not the transient flake the retry budget absorbs — the excuse is withdrawn \
+                         either way; triage as a standing host defect or a product failure, do not \
+                         re-run it again"
+                    ),
+                    S::SignatureChanged => format!(
+                        "the signature CHANGED across attempts ({class} -> {}), so no single cause \
+                         is established — the excuse is withdrawn; triage the newest signature on \
+                         its own",
+                        latest.unwrap_or("?")
+                    ),
+                };
                 println!(
-                    "🧱 {}: ENVIRONMENTAL BLOCK ({class}) after {} attempt(s) — validate could not \
-                     complete this node; this is NOT a test failure, and it is still a RED.",
-                    o.tag,
-                    max + 1
+                    "❌ {tag}: ENVIRONMENTAL REFUTED ({class}) — FAILED AGAIN on re-run at the same \
+                     commit ({env_retries} retry round(s)): {because}."
                 );
             }
+            V::Unconfirmed => println!(
+                "❔ {tag}: ENVIRONMENTAL UNCONFIRMED ({class}) — classified {class}, but never \
+                 re-run, so nothing distinguishes a host/sandbox block from a product failure. \
+                 This is NOT an environmental excuse and NOT a confirmed product failure; it is \
+                 an unsettled RED."
+            ),
         }
     }
 
@@ -5419,8 +5515,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if env_retries > 0 {
         detail.push(format!(
-            "{env_retries} environmental retry round(s) were spent on host/sandbox blocks; this \
-             verdict did NOT pass on the first attempt"
+            "{env_retries} environmental retry round(s) were spent on nodes CLASSIFIED as \
+             host/sandbox blocks; whether each class survived its re-run is the per-node \
+             CONFIRMED/REFUTED/UNCONFIRMED verdict in the log, not this count. This verdict did \
+             NOT pass on the first attempt"
         ));
     }
     match executed_tests {
