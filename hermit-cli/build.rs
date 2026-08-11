@@ -58,4 +58,41 @@ fn main() {
     {
         println!("cargo:rustc-cfg=hermit_kvm_tests_available");
     }
+
+    // Same defect, same cure, one level down. Six of the KVM-only tests also
+    // shell out to an auxiliary tool and guarded it with a runtime `return`,
+    // which libtest scores as a PASS -- so on a host without `setpriv` those
+    // tests announced success having executed nothing. Decide availability
+    // here instead, so a missing tool becomes an explicit ignored/SKIPPED.
+    //
+    // These requirements are SURFACED, not relaxed: nothing here lets a test
+    // run without its tool, it only makes the absence visible.
+    //
+    // HERMIT_TEST_MISSING_TOOLS is a comma-separated list of tool names to
+    // treat as absent. It exists only to bracket the unavailable-tool
+    // decision on a host that happens to have everything, mirroring
+    // HERMIT_KVM_TEST_DEVICE above. It can only make a present tool look
+    // missing, never the reverse.
+    let forced_missing = std::env::var("HERMIT_TEST_MISSING_TOOLS").unwrap_or_default();
+    let forced_missing: Vec<&str> = forced_missing
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    println!("cargo:rerun-if-env-changed=HERMIT_TEST_MISSING_TOOLS");
+    for (tool, path) in [
+        ("awk", "/usr/bin/awk"),
+        ("perl", "/usr/bin/perl"),
+        ("bash", "/bin/bash"),
+        ("paste", "/usr/bin/paste"),
+        ("diff", "/usr/bin/diff"),
+        ("setpriv", "/usr/bin/setpriv"),
+        ("date", "/bin/date"),
+    ] {
+        println!("cargo:rustc-check-cfg=cfg(hermit_test_{tool}_available)");
+        println!("cargo:rerun-if-changed={path}");
+        if !forced_missing.contains(&tool) && std::path::Path::new(path).exists() {
+            println!("cargo:rustc-cfg=hermit_test_{tool}_available");
+        }
+    }
 }

@@ -1140,14 +1140,10 @@ fn run_kvm_executes_dynamic_guest() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_awk_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/awk"
 )]
 fn run_kvm_awk_mincore_probe_terminates() {
-    if !Path::new("/usr/bin/awk").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1204,14 +1200,10 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_setpriv_available, hermit_test_date_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/setpriv and /bin/date"
 )]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
-    if !Path::new("/usr/bin/setpriv").exists() || !Path::new("/bin/date").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1258,17 +1250,10 @@ fn run_kvm_propagates_explicit_environment() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_bash_available, hermit_test_paste_available, hermit_test_diff_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /bin/bash, /usr/bin/paste and /usr/bin/diff"
 )]
 fn run_kvm_bash_process_substitution_is_deterministic() {
-    if !Path::new("/bin/bash").exists()
-        || !Path::new("/usr/bin/paste").exists()
-        || !Path::new("/usr/bin/diff").exists()
-    {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1477,14 +1462,10 @@ fn run_kvm_reads_standard_input() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
 )]
 fn run_kvm_f_getfl_and_reads_standard_input() {
-    if !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1505,14 +1486,10 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
 )]
 fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
-    if !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1587,14 +1564,10 @@ fn run_kvm_preserves_closed_standard_input() {
 
 #[test]
 #[cfg_attr(
-    not(hermit_kvm_tests_available),
-    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
 )]
 fn run_kvm_verify_does_not_write_to_standard_input() {
-    if !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create stdin fixture");
     let path = temp.path().join("stdin");
     fs::write(&path, b"original-data").expect("failed to write stdin fixture");
