@@ -1201,6 +1201,112 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
     assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
 }
 
+/// The two sanitizer variables Hermit forces into *every* guest, on *every*
+/// backend.
+///
+/// `hermit-cli/src/bin/hermit/run.rs` sets both to `detect_leaks=0` in one
+/// backend-independent place. That is a deliberate cross-backend parity fix,
+/// not a leak: the ptrace family forces them at spawn time inside
+/// `reverie-ptrace`, while the out-of-process KVM backend has no such spawn
+/// hook, so without this the guest would see two fewer variables under KVM than
+/// under ptrace -- directly observable as a differing DETLOG `[env ...]` hash.
+/// The unit test `guest_env_disables_sanitizer_leak_detection_on_every_backend`
+/// pins that invariant where the command is constructed; this file observes it
+/// end to end, in the guest's own `env` output.
+///
+/// So these two lines are *expected* output of `--base-env=empty`. Measured on
+/// devbig014 at hermit `2b6005cf`: `--backend kvm` and `--backend ptrace` both
+/// emit exactly this pair plus the explicit value, byte-identical, 5/5 runs
+/// each.
+const FORCED_GUEST_ENV: [&str; 2] = ["ASAN_OPTIONS=detect_leaks=0", "LSAN_OPTIONS=detect_leaks=0"];
+
+/// Describes how a guest's `env` output differs from *exactly*
+/// [`FORCED_GUEST_ENV`] plus `explicit`; `None` means it matched exactly.
+///
+/// This is an EXCLUSIVE set comparison on purpose. A `contains` check would
+/// pass when a host variable leaks in *and* pass when the explicit variable is
+/// dropped, so it could not tell a working `--base-env=empty` from a broken
+/// one. This test has already been non-discriminating once -- it silently
+/// skipped and reported success -- and a `contains` check would be the same
+/// defect wearing a different costume.
+fn guest_env_difference(stdout: &str, explicit: &[&str]) -> Option<String> {
+    let mut expected: Vec<&str> = FORCED_GUEST_ENV
+        .iter()
+        .copied()
+        .chain(explicit.iter().copied())
+        .collect();
+    expected.sort_unstable();
+    let mut actual: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    actual.sort_unstable();
+    if actual == expected {
+        return None;
+    }
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|value| !actual.contains(value))
+        .copied()
+        .collect();
+    let unexpected: Vec<&str> = actual
+        .iter()
+        .filter(|value| !expected.contains(value))
+        .copied()
+        .collect();
+    Some(format!(
+        "guest environment mismatch: missing {missing:?}, unexpected {unexpected:?} \
+         (observed {actual:?})"
+    ))
+}
+
+// The four controls below deliberately do NOT invoke Hermit and are NOT named
+// `run_kvm_*`. They therefore run on every host, including one without
+// `/dev/kvm`, and survive the `--skip run_kvm_` filter that the portable DAG
+// applies to `test.cli`. A control that only runs where the thing it controls
+// runs is not a control.
+
+#[test]
+fn guest_env_difference_accepts_the_forced_pair_plus_the_explicit_value() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nKVM_M3C=passed\nLSAN_OPTIONS=detect_leaks=0\n";
+    assert_eq!(guest_env_difference(observed, &["KVM_M3C=passed"]), None);
+}
+
+/// The exact string this test asserted before it was corrected -- which is also
+/// the *pre-parity-fix* KVM behaviour, where the guest saw the explicit value
+/// and not the two sanitizer variables. The corrected expectation must reject
+/// it, or it would still pass against the divergence the product already fixed.
+#[test]
+fn guest_env_difference_rejects_the_pre_parity_fix_output() {
+    let difference = guest_env_difference("KVM_M3C=passed\n", &["KVM_M3C=passed"])
+        .expect("the pre-parity-fix output must not satisfy the corrected expectation");
+    assert!(
+        difference.contains("ASAN_OPTIONS=detect_leaks=0"),
+        "{difference}"
+    );
+    assert!(
+        difference.contains("LSAN_OPTIONS=detect_leaks=0"),
+        "{difference}"
+    );
+}
+
+#[test]
+fn guest_env_difference_rejects_a_leaked_host_variable() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nKVM_HOST_ONLY=must-not-leak\n\
+                    KVM_M3C=passed\nLSAN_OPTIONS=detect_leaks=0\n";
+    let difference = guest_env_difference(observed, &["KVM_M3C=passed"])
+        .expect("a leaked host variable must fail the expectation");
+    assert!(
+        difference.contains("KVM_HOST_ONLY=must-not-leak"),
+        "{difference}"
+    );
+}
+
+#[test]
+fn guest_env_difference_rejects_a_dropped_explicit_variable() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nLSAN_OPTIONS=detect_leaks=0\n";
+    let difference = guest_env_difference(observed, &["KVM_M3C=passed"])
+        .expect("a dropped explicit variable must fail the expectation");
+    assert!(difference.contains("KVM_M3C=passed"), "{difference}");
+}
+
 #[test]
 fn run_kvm_propagates_explicit_environment() {
     if !Path::new("/dev/kvm").exists() {
@@ -1218,10 +1324,24 @@ fn run_kvm_propagates_explicit_environment() {
         "--",
         "/usr/bin/env",
     ];
-    let output = hermit(&args);
+    // Plant a host-only value, as `run_dbt_uses_the_requested_guest_environment`
+    // does: `--base-env=empty` only means something if there was something to
+    // exclude. The exclusive comparison below fails on this value specifically
+    // and on any other unexpected one.
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("KVM_HOST_ONLY", "must-not-leak")
+        .args(args)
+        .output()
+        .expect("failed to run the KVM guest-environment regression");
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "KVM_M3C=passed\n");
+    let stdout = stdout(&output);
+    assert_eq!(
+        guest_env_difference(&stdout, &["KVM_M3C=passed"]),
+        None,
+        "guest environment was not exactly the forced sanitizer pair plus the \
+         explicit value:\n{stdout}",
+    );
 }
 
 #[test]
