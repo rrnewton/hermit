@@ -65,8 +65,11 @@ Protocol for every PR:
    ledger row is written. Do not add **`locally-validated`** by hand: the applier
    re-reads the counted exact-head row, hashes its log, publishes an immutable
    receipt, and only then comments and labels. GitHub does not offer a per-label
-   ACL, so every label-add and ready-for-review event re-runs the trusted receipt
-   dereference; an unbacked human or agent mint is automatically stripped. The
+   ACL, so a human or general-purpose token can still mint the label. Such a
+   label is non-authorizing: the merge gate independently re-runs the trusted
+   receipt dereference. Label-add and ready-for-review events also initiate
+   best-effort cleanup, but per-PR workflow cancellation means the strip is not
+   guaranteed. Only `ci-hub apply-local-label` is an authorized writer. The
    command can also be run manually to backfill a validated head. Re-run
    validation after any subsequent push; the push invalidates both the prior
    receipt and label.

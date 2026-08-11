@@ -100,10 +100,26 @@ Apply it only through a full green validator run on the exact pull request head.
 Without that local receipt, the hosted leg requires both the portable and
 privileged jobs to pass. A hosted failure is never overridden by local evidence.
 GitHub exposes no per-label write ACL, so repository roles cannot prevent a
-human or general-purpose token from clicking or calling the label API. The
-enforceable boundary is causal instead: `pull_request: labeled` and
-`ready_for_review` both invoke the trusted receipt dereference and promptly strip
-an unbacked cache label. Only `ci-hub apply-local-label` is an authorized writer.
+human or general-purpose token from clicking or calling the label API. A
+hand-minted label is therefore possible, but it is **non-authorizing**: the
+merge gate independently dereferences the exact-head receipt before accepting
+the local-validation leg. `pull_request: labeled` and `ready_for_review` also
+initiate best-effort cleanup of an unbacked cache label. That cleanup is not an
+authorization boundary and is not guaranteed: another pull-request event can
+cancel the run, while `opened`, `reopened`, and `unlabeled` do not start a
+replacement invalidator. Only `ci-hub apply-local-label` is an authorized
+writer.
+
+The cleanup window is observable rather than instantaneous. On PR #2120, a
+label applied at 04:38:58Z produced a run at 04:39:00Z, reached the decision
+step at 04:39:43Z, and completed at 04:39:45Z: about 45 seconds from mint to
+decision, including queue and runner startup. During that window—or longer if
+the run is cancelled—humans and advisory consumers of the bare label can be
+misled. In particular, `pr-landing-planner` currently maps the label to local
+validation without receipt dereference. This G2 advisory exposure remains and
+cannot be closed by this workflow wiring; landing authorization must continue
+to use the gate or `land-pr.sh`, both of which dereference authoritative
+evidence.
 
 ## Validation-evidence trail
 
@@ -149,10 +165,12 @@ Known strip paths — all must leave the trail:
    refs; their advisory checks remain until a new receipt and label re-fire the
    pull-request gate.
 4. **Label creation and review readiness.** Every `pull_request: labeled` and
-   `ready_for_review` event runs that same invalidator. A human- or agent-minted
-   label with no remotely dereferenceable exact-head receipt is stripped; a
-   producer-backed label is retained. This closes the manual-write path without
-   treating the event actor or the cache label itself as authorization.
+   `ready_for_review` event starts that same invalidator. When it completes, a
+   human- or agent-minted label with no remotely dereferenceable exact-head
+   receipt is stripped and a producer-backed label is retained. A later
+   pull-request event can cancel the run without starting a replacement strip,
+   so this is best-effort cache and audit hygiene, not closure of the manual
+   write capability or an authorization boundary.
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads
