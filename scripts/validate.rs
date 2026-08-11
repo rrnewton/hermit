@@ -4276,6 +4276,14 @@ struct LedgerCtx {
     /// How that number was established, so a reader never has to guess whether a
     /// `0` is "measured exclusive" or "nobody looked".
     concurrency_proof: Option<&'static str>,
+    /// Sticky authority failure. A raw product pass is downgraded to no_result
+    /// while this is true, and the publisher latch stays closed.
+    concurrency_indeterminate: bool,
+    concurrency_indeterminate_detail: Option<String>,
+    concurrent_validate_monitor: serde_json::Value,
+    concurrent_validate_owner: serde_json::Value,
+    concurrent_validate_same_service: serde_json::Value,
+    concurrent_validate_peers: serde_json::Value,
     /// `INT` / `TERM` / `HUP` when an operator stopped the run.
     interruption: Option<String>,
     /// Whole-run CPU seconds (self + reaped children), the same pair printed in
@@ -4358,14 +4366,21 @@ fn receipt_evidence(
     }
 }
 
-/// Ask the canonical parent lock authority whether this exact run is admitted.
-/// Production never trusts caller-supplied owner PIDs or sidecar paths. The
-/// stop-test JSON seam is confined to an intrinsically non-qualifying fixture.
-fn canonical_validate_lock_admission(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalLockAuthority {
+    owner_pid: i32,
+    owner_start_ticks: u64,
+}
+
+/// Ask the canonical parent lock authority for the exact owner identity of this
+/// run. Production never trusts caller-supplied owner PIDs, sidecar paths, or
+/// environment overrides. The stop-test JSON seam is confined to an
+/// intrinsically non-qualifying fixture path selected before any product gate.
+fn canonical_validate_lock_authority(
     parent: Option<&Path>,
     commit: &str,
     host: &str,
-) -> bool {
+) -> Result<CanonicalLockAuthority, String> {
     fn object_string<'a>(
         object: &'a serde_json::Map<String, serde_json::Value>,
         key: &str,
@@ -4374,34 +4389,38 @@ fn canonical_validate_lock_admission(
     }
     let status = if stop_test_mode_enabled() {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
-            return false;
+            return Err("canonical-lock-authority-fixture-absent".into());
         };
         fixture.into_bytes()
     } else {
-        let Some(parent) = parent else { return false };
+        let Some(parent) = parent else {
+            return Err("canonical-lock-authority-parent-unavailable".into());
+        };
         let ci_hub = parent.join("ci-hub/ci-hub");
         if !ci_hub.is_file() {
-            return false;
+            return Err("canonical-lock-authority-query-unavailable".into());
         }
         let Ok(output) = Command::new(ci_hub)
             .args(["validate-lock", "authority-status", "--json"])
             .output()
         else {
-            return false;
+            return Err("canonical-lock-authority-query-failed".into());
         };
         if !output.status.success() {
-            return false;
+            return Err(format!(
+                "canonical-lock-authority-query-rc-{}",
+                output.status.code().unwrap_or(-1)
+            ));
         }
         output.stdout
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&status) else {
-        return false;
-    };
+    let value = serde_json::from_slice::<serde_json::Value>(&status)
+        .map_err(|_| "canonical-lock-authority-json-malformed".to_string())?;
     let Some(holder) = value.get("holder").and_then(serde_json::Value::as_object) else {
-        return false;
+        return Err("canonical-lock-authority-holder-missing".into());
     };
     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
-        return false;
+        return Err("canonical-lock-authority-owner-missing".into());
     };
     if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
         || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
@@ -4418,25 +4437,30 @@ fn canonical_validate_lock_admission(
         || object_string(owner, "host") != Some(host)
         || object_string(owner, "liveness") != Some("alive")
     {
-        return false;
+        return Err("canonical-lock-authority-status-refused".into());
     }
     let Some(pid64) = owner.get("pid").and_then(serde_json::Value::as_i64) else {
-        return false;
+        return Err("canonical-lock-authority-owner-pid-missing".into());
     };
     let Some(start_ticks) = owner.get("start_ticks").and_then(serde_json::Value::as_u64) else {
-        return false;
+        return Err("canonical-lock-authority-owner-start-missing".into());
     };
-    let Ok(pid) = i32::try_from(pid64) else { return false };
+    let Ok(pid) = i32::try_from(pid64) else {
+        return Err("canonical-lock-authority-owner-pid-invalid".into());
+    };
     if pid <= 1 || start_ticks == 0 {
-        return false;
+        return Err("canonical-lock-authority-owner-identity-invalid".into());
     }
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|id| id.trim().to_string());
     if boot_id.as_deref() != object_string(owner, "boot_id") {
-        return false;
+        return Err("canonical-lock-authority-boot-id-mismatch".into());
     }
-    validate_runtime::identity_in_ancestry(pid, start_ticks)
+    if !validate_runtime::identity_in_ancestry(pid, start_ticks) {
+        return Err("canonical-lock-authority-owner-not-in-ancestry".into());
+    }
+    Ok(CanonicalLockAuthority { owner_pid: pid, owner_start_ticks: start_ticks })
 }
 
 /// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.
@@ -4526,8 +4550,13 @@ fn write_ledger(
     // completed gate had already established one before the stop
     // (validate.sh:1473 `interruption_is_no_result`).
     let raw_result = if exit_code == 0 && failures == 0 { "pass" } else { "fail" };
-    let result =
-        if ctx.interruption.is_some() && failures == 0 { "no_result" } else { raw_result };
+    let result = if (ctx.interruption.is_some() && failures == 0)
+        || (ctx.concurrency_indeterminate && raw_result == "pass")
+    {
+        "no_result"
+    } else {
+        raw_result
+    };
     let timed_out = timed_out_nodes(outcomes);
     // Stable per-row identity. Corrections never edit a row; they append a new
     // one carrying `corrects: <this id>`, which is what keeps the shard
@@ -4597,6 +4626,12 @@ fn write_ledger(
         // exclusive, and writing 0 there would be a fabricated exclusivity claim.
         "concurrent_validates": ctx.concurrent_validates,
         "concurrency_proof": ctx.concurrency_proof,
+        "concurrency_indeterminate": ctx.concurrency_indeterminate,
+        "concurrency_indeterminate_detail": ctx.concurrency_indeterminate_detail,
+        "concurrent_validate_monitor": ctx.concurrent_validate_monitor,
+        "concurrent_validate_owner": ctx.concurrent_validate_owner,
+        "concurrent_validate_same_service": ctx.concurrent_validate_same_service,
+        "concurrent_validate_peers": ctx.concurrent_validate_peers,
         // Present (non-null) only for an operator stop; `result` above is then
         // `no_result` unless a completed gate had already failed.
         "interruption_signal": ctx.interruption,
@@ -5099,7 +5134,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(&root, &profile_name, parent.as_deref(), args.label_pr);
     }
 
     // ---- owner-watch front door --------------------------------------------
@@ -5116,7 +5151,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             if managed_worktree_slot(&root, parent).is_some() {
                 let commit = git_sha();
                 let host = short_hostname();
-                let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+                // Same authority, same predicate: the peer-snapshot work in this
+                // aggregate turned the former `canonical_validate_lock_admission`
+                // bool into `canonical_validate_lock_authority`, where every
+                // former `false` is an `Err` and `Ok` still means the live lock
+                // owner is in this process's ancestry for this exact host and
+                // commit.  `is_ok()` is that same boolean, not a weaker one.
+                let admitted =
+                    canonical_validate_lock_authority(Some(parent), &commit, &host).is_ok();
                 if let Some(refusal) = managed_worktree_front_door_refusal(
                     parent,
                     &root,
@@ -5584,6 +5626,52 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             std::time::Duration::from_secs(2),
         ))
     };
+    // The authority-bearing monitor is separate from the legacy CPU telemetry
+    // above. Its owner comes only from the canonical parent query; its production
+    // proc root and per-uid exclusion lock are not caller-selectable.
+    let lock_authority_start = if nesting.nested {
+        Err("nested-payload-has-no-independent-authority".to_string())
+    } else {
+        canonical_validate_lock_authority(parent.as_deref(), &commit, &host)
+    };
+    let controller_start = validate_runtime::process_start_ticks(std::process::id() as i32);
+    let mut peer_monitor_start_detail = None;
+    let monitor_owner_pid = lock_authority_start
+        .as_ref()
+        .map(|authority| authority.owner_pid)
+        .unwrap_or(std::process::id() as i32);
+    let mut peer_monitor = match controller_start {
+        Some(controller_start) => {
+            match validate_runtime::PeerSnapshotMonitor::start_production(
+                monitor_owner_pid,
+                controller_start,
+            ) {
+                Ok(monitor) => match monitor.probe() {
+                    Ok(_) => {
+                        if let Err(detail) = &lock_authority_start {
+                            monitor.mark_indeterminate(detail.clone());
+                        }
+                        Some(monitor)
+                    }
+                    Err(error) => {
+                        peer_monitor_start_detail =
+                            Some(format!("monitor-initial-probe-missing:{error}"));
+                        None
+                    }
+                },
+                Err(error) => {
+                    peer_monitor_start_detail = Some(format!("monitor-start-failed:{error}"));
+                    None
+                }
+            }
+        }
+        None => {
+            peer_monitor_start_detail = Some("monitor-controller-identity-unavailable".into());
+            None
+        }
+    };
+    let peer_monitor_excludes_competitors =
+        peer_monitor.as_ref().is_some_and(|monitor| monitor.exclusion_held());
     if nesting.nested {
         println!(
             "Nested validate (payload of outer pid {}): focused mode {} only; the outer run owns \
@@ -5650,30 +5738,42 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     };
     let mut run_timed_out = false;
 
-    let r = lane(&plan.cfg);
-    outcomes.extend(r.outcomes.iter().cloned());
-    skipped.extend(r.skipped.iter().cloned());
-    ok = ok && r.ok;
-    env_retries += r.env_retries;
-    run_timed_out = run_timed_out || r.run_timed_out;
+    if peer_monitor_excludes_competitors {
+        let r = lane(&plan.cfg);
+        outcomes.extend(r.outcomes.iter().cloned());
+        skipped.extend(r.skipped.iter().cloned());
+        ok = ok && r.ok;
+        env_retries += r.env_retries;
+        run_timed_out = run_timed_out || r.run_timed_out;
 
-    if let Some(second) = &plan.second {
-        if ok || keep_going {
-            let r2 = lane(second);
-            outcomes.extend(r2.outcomes.iter().cloned());
-            skipped.extend(r2.skipped.iter().cloned());
-            ok = ok && r2.ok;
-            env_retries += r2.env_retries;
-            run_timed_out = run_timed_out || r2.run_timed_out;
-        } else {
-            eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
-            explicit_unaccounted.extend(second.steps.iter().map(|step| {
-                validate_plan::UnaccountedNode {
-                    tag: step.tag(),
-                    reason: "second lane not dispatched after first-lane failure".to_string(),
-                }
-            }));
+        if let Some(second) = &plan.second {
+            if ok || keep_going {
+                let r2 = lane(second);
+                outcomes.extend(r2.outcomes.iter().cloned());
+                skipped.extend(r2.skipped.iter().cloned());
+                ok = ok && r2.ok;
+                env_retries += r2.env_retries;
+                run_timed_out = run_timed_out || r2.run_timed_out;
+            } else {
+                eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
+                explicit_unaccounted.extend(second.steps.iter().map(|step| {
+                    validate_plan::UnaccountedNode {
+                        tag: step.tag(),
+                        reason: "second lane not dispatched after first-lane failure".to_string(),
+                    }
+                }));
+            }
         }
+    } else {
+        eprintln!(
+            "validate: peer exclusion was not established; refusing every product gate and \
+             recording one diagnostic row"
+        );
+        skipped.extend(plan.cfg.steps.iter().map(|step| step.tag().to_string()));
+        if let Some(second) = &plan.second {
+            skipped.extend(second.steps.iter().map(|step| step.tag().to_string()));
+        }
+        ok = false;
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
@@ -5713,6 +5813,68 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
         None => (None, None),
     };
+    let mut peer_evidence = match peer_monitor.as_mut() {
+        Some(monitor) => monitor.final_ack(),
+        None => validate_runtime::PeerMonitorEvidence::diagnostic(
+            peer_monitor_start_detail
+                .clone()
+                .unwrap_or_else(|| "peer-monitor-never-established".into()),
+        ),
+    };
+    let lock_authority_final = canonical_validate_lock_authority(parent.as_deref(), &commit, &host);
+    let mut lock_admitted = match (&lock_authority_start, &lock_authority_final) {
+        (Ok(start), Ok(final_authority)) if start == final_authority => true,
+        (Ok(_), Ok(_)) => {
+            peer_evidence
+                .state
+                .mark_indeterminate("canonical-lock-authority-owner-changed");
+            false
+        }
+        (_, Err(detail)) => {
+            peer_evidence.state.mark_indeterminate(detail.clone());
+            false
+        }
+        _ => false,
+    };
+    if lock_admitted {
+        let authority = lock_authority_final.as_ref().expect("admitted above");
+        if !peer_evidence.state.owner.as_ref().is_some_and(|owner| {
+            owner.pid == authority.owner_pid && owner.start_ticks == authority.owner_start_ticks
+        }) {
+            peer_evidence
+                .state
+                .mark_indeterminate("snapshot-owner-does-not-match-canonical-authority");
+            lock_admitted = false;
+        }
+    }
+    if !peer_evidence.final_acknowledged {
+        peer_evidence
+            .state
+            .mark_indeterminate("monitor-final-ack-missing");
+    }
+    let concurrency_indeterminate = !lock_admitted
+        || !peer_evidence.final_acknowledged
+        || !peer_evidence.state.qualifies_exclusivity();
+    let peer_count = peer_evidence.state.peers.len() as i64;
+    let concurrent_validates = (!concurrency_indeterminate).then_some(peer_count);
+    let concurrency_proof = (!concurrency_indeterminate).then_some(if peer_count == 0 {
+        "validate_lock_owner_ancestry"
+    } else {
+        "external_validate_identity_monitor"
+    });
+    let concurrent_validate_monitor = peer_evidence.state.monitor_json();
+    let concurrent_validate_owner = peer_evidence.state.owner_json();
+    let concurrent_validate_same_service = peer_evidence.state.same_service_json();
+    let concurrent_validate_peers = peer_evidence.state.peers_json();
+    let concurrency_indeterminate_detail = if concurrency_indeterminate {
+        peer_evidence
+            .state
+            .indeterminate_detail
+            .clone()
+            .or_else(|| Some("peer-snapshot-authority-incomplete".into()))
+    } else {
+        None
+    };
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
@@ -5739,7 +5901,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let commit_anchored = commit != "unknown" && !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
-    let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -5762,12 +5923,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         reverie_base_sha: receipt.reverie_base_sha,
         reverie_base_tree: receipt.reverie_base_tree,
         reverie_pin_current: pin_gate_passed,
-        concurrent_validates: if lock_admitted { Some(0) } else { peak_active },
-        concurrency_proof: if lock_admitted {
-            Some("validate_lock_owner_ancestry")
-        } else {
-            peak_active.map(|_| "live_flock_registry_cpu_delta")
-        },
+        concurrent_validates,
+        concurrency_proof,
+        concurrency_indeterminate,
+        concurrency_indeterminate_detail,
+        concurrent_validate_monitor,
+        concurrent_validate_owner,
+        concurrent_validate_same_service,
+        concurrent_validate_peers,
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,
@@ -6027,14 +6190,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // first would label the PR from the previous run's newest row. Non-fatal by
     // contract — the exit code is already decided above and nothing here can
     // change it (validate.sh:1735).
-    match validate_receipt::eligible(
+    let publication_eligibility = if concurrency_indeterminate {
+        Err("peer-snapshot authority is indeterminate".to_string())
+    } else if concurrent_validates != Some(0) {
+        Err("external validation peer was observed".to_string())
+    } else {
+        validate_receipt::eligible(
         exit_code,
         effective_failures,
         args.label_pr && !nesting.nested,
         commit_anchored,
         dirty_now,
         &plan.profile,
-    ) {
+        )
+    };
+    match publication_eligibility {
         Ok(()) => {
             let _ = validate_receipt::publish();
         }
@@ -6045,6 +6215,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
+    // Release the authenticated monitor and its exclusion flock only after the
+    // row and any receipt-backed publication attempt are complete.
+    drop(peer_monitor);
     drop(run_record);
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -6180,7 +6353,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+    label_pr: bool,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
@@ -6198,6 +6376,51 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let outcomes =
         vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
 
+    // The canonical parent-owned adapter is the one writer; this is only the
+    // root the summary reports, never a caller-selected write target.
+    let ledger = canonical_ledger_root();
+    let host = short_hostname();
+    let commit = git_sha();
+    let authority_start = canonical_validate_lock_authority(parent, &commit, &host);
+    let controller_start = validate_runtime::process_start_ticks(std::process::id() as i32);
+    let mut monitor_start_detail = None;
+    let mut peer_monitor = match (&authority_start, controller_start) {
+        (Ok(authority), Some(controller_start)) => {
+            let proc_root = std::env::var("VALIDATE_STOP_TEST_PEER_PROC_ROOT").ok();
+            let exclusion = std::env::var("VALIDATE_STOP_TEST_EXCLUSION_LOCK").ok();
+            let socket = std::env::var("VALIDATE_STOP_TEST_CONTROL_SOCKET").ok();
+            match (proc_root, exclusion, socket) {
+                (Some(proc_root), Some(exclusion), Some(socket)) => {
+                    match validate_runtime::PeerSnapshotMonitor::start_fixture(
+                        Path::new(&proc_root),
+                        Path::new(&exclusion),
+                        Path::new(&socket),
+                        authority.owner_pid,
+                        controller_start,
+                    ) {
+                        Ok(monitor) => Some(monitor),
+                        Err(error) => {
+                            monitor_start_detail = Some(format!("monitor-start-failed:{error}"));
+                            None
+                        }
+                    }
+                }
+                _ => {
+                    monitor_start_detail = Some("stop-test-peer-fixture-incomplete".into());
+                    None
+                }
+            }
+        }
+        (Err(detail), _) => {
+            monitor_start_detail = Some(detail.clone());
+            None
+        }
+        (_, None) => {
+            monitor_start_detail = Some("monitor-controller-identity-unavailable".into());
+            None
+        }
+    };
+
     validate_runtime::stop_test_announce();
     let exit = validate_runtime::stop_test_park(interrupted_by);
 
@@ -6211,13 +6434,64 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         validate_runtime::StopTestExit::Signalled => interrupted_by().map(|s| s.to_string()),
         _ => None,
     };
-    let exit_code: u8 = if interruption.is_some() { 130 } else { 1 };
+    let exit_code: u8 = match exit {
+        validate_runtime::StopTestExit::SuccessReleased => 0,
+        validate_runtime::StopTestExit::Signalled => 130,
+        _ => 1,
+    };
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let wall = started.elapsed().as_secs_f64();
-    let ledger = canonical_ledger_root();
-    let host = short_hostname();
-    let commit = git_sha();
-    let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
+    let mut peer_evidence = match peer_monitor.as_mut() {
+        Some(monitor) => monitor.final_ack(),
+        None => validate_runtime::PeerMonitorEvidence::diagnostic(
+            monitor_start_detail.unwrap_or_else(|| "peer-monitor-never-established".into()),
+        ),
+    };
+    let authority_final = canonical_validate_lock_authority(parent, &commit, &host);
+    let mut lock_admitted = match (&authority_start, &authority_final) {
+        (Ok(start), Ok(final_authority)) if start == final_authority => true,
+        (Ok(_), Ok(_)) => {
+            peer_evidence
+                .state
+                .mark_indeterminate("canonical-lock-authority-owner-changed");
+            false
+        }
+        (_, Err(detail)) => {
+            peer_evidence.state.mark_indeterminate(detail.clone());
+            false
+        }
+        _ => false,
+    };
+    if lock_admitted {
+        let authority = authority_final.as_ref().expect("admitted above");
+        if !peer_evidence.state.owner.as_ref().is_some_and(|owner| {
+            owner.pid == authority.owner_pid && owner.start_ticks == authority.owner_start_ticks
+        }) {
+            peer_evidence
+                .state
+                .mark_indeterminate("snapshot-owner-does-not-match-canonical-authority");
+            lock_admitted = false;
+        }
+    }
+    let concurrency_indeterminate = !lock_admitted
+        || !peer_evidence.final_acknowledged
+        || !peer_evidence.state.qualifies_exclusivity();
+    let peer_count = peer_evidence.state.peers.len() as i64;
+    let concurrent_validates = (!concurrency_indeterminate).then_some(peer_count);
+    let concurrency_proof = (!concurrency_indeterminate).then_some(if peer_count == 0 {
+        "validate_lock_owner_ancestry"
+    } else {
+        "external_validate_identity_monitor"
+    });
+    let concurrency_indeterminate_detail = if concurrency_indeterminate {
+        peer_evidence
+            .state
+            .indeterminate_detail
+            .clone()
+            .or_else(|| Some("peer-snapshot-authority-incomplete".into()))
+    } else {
+        None
+    };
     let ctx = LedgerCtx {
         started_at,
         host,
@@ -6231,8 +6505,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         tree: git_tree(),
         git_ahead: 0,
         git_behind: 0,
-        commit_anchored: false,
-        tree_dirty: tree_dirty(),
+        commit_anchored: env_flag("VALIDATE_STOP_TEST_COMMIT_ANCHORED", "1"),
+        tree_dirty: false,
         dag_jobs: 0,
         admission: lock_admitted.then_some("ci-hub-validate-lock"),
         base_sha: serde_json::Value::Null,
@@ -6241,10 +6515,14 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         reverie_base_tree: serde_json::Value::Null,
         // The fixture runs no gates at all, so it never observed the pin gate.
         reverie_pin_current: false,
-        // The fixture never registers as a top-level driver, so it can neither
-        // observe peers nor be counted as one.
-        concurrent_validates: lock_admitted.then_some(0),
-        concurrency_proof: lock_admitted.then_some("validate_lock_owner_ancestry"),
+        concurrent_validates,
+        concurrency_proof,
+        concurrency_indeterminate,
+        concurrency_indeterminate_detail,
+        concurrent_validate_monitor: peer_evidence.state.monitor_json(),
+        concurrent_validate_owner: peer_evidence.state.owner_json(),
+        concurrent_validate_same_service: peer_evidence.state.same_service_json(),
+        concurrent_validate_peers: peer_evidence.state.peers_json(),
         interruption: interruption.clone(),
         cpu_user,
         cpu_sys,
@@ -6266,7 +6544,29 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         serde_json::json!({}),
     );
 
+    // The stop-test publisher is always an inert executable supplied by the
+    // fixture. It brackets the real latch without ever planting a label.
+    if !concurrency_indeterminate && concurrent_validates == Some(0) {
+        if validate_receipt::eligible(
+            exit_code,
+            outcomes.iter().filter(|outcome| !outcome.ok).count(),
+            label_pr,
+            ctx.commit_anchored,
+            ctx.tree_dirty,
+            profile,
+        )
+        .is_ok()
+        {
+            let _ = validate_receipt::publish();
+        }
+    }
+    drop(peer_monitor);
+
     let detail = match exit {
+        validate_runtime::StopTestExit::SuccessReleased => vec![format!(
+            "stop-path fixture: synthetic gates passed; recorded as {}",
+            if concurrency_indeterminate { "no_result" } else { "pass" }
+        )],
         validate_runtime::StopTestExit::Signalled => vec![format!(
             "stop-path fixture: stopped by SIG{}; recorded as {}",
             interruption.clone().unwrap_or_default(),
@@ -6289,7 +6589,13 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         ],
     };
     let mut s = RunSummary::new(
-        if interruption.is_some() { Verdict::Interrupted } else { Verdict::Fail },
+        if interruption.is_some() {
+            Verdict::Interrupted
+        } else if exit_code == 0 {
+            Verdict::Pass
+        } else {
+            Verdict::Fail
+        },
         exit_code,
         profile,
         detail,
