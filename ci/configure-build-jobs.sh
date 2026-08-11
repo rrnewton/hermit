@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 349460925ee56f2aca686a3392b534e8861ba375 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 349460925ee56f2aca686a3392b534e8861ba375" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031" >&2
     return 2
 fi
 
@@ -429,6 +429,38 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 #
 # BUILD-RELEVANT ANYWAY: reverie-dbt/build.rs is compiled by hermit, so this
 # bump requires REAL revalidation; no prior receipt may be reused.
+#
+# CARRY TO 6b62f91c (2026-08-11). The 108f9ab case, not the 3494609 case: the
+# recipe identity does NOT move, because the whole reverie-dbt subtree is one
+# byte-identical tree object at both pins. Evidenced by tree identity, not a
+# timing run:
+#
+#   git diff --name-only 3494609..6b62f91c              -> AGENTS.md
+#                                                          reverie-kvm/tests/static_elf.rs
+#   git rev-parse 3494609 :reverie-dbt                  -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 6b62f91c:reverie-dbt                  -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 3494609 :reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 6b62f91c:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 3494609 :reverie-dbt/build.rs         -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 6b62f91c:reverie-dbt/build.rs         -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#
+# All four source_recipe_key() inputs (vendor/dynamorio, build.rs, $CMAKE,
+# $CMAKE_GENERATOR) are unchanged, so the recipe identity remains
+# sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429 with
+# NO re-derivation required -- unlike the 3494609 entry above, there is no new
+# key to compute or validate against a positive control, because build.rs is the
+# same blob. The MAX_PARALLEL_JOBS=16 clamp still applies and the measured MISS
+# cost cannot have moved, because no DBT build input exists that differs.
+#
+# The four commits 3494609..6b62f91c are three AGENTS.md edits and one
+# test-comment rewording in reverie-kvm/tests/static_elf.rs (a test rename plus
+# PID-namespace prose). No Rust that hermit compiles, no C, no build script, no
+# vendored source. Unlike the 3494609 entry, this bump is NOT build-relevant:
+# nothing hermit compiles differs between the pins.
+#
+# Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
+# max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement
+# bar is still unmet, so nothing is recalibrated here.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
