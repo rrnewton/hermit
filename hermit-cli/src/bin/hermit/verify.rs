@@ -458,6 +458,41 @@ pub struct VerificationReport {
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
     pub guest_signal: Option<i32>,
+    /// What Hermit did with its OWN process to mirror the guest's termination,
+    /// recorded immediately before it did it. `null` until then.
+    ///
+    /// Every other field here describes the GUEST, and a consumer that accepts a
+    /// non-zero Hermit exit needs one more fact: that Hermit exited that way ON
+    /// PURPOSE. `139` is the same number for a guest killed by SIGSEGV *and for
+    /// Hermit itself dying of SIGSEGV*, so for such a consumer the invocation's
+    /// wait status is unbound: nothing in the record, which is published before
+    /// Hermit ends and describes only the guest, attests Hermit's own
+    /// disposition.
+    ///
+    /// (The gap between publishing the verdict and exiting is NOT the exposure,
+    /// and an earlier revision of this comment was wrong to imply it was: the
+    /// process spends that tail in state `S` on every 2ms sample, executing
+    /// nothing, before and after this change alike. The exposure is the
+    /// ambiguous number, not a window.)
+    ///
+    /// `Some("reraise-guest-signal:11")` / `Some("exit-guest-code:7")` is Hermit
+    /// declaring the intent one instruction before acting on it, which is what
+    /// makes "the guest died this way" checkable rather than inferred from a
+    /// wait status three different events share. `None` after a Hermit-side
+    /// death, because Hermit never got to say it.
+    pub terminating_action: Option<String>,
+}
+
+/// The value [`VerificationReport::terminating_action`] carries for a run that
+/// mirrors a guest killed by `signal`.
+pub fn reraise_guest_signal_action(signal: i32) -> String {
+    format!("reraise-guest-signal:{signal}")
+}
+
+/// The value [`VerificationReport::terminating_action`] carries for a run that
+/// mirrors a guest that exited with `code`.
+pub fn exit_guest_code_action(code: i32) -> String {
+    format!("exit-guest-code:{code}")
 }
 
 impl VerificationReport {
@@ -472,6 +507,7 @@ impl VerificationReport {
             compared_log_messages: None,
             guest_exit_code: None,
             guest_signal: None,
+            terminating_action: None,
         }
     }
 }
@@ -500,6 +536,10 @@ impl From<&VerificationOutcome> for VerificationReport {
             compared_log_messages: outcome.compared_log_messages,
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
+            // Deliberately not set here. The verdict is published long before
+            // Hermit terminates, so this can only be stamped at the exit site
+            // itself -- see `stamp_terminating_action`.
+            terminating_action: None,
         }
     }
 }
@@ -548,10 +588,60 @@ fn staging_directory(path: &Path) -> &Path {
     }
 }
 
+/// Stamp `action` into the record at `path`, immediately before Hermit acts on
+/// it, and return whether the stamp was published.
+///
+/// THIS IS THE LAST THING HERMIT DOES BEFORE MIRRORING THE GUEST'S TERMINATION.
+/// Everything else in the record describes the guest and is written when the
+/// verdict is reached; a consumer that accepts a non-zero Hermit exit cannot
+/// tell that apart from Hermit itself crashing afterwards, because the wait
+/// status is the same number. Writing the intent here shrinks that window to
+/// the distance between this atomic rename and the `raise` itself.
+///
+/// Read-modify-write on purpose: the verdict is the authority and must survive
+/// verbatim. Anything that stops the stamp -- a missing record, an unreadable
+/// one, a failed write -- leaves the record WITHOUT the field, which a
+/// consumer must treat as "Hermit never said it", i.e. a refusal. So this
+/// function never fails the process; it reports what happened and lets the
+/// absence of the field speak.
+pub fn stamp_terminating_action(path: &Path, action: &str) -> bool {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(line) = existing.lines().next_back() else {
+        return false;
+    };
+    let Ok(mut record) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(object) = record.as_object_mut() else {
+        return false;
+    };
+    // Refuse to stamp a record that never reached a verdict: a `no_result`
+    // carrying a terminating action would be a stranger artifact than one
+    // carrying neither.
+    if object.get("verdict").and_then(serde_json::Value::as_str) == Some("no_result") {
+        return false;
+    }
+    object.insert(
+        "terminating_action".to_owned(),
+        serde_json::Value::String(action.to_owned()),
+    );
+    let Ok(json) = serde_json::to_string(&record) else {
+        return false;
+    };
+    write_json_line(path, &json).is_ok()
+}
+
 fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
+    write_json_line(path, &serde_json::to_string(report)?)
+}
+
+/// Publish one JSON line to `path` atomically: a reader concurrent with the
+/// write sees either the old contents or the complete new record.
+fn write_json_line(path: &Path, json: &str) -> Result<(), Error> {
     use std::io::Write as _;
 
-    let json = serde_json::to_string(report)?;
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.
     let mut temp = NamedTempFile::new_in(staging_directory(path))

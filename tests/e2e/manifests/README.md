@@ -116,6 +116,73 @@ guest_args = { ptrace = ["multi"], kvm = ["multi"] }
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
+### `verify` assertions: L2 parity and guest termination
+
+A `verify` cell defaults to plain `hermit run --strict --verify`, which uses the
+lossy `Stripped` comparator and per `AGENTS.md` **cannot establish L2**, and
+requires the whole invocation to exit `0`. Its `assert` table upgrades both:
+
+```toml
+[test.modes.verify]
+ci = true
+assert = { bitwise_parity = true, guest_signal = 11 }
+backends_enabled = ["ptrace"]
+```
+
+- **`bitwise_parity = true`** runs the cell with `--verify-strict --verify-json`
+  and requires the run's own verdict to report `verified` **and**
+  `bitwise_parity`. Without it, a cell justified by a hand-measured L2 result
+  does not actually ratchet L2.
+- **`guest_signal = N`** or **`guest_exit_code = N`** (at most one, and only
+  beside `bitwise_parity = true`) declares that the guest's *deterministic*
+  outcome is a crash or a deliberate non-zero exit. The cell then also runs with
+  `--verify-allow both` — otherwise Hermit refuses the second run, publishes
+  `verdict: "no_result"`, and the cell measures nothing, which is why such
+  guests previously had to stay at `ci = false`, outside the envelope, even when
+  they reproduce bitwise.
+
+**A termination is declared as a termination, never as a wait status, and the
+pass is bound to the verdict rather than to the process exit code.** One 8-bit
+number cannot be a safety boundary: `139` is the same for a guest `exit(139)`, a
+guest killed by SIGSEGV, and *Hermit itself* dying of SIGSEGV, and only the last
+is a product defect that must never satisfy a cell. So a declaring cell passes
+only when all of the following hold:
+
+- the observed whole-invocation status equals `128+N` (signal) or `N` (exit
+  code);
+- the verdict exists and reports `verified: true` and `bitwise_parity: true` —
+  a missing, unparsable, or `no_result` verdict is a FAIL, never a pass;
+- the verdict's own provenance matches: `guest_signal: N` with
+  `guest_exit_code: null`, or `guest_exit_code: N` with `guest_signal: null`.
+  Hermit derives those from the **guest's** wait status and stamps the record
+  `no_result` before any fallible work, so a Hermit-side abort leaves a refusal
+  behind instead of a stale pass;
+- the verdict carries `terminating_action: "reraise-guest-signal:N"` (or
+  `"exit-guest-code:N"`). Every other field describes the GUEST, and the whole
+  record is published while Hermit is still alive, so none of them can say that
+  Hermit exited that way **on purpose** rather than having crashed afterwards
+  with the same wait status. Hermit writes this field as the last thing it does
+  before mirroring the guest's termination onto itself; a Hermit-side death
+  while it is still executing leaves the field absent, which is a refusal.
+
+This is strictly stronger than the exit-0 default, so the termination is part of
+the cell's observation: it binds the cell to one exact schedule, and a
+legitimate scheduler change must update the declaration in the same review.
+`guest_signal` must be `1..=64` (`139` is rejected as the wait status it is);
+`guest_exit_code` must be `1..=255` and omitted rather than written as `0`; and
+both are refused on every mode except `verify`, the only mode whose cell is a
+single Hermit invocation.
+
+**One derivation, two transports.** `ci/manifest-plan` is the only place the
+flag set is chosen. It emits the result into `--format harness-json` at
+`modes.verify.verify_flags` / `.verify_shell_status` (which `ci/test_harness.sh`
+reads) and as `--format verify-flags` TSV (which `scripts/manifest-to-commands.rs`
+and any out-of-tree harness read). Neither runner parses `assert` itself, so
+there is nothing to drift — and nothing that a cross-check could have policed
+anyway: a cross-check can only iterate cells some consumer names, so a consumer
+that names none is indistinguishable from one that agrees. `validate` still
+self-tests the verdict check against every impersonating record shape.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;
