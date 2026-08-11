@@ -32,6 +32,8 @@
  * tautology.
  */
 
+#define _GNU_SOURCE
+
 #include <errno.h>
 #include <stdio.h>
 #include <sys/resource.h>
