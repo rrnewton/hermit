@@ -6,6 +6,16 @@
       "rr": "not carried by the legacy rr corpus; reason not recorded upstream",
       "sabre": "not carried by the legacy sabre corpus; reason not recorded upstream"
     },
+    "make-parallel": {
+      "e9patch": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+      "rr": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+      "sabre": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it"
+    },
+    "python3-deep": {
+      "e9patch": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+      "rr": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+      "sabre": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it"
+    },
     "shell-build": {
       "e9patch": "not carried by the legacy e9patch corpus; reason not recorded upstream",
       "rr": "not carried by the legacy rr corpus; reason not recorded upstream",
@@ -1509,6 +1519,19 @@
     },
     {
       "argv": [
+        "env",
+        "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+        "bash",
+        "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+        "make-parallel"
+      ],
+      "label": "make-parallel",
+      "modes": [
+        "strict"
+      ]
+    },
+    {
+      "argv": [
         "/usr/bin/md5sum",
         "README.md"
       ],
@@ -2067,6 +2090,19 @@
         "sabre",
         "e9patch",
         "rr"
+      ]
+    },
+    {
+      "argv": [
+        "env",
+        "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+        "bash",
+        "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+        "python3-deep"
+      ],
+      "label": "python3-deep",
+      "modes": [
+        "strict"
       ]
     },
     {
