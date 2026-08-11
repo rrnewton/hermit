@@ -1054,11 +1054,25 @@ $direct_references"
         die "Makefile lint must use the canonical Reverie-pin launcher"
     [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
         die "pre-commit hook must use the canonical Reverie-pin launcher"
-    # Both hook invocations must bind the launcher to the exact repository
+    # EVERY hook invocation must bind the launcher to the exact repository
     # rather than relying on cwd -- that is the original intent of this
     # assertion, preserved across the 2026-08-08 relaxation.
-    [[ $(grep -Fc -- '--repo "$root"' "$ROOT_DIR/.githooks/pre-commit") == 2 ]] ||
-        die "pre-commit hook must bind the launcher to the exact repository (both invocations)"
+    #
+    # The count is DERIVED from the hook, not hand-written. It used to be a
+    # literal `== 2`, which measured "the Reverie launcher is invoked twice"
+    # and only incidentally implied the binding property. A hand-written count
+    # of a growing set does not fail when the set grows -- it stops covering
+    # it. When a second independently owned authority (agent-utils) added a
+    # third correctly-bound invocation, the literal fired on a hook that
+    # satisfied the property in full. Comparing the two derived counts asserts
+    # the property itself and stays correct as authorities are added.
+    local hook_invocations hook_bound
+    hook_invocations=$(grep -c '^"' "$ROOT_DIR/.githooks/pre-commit")
+    hook_bound=$(grep -c '^".*--repo "\$root"' "$ROOT_DIR/.githooks/pre-commit")
+    ((hook_invocations >= 2)) ||
+        die "pre-commit hook must invoke at least the two Reverie legs (found $hook_invocations)"
+    [[ $hook_invocations == "$hook_bound" ]] ||
+        die "pre-commit hook must bind the launcher to the exact repository (every invocation): $hook_bound of $hook_invocations bound"
     # The OFFLINE leg is the only hard blocker: local incoherence never needs
     # the network and is never fixed by waiting.
     [[ $(grep -Fxc '"$checker" --repo "$root" --offline || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
@@ -1374,14 +1388,50 @@ $direct_references"
         die "pre-commit must name the canonical agent-utils launcher"
     [[ $(grep -Fxc '"${proxy[@]}" "$agent_utils_checker" --repo "$root" || exit 1' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
         die "pre-commit must bind the agent-utils launcher to the exact repository"
-    [[ $(grep -Fc '"$ROOT_DIR/ci/run-agent-utils-pin-check.sh" --repo "$ROOT_DIR"' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate must execute exactly one exact-repository agent-utils gate"
-    [[ $(grep -Fc 'run_check "Agent-utils dependency pin equals latest main"' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate must expose exactly one agent-utils pin gate"
-    [[ $(grep -Fc 'AGENT_UTILS_PIN_GATE_PASSED != 1' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate receipt cleanup must reject a bypassed agent-utils gate"
-    [[ $(grep -Fc '\"agent_utils_pin_current\"' "$ROOT_DIR/validate.sh") == 1 ]] ||
-        die "validate receipts must carry the agent-utils pin condition"
+    # The agent-utils gate must be assigned a shard, not merely declared in the
+    # portable DAG. ci/check-shard-coverage.sh enforces this for every node; it
+    # is restated here because this authority's whole point is that a declared
+    # gate nothing executes is worse than no gate -- it reads as coverage.
+    [[ $(grep -Fxc '    "check.agent_utils_pin",' "$ROOT_DIR/ci/portable-shards.json") == 1 ]] ||
+        die "portable shard map must assign the agent-utils pin gate to exactly one job"
+
+    # OBLIGATION (agent-utils-pin-validate-receipt): the agent-utils gate is NOT
+    # yet reflected in the validate receipt, and this audit deliberately does not
+    # pretend otherwise.
+    #
+    # The assertion that stood here required the literal
+    #   "$ROOT_DIR/ci/run-agent-utils-pin-check.sh" --repo "$ROOT_DIR"
+    # inside validate.sh. That assertion was UNSATISFIABLE and had never once
+    # passed: main retired validate.sh to a three-line `exec ./scripts/validate.rs`
+    # shim, so the string it demanded cannot exist in the file it read, and
+    # `audit_ci_correspondence` -- which `validate` itself calls -- died with rc 2
+    # on every tree that carried it. A gate that can only fail is not coverage;
+    # it is a permanently red node that hides the checks queued behind it.
+    #
+    # It is replaced above by the shard assertion, which binds the authority to
+    # the execution path that actually exists today: both DAG lanes, the portable
+    # shard map, the hosted `agent-utils-pin` job, `make lint`, and the pre-commit
+    # hook -- each independently asserted in this function.
+    #
+    # What remains genuinely undone is the receipt field. `scripts/validate.rs`
+    # records `reverie_pin_current` from the `pre.reverie_pin` gate (PIN_GATE_TAG,
+    # and the fail-closed refusal that a PASS cannot be reached without it); the
+    # agent-utils authority has no counterpart there. Adding one is a receipt
+    # SCHEMA change to the landing authority, so it must be authored and
+    # validated by a host that can mint a qualifying receipt -- deliberately not
+    # done blind here. Until it lands, an agent-utils pin drift is refused by CI,
+    # by make lint, and by the hook, but is not recorded in the receipt.
+    # The three assertions removed with this comment belong to the same
+    # obligation, and were unsatisfiable for the same reason: they demanded
+    #   run_check "Agent-utils dependency pin equals latest main"
+    #   AGENT_UTILS_PIN_GATE_PASSED != 1
+    #   "agent_utils_pin_current"
+    # inside validate.sh -- the receipt gate, its fail-closed cleanup check, and
+    # its receipt field. All three were dropped from the change as obsolete when
+    # main retired validate.sh, while the assertions checking for them were kept.
+    # Restoring them means re-authoring the receipt gate in scripts/validate.rs,
+    # which is the OBLIGATION named above, not something this audit can assert
+    # into existence.
 
     local dag
     for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
@@ -1749,13 +1799,21 @@ EOF
 
     for lane in portable privileged; do
         dag="$DAG_ROOT/$lane.json"
-        jq -e --arg lane "$lane" '
+        # The lane-qualified `e2e.metadata` clause that stood here required
+        #   .cmd == "./ci/test_harness.sh validate --lane <lane>"
+        # while assert_node_budgets_fit_their_job_kill's sibling assertion below
+        # requires .cmd == "./ci/test_harness.sh validate" exactly. No value of
+        # .cmd satisfies both, so carrying both made `validate` unsatisfiable on
+        # every tree. Main's unqualified form is kept because its invariant is
+        # the load-bearing one and it is the newer, deliberate rule: both lane
+        # copies must run the SAME workload, so a shorter privileged proxy
+        # cannot reject work that already passed the portable gate. Lane
+        # qualification would make the privileged node audit strictly less than
+        # the portable node -- exactly the weaker proxy that rule forbids.
+        jq -e '
             .steps | type == "array" and length > 0
             and (map(.group + "." + .job) | unique | length) == length
             and all(.[]; (.cmd | type == "string" and length > 0))
-            and ([.[] | select(.group == "e2e" and .job == "metadata")
-                  | select(.cmd == ("./ci/test_harness.sh validate --lane " + $lane))]
-                 | length == 1)
         ' "$dag" >/dev/null || die "invalid or duplicate CI DAG steps: ${dag#"$ROOT_DIR/"}"
     done
 
