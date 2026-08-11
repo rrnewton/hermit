@@ -112,6 +112,17 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    # The stop fixture plans exactly the two synthetic gates it reports. This
+    # brackets the ledger side of node accounting: no terminal state may vanish
+    # between the summary and the durable row.
+    assert row["planned_nodes"] == 2, row
+    assert row["executed_nodes"] == 2, row
+    assert row["skipped_nodes"] == 0, row
+    assert row["skipped_node_details"] == [], row
+    assert row["unaccounted_node_count"] == 0, row
+    assert row["unaccounted_nodes"] == [], row
+    assert row["node_accounting_complete"] is True, row
+    assert row["node_accounting_errors"] == [], row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row
@@ -287,9 +298,25 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
         if refuse:
             assert not ledger_events(canonical_root), output
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert not list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            ), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            events = ledger_events(canonical_root)
+            # Producers make a row immediately visible through the ignored
+            # spool. Publication into a tracked ledger shard is a separate
+            # serialized operation and must not happen on this path.
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            spools = list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            )
+            assert len(spools) == 1, (spools, output)
+            events = [json.loads(line) for line in spools[0].read_text().splitlines()]
+            # ledger_events() unions the spool with ledger/hermit/*/*.jsonl, and
+            # the tracked-shard assertion above proves that arm is empty, so the
+            # two readers are the same list here.
+            assert events == ledger_events(canonical_root), (events, output)
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
