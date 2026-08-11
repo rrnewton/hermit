@@ -464,7 +464,7 @@ jobs:
           path: trusted
           fetch-depth: 1
           persist-credentials: false
-      - name: Require every exact PR head to pin latest Reverie main
+      - name: Require every exact PR head's Reverie pin to be an ancestor of main and not regress
         env:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           EVENT_NAME: ${{ github.event_name }}
