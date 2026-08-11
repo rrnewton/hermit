@@ -73,13 +73,19 @@ const DETERMINISTIC_PIPE_CAPACITY: i32 = 4 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 struct PipeCapacityFailure {
     created_fds: [i32; 2],
-    original_pipefd: [i32; 2],
+    /// The caller's bytes as they were before the kernel overwrote them, when they could be
+    /// read. `None` means the pre-call snapshot was unreadable -- a write-only mapping is the
+    /// realistic case: the kernel can write the pair even though the tool cannot read it.
+    /// Restoration is then skipped rather than guessed, and the errno is still returned; the
+    /// alternative, handing back a pipe whose capacity is not pinned, is the outcome this
+    /// whole path exists to prevent.
+    original_pipefd: Option<[i32; 2]>,
     error: Errno,
 }
 
 fn pipe_capacity_failure(
     created_fds: [i32; 2],
-    original_pipefd: [i32; 2],
+    original_pipefd: Option<[i32; 2]>,
     capacity_result: Result<i64, Errno>,
 ) -> Option<PipeCapacityFailure> {
     let error = match capacity_result {
@@ -97,7 +103,7 @@ fn pipe_capacity_failure(
 #[async_trait]
 trait PipeCapacityRollback<T> {
     async fn close_created_fd(&mut self, fd: i32);
-    fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno>;
+    fn restore_pipefd(&mut self, original_pipefd: Option<[i32; 2]>) -> Result<(), Errno>;
 }
 
 async fn apply_pipe_capacity_failure<T, R: PipeCapacityRollback<T>>(
@@ -125,7 +131,12 @@ where
         let _ = self.guest.inject(syscalls::Close::new().with_fd(fd)).await;
     }
 
-    fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno> {
+    fn restore_pipefd(&mut self, original_pipefd: Option<[i32; 2]>) -> Result<(), Errno> {
+        // Nothing to restore when the pre-call snapshot was unreadable; see
+        // `PipeCapacityFailure::original_pipefd`.
+        let Some(original_pipefd) = original_pipefd else {
+            return Ok(());
+        };
         self.guest
             .memory()
             .write_value(self.pipefd, &original_pipefd)
@@ -1881,10 +1892,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux leaves pipefd unchanged when pipe2 fails. Capacity pinning happens after the
         // kernel has created the pipe, so preserve the caller's bytes before that call in case
         // the synthetic postcondition fails and we must turn the apparent success into an error.
+        //
+        // STRICTLY BEST EFFORT: this read must never decide the syscall's outcome. Linux
+        // validates `flags` BEFORE it touches `pipefd`, so a bad pointer with bad flags is
+        // EINVAL and a bad pointer with good flags is EFAULT. Propagating a failed read from
+        // here (an earlier `?`) reported the tool's own memory error instead -- measured as
+        // EIO for both cases, which destroyed that precedence and made a bad pointer
+        // indistinguishable from bad flags. Discard the error and let the kernel speak: if the
+        // pointer really is unusable the injected call below fails on its own, with Linux's
+        // errno. The only thing lost is the ability to restore bytes we could not read, which
+        // is handled where the restore happens.
         let original_pipefd = if internally_nonblocking {
             call.pipefd()
-                .map(|pipefd| guest.memory().read_value(pipefd))
-                .transpose()?
+                .and_then(|pipefd| guest.memory().read_value(pipefd).ok())
         } else {
             None
         };
@@ -1901,7 +1921,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY)),
                     )
                     .await;
-                let original_pipefd = original_pipefd.ok_or(Errno::EFAULT)?;
                 if let Some(failure) = pipe_capacity_failure(fds, original_pipefd, capacity_result)
                 {
                     // Preserve Linux's unchanged-on-failure output contract. A kernel errno is
@@ -2848,7 +2867,7 @@ mod test {
     #[test]
     fn pipe_capacity_failure_preserves_output_and_errno_policy() {
         let created = [17, 18];
-        let original = [0x1234, 0x5678];
+        let original = Some([0x1234, 0x5678]);
         assert_eq!(pipe_capacity_failure(created, original, Ok(4096)), None);
 
         let mismatch = pipe_capacity_failure(created, original, Ok(8192)).unwrap();
@@ -2862,10 +2881,26 @@ mod test {
         assert_eq!(denied.error, Errno::EPERM);
     }
 
+    /// An unreadable pre-call snapshot must still close the fds and still surface the kernel's
+    /// errno. It must NOT invent an output value, and it must not convert the failure into a
+    /// success that hands back an unpinned pipe.
+    #[test]
+    fn pipe_capacity_failure_tolerates_an_unreadable_snapshot() {
+        let created = [17, 18];
+        assert_eq!(pipe_capacity_failure(created, None, Ok(4096)), None);
+
+        let denied = pipe_capacity_failure(created, None, Err(Errno::EPERM)).unwrap();
+        assert_eq!(denied.created_fds, created);
+        assert_eq!(denied.original_pipefd, None);
+        assert_eq!(denied.error, Errno::EPERM);
+    }
+
     #[derive(Default)]
     struct RecordingPipeCapacityRollback {
         closed: Vec<i32>,
-        restored: Option<[i32; 2]>,
+        /// `Some(None)` records "restore was called with nothing to write", which is different
+        /// from `None` meaning "restore was never called at all".
+        restored: Option<Option<[i32; 2]>>,
     }
 
     #[async_trait::async_trait]
@@ -2874,7 +2909,7 @@ mod test {
             self.closed.push(fd);
         }
 
-        fn restore_pipefd(&mut self, original_pipefd: [i32; 2]) -> Result<(), Errno> {
+        fn restore_pipefd(&mut self, original_pipefd: Option<[i32; 2]>) -> Result<(), Errno> {
             self.restored = Some(original_pipefd);
             Ok(())
         }
@@ -2884,7 +2919,7 @@ mod test {
     async fn pipe_capacity_failure_applies_fd_and_output_rollback() {
         let failure = PipeCapacityFailure {
             created_fds: [17, 18],
-            original_pipefd: [0x1234, 0x5678],
+            original_pipefd: Some([0x1234, 0x5678]),
             error: Errno::EPERM,
         };
         let mut rollback = RecordingPipeCapacityRollback::default();
@@ -2894,7 +2929,26 @@ mod test {
             Err(Errno::EPERM)
         );
         assert_eq!(rollback.closed, [17, 18]);
-        assert_eq!(rollback.restored, Some([0x1234, 0x5678]));
+        assert_eq!(rollback.restored, Some(Some([0x1234, 0x5678])));
+    }
+
+    /// The unreadable-snapshot path must still close BOTH fds. Leaking them would be worse
+    /// than the failure it is reporting.
+    #[tokio::test]
+    async fn pipe_capacity_failure_without_snapshot_still_closes_both_fds() {
+        let failure = PipeCapacityFailure {
+            created_fds: [17, 18],
+            original_pipefd: None,
+            error: Errno::EPERM,
+        };
+        let mut rollback = RecordingPipeCapacityRollback::default();
+
+        assert_eq!(
+            apply_pipe_capacity_failure(&mut rollback, failure).await,
+            Err(Errno::EPERM)
+        );
+        assert_eq!(rollback.closed, [17, 18]);
+        assert_eq!(rollback.restored, Some(None));
     }
 
     #[test]
