@@ -360,7 +360,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-successor): Timer slack is shared with the
+            // TODO-HUMAN-REVIEW(PR-2150): Timer slack is shared with the
             // virtual `/proc/<tid>/timerslack_ns` channel.  Never pass either
             // setter through to the physical tracee: a large physical slack
             // changes wake timing on Detcore's remaining host-timed waits.

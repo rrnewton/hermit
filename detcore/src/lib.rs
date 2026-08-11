@@ -976,7 +976,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::fcntl,
                 Sysno::arch_prctl,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(PR-successor): Timer-slack prctl state is
+                // TODO-HUMAN-REVIEW(PR-2150): Timer-slack prctl state is
                 // virtual and must not bypass Detcore under passthru_opt.
                 Sysno::prctl,
                 Sysno::ioctl,
