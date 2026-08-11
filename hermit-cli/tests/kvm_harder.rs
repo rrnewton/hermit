@@ -54,9 +54,6 @@ fn run_guest(backend: &str, binary: &Path, verify: bool) -> Output {
 }
 
 fn assert_ptrace_kvm_parity(name: &str, source: &str, extra_args: &[&str], expected_stdout: &str) {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
     let _guard = KVM_RUN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -88,6 +85,10 @@ fn assert_ptrace_kvm_parity(name: &str, source: &str, extra_args: &[&str], expec
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn kvm_matches_ptrace_for_pthread_lifecycle() {
     assert_ptrace_kvm_parity(
         "pthread_lifecycle",
@@ -98,6 +99,10 @@ fn kvm_matches_ptrace_for_pthread_lifecycle() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn kvm_matches_ptrace_for_fork_tree() {
     assert_ptrace_kvm_parity(
         "fork_tree",
@@ -109,6 +114,10 @@ fn kvm_matches_ptrace_for_fork_tree() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn kvm_matches_ptrace_for_prefilled_pipe_across_fork() {
     assert_ptrace_kvm_parity(
         "pipe_prefill",
