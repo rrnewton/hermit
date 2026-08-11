@@ -452,6 +452,14 @@ mod tests {
 
             assert!(rusage_micros >= times_micros);
             assert!(rusage_micros - times_micros < NANOS_PER_CLOCK_TICK / 1_000);
+
+            // A tick-ALIGNED duration must agree EXACTLY, not merely to within
+            // one tick. The bounds above are satisfied at every sample by an
+            // implementation carrying a constant sub-tick offset, so without
+            // this the suite cannot distinguish that from a correct one.
+            if nanos % NANOS_PER_CLOCK_TICK == 0 {
+                assert_eq!(rusage_micros, times_micros);
+            }
         }
     }
 
