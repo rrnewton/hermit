@@ -41,6 +41,9 @@ enum Format {
     Text,
     Json,
     HarnessJson,
+    /// The single derivation of verify-mode flags, for runners that do not read
+    /// `harness-json`.
+    VerifyFlags,
 }
 
 #[cfg(not(test))]
@@ -70,6 +73,7 @@ fn parse_format() -> Format {
             "text" => Format::Text,
             "json" => Format::Json,
             "harness-json" => Format::HarnessJson,
+            "verify-flags" => Format::VerifyFlags,
             _ => die(format!("unknown format: {value}")),
         };
     }
@@ -152,7 +156,13 @@ fn main() {
     });
 
     match format {
+        Format::VerifyFlags => {
+            for line in verify_flags_tsv(&documents) {
+                println!("{line}");
+            }
+        }
         Format::HarnessJson => {
+            attach_verify_flags(&mut documents);
             println!(
                 "{}",
                 serde_json::to_string(&documents)
@@ -599,6 +609,174 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
+/// Validate `modes.verify.assert.guest_signal` / `.guest_exit_code`, the cell's
+/// declaration of HOW ITS GUEST TERMINATES.
+///
+/// A guest whose deterministic outcome is a crash or a deliberate non-zero exit
+/// could not be a `verify` cell at all before this: `hermit run --verify`
+/// defaults to `--verify-allow success`, refuses the second run when the first
+/// does not exit 0, and publishes `verdict: "no_result"` -- so the cell measured
+/// nothing and had to stay at `ci = false`, outside the envelope, even when it
+/// reproduces bitwise. Same class of gap `guest_args` closed for guests that
+/// need arguments (rrnewton/hermit#1815).
+///
+/// The declaration names a TERMINATION, never a wait status, because one 8-bit
+/// number is not a safety boundary: `139` is indistinguishable between a guest
+/// `exit(139)`, a guest killed by SIGSEGV, and HERMIT ITSELF dying of SIGSEGV.
+/// Only the last is a product defect, and it must never be able to satisfy a
+/// cell. `ci/test_harness.sh` therefore checks this against the run's own
+/// `--verify-json` verdict, whose `guest_signal` / `guest_exit_code` Hermit
+/// derives from the GUEST's wait status -- and which is stamped `no_result`
+/// before any fallible work, so a Hermit-side abort leaves a refusal behind
+/// rather than a stale pass.
+fn validate_guest_termination_assertion(id: &str, assert: &Value) {
+    let signal = assert.get("guest_signal");
+    let exit_code = assert.get("guest_exit_code");
+    if signal.is_none() && exit_code.is_none() {
+        return;
+    }
+    if signal.is_some() && exit_code.is_some() {
+        die(format!(
+            "{id}: modes.verify.assert must set at most one of guest_signal / guest_exit_code"
+        ));
+    }
+    if let Some(value) = signal {
+        // 1..=64 is the Linux/x86_64 signal range. Rejecting 139 here is the
+        // point: that is `128 + SIGSEGV`, a wait status, not a signal.
+        match value.as_integer() {
+            Some(number) if (1..=64).contains(&number) => {}
+            other => die(format!(
+                "{id}: modes.verify.assert.guest_signal must be a signal number 1..=64 \
+                 (11 = SIGSEGV; 139 is a wait status, not a signal), got {other:?}"
+            )),
+        }
+    }
+    if let Some(value) = exit_code {
+        match value.as_integer() {
+            Some(number) if (1..=255).contains(&number) => {}
+            Some(0) => die(format!(
+                "{id}: modes.verify.assert.guest_exit_code=0 is the default; omit it \
+                 rather than restating the success contract"
+            )),
+            other => die(format!(
+                "{id}: modes.verify.assert.guest_exit_code must be 1..=255, got {other:?}"
+            )),
+        }
+    }
+    // A non-zero exit is accepted only BECAUSE the run reproduces bitwise, and
+    // only the canonical comparator can certify that. Allowing the termination
+    // assertion without the parity assertion would accept a non-zero exit on the
+    // lossy default comparator, which per AGENTS.md cannot establish L2.
+    if assert.get("bitwise_parity").and_then(Value::as_bool) != Some(true) {
+        die(format!(
+            "{id}: modes.verify.assert declares a guest termination, which also requires \
+             bitwise_parity = true -- a non-zero exit is acceptable only with canonical parity"
+        ));
+    }
+}
+
+/// The extra Hermit flags a verify cell's `assert` table requires, and the
+/// whole-invocation status it must produce.
+///
+/// SINGLE SOURCE. Both runners consume this: `ci/test_harness.sh` reads it out
+/// of `--format harness-json` (injected at `modes.verify.verify_flags` /
+/// `.verify_shell_status`), and `scripts/manifest-to-commands.rs` reads the same
+/// derivation through `--format verify-flags`. Neither re-derives it, so there
+/// is nothing to drift and nothing to cross-check. A cross-check would have to
+/// be one-directional -- it can only iterate cells some consumer already names,
+/// so a consumer that names none looks identical to a consumer that agrees.
+///
+/// `--verify-json` is deliberately absent: only the runner knows where its cell
+/// writes the record, so it appends the path itself.
+fn verify_assert_flags(assert: Option<&Value>) -> (Vec<&'static str>, i64) {
+    let Some(assert) = assert.and_then(Value::as_table) else {
+        return (Vec::new(), 0);
+    };
+    let mut flags = Vec::new();
+    if assert.get("bitwise_parity").and_then(Value::as_bool) == Some(true) {
+        flags.push("--verify-strict");
+        flags.push("--verify-json");
+    }
+    let mut shell_status = 0;
+    if let Some(signal) = assert.get("guest_signal").and_then(Value::as_integer) {
+        shell_status = 128 + signal;
+    } else if let Some(code) = assert.get("guest_exit_code").and_then(Value::as_integer) {
+        shell_status = code;
+    }
+    if shell_status != 0 {
+        // Without the allowance Hermit refuses the SECOND run, so the cell
+        // measures a `no_result` instead of the guest.
+        flags.push("--verify-allow");
+        flags.push("both");
+    }
+    (flags, shell_status)
+}
+
+/// Inject the single derivation into every test's `modes.verify` so
+/// `--format harness-json` carries it to `ci/test_harness.sh`.
+fn attach_verify_flags(documents: &mut [Value]) {
+    for document in documents.iter_mut() {
+        let Some(tests) = document.get_mut("test").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for test in tests.iter_mut() {
+            let Some(verify) = test
+                .get_mut("modes")
+                .and_then(Value::as_table_mut)
+                .and_then(|modes| modes.get_mut("verify"))
+                .and_then(Value::as_table_mut)
+            else {
+                continue;
+            };
+            let (flags, shell_status) = verify_assert_flags(verify.get("assert"));
+            verify.insert(
+                "verify_flags".to_owned(),
+                Value::Array(
+                    flags
+                        .iter()
+                        .map(|flag| Value::String((*flag).to_owned()))
+                        .collect(),
+                ),
+            );
+            verify.insert(
+                "verify_shell_status".to_owned(),
+                Value::Integer(shell_status),
+            );
+        }
+    }
+}
+
+/// `<test-id>\t<space-joined flags>\t<shell status>` for every verify cell whose
+/// `assert` asks for anything. The channel `scripts/manifest-to-commands.rs`
+/// and any out-of-tree harness read, so they never parse `assert` themselves.
+fn verify_flags_tsv(documents: &[Value]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for document in documents {
+        let Some(tests) = document.get("test").and_then(Value::as_array) else {
+            continue;
+        };
+        for test in tests {
+            let id = test
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let assert = test
+                .get("modes")
+                .and_then(Value::as_table)
+                .and_then(|modes| modes.get("verify"))
+                .and_then(Value::as_table)
+                .and_then(|verify| verify.get("assert"));
+            let (flags, shell_status) = verify_assert_flags(assert);
+            if flags.is_empty() {
+                continue;
+            }
+            lines.push(format!("{id}\t{}\t{shell_status}", flags.join(" ")));
+        }
+    }
+    lines.sort();
+    lines
+}
+
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -630,7 +808,7 @@ fn validate_mode(
         if let Some(assert) = spec.get("assert") {
             ensure_keys(
                 assert,
-                &["bitwise_parity"],
+                &["bitwise_parity", "guest_signal", "guest_exit_code"],
                 &format!("{id}.modes.verify.assert"),
             );
             if let Some(value) = assert.get("bitwise_parity") {
@@ -639,6 +817,20 @@ fn validate_mode(
                         "{id}: modes.verify.assert.bitwise_parity must be a boolean"
                     ));
                 }
+            }
+            validate_guest_termination_assertion(id, assert);
+        }
+    } else if let Some(assert) = spec.get("assert") {
+        // Every other mode's per-mode `assert` key check runs only when that
+        // mode has an enabled backend, so a termination key smuggled into a
+        // fully-disabled mode's assert table would be accepted and then read by
+        // nothing. Refuse it unconditionally: "only meaningful for verify" has
+        // to mean refused everywhere else, not merely ignored.
+        for key in ["guest_signal", "guest_exit_code"] {
+            if assert.get(key).is_some() {
+                die(format!(
+                    "{id}: modes.{mode}.assert.{key} is only meaningful for the verify mode"
+                ));
             }
         }
     }
@@ -921,6 +1113,150 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    fn verify_mode(assert_line: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = true
+{assert_line}
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    /// POSITIVE: a guest that deterministically dies must be declarable, and
+    /// the declaration names WHICH PROCESS DIED AND HOW.
+    #[test]
+    fn accepts_a_guest_signal_declaration_beside_parity() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_signal = 11 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// POSITIVE: the exit-code half of the same declaration.
+    #[test]
+    fn accepts_a_guest_exit_code_declaration_beside_parity() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_exit_code = 7 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE — THE CENTRAL ONE. `139` is `128 + SIGSEGV`, a wait status, and
+    /// a wait status is exactly what cannot be a safety boundary here: the same
+    /// number covers a guest `exit(139)`, a guest killed by SIGSEGV, and Hermit
+    /// itself dying of SIGSEGV.
+    #[test]
+    #[should_panic(expected = "must be a signal number 1..=64")]
+    fn rejects_a_wait_status_in_the_signal_slot() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_signal = 139 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: the two keys mean different things; a cell setting both would
+    /// have no single checkable termination.
+    #[test]
+    #[should_panic(expected = "at most one of guest_signal")]
+    fn rejects_both_termination_keys() {
+        let spec = verify_mode(
+            "assert = { bitwise_parity = true, guest_signal = 11, guest_exit_code = 7 }",
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: a non-zero exit is accepted only BECAUSE the run reproduces
+    /// bitwise. Without the parity assertion the cell would accept a crash on
+    /// the lossy default comparator, which cannot establish L2 at all.
+    #[test]
+    #[should_panic(expected = "also requires")]
+    fn rejects_a_termination_without_the_parity_assertion() {
+        let spec = verify_mode("assert = { guest_signal = 11 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: `guest_exit_code = 0` restates the default, so a reader could
+    /// not tell an examined cell from every unexamined one.
+    #[test]
+    #[should_panic(expected = "omit it rather than restating")]
+    fn rejects_a_redundant_zero_exit_code() {
+        let spec = verify_mode("assert = { bitwise_parity = true, guest_exit_code = 0 }");
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    /// NEGATIVE: only `verify` is a single Hermit invocation whose status and
+    /// verdict are the cell's whole observation.
+    #[test]
+    #[should_panic(expected = "only meaningful for the verify mode")]
+    fn rejects_a_termination_declaration_outside_verify() {
+        let spec = parse_mode(
+            r#"
+ci = false
+backends_enabled = []
+seeds = [1, 2]
+assert = { min_distinct = 2, guest_signal = 11 }
+
+[backends_disabled]
+ptrace = "unsupported"
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "chaos",
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[test]

@@ -357,7 +357,15 @@ pub struct RunOpts {
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
-    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// "guest_signal":int|null,"terminating_action":str|null}`.
+    /// `terminating_action` is written LAST, immediately before Hermit mirrors
+    /// the guest's termination onto itself
+    /// ("reraise-guest-signal:<n>"/"exit-guest-code:<n>"): every other field
+    /// describes the GUEST, so a consumer that accepts a non-zero Hermit exit
+    /// needs this one to know Hermit exited that way on purpose rather than
+    /// having crashed after the verdict was already published. Absent means
+    /// Hermit never said it, which such a consumer must treat as a refusal.
+    /// This is the exit-code-independent verdict
     /// channel: `verified` reflects whether the two runs matched, regardless of
     /// what the guest exited with, so a caller need not (and must not) infer the
     /// verdict from the process exit code. A determinism / record-replay parity

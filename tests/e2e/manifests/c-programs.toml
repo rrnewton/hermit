@@ -3355,7 +3355,25 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
   cflags = ["-D_GNU_SOURCE", "-pthread", "-Wno-error=unused-parameter", "-Wno-error=unused-function", "-Wno-error=unused-variable", "-Wno-error=attributes", "-Wno-error=unknown-pragmas", "-Wno-error=sign-compare"]
 
 [test.modes.verify]
-ci = false
+ci = true
+# This guest is a deliberate data race: the spawned thread nulls the pointer
+# main dereferences after the same 1s sleep. Natively main wins and the program
+# exits 0; Hermit's deterministic schedule resolves the race the other way every
+# time, so the GUEST dies of SIGSEGV.
+#
+# `guest_signal` declares WHICH PROCESS DIED AND HOW, not a wait status: 139 is
+# the same number for a guest `exit(139)`, a guest killed by SIGSEGV, and HERMIT
+# ITSELF dying of SIGSEGV, and the last is a Hermit defect that must never
+# satisfy a cell. The assertion is checked against the run's own verdict JSON
+# (`guest_signal: 11` with `guest_exit_code: null`), which Hermit derives from
+# the guest's wait status, alongside the `bitwise_parity` that justifies
+# accepting a non-zero exit at all. Both are required together.
+#
+# The termination is part of the observation: it binds the cell to one exact
+# schedule, so a legitimate scheduler change must update this declaration in the
+# same review. Do NOT drop it to make the cell green -- without it `--verify`
+# refuses the second run and the cell measures nothing.
+assert = { bitwise_parity = true, guest_signal = 11 }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
