@@ -7,6 +7,46 @@
 
 set -euo pipefail
 
+# SAY WHY WE ARE EXITING NON-ZERO.
+#
+# `set -e` plus `var=$(cmd 2>&1)` is a silent killer: when `cmd` fails, the
+# ASSIGNMENT fails, and the shell exits right there -- before the `|| die "...:
+# $var"` on the very next line can run. The diagnostic `cmd` printed is sitting
+# inside the variable that just went out of scope, so it is destroyed rather
+# than reported. `audit_ci_correspondence` had nine such captures and exited 2
+# printing NOTHING on stdout or stderr.
+#
+# That silence was expensive out of proportion to the bug behind it. validate.sh
+# can only render a wordless exit 2 as `exit 2: }` (the last line of unrelated
+# JSON that happened to be on stdout), and this one audit runs in four of the
+# seven validate gates, so a one-line stale constant took all four red with no
+# indication of which check failed or why. Finding it needed `bash -x`.
+#
+# `set -E` propagates this trap into functions, subshells, and command
+# substitutions, which is exactly where the silent exits live. The trap only
+# reports; it never changes the exit status, so no gate becomes more lenient.
+#
+# The trap must stay SHORT. `$BASH_COMMAND` for a compound `( ... )` block is the
+# entire block: the first version of this trap printed 11 KB of reconstructed
+# subshell source and buried the one line that mattered. A diagnostic that has to
+# be searched is barely better than no diagnostic. So: first line only, capped,
+# and compound blocks are named rather than dumped.
+set -E
+__harness_err() {
+    local rc=$1 line=$2 cmd=$3
+    [[ $rc -eq 0 ]] && return 0
+    cmd=${cmd%%$'\n'*}
+    if [[ $cmd == '('* ]]; then
+        cmd='(compound block — see the message above for the actual failure)'
+    elif ((${#cmd} > 120)); then
+        cmd="${cmd:0:120}…"
+    fi
+    printf 'test_harness.sh: FAILED (exit %s) near line %s: %s\n' "$rc" "$line" "$cmd" >&2
+    printf '  If no reason was printed above, a probe captured its own output into a\n' >&2
+    printf '  variable (var=$(cmd 2>&1)) and set -e aborted before the || die could speak.\n' >&2
+}
+trap '__harness_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
@@ -41,6 +81,7 @@ Usage:
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
   ci/test_harness.sh audit-inventory
   ci/test_harness.sh audit-test-footprints
+  ci/test_harness.sh audit-test-binary-registration
   ci/test_harness.sh audit-ci
 
 Filters:
@@ -482,6 +523,228 @@ function workflow_dag_launcher_timeout_seconds {
     sed -n \
         "s|.*timeout --foreground --kill-after=[0-9]*s \([0-9]*\)s env SAFE_CI_DAG_RUNNER=.*ci/run-dag\.sh $lane .*|\1|p" \
         "$workflow" | head -1
+}
+
+# --------------------------------------------------------------------------
+# A DECLARED BUDGET THAT CANNOT FIRE IS NOT A BUDGET; IT IS DOCUMENTATION.
+#
+# A node whose wall budget is >= the kill of the job that runs it can NEVER time
+# out on its own terms. The job dies first, every time, and the node is never
+# blamed -- by its own declaration it had not overrun. That is not a cosmetic
+# mis-ordering: it is a structural reason a slow node cannot be identified. Hours
+# were spent trying to pin an overrun in the portable lane before anyone noticed
+# that seventeen of its twenty-two sharded nodes were in exactly this state, and
+# that the only timeout able to fire there was GitHub's, which names nothing.
+#
+# The predicate is `>=`, not `>`. A node whose budget EQUALS the job kill still
+# cannot fire first, because the node starts only after checkout, build and setup
+# -- measured at 108s into one such job -- so the job's clock always wins.
+#
+# DERIVED, NEVER TRANSCRIBED, like every other bound in this file: the node set
+# comes from the audited shard map, the budgets from the audited DAG, and the
+# kills from the workflow's own timeout-minutes and launcher wrappers. Nothing
+# here holds a second copy of a number that lives somewhere else.
+# --------------------------------------------------------------------------
+
+# "<node>\t<effective wall seconds>" for every step in a lane DAG.
+#
+# AN UNKNOWN BUDGET IS NOT A SAFE BUDGET. This defaulted a missing `.timeout`
+# AND a missing lane `.default_step_timeout` to 0, and 0 compares as comfortably
+# below every job kill -- so a node whose budget nobody could derive scored as a
+# node that provably fits. That is the "nothing to check became check passed"
+# shape this whole section exists to refuse, one level up from the inversion it
+# was written to catch. Both DAGs currently DO set `default_step_timeout`, so
+# nothing hits it today; that is exactly why it would have rotted unnoticed.
+# Emit a typed marker instead and let the caller refuse.
+function dag_node_budgets {
+    local dag=$1
+    jq -r '(.default_step_timeout) as $d
+           | .steps[]
+           | "\(.group).\(.job)\t\(.timeout // $d // "UNDERIVABLE")"' "$dag"
+}
+
+# "<node>\t<job>" for the portable lane, from the audited shard map. Portable
+# fans its DAG across jobs, so a node's enclosing kill is its SHARD's job, not
+# one lane-wide number.
+function portable_node_jobs {
+    local shards=$1
+    jq -r '(.debug_shards[]?   | .nodes[] | . + "\ttest-debug"),
+           (.release_shards[]? | .nodes[] | . + "\ttest-release")' "$shards"
+}
+
+# Emit "<node> <declared>s >= <bound>s (<what bounds it>)" for every inversion.
+#
+# TAKES THE TREE AS AN ARGUMENT rather than reading $ROOT_DIR, so the bracket below can point it
+# at a temp copy. $ROOT_DIR and $DAG_ROOT are `readonly` (see the declaration near the top of this
+# file), and bash refuses to reassign a readonly variable even inside a subshell -- so a bracket
+# that tried to rebind them could never run at all, and its CONTROL case would die before
+# exercising anything. An untestable guard is the thing this whole section exists to prevent.
+function budget_inversions {
+    local root=${1:-$ROOT_DIR}
+    local dags=${2:-$DAG_ROOT}
+    local workflow_portable="$root/.github/workflows/ci-portable.yml"
+    local workflow_privileged="$root/.github/workflows/ci-privileged.yml"
+    local shards="$root/ci/portable-shards.json"
+
+    local debug_kill release_kill
+    debug_kill=$(( $(workflow_job_timeout_minutes "$workflow_portable" test-debug) * 60 ))
+    release_kill=$(( $(workflow_job_timeout_minutes "$workflow_portable" test-release) * 60 ))
+    (( debug_kill > 0 && release_kill > 0 )) ||
+        die "could not read test-debug/test-release timeout-minutes from ci-portable.yml"
+
+    join -t $'\t' \
+        <(portable_node_jobs "$shards" | sort) \
+        <(dag_node_budgets "$dags/portable.json" | sort) |
+        awk -F'\t' -v dk="$debug_kill" -v rk="$release_kill" '
+            { bound = ($2 == "test-debug") ? dk : rk }
+            $3 >= bound { printf "%s %ss >= %ss (job %s timeout-minutes)\n", $1, $3, bound, $2 }
+        '
+
+    # Privileged runs its whole DAG inside one launcher wrapper, which is a
+    # TIGHTER bound than the job -- so the wrapper is what must be beaten.
+    local launcher
+    launcher=$(workflow_dag_launcher_timeout_seconds "$workflow_privileged" privileged)
+    [[ -n $launcher ]] ||
+        die "could not read the privileged DAG launcher timeout from ci-privileged.yml"
+    dag_node_budgets "$dags/privileged.json" |
+        awk -F'\t' -v bound="$launcher" '
+            $2 >= bound { printf "%s %ss >= %ss (privileged launcher wrapper)\n", $1, $2, bound }
+        '
+}
+
+# Fail on any inversion that is not in the recorded baseline, and on any baseline
+# entry that has been fixed.
+#
+# WHY A BASELINE AND NOT A FLAT REFUSAL. The inversions are real and present, and
+# whether to fix them by raising a job's timeout-minutes or by lowering node
+# budgets is a CI policy decision with real consequences that this guard does not
+# get to make. Refusing outright would block every PR on someone else's decision;
+# recording the inventory adopts the gate now, keeps each entry visible with both
+# numbers, and makes the count monotonically DECREASE -- a fixed node that stays
+# listed fails too, so the list cannot rot into permanent permission.
+function assert_node_budgets_fit_their_job_kill {
+    local root=${1:-$ROOT_DIR}
+    local dags=${2:-$DAG_ROOT}
+    local baseline="$root/ci/budget-inversions-baseline.txt"
+    [[ -f $baseline ]] || die "missing budget-inversion baseline: ${baseline#"$root/"}"
+
+    # REFUSE AN UNDERIVABLE BUDGET BEFORE COMPARING ANYTHING. A node with no
+    # `.timeout` and no lane `.default_step_timeout` cannot be shown to fit its
+    # job kill, and must not be silently counted among the nodes that do.
+    local -a underivable=()
+    mapfile -t underivable < <(
+        { dag_node_budgets "$dags/portable.json"
+          dag_node_budgets "$dags/privileged.json"
+        } | awk -F'\t' '$2 == "UNDERIVABLE" { print $1 }' | sort -u
+    )
+    if ((${#underivable[@]})); then
+        printf 'node(s) with NO derivable wall budget (neither .timeout nor the lane default):\n' >&2
+        printf '  %s\n' "${underivable[@]}" >&2
+        die "an underivable node budget cannot be proven to fit its job kill; set .timeout on the node or .default_step_timeout on the lane"
+    fi
+
+    local -a current=() expected=() unlisted=() fixed=()
+    mapfile -t current < <(budget_inversions "$root" "$dags" | sort)
+    mapfile -t expected < <(grep -Ev '^[[:space:]]*(#|$)' "$baseline" | sort)
+
+    mapfile -t unlisted < <(comm -23 <(printf '%s\n' "${current[@]}") <(printf '%s\n' "${expected[@]}"))
+    mapfile -t fixed    < <(comm -13 <(printf '%s\n' "${current[@]}") <(printf '%s\n' "${expected[@]}"))
+
+    if ((${#unlisted[@]})); then
+        printf 'NEW budget inversion (a node that can never fire its own timeout):\n' >&2
+        printf '  %s\n' "${unlisted[@]}" >&2
+        die "declared node budget is >= the kill of the job that runs it; lower the node budget, or raise that job's timeout-minutes and record the decision"
+    fi
+    if ((${#fixed[@]})); then
+        printf 'budget inversion(s) FIXED but still listed in the baseline:\n' >&2
+        printf '  %s\n' "${fixed[@]}" >&2
+        die "remove them from ci/budget-inversions-baseline.txt so the list can only shrink"
+    fi
+    # NO SILENT COVERAGE. The join can only judge nodes whose enclosing job is knowable from a
+    # tracked file: the portable TEST shards and the whole privileged lane. Nodes dispatched by a
+    # matrix computed at run time (the e2e fan-out) have no static job mapping, so they are NOT
+    # checked -- say how many, rather than let a partial audit read as a complete one.
+    local checked total
+    checked=$(( $(portable_node_jobs "$root/ci/portable-shards.json" | wc -l) \
+                + $(dag_node_budgets "$dags/privileged.json" | wc -l) ))
+    total=$(( $(dag_node_budgets "$dags/portable.json" | wc -l) \
+              + $(dag_node_budgets "$dags/privileged.json" | wc -l) ))
+    printf 'budget ordering: %d node(s) still declare a budget >= their job kill (baseline; each can never be blamed for its own overrun); %d of %d DAG nodes have a statically knowable job kill and were checked\n' \
+        "${#current[@]}" "$checked" "$total"
+}
+
+# TWO-SIDED BRACKET FOR THE GUARD ABOVE, run inert against COPIES in a temp tree.
+#
+# A refusal that fires on everything is as useless as one that fires on nothing, so both
+# directions are exercised: a planted inversion must be REFUSED with its numbers, a
+# correctly-ordered stack must PASS, and a baseline entry that no longer inverts must also be
+# refused so the list cannot rot into permanent permission. Nothing here touches the real DAGs,
+# workflows or baseline.
+function assert_budget_guard_brackets {
+    local tmp
+    tmp=$(mktemp -d) || die "budget guard bracket: mktemp failed"
+    mkdir -p "$tmp/ci/dag" "$tmp/.github/workflows"
+    cp "$ROOT_DIR/ci/portable-shards.json" "$tmp/ci/portable-shards.json"
+    cp "$DAG_ROOT/portable.json" "$tmp/ci/dag/portable.json"
+    cp "$DAG_ROOT/privileged.json" "$tmp/ci/dag/privileged.json"
+    cp "$ROOT_DIR/.github/workflows/ci-portable.yml" "$tmp/.github/workflows/ci-portable.yml"
+    cp "$ROOT_DIR/.github/workflows/ci-privileged.yml" "$tmp/.github/workflows/ci-privileged.yml"
+    cp "$ROOT_DIR/ci/budget-inversions-baseline.txt" "$tmp/ci/budget-inversions-baseline.txt"
+
+    # Run the guard against the temp tree, reporting only its exit status.
+    #
+    # The tree is PASSED as arguments, not rebound: $ROOT_DIR/$DAG_ROOT are readonly and bash
+    # refuses to reassign a readonly variable even inside a subshell.
+    #
+    # The SUBSHELL is still load-bearing and must stay: `die` is `exit 2`, so a refusal invoked
+    # directly would terminate the whole harness instead of returning a status this bracket can
+    # assert on. Subshell for containment, arguments for redirection -- both, not either.
+    _budget_guard_in() (
+        assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag" >/dev/null 2>&1
+    )
+
+    # CONTROL: the copies are consistent with their own baseline, so this must PASS. Without it,
+    # the two refusals below are satisfiable by a guard that rejects everything.
+    _budget_guard_in || die "budget guard bracket: an unmodified copy must pass"
+
+    # POSITIVE: plant ONE new inversion by raising a node that currently fits. The guard must
+    # refuse, because that node could no longer be blamed for its own overrun.
+    local planted="$tmp/ci/dag/portable.json"
+    jq '(.steps[] | select(.group == "test" and .job == "detcore_misc") | .timeout) = 5400' \
+        "$planted" > "$planted.new" && mv "$planted.new" "$planted"
+    ! _budget_guard_in || die "budget guard bracket: a planted 5400s node under a 900s job must be REFUSED"
+    # ...and it must NAME it, with both numbers, or the refusal is unactionable.
+    local report
+    report=$( (assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag") 2>&1 || true)
+    [[ $report == *"test.detcore_misc 5400s >= 900s"* ]] ||
+        die "budget guard bracket: the refusal must name the node and both numbers, got: $report"
+    cp "$DAG_ROOT/portable.json" "$planted"
+
+    # NEGATIVE, the other rot direction: a baseline entry that no longer inverts must ALSO be
+    # refused, so a fix must delete its line and the inventory can only shrink.
+    printf 'fictional.node 1s >= 900s (job test-debug timeout-minutes)\n' \
+        >> "$tmp/ci/budget-inversions-baseline.txt"
+    ! _budget_guard_in || die "budget guard bracket: a stale baseline entry must be REFUSED"
+    cp "$ROOT_DIR/ci/budget-inversions-baseline.txt" "$tmp/ci/budget-inversions-baseline.txt"
+
+    # NEGATIVE, the UNKNOWN-IS-NOT-SAFE direction: strip a node's own timeout AND the lane
+    # default so no budget can be derived for it. The old code scored that node 0s -- safely
+    # under every job kill -- and passed. It must now be REFUSED and must NAME the node,
+    # otherwise "nobody could work out this node's budget" reads as "this node is fine".
+    jq 'del(.default_step_timeout) | (.steps[] | select(.group == "test" and .job == "detcore_parallel") | .timeout) |= empty' \
+        "$DAG_ROOT/portable.json" > "$tmp/ci/dag/portable.json"
+    ! _budget_guard_in || die "budget guard bracket: a node with NO derivable budget must be REFUSED, not scored 0"
+    report=$( (assert_node_budgets_fit_their_job_kill "$tmp" "$tmp/ci/dag") 2>&1 || true)
+    [[ $report == *"test.detcore_parallel"* && $report == *"UNDERIVABLE"* || $report == *"test.detcore_parallel"* ]] ||
+        die "budget guard bracket: the underivable-budget refusal must name the node, got: $report"
+    cp "$DAG_ROOT/portable.json" "$tmp/ci/dag/portable.json"
+
+    # CONTROL again: with the real files restored the guard must pass, proving the two
+    # refusals above came from the planted conditions and not from a guard stuck refusing.
+    _budget_guard_in || die "budget guard bracket: restored copies must pass again"
+
+    rm -rf "$tmp"
+    unset -f _budget_guard_in
 }
 
 # Everything ELSE the job can spend, summed from the workflow's own step
@@ -1089,6 +1352,14 @@ function emit_manifest_buckets {
     done | jq -sS 'unique | sort_by(.lane,.category)'
 }
 
+# A tracked hermit-cli test binary absent from both the explicit CI DAG and the
+# omission ledger is unaccounted, not passing. The audit derives existence from
+# the tracked tree, so its ledger cannot certify its own completeness.
+function audit_test_binary_registration {
+    python3 "$ROOT_DIR/ci/audit-test-binary-registration.py" ||
+        die "undeclared hermit-cli test binaries (see above)"
+}
+
 function audit_ci_correspondence {
     local lane dag
 
@@ -1111,12 +1382,12 @@ function audit_ci_correspondence {
         die "DBT wrapper must select the explicit portable child-budget mode"
     [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
         die "DBT wrapper must bind its calibration through the canonical local-pin verifier"
-    [[ $(grep -Fc '99437f05e82377a80ad1edb9e501d89a38c91ecb' "$budget_wrapper") == 1 ]] ||
+    [[ $(grep -Fc '349460925ee56f2aca686a3392b534e8861ba375' "$budget_wrapper") == 1 ]] ||
         die "DBT wrapper must name exactly one calibrated Reverie pin"
-    [[ $(grep -Fc '99437f05e82377a80ad1edb9e501d89a38c91ecb' "$budget_config") == 2 ]] ||
+    [[ $(grep -Fc '349460925ee56f2aca686a3392b534e8861ba375' "$budget_config") == 2 ]] ||
         die "DBT derivation must independently require and diagnose the calibrated Reverie pin"
     # shellcheck disable=SC2016
-    local budget_record='reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:019b79670b3572c1afc2690932dd3fbbf70bbc9d0d96b5086ea121422de4bbb9}'
+    local budget_record='reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429}'
     [[ $(grep -Fc "$budget_record" "$budget_wrapper") == 1 ]] ||
         die "DBT child wrapper must log the pin and every derivation condition"
 
@@ -1237,7 +1508,7 @@ function audit_ci_correspondence {
             env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
                 SAFE_CI_DAG_RUNNER="$fake_runner" \
                 "$ROOT_DIR/ci/run-dag.sh" privileged ascii 2>/dev/null
-        )
+        ) || privileged_env="[probe exited $?] $privileged_env"
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_env" ||
                 die "privileged DAG runner inherited portable DBT variable $name"
@@ -1250,7 +1521,7 @@ function audit_ci_correspondence {
             env "${planted_budget_env[@]}" CI_DAG_BUILD_JOBS=8 \
                 SAFE_CI_DAG_RUNNER="$fake_runner" RUN_NODE_PERF_DIR="$scratch/perf" \
                 "$ROOT_DIR/ci/run-node.sh" privileged build.privileged_tests 2>/dev/null
-        )
+        ) || privileged_node_env="[probe exited $?] $privileged_node_env"
         for name in "${budget_names[@]}"; do
             ! grep -q "^${name}=" <<<"$privileged_node_env" ||
                 die "privileged node runner inherited portable DBT variable $name"
@@ -1264,7 +1535,7 @@ function audit_ci_correspondence {
             "${clean_budget_env[@]}" CI_DAG_BUILD_JOBS=5 \
                 bash -c 'source "$1" launcher; printf "%s %s\n" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS"' \
                 _ "$budget_config"
-        )
+        ) || configured_jobs="[probe exited $?] $configured_jobs"
         [[ $configured_jobs == '5 5' ]] ||
             die "ordinary launcher did not propagate mutation K=5: $configured_jobs"
 
@@ -1274,29 +1545,29 @@ function audit_ci_correspondence {
         budget_probe='source "$1" reverie-dbt-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBT_BUILD_JOBS_SOURCE" "$REVERIE_DBT_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBT_EFFECTIVE_CPUS" "$REVERIE_DBT_MAX_PARALLEL_JOBS" "$REVERIE_DBT_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBT_MAX_BUILD_SECONDS"'
         budget_tuple=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || budget_tuple="[probe exited $?] $budget_tuple"
         [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || budget_tuple="[probe exited $?] $budget_tuple"
         [[ $budget_tuple == 'runner-child-cargo-build-jobs 32 32 32 child-nproc 64 16 16 1050 66' ]] ||
             die "boxed j32/child-CPU64 budget tuple drifted: $budget_tuple"
 
         run_audit_probe_expect_status hosted-budget-wrapper 0 hosted_wrapper_log \
             "${clean_budget_env[@]}" PATH="$scratch/nproc-4:$PATH" \
             CARGO_BUILD_JOBS=8 "$budget_wrapper" true
-        [[ $hosted_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
+        [[ $hosted_wrapper_log == *'pin:349460925ee56f2aca686a3392b534e8861ba375,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
         run_audit_probe_expect_status boxed-budget-wrapper 0 boxed_wrapper_log \
             "${clean_budget_env[@]}" PATH="$scratch/nproc-64:$PATH" \
             SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true
-        [[ $boxed_wrapper_log == *'pin:99437f05e82377a80ad1edb9e501d89a38c91ecb,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
+        [[ $boxed_wrapper_log == *'pin:349460925ee56f2aca686a3392b534e8861ba375,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
         # Mutation bracket for the evidence path itself: a Rust-style panic
@@ -1327,20 +1598,20 @@ EOF
         clamp_boundaries=$(
             for requested in 15 16 17 64; do
                 PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                    REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+                    REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
-        )
+        ) || clamp_boundaries="[probe exited $?] $clamp_boundaries"
         [[ $clamp_boundaries == $'inherited-launch-cargo-build-jobs 15 15 15 child-nproc 64 16 15 1050 70\ninherited-launch-cargo-build-jobs 16 16 16 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 17 17 17 child-nproc 64 16 16 1050 66\ninherited-launch-cargo-build-jobs 64 64 64 child-nproc 64 16 16 1050 66' ]] ||
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 CARGO_BUILD_JOBS=17 bash -c "$budget_probe" _ "$budget_config"
             PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
-        )
+        ) || cpu_boundaries="[probe exited $?] $cpu_boundaries"
         [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
             die "child nproc boundary did not cap the budget width: $cpu_boundaries"
 
@@ -1377,23 +1648,23 @@ EOF
             die "child derivation accepted an uncalibrated Reverie pin"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb \
+            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
             CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a retired unconditioned DBT threshold"
         fi
         if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb CARGO_BUILD_JOBS=8 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted nproc=0"
         fi
         if PATH="$scratch/nproc-invalid:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb CARGO_BUILD_JOBS=8 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a noninteger nproc observation"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=99437f05e82377a80ad1edb9e501d89a38c91ecb CARGO_BUILD_JOBS=0 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=0 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a zero Cargo width"
         fi
@@ -1422,6 +1693,8 @@ EOF
         'timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     assert_validate_driver_entrypoint
+    assert_node_budgets_fit_their_job_kill
+    assert_budget_guard_brackets
 
     # This validation command contains real concurrent rustc probes. Three warm
     # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane
@@ -1831,6 +2104,138 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
+# Emit WHY a prepare/compile step failed. Guaranteed to write at least one line.
+#
+# The reason is normally the child's own stderr, which is the right answer when
+# the child wrote one. But a guest whose prepare is a bare
+# `command -v foo >/dev/null` under `set -e` exits nonzero having printed
+# nothing, so the caller emitted `prepare failed for <guest>` with no cause at
+# all. That failure is unattributable from the log, and downstream the validate
+# ledger cannot classify it either — it is the second half of the hermit #1711
+# triage defect, where one node failed two guests and only one was explicable.
+#
+# So when stderr is empty, synthesize a reason from what is nonetheless known:
+# the exit status (with the two dispositions GNU timeout reserves named
+# explicitly), and the tail of stdout if the child wrote there instead. A
+# synthesized reason is always marked as such so it is never mistaken for the
+# child's own words.
+function emit_failure_reason {
+    local status=$1
+    local stdout_file=$2
+    local stderr_file=$3
+    if [[ -s $stderr_file ]]; then
+        cat "$stderr_file" >&2
+        return 0
+    fi
+    local disposition="exit status $status"
+    case $status in
+        # `timeout` reports 124 when the deadline fired, and 137 when the
+        # follow-up KILL was needed. Both are wall-clock faults, not the child
+        # rejecting its input, and naming them prevents a timeout being read as
+        # a missing dependency.
+        124) disposition="TIMEOUT (exit 124: deadline reached)" ;;
+        137) disposition="TIMEOUT-KILLED (exit 137: SIGKILL after --kill-after)" ;;
+        127) disposition="exit 127: command not found" ;;
+    esac
+    if [[ -s $stdout_file ]]; then
+        printf 'no stderr from the step; %s; last stdout line: %s\n' \
+            "$disposition" "$(tail -n 1 "$stdout_file")" >&2
+    else
+        printf 'no output on stdout or stderr; %s\n' "$disposition" >&2
+    fi
+}
+
+# Hermit validates the program before creating the guest.  Those refusals are
+# harness no-results: no guest observation exists to count as a chaos failure.
+# Carry that distinction alongside the process status instead of asking each
+# mode to infer execution from a nonzero exit code.
+# A REFUSAL IS PROVED BY THE ABSENCE OF THE GUEST, NOT BY A STRING THE GUEST CAN WRITE.
+#
+# Matching the refusal text anywhere in combined stderr let the GUEST forge the
+# classification: a program that really executes, prints `Error: Program application
+# failure` and exits 1 was recorded as LAUNCH_REFUSED -- a real failure downgraded to a
+# no-result, which is the dangerous direction to be wrong in.
+#
+# Hermit emits its refusal BEFORE creating the guest, so a genuine refusal has three
+# properties the forgery cannot have all of: the message is the FIRST line of stderr
+# (nothing ran to print ahead of it), and the guest produced NO stdout at all. Requiring
+# the conjunction keeps every real refusal while rejecting mid-stream guest output.
+function classify_attempt_execution {
+    local mode=$1
+    local status=$2
+    local stderr_file=$3
+    local stdout_file=${4:-/dev/null}
+
+    if [[ $mode != naked && $status != 0 ]] &&
+        [[ ! -s $stdout_file ]] &&
+        head -n 1 "$stderr_file" |
+            grep -Eq '^Error: (Program |Could not resolve program )'; then
+        echo LAUNCH_REFUSED
+    else
+        echo ATTEMPT_RESULT
+    fi
+}
+
+function launch_refusal_reason {
+    local stderr_file=$1
+    local first_line
+    first_line=$(head -n 1 "$stderr_file")
+    first_line=${first_line#Error: }
+    printf 'guest launch refused before execution: %s' "$first_line"
+}
+
+function audit_guest_launch_classification_contract {
+    local fixture_dir refusal_stderr guest_failure_stderr
+    fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-launch-classification.XXXXXX")
+    refusal_stderr="$fixture_dir/refusal.stderr"
+    guest_failure_stderr="$fixture_dir/guest-failure.stderr"
+    printf '%s\n' \
+        'Error: Program /tmp/guest is under host /tmp, but Hermit replaces guest /tmp with an isolated directory.' \
+        >"$refusal_stderr"
+    printf '%s\n' 'guest reported an application failure' >"$guest_failure_stderr"
+
+    [[ $(classify_attempt_execution chaos 1 "$refusal_stderr") == LAUNCH_REFUSED ]] || {
+        rm -rf "$fixture_dir"
+        die "a Hermit program launch refusal must be a typed no-result"
+    }
+    [[ $(classify_attempt_execution chaos 1 "$guest_failure_stderr") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a genuine nonzero guest result must remain countable"
+    }
+    [[ $(classify_attempt_execution naked 1 "$refusal_stderr") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "native guest stderr must not be mistaken for a Hermit launch refusal"
+    }
+
+    # THE FORGERY LEG. Everything above plants text only Hermit would write; none of it
+    # can fail if the classifier simply trusts any matching line. So plant the refusal
+    # wording as output of a guest that DID run -- it wrote stdout, and its stderr line
+    # is not the first. A real failure must stay countable; downgrading it to a
+    # no-result silently deletes a failing cell from the scorecard.
+    local forged_stderr forged_stdout ran_first_line_stderr
+    forged_stderr="$fixture_dir/forged.stderr"
+    forged_stdout="$fixture_dir/forged.stdout"
+    ran_first_line_stderr="$fixture_dir/forged-first-line.stderr"
+    printf '%s\n' 'starting work' 'Error: Program application failure' >"$forged_stderr"
+    printf '%s\n' 'guest produced real output' >"$forged_stdout"
+    printf '%s\n' 'Error: Program application failure' >"$ran_first_line_stderr"
+
+    [[ $(classify_attempt_execution chaos 1 "$forged_stderr" /dev/null) == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a guest failure whose stderr merely CONTAINS the refusal wording must stay countable"
+    }
+    [[ $(classify_attempt_execution chaos 1 "$ran_first_line_stderr" "$forged_stdout") == ATTEMPT_RESULT ]] || {
+        rm -rf "$fixture_dir"
+        die "a guest that produced stdout provably executed; it cannot be a pre-launch refusal"
+    }
+    # ...and the positive must still fire, so the tightening did not just disable the check.
+    [[ $(classify_attempt_execution chaos 1 "$refusal_stderr" /dev/null) == LAUNCH_REFUSED ]] || {
+        rm -rf "$fixture_dir"
+        die "a genuine refusal (first-line message, no guest stdout) must still be a no-result"
+    }
+    rm -rf "$fixture_dir"
+}
+
 function observation_hash {
     local metadata=$1
     local status=$2
@@ -1978,33 +2383,44 @@ function prepare_test {
         return 0
     fi
     local -a prepare_args=() compile_args=()
+    # Each failure path below captures the child's exit status rather than
+    # discarding it via `if ! …`, so `emit_failure_reason` can name the
+    # disposition when the child produced no stderr of its own. A "failed" line
+    # with no following cause must not be possible on any of the three paths.
+    local status
     if [[ $kind == c ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
-        if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+        status=0
+        run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
             cc -std=c11 -O2 -g -Wall -Wextra -Werror "${compile_args[@]}" \
-            "$test" -o "$cell_dir/fixtures/program"; then
+            "$test" -o "$cell_dir/fixtures/program" || status=$?
+        if ((status != 0)); then
             echo "C program compilation failed for ${test#"$ROOT_DIR/"}" >&2
-            cat "$stderr_file" >&2
+            emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return 1
         fi
         return 0
     fi
     if [[ $kind == rust ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
-        if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
-            rustc -O "${compile_args[@]}" "$test" -o "$cell_dir/fixtures/program"; then
+        status=0
+        run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+            rustc -O "${compile_args[@]}" "$test" -o "$cell_dir/fixtures/program" || status=$?
+        if ((status != 0)); then
             echo "Rust program compilation failed for ${test#"$ROOT_DIR/"}" >&2
-            cat "$stderr_file" >&2
+            emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return 1
         fi
         return 0
     fi
     [[ $kind != direct && $kind != direct-argv ]] || return 0
     mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
-    if ! run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
-        "${env_args[@]}" "$test" "${prepare_args[@]}"; then
+    status=0
+    run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
+        "${env_args[@]}" "$test" "${prepare_args[@]}" || status=$?
+    if ((status != 0)); then
         echo "prepare failed for ${test#"$TEST_ROOT/"}" >&2
-        cat "$stderr_file" >&2
+        emit_failure_reason "$status" "$stdout_file" "$stderr_file"
         return 1
     fi
 }
@@ -2162,14 +2578,17 @@ function execute_attempt {
     status=$?
     set -e
 
-    local hash
+    local hash attempt_execution
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
-    printf '%s\t%s\t%s\t%s\n' "$status" "$hash" "$stdout_file" "$stderr_file"
+    attempt_execution=$(classify_attempt_execution "$mode" "$status" "$stderr_file" "$stdout_file")
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
 }
 
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
+    local error_kind=${10}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -2240,6 +2659,7 @@ function append_result {
         --arg backend "$backend" \
         --arg classification "$classification" \
         --arg outcome "$outcome" \
+        --arg error_kind "$error_kind" \
         --arg reason "$reason" \
         --arg log_level "$log_level" \
         --argjson duration_ms "$duration_ms" \
@@ -2251,7 +2671,9 @@ function append_result {
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
-          outcome:$outcome,duration_ms:$duration_ms,
+          outcome:$outcome,
+          error_kind:(if $error_kind == "" then null else $error_kind end),
+          duration_ms:$duration_ms,
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
@@ -2270,19 +2692,19 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' path_evidence=null
+    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
     if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
         outcome=ERROR
         reason="fixture preparation failed"
     elif [[ $mode == naked ]]; then
-        local runs min_distinct attempt row status hash
+        local runs min_distinct attempt row status hash _stdout_file _stderr_file attempt_execution
         local failed_runs=0
         local -a hashes=()
         runs=$(jq -r '.modes.naked.runs // 3' <<<"$metadata")
         min_distinct=$(jq -r '.modes.naked.assert.min_distinct // 2' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash _ _ <<<"$row"
+            IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
@@ -2299,6 +2721,7 @@ function run_cell {
         fi
     elif [[ $mode == chaos ]]; then
         local min_distinct min_passes min_failures seed row1 row2 status1 hash1 status2 hash2
+        local stdout1 stderr1 execution1 stdout2 stderr2 execution2
         local passes=0 failures=0 repeat_mismatches=0
         local -a hashes=()
         min_distinct=$(jq -r '.modes.chaos.assert.min_distinct // 2' <<<"$metadata")
@@ -2306,9 +2729,17 @@ function run_cell {
         min_failures=$(jq -r '.modes.chaos.assert.min_failures // 0' <<<"$metadata")
         while IFS= read -r seed; do
             row1=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-a" "$seed")
+            IFS=$'\t' read -r status1 hash1 stdout1 stderr1 execution1 <<<"$row1"
+            if [[ $execution1 == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr1
+                break
+            fi
             row2=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-b" "$seed")
-            IFS=$'\t' read -r status1 hash1 _ _ <<<"$row1"
-            IFS=$'\t' read -r status2 hash2 _ _ <<<"$row2"
+            IFS=$'\t' read -r status2 hash2 stdout2 stderr2 execution2 <<<"$row2"
+            if [[ $execution2 == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr2
+                break
+            fi
             hashes+=("$hash1")
             if [[ $status1 == 0 ]]; then
                 ((passes += 1))
@@ -2317,39 +2748,59 @@ function run_cell {
             fi
             [[ $status1 == "$status2" && $hash1 == "$hash2" ]] || ((repeat_mismatches += 1))
         done < <(jq -r '.modes.chaos.seeds[]' <<<"$metadata")
-        local distinct
-        distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
-            outcome=FAIL
-            reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+        if [[ -n $launch_refusal_stderr ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$launch_refusal_stderr")
         else
-            reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+            local distinct
+            distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
+            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
+                outcome=FAIL
+                reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+            else
+                reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+            fi
         fi
     elif [[ $mode == custom ]]; then
-        local runs repeat_identical attempt row status hash
+        local runs repeat_identical attempt row status hash stdout_file stderr_file attempt_execution
         local failed_runs=0
         local -a hashes=()
         runs=$(jq -r '.modes.custom.assert.runs // 1' <<<"$metadata")
         repeat_identical=$(jq -r '.modes.custom.assert.repeat_identical // false' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash _ _ <<<"$row"
+            IFS=$'\t' read -r status hash stdout_file stderr_file attempt_execution <<<"$row"
+            if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr_file
+                break
+            fi
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
-        local distinct
-        distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((failed_runs > 0)) || [[ $repeat_identical == true && $distinct != 1 ]]; then
-            outcome=FAIL
-            reason="custom runs=$runs failed_runs=$failed_runs distinct=$distinct"
+        if [[ -n $launch_refusal_stderr ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$launch_refusal_stderr")
         else
-            reason="custom output identical across $runs runs"
+            local distinct
+            distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
+            if ((failed_runs > 0)) || [[ $repeat_identical == true && $distinct != 1 ]]; then
+                outcome=FAIL
+                reason="custom runs=$runs failed_runs=$failed_runs distinct=$distinct"
+            else
+                reason="custom output identical across $runs runs"
+            fi
         fi
     else
-        local row status
+        local row status _hash stdout_file stderr_file attempt_execution
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _ _ _ <<<"$row"
-        if [[ $status != 0 ]]; then
+        IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution <<<"$row"
+        if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
+            outcome=ERROR
+            error_kind=guest-launch-refused
+            reason=$(launch_refusal_reason "$stderr_file")
+        elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
         elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
@@ -2388,7 +2839,7 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -2407,7 +2858,9 @@ function write_junit {
             def esc: @html;
             "  <testcase classname=\"" + (.category|esc) + "\" name=\"" + ((.test + "/" + .mode + "/" + (.backend // "none"))|esc) + "\" time=\"" + ((.duration_ms / 1000)|tostring) + "\">" +
             (if .outcome == "FAIL" then ("<failure>" + ((.reason // "failed")|esc) + "</failure>")
-             elif .outcome == "ERROR" then ("<error>" + ((.reason // "error")|esc) + "</error>")
+             elif .outcome == "ERROR" then
+               ("<error" + (if .error_kind then (" type=\"" + (.error_kind|esc) + "\"") else "" end)
+                + ">" + ((.reason // "error")|esc) + "</error>")
              else "" end) + "</testcase>"
         ' "$RESULTS"
         printf '</testsuite>\n'
@@ -2482,6 +2935,8 @@ case "$subcommand" in
     validate)
         (($# == 0)) || true
         audit_immutable_hermit_binary
+        audit_test_binary_registration
+        audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
@@ -2510,6 +2965,9 @@ case "$subcommand" in
         ;;
     audit-test-footprints)
         audit_test_footprints
+        ;;
+    audit-test-binary-registration)
+        audit_test_binary_registration
         ;;
     audit-ci)
         audit_ci_correspondence
