@@ -425,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn rusage_never_reports_less_cpu_than_times_off_the_tick_grid() {
+        // Folded from PR #1686. The test above pins the tick-ALIGNED case, where the two
+        // projections must be exactly equal. Off the grid they cannot be equal -- times(2) is
+        // obliged to quantize to USER_HZ -- so the invariant is directional and bounded:
+        // getrusage must never report LESS CPU than times(2), and the two must stay within one
+        // clock tick. An implementation that quantized rusage to the tick grid, or that let the
+        // two drift apart, fails here while passing the aligned case.
+        for nanos in [0u64, 1_000_000, 300_484_000, 7_000_000_000, 12_345_678_901] {
+            let duration = LogicalTime::from_nanos(nanos);
+            let tv = timeval_from_logical(duration);
+
+            let rusage_micros = tv.tv_sec as u64 * MICROS_PER_SECOND + tv.tv_usec as u64;
+            let times_micros = clock_ticks(duration) * (NANOS_PER_CLOCK_TICK / NANOS_PER_MICRO);
+
+            assert!(
+                rusage_micros >= times_micros,
+                "getrusage must not report LESS CPU than times for {nanos}ns: \
+                 {rusage_micros}us vs {times_micros}us"
+            );
+            assert!(
+                rusage_micros - times_micros < NANOS_PER_CLOCK_TICK / NANOS_PER_MICRO,
+                "the two views must agree to within one clock tick for {nanos}ns: \
+                 {rusage_micros}us vs {times_micros}us"
+            );
+        }
+    }
+
+    #[test]
     fn logical_clock_ticks_include_boot_offset_and_fractional_seconds() {
         let boot = LogicalTime::from_secs(1_000);
         let now = boot + LogicalTime::from_millis(25);
