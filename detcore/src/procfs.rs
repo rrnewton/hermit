@@ -32,7 +32,7 @@ enum ProcfsKind {
     Statm,
     ProcessStatus,
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-successor): Review Linux-compatible timer-slack
+    // TODO-HUMAN-REVIEW(PR-2150): Review Linux-compatible timer-slack
     // path recognition, open-time target binding, and snapshot behavior.
     /// Linux exposes timer slack only at top-level `/proc/<tid>/timerslack_ns`
     /// (and `/proc/self/timerslack_ns` for the process leader).  The nested
