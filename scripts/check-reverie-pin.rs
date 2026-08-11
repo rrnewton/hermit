@@ -102,10 +102,10 @@ struct Config {
     /// main-tip query) and decide only what is decidable offline: that the
     /// tracked manifests agree with each other, and that the LiteInst cache
     /// keys track the pin. Used by the pre-commit hook, which the owner has
-    /// ruled must not be a hard blocker on pin currency.
+    /// ruled must not be a hard blocker on distance from the main tip.
     offline: bool,
     /// Pre-commit advisory. Judges the STAGED pin against HEAD's and against
-    /// Reverie master, and speaks in exactly one of four cases (see
+    /// Reverie main, and speaks in exactly one of four cases (see
     /// `staged_pin_advisory`). Never a hard refusal: case 3 is an
     /// ACKNOWLEDGEMENT, cleared by HERMIT_PIN_BELOW_MASTER_ACK=1.
     staged_advisory: bool,
@@ -152,9 +152,9 @@ fn usage() -> &'static str {
      Options:\n\
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
-       --update-to-latest                  Update every derived Cargo pin site to latest main\n\
+       --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
-       --offline                           Local consistency only; no network, no currency\n\
+       --offline                           Local consistency only; no networked policy checks\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
@@ -501,7 +501,7 @@ fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, S
     // not in it, so the pin is not reachable. ABSENT DESCENDANT is NOT a
     // verdict -- it means the graph we fetched does not even contain main, so
     // we cannot tell, and answering "false" there produces a FALSE REFUSAL.
-    // That bug was live: the harness reported "Hermit pin: X / Latest main: X"
+    // That bug was live: the harness reported "Hermit pin: X / Reverie main: X"
     // -- identical -- while claiming X was not reachable from main.
     let main_present = git_in(graph, &["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
     if !main_present.status.success() {
@@ -570,12 +570,13 @@ const ACK_ENV: &str = "HERMIT_PIN_BELOW_MASTER_ACK";
 /// PRE-COMMIT ADVISORY. Exactly four cases, owner-specified 2026-08-08:
 ///
 ///   1. the commit does NOT touch pin entries          -> SILENT, exit 0.
-///   2. it touches them and bumps ALL THE WAY to master -> SILENT, exit 0.
+///   2. it touches them and advances to the main tip    -> SILENT, exit 0.
 ///   3. it touches them and bumps but STOPS SHORT       -> surface + require
-///      acknowledgement. "Why update but leave it stale?" Deliberately touching
-///      the pin and stopping short is a smell: either go to master, or say why
-///      not. PROCEEDABLE, NOT BLOCKING -- pinning below a known-bad newer
-///      commit, or a master that does not build yet, are legitimate.
+///      acknowledgement. "Why advance without selecting the tip?" Deliberately
+///      touching the pin and stopping short deserves an explicit choice.
+///      PROCEEDABLE, POLICY-COMPLIANT, NOT BLOCKING -- pinning below a
+///      known-bad newer commit, or a main tip that does not build yet, are
+///      legitimate.
 ///   4. it REGRESSES the pin                            -> SILENT here. That is
 ///      the CI check's monotonicity refusal, a hard refusal, and duplicating it
 ///      as a soft prompt would teach people to acknowledge past it.
@@ -614,19 +615,19 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     }
     let behind = git_in(&graph, &["rev-list", "--count", &format!("{candidate}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
-    loud_header("REVERIE PIN BUMPED, BUT NOT TO MASTER");
+    loud_header("REVERIE PIN ADVANCED BELOW THE MAIN TIP - ACKNOWLEDGEMENT");
     eprintln!("Previous pin: {head}");
     eprintln!("This commit:  {candidate}");
     eprintln!("Reverie main: {main}  ({lag} commit(s) ahead of this commit's pin)");
     eprintln!();
-    eprintln!("You are deliberately moving the pin but stopping short of Reverie master.");
-    eprintln!("That is allowed -- pinning below a known-bad newer commit, or below a master");
-    eprintln!("that does not build yet, are legitimate reasons -- but it should be a choice,");
-    eprintln!("not an accident.");
+    eprintln!("You are deliberately moving the pin but not selecting the Reverie main tip.");
+    eprintln!("That is policy-compliant: the pin is on main history and moves forward.");
+    eprintln!("Pinning below a known-bad newer commit, or below a main tip that does not");
+    eprintln!("build yet, are legitimate reasons; this advisory only asks that it be a choice.");
     eprintln!();
     eprintln!("Go all the way:      with-proxy ./ci/run-reverie-pin-check.sh --update-to-latest");
     eprintln!("Or acknowledge:      {ACK_ENV}=1 git commit ...");
-    eprintln!("  (acknowledging states you know Hermit will be on a non-master Reverie.)");
+    eprintln!("  (The environment variable keeps its historical name for compatibility.)");
     Ok(1)
 }
 
@@ -912,7 +913,7 @@ fn calibration_decision_required(old: &str, main: &str) -> String {
          If it carries: set expected_pin={main} in {BUDGET_CALIBRATION_SITE} and\n\
          append a `CARRY TO` block to ci/configure-build-jobs.sh stating the\n\
          evidence. If it does not: recalibrate and record the measurement.\n\
-         Then re-run this checker; it will report the tree current.\n\
+         Then re-run this checker; it will report the tree policy-compliant.\n\
          \n\
          Nothing above needs redoing -- the Cargo sites and the derived CI sites\n\
          are already written.\n"
@@ -966,7 +967,7 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         ));
     }
     println!(
-        "Reverie pin updated to latest main {main} across {} derived Cargo revision entries.",
+        "Reverie pin advanced to main tip {main} across {} derived Cargo revision entries.",
         updated.occurrences.len()
     );
     finish_ci_pin_sites(root, calibrated.as_deref(), main, false)
@@ -987,7 +988,7 @@ fn finish_ci_pin_sites(
 ) -> Result<(), String> {
     let Some(old) = calibrated else {
         if cargo_already_current {
-            println!("Reverie pin is already current: {main}");
+            println!("Reverie pin already equals the main tip: {main}");
         }
         return Ok(());
     };
@@ -996,7 +997,7 @@ fn finish_ci_pin_sites(
         // so there is nothing left to carry. Counting the already-correct sites
         // here would report work that did not happen.
         if cargo_already_current {
-            println!("Reverie pin is already current: {main}");
+            println!("Reverie pin already equals the main tip: {main}");
         }
         return Ok(());
     }
@@ -1213,7 +1214,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let main = match main_result {
         Ok(main) => main,
         Err(error) => {
-            loud_header("COULD NOT VERIFY LATEST REVERIE MAIN - BLOCKED");
+            loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
             if let Ok(pin) = unique_pin(&scan) {
                 eprintln!("Hermit pin: {pin}");
             }
@@ -1248,11 +1249,12 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // unique_pin) and the LiteInst cache keys track the pin. Those are real,
     // offline-decidable defects that no amount of waiting fixes, so they stay
     // BLOCKING for every caller. What offline deliberately does NOT judge is
-    // currency -- see the pre-commit hook for why that must not block.
+    // remote-policy compliance -- see the pre-commit hook for why that must not
+    // block.
     if config.offline {
         println!(
             "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
-             {pin_files} tracked Cargo metadata files; currency not evaluated, --offline)"
+             {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
         );
         return Ok(0);
     }
@@ -1286,11 +1288,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if !is_ancestor(&graph, pin, &main)? {
         loud_header("REVERIE PIN IS NOT ON reverie/main HISTORY - BLOCKED");
         eprintln!("Hermit pin:  {pin}");
-        eprintln!("Latest main: {main}");
+        eprintln!("Reverie main: {main}");
         eprintln!(
             "The pin is not reachable from rrnewton/reverie:main. It names a commit that was\n\
              abandoned, rewritten, or never merged -- so nothing on main contains it and no\n\
-             amount of waiting will make it current."
+             amount of waiting will put it on main history."
         );
         eprintln!(
             "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
@@ -1359,7 +1361,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     if pin == main {
         println!(
-            "Reverie pin is current: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
+            "Reverie pin equals the main tip: {pin} ({entries} revision entries across {pin_files} tracked Cargo metadata files)"
         );
     } else {
         println!(
