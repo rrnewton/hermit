@@ -204,6 +204,8 @@ pub fn gate_node(g: &SuperGate, deps: Vec<String>) -> Step {
         wall,
         (wall * 2).min(7200),
         mem_for(&g.argv),
+        None,
+        None,
     )
 }
 
@@ -313,6 +315,8 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             30,
             30,
             256 * 1024 * 1024,
+            None,
+            None,
         ),
         node(
             "superstress",
@@ -326,6 +330,8 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             60,
             120,
             SUPER_PROBE_MEM_BYTES,
+            None,
+            None,
         ),
     ]
 }
@@ -361,6 +367,8 @@ pub fn stress_nodes(
                 SUPER_PROBE_TIMEOUT_S,
                 SUPER_PROBE_CPU_TIMEOUT_S,
                 SUPER_PROBE_MEM_BYTES,
+                None,
+                None,
             ));
         }
     }
@@ -502,7 +510,18 @@ printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, u
 HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test analyze -j 1 {test_args}"#
     );
     let wall = g.wall();
-    node("super", &g.job, &g.label, cmd, deps, wall, (wall * 2).min(7200), TEST_MEM_BYTES)
+    node(
+        "super",
+        &g.job,
+        &g.label,
+        cmd,
+        deps,
+        wall,
+        (wall * 2).min(7200),
+        TEST_MEM_BYTES,
+        None,
+        None,
+    )
 }
 
 // ----------------------------------------------------------------- self-test
