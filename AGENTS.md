@@ -461,11 +461,16 @@ below are mandatory for every implementation and review agent.
    change is actually present in the pull request diff, that the cited tests
    exist and were run at the PR head SHA, and that the reported assurance level
    (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check must lose the `implemented` tag.
+   survive this check must lose the `implemented` tag. **This step comes before
+   the close, not after it.** An approval issued after a task is already closed
+   is a *record*, not a *check*. Reopening remains available when review lands
+   late anyway, but that is the exception; do not read the availability of a
+   remedy as permission to skip the step it remedies.
 4. **Then the owning agent closes its own task** — `tg update <task> --status
-   closed`. No coordinator, no gateway. Close once rule 1 is satisfied and the
-   PR is published; do **not** hold it open waiting for the merge. Work that is
-   genuinely blocked is different: a task with no published artifact stays
+   closed`. No coordinator, no gateway. Close once rules 1 and 3 are satisfied
+   and the PR is published; do **not** hold it open waiting for the merge. Work
+   that is genuinely blocked is different: a task with no published artifact, or
+   one whose published artifact is red or unvalidated at its exact head, stays
    `in_progress` with the blocker and partial SHA recorded, and is never tagged
    `implemented`. If a published artifact disappears or the implementation claim
    proves false, strip the tag and reopen; do not invent a status TaskGraph does
@@ -491,12 +496,10 @@ the lower status and say why in a task note.
 
 **`closed` + `implemented` (the owning agent closes, once evidenced):**
 
-- Branch pushed, PR open, exact-head validation green, awaiting merge.
-- PR open but validation red, or an exact-head receipt missing/stale — still
-  close it, and report the exact failure in the note. A red PR is published and
-  evidenced; the debt rides on the tag, not on the status.
-- Work committed and pushed but blocked on another PR or a reverie pin bump —
-  closed with the blocker and dependency SHAs named.
+- Branch pushed, PR open, adversarial review satisfied, exact-head validation
+  green, awaiting **only** the merge. "Do not hold it open waiting for the
+  merge" means exactly that and nothing broader: a pending merge is not a
+  blocker, so it is not grounds to stay open. A pending *fix* is.
 
 **`closed` + `CLOSURE-VERIFIED` (landing debt discharged):**
 
@@ -509,6 +512,14 @@ the lower status and say why in a task note.
 **Not done (stays `in_progress`, never tagged `implemented` or closed):**
 
 - Code written but uncommitted or not pushed. Do not use a stash as a handoff.
+- PR open but validation red, or an exact-head receipt missing or stale. Report
+  the exact failure in the note and leave the task open. A red PR is published
+  but it is **not evidenced**: red validation is evidence *against* the claim,
+  and rule 3 requires a reviewer to confirm real validation at the handoff SHA,
+  which a red head does not have. Closing it does not discharge the work, it
+  only removes it from the live queue while the defect survives.
+- Work committed and pushed but blocked on another PR or a reverie pin bump —
+  stays open with the blocker and the dependency SHAs named.
 - "It builds/tests pass locally" with no pushed branch and no open PR.
 - A green local `cargo test` presented as project completion — a local run is
   not a landing, and one backend passing is not "done" across all backends.
