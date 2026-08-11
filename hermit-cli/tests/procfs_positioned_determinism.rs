@@ -9,11 +9,11 @@
 //! AUTONOMOUS-BOT-IMPLEMENTED
 //! TODO-HUMAN-REVIEW(PR-973): Review positioned/copy procfs bypass coverage.
 //!
-//! Regression coverage for the systemic procfs determinism gap where only the
-//! sequential `read` path consumed the sanitized [`ProcfsFile`] snapshot while
-//! `pread64` and `sendfile` read live kernel bytes. The probe asserts that a
-//! positioned read observes the sanitized snapshot and that a procfs `sendfile`
-//! input is refused, and Hermit's own `--verify` proves both are deterministic.
+//! Regression coverage for procfs snapshot mediation and lifecycle. The probe
+//! keeps one `/proc/self/maps` fd open across mmap/mprotect/munmap and proves a
+//! rewind/read observes each live layout, then checks positioned sanitization
+//! and the procfs `sendfile` refusal. Hermit's own `--verify` proves the complete
+//! behavior is deterministic.
 
 use std::path::Path;
 use std::process::Command;
@@ -40,10 +40,9 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     );
 
     // First a plain strict run so the guest's stdout reaches this process. The
-    // probe itself asserts that pread observed the *sanitized* snapshot (stat
-    // starttime == 0) and that a procfs sendfile input was refused; a nonzero
-    // guest exit fails `status.success()`, and the markers confirm both checks
-    // actually executed rather than being skipped.
+    // probe itself asserts that one maps fd refreshes across all three address-
+    // space mutations, pread observed the *sanitized* stat snapshot, and a
+    // procfs sendfile input was refused. Markers prove every check executed.
     let run = Command::new("timeout")
         .args(["--kill-after", "5s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -74,6 +73,16 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
         stdout.contains("procfs-sendfile-refused-ok"),
         "sendfile with a procfs input was not refused\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    for marker in [
+        "procfs-maps-live-mmap-ok",
+        "procfs-maps-live-mprotect-ok",
+        "procfs-maps-live-munmap-ok",
+    ] {
+        assert!(
+            stdout.contains(marker),
+            "maps lifecycle check omitted {marker}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 
     // Then a --verify run so Hermit proves the positioned/copy paths are
     // bitwise identical across executions (they would diverge if pread read

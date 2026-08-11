@@ -147,6 +147,47 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// Successful address-space mutations end the lifetime of every cached
+/// `/proc/<pid>/maps` scan in this process. Include pass-through mutations as
+/// well as Detcore's modeled mmap family.
+fn syscall_invalidates_procfs_maps(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::mmap
+            | Sysno::munmap
+            | Sysno::mremap
+            | Sysno::mprotect
+            | Sysno::brk
+            | Sysno::pkey_mprotect
+    )
+}
+
+/// Every syscall in the pinned x86_64 table, including the final entry.
+///
+/// Backends that sweep the classification table must use this rather than
+/// `Sysno::iter()`, which stops one short and silently drops the last row.
+pub fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
+    syscall_classification::all_pinned_syscalls()
+}
+
+/// Returns whether the audited runtime policy classifies `sysno` as
+/// `Determinized` — that is, Detcore either models the syscall with a handler
+/// or applies an explicit deterministic refusal policy to it.
+///
+/// This is the complement of the refusal boundary below. A backend that
+/// executes guest syscalls outside `handle_syscall_event` needs BOTH: the
+/// refusal set tells it which syscalls to answer with a fixed errno, and this
+/// predicate tells it which syscalls Detcore claims to determinize at all.
+/// Running a `Determinized` syscall natively is a determinism hole even when it
+/// is not in the refusal set, because the modelling that makes it deterministic
+/// lives in a handler the backend never entered.
+pub fn is_determinized_syscall(sysno: Sysno) -> bool {
+    matches!(
+        syscall_classification::classify_syscall(sysno),
+        syscall_classification::SyscallClassification::Determinized
+    )
+}
+
 /// Returns whether `sysno` is a kernel-keyring syscall (`add_key`,
 /// `request_key`, `keyctl`) that Detcore hides behind a deterministic
 /// `CONFIG_KEYS`-absent boundary under strict mode.
@@ -924,10 +965,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::pread64,
                 Sysno::lseek,
                 Sysno::fadvise64,
+                Sysno::brk,
                 Sysno::mmap,
                 Sysno::madvise,
                 Sysno::munmap,
                 Sysno::mremap,
+                Sysno::mprotect,
+                Sysno::pkey_mprotect,
                 Sysno::fcntl,
                 Sysno::arch_prctl,
                 Sysno::ioctl,
@@ -1074,9 +1118,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
             // strict guests execute those syscalls natively against the host,
             // exactly the leak the DBT copied-child path also had to close.
-            subscription.syscalls(Sysno::iter().filter(|sysno| {
-                syscall_classification::is_deterministically_refused_syscall(*sysno)
-            }));
+            // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
+            // stops one short of the end of the table, which silently dropped
+            // `lsm_list_modules` out of this sweep.
+            subscription.syscalls(
+                syscall_classification::all_pinned_syscalls().filter(|sysno| {
+                    syscall_classification::is_deterministically_refused_syscall(*sysno)
+                }),
+            );
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
@@ -2366,6 +2415,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
         };
 
+        if res.is_ok() && syscall_invalidates_procfs_maps(call.number()) {
+            guest.thread_state().invalidate_procfs_maps_snapshots();
+        }
+
         detlog!(
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",
             dettid,
@@ -2479,6 +2532,65 @@ mod subscription_tests {
         }
     }
 
+    /// The last row of the pinned table is the one a `Sysno::iter()` sweep
+    /// drops. `lsm_list_modules` is Determinized AND deterministically refused,
+    /// so before this was fixed it executed natively against the host under
+    /// `--passthru-opt` — which is the default for `hermit record` and
+    /// `hermit replay` — instead of receiving its fixed refusal.
+    #[test]
+    fn passthru_opt_covers_the_final_row_of_the_pinned_table() {
+        let last = Sysno::last();
+        // Guard the premise: if the table endpoint moves, this test must be
+        // re-derived rather than silently passing on a different syscall.
+        assert_eq!(last, Sysno::lsm_list_modules);
+        assert!(crate::is_determinized_syscall(last));
+        assert!(crate::is_deterministically_refused_syscall(last));
+        // The bug this pins: the final row is absent from `Sysno::iter()`.
+        assert!(!Sysno::iter().any(|sysno| sysno == last));
+
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        assert!(
+            subscriptions.iter_syscalls().any(|sysno| sysno == last),
+            "{last} must be intercepted under passthru_opt; it is deterministically refused"
+        );
+    }
+
+    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
+    /// syscalls does each subscription path actually deliver to Detcore?
+    ///
+    /// `passthru_opt` is not a niche flag: `record_or_replay_config` turns it on
+    /// for every `hermit record` / `hermit replay`, so this census is the record
+    /// and replay coverage too.
+    #[test]
+    fn census_determinized_syscalls_reaching_each_subscription_path() {
+        let determinized: Vec<Sysno> = crate::all_pinned_syscalls()
+            .filter(|sysno| crate::is_determinized_syscall(*sysno))
+            .collect();
+        let m = determinized.len();
+
+        for passthru_opt in [false, true] {
+            let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
+            let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+            let (reached, missing): (Vec<Sysno>, Vec<Sysno>) = determinized
+                .iter()
+                .partition(|sysno| delivered.contains(sysno));
+            println!(
+                "subscriptions passthru_opt={passthru_opt}: {}/{m} Determinized syscalls \
+                 delivered to Detcore; {} bypass it",
+                reached.len(),
+                missing.len()
+            );
+            println!(
+                "  bypassing: {}",
+                missing
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+
     #[test]
     fn strict_subscriptions_intercept_every_event_by_default() {
         let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
@@ -2536,6 +2648,29 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::pidfd_open)
         );
+    }
+
+    #[test]
+    fn passthru_opt_intercepts_every_maps_mutation() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        for expected in [
+            Sysno::mmap,
+            Sysno::munmap,
+            Sysno::mremap,
+            Sysno::mprotect,
+            Sysno::brk,
+            Sysno::pkey_mprotect,
+        ] {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|actual| actual == expected),
+                "passthru-opt omitted maps mutation {expected:?}"
+            );
+            assert!(syscall_invalidates_procfs_maps(expected));
+        }
+        assert!(!syscall_invalidates_procfs_maps(Sysno::read));
     }
 }
 
