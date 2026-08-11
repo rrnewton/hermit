@@ -33,7 +33,10 @@ fn reap_all(expected: usize) -> Vec<(libc::pid_t, i32)> {
     for _ in 0..expected {
         let mut status: libc::c_int = 0;
         let pid = unsafe { libc::wait(&mut status) };
-        assert!(pid > 0, "wait() failed with {pid} before all children were reaped");
+        assert!(
+            pid > 0,
+            "wait() failed with {pid} before all children were reaped"
+        );
         assert!(
             libc::WIFEXITED(status),
             "child {pid} did not exit normally; status {status:#x}"
@@ -90,7 +93,11 @@ fn fork_order_and_pid_assignment_are_deterministic() {
             "REAP ORDER changed: children were created {pids:?} but reaped {reaped_pids:?}"
         );
         let codes: Vec<i32> = reaped.iter().map(|(_, c)| *c).collect();
-        assert_eq!(codes, vec![0, 1, 2, 3], "exit codes did not follow creation order");
+        assert_eq!(
+            codes,
+            vec![0, 1, 2, 3],
+            "exit codes did not follow creation order"
+        );
     });
 }
 
@@ -106,7 +113,11 @@ fn reap_order_is_stable_across_repeated_generations() {
             let reaped = reap_all(pids.len());
             let order: Vec<usize> = reaped
                 .iter()
-                .map(|(p, _)| pids.iter().position(|q| q == p).expect("reaped an unknown pid"))
+                .map(|(p, _)| {
+                    pids.iter()
+                        .position(|q| q == p)
+                        .expect("reaped an unknown pid")
+                })
                 .collect();
             generations.push(order);
         }
@@ -132,7 +143,10 @@ fn exec_preserves_child_identity_and_exit_status() {
         let mut status: libc::c_int = 0;
         let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
         assert_eq!(reaped, pid, "exec changed the pid observed by the parent");
-        assert!(libc::WIFEXITED(status), "exec'd child did not exit normally");
+        assert!(
+            libc::WIFEXITED(status),
+            "exec'd child did not exit normally"
+        );
         assert_eq!(
             libc::WEXITSTATUS(status),
             0,

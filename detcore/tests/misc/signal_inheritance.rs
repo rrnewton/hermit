@@ -106,7 +106,10 @@ fn fork_child_inherits_the_blocked_signal_mask() {
 #[test]
 fn fork_child_inherits_handler_dispositions() {
     super::det_test_fn_without_pmu(|| {
-        set_disposition(libc::SIGUSR1, noop_handler as *const () as libc::sighandler_t);
+        set_disposition(
+            libc::SIGUSR1,
+            noop_handler as *const () as libc::sighandler_t,
+        );
         set_disposition(libc::SIGUSR2, libc::SIG_IGN);
         let custom = disposition(libc::SIGUSR1);
         in_child("fork disposition-inheritance", || {
@@ -230,7 +233,10 @@ fn exec_resets_custom_handlers_but_keeps_ignore() {
         // handler's code no longer exists in the new image. Signals set to SIG_IGN
         // stay ignored. Getting this backwards is a classic source of a "lost"
         // signal after exec, and it is invisible until that signal arrives.
-        set_disposition(libc::SIGUSR1, noop_handler as *const () as libc::sighandler_t);
+        set_disposition(
+            libc::SIGUSR1,
+            noop_handler as *const () as libc::sighandler_t,
+        );
         set_disposition(libc::SIGUSR2, libc::SIG_IGN);
 
         let pid = unsafe { libc::fork() };
