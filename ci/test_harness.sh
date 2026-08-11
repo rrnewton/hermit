@@ -374,8 +374,13 @@ CARGO_SHIM
     )
     [[ -z $uncovered ]] ||
         die "metadata consumer subcommand(s) outside this audit's scope:$uncovered"
+    # Sum with awk, not `paste -sd+ - | bc`: bc is NOT part of this harness's
+    # tool contract. It appears on main only as a *guest payload* inside
+    # ci/compat/corpus-*.json, and the privileged runner image does not ship it,
+    # so the bc form exited 127 here and took e2e.metadata down with it. awk is
+    # the idiom the very next line already uses for the same summation.
     dag_consumers=$(jq -r '[.steps[] | select(.cmd | test("\\./ci/test_harness\\.sh (run|build|plan|validate)( |$)"))] | length' \
-        "$DAG_ROOT"/*.json | paste -sd+ - | bc)
+        "$DAG_ROOT"/*.json | awk '{s+=$1} END {print s+0}')
     workflow_consumers=$(grep -rcoE '\./ci/test_harness\.sh (run|build|plan|validate)( |$)' \
         "$ROOT_DIR/.github/workflows/" | awk -F: '{s+=$2} END {print s+0}')
     ((dag_consumers > 0)) || die "no DAG metadata consumers found"
