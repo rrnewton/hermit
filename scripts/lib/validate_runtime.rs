@@ -746,10 +746,39 @@ fn cgroup_identity(text: &str) -> Result<(String, String, String, String), Strin
     ))
 }
 
+fn confirm_exited_after_empty_cmdline(
+    proc_root: &Path,
+    pid: i32,
+    initial_state: char,
+    initial_start_ticks: u64,
+) -> std::io::Result<char> {
+    if matches!(initial_state, 'Z' | 'X' | 'x') {
+        return Ok(initial_state);
+    }
+    let stat_text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))?;
+    let (state, _, _, _, start_ticks) = parse_proc_stat(&stat_text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if start_ticks != initial_start_ticks {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "empty-cmdline PID identity changed start_ticks {initial_start_ticks}->{start_ticks}"
+            ),
+        ));
+    }
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return Ok(state);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "empty cmdline for live userspace process",
+    ))
+}
+
 fn read_process_record(proc_root: &Path, pid: i32) -> std::io::Result<ProcessRecord> {
     let process = proc_root.join(pid.to_string());
     let stat_text = std::fs::read_to_string(process.join("stat"))?;
-    let (state, ppid, pgid, flags, start_ticks) = parse_proc_stat(&stat_text)
+    let (mut state, ppid, pgid, flags, start_ticks) = parse_proc_stat(&stat_text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let cmdline = std::fs::read(process.join("cmdline"))?;
     let argv: Vec<String> = cmdline
@@ -764,11 +793,12 @@ fn read_process_record(proc_root: &Path, pid: i32) -> std::io::Result<ProcessRec
             })
         })
         .collect::<std::io::Result<Vec<_>>>()?;
-    if argv.is_empty() && !matches!(state, 'Z' | 'X' | 'x') && flags & PF_KTHREAD == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "empty cmdline for live userspace process",
-        ));
+    if argv.is_empty() && flags & PF_KTHREAD == 0 {
+        // A process may exit between the stat and cmdline reads. Re-read stat
+        // and accept only the same kernel identity in an explicit terminal
+        // state; an empty cmdline for a still-live or PID-reused process stays
+        // unresolved. This is the zombie form of the genuine-exit race.
+        state = confirm_exited_after_empty_cmdline(proc_root, pid, state, start_ticks)?;
     }
     let cgroup_text = std::fs::read_to_string(process.join("cgroup"))?;
     let (cgroup, cgroup_path, systemd_unit, systemd_unit_cgroup) =
@@ -1368,7 +1398,6 @@ impl PeerSnapshotMonitor {
     /// Production hard-binds `/proc` and the uid-derived runtime lock.  There is
     /// intentionally no environment override for either authority input.
     pub fn start_production(
-        socket_dir: &Path,
         owner_pid: i32,
         controller_start_ticks: u64,
     ) -> Result<Self, SnapshotUnresolved> {
@@ -1383,7 +1412,10 @@ impl PeerSnapshotMonitor {
         Self::start_at(
             PathBuf::from("/proc"),
             runtime.join("hermit-validate-peer-snapshot.lock"),
-            socket_dir.join("peer-monitor.sock"),
+            runtime.join(format!(
+                "hermit-validate-peer-{}-{controller_start_ticks}.sock",
+                std::process::id()
+            )),
             owner_pid,
             std::process::id() as i32,
             controller_start_ticks,
@@ -2281,6 +2313,60 @@ pub fn self_test() -> Result<String, String> {
         return Err(format!("peer exit race: vanished PID remained a peer: {exit_snapshot:?}"));
     }
 
+    // Genuine exit race, zombie form: stat initially identified a live
+    // userspace process, then an empty cmdline coincided with the SAME process
+    // reaching Z. That is proved exit, not unknown evidence. A live empty-
+    // cmdline process and PID reuse remain refused.
+    write_fake_process(
+        &exit_proc,
+        50,
+        1,
+        50,
+        50,
+        &[],
+        "/user.slice/user@1000.service/app.slice/validate-Z.service",
+        0,
+    )?;
+    let zombie_stat = std::fs::read_to_string(exit_proc.join("50/stat"))
+        .map_err(|e| format!("zombie fixture stat read: {e}"))?
+        .replacen(") S ", ") Z ", 1);
+    std::fs::write(exit_proc.join("50/stat"), zombie_stat)
+        .map_err(|e| format!("zombie fixture stat: {e}"))?;
+    if confirm_exited_after_empty_cmdline(&exit_proc, 50, 'S', 50)
+        .map_err(|e| format!("zombie exit race was refused: {e}"))?
+        != 'Z'
+    {
+        return Err("zombie exit race did not preserve the terminal state".into());
+    }
+    if read_process_record(&exit_proc, 50)
+        .map_err(|e| format!("terminal zombie evidence was refused: {e}"))?
+        .state
+        != 'Z'
+    {
+        return Err("terminal zombie record did not remain terminal".into());
+    }
+    let live_stat = std::fs::read_to_string(exit_proc.join("50/stat"))
+        .map_err(|e| format!("live empty-cmdline fixture stat read: {e}"))?
+        .replacen(") Z ", ") S ", 1);
+    std::fs::write(exit_proc.join("50/stat"), live_stat)
+        .map_err(|e| format!("live empty-cmdline fixture stat: {e}"))?;
+    if confirm_exited_after_empty_cmdline(&exit_proc, 50, 'S', 50).is_ok() {
+        return Err("live empty-cmdline userspace process was laundered as exited".into());
+    }
+    write_fake_process(
+        &exit_proc,
+        50,
+        1,
+        50,
+        51,
+        &[],
+        "/user.slice/user@1000.service/app.slice/validate-Z.service",
+        0,
+    )?;
+    if confirm_exited_after_empty_cmdline(&exit_proc, 50, 'S', 50).is_ok() {
+        return Err("reused PID with an empty cmdline was laundered as exited".into());
+    }
+
     // Persistent unreadable numeric PID: UNKNOWN, not absent.  A later clean
     // snapshot cannot recover the sticky state to authority.
     let unresolved = collect_peer_snapshot_with(
@@ -2484,7 +2570,7 @@ pub fn self_test() -> Result<String, String> {
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
          registry census 1 live / 1 stale-reaped / 1 cpu-active, peer identity 1 same-service \
-         self / 1 different-unit peer, peer scan 1 genuine-exit accept / 1 persistent-unreadable \
+         self / 1 different-unit peer, peer scan 2 genuine-exit accepts (vanish + zombie) / 1 persistent-unreadable \
          sticky-refuse, monitor 1 legitimate final-ack / 1 same-uid non-owner refuse / 1 replay-refuse"
     ))
 }
