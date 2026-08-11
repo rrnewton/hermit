@@ -4,8 +4,12 @@ This directory tracks executable parity contracts across Hermit's ptrace,
 DynamoRIO (DBT), and KVM backends. The case catalog and its small set of known
 gaps live in `run_matrix.py`; new cases are green contracts by default. Live
 results are compatibility measurement state, so when Hermit is checked out
-inside dev-hermit the runner appends them to the outer
-`compat-envelope/scorecard.csv` instead of maintaining a generated TSV here.
+inside dev-hermit the runner writes them to one ignored per-run observation
+file under `compat-envelope/ignored/backend-parity/` instead of maintaining a
+generated TSV here. It does **not** touch the tracked
+`compat-envelope/scorecard.csv`; that artifact is advanced only by the parent
+publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
+runner prints at the end of the run.
 
 ## Current ratchet
 
@@ -339,9 +343,15 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Every non-check run auto-discovers an outer dev-hermit checkout and appends
-scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
-to select another outer scorecard, `--no-parent-scorecard` for a deliberately
+Every non-check run auto-discovers an outer dev-hermit checkout and writes its
+observation rows to one ignored per-run file,
+`compat-envelope/ignored/backend-parity/<run-id>.csv`; the tracked
+`compat-envelope/scorecard.csv` is left unchanged. The run then prints the exact
+`publish-scorecard.py --observation ... --current ... --history ...` command that
+folds that observation into the tracked scorecard and its history, so publishing
+is a reviewed step rather than a side effect of measuring. Use
+`--parent-scorecard PATH` to write the observation to that exact artifact instead
+of the default per-run file, `--no-parent-scorecard` for a deliberately
 side-effect-free run, or `--output /tmp/backend-parity.tsv` for the legacy
 standalone observation TSV. `BLOCKED` means a required host capability or
 runtime artifact was absent; it does not change the known-gap contract.

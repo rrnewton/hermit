@@ -24,9 +24,12 @@ BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
 
 # The compatibility scorecard is measurement state, not Hermit source.  When
-# this checkout is nested in dev-hermit, live observations are appended to the
-# outer workspace's canonical scorecard.  Standalone Hermit clones simply skip
-# that side effect unless --parent-scorecard is supplied.
+# this checkout is nested in dev-hermit, live observations are written to one
+# ignored per-run file under compat-envelope/ignored/backend-parity/.  The
+# tracked compat-envelope/scorecard.csv is advanced only by the parent
+# publisher, publish-scorecard.py, so measuring never mutates it.  Standalone
+# Hermit clones simply skip that side effect unless --parent-scorecard is
+# supplied.
 SCORECARD_HEADER = (
     "run_id",
     "run_utc",
