@@ -822,6 +822,8 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    compat_known_failclosed_bracket()?;
+    compat_summary_consumer_bracket()?;
     coverage_schema_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_path_resolution_bracket()?;
@@ -2990,14 +2992,285 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     }
 }
 
+/// What one measured compatibility row means: does it block, and what must be said about it.
+#[derive(Debug, PartialEq, Eq)]
+struct CompatDisposition {
+    blocking: bool,
+    warning: Option<String>,
+}
+
+/// Classify one measured compatibility row, without printing or mutating anything.
+///
+/// THE DEFECT THIS EXISTS TO CLOSE. Both `known_failclosed` branches used to be gated on
+/// `CompatMode::Strict`, and the lane that actually gates main runs `CompatMode::PortableStrict`.
+/// So on that lane the table was INERT IN BOTH DIRECTIONS AND SILENT IN BOTH. Measured on run
+/// 31344267499: `wget-localhost` is listed and was counted a blocking failure anyway, while `make`
+/// is listed, RAN AND PASSED, and produced no stale-entry warning — zero warnings of either kind
+/// in the whole job log. A classification that changes nothing and announces nothing is not a
+/// classification; it is a comment.
+///
+/// WHAT THIS DOES *NOT* DO, DELIBERATELY: it does not make a single failing row nonblocking on
+/// `PortableStrict`. Honouring the table's exemption there would flip `wget-localhost` — the row
+/// currently gating the lane at program 58 of 191 — from blocking to passing, which is exactly the
+/// "make it nonblocking to get green" move that is forbidden. Blocking behaviour on BOTH modes is
+/// therefore byte-for-byte what it was; the entire change is that the table is now consulted and
+/// its verdict is SAID OUT LOUD on the lane where it was mute.
+fn compat_disposition(
+    mode: CompatMode,
+    label: &str,
+    ok: bool,
+    known: &BTreeMap<&str, &str>,
+    diagnostic: &BTreeMap<&str, &str>,
+) -> CompatDisposition {
+    // The fail-closed expectations describe `--strict` behaviour, and PortableStrict runs the same
+    // corpus with `--strict`. Both strict modes therefore CONSULT the table; they differ only in
+    // whether it exempts.
+    let strict_mode = matches!(mode, CompatMode::Strict | CompatMode::PortableStrict);
+    let listed = if strict_mode { known.get(label).copied() } else { None };
+
+    if ok {
+        // A LISTED ROW THAT PASSES IS A STALE EXPECTATION, and saying so is how a fixed bug stops
+        // being recorded as broken. This is the direction that was silent for `make`.
+        return CompatDisposition {
+            blocking: false,
+            warning: listed.map(|reason| {
+                format!(
+                    "{label} PASSED but is still listed in the known fail-closed table ({reason}) — the expectation is STALE; drop the row"
+                )
+            }),
+        };
+    }
+    if let Some(reason) = listed {
+        return match mode {
+            // Strict keeps its historical exemption: the row stays visible and nonblocking.
+            CompatMode::Strict => CompatDisposition {
+                blocking: false,
+                warning: Some(format!(
+                    "{label} failed as the known fail-closed table expects ({reason}; nonblocking under --strict)"
+                )),
+            },
+            // PortableStrict REPORTS the expectation and still blocks on it. The row's reason is
+            // an unaudited claim — two of the four were measured refuted by native syscall trace —
+            // so it is surfaced for audit, never used to excuse a red on the gating lane.
+            _ => CompatDisposition {
+                blocking: true,
+                warning: Some(format!(
+                    "{label} failed and IS listed in the known fail-closed table ({reason}), but that table does not exempt this lane — counted BLOCKING. Either the row's reason is stale or this lane needs an explicit decision"
+                )),
+            },
+        };
+    }
+    if mode == CompatMode::PortableStrict {
+        if let Some(reason) = diagnostic.get(label).copied() {
+            return CompatDisposition {
+                blocking: false,
+                warning: Some(format!("{label} is a bounded portable diagnostic: {reason}")),
+            };
+        }
+    }
+    CompatDisposition { blocking: true, warning: None }
+}
+
+/// Two-sided bracket for the known-failclosed consumer, with counts, plus blocking controls.
+///
+/// EXERCISES THE TABLE LOOKUP, not a pre-resolved answer: the planted rows go into a planted map
+/// and the classifier does its own `get`. A bracket that hands the function the conclusion tests
+/// the formatter and nothing else — the same shape of hole as the defect it guards.
+fn compat_known_failclosed_bracket() -> Result<(), String> {
+    let reason = "planted known-failclosed expectation";
+    let known = BTreeMap::from([
+        ("planted-known-failure", reason),
+        ("planted-stale-expectation", reason),
+    ]);
+    let diagnostic = BTreeMap::from([("planted-diagnostic", "planted bounded diagnostic")]);
+    let mut warned = 0usize;
+    let mut blocked = 0usize;
+
+    // 1) POSITIVE, the direction that was silent: a listed row that fails is NAMED on the gating
+    //    lane, and still blocks there.
+    let expected = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    let text = expected.warning.clone().unwrap_or_default();
+    if !expected.blocking {
+        return Err(
+            "compat bracket: a listed failure must STILL BLOCK on PortableStrict — exempting it would turn the gating lane green by table entry"
+                .to_string(),
+        );
+    }
+    if !text.contains("planted-known-failure") || !text.contains(reason) || !text.contains("BLOCKING")
+    {
+        return Err(format!(
+            "compat bracket: a listed failure must be named with its reason and its blocking status; got {text:?}"
+        ));
+    }
+    warned += 1;
+    blocked += 1;
+
+    // 2) POSITIVE, the other direction: a listed row that PASSES is called out as stale. This is
+    //    the `make` case, which produced no warning at all.
+    let stale = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-stale-expectation",
+        true,
+        &known,
+        &diagnostic,
+    );
+    let text = stale.warning.clone().unwrap_or_default();
+    if stale.blocking || !text.contains("STALE") || !text.contains("planted-stale-expectation") {
+        return Err(format!(
+            "compat bracket: a listed row that passes must warn that the expectation is stale; got blocking={} {text:?}",
+            stale.blocking
+        ));
+    }
+    warned += 1;
+
+    // 3) Strict keeps its historical exemption, so the two modes are provably distinguished.
+    let strict = compat_disposition(
+        CompatMode::Strict,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if strict.blocking || strict.warning.is_none() {
+        return Err("compat bracket: Strict must keep its nonblocking exemption and warn".to_string());
+    }
+    warned += 1;
+
+    // 4) NEGATIVE CONTROL: an UNLISTED failure blocks silently, exactly as before. Without this,
+    //    every assertion above is satisfiable by a classifier that warns about everything.
+    let unlisted = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-unlisted-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if !unlisted.blocking || unlisted.warning.is_some() {
+        return Err("compat bracket: an unlisted failure must block, with no warning".to_string());
+    }
+    blocked += 1;
+
+    // 5) NEGATIVE CONTROL: a non-strict mode must not consult the table at all, or the exemption
+    //    would leak into Sabre/E9patch/Rr where it was never intended.
+    let other = compat_disposition(
+        CompatMode::Sabre,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if !other.blocking || other.warning.is_some() {
+        return Err("compat bracket: a non-strict mode must not consult the fail-closed table".to_string());
+    }
+    blocked += 1;
+
+    println!(
+        "  self-test: compat known-failclosed bracket OK ({warned} warned, {blocked} blocking, 2 negative controls)"
+    );
+    Ok(())
+}
+
+/// Bracket the CONSUMER on the real table, not only the pure classifier.
+///
+/// PROXY BINDING: proving `compat_disposition` behaves says nothing about whether
+/// `print_compat_summary` calls it, or whether it reads the REAL `known_failclosed()`. The defect
+/// being fixed was exactly a correct table with no consumer. So this drives the actual summary
+/// function with synthetic outcomes for real table labels and asserts the blocking set it returns.
+fn compat_summary_consumer_bracket() -> Result<(), String> {
+    let known = validate_corpus::known_failclosed();
+    let mut labels = known.keys();
+    let (Some(listed_a), Some(listed_b)) = (labels.next(), labels.next()) else {
+        return Err("compat consumer bracket: the known fail-closed table needs >= 2 rows".to_string());
+    };
+    let outcomes = vec![
+        StepOutcome::failed(
+            format!("compat.{listed_a}"),
+            0.0,
+            String::new(),
+            Some(1),
+            false,
+            0,
+            false,
+            0,
+            false,
+            0,
+            false,
+        ),
+        StepOutcome::passed(format!("compat.{listed_b}"), 0.0, String::new(), Some(0)),
+        StepOutcome::failed(
+            "compat.planted-unlisted".to_string(),
+            0.0,
+            String::new(),
+            Some(1),
+            false,
+            0,
+            false,
+            0,
+            false,
+            0,
+            false,
+        ),
+    ];
+    let (passed, measured, blocking, warnings) =
+        print_compat_summary(CompatMode::PortableStrict, &outcomes);
+    if (passed, measured) != (1, 3) {
+        return Err(format!(
+            "compat consumer bracket: expected 1 passed of 3 measured, got {passed}/{measured}"
+        ));
+    }
+    // The listed FAILURE still blocks on the gating lane, and the unlisted one always did.
+    // Exempting either would be the forbidden "go green by table entry".
+    if !blocking.contains(&listed_a.to_string())
+        || !blocking.contains(&"planted-unlisted".to_string())
+        || blocking.len() != 2
+    {
+        return Err(format!(
+            "compat consumer bracket: expected both failures blocking, got {blocking:?}"
+        ));
+    }
+    // THE DIRECTION THAT DISTINGUISHES FIXED FROM BROKEN. Blocking behaviour is unchanged by
+    // design, so the blocking assertions above pass on the OLD inert code too. The warnings are
+    // the only observable difference: one for the listed failure, one for the stale pass, plus
+    // one per listed row this synthetic run never measured.
+    let unmeasured = known.len().saturating_sub(2);
+    let want = 2 + unmeasured;
+    if warnings != want {
+        return Err(format!(
+            "compat consumer bracket: expected {want} warning(s) (listed failure + stale pass + \
+             {unmeasured} unmeasured row(s)), got {warnings}"
+        ));
+    }
+    println!(
+        "  self-test: compat summary consumer bracket OK (real table, {} row(s); 2 blocking, {warnings} warning(s))",
+        known.len()
+    );
+    Ok(())
+}
+
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
-fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
+/// Returns `(passed, measured, blocking, warnings)`.
+///
+/// THE WARNING COUNT IS RETURNED, NOT JUST PRINTED, so a test can bind to it. Without it the only
+/// observable difference between this and the inert version is text on stdout, and a bracket that
+/// cannot see the warnings cannot tell a fixed classifier from the broken one it replaced — which
+/// is the very failure mode under repair.
+fn print_compat_summary(
+    mode: CompatMode,
+    outcomes: &[StepOutcome],
+) -> (usize, usize, Vec<String>, usize) {
     let known = validate_corpus::known_failclosed();
     let diag = validate_corpus::portable_diagnostic();
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
+    let mut warnings = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
@@ -3008,14 +3281,13 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
         if o.ok {
             e.0 += 1;
             passed += 1;
-            if mode == CompatMode::Strict && known.contains_key(label) {
-                println!("  WARN {label} unexpectedly passed fail-closed --strict; drop it from the known-failure table");
-            }
-        } else if mode == CompatMode::Strict && known.contains_key(label) {
-            println!("  WARN {label} known fail-closed under --strict ({}; nonblocking)", known[label]);
-        } else if mode == CompatMode::PortableStrict && diag.contains_key(label) {
-            println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
-        } else {
+        }
+        let d = compat_disposition(mode, label, o.ok, &known, &diag);
+        if let Some(w) = &d.warning {
+            println!("  WARN {w}");
+            warnings += 1;
+        }
+        if d.blocking {
             blocking_failures.push(label.to_string());
         }
     }
@@ -3030,6 +3302,31 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
     println!("{}", "-".repeat(46));
     println!("{:<22} | {measured:>8} | {:>9}", "TOTAL", format!("{passed}/{measured}"));
     println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
+    // AUDIT THE TABLE ITSELF, not only the rows it happened to touch. A listed row that this run
+    // never measured is unaudited for this run, which is the same silent-inertness in a different
+    // guise: the reader sees a table and assumes every line of it was checked.
+    if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+        let measured_labels: BTreeSet<&str> = outcomes
+            .iter()
+            .filter_map(|o| o.tag.strip_prefix("compat."))
+            .collect();
+        let unmeasured: Vec<&&str> = known
+            .keys()
+            .filter(|l| !measured_labels.contains(**l))
+            .collect();
+        // An unaudited row is a warning in its own right, so it is COUNTED as one. A tally that
+        // omitted it would report "0 warnings" for a run that checked none of the table.
+        warnings += unmeasured.len();
+        println!(
+            "known fail-closed table: {} row(s), {} measured this run, {} not measured; {warnings} warning(s) emitted",
+            known.len(),
+            known.len() - unmeasured.len(),
+            unmeasured.len()
+        );
+        for label in &unmeasured {
+            println!("  WARN {label} is listed as a known fail-closed expectation but was NOT measured in this run; the row is unaudited here");
+        }
+    }
     if mode == CompatMode::Rr {
         // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
         // that silently drops five known divergences reads as full coverage.
@@ -3042,7 +3339,7 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             println!("  - {label}: {why}");
         }
     }
-    (passed, measured, blocking_failures)
+    (passed, measured, blocking_failures, warnings)
 }
 
 /// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
@@ -5257,7 +5554,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        let (passed, measured, blocking, _warnings) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
         compat_measured = Some(measured);
         let floor = match mode {
