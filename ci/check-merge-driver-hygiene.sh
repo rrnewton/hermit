@@ -123,16 +123,38 @@ for driver in "${!bound_drivers[@]}"; do
          see. Fix: define it in a tracked file, or remove the binding."
         continue
     fi
-    # Locate the program: the first token that looks like a path.
+    # Locate the program: the first token that is not a %-placeholder or an
+    # option. A token WITHOUT a slash is resolved by git through PATH, so it
+    # names a machine-local executable that no reviewer of this repository can
+    # see -- exactly the thing this check exists to refuse. Selecting only
+    # slash-bearing tokens used to leave `program` empty for that case and the
+    # `-n $program` guard below then FAILED OPEN.
     program=""
     for token in $command; do
         case "$token" in
             %*) continue ;;
             -*) continue ;;
-            */*) program=$token; break ;;
+            *) program=$token; break ;;
         esac
     done
-    [[ -n $program ]] || continue
+    if [[ -z $program ]]; then
+        report "merge driver '$driver' has a merge.$driver.driver command
+         ('$command') with no program token at all. A driver whose program cannot
+         be identified cannot be reviewed.
+         Fix: define the driver as a repo-relative path, e.g. ./ci/my-driver.sh."
+        continue
+    fi
+    case "$program" in
+        */*) ;;
+        *)
+            report "merge driver '$driver' runs '$program', a BARE COMMAND NAME.
+         git resolves it through PATH, so which executable rewrites your committed
+         content depends on the machine, not on anything a reviewer can see -- and
+         nothing in this repository pins it.
+         Fix: point the driver at a tracked repo-relative path, e.g. ./ci/$program."
+            continue
+            ;;
+    esac
     if git ls-files --error-unmatch "$program" >/dev/null 2>&1; then
         continue
     fi
