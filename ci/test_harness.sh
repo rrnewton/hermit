@@ -944,6 +944,61 @@ function assert_privileged_diagnostics {
 # implementation must stay absent; the root validate.sh is an exact, behaviorless
 # reminder alias, while Make, workflows, and DAGs call Rust directly.
 #
+# The merged backend-agnostic corpus (`ci/compat/corpus.json`) is the single
+# source of truth for WHICH PROGRAMS Hermit is measured against; the four
+# `corpus-<mode>.json` files are VIEWS of it, kept for the mode-driven validate
+# path. This asserts the views are still exactly re-derivable.
+#
+# Why it is a gate and not a comment: the merge's entire value is that it changed
+# STRUCTURE and not BEHAVIOUR. Without a check, editing one side and not the
+# other silently changes what CI runs — and it would change it in the direction
+# nobody notices, since a program quietly dropped from a view simply stops being
+# measured and no cell goes red. Absence is silence; that is the defect this
+# whole corpus exists to remove, so it must not reappear in the corpus itself.
+#
+# Implemented in python3 (already a hard dependency of this gate, cf. the
+# `split_asymmetric_pr.py --self-test` call) rather than by shelling out to
+# `ci/compat/merge-corpus.rs`, so the assertion cannot be skipped on a host
+# without the rust-script interpreter. A gate that silently skips is worse than
+# no gate. `ci/compat/merge-corpus.rs verify` performs the identical comparison
+# for humans and prints a fuller diff.
+function assert_compat_corpus_equivalence {
+    local dir="$ROOT_DIR/ci/compat"
+    [[ -f $dir/corpus.json ]] ||
+        die "ci/compat/corpus.json is missing; regenerate with ci/compat/merge-corpus.rs generate"
+    python3 - "$dir" <<'PY' || die "compat corpus views are not re-derivable from corpus.json"
+import json, sys, pathlib
+d = pathlib.Path(sys.argv[1])
+merged = json.loads((d / "corpus.json").read_text())
+if merged.get("schema") != "hermit-compat-corpus/v1":
+    print(f"corpus.json schema is {merged.get('schema')!r}, expected 'hermit-compat-corpus/v1'")
+    raise SystemExit(1)
+bad, counts = [], []
+for mode in ("strict", "sabre", "e9patch", "rr"):
+    legacy = {r["label"]: r["argv"] for r in json.loads((d / f"corpus-{mode}.json").read_text())["rows"]}
+    derived = {}
+    for p in merged["programs"]:
+        if mode not in p.get("modes", []):
+            continue
+        derived[p["label"]] = p.get("mode_argv", {}).get(mode, p["argv"])
+    counts.append(f"{mode} {len(derived)}/{len(legacy)}")
+    for label, argv in legacy.items():
+        if label not in derived:
+            bad.append(f"{mode}: LOST program {label!r}")
+        elif derived[label] != argv:
+            bad.append(f"{mode}: {label!r} argv differs")
+    for label in derived:
+        if label not in legacy:
+            bad.append(f"{mode}: INVENTED program {label!r}")
+if bad:
+    for b in bad[:20]:
+        print(b)
+    print(f"{len(bad)} discrepanc(y/ies)")
+    raise SystemExit(1)
+print(f"PASS: {len(merged['programs'])} corpus programs; every per-mode view re-derived exactly [{', '.join(counts)}]")
+PY
+}
+
 # These assertions replace the former `assert_validate_entrypoint` audits over
 # bash function bodies. The property audited is unchanged and is the one that
 # matters: a validate profile's node set comes from the AUDITED DAG FILES and
@@ -2938,6 +2993,7 @@ case "$subcommand" in
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
+        assert_compat_corpus_equivalence
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
