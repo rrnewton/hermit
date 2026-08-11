@@ -749,12 +749,13 @@ fn cgroup_identity(text: &str) -> Result<(String, String, String, String), Strin
 fn confirm_exited_after_empty_cmdline(
     proc_root: &Path,
     pid: i32,
-    initial_state: char,
+    _initial_state: char,
     initial_start_ticks: u64,
 ) -> std::io::Result<char> {
-    if matches!(initial_state, 'Z' | 'X' | 'x') {
-        return Ok(initial_state);
-    }
+    // Always re-read stat, even when the first observation was already
+    // terminal.  The empty-cmdline read sits between the two observations, so
+    // a terminal PID can be reaped and reused during that window just as a live
+    // PID can.  Accept only the same kernel identity in a terminal state.
     let stat_text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))?;
     let (state, _, _, _, start_ticks) = parse_proc_stat(&stat_text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -2366,6 +2367,14 @@ pub fn self_test() -> Result<String, String> {
     if confirm_exited_after_empty_cmdline(&exit_proc, 50, 'S', 50).is_ok() {
         return Err("reused PID with an empty cmdline was laundered as exited".into());
     }
+    let reused_zombie_stat = std::fs::read_to_string(exit_proc.join("50/stat"))
+        .map_err(|e| format!("initial-z reuse fixture stat read: {e}"))?
+        .replacen(") S ", ") Z ", 1);
+    std::fs::write(exit_proc.join("50/stat"), reused_zombie_stat)
+        .map_err(|e| format!("initial-z reuse fixture stat: {e}"))?;
+    if confirm_exited_after_empty_cmdline(&exit_proc, 50, 'Z', 50).is_ok() {
+        return Err("initial-terminal PID reuse was laundered as the original exit".into());
+    }
 
     // Persistent unreadable numeric PID: UNKNOWN, not absent.  A later clean
     // snapshot cannot recover the sticky state to authority.
@@ -2570,7 +2579,9 @@ pub fn self_test() -> Result<String, String> {
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
          registry census 1 live / 1 stale-reaped / 1 cpu-active, peer identity 1 same-service \
-         self / 1 different-unit peer, peer scan 2 genuine-exit accepts (vanish + zombie) / 1 persistent-unreadable \
-         sticky-refuse, monitor 1 legitimate final-ack / 1 same-uid non-owner refuse / 1 replay-refuse"
+         self / 1 different-unit peer, peer scan 2 genuine-exit accepts (vanish + zombie) / \
+         1 live-empty refuse / 2 PID-reuse refuses (live + initial-terminal) / \
+         1 persistent-unreadable sticky-refuse, monitor 1 legitimate final-ack / \
+         1 same-uid non-owner refuse / 1 replay-refuse"
     ))
 }

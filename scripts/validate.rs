@@ -129,6 +129,10 @@ const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_N
 /// non-qualifying below.
 const HISTORICAL_PRODUCER_ENV: &str = "CI_HUB_HISTORICAL_DEBUG_PRODUCER";
 const HISTORICAL_PRODUCER: &str = "validate-lock-bench-v1";
+/// Hidden, inert integration seam used only by focused admission tests.  Both
+/// values return before plan construction, product work, durable logging, or
+/// ledger publication.
+const ADMISSION_TEST_MODE_ENV: &str = "HERMIT_VALIDATE_ADMISSION_TEST_MODE";
 
 // --------------------------------------------------------------------------- args
 
@@ -4332,12 +4336,45 @@ struct CanonicalLockAuthority {
     owner_start_ticks: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalLockKind {
+    Validate,
+    Bench,
+}
+
+impl CanonicalLockKind {
+    fn for_historical_debug(historical_debug: bool) -> Self {
+        if historical_debug { Self::Bench } else { Self::Validate }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::Bench => "bench",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerAuthorityMode {
+    EstablishTopLevel,
+    InheritOuter,
+}
+
+impl PeerAuthorityMode {
+    fn for_nesting(nested: bool) -> Self {
+        if nested { Self::InheritOuter } else { Self::EstablishTopLevel }
+    }
+}
+
 /// Ask the canonical parent lock authority for the exact owner identity of this
 /// run. Production never trusts caller-supplied owner PIDs, sidecar paths, or
-/// environment overrides. The stop-test JSON seam is confined to an
-/// intrinsically non-qualifying fixture path selected before any product gate.
+/// environment overrides. JSON fixtures are confined to the intrinsically
+/// non-qualifying stop test and the two inert admission brackets, all of which
+/// return before product work or real ledger publication.
 fn canonical_validate_lock_authority(
     parent: Option<&Path>,
+    expected_kind: CanonicalLockKind,
     commit: &str,
     host: &str,
 ) -> Result<CanonicalLockAuthority, String> {
@@ -4347,7 +4384,11 @@ fn canonical_validate_lock_authority(
     ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
     }
-    let status = if stop_test_mode_enabled() {
+    let admission_fixture = matches!(
+        std::env::var(ADMISSION_TEST_MODE_ENV).as_deref(),
+        Ok("front-door" | "nested-peer")
+    );
+    let status = if stop_test_mode_enabled() || admission_fixture {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
             return Err("canonical-lock-authority-fixture-absent".into());
         };
@@ -4391,7 +4432,7 @@ fn canonical_validate_lock_authority(
             value.get("cleanup_state").and_then(serde_json::Value::as_str),
             Some("none" | "active-bound")
         )
-        || object_string(holder, "kind") != Some("validate")
+        || object_string(holder, "kind") != Some(expected_kind.as_str())
         || object_string(holder, "target") != Some(commit)
         || object_string(holder, "host") != Some(host)
         || object_string(owner, "host") != Some(host)
@@ -5043,6 +5084,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // lock record and the ledger row can never disagree about what was running.
     let profile_name =
         args.focused.as_ref().map(|f| f.profile()).unwrap_or_else(|| level_name.clone());
+    let lock_kind = CanonicalLockKind::for_historical_debug(args.historical_debug);
 
     // ---- re-entrancy (validate.sh:460) ---------------------------------------
     //
@@ -5140,7 +5182,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         };
         let commit = git_sha();
         let host = short_hostname();
-        let admitted = canonical_validate_lock_authority(Some(parent), &commit, &host).is_ok();
+        let admitted =
+            canonical_validate_lock_authority(Some(parent), lock_kind, &commit, &host).is_ok();
         if let Some(refusal) = product_front_door_refusal(
             parent,
             &root,
@@ -5163,7 +5206,44 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 ],
             );
         }
+
+        let peer_authority_mode = PeerAuthorityMode::for_nesting(nesting.nested);
+        match std::env::var(ADMISSION_TEST_MODE_ENV).as_deref() {
+            Ok("front-door") => {
+                return RunSummary::new(
+                    Verdict::SelfTest,
+                    0,
+                    &profile_name,
+                    vec![format!(
+                        "inert admission bracket accepted canonical {} ownership before product work",
+                        lock_kind.as_str()
+                    )],
+                );
+            }
+            Ok("nested-peer") if peer_authority_mode == PeerAuthorityMode::InheritOuter => {
+                return RunSummary::new(
+                    Verdict::SelfTest,
+                    0,
+                    &profile_name,
+                    vec![
+                        "inert nested-payload bracket inherited the outer peer authority without starting a second monitor"
+                            .into(),
+                    ],
+                );
+            }
+            Ok("nested-peer") => {
+                return RunSummary::refused(
+                    2,
+                    &profile_name,
+                    "the inert nested-payload admission bracket",
+                    vec!["the invocation did not have a live outer validate ancestor".into()],
+                );
+            }
+            _ => {}
+        }
     }
+
+    let peer_authority_mode = PeerAuthorityMode::for_nesting(nesting.nested);
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
     // durable-log setup, and registration.  A nested focused payload inherits the enclosing
@@ -5621,10 +5701,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // The authority-bearing monitor is separate from the legacy CPU telemetry
     // above. Its owner comes only from the canonical parent query; its production
     // proc root and per-uid exclusion lock are not caller-selectable.
-    let lock_authority_start = if nesting.nested {
-        Err("nested-payload-has-no-independent-authority".to_string())
+    let lock_authority_start = if peer_authority_mode == PeerAuthorityMode::InheritOuter {
+        Err("nested-payload-inherits-outer-authority".to_string())
     } else {
-        canonical_validate_lock_authority(parent.as_deref(), &commit, &host)
+        canonical_validate_lock_authority(parent.as_deref(), lock_kind, &commit, &host)
     };
     let controller_start = validate_runtime::process_start_ticks(std::process::id() as i32);
     let mut peer_monitor_start_detail = None;
@@ -5632,8 +5712,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .as_ref()
         .map(|authority| authority.owner_pid)
         .unwrap_or(std::process::id() as i32);
-    let mut peer_monitor = match controller_start {
-        Some(controller_start) => {
+    let mut peer_monitor = match (peer_authority_mode, controller_start) {
+        (PeerAuthorityMode::InheritOuter, _) => None,
+        (PeerAuthorityMode::EstablishTopLevel, Some(controller_start)) => {
             match validate_runtime::PeerSnapshotMonitor::start_production(
                 monitor_owner_pid,
                 controller_start,
@@ -5657,13 +5738,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 }
             }
         }
-        None => {
+        (PeerAuthorityMode::EstablishTopLevel, None) => {
             peer_monitor_start_detail = Some("monitor-controller-identity-unavailable".into());
             None
         }
     };
-    let peer_monitor_excludes_competitors =
-        peer_monitor.as_ref().is_some_and(|monitor| monitor.exclusion_held());
+    let peer_monitor_excludes_competitors = peer_authority_mode == PeerAuthorityMode::InheritOuter
+        || peer_monitor.as_ref().is_some_and(|monitor| monitor.exclusion_held());
     if nesting.nested {
         println!(
             "Nested validate (payload of outer pid {}): focused mode {} only; the outer run owns \
@@ -5811,68 +5892,107 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
         None => (None, None),
     };
-    let mut peer_evidence = match peer_monitor.as_mut() {
-        Some(monitor) => monitor.final_ack(),
-        None => validate_runtime::PeerMonitorEvidence::diagnostic(
-            peer_monitor_start_detail
-                .clone()
-                .unwrap_or_else(|| "peer-monitor-never-established".into()),
-        ),
-    };
-    let lock_authority_final = canonical_validate_lock_authority(parent.as_deref(), &commit, &host);
-    let mut lock_admitted = match (&lock_authority_start, &lock_authority_final) {
-        (Ok(start), Ok(final_authority)) if start == final_authority => true,
-        (Ok(_), Ok(_)) => {
-            peer_evidence
-                .state
-                .mark_indeterminate("canonical-lock-authority-owner-changed");
-            false
-        }
-        (_, Err(detail)) => {
-            peer_evidence.state.mark_indeterminate(detail.clone());
-            false
-        }
-        _ => false,
-    };
-    if lock_admitted {
-        let authority = lock_authority_final.as_ref().expect("admitted above");
-        if !peer_evidence.state.owner.as_ref().is_some_and(|owner| {
-            owner.pid == authority.owner_pid && owner.start_ticks == authority.owner_start_ticks
-        }) {
-            peer_evidence
-                .state
-                .mark_indeterminate("snapshot-owner-does-not-match-canonical-authority");
-            lock_admitted = false;
-        }
-    }
-    if !peer_evidence.final_acknowledged {
-        peer_evidence
-            .state
-            .mark_indeterminate("monitor-final-ack-missing");
-    }
-    let concurrency_indeterminate = !lock_admitted
-        || !peer_evidence.final_acknowledged
-        || !peer_evidence.state.qualifies_exclusivity();
-    let peer_count = peer_evidence.state.peers.len() as i64;
-    let concurrent_validates = (!concurrency_indeterminate).then_some(peer_count);
-    let concurrency_proof = (!concurrency_indeterminate).then_some(if peer_count == 0 {
-        "validate_lock_owner_ancestry"
+    let (
+        lock_admitted,
+        peer_evidence,
+        concurrency_indeterminate,
+        concurrent_validates,
+        concurrency_proof,
+        concurrency_indeterminate_detail,
+    ) = if peer_authority_mode == PeerAuthorityMode::InheritOuter {
+        // A nested focused process is a DAG payload, not a second validation
+        // producer. The live ancestor marker established that relationship
+        // above, and the outer driver owns the monitor, ledger, and publisher.
+        // Do not contend for the outer process's per-uid exclusion lock or
+        // query/finalize a second authority record here.
+        (
+            false,
+            validate_runtime::PeerMonitorEvidence::diagnostic(
+                "nested-payload-inherits-outer-peer-authority",
+            ),
+            false,
+            Some(0),
+            Some("inherited_outer_validate_payload"),
+            None,
+        )
     } else {
-        "external_validate_identity_monitor"
-    });
+        let mut peer_evidence = match peer_monitor.as_mut() {
+            Some(monitor) => monitor.final_ack(),
+            None => validate_runtime::PeerMonitorEvidence::diagnostic(
+                peer_monitor_start_detail
+                    .clone()
+                    .unwrap_or_else(|| "peer-monitor-never-established".into()),
+            ),
+        };
+        let lock_authority_final = canonical_validate_lock_authority(
+            parent.as_deref(),
+            lock_kind,
+            &commit,
+            &host,
+        );
+        let mut lock_admitted = match (&lock_authority_start, &lock_authority_final) {
+            (Ok(start), Ok(final_authority)) if start == final_authority => true,
+            (Ok(_), Ok(_)) => {
+                peer_evidence
+                    .state
+                    .mark_indeterminate("canonical-lock-authority-owner-changed");
+                false
+            }
+            (_, Err(detail)) => {
+                peer_evidence.state.mark_indeterminate(detail.clone());
+                false
+            }
+            _ => false,
+        };
+        if lock_admitted {
+            let authority = lock_authority_final.as_ref().expect("admitted above");
+            if !peer_evidence.state.owner.as_ref().is_some_and(|owner| {
+                owner.pid == authority.owner_pid
+                    && owner.start_ticks == authority.owner_start_ticks
+            }) {
+                peer_evidence
+                    .state
+                    .mark_indeterminate("snapshot-owner-does-not-match-canonical-authority");
+                lock_admitted = false;
+            }
+        }
+        if !peer_evidence.final_acknowledged {
+            peer_evidence
+                .state
+                .mark_indeterminate("monitor-final-ack-missing");
+        }
+        let concurrency_indeterminate = !lock_admitted
+            || !peer_evidence.final_acknowledged
+            || !peer_evidence.state.qualifies_exclusivity();
+        let peer_count = peer_evidence.state.peers.len() as i64;
+        let concurrent_validates = (!concurrency_indeterminate).then_some(peer_count);
+        let concurrency_proof = (!concurrency_indeterminate).then_some(if peer_count == 0 {
+            "validate_lock_owner_ancestry"
+        } else {
+            "external_validate_identity_monitor"
+        });
+        let concurrency_indeterminate_detail = if concurrency_indeterminate {
+            peer_evidence
+                .state
+                .indeterminate_detail
+                .clone()
+                .or_else(|| Some("peer-snapshot-authority-incomplete".into()))
+        } else {
+            None
+        };
+        (
+            lock_admitted,
+            peer_evidence,
+            concurrency_indeterminate,
+            concurrent_validates,
+            concurrency_proof,
+            concurrency_indeterminate_detail,
+        )
+    };
     let concurrent_validate_monitor = peer_evidence.state.monitor_json();
     let concurrent_validate_owner = peer_evidence.state.owner_json();
     let concurrent_validate_same_service = peer_evidence.state.same_service_json();
     let concurrent_validate_peers = peer_evidence.state.peers_json();
-    let concurrency_indeterminate_detail = if concurrency_indeterminate {
-        peer_evidence
-            .state
-            .indeterminate_detail
-            .clone()
-            .or_else(|| Some("peer-snapshot-authority-incomplete".into()))
-    } else {
-        None
-    };
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
@@ -6352,7 +6472,8 @@ fn stop_test_seam(
     let ledger = canonical_ledger_root(parent);
     let host = short_hostname();
     let commit = git_sha();
-    let authority_start = canonical_validate_lock_authority(parent, &commit, &host);
+    let lock_kind = CanonicalLockKind::for_historical_debug(historical_debug);
+    let authority_start = canonical_validate_lock_authority(parent, lock_kind, &commit, &host);
     let controller_start = validate_runtime::process_start_ticks(std::process::id() as i32);
     let mut monitor_start_detail = None;
     let mut peer_monitor = match (&authority_start, controller_start) {
@@ -6418,7 +6539,7 @@ fn stop_test_seam(
             monitor_start_detail.unwrap_or_else(|| "peer-monitor-never-established".into()),
         ),
     };
-    let authority_final = canonical_validate_lock_authority(parent, &commit, &host);
+    let authority_final = canonical_validate_lock_authority(parent, lock_kind, &commit, &host);
     let mut lock_admitted = match (&authority_start, &authority_final) {
         (Ok(start), Ok(final_authority)) if start == final_authority => true,
         (Ok(_), Ok(_)) => {
