@@ -10,6 +10,7 @@
   ],
   "preflight_nodes": [
     "check.reverie_pin",
+    "check.agent_utils_pin",
     "check.skill_discovery",
     "check.backend_abstraction",
     "check.portability_paths",
