@@ -381,6 +381,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         maximum: usize,
     ) -> Result<i64, Error> {
         self.require_timer_slack_access(guest, fd, false)?;
+        if maximum == 0 {
+            return Ok(0);
+        }
         let binding = self
             .timer_slack_binding(guest, fd)?
             .expect("timer-slack read lost its procfs classification");
@@ -412,6 +415,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         self.require_timer_slack_access(guest, fd, false)?;
+        if maximum == 0 {
+            return Ok(0);
+        }
         let binding = self
             .timer_slack_binding(guest, fd)?
             .expect("timer-slack pread lost its procfs classification");
@@ -1169,9 +1175,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
-        if let Some(binding) = timer_slack_binding {
-            self.require_current_timer_slack_target(guest, binding)
-                .await?;
+        if timer_slack_binding.is_some() {
+            let status_flags = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.status_flags())?;
+            if status_flags & libc::O_PATH != 0 {
+                return Err(Errno::EBADF.into());
+            }
         }
         let procfs_position = guest
             .thread_state()
@@ -1193,7 +1203,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         };
 
-        if timer_slack_binding.is_some() {
+        if let Some(binding) = timer_slack_binding {
             // Linux exposes this file through seq_lseek, which accepts only
             // SEEK_SET and SEEK_CUR. Keep that position entirely in the
             // virtual open-file description even before the first read.
@@ -1205,6 +1215,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
             let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+            // seq_lseek does not call the show callback for a no-op or a reset
+            // to zero. Only a traversal to another positive position observes
+            // the target task and therefore performs lifetime/access checks.
+            if new_offset != 0 && new_offset != current {
+                self.require_current_timer_slack_target(guest, binding)
+                    .await?;
+            }
             guest
                 .thread_state()
                 .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
