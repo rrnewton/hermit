@@ -20,10 +20,12 @@ use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::AtFlags;
 use reverie::syscalls::Errno;
 use reverie::syscalls::FcntlCmd::*;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
@@ -68,6 +70,30 @@ const TIMER_SLACK_PARSE_BYTES: usize = 66;
 struct TimerSlackIovec {
     base: usize,
     len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimerSlackBinding {
+    target: i32,
+    device: u64,
+    inode: u64,
+}
+
+fn classify_timer_slack_binding(
+    binding: TimerSlackBinding,
+    observed_identity: Option<(u64, u64)>,
+    current_tid: i32,
+) -> Result<(), Errno> {
+    if observed_identity != Some((binding.device, binding.inode)) {
+        // The bound task exited. A missing path and a new task that recycled
+        // the same numeric TID are both ESRCH for the old open inode.
+        return Err(Errno::ESRCH);
+    }
+    if current_tid != binding.target {
+        // Cross-task CAP_SYS_NICE access is intentionally not exposed.
+        return Err(Errno::EPERM);
+    }
+    Ok(())
 }
 
 fn parse_timer_slack_write(bytes: &[u8]) -> Result<u64, Errno> {
@@ -140,6 +166,22 @@ fn read_iovecs<M: MemoryAccess>(
         .collect())
 }
 
+fn copy_timer_slack_output<M: MemoryAccess>(
+    memory: &mut M,
+    destination: Option<AddrMut<'_, u8>>,
+    bytes: &[u8],
+) -> Result<usize, Errno> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let copied = memory.write(destination.ok_or(Errno::EFAULT)?, bytes)?;
+    if copied == 0 {
+        Err(Errno::EFAULT)
+    } else {
+        Ok(copied)
+    }
+}
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -205,42 +247,69 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    async fn require_current_timer_slack_target<G: Guest<Self>>(
+    async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         target: i32,
-    ) -> Result<(), Error> {
-        let current = guest.inject(syscalls::Gettid::new()).await? as i32;
-        if current == target {
-            return Ok(());
-        }
+    ) -> Result<Option<(u64, u64)>, Error> {
+        // Re-resolve the numeric proc path on every operation. Linux gives a
+        // recycled TID a different proc inode, while the original open file
+        // description remains bound to the exited task's inode.
+        let path = format!("/proc/{target}/timerslack_ns");
+        let path = path.as_bytes();
+        let mut path_buffer = [0_u8; 64];
+        assert!(path.len() < path_buffer.len());
+        path_buffer[..path.len()].copy_from_slice(path);
 
-        // Linux checks the proc inode's bound task on every operation. A
-        // signal-0 tkill observes liveness without changing the target. Detcore
-        // rejects raw-TID reuse for a retired scheduler incarnation, so the
-        // namespace-visible TID remains an incarnation key for the run.
-        match guest
-            .inject(syscalls::Tkill::new().with_tid(target).with_sig(0))
-            .await
-        {
-            Err(Errno::ESRCH) => Err(Errno::ESRCH.into()),
-            Ok(_) | Err(Errno::EPERM) => {
-                // Detcore does not expose CAP_SYS_NICE cross-task mutation;
-                // preserve the ordinary Linux result for a live other task.
-                Err(Errno::EPERM.into())
+        let mut stack = guest.stack().await;
+        let path_address = stack.push(path_buffer).cast::<libc::c_char>();
+        let statptr = StatPtr(stack.reserve());
+        let stack_guard = stack.commit()?;
+        let call = syscalls::Fstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_stat(Some(statptr))
+            .with_flags(AtFlags::empty());
+        let identity = match guest.inject_with_retry(call).await {
+            Ok(_) => {
+                let stat = statptr.read(&guest.memory())?;
+                Some((stat.st_dev, stat.st_ino))
             }
-            Err(error) => Err(error.into()),
-        }
+            Err(Errno::ENOENT) | Err(Errno::ESRCH) => None,
+            Err(error) => return Err(error.into()),
+        };
+        drop(stack_guard);
+        Ok(identity)
     }
 
-    fn timer_slack_target<G: Guest<Self>>(
+    async fn require_current_timer_slack_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        binding: TimerSlackBinding,
+    ) -> Result<(), Error> {
+        let observed_identity = self
+            .observe_timer_slack_identity(guest, binding.target)
+            .await?;
+        let current = guest.inject(syscalls::Gettid::new()).await? as i32;
+        classify_timer_slack_binding(binding, observed_identity, current).map_err(Into::into)
+    }
+
+    fn timer_slack_binding<G: Guest<Self>>(
         &self,
         guest: &G,
         fd: RawFd,
-    ) -> Result<Option<i32>, Errno> {
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.procfs_timer_slack_target())
+    ) -> Result<Option<TimerSlackBinding>, Errno> {
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd
+                .procfs_timer_slack_binding()
+                .map(|(target, device, inode)| TimerSlackBinding {
+                    target,
+                    device,
+                    inode,
+                })
+        })
     }
 
     fn require_timer_slack_access<G: Guest<Self>>(
@@ -285,22 +354,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         maximum: usize,
     ) -> Result<i64, Error> {
         self.require_timer_slack_access(guest, fd, false)?;
-        let target = self
-            .timer_slack_target(guest, fd)?
+        let binding = self
+            .timer_slack_binding(guest, fd)?
             .expect("timer-slack read lost its procfs classification");
-        self.require_current_timer_slack_target(guest, target)
+        self.require_current_timer_slack_target(guest, binding)
             .await?;
         let value = guest.thread_state().timer_slack_ns;
-        let bytes = guest
+        let preview = guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.take_procfs_timer_slack(value, maximum))?
+            .with_detfd(fd, |detfd| detfd.preview_procfs_timer_slack(value, maximum))?
             .expect("timer-slack procfs state disappeared");
-        if !bytes.is_empty() {
-            guest
-                .memory()
-                .write_exact(buffer.ok_or(Errno::EFAULT)?, &bytes)?;
+        let copied = copy_timer_slack_output(&mut guest.memory(), buffer, &preview.bytes)?;
+        if copied != 0 {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.commit_procfs_timer_slack_read(&preview, copied);
+            })?;
         }
-        Ok(bytes.len() as i64)
+        Ok(copied as i64)
     }
 
     async fn pread_timer_slack<G: Guest<Self>>(
@@ -315,10 +385,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         self.require_timer_slack_access(guest, fd, false)?;
-        let target = self
-            .timer_slack_target(guest, fd)?
+        let binding = self
+            .timer_slack_binding(guest, fd)?
             .expect("timer-slack pread lost its procfs classification");
-        self.require_current_timer_slack_target(guest, target)
+        self.require_current_timer_slack_target(guest, binding)
             .await?;
         let value = guest.thread_state().timer_slack_ns;
         let bytes = guest
@@ -327,12 +397,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.take_procfs_timer_slack_at(value, offset as usize, maximum)
             })?
             .expect("timer-slack procfs state disappeared");
-        if !bytes.is_empty() {
-            guest
-                .memory()
-                .write_exact(buffer.ok_or(Errno::EFAULT)?, &bytes)?;
-        }
-        Ok(bytes.len() as i64)
+        Ok(copy_timer_slack_output(&mut guest.memory(), buffer, &bytes)? as i64)
     }
 
     async fn readv_timer_slack<G: Guest<Self>>(
@@ -351,10 +416,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if flags & !libc::RWF_HIPRI != 0 {
             return Err(Errno::EOPNOTSUPP.into());
         }
-        let target = self
-            .timer_slack_target(guest, fd)?
+        let binding = self
+            .timer_slack_binding(guest, fd)?
             .expect("timer-slack readv lost its procfs classification");
-        self.require_current_timer_slack_target(guest, target)
+        self.require_current_timer_slack_target(guest, binding)
             .await?;
         let value = guest.thread_state().timer_slack_ns;
         let mut positioned_offset = offset.map(|offset| offset as usize);
@@ -363,33 +428,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             if iovec.len == 0 {
                 continue;
             }
-            let bytes = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| match positioned_offset {
-                    None => detfd.take_procfs_timer_slack(value, iovec.len),
-                    Some(offset) => detfd.take_procfs_timer_slack_at(value, offset, iovec.len),
+            let sequential_preview = if positioned_offset.is_none() {
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.preview_procfs_timer_slack(value, iovec.len)
                 })?
-                .expect("timer-slack procfs state disappeared");
+            } else {
+                None
+            };
+            let bytes = match (&sequential_preview, positioned_offset) {
+                (Some(preview), None) => preview.bytes.clone(),
+                (None, Some(offset)) => guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| {
+                        detfd.take_procfs_timer_slack_at(value, offset, iovec.len)
+                    })?
+                    .expect("timer-slack procfs state disappeared"),
+                _ => unreachable!("timer-slack read mode changed while reading"),
+            };
             if bytes.is_empty() {
                 break;
             }
-            let Some(destination) = AddrMut::from_raw(iovec.base) else {
-                return if total > 0 {
-                    Ok(total as i64)
-                } else {
-                    Err(Errno::EFAULT.into())
-                };
+            let copied = match copy_timer_slack_output(
+                &mut guest.memory(),
+                AddrMut::from_raw(iovec.base),
+                &bytes,
+            ) {
+                Ok(copied) => copied,
+                Err(_) if total > 0 => return Ok(total as i64),
+                Err(error) => return Err(error.into()),
             };
-            if let Err(error) = guest.memory().write_exact(destination, &bytes) {
-                return if total > 0 {
-                    Ok(total as i64)
-                } else {
-                    Err(error.into())
-                };
+            if let Some(preview) = &sequential_preview {
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.commit_procfs_timer_slack_read(preview, copied);
+                })?;
             }
-            total += bytes.len();
+            total += copied;
             if let Some(offset) = positioned_offset.as_mut() {
-                *offset += bytes.len();
+                *offset += copied;
+            }
+            if copied != bytes.len() {
+                return Ok(total as i64);
             }
             if bytes.len() != iovec.len {
                 break;
@@ -407,10 +485,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         self.require_timer_slack_access(guest, fd, true)?;
         let requested = self.read_timer_slack_input(guest, buffer, count)?;
-        let target = self
-            .timer_slack_target(guest, fd)?
+        let binding = self
+            .timer_slack_binding(guest, fd)?
             .expect("timer-slack write lost its procfs classification");
-        self.require_current_timer_slack_target(guest, target)
+        self.require_current_timer_slack_target(guest, binding)
             .await?;
         let state = guest.thread_state_mut();
         state.timer_slack_ns = if requested == 0 {
@@ -451,10 +529,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(_error) if total > 0 => return Ok(total),
                 Err(error) => return Err(error.into()),
             };
-            let target = self
-                .timer_slack_target(guest, fd)?
+            let binding = self
+                .timer_slack_binding(guest, fd)?
                 .expect("timer-slack writev lost its procfs classification");
-            if let Err(error) = self.require_current_timer_slack_target(guest, target).await {
+            if let Err(error) = self
+                .require_current_timer_slack_target(guest, binding)
+                .await
+            {
                 return if total > 0 { Ok(total) } else { Err(error) };
             }
             let state = guest.thread_state_mut();
@@ -617,6 +698,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .as_mut()
                         .expect("thread identity request lost its procfs file")
                         .bind_thread_identity(tgid, tid, ppid);
+                }
+                if procfs
+                    .as_ref()
+                    .and_then(ProcfsFile::timer_slack_target)
+                    .is_some()
+                {
+                    let stat = match guest.thread_state().with_detfd(fd, |detfd| detfd.stat())? {
+                        Some(stat) => libc::stat::from(&stat),
+                        None => self.inject_fstat(guest, fd).await?,
+                    };
+                    procfs
+                        .as_mut()
+                        .expect("timer-slack classification disappeared")
+                        .bind_timer_slack_identity(stat.st_dev, stat.st_ino);
                 }
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&observed_path);
@@ -851,7 +946,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(res);
         }
 
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .read_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
@@ -962,7 +1057,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(res);
         }
 
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .pread_timer_slack(guest, call.fd(), call.buf(), call.len(), call.offset())
                 .await;
@@ -1260,7 +1355,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .write_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
@@ -1359,7 +1454,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Pwrite64,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return Err(if call.offset() < 0 {
                 Errno::EINVAL.into()
             } else {
@@ -1461,7 +1556,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), true)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
@@ -1525,7 +1620,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readv,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             self.require_timer_slack_access(guest, call.fd(), false)?;
             let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
             return self
@@ -1587,7 +1682,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Preadv,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
             if offset < 0 {
                 return Err(Errno::EINVAL.into());
@@ -1629,7 +1724,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Preadv2,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
             if offset < -1 {
                 return Err(Errno::EINVAL.into());
@@ -1679,7 +1774,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
             return if offset < 0 {
                 Err(Errno::EINVAL.into())
@@ -1730,7 +1825,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
-        if self.timer_slack_target(guest, call.fd())?.is_some() {
+        if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
             if offset < -1 {
                 return Err(Errno::EINVAL.into());
@@ -3165,8 +3260,10 @@ mod test {
     use nix::fcntl::OFlag;
 
     use super::Errno;
+    use super::TimerSlackBinding;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::classify_timer_slack_binding;
     use super::parse_timer_slack_write;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
@@ -3240,6 +3337,32 @@ mod test {
         assert_eq!(vectored_offset(u64::MAX, u64::MAX), -1);
         assert_eq!(vectored_offset(0, 0), 0);
         assert_eq!(vectored_offset(7, 0), 7);
+    }
+
+    #[test]
+    fn timer_slack_binding_rejects_exit_reuse_and_other_tasks() {
+        let binding = TimerSlackBinding {
+            target: 202,
+            device: 11,
+            inode: 22,
+        };
+        assert_eq!(
+            classify_timer_slack_binding(binding, Some((11, 22)), 202),
+            Ok(())
+        );
+        assert_eq!(
+            classify_timer_slack_binding(binding, Some((11, 22)), 303),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            classify_timer_slack_binding(binding, None, 202),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            classify_timer_slack_binding(binding, Some((11, 23)), 202),
+            Err(Errno::ESRCH),
+            "a recycled numeric TID must not revive an old proc inode"
+        );
     }
 
     #[test]
