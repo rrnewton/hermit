@@ -214,6 +214,21 @@ fn exclusions() -> serde_json::Value {
             "sabre": "not carried by the legacy sabre corpus; reason not recorded upstream",
             "e9patch": "not carried by the legacy e9patch corpus; reason not recorded upstream",
             "rr": "not carried by the legacy rr corpus; reason not recorded upstream"
+        },
+        // Folded in from PR #2042. These two live here rather than only in
+        // corpus.json because `generate` REWRITES the `exclusions` object from
+        // this function: a reason recorded only in the data file is silently
+        // deleted by the next refresh, which is exactly the "absence is
+        // silence" failure this corpus exists to remove.
+        "make-parallel": {
+            "sabre": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+            "e9patch": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+            "rr": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it"
+        },
+        "python3-deep": {
+            "sabre": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+            "e9patch": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it",
+            "rr": "added by PR #2042, which measured L2 bitwise parity for this program on the ptrace/strict backend only and explicitly deferred the sabre/e9patch/rr decision to the backend-agnostic corpus work; not a statement that this backend cannot run it"
         }
     })
 }
