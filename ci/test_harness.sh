@@ -370,7 +370,10 @@ function load_tests {
     ID_BY_TEST=()
     METADATA_BY_ID=()
     local documents raw metadata id test relative kind
-    documents=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json) ||
+    local manifest_plan="$ROOT_DIR/target/debug/hermit-manifest-plan"
+    [[ -x $manifest_plan ]] ||
+        die "prebuilt manifest planner is missing or not executable: $manifest_plan (setup.manifest_plan must build it)"
+    documents=$("$manifest_plan" --format harness-json) ||
         die "TOML manifest validation failed"
     while IFS= read -r raw; do
         id=$(jq -r .id <<<"$raw")
@@ -474,8 +477,10 @@ function audit_inventory {
 }
 
 function audit_test_footprints {
-    cargo run --quiet -p hermit-manifest-plan \
-        --bin generate-test-footprints -- --check ||
+    local generator="$ROOT_DIR/target/debug/generate-test-footprints"
+    [[ -x $generator ]] ||
+        die "prebuilt footprint generator is missing or not executable: $generator (setup.manifest_plan must build it)"
+    "$generator" --check ||
         die "ci/test-footprints.json is stale relative to Cargo metadata, the portable DAG, or footprint policy"
 }
 

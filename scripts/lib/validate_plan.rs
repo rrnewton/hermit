@@ -49,6 +49,7 @@ use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::ResourceHint;
 use safe_ci_dag_runner::model::Step;
+use safe_ci_dag_runner::model::WriteDomainGuarantee;
 
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;
@@ -186,6 +187,8 @@ pub fn node(
     timeout: i64,
     cpu_timeout: i64,
     mem_bytes: i64,
+    write_domains: Option<Vec<String>>,
+    write_domain_guarantee: Option<WriteDomainGuarantee>,
 ) -> Step {
     Step {
         group: group.to_string(),
@@ -206,6 +209,8 @@ pub fn node(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains,
+        write_domain_guarantee,
     }
 }
 
@@ -235,7 +240,7 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .join(" ")
 }
 
-/// The three always-on preflight gates, as DAG nodes.
+/// The four always-on preflight gates, as DAG nodes.
 ///
 /// `validate.sh` runs these before every profile and fails fast if either of the
 /// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
@@ -264,6 +269,8 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
+            Some(Vec::new()),
+            None,
         ),
         node(
             // Tag must stay `pre.reverie_pin`: scripts/validate.rs asserts a
@@ -276,16 +283,32 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
+            Some(vec!["target-ci".to_string()]),
+            Some(WriteDomainGuarantee::ExplicitlyIsolated),
+        ),
+        node(
+            "pre",
+            "manifest_plan",
+            "Build the manifest-plan binaries used by metadata validation",
+            "cargo build -p hermit-manifest-plan --bins".to_string(),
+            vec!["pre.reverie_pin".to_string()],
+            PREFLIGHT_TIMEOUT_S,
+            PREFLIGHT_CPU_TIMEOUT_S,
+            PREFLIGHT_MEM_BYTES,
+            Some(vec!["shared-cargo-target".to_string()]),
+            Some(WriteDomainGuarantee::ArtifactProducer),
         ),
         node(
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
             "./ci/test_harness.sh validate".to_string(),
-            vec!["pre.reverie_pin".to_string()],
+            vec!["pre.manifest_plan".to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
+            Some(vec!["target-ci".to_string()]),
+            Some(WriteDomainGuarantee::ExplicitlyIsolated),
         ),
     ]
 }
@@ -426,6 +449,8 @@ pub fn compat_nodes_for(
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
+            None,
+            None,
         ));
     }
     if out.is_empty() {
@@ -563,6 +588,12 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     }
     if base.default_step_cpu_count != derived.default_step_cpu_count {
         bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
+    }
+    if base.write_domain_policy != derived.write_domain_policy {
+        bad.push(format!(
+            "write_domain_policy {:?} != {:?}",
+            base.write_domain_policy, derived.write_domain_policy
+        ));
     }
     if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
 }
