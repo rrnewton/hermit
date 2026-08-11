@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 349460925ee56f2aca686a3392b534e8861ba375 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 349460925ee56f2aca686a3392b534e8861ba375" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 6b62f91c29a5d673a5b3ab4f013dbb8078f5e031" >&2
     return 2
 fi
 
@@ -429,6 +429,26 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 #
 # BUILD-RELEVANT ANYWAY: reverie-dbt/build.rs is compiled by hermit, so this
 # bump requires REAL revalidation; no prior receipt may be reused.
+
+# CARRY TO 6b62f91 (2026-08-11). The calibration carries unchanged because
+# every versioned input to the DynamoRIO content-key miss is object-identical
+# across 3494609..6b62f91:
+#
+#   git diff --name-status 3494609..6b62f91 -- reverie-dbt -> no output
+#   git rev-parse 3494609:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 6b62f91:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 3494609:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 6b62f91:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 3494609:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 6b62f91:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#
+# The four intervening commits modify only AGENTS.md and the KVM static-ELF
+# test. Neither enters the DBT build recipe, vendored source, CMake command, or
+# source_recipe_key(). The recipe key therefore remains
+# sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429.
+# MAX_PARALLEL_JOBS=16 and the measured 1050 effective-job-second threshold
+# (263s at 4 effective jobs; 66s at 16) carry unchanged. Fresh exact-head
+# validation is still required; this carry does not authorize receipt reuse.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
