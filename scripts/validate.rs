@@ -121,21 +121,14 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 
-const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
-
-/// Standalone-only in-repo ledger directory.
-///
-/// Admitted runs never write here: they send their HistoryRow to the parent's
-/// canonical adapter. This fallback exists only for a checkout with no
-/// dev-hermit parent and is deliberately not a qualifying receipt authority.
-const LEDGER_DIR: &str = "ci/validate-ledger";
-
-/// Fleet/team identity component of the shard name. Overridable so a different
-/// team's runs land in a different shard rather than interleaving.
-const LEDGER_TEAM_ENV: &str = "VALIDATE_LEDGER_TEAM";
-const LEDGER_TEAM_DEFAULT: &str = "local";
+/// Set only by `scripts/historical-debug-validate` after the wrapper has
+/// entered ci-hub's box-exclusive validate/bench lock.  The marker is an
+/// invocation guard, not evidence: the resulting row is independently typed
+/// non-qualifying below.
+const HISTORICAL_PRODUCER_ENV: &str = "CI_HUB_HISTORICAL_DEBUG_PRODUCER";
+const HISTORICAL_PRODUCER: &str = "validate-lock-bench-v1";
 
 // --------------------------------------------------------------------------- args
 
@@ -259,6 +252,7 @@ struct Args {
     reuse_parent_manifest_gate: bool,
     self_test: bool,
     show_plan: bool,
+    historical_debug: bool,
 }
 
 fn usage() -> &'static str {
@@ -311,14 +305,16 @@ fn usage() -> &'static str {
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
+     \x20 --historical-debug  Run a typed NON-QUALIFYING historical measurement;\n\
+     \x20                     requires the serialized wrapper and forces -j 1.\n\
      \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
      \x20 --self-test      Run the driver's inert policy/quoting brackets and exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
-     HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
-     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
+     PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON, HERMIT_LAST_GREEN_SHA,\n\
+     CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -390,6 +386,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         reuse_parent_manifest_gate: false,
         self_test: false,
         show_plan: false,
+        historical_debug: false,
     };
     let mut shallow = false;
     let mut selective = false;
@@ -471,6 +468,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             // and Reverie-pin checks, so `reverie_pin_current` remains observed.
             "--reuse-parent-manifest-gate" => args.reuse_parent_manifest_gate = true,
             "--self-test" => args.self_test = true,
+            "--historical-debug" => args.historical_debug = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
             "--run-timeout" => {
@@ -566,6 +564,41 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     if shallow && args.baseline.is_some() {
         eprintln!("validate: --shallow-select forces a HEAD~1 baseline; do not also pass --baseline");
         return Err(2);
+    }
+    if args.historical_debug {
+        if args.allow_cgroup_failure {
+            eprintln!(
+                "validate: --historical-debug requires cgroup boxing; \
+                 --allow-cgroup-failure is forbidden"
+            );
+            return Err(2);
+        }
+        match args.jobs {
+            Some(1) | None => args.jobs = Some(1),
+            Some(width) => {
+                eprintln!(
+                    "validate: --historical-debug is sequential and requires -j 1, got -j {width}"
+                );
+                return Err(2);
+            }
+        }
+        if std::env::var(HISTORICAL_PRODUCER_ENV).as_deref() != Ok(HISTORICAL_PRODUCER) {
+            eprintln!(
+                "validate: direct --historical-debug invocation is disabled; use \
+                 ./scripts/historical-debug-validate so ci-hub serializes the run"
+            );
+            return Err(2);
+        }
+        if args.focused.is_some() {
+            eprintln!(
+                "validate: --historical-debug accepts a validation LEVEL, not a focused mode"
+            );
+            return Err(2);
+        }
+        // Historical measurements must execute and must never ask the receipt
+        // publisher to derive a landing label from their row.
+        args.ignore_cache = true;
+        args.label_pr = false;
     }
     Ok(args)
 }
@@ -834,8 +867,11 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    compat_known_failclosed_bracket()?;
+    compat_summary_consumer_bracket()?;
     coverage_schema_bracket()?;
     typed_libtest_count_bracket()?;
+    ledger_path_resolution_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -1131,6 +1167,60 @@ fn coverage_schema_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// Exercise the exact pure resolver used by the production ledger tool/root
+/// accessors. Poisoned fixture overrides must be authoritative only for the
+/// exact mode value `1`; a merely present `0` or empty value must resolve both
+/// paths from HOME.
+fn ledger_path_resolution_bracket() -> Result<(), String> {
+    use std::ffi::OsStr;
+
+    let fixture_tool = OsStr::new("/poison/fixture/validate_rows.py");
+    let fixture_root = OsStr::new("/poison/fixture/root");
+    let home = OsStr::new("/normal/home");
+    let fixture = resolve_ledger_paths(
+        Some(OsStr::new("1")),
+        Some(fixture_tool),
+        Some(fixture_root),
+        Some(home),
+    );
+    let expected_fixture = LedgerPaths {
+        tool: PathBuf::from(fixture_tool),
+        root: PathBuf::from(fixture_root).join("ledger"),
+    };
+    if fixture != expected_fixture {
+        return Err(format!(
+            "ledger seam: MODE=1 must select both fixture overrides, got {fixture:?}"
+        ));
+    }
+
+    let expected_normal = LedgerPaths {
+        tool: PathBuf::from(home).join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
+        root: PathBuf::from(home).join("work/dev-hermit/ledger"),
+    };
+    for (label, mode) in [
+        ("0", Some(OsStr::new("0"))),
+        ("empty", Some(OsStr::new(""))),
+        ("unrelated", Some(OsStr::new("unrelated"))),
+        ("unset", None),
+    ] {
+        let resolved = resolve_ledger_paths(
+            mode,
+            Some(fixture_tool),
+            Some(fixture_root),
+            Some(home),
+        );
+        if resolved != expected_normal {
+            return Err(format!(
+                "ledger seam: MODE={label} must ignore poisoned overrides, got {resolved:?}"
+            ));
+        }
+    }
+    println!(
+        "  ledger seam: MODE=1 selected fixture tool+root; MODE=0/empty/unrelated/unset selected HOME tool+root"
+    );
+    Ok(())
+}
+
 /// Bracket the self-output classifier that decides whether the tree is dirty.
 ///
 /// This predicate is load-bearing in a way that is easy to miss: `tree_dirty()`
@@ -1140,15 +1230,9 @@ fn coverage_schema_bracket() -> Result<(), String> {
 /// listing SHAPE gets an explicit case, including the exact one that regressed:
 /// a porcelain line whose leading status column has been eaten by a trim.
 fn self_output_bracket() -> Result<(), String> {
-    // MUST be excused (validate's own output, in every shape a caller emits).
+    // MUST be excused (validate's checkout-local log output).
     let excused = [
-        (" M ci/validate-ledger/local.example-host.jsonl", "porcelain, modified, leading space intact"),
-        ("M ci/validate-ledger/local.example-host.jsonl", "porcelain whose leading space a trim ate"),
-        ("?? ci/validate-ledger/local.other.jsonl", "porcelain, untracked shard"),
-        ("ci/validate-ledger/local.example-host.jsonl", "bare path (git diff --name-only)"),
         ("ignored/validate/validate-full-abc-1.log", "bare path, durable log"),
-        (" M \"ci/validate-ledger/has space.jsonl\"", "porcelain, quoted path"),
-        ("R  ci/validate-ledger/a.jsonl -> ci/validate-ledger/b.jsonl", "rename within the ledger dir"),
     ];
     for (line, why) in excused {
         if !line_is_self_output(line) {
@@ -1162,10 +1246,8 @@ fn self_output_bracket() -> Result<(), String> {
         ("?? detcore/src/new_thing.rs", "a new untracked source file"),
         ("M  Cargo.lock", "a staged lockfile change"),
         ("scripts/lib/validate_plan.rs", "bare path, real source"),
-        ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
-        ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
         (" M ci/dag/portable.json", "a lane change under ci/, but not the ledger"),
-        (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
+        (" M ci/retired-receipts/local.example-host.jsonl", "a retired checkout-local receipt is ordinary dirt"),
     ];
     for (line, why) in foreign {
         if line_is_self_output(line) {
@@ -1742,21 +1824,14 @@ fn repo_root() -> PathBuf {
 
 /// Paths excluded from every dirtiness and anchoring judgement.
 ///
-/// The ledger shard lives IN the repository, and validate is what writes it. If
-/// it counted as dirt, validate would poison the very tree it just judged: the
-/// next run would refuse on a dirty tree, and the tree hash — the result-cache
-/// key — would change after every run, so a cache could never hit. Validate's own
-/// output is not a source change, so it is excluded here rather than being
-/// gitignored (the shards are meant to be committed and unioned across machines).
-const SELF_OUTPUT_PREFIXES: &[&str] = &[LEDGER_DIR, "ignored/"];
+/// Durable logs remain checkout-local self-output. The ledger no longer lives
+/// in a checkout, so there is no ledger-shaped dirt exception to go stale.
+const SELF_OUTPUT_PREFIXES: &[&str] = &["ignored/"];
 
 /// True when `path` is inside (or equal to) one of validate's own output roots.
 ///
-/// The match is on a PATH BOUNDARY, not a raw string prefix. A bare
-/// `starts_with("ci/validate-ledger")` also swallowed siblings such as
-/// `ci/validate-ledger-notes.md`, which would have been silently excused from the
-/// dirty gate — the opposite of the failure it is meant to prevent, and exactly
-/// the kind of "correlated proxy" match this driver is supposed to avoid.
+/// The match is on a PATH BOUNDARY, not a raw string prefix: swallowing a
+/// similarly named sibling would silently excuse a real source change.
 fn is_self_output(path: &str) -> bool {
     SELF_OUTPUT_PREFIXES.iter().any(|p| {
         let root = p.trim_end_matches('/');
@@ -1773,17 +1848,9 @@ fn is_self_output(path: &str) -> bool {
 /// derived and the classification asks whether ALL of them are validate's own
 /// output.
 ///
-/// **Do not reintroduce a fixed-offset strip.** Two bugs have now come from one:
-/// stripping three characters unconditionally broke the bare-path callers
-/// (turning `ci/validate-ledger/…` into `validate-ledger/…`), and the fix for
-/// that still relied on the porcelain line keeping its leading status column —
-/// which `sh()` trimmed off the FIRST line of the output. The measured effect of
-/// the second bug: after any run, `git status --porcelain` returned exactly one
-/// line, ` M ci/validate-ledger/<shard>.jsonl`, whose leading space `sh()` ate;
-/// the 3-char strip then produced `i/validate-ledger/…`, no reading matched, and
-/// `tree_dirty()` reported TRUE. Every subsequent ledger row was written with
-/// `commit_anchored: false`, so the tree-keyed cache could never hit and a
-/// receipt-backed label could never be published — both features inert, silently.
+/// **Do not reintroduce a fixed-offset strip.** Bare-path and porcelain callers
+/// have different shapes, and trimming the first status column changes the
+/// identity of the path being classified.
 fn path_readings(line: &str) -> Vec<String> {
     let unquote = |s: &str| s.trim().trim_matches('"').to_string();
     let mut out = vec![unquote(line)];
@@ -2660,8 +2727,7 @@ fn selective_plan(
         // parent, so selection fails safe to the full lane (validate.sh:4369).
         sh("git", &["rev-parse", "--verify", "HEAD~1"])
     } else {
-        let ledger = ledger_path(root);
-        let rows = validate_history::read_rows(&ledger);
+        let rows = canonical_ledger_rows();
         let parent = find_parent(root);
         let slot = slot_name(root, parent.as_deref());
         validate_history::selective_baseline(&rows, args.baseline.as_deref(), &slot, &commit_exists)
@@ -2958,14 +3024,296 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     }
 }
 
+/// What one measured compatibility row means: does it block, and what must be said about it.
+#[derive(Debug, PartialEq, Eq)]
+struct CompatDisposition {
+    blocking: bool,
+    warning: Option<String>,
+}
+
+/// Classify one measured compatibility row, without printing or mutating anything.
+///
+/// THE DEFECT THIS EXISTS TO CLOSE. Both `known_failclosed` branches used to be gated on
+/// `CompatMode::Strict`, and the lane that actually gates main runs `CompatMode::PortableStrict`.
+/// So on that lane the table was INERT IN BOTH DIRECTIONS AND SILENT IN BOTH. Measured on run
+/// 31344267499: `wget-localhost` is listed and was counted a blocking failure anyway, while `make`
+/// is listed, RAN AND PASSED, and produced no stale-entry warning — zero warnings of either kind
+/// in the whole job log. A classification that changes nothing and announces nothing is not a
+/// classification; it is a comment.
+///
+/// WHAT THIS DOES *NOT* DO, DELIBERATELY: it does not make a single failing row nonblocking on
+/// `PortableStrict`. Honouring the table's exemption there would flip `wget-localhost` — the row
+/// currently gating the lane at program 58 of 191 — from blocking to passing, which is exactly the
+/// "make it nonblocking to get green" move that is forbidden. Blocking behaviour on BOTH modes is
+/// therefore byte-for-byte what it was; the entire change is that the table is now consulted and
+/// its verdict is SAID OUT LOUD on the lane where it was mute.
+fn compat_disposition(
+    mode: CompatMode,
+    label: &str,
+    ok: bool,
+    known: &BTreeMap<&str, &str>,
+    diagnostic: &BTreeMap<&str, &str>,
+) -> CompatDisposition {
+    // The fail-closed expectations describe `--strict` behaviour, and PortableStrict runs the same
+    // corpus with `--strict`. Both strict modes therefore CONSULT the table; they differ only in
+    // whether it exempts.
+    let strict_mode = matches!(mode, CompatMode::Strict | CompatMode::PortableStrict);
+    let listed = if strict_mode { known.get(label).copied() } else { None };
+
+    if ok {
+        // A LISTED ROW THAT PASSES IS A STALE EXPECTATION, and saying so is how a fixed bug stops
+        // being recorded as broken. This is the direction that was silent for `make`.
+        return CompatDisposition {
+            blocking: false,
+            warning: listed.map(|reason| {
+                format!(
+                    "{label} PASSED but is still listed in the known fail-closed table ({reason}) — the expectation is STALE; drop the row"
+                )
+            }),
+        };
+    }
+    if let Some(reason) = listed {
+        return match mode {
+            // Strict keeps its historical exemption: the row stays visible and nonblocking.
+            CompatMode::Strict => CompatDisposition {
+                blocking: false,
+                warning: Some(format!(
+                    "{label} failed as the known fail-closed table expects ({reason}; nonblocking under --strict)"
+                )),
+            },
+            // PortableStrict REPORTS the expectation and still blocks on it. The row's reason is
+            // an unaudited claim — two of the four were measured refuted by native syscall trace —
+            // so it is surfaced for audit, never used to excuse a red on the gating lane.
+            _ => CompatDisposition {
+                blocking: true,
+                warning: Some(format!(
+                    "{label} failed and IS listed in the known fail-closed table ({reason}), but that table does not exempt this lane — counted BLOCKING. Either the row's reason is stale or this lane needs an explicit decision"
+                )),
+            },
+        };
+    }
+    if mode == CompatMode::PortableStrict {
+        if let Some(reason) = diagnostic.get(label).copied() {
+            return CompatDisposition {
+                blocking: false,
+                warning: Some(format!("{label} is a bounded portable diagnostic: {reason}")),
+            };
+        }
+    }
+    CompatDisposition { blocking: true, warning: None }
+}
+
+/// Two-sided bracket for the known-failclosed consumer, with counts, plus blocking controls.
+///
+/// EXERCISES THE TABLE LOOKUP, not a pre-resolved answer: the planted rows go into a planted map
+/// and the classifier does its own `get`. A bracket that hands the function the conclusion tests
+/// the formatter and nothing else — the same shape of hole as the defect it guards.
+fn compat_known_failclosed_bracket() -> Result<(), String> {
+    let reason = "planted known-failclosed expectation";
+    let known = BTreeMap::from([
+        ("planted-known-failure", reason),
+        ("planted-stale-expectation", reason),
+    ]);
+    let diagnostic = BTreeMap::from([("planted-diagnostic", "planted bounded diagnostic")]);
+    let mut warned = 0usize;
+    let mut blocked = 0usize;
+
+    // 1) POSITIVE, the direction that was silent: a listed row that fails is NAMED on the gating
+    //    lane, and still blocks there.
+    let expected = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    let text = expected.warning.clone().unwrap_or_default();
+    if !expected.blocking {
+        return Err(
+            "compat bracket: a listed failure must STILL BLOCK on PortableStrict — exempting it would turn the gating lane green by table entry"
+                .to_string(),
+        );
+    }
+    if !text.contains("planted-known-failure") || !text.contains(reason) || !text.contains("BLOCKING")
+    {
+        return Err(format!(
+            "compat bracket: a listed failure must be named with its reason and its blocking status; got {text:?}"
+        ));
+    }
+    warned += 1;
+    blocked += 1;
+
+    // 2) POSITIVE, the other direction: a listed row that PASSES is called out as stale. This is
+    //    the `make` case, which produced no warning at all.
+    let stale = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-stale-expectation",
+        true,
+        &known,
+        &diagnostic,
+    );
+    let text = stale.warning.clone().unwrap_or_default();
+    if stale.blocking || !text.contains("STALE") || !text.contains("planted-stale-expectation") {
+        return Err(format!(
+            "compat bracket: a listed row that passes must warn that the expectation is stale; got blocking={} {text:?}",
+            stale.blocking
+        ));
+    }
+    warned += 1;
+
+    // 3) Strict keeps its historical exemption, so the two modes are provably distinguished.
+    let strict = compat_disposition(
+        CompatMode::Strict,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if strict.blocking || strict.warning.is_none() {
+        return Err("compat bracket: Strict must keep its nonblocking exemption and warn".to_string());
+    }
+    warned += 1;
+
+    // 4) NEGATIVE CONTROL: an UNLISTED failure blocks silently, exactly as before. Without this,
+    //    every assertion above is satisfiable by a classifier that warns about everything.
+    let unlisted = compat_disposition(
+        CompatMode::PortableStrict,
+        "planted-unlisted-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if !unlisted.blocking || unlisted.warning.is_some() {
+        return Err("compat bracket: an unlisted failure must block, with no warning".to_string());
+    }
+    blocked += 1;
+
+    // 5) NEGATIVE CONTROL: a non-strict mode must not consult the table at all, or the exemption
+    //    would leak into Sabre/E9patch/Rr where it was never intended.
+    let other = compat_disposition(
+        CompatMode::Sabre,
+        "planted-known-failure",
+        false,
+        &known,
+        &diagnostic,
+    );
+    if !other.blocking || other.warning.is_some() {
+        return Err("compat bracket: a non-strict mode must not consult the fail-closed table".to_string());
+    }
+    blocked += 1;
+
+    println!(
+        "  self-test: compat known-failclosed bracket OK ({warned} warned, {blocked} blocking, 2 negative controls)"
+    );
+    Ok(())
+}
+
+/// Bracket the CONSUMER on the real table, not only the pure classifier.
+///
+/// PROXY BINDING: proving `compat_disposition` behaves says nothing about whether
+/// `print_compat_summary` calls it, or whether it reads the REAL `known_failclosed()`. The defect
+/// being fixed was exactly a correct table with no consumer. So this drives the actual summary
+/// function with synthetic outcomes for real table labels and asserts the blocking set it returns.
+fn compat_summary_consumer_bracket() -> Result<(), String> {
+    let known = validate_corpus::known_failclosed();
+    let mut labels = known.keys();
+    let (Some(listed_a), Some(listed_b)) = (labels.next(), labels.next()) else {
+        return Err("compat consumer bracket: the known fail-closed table needs >= 2 rows".to_string());
+    };
+    let outcomes = vec![
+        StepOutcome::failed(
+            format!("compat.{listed_a}"),
+            0.0,
+            String::new(),
+            Some(1),
+            false,
+            0,
+            false,
+            0,
+            false,
+            0,
+            false,
+            None,
+            None,
+        ),
+        StepOutcome::passed(
+            format!("compat.{listed_b}"),
+            0.0,
+            String::new(),
+            Some(0),
+            None,
+            None,
+        ),
+        StepOutcome::failed(
+            "compat.planted-unlisted".to_string(),
+            0.0,
+            String::new(),
+            Some(1),
+            false,
+            0,
+            false,
+            0,
+            false,
+            0,
+            false,
+            None,
+            None,
+        ),
+    ];
+    let (passed, measured, blocking, warnings) =
+        print_compat_summary(CompatMode::PortableStrict, &outcomes);
+    if (passed, measured) != (1, 3) {
+        return Err(format!(
+            "compat consumer bracket: expected 1 passed of 3 measured, got {passed}/{measured}"
+        ));
+    }
+    // The listed FAILURE still blocks on the gating lane, and the unlisted one always did.
+    // Exempting either would be the forbidden "go green by table entry".
+    if !blocking.contains(&listed_a.to_string())
+        || !blocking.contains(&"planted-unlisted".to_string())
+        || blocking.len() != 2
+    {
+        return Err(format!(
+            "compat consumer bracket: expected both failures blocking, got {blocking:?}"
+        ));
+    }
+    // THE DIRECTION THAT DISTINGUISHES FIXED FROM BROKEN. Blocking behaviour is unchanged by
+    // design, so the blocking assertions above pass on the OLD inert code too. The warnings are
+    // the only observable difference: one for the listed failure, one for the stale pass, plus
+    // one per listed row this synthetic run never measured.
+    let unmeasured = known.len().saturating_sub(2);
+    let want = 2 + unmeasured;
+    if warnings != want {
+        return Err(format!(
+            "compat consumer bracket: expected {want} warning(s) (listed failure + stale pass + \
+             {unmeasured} unmeasured row(s)), got {warnings}"
+        ));
+    }
+    println!(
+        "  self-test: compat summary consumer bracket OK (real table, {} row(s); 2 blocking, {warnings} warning(s))",
+        known.len()
+    );
+    Ok(())
+}
+
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
-fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, usize, Vec<String>) {
+/// Returns `(passed, measured, blocking, warnings)`.
+///
+/// THE WARNING COUNT IS RETURNED, NOT JUST PRINTED, so a test can bind to it. Without it the only
+/// observable difference between this and the inert version is text on stdout, and a bracket that
+/// cannot see the warnings cannot tell a fixed classifier from the broken one it replaced — which
+/// is the very failure mode under repair.
+fn print_compat_summary(
+    mode: CompatMode,
+    outcomes: &[StepOutcome],
+) -> (usize, usize, Vec<String>, usize) {
     let known = validate_corpus::known_failclosed();
     let diag = validate_corpus::portable_diagnostic();
     let mut per_cat: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut passed = 0usize;
     let mut measured = 0usize;
+    let mut warnings = 0usize;
     let mut blocking_failures: Vec<String> = Vec::new();
     for o in outcomes {
         let Some(label) = o.tag.strip_prefix("compat.") else { continue };
@@ -2976,14 +3324,13 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
         if o.ok {
             e.0 += 1;
             passed += 1;
-            if mode == CompatMode::Strict && known.contains_key(label) {
-                println!("  WARN {label} unexpectedly passed fail-closed --strict; drop it from the known-failure table");
-            }
-        } else if mode == CompatMode::Strict && known.contains_key(label) {
-            println!("  WARN {label} known fail-closed under --strict ({}; nonblocking)", known[label]);
-        } else if mode == CompatMode::PortableStrict && diag.contains_key(label) {
-            println!("  WARN {label} is a bounded portable diagnostic: {}", diag[label]);
-        } else {
+        }
+        let d = compat_disposition(mode, label, o.ok, &known, &diag);
+        if let Some(w) = &d.warning {
+            println!("  WARN {w}");
+            warnings += 1;
+        }
+        if d.blocking {
             blocking_failures.push(label.to_string());
         }
     }
@@ -2998,6 +3345,31 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
     println!("{}", "-".repeat(46));
     println!("{:<22} | {measured:>8} | {:>9}", "TOTAL", format!("{passed}/{measured}"));
     println!("P/M means passing/measured; failures are M-P. Unmeasured rows are excluded from M.");
+    // AUDIT THE TABLE ITSELF, not only the rows it happened to touch. A listed row that this run
+    // never measured is unaudited for this run, which is the same silent-inertness in a different
+    // guise: the reader sees a table and assumes every line of it was checked.
+    if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+        let measured_labels: BTreeSet<&str> = outcomes
+            .iter()
+            .filter_map(|o| o.tag.strip_prefix("compat."))
+            .collect();
+        let unmeasured: Vec<&&str> = known
+            .keys()
+            .filter(|l| !measured_labels.contains(**l))
+            .collect();
+        // An unaudited row is a warning in its own right, so it is COUNTED as one. A tally that
+        // omitted it would report "0 warnings" for a run that checked none of the table.
+        warnings += unmeasured.len();
+        println!(
+            "known fail-closed table: {} row(s), {} measured this run, {} not measured; {warnings} warning(s) emitted",
+            known.len(),
+            known.len() - unmeasured.len(),
+            unmeasured.len()
+        );
+        for label in &unmeasured {
+            println!("  WARN {label} is listed as a known fail-closed expectation but was NOT measured in this run; the row is unaudited here");
+        }
+    }
     if mode == CompatMode::Rr {
         // Name the rows deliberately EXCLUDED from the R/R ratchet. A denominator
         // that silently drops five known divergences reads as full coverage.
@@ -3010,7 +3382,7 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             println!("  - {label}: {why}");
         }
     }
-    (passed, measured, blocking_failures)
+    (passed, measured, blocking_failures, warnings)
 }
 
 /// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
@@ -3447,6 +3819,19 @@ fn run_lane_with_env_retries(
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
     let mut env_retries = 0usize;
+    // THE RETRY IS THE EXPERIMENT. `environmental_block_class` binds by
+    // COLOCATION: a banner somewhere in the failing node's detail region. That
+    // establishes contemporaneity, not causation. The retry — same commit, same
+    // code, fresh environment — is the differential that settles it, and we were
+    // already paying for it in full and then discarding the verdict.
+    //
+    // Retain the two facts the loop otherwise destroys (`by_tag` is overwritten
+    // by each retry outcome): which nodes were ever CLASSIFIED, and which were
+    // actually RE-RUN. Without the second, "still failing" cannot be told apart
+    // from "never retried" — and that collapse is exactly what would let an
+    // unconfirmed excuse stand.
+    let mut classified: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut retried: BTreeSet<String> = BTreeSet::new();
 
     while env_retries < max {
         let failed: Vec<&StepOutcome> = by_tag.values().filter(|o| !o.ok && !o.aborted).collect();
@@ -3474,6 +3859,9 @@ fn run_lane_with_env_retries(
             break;
         }
         env_retries += 1;
+        for (tag, class) in &blocked {
+            classified.insert(tag.clone(), class);
+        }
         for (tag, class) in &blocked {
             println!(
                 "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
@@ -3528,6 +3916,12 @@ fn run_lane_with_env_retries(
         forward_step_profiles(&again, jobs);
         run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
+            // An aborted retry outcome means the node never executed a second
+            // time. Recording it as "retried" would let a node that was never
+            // re-run masquerade as one whose hypothesis was tested.
+            if !o.aborted {
+                retried.insert(o.tag.clone());
+            }
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
             }
@@ -3536,21 +3930,95 @@ fn run_lane_with_env_retries(
         skipped = again.skipped.clone();
     }
 
-    // Retries exhausted with an environmental block still standing is a RED, but
-    // one whose cause is named. The verdict is unchanged; only its label is.
-    if env_retries == max && by_tag.values().any(|o| !o.ok && !o.aborted) {
-        let log = read_log_settled(log_path);
-        for o in by_tag.values().filter(|o| !o.ok && !o.aborted) {
-            if let Some(class) = validate_runtime::extract_node_detail(&log, &o.tag)
-                .and_then(|d| validate_runtime::environmental_block_class(&d))
-            {
+    // A node can carry a banner and never be classified inside the loop: a zero
+    // retry budget, or a break (unreadable log, empty retry set) before its round.
+    // Classify those here so they are reported as UNCONFIRMED rather than not at
+    // all — the silent case is the one that lets an unexamined excuse stand.
+    let unexamined: Vec<String> = by_tag
+        .values()
+        .filter(|o| !o.ok && !o.aborted && !classified.contains_key(&o.tag))
+        .map(|o| o.tag.clone())
+        .collect();
+    let final_log = if unexamined.is_empty() && classified.is_empty() {
+        String::new()
+    } else {
+        read_log_settled(log_path)
+    };
+    for tag in unexamined {
+        if let Some(class) = validate_runtime::extract_node_detail(&final_log, &tag)
+            .and_then(|d| validate_runtime::environmental_block_class(&d))
+        {
+            classified.insert(tag, class);
+        }
+    }
+
+    // THREE-STATE ENVIRONMENTAL VERDICT.
+    //
+    // Classification — a banner colocated with a failing node's detail region —
+    // is a HYPOTHESIS about cause. The retry is the experiment that settles it:
+    // same commit, same code, fresh environment. Every classified node lands in
+    // exactly one of three states, and none of them is a default:
+    //
+    //   CONFIRMED    re-run and PASSED. The environment was the difference.
+    //   REFUTED      re-run and FAILED AGAIN. The retry did not clear it, so the
+    //                class's claim — a TRANSIENT host condition — is refuted.
+    //   UNCONFIRMED  never re-run (zero budget, unreadable log, empty retry set,
+    //                aborted in the retry). No experiment ran, so there is no
+    //                verdict — and it must read as neither of the other two.
+    //
+    // On REFUTED, be precise about WHAT was refuted. A failing re-run proves the
+    // failure reproduces at this commit in this host state; it does not by itself
+    // prove a product bug, because a PERSISTENT host denial also reproduces. So
+    // compare the newest attempt's signature against the original class, which
+    // splits REFUTED into the two cases a triager actually needs — and note that
+    // the excuse is withdrawn in BOTH, since a persistent condition is not the
+    // transient flake this retry budget exists to absorb.
+    //
+    // The verdict of the lane is unchanged by any of this; only the label is. A
+    // REFUTED node was already RED and stays RED, an UNCONFIRMED node likewise.
+    for (tag, class) in &classified {
+        let passed = by_tag.get(tag).map(|o| o.ok).unwrap_or(false);
+        use validate_runtime::EnvBlockVerdict as V;
+        match V::settle(retried.contains(tag), passed) {
+            V::Confirmed => println!(
+                "✅ {tag}: ENVIRONMENTAL CONFIRMED ({class}) — failed, then PASSED on re-run at the \
+                 same commit ({env_retries} retry round(s)). The environment was the difference."
+            ),
+            V::Refuted => {
+                // `extract_node_detail` returns the LAST detail region, so this is
+                // the newest attempt's signature, not the one that classified.
+                let latest = validate_runtime::extract_node_detail(&final_log, tag)
+                    .and_then(|d| validate_runtime::environmental_block_class(&d));
+                use validate_runtime::RefutedShape as S;
+                let because = match S::of(class, latest) {
+                    S::BannerGone => format!(
+                        "the {class} banner is GONE from the newest attempt and the node failed \
+                         anyway — coincidence, not cause: report this as a PRODUCT FAILURE"
+                    ),
+                    S::Persistent => format!(
+                        "the newest attempt still shows {class}, so this is a PERSISTENT condition, \
+                         not the transient flake the retry budget absorbs — the excuse is withdrawn \
+                         either way; triage as a standing host defect or a product failure, do not \
+                         re-run it again"
+                    ),
+                    S::SignatureChanged => format!(
+                        "the signature CHANGED across attempts ({class} -> {}), so no single cause \
+                         is established — the excuse is withdrawn; triage the newest signature on \
+                         its own",
+                        latest.unwrap_or("?")
+                    ),
+                };
                 println!(
-                    "🧱 {}: ENVIRONMENTAL BLOCK ({class}) after {} attempt(s) — validate could not \
-                     complete this node; this is NOT a test failure, and it is still a RED.",
-                    o.tag,
-                    max + 1
+                    "❌ {tag}: ENVIRONMENTAL REFUTED ({class}) — FAILED AGAIN on re-run at the same \
+                     commit ({env_retries} retry round(s)): {because}."
                 );
             }
+            V::Unconfirmed => println!(
+                "❔ {tag}: ENVIRONMENTAL UNCONFIRMED ({class}) — classified {class}, but never \
+                 re-run, so nothing distinguishes a host/sandbox block from a product failure. \
+                 This is NOT an environmental excuse and NOT a confirmed product failure; it is \
+                 an unsettled RED."
+            ),
         }
     }
 
@@ -3706,7 +4174,7 @@ fn canonical_validate_lock_admission(
     ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
     }
-    let status = if env_flag("HERMIT_VALIDATE_STOP_TEST_MODE", "1") {
+    let status = if stop_test_mode_enabled() {
         let Ok(fixture) = std::env::var("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON") else {
             return false;
         };
@@ -3843,7 +4311,6 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
 /// merge gate keep reading one shape across the port.
 #[allow(clippy::too_many_arguments)]
 fn write_ledger(
-    ledger: &Path,
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
     skipped: &[String],
@@ -3886,7 +4353,7 @@ fn write_ledger(
             })
         })
         .collect();
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
         "producer": LEDGER_PRODUCER,
@@ -3964,84 +4431,57 @@ fn write_ledger(
         "coverage": coverage,
         "gates": gates,
     });
-    let line = format!("{}\n", serde_json::to_string(&record).unwrap());
-    let explicit = std::env::var(LEDGER_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| Path::new(&value) == ledger);
-    if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
-        let Some(parent) = ledger.parent() else {
-            eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
-            return;
-        };
-        let adapter = parent.join("ci-hub/ledger/validate_rows.py");
-        let mut child = match Command::new("python3")
-            .arg(&adapter)
-            .arg("record")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!(
-                    "validate: warning: cannot launch canonical ledger writer {}: {e}",
-                    adapter.display()
-                );
-                return;
-            }
-        };
-        use std::io::Write;
-        let write_error = child
-            .stdin
-            .take()
-            .and_then(|mut stdin| stdin.write_all(line.as_bytes()).err());
-        let output = child.wait_with_output();
-        if let Some(error) = write_error {
-            eprintln!("validate: warning: cannot send row to canonical ledger writer: {error}");
-            return;
-        }
-        match output {
-            Ok(output) if output.status.success() => eprintln!(
-                "validate: canonical ledger record appended via {}: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stdout).trim()
-            ),
-            Ok(output) => eprintln!(
-                "validate: warning: canonical ledger writer {} refused: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            Err(e) => eprintln!(
-                "validate: warning: cannot wait for canonical ledger writer {}: {e}",
-                adapter.display()
-            ),
-        }
-        return;
-    }
-
-    if let Some(dir) = ledger.parent() {
-        if !dir.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
-                return;
-            }
-        }
+    if ctx.selection_mode == "historical-debug" {
+        // `selection_mode` is the shared predicate's load-bearing refusal.
+        // These carried values make the reason explicit to every human and
+        // future reader without changing ordinary validation rows.
+        record["evidence_class"] = serde_json::json!("historical-debug");
+        record["landing_eligible"] = serde_json::json!(false);
+        record["non_qualifying_reason"] = serde_json::json!("historical-debug");
     }
     use std::io::Write;
-    match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => match f.write_all(line.as_bytes()) {
-            Ok(()) => {
-                eprintln!(
-                    "validate: fixture/standalone ledger record appended to {}",
-                    ledger.display()
-                );
-                warn_if_unreadable_ledger(ledger);
-            }
-            Err(e) => eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display()),
-        },
-        Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
+    let tool = ledger_tool_path();
+    let mut child = match Command::new("python3")
+        .arg(&tool)
+        .arg("record")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("validate: warning: cannot execute canonical ledger writer {}: {e}", tool.display());
+            return;
+        }
+    };
+    let write_error = child
+        .stdin
+        .take()
+        .and_then(|mut stdin| stdin.write_all(record.to_string().as_bytes()).err());
+    let output = child.wait_with_output();
+    if let Some(error) = write_error {
+        eprintln!(
+            "validate: warning: cannot send row to canonical ledger writer {}: {error}",
+            tool.display()
+        );
+        return;
+    }
+    match output {
+        Ok(output) if output.status.success() => {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+            eprintln!(
+                "validate: ledger event appended to {}",
+                report.get("shard").and_then(|v| v.as_str()).unwrap_or("canonical per-machine shard")
+            );
+        }
+        Ok(output) => eprintln!(
+            "validate: warning: canonical ledger writer {} refused (rc={}): {}",
+            tool.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(e) => eprintln!("validate: warning: canonical ledger writer {} failed: {e}", tool.display()),
     }
 }
 
@@ -4059,86 +4499,83 @@ fn short_hostname() -> String {
     raw.split('.').next().unwrap_or("unknown").to_string()
 }
 
-/// Resolve the logical ledger authority. Precedence:
-///   1. `$HERMIT_VALIDATE_LEDGER` — explicit fixture/standalone file.
-///   2. `$DEV_HERMIT_PARENT/ledger` — the canonical adapter-backed union.
-///   3. A discovered dev-hermit parent's canonical union.
-///   4. The standalone in-repo diagnostic shard.
-fn ledger_path(root: &Path) -> PathBuf {
-    if let Ok(explicit) = std::env::var(LEDGER_ENV) {
-        if !explicit.is_empty() {
-            return PathBuf::from(explicit);
-        }
-    }
-    if let Ok(parent) = std::env::var(PARENT_ENV) {
-        if !parent.is_empty() {
-            return PathBuf::from(parent).join("ledger");
-        }
-    }
-    let team = std::env::var(LEDGER_TEAM_ENV)
-        .ok()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| LEDGER_TEAM_DEFAULT.to_string());
-    let sanitize = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-            .collect::<String>()
+/// Resolve the one live-ledger shard for this machine.
+///
+/// This deliberately has no override and performs no parent/check-out discovery.
+/// Every Hermit checkout for this account writes the same per-machine file;
+/// ci-hub is the only component that unions it with other machines and the
+/// published append-only shards.
+#[derive(Debug, Eq, PartialEq)]
+struct LedgerPaths {
+    tool: PathBuf,
+    root: PathBuf,
+}
+
+fn stop_test_mode_active(mode: Option<&std::ffi::OsStr>) -> bool {
+    mode == Some(std::ffi::OsStr::new("1"))
+}
+
+fn stop_test_mode_enabled() -> bool {
+    stop_test_mode_active(std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").as_deref())
+}
+
+fn resolve_ledger_paths(
+    mode: Option<&std::ffi::OsStr>,
+    fixture_tool: Option<&std::ffi::OsStr>,
+    fixture_root: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> LedgerPaths {
+    let home = home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/nonexistent-home"));
+    let mut resolved = LedgerPaths {
+        tool: home.join("work/dev-hermit/ci-hub/ledger/validate_rows.py"),
+        root: home.join("work/dev-hermit/ledger"),
     };
-    // CONFLICT RESOLUTION (rebase onto cd428f96): main added this parent-discovery step and this
-    // PR replaced the fallback beneath it. Both are kept -- the discovery runs FIRST, then this
-    // PR's team/host fallback. Dropping it would have silently reverted a landed fix.
-    // main's rationale, preserved verbatim: the env var being unset does NOT mean there is no
-    // parent -- far more often it means a run inside a dev-hermit slot that simply did not export
-    // it. Measured 2026-08-08: 111 real rows sat in two slots' local ledgers for exactly that
-    // reason, and `ci-hub validate-status` could not see one of them.
-    if let Some(found) = discover_parent_ledger(root) {
-        eprintln!(
-            "validate.rs: {PARENT_ENV} is unset; recording to the DISCOVERED parent ledger {}",
-            found.display()
-        );
-        return found;
-    }
-    root.join(LEDGER_DIR)
-        .join(format!("{}.{}.jsonl", sanitize(&team), sanitize(&short_hostname())))
-}
-
-/// Walk up from `root` for the dev-hermit parent that owns the canonical adapter.
-///
-/// Deliberately keyed on the executable contract, not a directory name or a
-/// retired raw file. Returns `None` only for a genuinely standalone checkout.
-fn discover_parent_ledger(root: &Path) -> Option<PathBuf> {
-    let mut dir = root.parent();
-    while let Some(candidate) = dir {
-        let adapter = candidate.join("ci-hub/ledger/validate_rows.py");
-        if adapter.is_file() {
-            return Some(candidate.join("ledger"));
+    if stop_test_mode_active(mode) {
+        if let Some(path) = fixture_tool {
+            resolved.tool = PathBuf::from(path);
         }
-        dir = candidate.parent();
+        if let Some(path) = fixture_root {
+            resolved.root = PathBuf::from(path).join("ledger");
+        }
     }
-    None
+    resolved
 }
 
-/// Say plainly that a row is not going anywhere a reader will look.
-///
-/// A writer that SUCCEEDS into a location no consumer reads reports success and attests nothing --
-/// the same shape as a `locally-validated` label with no backing run. This does not fail the run,
-/// because a standalone checkout must still be able to validate; it makes the invisibility
-/// impossible to miss, so "silent success" stops being the failure mode.
-///
-/// CONFLICT RESOLUTION: main keyed this on `LOCAL_LEDGER_BASENAME`, which this PR removes. Re-keyed
-/// to this PR's `LEDGER_DIR` fallback, which is the same thing under the new design -- the location
-/// no reader queries. Behaviour preserved, constant adapted.
-fn warn_if_unreadable_ledger(ledger: &Path) {
-    if !ledger.parent().is_some_and(|p| p.ends_with(LEDGER_DIR)) {
-        return;
+fn ledger_paths_from_env() -> LedgerPaths {
+    resolve_ledger_paths(
+        std::env::var_os("HERMIT_VALIDATE_STOP_TEST_MODE").as_deref(),
+        std::env::var_os("VALIDATE_STOP_TEST_LEDGER_TOOL").as_deref(),
+        std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn ledger_tool_path() -> PathBuf {
+    ledger_paths_from_env().tool
+}
+
+fn canonical_ledger_root() -> PathBuf {
+    ledger_paths_from_env().root
+}
+
+fn canonical_ledger_rows() -> Vec<serde_json::Value> {
+    let tool = ledger_tool_path();
+    let Ok(output) = Command::new("python3").arg(&tool).arg("rows").output() else {
+        eprintln!("validate: warning: cannot execute canonical ledger reader {}", tool.display());
+        return Vec::new();
+    };
+    if !output.status.success() {
+        eprintln!(
+            "validate: warning: canonical ledger reader {} refused (rc={})",
+            tool.display(),
+            output.status
+        );
+        return Vec::new();
     }
-    eprintln!(
-        "validate.rs: WARNING: this row is going to the CHECKOUT-LOCAL ledger {}, which NO reader \
-         queries -- `ci-hub validate-status` will report NOT-VALIDATED for this commit even though \
-         the run passed. Set {PARENT_ENV} to the dev-hermit workspace (or {LEDGER_ENV} to an \
-         explicit file) if this row is meant to count.",
-        ledger.display()
-    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 // --------------------------------------------------------------------------- main
@@ -4443,7 +4880,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(
+            &root,
+            &profile_name,
+            parent.as_deref(),
+            args.historical_debug,
+        );
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
@@ -4533,7 +4975,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
     // payload inherits the outer run's verdict on the very same checkout; it also
     // must not spend a network round trip inside a budgeted DAG node.
-    match rebase_freshness(args.run_on_dirty_tree || nesting.nested) {
+    match rebase_freshness(args.run_on_dirty_tree || nesting.nested || args.historical_debug) {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
@@ -4574,6 +5016,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             );
         }
     };
+
+    if args.historical_debug {
+        // This value is the load-bearing refusal consumed by the shared receipt
+        // predicate.  It is set after plan construction so every supported
+        // level, including early-return plan shapes, is typed identically.
+        plan.selection_mode = "historical-debug";
+        eprintln!(
+            "validate: running historical-debug level {:?} at -j 1; evidence is \
+             NON-QUALIFYING and cannot authorize landing",
+            args.level
+        );
+    }
 
     // Nested validate payloads are ordinary DAG children. Carry the selected
     // level through the plan so `--verbosity 5` does not become level 1 at the
@@ -4726,8 +5180,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the commit would re-run it. `--ignore-cache` forces a real run; a focused
     // or selective profile is never cached because `selection_mode == "full"` is
     // part of the key.
-    let ledger = ledger_path(&root);
-    let ledger_rows = validate_history::read_rows(&ledger);
+    let ledger = canonical_ledger_root();
+    let ledger_rows = canonical_ledger_rows();
     let tree = git_tree();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
@@ -5080,7 +5534,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some(sig) = &interruption {
         if !nesting.nested {
             write_ledger(
-                &ledger,
                 &ctx,
                 &outcomes,
                 &skipped,
@@ -5123,7 +5576,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking) = print_compat_summary(mode, &outcomes);
+        let (passed, measured, blocking, _warnings) = print_compat_summary(mode, &outcomes);
         compat_blocking = blocking.len();
         compat_measured = Some(measured);
         let floor = match mode {
@@ -5264,7 +5717,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the re-entrancy guard exists to prevent.
     if !nesting.nested {
         write_ledger(
-            &ledger,
             &ctx,
             &outcomes,
             &skipped,
@@ -5360,8 +5812,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if env_retries > 0 {
         detail.push(format!(
-            "{env_retries} environmental retry round(s) were spent on host/sandbox blocks; this \
-             verdict did NOT pass on the first attempt"
+            "{env_retries} environmental retry round(s) were spent on nodes CLASSIFIED as \
+             host/sandbox blocks; whether each class survived its re-run is the per-node \
+             CONFIRMED/REFUTED/UNCONFIRMED verdict in the log, not this count. This verdict did \
+             NOT pass on the first attempt"
         ));
     }
     match executed_tests {
@@ -5415,7 +5869,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+    historical_debug: bool,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
@@ -5449,7 +5908,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let exit_code: u8 = if interruption.is_some() { 130 } else { 1 };
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let wall = started.elapsed().as_secs_f64();
-    let ledger = ledger_path(root);
+    let ledger = canonical_ledger_root();
     let host = short_hostname();
     let commit = git_sha();
     let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
@@ -5460,7 +5919,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         slot: slot_name(root, parent),
         cwd: root.to_string_lossy().into(),
         profile: profile.to_string(),
-        selection_mode: "full".into(),
+        selection_mode: if historical_debug { "historical-debug" } else { "full" }.into(),
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
@@ -5490,7 +5949,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(&ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(

@@ -115,6 +115,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 		fi
 	@git diff --check
 	python3 scripts/test_validate_stop_paths.py
+	python3 scripts/test_validate_rs_historical.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs

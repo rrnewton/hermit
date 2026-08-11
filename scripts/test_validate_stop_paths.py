@@ -20,16 +20,20 @@ TEST_ROOTS: list[Path] = []
 
 def stop_test_env(
     tmpdir: Path,
-    ledger: Path,
     *,
+    mode: str = "1",
     lock_proven: bool = False,
     forged_owner: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
     env.update(
-        HERMIT_VALIDATE_STOP_TEST_MODE="1",
-        HERMIT_VALIDATE_LEDGER=str(ledger),
+        HERMIT_VALIDATE_STOP_TEST_MODE=mode,
+        VALIDATE_STOP_TEST_LEDGER_TOOL=os.environ.get(
+            "VALIDATE_STOP_TEST_LEDGER_TOOL",
+            str(ROOT.parents[2] / "ci-hub" / "ledger" / "validate_rows.py"),
+        ),
+        CI_HUB_VALIDATE_LEDGER_TEST_ROOT=str(tmpdir),
         DEV_HERMIT_PARENT=str(ROOT.parent),
         VALIDATE_RUN_ON_DIRTY_TREE="1",
         VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
@@ -79,6 +83,19 @@ def stop_test_env(
     return env
 
 
+def ledger_events(root: Path) -> list[dict]:
+    """Read the adapter's live spool plus any already-published test shards."""
+    paths = [
+        *root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl"),
+        *root.glob("ledger/hermit/*/*.jsonl"),
+    ]
+    return [json.loads(line) for path in paths for line in path.read_text().splitlines()]
+
+
+def ledger_rows(root: Path) -> list[dict]:
+    return [event["legacy_row"] for event in ledger_events(root)]
+
+
 def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -116,11 +133,9 @@ def run_signal(
 ) -> None:
     with tempfile.TemporaryDirectory(prefix=f"validate-stop-{sig.name.lower()}-") as tmp:
         tmpdir = Path(tmp)
-        ledger = tmpdir / "ledger.jsonl"
+        ledger = tmpdir
         log = tmpdir / "validate.log"
-        env = stop_test_env(
-            tmpdir, ledger, lock_proven=lock_proven, forged_owner=forged_owner
-        )
+        env = stop_test_env(tmpdir, lock_proven=lock_proven, forged_owner=forged_owner)
         env.update(
             VALIDATE_STOP_TEST_PRIOR_FAILURE="1" if prior_failure else "0",
         )
@@ -137,7 +152,7 @@ def run_signal(
             process.send_signal(sig)
             rc = process.wait(timeout=10)
 
-        rows = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+        rows = ledger_rows(ledger)
         if not expect_record:
             assert not rows, (sig.name, rows)
             assert rc == -sig.value, (sig.name, rc)
@@ -157,11 +172,8 @@ def run_signal(
 def run_incomplete_exit() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-incomplete-") as tmp:
         tmpdir = Path(tmp)
-        # A fixture path named exactly `ledger` must remain an explicit file;
-        # basename matching alone must never redirect a caller-selected path to
-        # a sibling adapter.
-        ledger = tmpdir / "ledger"
-        env = stop_test_env(tmpdir, ledger)
+        ledger = tmpdir
+        env = stop_test_env(tmpdir)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
         )
@@ -174,7 +186,7 @@ def run_incomplete_exit() -> None:
             check=False,
         )
         assert process.returncode == 1, process.stdout.decode(errors="replace")
-        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        rows = ledger_rows(ledger)
         assert len(rows) == 1, rows
         row = rows[0]
         assert_schema5_contract(row)
@@ -185,43 +197,17 @@ def run_incomplete_exit() -> None:
         assert row["interruption_signal"] is None, row
 
 
-def run_canonical_adapter_contract(*, refuse: bool) -> None:
-    """Production-shaped writes use the parent adapter, never a raw shadow."""
-    with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
+def run_mode_activation_contract() -> None:
+    """Only the exact value 1 activates the seam and its path overrides."""
+    # Positive: MODE=1 must enter the seam and route its row through both
+    # fixture-only overrides. run_incomplete_exit() proves the full row shape;
+    # this compact bracket makes the activation contract explicit beside both
+    # negative values.
+    with tempfile.TemporaryDirectory(prefix="validate-stop-mode-one-") as tmp:
         tmpdir = Path(tmp)
-        canonical_root = tmpdir / "canonical-root"
-        if refuse:
-            parent = tmpdir / "parent"
-            adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
-            adapter.parent.mkdir(parents=True)
-            adapter.write_text(
-                "import sys\n"
-                "sys.stdin.read()\n"
-                "print('planted refusal', file=sys.stderr)\n"
-                "raise SystemExit(2)\n"
-            )
-        else:
-            # Exercise the REAL parent adapter, redirected only through its
-            # explicit stop-test root. This proves the producer/consumer
-            # contract without appending the machine's authoritative ledger.
-            parent = next(
-                candidate
-                for candidate in ROOT.parents
-                if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file()
-            )
-        raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
-        raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
-        env = os.environ.copy()
-        env.update(
-            HERMIT_VALIDATE_STOP_TEST_MODE="1",
-            DEV_HERMIT_PARENT=str(parent),
-            CI_HUB_VALIDATE_LEDGER_TEST_ROOT=str(canonical_root),
-            VALIDATE_RUN_ON_DIRTY_TREE="1",
-            VALIDATE_STOP_TEST_TMP_ROOT=str(tmpdir / "validation"),
-            VALIDATE_STOP_TEST_EXIT_EARLY="1",
-            TMPDIR=str(tmpdir),
-        )
-        env.pop("HERMIT_VALIDATE_LEDGER", None)
+        ledger = tmpdir
+        env = stop_test_env(tmpdir, mode="1")
+        env["VALIDATE_STOP_TEST_EXIT_EARLY"] = "1"
         process = subprocess.run(
             [str(VALIDATE), "full"],
             cwd=ROOT,
@@ -232,28 +218,91 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         )
         output = process.stdout.decode(errors="replace")
         assert process.returncode == 1, output
+        assert len(ledger_rows(ledger)) == 1, output
+        assert "stop-path fixture" in output, output
+
+    # Negative integration bracket for the root seam: a present variable with
+    # value 0, and a present-but-empty variable, must both follow the ordinary
+    # inert plan path. The Rust --self-test directly brackets the ledger tool
+    # and root resolvers because --show-plan deliberately never calls them.
+    for mode, label in (("0", "zero"), ("", "empty")):
+        with tempfile.TemporaryDirectory(prefix=f"validate-stop-mode-{label}-") as tmp:
+            tmpdir = Path(tmp)
+            ledger = tmpdir
+            env = stop_test_env(tmpdir, mode=mode)
+            env["VALIDATE_STOP_TEST_EXIT_EARLY"] = "1"
+            process = subprocess.run(
+                [str(VALIDATE), "--show-plan", "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            output = process.stdout.decode(errors="replace")
+            assert process.returncode == 0, (mode, output)
+            assert "PLAN ONLY (nothing executed)" in output, (mode, output)
+            assert "VALIDATE_STOP_TEST_READY" not in output, (mode, output)
+            assert not ledger_rows(ledger), (mode, ledger_rows(ledger), output)
+
+
+def run_canonical_adapter_contract(*, refuse: bool) -> None:
+    """The fixed producer path accepts/refuses without discovery or a raw shadow."""
+    with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
+        tmpdir = Path(tmp)
+        canonical_root = tmpdir / "canonical-root"
+        parent = next(
+            candidate
+            for candidate in ROOT.parents
+            if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file()
+        )
+        adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
+        if refuse:
+            adapter = tmpdir / "refusing-validate-rows.py"
+            adapter.write_text(
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "print('planted refusal', file=sys.stderr)\n"
+                "raise SystemExit(2)\n"
+            )
+        raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
+        raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
+        env = stop_test_env(tmpdir)
+        env["VALIDATE_STOP_TEST_LEDGER_TOOL"] = str(adapter)
+        env["CI_HUB_VALIDATE_LEDGER_TEST_ROOT"] = str(canonical_root)
+        env.pop("DEV_HERMIT_PARENT", None)
+        env["VALIDATE_STOP_TEST_EXIT_EARLY"] = "1"
+        process = subprocess.run(
+            [str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+        assert "DISCOVERED" not in output, output
         raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
         if refuse:
-            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert not ledger_events(canonical_root), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            events = ledger_events(canonical_root)
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
-            assert "canonical ledger record appended" in output, output
+            assert "ledger event appended" in output, output
 
 
 def run_cleanup_signal_race() -> None:
     with tempfile.TemporaryDirectory(prefix="validate-stop-cleanup-race-") as tmp:
         tmpdir = Path(tmp)
-        ledger = tmpdir / "ledger.jsonl"
+        ledger = tmpdir
         log = tmpdir / "validate.log"
         cleanup_ready = tmpdir / "cleanup-ready"
-        env = stop_test_env(tmpdir, ledger)
+        env = stop_test_env(tmpdir)
         env.update(
             VALIDATE_STOP_TEST_EXIT_EARLY="1",
             VALIDATE_STOP_TEST_CLEANUP_READY_FILE=str(cleanup_ready),
@@ -281,7 +330,7 @@ def run_cleanup_signal_race() -> None:
                 time.sleep(0.01)
             rc = process.wait(timeout=10)
 
-        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        rows = ledger_rows(ledger)
         assert rc == 1, (rc, log.read_text(errors="replace"))
         assert len(rows) == 1, rows
         assert_schema5_contract(rows[0])
@@ -299,6 +348,7 @@ def main() -> None:
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
+    run_mode_activation_contract()
     run_canonical_adapter_contract(refuse=False)
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
@@ -307,7 +357,7 @@ def main() -> None:
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
-        "accept/refuse bracketed; cleanup is signal-atomic"
+        "accept/refuse bracketed; MODE=1/0/empty activation bracketed; cleanup is signal-atomic"
     )
 
 
