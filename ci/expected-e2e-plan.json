@@ -540,25 +540,25 @@
       "test": "system-utils/date-nanoseconds"
     },
     {
-      "backend": "dbi",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "system-utils/file-lock-ordering"
-    },
-    {
-      "backend": "ptrace",
-      "category": "system-utils",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "system-utils/file-lock-ordering"
-    },
-    {
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/du-tree-summary"
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-lock-ordering"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-lock-ordering"
     },
     {
       "backend": "ptrace",

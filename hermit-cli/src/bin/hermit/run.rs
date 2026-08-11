@@ -1364,15 +1364,15 @@ fn liteinst_fences_off_rdrand_determinization_under_strict() {
 /// POSITIVE SIDE: the fence must not fire where the backend is measured working
 /// or is already handled, or it silently withdraws a guarantee that backend
 /// satisfies. ptrace is measured working (three identical values with
-/// determinization on, three distinct with it off). DBI keeps its own separate
-/// fence inside `run_dbi` for a different cause, so double-fencing here would
+/// determinization on, three distinct with it off). DBT keeps its own separate
+/// fence inside `run_dbt` for a different cause, so double-fencing here would
 /// print two withdrawal notices for one withdrawal. KVM is UNMEASURED, and an
 /// unmeasured backend must not be fenced. KVM specifically hangs here with the
 /// flag OFF and with a guest containing no RDRAND, so its hang is
 /// unattributable to this feature.
 #[test]
 fn other_backends_keep_rdrand_determinization() {
-    for backend in ["ptrace", "kvm", "dbi"] {
+    for backend in ["ptrace", "kvm", "dbt"] {
         let mut opts =
             RunOpts::parse_from(["fakehermit", &format!("--backend={backend}"), "fakeprog"]);
         opts.validate_args_with_perf_support(true).unwrap();
@@ -2220,7 +2220,7 @@ impl RunOpts {
         // RDRAND-using guest and a plain `printf` guest exit 1 with zero bytes
         // of output; with `--no-determinize-rdrand` both run normally.
         //
-        // Note this is NOT the DBI failure mode. DBI is fenced in `run_dbi`
+        // Note this is NOT the DBT failure mode. DBT is fenced in `run_dbt`
         // because a translating backend keeps a second copy of the instruction
         // stream, so the in-place patch and the code cache fight. Here nothing
         // is ever patched: the scan cannot read the image in the first place.
@@ -2237,14 +2237,14 @@ impl RunOpts {
         // `PROFILE=release`), same guest, same binary, one flag toggled:
         //
         //   ptrace    on -> 3 identical values   off -> 3 distinct   WORKS
-        //   dbi       on -> fenced in `run_dbi`  off -> ok           ALREADY FENCED
+        //   dbt       on -> fenced in `run_dbt`  off -> ok           ALREADY FENCED
         //   liteinst  on -> rc=1, zero output    off -> ok           silent abort
         //   sabre     on -> hangs (>90s)         off -> ok           hang
         //   e9patch   on -> 3 DISTINCT values    off -> 3 distinct   silent nondeterminism
         //
         // The reason differs per backend, so this is a table of measured facts
         // rather than a category rule. In particular "any backend that patches
-        // the guest" is NOT the right predicate: DBI fails because a
+        // the guest" is NOT the right predicate: DBT fails because a
         // translating backend holds a second copy of the instruction stream,
         // LiteInst because the scan cannot read its trampolines at all, and
         // e9patch because the guest ends up executing entropy despite the scan
@@ -2276,12 +2276,12 @@ impl RunOpts {
             // fix: e9patch already locates the site (`mapped_sites=1`), so the
             // instruction should be determinized at rewrite time instead.
             Backend::E9patch => Some("the rewritten guest still reads host entropy"),
-            // ptrace is measured working. DBI keeps its own fence in `run_dbi`
+            // ptrace is measured working. DBT keeps its own fence in `run_dbt`
             // for its own distinct cause; fencing it here too would print two
             // withdrawal notices for one withdrawal. KVM hangs on this host
             // regardless of the flag, so it is unattributable, not broken by
             // this feature.
-            Backend::Ptrace | Backend::Dbi | Backend::Kvm => None,
+            Backend::Ptrace | Backend::Dbt | Backend::Kvm => None,
         };
         if let Some(reason) = rdrand_fence_reason
             && config.determinize_rdrand
@@ -2290,7 +2290,7 @@ impl RunOpts {
             // Printed, not logged: a determinism guarantee being withdrawn must
             // be visible at the default log level, or the fence is itself the
             // concealment pattern this work set out to remove. This matches the
-            // notice `run_dbi` prints for the DBI fence.
+            // notice `run_dbt` prints for the DBT fence.
             eprintln!(
                 "hermit: [{} backend] RDRAND/RDSEED determinization is DISABLED on this backend \
                  because {reason}; the instructions stay masked in CPUID but remain live for a \

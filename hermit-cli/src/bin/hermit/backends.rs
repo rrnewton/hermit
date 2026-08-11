@@ -403,7 +403,7 @@ pub(super) fn run_dbt(
     // instructions and DR faults internally. Fence it off here rather than
     // shipping a crash.
     //
-    // This is a NAMED hole, not a silent downgrade: on DBI the instruction goes
+    // This is a NAMED hole, not a silent downgrade: on DBT the instruction goes
     // back to being masked-but-live, exactly as it was before determinization
     // existed, and the warning says so. Closing it properly means instrumenting
     // the instruction at translation time, which is the DBT backend's own job.
@@ -415,7 +415,7 @@ pub(super) fn run_dbt(
             // be visible at the default log level, or the fence is itself a
             // silent downgrade. This matches the backend notices above.
             eprintln!(
-                "hermit: [dbi backend] RDRAND/RDSEED determinization is DISABLED on this \
+                "hermit: [dbt backend] RDRAND/RDSEED determinization is DISABLED on this \
                  backend; the instructions stay masked in CPUID but remain live for a guest \
                  that ignores CPUID"
             );

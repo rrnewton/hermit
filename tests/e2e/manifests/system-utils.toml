@@ -1477,7 +1477,7 @@ native = "The guest asserts the Linux contract directly; native behaviour is the
 # byte-identical run to run.
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace", "dbi"]
+backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
 sabre = "KNOWN GAP -- not measured for this case; SaBRe needs its own qualification run"
 kvm = "KNOWN GAP -- not measured: the KVM backend livelocks at guest startup on this host, so no verdict was obtained. Not to be read as passing."
@@ -1488,7 +1488,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "This case asserts lock semantics, not the record/replay contract"
-dbi = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -1498,7 +1498,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Lock acquisition ORDER under contention is the natural chaos case, but it is unmeasurable while flock is a no-op; see the guest header"
-dbi = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -1508,7 +1508,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No edge-case Hermit arguments are required"
-dbi = "No edge-case Hermit arguments are required"
+dbt = "No edge-case Hermit arguments are required"
 kvm = "No edge-case Hermit arguments are required"
 sabre = "No edge-case Hermit arguments are required"
 liteinst = "No edge-case Hermit arguments are required"
