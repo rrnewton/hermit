@@ -16,8 +16,10 @@ use clap::Parser;
 use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
+use super::tracing::BoundedWriter;
 use super::tracing::init_file_tracing;
 use super::tracing::init_stderr_tracing;
+use super::tracing::log_max_bytes;
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
 /// Arbitrary programs run inside (guests) become deterministic
@@ -118,6 +120,10 @@ impl GlobalOpts {
             // problem. Keep the historical behaviour for those, rather than changing
             // a path this task did not investigate.
             let file_writer = File::create(path).expect("Failed to open log file");
+            // Bounded so a run that makes no progress cannot fill the disk: a
+            // livelocked guest logged 928.8 GiB over 11.7 hours before this.
+            // The bound is on the LOG only; the run is unaffected.
+            let file_writer = BoundedWriter::new(file_writer, log_max_bytes());
             Some(init_file_tracing(self.log, file_writer))
         } else {
             init_stderr_tracing(self.log);
