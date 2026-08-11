@@ -64,9 +64,12 @@ Protocol for every PR:
 3. A full green `scripts/validate.rs` delegates to `ci-hub apply-local-label` after its
    ledger row is written. Do not add **`locally-validated`** by hand: the applier
    re-reads the counted exact-head row, hashes its log, publishes an immutable
-   receipt, and only then comments and labels. The command can also be run
-   manually to backfill a validated head. Re-run validation after any subsequent
-   push; the push invalidates both the prior receipt and label.
+   receipt, and only then comments and labels. GitHub does not offer a per-label
+   ACL, so every label-add and ready-for-review event re-runs the trusted receipt
+   dereference; an unbacked human or agent mint is automatically stripped. The
+   command can also be run manually to backfill a validated head. Re-run
+   validation after any subsequent push; the push invalidates both the prior
+   receipt and label.
 
 A PR that changes code but is missing the `locally-validated` label — or whose
 description does not account for any check that could not run locally — is not

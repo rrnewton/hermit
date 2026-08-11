@@ -189,8 +189,11 @@ jobs:
     name: invalidate-mutated-validation-evidence
     if: >-
       github.repository == 'rrnewton/hermit' &&
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request != null
+      ((github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null) ||
+       (github.event_name == 'pull_request' &&
+        (github.event.action == 'labeled' ||
+         github.event.action == 'ready_for_review')))
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
     permissions:
@@ -242,7 +245,8 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          LABEL_NAME: locally-validated
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -256,9 +260,10 @@ jobs:
             echo "PR #${PR_NUMBER} is ${state}; no live validation label to protect."
             exit 0
           fi
-          if ! jq -e 'any(.labels[]?; .name == "locally-validated")' \
+          if ! jq -e --arg expected_label "$LABEL_NAME" \
+              'any(.labels[]?; .name == $expected_label)' \
               <<< "$pr" >/dev/null; then
-            echo "PR #${PR_NUMBER} has no locally-validated label."
+            echo "PR #${PR_NUMBER} has no ${LABEL_NAME} label."
             exit 0
           fi
 
@@ -283,10 +288,10 @@ jobs:
           fi
 
           # Invalidate both the steady-state v4 context and the transition-only
-          # v3 context before mutating the label. The issue_comment job
-          # itself is not required, and a follow-up dispatch can fail (fork
-          # heads cannot be dispatched at all). Publishing both failures keeps
-          # either ruleset version fail-closed at the exact PR head.
+          # v3 context before mutating the label. The invalidator job itself is
+          # not required, and a follow-up dispatch can fail (fork heads cannot
+          # be dispatched at all). Publishing both failures keeps either
+          # ruleset version fail-closed at the exact PR head.
           summary="No immutable counted full-validation receipt remains for exact head ${head_sha}."
           for context in merge-gate-v4 merge-gate-v3; do
             gh api --method POST \
@@ -304,14 +309,14 @@ jobs:
           done
 
           gh api --method DELETE \
-            "repos/${REPO}/issues/${PR_NUMBER}/labels/locally-validated" \
+            "repos/${REPO}/issues/${PR_NUMBER}/labels/${LABEL_NAME}" \
             --silent
           body="[coordinator, github-actions]
 
-          Removed \`locally-validated\`: no remotely readable counted validation receipt remains for exact head \`${head_sha}\`."
+          Removed \`${LABEL_NAME}\`: no remotely readable counted validation receipt remains for exact head \`${head_sha}\`."
           gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" \
             -f body="$body" --silent
-          echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
+          echo "Removed ${LABEL_NAME} from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
 
           # Events caused by GITHUB_TOKEN do not recursively start workflows.
           # Same-repository refs can run the normal gate immediately. Fork refs

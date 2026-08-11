@@ -72,6 +72,16 @@ grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scri
     fail "both gate legs must content-pin the producer-definition registry"
 grep -Fq '"$RECEIPT_VERIFIER"' "$WORKFLOW" ||
     fail "local alternate leg must call the parent receipt verifier"
+grep -Fq "github.event.action == 'labeled'" "$WORKFLOW" ||
+    fail "a label-add event must invoke receipt-backed invalidation"
+grep -Fq "github.event.action == 'ready_for_review'" "$WORKFLOW" ||
+    fail "review readiness must invoke receipt-backed invalidation"
+grep -Fq 'PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}' "$WORKFLOW" ||
+    fail "the invalidator must resolve both comment and pull-request event numbers"
+grep -Fq 'LABEL_NAME: locally-validated' "$WORKFLOW" ||
+    fail "the production event must target the authorization-cache label"
+grep -Fq 'labels/${LABEL_NAME}' "$WORKFLOW" ||
+    fail "the invalidator must delete the configured cache label on refusal"
 if grep -Eq 'scripts/(check|verify)-local-validation' "$WORKFLOW"; then
     fail "gate must not call a PR-local validation-evidence verifier"
 fi
@@ -92,5 +102,7 @@ grep -Fq 'GATE_RUN_ID' "$WORKFLOW" || fail "self-cancellation must identify the 
 if grep -Eq 'success[[:space:]]*\|[[:space:]]*skipped|success[[:space:]]+or[[:space:]]+skipped' "$WORKFLOW"; then
     fail "skipped must never satisfy a required check"
 fi
+
+"$ROOT_DIR/scripts/test-local-validation-label-invalidator.sh" "$ROOT_DIR"
 
 echo "check-merge-gate-policy.sh: OK - PASSED/FAILED/NO_RESULT gate wiring enforced"

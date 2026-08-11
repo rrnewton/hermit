@@ -99,6 +99,11 @@ The label is an alternate merge admission signal, not a partial-test waiver.
 Apply it only through a full green validator run on the exact pull request head.
 Without that local receipt, the hosted leg requires both the portable and
 privileged jobs to pass. A hosted failure is never overridden by local evidence.
+GitHub exposes no per-label write ACL, so repository roles cannot prevent a
+human or general-purpose token from clicking or calling the label API. The
+enforceable boundary is causal instead: `pull_request: labeled` and
+`ready_for_review` both invoke the trusted receipt dereference and promptly strip
+an unbacked cache label. Only `ci-hub apply-local-label` is an authorized writer.
 
 ## Validation-evidence trail
 
@@ -143,6 +148,11 @@ Known strip paths — all must leave the trail:
    workflow. Fork heads cannot be used as base-repository workflow-dispatch
    refs; their advisory checks remain until a new receipt and label re-fire the
    pull-request gate.
+4. **Label creation and review readiness.** Every `pull_request: labeled` and
+   `ready_for_review` event runs that same invalidator. A human- or agent-minted
+   label with no remotely dereferenceable exact-head receipt is stripped; a
+   producer-backed label is retained. This closes the manual-write path without
+   treating the event actor or the cache label itself as authorization.
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads
