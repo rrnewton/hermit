@@ -875,6 +875,7 @@ fn self_test() -> Result<(), String> {
     ledger_path_resolution_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
+    product_front_door_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -1973,6 +1974,115 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
         if !cur.pop() || cur.as_os_str().is_empty() {
             return None;
         }
+    }
+}
+
+/// Decide whether a product run inside a dev-hermit workspace must be sent
+/// through ci-hub.
+///
+/// `canonically_admitted` is supplied only by
+/// [`canonical_validate_lock_admission`] in production.  Keeping the path and
+/// message construction pure makes both sides bracketable without acquiring a
+/// real box-exclusive lock in `--self-test`.
+fn product_front_door_refusal(
+    parent: &Path,
+    root: &Path,
+    commit: &str,
+    requested_args: &str,
+    canonically_admitted: bool,
+) -> Option<String> {
+    if canonically_admitted {
+        return None;
+    }
+    let ci_hub = validate_plan::shell_quote(&parent.join("ci-hub/ci-hub").to_string_lossy());
+    let checkout = validate_plan::shell_quote(&root.to_string_lossy());
+    Some(format!(
+        "validate: REFUSED — product validation inside dev-hermit must enter through the canonical ci-hub admission.\n\
+         A naked run from {checkout} can consume the validation box without holding the exact\n\
+         validate-lock owner ancestry and can write an unadmitted ledger row.\n\
+         \n\
+         Run this exact command instead:\n\
+         \n\
+           {ci_hub} validate-run --checkout {checkout} --agent '<registered-agent-name>' --target {commit} -- {requested_args}"
+    ))
+}
+
+/// Reproduce the caller's validated argv after ci-hub's `--` separator.
+/// An empty argv means the driver's default full profile.
+fn requested_validate_args() -> String {
+    let args = std::env::args()
+        .skip(1)
+        .map(|arg| validate_plan::shell_quote(&arg))
+        .collect::<Vec<_>>();
+    if args.is_empty() { "full".into() } else { args.join(" ") }
+}
+
+/// Two-root bracket for the product front door.  It is intentionally pure:
+/// no validate lock is acquired and no product command, ledger writer, or
+/// receipt publisher can run from this test.
+fn product_front_door_bracket() -> Result<(), String> {
+    let parent = PathBuf::from("/srv/dev-hermit");
+    let primary = parent.join("hermit");
+    let managed = parent.join("worktrees/slot07/hermit");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let requested = "--strict-compat-only";
+
+    for checkout in [&primary, &managed] {
+        // Both the primary and a managed slot are product-running checkouts.
+        // Neither may start work or reach the ledger writer without the same
+        // exact lock-owner ancestry proof.
+        let refusal = product_front_door_refusal(
+            &parent, checkout, commit, requested, false,
+        )
+        .ok_or_else(|| format!("product front door accepted naked run from {}", checkout.display()))?;
+        let quoted = validate_plan::shell_quote(&checkout.to_string_lossy());
+        let exact = format!(
+            "/srv/dev-hermit/ci-hub/ci-hub validate-run --checkout {quoted} --agent \
+             '<registered-agent-name>' --target {commit} -- {requested}"
+        );
+        if !refusal.contains(&exact) || !refusal.contains("unadmitted ledger row") {
+            return Err(format!(
+                "product refusal omitted its exact remediation or consequence: {refusal}"
+            ));
+        }
+        if product_front_door_refusal(&parent, checkout, commit, requested, true).is_some() {
+            return Err(format!(
+                "product front door refused canonical admission for {}",
+                checkout.display()
+            ));
+        }
+    }
+
+    // The retired producer environment marker is not an input to the decision.
+    // Bracket that explicitly because a forgeable env exemption was the defect
+    // in the historical implementation.
+    let saved = std::env::var_os("CI_HUB_VALIDATE_PRODUCER");
+    std::env::set_var("CI_HUB_VALIDATE_PRODUCER", "forged");
+    let forged = product_front_door_refusal(
+        &parent, &managed, commit, requested, false,
+    )
+    .is_some();
+    match saved {
+        Some(value) => std::env::set_var("CI_HUB_VALIDATE_PRODUCER", value),
+        None => std::env::remove_var("CI_HUB_VALIDATE_PRODUCER"),
+    }
+    if !forged {
+        return Err("owner-watch front door trusted forged CI_HUB_VALIDATE_PRODUCER".into());
+    }
+
+    println!(
+        "  product front door: naked primary+slot 2 refused / canonical admission 2 allowed / \
+         forged env 1 refused"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod owner_watch_front_door_tests {
+    #[test]
+    fn primary_slot_admission_and_forged_env_are_bracketed() {
+        super::product_front_door_bracket()
+            .expect("product front-door bracket");
     }
 }
 
@@ -4949,6 +5059,44 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             parent.as_deref(),
             args.historical_debug,
         );
+    }
+
+    // ---- product front door ------------------------------------------------
+    //
+    // Every product-running checkout inside dev-hermit, including the primary,
+    // may start work only beneath the box-global validate-lock owner.  Do not
+    // trust CI_HUB_VALIDATE_PRODUCER (or any other caller-supplied marker): the
+    // authority query binds the live lock owner PID/start-time to this process's
+    // real ancestry, exact commit and host.  Inert help, self-test, stop-test and
+    // show-plan paths bypass this product-work guard.
+    if !args.show_plan {
+        if let Some(parent) = parent.as_deref() {
+            let commit = git_sha();
+            let host = short_hostname();
+            let admitted = canonical_validate_lock_admission(Some(parent), &commit, &host);
+            if let Some(refusal) = product_front_door_refusal(
+                parent,
+                &root,
+                &commit,
+                &requested_validate_args(),
+                admitted,
+            ) {
+                eprintln!("{refusal}");
+                return RunSummary::refused(
+                    4,
+                    &profile_name,
+                    "the dev-hermit product front door",
+                    vec![
+                        "this checkout is inside dev-hermit, but this process is not descended \
+                         from the canonical validate-lock owner"
+                            .into(),
+                        "use the exact ci-hub validate-run command printed above; environment \
+                         markers cannot authorize product work"
+                            .into(),
+                    ],
+                );
+            }
+        }
     }
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
