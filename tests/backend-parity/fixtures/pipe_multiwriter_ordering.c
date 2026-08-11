@@ -68,7 +68,19 @@ int main(void) {
             if (write(fd[1], buf, (size_t)n) != n) {
                 _exit(3);
             }
-            _exit((int)(acc & 1) == 2 ? 4 : i + 1);
+            /*
+             * `acc` is volatile, so every iteration of the busy loop above is
+             * an observable access the compiler must emit; nothing further is
+             * needed to keep the unequal work alive. The previous form here
+             * guarded the exit code with `(acc & 1) == 2`, which cannot hold
+             * for any value of a one-bit mask -- gcc rejects it under the
+             * harness's own `-Werror=tautological-compare`
+             * (ci/test_harness.sh:2395), so this guest never compiled and the
+             * cell could never have produced a witness. The `4` arm was
+             * unreachable by construction, so dropping it leaves the observed
+             * exit code exactly as it always would have been: `i + 1`.
+             */
+            _exit(i + 1);
         }
         kids[i] = p;
     }
