@@ -16,6 +16,73 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
+DEV_HERMIT = next(parent for parent in ROOT.parents if (parent / "ci-hub" / "ci-hub").is_file())
+
+
+def process_start_ticks(pid: int) -> int:
+    return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+
+
+def write_fake_process(
+    proc_root: Path,
+    pid: int,
+    *,
+    ppid: int,
+    pgid: int,
+    start_ticks: int,
+    argv: tuple[str, ...],
+    cgroup: str,
+    flags: int = 0,
+) -> None:
+    process = proc_root / str(pid)
+    process.mkdir(parents=True)
+    fields = ["0"] * 20
+    fields[0] = "S"
+    fields[1] = str(ppid)
+    fields[2] = str(pgid)
+    fields[6] = str(flags)
+    fields[19] = str(start_ticks)
+    (process / "stat").write_text(f"{pid} (fixture) {' '.join(fields)}\n")
+    (process / "cmdline").write_bytes(
+        b"\0".join(argument.encode() for argument in argv) + (b"\0" if argv else b"")
+    )
+    (process / "cgroup").write_text(f"0::{cgroup}\n")
+
+
+def peer_proc_fixture(tmpdir: Path, *, unresolved: bool = False) -> Path:
+    proc_root = tmpdir / "proc"
+    proc_root.mkdir()
+    write_fake_process(
+        proc_root,
+        1,
+        ppid=0,
+        pgid=1,
+        start_ticks=1,
+        argv=(),
+        cgroup="/",
+        flags=0x00200000,
+    )
+    write_fake_process(
+        proc_root,
+        os.getpid(),
+        ppid=1,
+        pgid=os.getpid(),
+        start_ticks=process_start_ticks(os.getpid()),
+        argv=("ci-hub", "validate-lock"),
+        cgroup="/user.slice/user@1000.service/app.slice/validate-X.service",
+    )
+    if unresolved:
+        write_fake_process(
+            proc_root,
+            40,
+            ppid=1,
+            pgid=40,
+            start_ticks=40,
+            argv=("/other/scripts/validate.rs", "full"),
+            cgroup="/user.slice/user@1000.service/app.slice/validate-Z.service",
+        )
+        (proc_root / "40" / "stat").write_text("malformed stat\n")
+    return proc_root
 
 
 def stop_test_env(
@@ -24,6 +91,7 @@ def stop_test_env(
     mode: str = "1",
     lock_proven: bool = False,
     forged_owner: bool = False,
+    unresolved_peer: bool = False,
 ) -> dict[str, str]:
     TEST_ROOTS.append(tmpdir)
     env = os.environ.copy()
@@ -72,6 +140,11 @@ def stop_test_env(
             # must win; otherwise parked stop-test fixtures make every genuine
             # admitted schema-5 receipt unqualifiable.
             CI_HUB_VALIDATE_CONCURRENT="true",
+            VALIDATE_STOP_TEST_PEER_PROC_ROOT=str(
+                peer_proc_fixture(tmpdir, unresolved=unresolved_peer)
+            ),
+            VALIDATE_STOP_TEST_EXCLUSION_LOCK=str(tmpdir / "peer-exclusion.lock"),
+            VALIDATE_STOP_TEST_CONTROL_SOCKET=str(tmpdir / "peer-monitor.sock"),
         )
     if forged_owner:
         owner_file = tmpdir / "caller-chosen.owner"
@@ -365,7 +438,127 @@ def run_cleanup_signal_race() -> None:
         assert rows[0]["interruption_signal"] is None, rows[0]
 
 
+def qualifying(row: dict) -> bool:
+    result = subprocess.run(
+        [
+            "python3",
+            str(DEV_HERMIT / "ci-hub" / "qualifying_receipt.py"),
+            "--sha",
+            row["commit"],
+            "--json",
+        ],
+        input=json.dumps(row),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    try:
+        return result.returncode == 0 and json.loads(result.stdout)["accepted"] is True
+    except (json.JSONDecodeError, KeyError):
+        return False
+
+
+def inert_publisher(tmpdir: Path) -> tuple[Path, Path]:
+    calls = tmpdir / "publisher-calls"
+    publisher = tmpdir / "inert-publisher"
+    publisher.write_text(
+        "#!/bin/sh\n"
+        f"printf 'called\\n' >> {calls}\n"
+        "exit 0\n"
+    )
+    publisher.chmod(0o755)
+    return publisher, calls
+
+
+def run_authority_causal_fixture(mode: str) -> tuple[int, int, int]:
+    with tempfile.TemporaryDirectory(prefix=f"validate-authority-{mode}-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir
+        log = tmpdir / "validate.log"
+        release = tmpdir / "success-release"
+        publisher, publisher_calls = inert_publisher(tmpdir)
+        if mode == "forged-sidecar":
+            env = stop_test_env(tmpdir, forged_owner=True)
+        elif mode == "unresolvable-process":
+            env = stop_test_env(tmpdir, lock_proven=True, unresolved_peer=True)
+        elif mode == "same-uid-nonowner":
+            env = stop_test_env(tmpdir, lock_proven=True)
+        else:
+            raise AssertionError(f"unknown authority fixture {mode}")
+        env.update(
+            VALIDATE_STOP_TEST_SUCCESS_RELEASE="1",
+            VALIDATE_STOP_TEST_RELEASE_FILE=str(release),
+            VALIDATE_STOP_TEST_COMMIT_ANCHORED="1",
+            CI_HUB_APPLY_LOCAL_LABEL=str(publisher),
+            PR_NUMBER="999999",
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                wait_for_text(log, "VALIDATE_STOP_TEST_READY", process)
+                if mode == "same-uid-nonowner":
+                    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    client.connect(str(tmpdir / "peer-monitor.sock"))
+                    client.sendall(b"final\n")
+                    response = json.loads(client.recv(4096))
+                    client.close()
+                    assert response == {
+                        "ok": False,
+                        "error": "unauthorized-controller",
+                    }, response
+                release.write_text("release\n")
+                rc = process.wait(timeout=20)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=10)
+
+        assert rc == 0, (mode, rc, log.read_text(errors="replace"))
+        rows = ledger_rows(ledger)
+        assert len(rows) == 1, (mode, rows)
+        row = rows[0]
+        assert row["raw_result"] == "pass", row
+        qualifying_count = sum(qualifying(candidate) for candidate in rows)
+        publisher_count = (
+            len(publisher_calls.read_text().splitlines()) if publisher_calls.exists() else 0
+        )
+        if mode in {"forged-sidecar", "unresolvable-process"}:
+            assert row["result"] == "no_result", row
+            assert row["concurrency_indeterminate"] is True, row
+            assert row["concurrent_validates"] is None, row
+            assert row["concurrency_proof"] is None, row
+            assert (len(rows), qualifying_count, publisher_count) == (1, 0, 0)
+            if mode == "forged-sidecar":
+                assert row["admission"] is None, row
+            else:
+                assert "snapshot-unresolved:process PID 40" in row[
+                    "concurrency_indeterminate_detail"
+                ], row
+        else:
+            assert row["concurrency_indeterminate"] is False, row
+            assert row["concurrent_validates"] == 0, row
+            monitor = row["concurrent_validate_monitor"]
+            assert monitor["monitor_sequence"] == monitor["final_ack_sequence"], monitor
+            # Positive side of the publication latch: after the unauthorized
+            # request was refused, the legitimate controller still finalized
+            # and the inert publisher was invoked exactly once.
+            assert publisher_count == 1, (row, publisher_count)
+        return len(rows), qualifying_count, publisher_count
+
+
 def main() -> None:
+    assert run_authority_causal_fixture("forged-sidecar") == (1, 0, 0)
+    assert run_authority_causal_fixture("unresolvable-process") == (1, 0, 0)
+    unauthorized = run_authority_causal_fixture("same-uid-nonowner")
+    assert unauthorized[0] == 1 and unauthorized[2] == 1, unauthorized
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         run_signal(sig, expect_record=True)
     run_signal(signal.SIGKILL, expect_record=False)
@@ -382,7 +575,9 @@ def main() -> None:
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"
     print(
-        "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
+        "PASS: forged sidecar 1 diagnostic/0 qualifying/0 publisher; "
+        "unresolvable process sticky 1/0/0; same-uid non-owner final refused and "
+        "legitimate final published inertly 1/1; TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
         "accept/refuse bracketed; MODE=1/0/empty activation bracketed; cleanup is signal-atomic"
     )
