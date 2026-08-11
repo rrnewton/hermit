@@ -4,6 +4,10 @@ This file is the developer guide for the Hermit project. It covers what Hermit
 is, how to build and test it, its architecture, how to debug determinism
 problems, and how changes reach the repository.
 
+Codex coordinator discipline: coordinate only; delegate nontrivial tool work to workers. Never paste raw tool
+output into the user transcript; provide concise synthesized results to avoid the cybersecurity false-positive
+filter. If a worker hits that filter, rephrase or replace the worker without stalling the coordinator.
+
 ## Autonomous Bot Audit Tags
 
 New syscall support authored by a bot must leave two narrowly scoped
@@ -336,11 +340,17 @@ Typical flow for a change:
   imperative, descriptive commit subject that states what changed. Explain the
   reason and any non-obvious constraints in the body.
 - **End every commit body with a role + team tag**, as its own final line:
-  `[<role>, MODEL] [<full-team-name>]` — for example
-  `[impl agent, claude-opus-5] [claude-coord-176]`. Role is `impl agent`,
-  `adversarial-reviewer agent`, `coordinator`, or `Human`; the team name includes
-  the machine. The same tag opens the PR description and prefixes any GitHub
-  comment coordinating across teams.
+  `[<role>, MODEL] [<team-slug>, <machine>]` — for example
+  `[impl agent, claude-opus-5] [hermit-coord, devbig030]`, where `<machine>` is
+  an exact `devbigNNN` token kept comma-delimited from the team slug (never
+  embedded in it). Role is `impl agent`, `adversarial-reviewer agent`,
+  `coordinator`, or `Human`. The same tag opens the PR description and
+  prefixes any GitHub comment coordinating across teams. This matches the
+  dev-hermit parent's Conventions and its installed
+  `scripts/check_commit_attribution.py` hook, which is what actually enforces
+  this format across every initialized checkout including this one — an older
+  single-bracket `[<full-team-name>]` form (e.g. `[claude-coord-176]`) is
+  rejected by that hook.
 
   The commit trailer is the load-bearing one. This repository lands PRs by
   **rebase merge**, which replays the branch commit onto `main` verbatim and adds
