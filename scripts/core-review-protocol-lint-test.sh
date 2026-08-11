@@ -41,6 +41,9 @@ APPROVE at exact head ${HEAD_SHA}. Independent review found no blocker."
 readonly SELF_REVIEW="[adversarial-reviewer agent, CODEX] [author-agent, devbig999]
 
 PASS at exact head ${HEAD_SHA}."
+readonly EARLIER_AUTHOR_REVIEW="[adversarial-reviewer agent, CODEX] [earlier-author, devbig998]
+
+PASS at exact head ${HEAD_SHA}."
 readonly STALE_REVIEW="[adversarial-reviewer agent, CODEX] [codex-reviewer, devbig998]
 
 PASS at stale head ${OLD_SHA}."
@@ -186,6 +189,13 @@ run_case "malformed historical author trailer blocks" 1 "" "$FULL_BODY" false "$
     $'Test candidate\n\n[impl agent, CODEX] [author-agent, devbig999]' \
     'Historical candidate\n\n[impl agent, CODEX] [author-agent@devbig999]'
 run_case "self-review does not satisfy independence" 1 "" "$FULL_BODY" false "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "reviewer disjoint from every commit author passes" 0 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
+    $'Head candidate\n\n[impl agent, CLAUDE] [head-author, devbig999]' \
+    $'Earlier candidate\n\n[impl agent, CODEX] [earlier-author, devbig998]'
+run_case "earlier commit author cannot approve aggregate" 1 "" "$FULL_BODY" false \
+    "$(comments_json "$EARLIER_AUTHOR_REVIEW")" "$empty" "$ORDINARY_DIFF" \
+    $'Head candidate\n\n[impl agent, CLAUDE] [head-author, devbig999]' \
+    $'Earlier candidate\n\n[impl agent, CODEX] [earlier-author, devbig998]'
 run_case "stale-head review does not count" 1 "" "$FULL_BODY" false "$(comments_json "$STALE_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "request-changes verdict does not authorize landing" 1 "" "$FULL_BODY" false "$(comments_json "$BLOCK_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "triggered PR with only Codex review blocks" 1 post-facto-human-review "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"

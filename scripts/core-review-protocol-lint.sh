@@ -61,7 +61,8 @@ team_tag() {
     sed -nE '1s/^\[[^]]+\][[:space:]]+\[([^],]+),[[:space:]]*devbig[0-9]+\]$/\1/p'
 }
 
-author_identity=
+head_author_identity=
+declare -A author_identities=()
 declare -A seen_commit_shas=()
 commit_count=0
 head_count=0
@@ -86,15 +87,19 @@ while IFS= read -r item; do
         fail "commit ${commit_sha} must end with a standalone role tag and comma-delimited team/machine tag."
     fi
 
+    if [[ -n $commit_identity ]]; then
+        author_identities["$commit_identity"]=1
+    fi
+
     if [[ $commit_sha == "$head_sha" ]]; then
         head_count=$((head_count + 1))
-        author_identity=$commit_identity
+        head_author_identity=$commit_identity
     fi
 done < <(jq -c '.[]' "$commit_messages_file")
 
 ((commit_count > 0)) || fail "base-to-head commit range is empty."
 ((head_count == 1)) || fail "base-to-head commit range must contain exact head ${head_sha} once."
-[[ -n $author_identity ]] || fail "exact-head author identity is unavailable."
+[[ -n $head_author_identity ]] || fail "exact-head author identity is unavailable."
 
 positive_verdict() {
     local review_body=$1 verdict
@@ -122,7 +127,7 @@ consider_review() {
         # checkable fleet identity and must differ from the author's tag.
         reviewer_identity="agent:${reviewer_team,,}"
     fi
-    [[ -n $author_identity && $reviewer_identity != "$author_identity" ]] || return 0
+    [[ -z ${author_identities[$reviewer_identity]+x} ]] || return 0
     positive_verdict "$review_body" || return 0
     if [[ $exact_by_api != true ]]; then
         grep -Fq "$head_sha" <<< "$review_body" || return 0
