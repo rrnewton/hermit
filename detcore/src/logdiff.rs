@@ -1624,12 +1624,12 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     /// record for an entire run, so any cross-backend diff compares 1 message
     /// against thousands and can never say anything.
     ///
-    /// This is exactly what the DBI backend did. `detcore-dbi` hand-rolls its own
+    /// This is exactly what the DBI backend did. `detcore-dbt` hand-rolls its own
     /// `tracing::Subscriber` (it runs as a DynamoRIO client inside the guest and
     /// never sees the CLI's `tracing_subscriber::fmt()`), and it emitted
     /// `"{level} {target}: {fields}"` with no stamp. These tests pin the consumer
     /// side of the contract so the producer cannot silently regress; the producer
-    /// side is pinned in `detcore-dbi/src/lib.rs::record_framing`.
+    /// side is pinned in `detcore-dbt/src/lib.rs::record_framing`.
     #[test]
     fn unstamped_records_collapse_into_one_message() {
         // The pre-fix DBI shape. It satisfies the level-tag check -- so it does

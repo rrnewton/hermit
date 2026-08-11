@@ -400,9 +400,9 @@ pub(super) fn run_dbt(
         ));
     }
     // This CLI adapter bypasses libhermit's run_with_backend entry point. Use
-    // the same normalizer explicitly so every DBI capability flag crosses the
+    // the same normalizer explicitly so every DBT capability flag crosses the
     // serialized config boundary without cloning policy at this seam.
-    let config = hermit::normalize_backend_config(config.clone(), Backend::Dbi);
+    let config = hermit::normalize_backend_config(config.clone(), Backend::Dbt);
     let config_json = serde_json::to_string(&config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBT backend: {error}"
