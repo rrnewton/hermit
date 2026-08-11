@@ -118,6 +118,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             SMOKE_TIMEOUT_S,
             SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
+            None,
+            None,
         ));
         out.push(node(
             "envelope",
@@ -128,6 +130,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             SMOKE_TIMEOUT_S,
             SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
+            None,
+            None,
         ));
         out.push(node(
             "envelope",
@@ -142,6 +146,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             SMOKE_TIMEOUT_S,
             SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
+            None,
+            None,
         ));
         // L4 depends on L2: the bash only counted L4 when L2 passed, and a
         // dependency edge reproduces that without a second conditional. Each
@@ -160,6 +166,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             SMOKE_TIMEOUT_S * reps + 60,
             SMOKE_TIMEOUT_S * reps * 2,
             PROBE_MEM_BYTES,
+            None,
+            None,
         ));
         // `record start --verify` records, replays non-interactively, diffs the
         // two logs, and deletes the recording on success -- a self-contained rr
@@ -180,6 +188,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             rr_timeout,
             rr_timeout * 2,
             PROBE_MEM_BYTES,
+            None,
+            None,
         ));
     }
     out
@@ -196,6 +206,8 @@ pub fn build_node(gate_dep: &str) -> Step {
         3600,
         7200,
         16 * 1024 * 1024 * 1024,
+        None,
+        None,
     )
 }
 

@@ -895,8 +895,42 @@ fn self_test() -> Result<(), String> {
                     "carry bracket: lane {lane} rebuilt from Default::default() compared EQUAL to \
                      its file config -- the assertion cannot detect the bug it exists for"));
             }
+            let domain_errors = safe_ci_dag_runner::model::write_domain_violations(&carried);
+            if !domain_errors.is_empty() {
+                return Err(format!(
+                    "write-domain bracket: real lane {lane} was refused: {}",
+                    domain_errors.join("; ")
+                ));
+            }
+            // Isolate the new field. A broad defaulted-config mismatch could
+            // stay red even if the write-domain policy silently disappeared.
+            let mut dropped_policy = carried.clone();
+            dropped_policy.write_domain_policy = Default::default();
+            let policy_drop = validate_plan::assert_config_carried(&base, &dropped_policy)
+                .expect_err("carry bracket: dropped write-domain policy was accepted");
+            if !policy_drop.contains("write_domain_policy") {
+                return Err(format!(
+                    "carry bracket: dropped write-domain policy refusal did not name the field: \
+                     {policy_drop}"
+                ));
+            }
+            // Prove the runner's pre-execution predicate refuses an omitted
+            // declaration while accepting the real lane above.
+            let mut missing_domain = carried.clone();
+            let missing_tag = missing_domain.steps[0].tag();
+            missing_domain.steps[0].write_domains = None;
+            let missing_errors =
+                safe_ci_dag_runner::model::write_domain_violations(&missing_domain);
+            if !missing_errors.iter().any(|e| {
+                e.contains(&missing_tag) && e.contains("missing write_domains")
+            }) {
+                return Err(format!(
+                    "write-domain bracket: omitted declaration for {missing_tag} was not named: \
+                     {missing_errors:?}"
+                ));
+            }
             println!("  dag-config: {lane} carries {} cap(s), default_step_timeout={}s; \
-cleared-caps refusal names {} starved step(s)",
+cleared-caps refusal names {} starved step(s); write domains 1 accept / 1 omitted-declaration refusal",
                      base.resource_caps.len(), base.default_step_timeout, starved.len());
         }
     }
@@ -1334,6 +1368,8 @@ fn super_plan_bracket() -> Result<(), String> {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -2442,6 +2478,10 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // artifact -- a check that passes while measuring the wrong thing,
         // which is worse than failing loudly. Zero binaries still fails.
         privileged_build.cmd = "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"".to_string();
+        // The fused replacement only reads already-published artifacts; it no
+        // longer performs the original privileged Cargo writes.
+        privileged_build.write_domains = Some(Vec::new());
+        privileged_build.write_domain_guarantee = None;
 
         let cpuid = steps
             .iter_mut()
@@ -2461,6 +2501,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // `-ge 1` relaxation -- running a stale `tests_misc` would report a
         // CPUID verdict about an artifact that is not the one under test.
         cpuid.cmd = "newest=\"\"; for f in target/debug/deps/tests_misc-*; do if [ -f \"$f\" ] && [ -x \"$f\" ] && { [ -z \"$newest\" ] || [ \"$f\" -nt \"$newest\" ]; }; then newest=\"$f\"; fi; done; test -n \"$newest\"; timeout 30 \"$newest\" rdrand_rdseed_is_masked --exact".to_string();
+        cpuid.write_domains = Some(Vec::new());
+        cpuid.write_domain_guarantee = None;
     }
     // Fusing lanes means one config for both. Their default wall timeouts differ,
     // but every shipped/synthesized node has an explicit wall timeout and the
@@ -2473,6 +2515,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         .collect::<Result<_, _>>()?;
     let mut fused = bases[0].clone();
     for b in bases.iter().skip(1) {
+        if b.write_domain_policy != fused.write_domain_policy {
+            return Err(format!(
+                "--merge-lanes refused: write-domain policies differ: {:?} != {:?}",
+                fused.write_domain_policy, b.write_domain_policy
+            ));
+        }
         fused.default_step_timeout = fused.default_step_timeout.min(b.default_step_timeout);
         for (r, n) in &b.resource_caps {
             if let Some(prev) = fused.resource_caps.get(r) {
@@ -2486,6 +2534,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
     }
     let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
+    let domain_errors = safe_ci_dag_runner::model::write_domain_violations(&cfg);
+    if !domain_errors.is_empty() {
+        return Err(format!(
+            "--merge-lanes refused before execution: fused write-domain policy violation(s): {}",
+            domain_errors.join("; ")
+        ));
+    }
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -2757,7 +2812,10 @@ fn selective_plan(
     };
     let mut nodes = pre;
     nodes.extend(steps);
-    let cfg = validate_plan::config_from(nodes, "selective portable subset");
+    let base = validate_plan::lane_config(root, "portable")?;
+    let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
+    validate_plan::assert_config_carried(&base, &cfg)
+        .map_err(|e| format!("selective portable lane: DAG config was not carried: {e}"))?;
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -2960,6 +3018,8 @@ fn step_with_caps(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
