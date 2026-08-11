@@ -409,6 +409,12 @@
       "why": "tests/backend-parity/fixtures/mknod_special.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/backend-parity/fixtures/mmap_exact_address_parity.c",
+      "runner": "hermit-cli/tests/mmap_backend_parity.rs",
+      "why": "tests/backend-parity/fixtures/mmap_exact_address_parity.c is owned by hermit-cli/tests/mmap_backend_parity.rs: Prints the absolute anonymous-mmap addresses (and, with `perturb-third`, a one-sided allocator perturbation) so the Rust integration test can assert EXACT ptrace-vs-DBT mmap address parity plus its negative control. It is compiled directly by that cargo test with cc into CARGO_TARGET_TMPDIR, never discovered through a manifest, and it is deliberately distinct from tests/backend-parity/fixtures/mmap_layout_pointer_order.c, which asserts the relocation-invariant ORDER and SPACING contract and prints no absolute address."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/mmap_layout_pointer_order.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
