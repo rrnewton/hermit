@@ -208,6 +208,10 @@ fn workloads() -> &'static [Workload] {
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_record_replay_file_state", "record_replay_file_state.c"),
             ("c_lseek_seek_cur", "record_replay_lseek_seek_cur.c"),
+            (
+                "c_timerslack_proc_record_replay",
+                "timerslack_proc_record_replay.c",
+            ),
             ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
             ("c_ppoll_readv", "ppoll_readv.c"),
             ("c_uname", "uname.c"),
@@ -246,14 +250,35 @@ fn workload(name: &str) -> &Workload {
 }
 
 fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+    record_replay_command_with_policy(name, program, args, false);
+}
+
+fn record_replay_strict_command(name: &str, program: &Path, args: &[&OsStr]) {
+    record_replay_command_with_policy(name, program, args, true);
+}
+
+fn record_replay_command_with_policy(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    verify_strict: bool,
+) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let verdict = data_dir.path().join("verdict.json");
     // Bound replay as well as recording: --record-timeout only covers the first phase.
     let mut command = Command::new("timeout");
     command
         .env("HERMIT_MODE", "record")
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .args(["record", "start", "--verify"]);
+    if verify_strict {
+        command
+            .args(["--strict", "--verify-strict"])
+            .arg(format!("--verify-json={}", verdict.display()));
+    }
+    command
+        .arg("--record-timeout=30")
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
         .arg(program)
@@ -268,6 +293,17 @@ fn record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         combined_output.contains("Success: replay matched recording."),
         "Hermit did not report deterministic replay for {name}:\n{combined_output}"
     );
+    if verify_strict {
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict).expect("strict record/replay verdict was not written"),
+        )
+        .expect("strict record/replay verdict is valid JSON");
+        assert_eq!(report["verified"], true, "record/replay did not verify");
+        assert_eq!(
+            report["bitwise_parity"], true,
+            "record/replay did not establish canonical parity"
+        );
+    }
 }
 fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
@@ -930,6 +966,20 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     let _guard = hermit_record_lock();
     record_replay(workload("c_pidfd_open_self"));
     record_replay(workload("c_pidfd_poll_self"));
+}
+
+/// Replayer substitutes an eventfd for this proc descriptor. The Detcore
+/// procfs layer must bind the live task incarnation named by the path rather
+/// than the placeholder inode, then preserve one virtual timer-slack scalar
+/// across proc read/write and prctl access in both phases.
+#[test]
+fn record_timer_slack_proc_read_write() {
+    let _guard = hermit_record_lock();
+    record_replay_strict_command(
+        "timer-slack-proc-read-write",
+        &workload("c_timerslack_proc_record_replay").path,
+        &[],
+    );
 }
 
 macro_rules! record_replay_tests {
