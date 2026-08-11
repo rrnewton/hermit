@@ -234,17 +234,42 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         assert process.returncode == 1, output
         raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
+        marker = "canonical ledger record appended"
         if refuse:
-            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            # Nothing durable anywhere under the test root, not merely no shard:
+            # a planted adapter that spooled instead of publishing must still
+            # count as a refusal.
+            assert not list(canonical_root.rglob("*.jsonl")), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            assert marker in output, output
+            # DEREFERENCE THE ADAPTER'S OWN CLAIM rather than hard-coding where
+            # it writes. `record()` reports the location it durably wrote, and
+            # that location has moved: up to parent c0f3ba20 it appended the
+            # tracked shard and reported `shard`; since parent a14d4f5b it
+            # writes only the machine-local spool and reports `spool`, while its
+            # `published_shard` is a COMPUTED path that no publish has created
+            # yet. Asserting the fixed shard path made this test's verdict a
+            # function of the producing host's unpinned parent checkout instead
+            # of the hermit head under test -- measured on one hermit head
+            # (3af05fe0) against two parents: c0f3ba20 gave shards=1 spools=0
+            # and passed, current parent gave shards=0 spools=1 and failed.
+            line = next(l for l in output.splitlines() if marker in l)
+            record = json.loads(line[line.index("{") :])
+            assert record["schema"] == "ci-hub-validate-ledger-record/v1", record
+            written = record.get("shard") or record.get("spool")
+            assert written, ("adapter reported no durable location", record)
+            path = canonical_root / written
+            assert path.is_file(), (path, record, output)
+            events = [json.loads(line) for line in path.read_text().splitlines()]
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
-            assert "canonical ledger record appended" in output, output
+            # Exactly one durable copy under the test root, so a future adapter
+            # cannot satisfy this by writing the event twice or by leaving a
+            # stray partial batch behind.
+            strays = [other for other in canonical_root.rglob("*.jsonl") if other != path]
+            assert not strays, (strays, output)
 
 
 def run_cleanup_signal_race() -> None:
