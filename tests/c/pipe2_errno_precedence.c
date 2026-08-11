@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -77,7 +78,26 @@ static void expect_errno(
   failures++;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  /* Optional expected capacity. Passed as a guest arg under Detcore, where the
+   * pin makes the value knowable; omitted for a native run, whose capacity is
+   * whatever the host default happens to be. Without this the positive control
+   * only PRINTED F_GETPIPE_SZ, so deleting the pin outright still passed every
+   * registered cell: two runs of an unpinned pipe agree with each other and the
+   * errno cases are unaffected. The mechanism this guest exists to protect was
+   * therefore uncovered. */
+  long expected_capacity = -1;
+  if (argc > 1) {
+    errno = 0;
+    char* end = NULL;
+    expected_capacity = strtol(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0' ||
+        expected_capacity <= 0) {
+      fprintf(stderr, "usage: %s [expected-capacity-bytes]\n", argv[0]);
+      return 2;
+    }
+  }
+
   /* A non-null pointer that cannot be written. This is the case that
    * regressed; NULL never did, because a null pipefd was filtered out before
    * the tool touched it at all. Both are asserted so the fix cannot be
@@ -92,10 +112,10 @@ int main(void) {
   expect_errno("badptr_allflags", bad, -1, EINVAL);
   expect_errno("badptr_oappend", bad, O_APPEND, EINVAL);
 
-  /* Positive control, so a "fix" that simply stopped pinning capacity would
-   * fail here rather than look clean. Under Detcore the capacity is pinned to
-   * one page; run natively it is whatever the host default is, so only assert
-   * the pipe works and report the capacity. */
+  /* Positive control. When an expected capacity is supplied this ASSERTS the
+   * pinned value, so removing or bypassing F_SETPIPE_SZ fails here instead of
+   * looking clean. With no argument it only reports, which keeps the native
+   * errno bracket runnable on a host with any default. */
   int fds[2] = {-1, -1};
   long rc = raw_pipe2(fds, 0);
   if (rc != 0) {
@@ -105,6 +125,13 @@ int main(void) {
   } else {
     int capacity = fcntl(fds[1], F_GETPIPE_SZ);
     printf("valid_pipe2: ok capacity=%d\n", capacity);
+    if (expected_capacity > 0 && (long)capacity != expected_capacity) {
+      fprintf(stderr,
+              "valid_pipe2: expected pinned capacity %ld, got %d -- the "
+              "deterministic pipe-capacity pin is not in effect\n",
+              expected_capacity, capacity);
+      failures++;
+    }
     /* The pair must be usable, not merely returned. */
     if (write(fds[1], "x", 1) != 1) {
       perror("valid_pipe2 write");

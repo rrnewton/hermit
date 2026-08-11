@@ -4217,6 +4217,12 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace", "dbt", "sabre"]
+# 4096 is the pinned one-page capacity. Passing it makes the guest ASSERT the
+# pin rather than only print F_GETPIPE_SZ: without it, deleting F_SETPIPE_SZ
+# still passed every cell, because two runs of an unpinned pipe agree with each
+# other and the errno cases are unaffected. Omitted natively, where the default
+# is the host's.
+guest_args = { ptrace = ["4096"], dbt = ["4096"], sabre = ["4096"] }
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
