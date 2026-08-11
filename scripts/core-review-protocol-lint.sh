@@ -110,6 +110,7 @@ positive_verdict() {
 review_count=0
 codex_review=0
 claude_review=0
+declare -A seen_reviewer_identities=()
 consider_review() {
     local review_body=$1 reviewer_association=$2 exact_by_api=$3
     local first_line reviewer_team reviewer_identity family=
@@ -128,6 +129,8 @@ consider_review() {
     if [[ $exact_by_api != true ]]; then
         grep -Fq "$head_sha" <<< "$review_body" || return 0
     fi
+    [[ -z ${seen_reviewer_identities[$reviewer_identity]+x} ]] || return 0
+    seen_reviewer_identities["$reviewer_identity"]=1
 
     review_count=$((review_count + 1))
     if grep -Eiq '(codex|gpt-[0-9])' <<< "$first_line"; then

@@ -38,6 +38,12 @@ PASS at exact head ${HEAD_SHA}. Independent review found no blocker."
 readonly CLAUDE_REVIEW="[adversarial-reviewer agent, claude-opus] [claude-reviewer, devbig997]
 
 APPROVE at exact head ${HEAD_SHA}. Independent review found no blocker."
+readonly SAME_REVIEWER_CODEX="[adversarial-reviewer agent, CODEX] [one-reviewer, devbig996]
+
+PASS at exact head ${HEAD_SHA}."
+readonly SAME_REVIEWER_CLAUDE="[adversarial-reviewer agent, CLAUDE] [one-reviewer, devbig996]
+
+PASS at exact head ${HEAD_SHA}."
 readonly SELF_REVIEW="[adversarial-reviewer agent, CODEX] [author-agent, devbig999]
 
 PASS at exact head ${HEAD_SHA}."
@@ -171,6 +177,7 @@ run_case() {
 empty='[]'
 codex=$(comments_json "$CODEX_REVIEW")
 dual=$(comments_json "$CODEX_REVIEW" "$CLAUDE_REVIEW")
+same_reviewer_dual=$(comments_json "$SAME_REVIEWER_CODEX" "$SAME_REVIEWER_CLAUDE")
 formal_codex=$(jq -cn --arg body "$CODEX_REVIEW" --arg sha "$HEAD_SHA" \
     '[{body:$body, user:{login:"rrnewton"}, author_association:"OWNER", state:"APPROVED", commit_id:$sha}]')
 unauthorized_codex=$(jq -cn --arg body "$CODEX_REVIEW" \
@@ -204,6 +211,8 @@ run_case "earlier commit author cannot approve aggregate" 1 "" "$FULL_BODY" fals
 run_case "stale-head review does not count" 1 "" "$FULL_BODY" false "$(comments_json "$STALE_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "request-changes verdict does not authorize landing" 1 "" "$FULL_BODY" false "$(comments_json "$BLOCK_REVIEW")" "$empty" "$ORDINARY_DIFF"
 run_case "triggered PR with only Codex review blocks" 1 post-facto-human-review "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF"
+run_case "triggered PR cannot count one reviewer identity in both families" 1 post-facto-human-review \
+    "$FULL_BODY" false "$same_reviewer_dual" "$empty" "$ORDINARY_DIFF"
 run_case "triggered PR with both independent families passes" 0 post-facto-human-review "$FULL_BODY" false "$dual" "$empty" "$ORDINARY_DIFF"
 
 # Body contracts remain enforced for every PR.
