@@ -939,6 +939,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#547)
                 Sysno::writev,
+                // Timer-slack procfs virtualization must see every scalar and
+                // vectored read/write form that Linux accepts for the file.
+                Sysno::readv,
+                Sysno::preadv,
+                Sysno::preadv2,
+                Sysno::pwritev,
+                Sysno::pwritev2,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#683)
                 Sysno::pwrite64,
@@ -956,6 +963,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::mremap,
                 Sysno::fcntl,
                 Sysno::arch_prctl,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(PR-successor): Timer-slack prctl state is
+                // virtual and must not bypass Detcore under passthru_opt.
+                Sysno::prctl,
                 Sysno::ioctl,
                 Sysno::futex,
                 Sysno::clone,
@@ -1335,6 +1346,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         }
                     },
                     discover_live_file_metadata: pts.1.discover_live_file_metadata,
+                    // Linux copies the creating thread's current timer slack
+                    // into both fields of every new task (thread or process).
+                    timer_slack_ns: pts.1.timer_slack_ns,
+                    default_timer_slack_ns: pts.1.timer_slack_ns,
                     // POSIX timers are shared among threads of a process but are
                     // NOT inherited across fork(2). Share the table for a new
                     // thread (CLONE_THREAD); give a new process a fresh, empty
@@ -2616,6 +2631,26 @@ mod subscription_tests {
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::writev)
         );
+        for sysno in [
+            Sysno::read,
+            Sysno::write,
+            Sysno::pread64,
+            Sysno::pwrite64,
+            Sysno::readv,
+            Sysno::writev,
+            Sysno::preadv,
+            Sysno::preadv2,
+            Sysno::pwritev,
+            Sysno::pwritev2,
+            Sysno::prctl,
+        ] {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|subscribed| subscribed == sysno),
+                "timer-slack mediation requires {sysno:?}"
+            );
+        }
         assert!(
             subscriptions
                 .iter_syscalls()

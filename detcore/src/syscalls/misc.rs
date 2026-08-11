@@ -84,15 +84,8 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // applications that explicitly disable or restore core-dump access.
             | libc::PR_SET_DUMPABLE
             | libc::PR_GET_DUMPABLE
-            // TODO-HUMAN-REVIEW(PR-924)
-            //
-            // Timer slack is a per-thread kernel control for coalescing timer
-            // wakeups. Detcore virtualizes sleeps and thread scheduling, so
-            // passthrough preserves Linux's set/get behavior without changing
-            // guest ordering or logical time. Recording the result also keeps
-            // the inherited default stable during replay.
-            | libc::PR_SET_TIMERSLACK
-            | libc::PR_GET_TIMERSLACK
+            // PR_SET_TIMERSLACK and PR_GET_TIMERSLACK are deliberately absent:
+            // `handle_prctl` emulates them against per-thread Detcore state.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#802)
             //
@@ -366,6 +359,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call.option() {
             // The capability bounding set is fixed by the container launch policy.
             libc::PR_CAPBSET_READ => Ok(self.record_or_replay(guest, call).await?),
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-successor): Timer slack is shared with the
+            // virtual `/proc/<tid>/timerslack_ns` channel.  Never pass either
+            // setter through to the physical tracee: a large physical slack
+            // changes wake timing on Detcore's remaining host-timed waits.
+            libc::PR_SET_TIMERSLACK => {
+                let requested = call.arg2();
+                let state = guest.thread_state_mut();
+                // Linux treats zero as reset-to-default. Hermit virtualizes the
+                // Linux scheduling policy as SCHED_OTHER, so the kernel's
+                // RT/DL no-op branch is unreachable in the guest model.
+                state.timer_slack_ns = if requested == 0 {
+                    state.default_timer_slack_ns
+                } else {
+                    requested
+                };
+                Ok(0)
+            }
+            libc::PR_GET_TIMERSLACK => Ok(guest.thread_state().timer_slack_ns as i64),
             option
                 if guest.config().backend_virtualizes_capability_prctls
                     && is_backend_virtualized_capability_prctl(option) =>
@@ -811,9 +823,6 @@ mod tests {
             // Deterministic per-process dumpability state.
             libc::PR_SET_DUMPABLE,
             libc::PR_GET_DUMPABLE,
-            // Deterministic per-thread timer-coalescing controls.
-            libc::PR_SET_TIMERSLACK,
-            libc::PR_GET_TIMERSLACK,
             // Deterministic per-thread capability-retention flag used by setpriv.
             libc::PR_SET_KEEPCAPS,
             libc::PR_GET_KEEPCAPS,
@@ -825,6 +834,8 @@ mod tests {
         }
 
         assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
+        assert!(!is_supported_prctl_option(libc::PR_SET_TIMERSLACK));
+        assert!(!is_supported_prctl_option(libc::PR_GET_TIMERSLACK));
     }
 
     #[test]
