@@ -372,6 +372,35 @@ impl DetFd {
             .and_then(|procfs| procfs.take_at(offset, maximum))
     }
 
+    /// Namespace-visible task id bound to a timer-slack procfs description.
+    pub(crate) fn procfs_timer_slack_target(&self) -> Option<i32> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(ProcfsFile::timer_slack_target)
+    }
+
+    /// Consume bytes from the timer-slack snapshot shared by dup/fork aliases.
+    pub(crate) fn take_procfs_timer_slack(&self, value: u64, maximum: usize) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_mut()
+            .and_then(|procfs| procfs.take_timer_slack(value, maximum))
+    }
+
+    /// Read a fresh timer-slack value at an explicit offset.
+    pub(crate) fn take_procfs_timer_slack_at(
+        &self,
+        value: u64,
+        offset: usize,
+        maximum: usize,
+    ) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
+    }
+
     /// Return the shared procfs cursor and initialized snapshot length.
     pub(crate) fn procfs_position(&self) -> Option<(usize, Option<usize>)> {
         self.description().procfs.as_ref().map(ProcfsFile::position)

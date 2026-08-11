@@ -59,6 +59,86 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-successor): Review timer-slack procfs parsing,
+// per-operation target checks, and scalar/vector I/O emulation.
+const TIMER_SLACK_PARSE_BYTES: usize = 66;
+
+#[derive(Clone, Copy)]
+struct TimerSlackIovec {
+    base: usize,
+    len: usize,
+}
+
+fn parse_timer_slack_write(bytes: &[u8]) -> Result<u64, Errno> {
+    // `kstrtoull_from_user` copies at most sign + 64 binary digits + newline,
+    // then accepts decimal digits with one optional leading '+' and one
+    // optional trailing newline. An embedded NUL terminates the C string.
+    let bytes = &bytes[..bytes.len().min(TIMER_SLACK_PARSE_BYTES)];
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let mut value = &bytes[..end];
+    if value.first() == Some(&b'+') {
+        value = &value[1..];
+    }
+    if value.last() == Some(&b'\n') {
+        value = &value[..value.len() - 1];
+    }
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return Err(Errno::EINVAL);
+    }
+    value.iter().try_fold(0_u64, |parsed, digit| {
+        parsed
+            .checked_mul(10)
+            .and_then(|parsed| parsed.checked_add(u64::from(digit - b'0')))
+            .ok_or(Errno::ERANGE)
+    })
+}
+
+fn vectored_offset(low: u64, high: u64) -> i64 {
+    if std::mem::size_of::<usize>() == 8 {
+        low as i64
+    } else {
+        ((high << 32) | (low & u32::MAX as u64)) as i64
+    }
+}
+
+fn read_iovecs<M: MemoryAccess>(
+    memory: &M,
+    address: Option<Addr<libc::iovec>>,
+    count: usize,
+) -> Result<Vec<TimerSlackIovec>, Errno> {
+    if count > libc::UIO_MAXIOV as usize {
+        return Err(Errno::EINVAL);
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let address = address.ok_or(Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        count
+    ];
+    memory.read_values(address, &mut iovecs)?;
+    let total = iovecs.iter().try_fold(0_usize, |total, iovec| {
+        total.checked_add(iovec.iov_len).ok_or(Errno::EINVAL)
+    })?;
+    if total > isize::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    Ok(iovecs
+        .into_iter()
+        .map(|iovec| TimerSlackIovec {
+            base: iovec.iov_base as usize,
+            len: iovec.iov_len,
+        })
+        .collect())
+}
 
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
@@ -125,6 +205,270 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn require_current_timer_slack_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target: i32,
+    ) -> Result<(), Error> {
+        let current = guest.inject(syscalls::Gettid::new()).await? as i32;
+        if current == target {
+            return Ok(());
+        }
+
+        // Linux checks the proc inode's bound task on every operation. A
+        // signal-0 tkill observes liveness without changing the target. Detcore
+        // rejects raw-TID reuse for a retired scheduler incarnation, so the
+        // namespace-visible TID remains an incarnation key for the run.
+        match guest
+            .inject(syscalls::Tkill::new().with_tid(target).with_sig(0))
+            .await
+        {
+            Err(Errno::ESRCH) => Err(Errno::ESRCH.into()),
+            Ok(_) | Err(Errno::EPERM) => {
+                // Detcore does not expose CAP_SYS_NICE cross-task mutation;
+                // preserve the ordinary Linux result for a live other task.
+                Err(Errno::EPERM.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn timer_slack_target<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> Result<Option<i32>, Errno> {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_timer_slack_target())
+    }
+
+    fn require_timer_slack_access<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        write: bool,
+    ) -> Result<(), Errno> {
+        guest.thread_state().with_detfd(fd, |detfd| {
+            let flags = detfd.status_flags();
+            let mode = flags & libc::O_ACCMODE;
+            let denied = flags & libc::O_PATH != 0
+                || if write {
+                    mode == libc::O_RDONLY
+                } else {
+                    mode == libc::O_WRONLY
+                };
+            (!denied).then_some(()).ok_or(Errno::EBADF)
+        })?
+    }
+
+    fn read_timer_slack_input<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        buffer: Option<Addr<u8>>,
+        count: usize,
+    ) -> Result<u64, Errno> {
+        let mut bytes = vec![0_u8; count.min(TIMER_SLACK_PARSE_BYTES)];
+        if !bytes.is_empty() {
+            guest
+                .memory()
+                .read_exact(buffer.ok_or(Errno::EFAULT)?, &mut bytes)?;
+        }
+        parse_timer_slack_write(&bytes)
+    }
+
+    async fn read_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        buffer: Option<AddrMut<'_, u8>>,
+        maximum: usize,
+    ) -> Result<i64, Error> {
+        self.require_timer_slack_access(guest, fd, false)?;
+        let target = self
+            .timer_slack_target(guest, fd)?
+            .expect("timer-slack read lost its procfs classification");
+        self.require_current_timer_slack_target(guest, target)
+            .await?;
+        let value = guest.thread_state().timer_slack_ns;
+        let bytes = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.take_procfs_timer_slack(value, maximum))?
+            .expect("timer-slack procfs state disappeared");
+        if !bytes.is_empty() {
+            guest
+                .memory()
+                .write_exact(buffer.ok_or(Errno::EFAULT)?, &bytes)?;
+        }
+        Ok(bytes.len() as i64)
+    }
+
+    async fn pread_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        buffer: Option<AddrMut<'_, u8>>,
+        maximum: usize,
+        offset: i64,
+    ) -> Result<i64, Error> {
+        if offset < 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        self.require_timer_slack_access(guest, fd, false)?;
+        let target = self
+            .timer_slack_target(guest, fd)?
+            .expect("timer-slack pread lost its procfs classification");
+        self.require_current_timer_slack_target(guest, target)
+            .await?;
+        let value = guest.thread_state().timer_slack_ns;
+        let bytes = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                detfd.take_procfs_timer_slack_at(value, offset as usize, maximum)
+            })?
+            .expect("timer-slack procfs state disappeared");
+        if !bytes.is_empty() {
+            guest
+                .memory()
+                .write_exact(buffer.ok_or(Errno::EFAULT)?, &bytes)?;
+        }
+        Ok(bytes.len() as i64)
+    }
+
+    async fn readv_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        iovecs: Vec<TimerSlackIovec>,
+        offset: Option<i64>,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        self.require_timer_slack_access(guest, fd, false)?;
+        let maximum = iovecs.iter().map(|iovec| iovec.len).sum::<usize>();
+        if maximum == 0 {
+            return Ok(0);
+        }
+        if flags & !libc::RWF_HIPRI != 0 {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        let target = self
+            .timer_slack_target(guest, fd)?
+            .expect("timer-slack readv lost its procfs classification");
+        self.require_current_timer_slack_target(guest, target)
+            .await?;
+        let value = guest.thread_state().timer_slack_ns;
+        let mut positioned_offset = offset.map(|offset| offset as usize);
+        let mut total = 0_usize;
+        for iovec in iovecs {
+            if iovec.len == 0 {
+                continue;
+            }
+            let bytes = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| match positioned_offset {
+                    None => detfd.take_procfs_timer_slack(value, iovec.len),
+                    Some(offset) => detfd.take_procfs_timer_slack_at(value, offset, iovec.len),
+                })?
+                .expect("timer-slack procfs state disappeared");
+            if bytes.is_empty() {
+                break;
+            }
+            let Some(destination) = AddrMut::from_raw(iovec.base) else {
+                return if total > 0 {
+                    Ok(total as i64)
+                } else {
+                    Err(Errno::EFAULT.into())
+                };
+            };
+            if let Err(error) = guest.memory().write_exact(destination, &bytes) {
+                return if total > 0 {
+                    Ok(total as i64)
+                } else {
+                    Err(error.into())
+                };
+            }
+            total += bytes.len();
+            if let Some(offset) = positioned_offset.as_mut() {
+                *offset += bytes.len();
+            }
+            if bytes.len() != iovec.len {
+                break;
+            }
+        }
+        Ok(total as i64)
+    }
+
+    async fn write_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        buffer: Option<Addr<'_, u8>>,
+        count: usize,
+    ) -> Result<i64, Error> {
+        self.require_timer_slack_access(guest, fd, true)?;
+        let requested = self.read_timer_slack_input(guest, buffer, count)?;
+        let target = self
+            .timer_slack_target(guest, fd)?
+            .expect("timer-slack write lost its procfs classification");
+        self.require_current_timer_slack_target(guest, target)
+            .await?;
+        let state = guest.thread_state_mut();
+        state.timer_slack_ns = if requested == 0 {
+            state.default_timer_slack_ns
+        } else {
+            requested
+        };
+        i64::try_from(count).map_err(|_| Errno::EINVAL.into())
+    }
+
+    async fn writev_timer_slack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        iovecs: Vec<TimerSlackIovec>,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        self.require_timer_slack_access(guest, fd, true)?;
+        if iovecs.iter().all(|iovec| iovec.len == 0) {
+            return Ok(0);
+        }
+        if flags & !libc::RWF_HIPRI != 0 {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        // Procfs supplies only `.write`, so Linux's writev fallback invokes it
+        // once per nonempty iovec. Preserve its partial-success behavior and
+        // let the last successful segment determine the current slack.
+        let mut total = 0_i64;
+        for iovec in iovecs {
+            if iovec.len == 0 {
+                continue;
+            }
+            let buffer = Addr::from_raw(iovec.base).ok_or(Errno::EFAULT);
+            let requested = match buffer
+                .and_then(|buffer| self.read_timer_slack_input(guest, Some(buffer), iovec.len))
+            {
+                Ok(requested) => requested,
+                Err(_error) if total > 0 => return Ok(total),
+                Err(error) => return Err(error.into()),
+            };
+            let target = self
+                .timer_slack_target(guest, fd)?
+                .expect("timer-slack writev lost its procfs classification");
+            if let Err(error) = self.require_current_timer_slack_target(guest, target).await {
+                return if total > 0 { Ok(total) } else { Err(error) };
+            }
+            let state = guest.thread_state_mut();
+            state.timer_slack_ns = if requested == 0 {
+                state.default_timer_slack_ns
+            } else {
+                requested
+            };
+            total = total
+                .checked_add(i64::try_from(iovec.len).map_err(|_| Errno::EINVAL)?)
+                .ok_or(Errno::EINVAL)?;
+        }
+        Ok(total)
+    }
     /// Inject an extra fstat to retrieve file metadata.
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
@@ -507,6 +851,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(res);
         }
 
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            return self
+                .read_timer_slack(guest, call.fd(), call.buf(), call.len())
+                .await;
+        }
+
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
@@ -610,6 +960,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Zero-count reads only serve to detect errors.
             let res = guest.inject(Syscall::from(call)).await?;
             return Ok(res);
+        }
+
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            return self
+                .pread_timer_slack(guest, call.fd(), call.buf(), call.len(), call.offset())
+                .await;
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
@@ -904,6 +1260,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            return self
+                .write_timer_slack(guest, call.fd(), call.buf(), call.len())
+                .await;
+        }
+
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
@@ -997,6 +1359,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Pwrite64,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            return Err(if call.offset() < 0 {
+                Errno::EINVAL.into()
+            } else {
+                Errno::ESPIPE.into()
+            });
+        }
+
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
@@ -1091,6 +1461,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            self.require_timer_slack_access(guest, call.fd(), true)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
+            return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
+        }
+
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
@@ -1149,6 +1525,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Readv,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            self.require_timer_slack_access(guest, call.fd(), false)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), call.len())?;
+            return self
+                .readv_timer_slack(guest, call.fd(), iovecs, None, 0)
+                .await;
+        }
+
         let is_procfs = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
@@ -1203,6 +1587,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Preadv,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            let offset = vectored_offset(call.pos_l(), call.pos_h());
+            if offset < 0 {
+                return Err(Errno::EINVAL.into());
+            }
+            self.require_timer_slack_access(guest, call.fd(), false)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), call.iov_len())?;
+            return self
+                .readv_timer_slack(guest, call.fd(), iovecs, Some(offset), 0)
+                .await;
+        }
+
         let is_procfs = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
@@ -1233,6 +1629,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Preadv2,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            let offset = vectored_offset(call.pos_l(), call.pos_h());
+            if offset < -1 {
+                return Err(Errno::EINVAL.into());
+            }
+            self.require_timer_slack_access(guest, call.fd(), false)?;
+            let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
+            return if offset == -1 {
+                self.readv_timer_slack(guest, call.fd(), iovecs, None, call.flags())
+                    .await
+            } else {
+                self.readv_timer_slack(guest, call.fd(), iovecs, Some(offset), call.flags())
+                    .await
+            };
+        }
+
         let is_procfs = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
@@ -1266,6 +1679,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            let offset = vectored_offset(call.pos_l(), call.pos_h());
+            return if offset < 0 {
+                Err(Errno::EINVAL.into())
+            } else {
+                Err(Errno::ESPIPE.into())
+            };
+        }
+
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
@@ -1308,6 +1730,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
+        if self.timer_slack_target(guest, call.fd())?.is_some() {
+            let offset = vectored_offset(call.pos_l(), call.pos_h());
+            if offset < -1 {
+                return Err(Errno::EINVAL.into());
+            }
+            if offset >= 0 {
+                return Err(Errno::ESPIPE.into());
+            }
+            self.require_timer_slack_access(guest, call.fd(), true)?;
+            let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
+            let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
+            return self
+                .writev_timer_slack(guest, call.fd(), iovecs, call.flags())
+                .await;
+        }
+
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
             (detfd.resource(), detfd.stat().map(|stat| stat.inode))
         })?;
@@ -2726,11 +3164,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod test {
     use nix::fcntl::OFlag;
 
+    use super::Errno;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::parse_timer_slack_write;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
+    use super::vectored_offset;
     use crate::fd::FdType;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
@@ -2773,6 +3214,32 @@ mod test {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn timer_slack_write_parser_matches_decimal_procfs_contract() {
+        assert_eq!(parse_timer_slack_write(b"0"), Ok(0));
+        assert_eq!(parse_timer_slack_write(b"+123\n"), Ok(123));
+        assert_eq!(parse_timer_slack_write(b"456\0ignored"), Ok(456));
+        assert_eq!(
+            parse_timer_slack_write(u64::MAX.to_string().as_bytes()),
+            Ok(u64::MAX)
+        );
+
+        for invalid in [b"".as_slice(), b"+", b"-1", b" 1", b"1 ", b"1\n2", b"0x10"] {
+            assert_eq!(parse_timer_slack_write(invalid), Err(Errno::EINVAL));
+        }
+        assert_eq!(
+            parse_timer_slack_write(b"18446744073709551616"),
+            Err(Errno::ERANGE)
+        );
+    }
+
+    #[test]
+    fn timer_slack_vectored_offset_preserves_minus_one_sentinel() {
+        assert_eq!(vectored_offset(u64::MAX, u64::MAX), -1);
+        assert_eq!(vectored_offset(0, 0), 0);
+        assert_eq!(vectored_offset(7, 0), 7);
     }
 
     #[test]
