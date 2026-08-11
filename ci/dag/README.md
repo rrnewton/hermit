@@ -95,11 +95,15 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
-   and CI correspondence. Its exact per-lane command is audited: the portable
-   lane also runs the stop-signal fixture, while the privileged lane
-   explicitly skips that portable fixture to preserve its bounded hardware
-   critical path.
+1. `e2e.metadata` validates schema, inventory, stop-signal handling, generated
+   test-footprint freshness, and CI correspondence. Both lanes run the SAME
+   audited command, `./ci/test_harness.sh validate`, so the privileged copy can
+   never reject work the portable copy already accepted; the shared 75s/180s
+   workload class is asserted per lane. `validate` also accepts
+   `--lane portable|privileged`, which skips the portable-owned stop-signal
+   fixture for a privileged-only invocation, but no DAG node uses that form --
+   lane-qualifying either node would make the privileged audit strictly weaker
+   than the portable one.
 2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
    hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
    tree, then atomically publishes a content-addressed bundle. Every later

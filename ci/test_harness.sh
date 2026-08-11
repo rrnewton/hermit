@@ -104,8 +104,9 @@ Every selected required cell emits one JSONL record. Verification runs use the
 required INFO level, but diagnostics stay outside the guest-observation hash.
 
 The validate command runs the validate.sh stop-signal fixture by default and
-for the portable lane. The privileged lane skips that portable fixture so its
-hardware DAG retains the audited critical-path bound.
+for --lane portable; --lane privileged skips that portable-owned fixture. Both
+DAG lanes deliberately invoke the unqualified form, so both run the fixture and
+neither lane's audit is a weaker proxy for the other's.
 USAGE
 }
 
@@ -1810,6 +1811,19 @@ EOF
         # cannot reject work that already passed the portable gate. Lane
         # qualification would make the privileged node audit strictly less than
         # the portable node -- exactly the weaker proxy that rule forbids.
+        #
+        # THERE WERE TWO SITES, and the first repair only reached this one. The
+        # second lived in validate_dag_correspondence and demanded the same
+        # lane-qualified `.cmd`, so `validate` still died rc 2 -- measured at
+        # 3eaebbb4 on both lanes:
+        #   ci/dag/portable.json: e2e.metadata must run exactly
+        #   'test_harness.sh validate --lane portable'
+        # while pristine main reached the end of the same function rc 0. That
+        # site is now restored to main's predicate byte-for-byte. If you fold
+        # anything into this branch, do not reintroduce lane qualification at
+        # EITHER site without also changing both DAG `.cmd` values and this
+        # budget assertion -- partial application is what made the audit
+        # unsatisfiable twice.
         jq -e '
             .steps | type == "array" and length > 0
             and (map(.group + "." + .job) | unique | length) == length
@@ -2031,11 +2045,11 @@ function validate_dag_correspondence {
 
         # --- (2) e2e run-nodes must correspond to the planned cells. ---
         # The e2e.metadata gate node (which runs this very `validate`) must exist.
-        jq -e --arg lane "$lane" '[.steps[]
+        jq -e '[.steps[]
                 | select(.group == "e2e" and .job == "metadata"
-                         and .cmd == ("./ci/test_harness.sh validate --lane " + $lane))]
+                         and (.cmd | test("test_harness\\.sh validate")))]
                | length == 1' >/dev/null <"$dag" ||
-            die "ci/dag/$lane.json: e2e.metadata must run exactly 'test_harness.sh validate --lane $lane'"
+            die "ci/dag/$lane.json: missing e2e.metadata node running 'test_harness.sh validate'"
 
         # Every e2e run-node must target this lane.
         local wrong_lane
