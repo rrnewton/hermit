@@ -21,8 +21,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-/// Environment variable containing the coordinator's Unix-domain socket path.
-// TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
+/// Private env var carrying the coordinator's `Config` wire fingerprint.
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
@@ -35,6 +34,8 @@ use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallArgs;
 use reverie_syscalls::Sysno;
 
+/// Environment variable containing the coordinator's Unix-domain socket path.
+// TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 
 /// Private opt-in for forwarding injected-process Detcore INFO events.
