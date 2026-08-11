@@ -665,6 +665,18 @@ fn timer_slack_procfs_binds_target_at_open() {
             .open(format!("/proc/{tid}/timerslack_ns"))
             .unwrap();
         let mut byte = [0_u8; 1];
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
         assert_eq!(
             file.read(&mut byte).unwrap_err().raw_os_error(),
             Some(libc::EPERM),
@@ -673,6 +685,18 @@ fn timer_slack_procfs_binds_target_at_open() {
         file_send.send(file).unwrap();
         let mut file = back_recv.recv().unwrap();
         worker.join().unwrap();
+        assert_eq!(libc::read(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0), 0);
+        assert_eq!(
+            libc::pread(file.as_raw_fd(), byte.as_mut_ptr().cast(), 0, 0),
+            0
+        );
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR), 0);
+        assert_eq!(libc::lseek(file.as_raw_fd(), 0, libc::SEEK_END), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
         assert_eq!(
             file.read(&mut byte).unwrap_err().raw_os_error(),
             Some(libc::ESRCH),

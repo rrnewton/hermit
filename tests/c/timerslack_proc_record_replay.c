@@ -64,6 +64,22 @@ static long read_relative_proc_timer_slack(void) {
   if (chdir("/") != 0) {
     return -1;
   }
+  const int path_fd =
+      open("proc/self/timerslack_ns", O_PATH | O_CLOEXEC);
+  if (path_fd < 0) {
+    return -1;
+  }
+  errno = 0;
+  if (lseek(path_fd, 0, SEEK_SET) != -1 || errno != EBADF) {
+    const int saved_errno = errno == 0 ? EIO : errno;
+    close(path_fd);
+    errno = saved_errno;
+    return -1;
+  }
+  if (close(path_fd) != 0) {
+    return -1;
+  }
+
   const int fd = open("proc/self/timerslack_ns", O_RDONLY);
   if (fd < 0) {
     return -1;
@@ -144,8 +160,8 @@ int main(void) {
   }
 
   printf(
-      "relative_zero=ok relative_seek=ok before=%ld after_proc=%ld "
-      "after_prctl=%ld\n",
+      "relative_zero=ok relative_seek=ok opath_seek=ok before=%ld "
+      "after_proc=%ld after_prctl=%ld\n",
       before,
       after_proc,
       after_prctl);
