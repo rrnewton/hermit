@@ -98,6 +98,9 @@ struct Config {
     remote: Option<String>,
     print_pin: bool,
     update_to_latest: bool,
+    /// Skip the post-bump compile check. Store the unsafe choice inverted so
+    /// `Config::default()` structurally keeps verification enabled.
+    skip_verify_build: bool,
     /// Skip every NETWORKED judgement (ancestry, monotonicity, and the
     /// main-tip query) and decide only what is decidable offline: that the
     /// tracked manifests agree with each other, and that the LiteInst cache
@@ -126,6 +129,7 @@ impl Default for Config {
             remote: None,
             print_pin: false,
             update_to_latest: false,
+            skip_verify_build: false,
             offline: false,
             staged_advisory: false,
             no_base: false,
@@ -153,6 +157,7 @@ fn usage() -> &'static str {
        --repo PATH                         Hermit checkout (default: git root)\n\
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
+       --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
        --offline                           Local consistency only; no networked policy checks\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
@@ -183,6 +188,7 @@ fn parse_args() -> Result<Config, String> {
             "--no-base" => config.no_base = true,
             "--staged-pin-advisory" => config.staged_advisory = true,
             "--update-to-latest" => config.update_to_latest = true,
+            "--no-verify-build" => config.skip_verify_build = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -193,6 +199,9 @@ fn parse_args() -> Result<Config, String> {
     }
     if config.print_pin && config.update_to_latest {
         return Err("--print-pin and --update-to-latest are mutually exclusive".to_string());
+    }
+    if config.skip_verify_build && !config.update_to_latest {
+        return Err("--no-verify-build requires --update-to-latest".to_string());
     }
     Ok(config)
 }
@@ -920,7 +929,12 @@ fn calibration_decision_required(old: &str, main: &str) -> String {
     )
 }
 
-fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), String> {
+fn update_to_latest(
+    root: &Path,
+    scan: &PinScan,
+    main: &str,
+    verify_build: bool,
+) -> Result<(), String> {
     // Read the calibration BEFORE any rewrite: once the derived sites move, the
     // wrapper is the only remaining record of the revision we are carrying from.
     let calibrated = calibrated_pin(root)?;
@@ -933,7 +947,7 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         // Cargo metadata is current, but the CI sites are a separate scope and
         // may still be mid-carry -- finish them rather than reporting success
         // over a narrower scope than the caller means by "the pin".
-        return finish_ci_pin_sites(root, calibrated.as_deref(), main, true);
+        return finish_and_verify_pin_update(root, calibrated.as_deref(), main, true, verify_build);
     }
 
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
@@ -970,7 +984,69 @@ fn update_to_latest(root: &Path, scan: &PinScan, main: &str) -> Result<(), Strin
         "Reverie pin advanced to main tip {main} across {} derived Cargo revision entries.",
         updated.occurrences.len()
     );
-    finish_ci_pin_sites(root, calibrated.as_deref(), main, false)
+    finish_and_verify_pin_update(root, calibrated.as_deref(), main, false, verify_build)
+}
+
+/// Finish every non-build carry before judging whether the bumped tree builds.
+///
+/// `finish_ci_pin_sites` can still refuse an unsettled DBT calibration. Running
+/// it first preserves that decision boundary and ensures the compile result is
+/// about the complete candidate tree, not a half-carried pin.
+fn finish_and_verify_pin_update(
+    root: &Path,
+    calibrated: Option<&str>,
+    main: &str,
+    cargo_already_current: bool,
+    verify_build: bool,
+) -> Result<(), String> {
+    finish_and_verify_pin_update_with(
+        root,
+        calibrated,
+        main,
+        cargo_already_current,
+        verify_build,
+        Path::new("cargo"),
+    )
+}
+
+fn finish_and_verify_pin_update_with(
+    root: &Path,
+    calibrated: Option<&str>,
+    main: &str,
+    cargo_already_current: bool,
+    verify_build: bool,
+    cargo_program: &Path,
+) -> Result<(), String> {
+    finish_ci_pin_sites(root, calibrated, main, cargo_already_current)?;
+    if verify_build {
+        verify_bumped_tree_builds(root, cargo_program)
+    } else {
+        eprintln!(
+            "WARNING: --no-verify-build was passed: pin consistency was checked, but pin \
+             viability was not. The bumped tree may not compile."
+        );
+        Ok(())
+    }
+}
+
+/// Compile the complete bumped tree without permitting lockfile re-resolution.
+fn verify_bumped_tree_builds(root: &Path, cargo_program: &Path) -> Result<(), String> {
+    println!(
+        "Verifying the bumped tree compiles (cargo check --locked --workspace --all-targets)..."
+    );
+    let status = Command::new(cargo_program)
+        .current_dir(root)
+        .args(["check", "--locked", "--workspace", "--all-targets"])
+        .status()
+        .map_err(|error| format!("could not run cargo check for the bumped tree: {error}"))?;
+    if status.success() {
+        println!("Bumped tree compiles.");
+        return Ok(());
+    }
+    Err(format!(
+        "BUMP REFUSED: the pin was updated consistently, but the tree does not compile \
+         against it ({status}). The edits remain on disk for inspection; do not commit them."
+    ))
 }
 
 /// Carry the derived CI sites, then refuse to claim success if the one
@@ -1225,7 +1301,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     };
 
     if config.update_to_latest {
-        update_to_latest(&root, &scan, &main)?;
+        update_to_latest(&root, &scan, &main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
         let updated_pin = unique_pin(&updated)?;
         let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
@@ -1499,11 +1575,142 @@ mod tests {
         assert!(error.contains("no expected_pin="), "{error}");
     }
 
+    fn compile_fixture(label: &str, source: &str) -> PathBuf {
+        let root = temp_path(label);
+        fs::create_dir_all(root.join("src")).expect("create compile fixture");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"pin-build-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write fixture manifest");
+        fs::write(
+            root.join("Cargo.lock"),
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"pin-build-fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("write fixture lockfile");
+        fs::write(root.join("src/lib.rs"), source).expect("write fixture source");
+        root
+    }
+
+    fn fixture_cargo(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("fixture-cargo");
+        fs::write(
+            &path,
+            "#!/bin/sh\nset -eu\ncase \"${1:-}\" in\n  metadata)\n    test -f Cargo.toml\n    test -f Cargo.lock\n    printf '{\"packages\":[]}\\n'\n    ;;\n  check)\n    test \"$*\" = 'check --locked --workspace --all-targets'\n    mkdir -p target\n    rustc --edition=2021 --crate-type=lib src/lib.rs --out-dir target \\\n      >target/rustc.stdout 2>target/rustc.stderr\n    ;;\n  *) exit 64 ;;\nesac\n",
+        )
+        .expect("write fixture cargo");
+        let mut permissions = fs::metadata(&path)
+            .expect("stat fixture cargo")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("make fixture cargo executable");
+        path
+    }
+
+    #[test]
+    fn post_carry_compile_gate_accepts_one_building_tree_and_refuses_one_nonbuilding_tree() {
+        let main = "2".repeat(40);
+        let building = compile_fixture("building-bump", "pub fn value() -> u8 { 1 }\n");
+        let nonbuilding = compile_fixture(
+            "nonbuilding-bump",
+            "pub fn value() -> u8 { missing_after_resolvable_bump() }\n",
+        );
+        let building_cargo = fixture_cargo(&building);
+        let nonbuilding_cargo = fixture_cargo(&nonbuilding);
+
+        let resolved = Command::new(&nonbuilding_cargo)
+            .current_dir(&nonbuilding)
+            .args(["metadata", "--locked", "--format-version", "1"])
+            .output()
+            .expect("run cargo metadata for nonbuilding fixture");
+        assert!(
+            resolved.status.success(),
+            "the negative fixture must resolve successfully before its compile refusal is meaningful: {}",
+            String::from_utf8_lossy(&resolved.stderr)
+        );
+
+        let mut accepted = 0;
+        let mut refused = 0;
+        finish_and_verify_pin_update_with(
+            &building,
+            None,
+            &main,
+            true,
+            true,
+            &building_cargo,
+        )
+            .expect("a complete pin carry whose tree builds must be accepted");
+        accepted += 1;
+
+        let error = finish_and_verify_pin_update_with(
+            &nonbuilding,
+            None,
+            &main,
+            true,
+            true,
+            &nonbuilding_cargo,
+        )
+        .expect_err("a resolvable pin carry whose tree does not build must be refused");
+        assert!(error.contains("BUMP REFUSED"), "{error}");
+        assert!(error.contains("does not compile"), "{error}");
+        refused += 1;
+
+        assert_eq!((accepted, refused), (1, 1));
+        fs::remove_dir_all(building).expect("remove building fixture");
+        fs::remove_dir_all(nonbuilding).expect("remove nonbuilding fixture");
+    }
+
+    #[test]
+    fn calibration_refusal_precedes_build_verification() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = compile_fixture(
+            "finish-before-build",
+            "pub fn value() -> u8 { missing_after_resolvable_bump() }\n",
+        );
+        fs::create_dir_all(root.join("ci")).expect("create CI fixture directory");
+        fs::write(
+            root.join(BUDGET_CALIBRATION_SITE),
+            format!("#!/bin/bash\nexpected_pin={old}\n"),
+        )
+        .expect("write calibration fixture");
+        fs::write(
+            root.join("ci/configure-build-jobs.sh"),
+            format!("# derived pin\ncheck {old}\n"),
+        )
+        .expect("write derived pin fixture");
+        init_fixture_repo(&root);
+        assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
+
+        let missing_cargo = root.join("must-not-run-cargo");
+        let error =
+            finish_and_verify_pin_update_with(&root, Some(&old), &main, false, true, &missing_cargo)
+                .expect_err("an unsettled DBT calibration must refuse before cargo check runs");
+        assert!(error.contains("CALIBRATION DECISION REQUIRED"), "{error}");
+        assert!(
+            !error.contains("BUMP REFUSED"),
+            "build verification ran before finish_ci_pin_sites: {error}"
+        );
+        fs::remove_dir_all(root).expect("remove ordering fixture");
+    }
+
+    #[test]
+    fn build_verification_is_enabled_by_default() {
+        assert!(
+            !Config::default().skip_verify_build,
+            "the unsafe opt-out must never be the derived default"
+        );
+    }
+
     #[test]
     fn help_states_the_checker_scope() {
         let help = usage();
         assert!(help.contains("every tracked Cargo.toml and Cargo.lock"));
         assert!(help.contains("Excludes non-Cargo files"));
+        assert!(help.contains("--no-verify-build"));
+        assert!(help.contains("UNSAFE"));
     }
 
     #[test]
