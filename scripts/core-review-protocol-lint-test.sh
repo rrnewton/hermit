@@ -175,6 +175,8 @@ formal_codex=$(jq -cn --arg body "$CODEX_REVIEW" --arg sha "$HEAD_SHA" \
     '[{body:$body, user:{login:"rrnewton"}, author_association:"OWNER", state:"APPROVED", commit_id:$sha}]')
 unauthorized_codex=$(jq -cn --arg body "$CODEX_REVIEW" \
     '[{body:$body, user:{login:"stranger"}, author_association:"NONE"}]')
+same_agent_distinct_login=$(jq -cn --arg body "$SELF_REVIEW" \
+    '[{body:$body, user:{login:"other-collaborator"}, author_association:"MEMBER"}]')
 
 # Mandatory review and exact-head/identity binding.
 run_case "unlabeled PR without review blocks" 1 "" "$FULL_BODY" false "$empty" "$empty" "$ORDINARY_DIFF"
@@ -188,7 +190,10 @@ run_case "malformed exact-head author trailer blocks" 1 "" "$FULL_BODY" false "$
 run_case "malformed historical author trailer blocks" 1 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
     $'Test candidate\n\n[impl agent, CODEX] [author-agent, devbig999]' \
     'Historical candidate\n\n[impl agent, CODEX] [author-agent@devbig999]'
-run_case "self-review does not satisfy independence" 1 "" "$FULL_BODY" false "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "same-agent review under shared rrnewton login does not satisfy independence" 1 "" "$FULL_BODY" false \
+    "$(comments_json "$SELF_REVIEW")" "$empty" "$ORDINARY_DIFF"
+run_case "different GitHub login cannot override a matching agent trailer" 1 "" "$FULL_BODY" false \
+    "$same_agent_distinct_login" "$empty" "$ORDINARY_DIFF"
 run_case "reviewer disjoint from every commit author passes" 0 "" "$FULL_BODY" false "$codex" "$empty" "$ORDINARY_DIFF" \
     $'Head candidate\n\n[impl agent, CLAUDE] [head-author, devbig999]' \
     $'Earlier candidate\n\n[impl agent, CODEX] [earlier-author, devbig998]'

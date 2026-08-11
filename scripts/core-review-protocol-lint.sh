@@ -111,7 +111,7 @@ review_count=0
 codex_review=0
 claude_review=0
 consider_review() {
-    local review_body=$1 reviewer_login=$2 reviewer_association=$3 exact_by_api=$4
+    local review_body=$1 reviewer_association=$2 exact_by_api=$3
     local first_line reviewer_team reviewer_identity family=
 
     [[ $reviewer_association =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]] || return 0
@@ -119,14 +119,10 @@ consider_review() {
     grep -Eiq '^\[adversarial-reviewer agent,[^]]+\][[:space:]]+\[[a-z0-9][a-z0-9-]*,[[:space:]]+devbig[0-9]+\]$' <<< "$first_line" || return 0
     reviewer_team=$(printf '%s\n' "$first_line" | team_tag)
     [[ -n $reviewer_team ]] || return 0
-    if [[ -n $reviewer_login && ${reviewer_login,,} != "${author_login,,}" ]]; then
-        reviewer_identity="github:${reviewer_login,,}"
-    else
-        # Agents currently share the repository owner's GitHub credential. In
-        # that case the mandatory role+team provenance tag is the independently
-        # checkable fleet identity and must differ from the author's tag.
-        reviewer_identity="agent:${reviewer_team,,}"
-    fi
+    # The fork's GitHub credential identifies the shared account, not the
+    # acting agent. The mandatory role+team provenance tag is the only agent
+    # identity and must be disjoint from every commit author's tag.
+    reviewer_identity="agent:${reviewer_team,,}"
     [[ -z ${author_identities[$reviewer_identity]+x} ]] || return 0
     positive_verdict "$review_body" || return 0
     if [[ $exact_by_api != true ]]; then
@@ -146,18 +142,16 @@ consider_review() {
 
 while IFS= read -r item; do
     comment_body=$(jq -r '.body // ""' <<< "$item")
-    comment_login=$(jq -r '.user.login // ""' <<< "$item")
     comment_association=$(jq -r '.author_association // ""' <<< "$item")
-    consider_review "$comment_body" "$comment_login" "$comment_association" false
+    consider_review "$comment_body" "$comment_association" false
 done < <(jq -c '.[]' "$comments_file")
 
 while IFS= read -r item; do
     [[ $(jq -r '.state // ""' <<< "$item") == APPROVED ]] || continue
     [[ $(jq -r '.commit_id // ""' <<< "$item") == "$head_sha" ]] || continue
     review_body=$(jq -r '.body // ""' <<< "$item")
-    review_login=$(jq -r '.user.login // ""' <<< "$item")
     review_association=$(jq -r '.author_association // ""' <<< "$item")
-    consider_review "$review_body" "$review_login" "$review_association" true
+    consider_review "$review_body" "$review_association" true
 done < <(jq -c '.[]' "$reviews_file")
 
 ((review_count > 0)) || fail "no independent positive adversarial verdict bound to exact head ${head_sha}."
