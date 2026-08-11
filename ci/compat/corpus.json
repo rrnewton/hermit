@@ -569,7 +569,9 @@
       "label": "curl-localhost",
       "modes": [
         "strict",
-        "sabre"
+        "sabre",
+        "e9patch",
+        "rr"
       ]
     },
     {
@@ -2958,7 +2960,9 @@
       "label": "wget-localhost",
       "modes": [
         "strict",
-        "sabre"
+        "sabre",
+        "e9patch",
+        "rr"
       ]
     },
     {
