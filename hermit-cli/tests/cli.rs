@@ -1173,7 +1173,11 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 
 #[test]
 #[cfg_attr(
-    not(all(hermit_kvm_tests_available, hermit_test_setpriv_available, hermit_test_date_available)),
+    not(all(
+        hermit_kvm_tests_available,
+        hermit_test_setpriv_available,
+        hermit_test_date_available
+    )),
     ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/setpriv and /bin/date"
 )]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
@@ -1223,7 +1227,12 @@ fn run_kvm_propagates_explicit_environment() {
 
 #[test]
 #[cfg_attr(
-    not(all(hermit_kvm_tests_available, hermit_test_bash_available, hermit_test_paste_available, hermit_test_diff_available)),
+    not(all(
+        hermit_kvm_tests_available,
+        hermit_test_bash_available,
+        hermit_test_paste_available,
+        hermit_test_diff_available
+    )),
     ignore = "SKIPPED: requires readable and writable /dev/kvm and /bin/bash, /usr/bin/paste and /usr/bin/diff"
 )]
 fn run_kvm_bash_process_substitution_is_deterministic() {
