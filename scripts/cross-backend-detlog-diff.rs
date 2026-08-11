@@ -50,7 +50,7 @@
 //! Divergence is exit 1, not an error: finding one is a successful measurement.
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude; // rust-script cache-key: 9754dbf04d4f (regen: scripts/lib/prelude-cache-key.sh --write)
 
 use std::collections::HashMap;
 use std::env;
