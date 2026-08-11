@@ -814,6 +814,7 @@ fn self_test() -> Result<(), String> {
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
+    compat_exemption_bracket()?;
     // Every ported subsystem brings its own two-sided brackets. They are inert:
     // none of them runs a gate, publishes a label, writes the real ledger, or
     // touches a PR — see each module's `self_test` doc for why that matters.
@@ -2936,6 +2937,45 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     if !skipped.is_empty() {
         println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
     }
+}
+
+/// Two-sided bracket for the mode-specific compatibility exemptions. Inert: it
+/// creates no DAG and runs no guest; it exercises the exact predicate consumed
+/// by the verdict.
+fn compat_exemption_bracket() -> Result<(), String> {
+    let strict = validate_corpus::known_failclosed();
+    let portable = validate_corpus::portable_diagnostic();
+    let Some(reason) = portable.get("lsof") else {
+        return Err("PortableStrict lsof is not a portable diagnostic".into());
+    };
+    for evidence in [
+        "/proc/mounts",
+        "122 versus 121",
+        "/mnt/xarfuse/uid-0/92a7f8cd-seed-fb-pcie-error-log-ns-4026531832",
+    ] {
+        if !reason.contains(evidence) {
+            return Err(format!(
+                "PortableStrict lsof exemption lost retained evidence {evidence:?}: {reason}"
+            ));
+        }
+    }
+    if strict.contains_key("lsof") {
+        return Err("lsof is still duplicated in the unobserved Strict exemption table".into());
+    }
+    if !strict.contains_key("make") {
+        return Err("Strict known-failclosed policy became inert while moving lsof".into());
+    }
+    for label in ["make", "yes"] {
+        if portable.contains_key(label) {
+            return Err(format!("unexpected PortableStrict exemption for {label}"));
+        }
+    }
+    if CompatMode::PortableStrict.timeout_for("lsof") != 20
+        || CompatMode::Strict.timeout_for("lsof") != 60
+    {
+        return Err("lsof diagnostic budget is not bound exclusively to PortableStrict".into());
+    }
+    Ok(())
 }
 
 /// Per-program compatibility summary, built from typed node outcomes rather than

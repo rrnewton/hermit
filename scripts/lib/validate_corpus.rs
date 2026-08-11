@@ -127,10 +127,7 @@ pub const E9PATCH_COMPAT_TOTAL: usize = 155;
 /// Under `strict` these are NONBLOCKING: the row keeps running so the gap stays
 /// visible, mirroring the gcc vfork precedent.
 pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("lsof", "fail-closed --strict rejects the unsupported close_range syscall"),
-        ("make", "fail-closed --strict rejects the unsupported setresuid syscall"),
-    ])
+    BTreeMap::from([("make", "fail-closed --strict rejects the unsupported setresuid syscall")])
 }
 
 /// `PORTABLE_STRICT_DIAGNOSTIC_FAILURES` (validate.sh:1147). Bounded diagnostics
@@ -138,6 +135,10 @@ pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
 /// probe is given a shortened 20s budget.
 pub fn portable_diagnostic() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        (
+            "lsof",
+            "reads live unvirtualized /proc/mounts; retained divergent logs showed 122 versus 121 readlink paths because one run observed the transient /mnt/xarfuse/uid-0/92a7f8cd-seed-fb-pcie-error-log-ns-4026531832 mount",
+        ),
         ("top", "live process-table reads differ on the GitHub-managed portable runner"),
         ("zstd", "timed out on the GitHub-managed portable no-PMU runner"),
         ("zstd-roundtrip", "timed out on the GitHub-managed portable no-PMU runner"),
