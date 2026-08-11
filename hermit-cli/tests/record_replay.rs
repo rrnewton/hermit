@@ -969,9 +969,11 @@ fn record_pidfd_open_modeled_descriptor_ops() {
 }
 
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
-/// procfs layer must bind the live task incarnation named by the path rather
-/// than the placeholder inode, then preserve one virtual timer-slack scalar
-/// across proc read/write and prctl access in both phases.
+/// procfs layer must bind the live task incarnation named by an absolute or
+/// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
+/// read/pread and pre-snapshot lseek must remain entirely virtual, then one
+/// timer-slack scalar must compose across proc read/write and prctl access in
+/// both phases.
 #[test]
 fn record_timer_slack_proc_read_write() {
     let _guard = hermit_record_lock();

@@ -11,6 +11,7 @@
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
@@ -245,6 +246,20 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
     link.is_absolute().then_some(link)
+}
+
+/// Resolve an `AT_FDCWD`-relative spelling in the guest's filesystem view.
+///
+/// Replayer chroots the guest, so the tracer-visible cwd includes the replay
+/// root. Stripping `/proc/<pid>/root` produces the same guest-absolute path in
+/// record and replay without depending on the opened descriptor (which is an
+/// eventfd placeholder during replay).
+fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
+    debug_assert!(!path.is_absolute());
+    let root = std::fs::read_link(format!("/proc/{pid}/root")).ok()?;
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let guest_cwd = cwd.strip_prefix(root).ok()?;
+    Some(Path::new("/").join(guest_cwd).join(path))
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -650,9 +665,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // classifying the unresolved lexical pathname lets one spelling bypass
         // normalization and expose the host value. Absolute paths are already
         // bound; a dirfd supplies its own prefix; AT_FDCWD-relative spellings
-        // were the gap and are resolved below against the opened object.
-        let observed_path = if path.is_absolute() || call.dirfd() == libc::AT_FDCWD {
+        // are resolved through the guest's root and cwd before the open so the
+        // result does not depend on Replayer's placeholder descriptor.
+        let observed_path = if path.is_absolute() {
             path.clone()
+        } else if call.dirfd() == libc::AT_FDCWD {
+            resolved_at_fdcwd_path(guest.pid().as_raw(), &path).unwrap_or_else(|| path.clone())
         } else {
             guest
                 .thread_state()
@@ -970,16 +988,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<i64, Error> {
-        if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
-        }
-
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .read_timer_slack(guest, call.fd(), call.buf(), call.len())
                 .await;
+        }
+
+        if call.len() == 0 {
+            // Zero-count reads only serve to detect errors.
+            let res = guest.inject(Syscall::from(call)).await?;
+            return Ok(res);
         }
 
         let needs_procfs_snapshot = guest
@@ -1081,16 +1099,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pread64,
     ) -> Result<i64, Error> {
-        if call.len() == 0 {
-            // Zero-count reads only serve to detect errors.
-            let res = guest.inject(Syscall::from(call)).await?;
-            return Ok(res);
-        }
-
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .pread_timer_slack(guest, call.fd(), call.buf(), call.len(), call.offset())
                 .await;
+        }
+
+        if call.len() == 0 {
+            // Zero-count reads only serve to detect errors.
+            let res = guest.inject(Syscall::from(call)).await?;
+            return Ok(res);
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
@@ -1150,6 +1168,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
+        let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
+        if let Some(binding) = timer_slack_binding {
+            self.require_current_timer_slack_target(guest, binding)
+                .await?;
+        }
         let procfs_position = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
@@ -1169,6 +1192,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the recorded value on replay, keeping the two runs identical.
             return Ok(self.record_or_replay(guest, call).await?);
         };
+
+        if timer_slack_binding.is_some() {
+            // Linux exposes this file through seq_lseek, which accepts only
+            // SEEK_SET and SEEK_CUR. Keep that position entirely in the
+            // virtual open-file description even before the first read.
+            let requested = i128::from(call.offset());
+            let new_offset = match call.whence() {
+                Whence::SEEK_SET => requested,
+                Whence::SEEK_CUR => current as i128 + requested,
+                _ => return Err(Errno::EINVAL.into()),
+            };
+            let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
+            let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;
+            return Ok(result);
+        }
 
         let Some(snapshot_len) = snapshot_len else {
             let offset = guest.inject(Syscall::from(call)).await?;
