@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "incident": "strict_compat 7x wall-time regression accepted at 92aaed5d0",
+  "source": "owner incident report; 730s is the conservative lower bound for the observed >730s run",
+  "sha": "92aaed5d09dd44ae4fb330a99c7adf28c1fc0cae",
+  "nodes": {
+    "test.strict_compat": {
+      "elapsed_seconds": 730.0,
+      "returncode": 0,
+      "ok": true,
+      "timed_out": false,
+      "cpu_timed_out": false,
+      "oom_kills": 0
+    }
+  }
+}

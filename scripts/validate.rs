@@ -3253,6 +3253,75 @@ fn compat_summary_consumer_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the same versioned timing authority as hosted portable CI.
+///
+/// `StepOutcome` is the local runner's typed terminal evidence. Serialize that
+/// evidence into the gate's fixture format and invoke the ONE verifier used by
+/// `ci/run-node.sh`; reimplementing p90/baseline semantics here would let the two
+/// landing authorities disagree. Missing Python, baseline, output, or timing is
+/// therefore an error, never "no regression".
+fn enforce_portable_timing_gate(
+    root: &Path,
+    tmp: &Path,
+    commit: &str,
+    outcomes: &[StepOutcome],
+) -> Result<(), String> {
+    let mut nodes = serde_json::Map::new();
+    for o in outcomes {
+        let reason = o.reason.to_ascii_lowercase();
+        // A sequential full run executes portable first and privileged second;
+        // a few setup tags occur in both lanes. The baseline describes the
+        // portable lane, so retain its first typed outcome rather than silently
+        // replacing it with the later privileged row.
+        nodes.entry(o.tag.clone()).or_insert_with(|| {
+            serde_json::json!({
+                "elapsed_seconds": o.duration_s,
+                "returncode": o.returncode.unwrap_or(-1),
+                "ok": o.ok,
+                "timed_out": reason.contains("timeout") || reason.contains("timed out"),
+                "cpu_timed_out": reason.contains("cpu-timeout"),
+                "oom_kills": if reason.contains("oom") { 1 } else { 0 },
+            })
+        });
+    }
+    let candidate = tmp.join("validate-timing-candidate.json");
+    let body = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "sha": commit,
+        "nodes": nodes,
+    }))
+    .map_err(|e| format!("cannot encode candidate timing evidence: {e}"))?;
+    std::fs::write(&candidate, body)
+        .map_err(|e| format!("cannot write {}: {e}", candidate.display()))?;
+
+    let gate = root.join("ci/validate-timing-gate.py");
+    let baseline = root.join("ci/validate-timing-baseline.json");
+    let output = Command::new("python3")
+        .arg(&gate)
+        .arg("--baseline")
+        .arg(&baseline)
+        .arg("--candidate-json")
+        .arg(&candidate)
+        .arg("--sha")
+        .arg(commit)
+        .arg("--nodes-from-baseline")
+        .output()
+        .map_err(|e| format!("cannot execute {}: {e}", gate.display()))?;
+    if output.status.success() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(format!(
+        "portable per-node timing gate rejected this run (exit {}): {}{}{}",
+        output.status.code().unwrap_or(1),
+        stderr,
+        if !stderr.is_empty() && !stdout.is_empty() { " | " } else { "" },
+        stdout,
+    ))
+}
+
 /// Per-program compatibility summary, built from typed node outcomes rather than
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
 /// Returns `(passed, measured, blocking, warnings)`.
@@ -5607,6 +5676,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
+    // Both owner-authorized landing authorities enforce the same timing
+    // baseline: hosted portable shards do so in run-node.sh; complete local
+    // portable/full validation does so from the runner's typed outcomes here.
+    // Focused/selective profiles are not complete landing receipts and cannot
+    // substitute for this check.
+    let timing_gate_failure = if matches!(plan.profile.as_str(), "portable-only" | "full")
+        && plan.selection_mode == "full"
+    {
+        match enforce_portable_timing_gate(&root, &tmp, &commit, &outcomes) {
+            Ok(()) => None,
+            Err(why) => {
+                eprintln!("validate: ERROR: {why}");
+                Some(why)
+            }
+        }
+    } else {
+        None
+    };
+
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
     // The verdict is the RATCHET, not the raw node count.
     //
@@ -5637,13 +5725,16 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 && !plan.nonblocking.contains(&o.tag)
         })
         .count();
-    let effective_failures = if plan.compat.is_some() {
+    let mut effective_failures = if plan.compat.is_some() {
         compat_blocking + structural_failures
     } else if plan.super_mode {
         blocking_failures + super_blocking
     } else {
         blocking_failures
     };
+    if timing_gate_failure.is_some() {
+        effective_failures += 1;
+    }
     let mut exit_code: u8 = if effective_failures == 0 { 0 } else { 1 };
     // `ok` from the runner reflects every node, including the nonblocking ones,
     // so it is only authoritative when nothing is excused.
@@ -5651,6 +5742,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         exit_code = 1;
     }
     if envelope_regressed {
+        exit_code = 1;
+    }
+    if timing_gate_failure.is_some() {
         exit_code = 1;
     }
     if let Some((code, _)) = &envelope_error {
@@ -5776,6 +5870,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((_, msg)) = &envelope_error {
         detail.push(format!("envelope comparison could not run: {msg}"));
+    }
+    if let Some(why) = &timing_gate_failure {
+        detail.push(format!("TIMING GATE: {why}"));
     }
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(

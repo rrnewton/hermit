@@ -43,9 +43,10 @@
 #                        shim semantics). Inner per-node parallelism (cargo /
 #                        nextest -j) comes from each node's jobs_flag in the DAG,
 #                        independent of this.
-#   RUN_NODE_PERF_DIR    directory for per-step + whole-run resource-usage CSVs
-#                        (default ignored/ci/perf/run-node/<lane>). CI uploads it
-#                        as a per-shard performance artifact.
+#   RUN_NODE_PERF_DIR    parent directory for per-step + whole-run resource-usage
+#                        CSVs (default ignored/ci/perf/run-node/<lane>). Each
+#                        invocation gets a unique child so stale rows cannot be
+#                        mistaken for this exact-SHA run. CI uploads the parent.
 #
 # Example:
 #   ci/run-node.sh portable test.hermit_unit,test.detcore_unit
@@ -111,6 +112,10 @@ mkdir -p "$perf_dir" || {
     echo "run-node.sh: could not create perf dir: $perf_dir" >&2
     exit 2
 }
+run_perf_dir=$(mktemp -d "$perf_dir/run-XXXXXX") || {
+    echo "run-node.sh: could not create unique run perf dir under: $perf_dir" >&2
+    exit 2
+}
 
 # Boxing policy. safe-ci-dag-runner boxes fail-closed by default (two-level
 # cgroup-v2 + a systemd --user scope, or it exits 3). Inside GitHub Actions the
@@ -125,5 +130,26 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
     acf=(--allow-cgroup-failure)
 fi
 
-echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
-exec "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v
+echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$run_perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
+"$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$run_perf_dir" "${acf[@]}" -v
+runner_rc=$?
+
+# Portable CI is the exact-head merge authority this baseline describes. Run
+# the timing judgement even after a runner failure: a timeout/reap path that did
+# not emit a terminal profile is itself explicit fail-closed evidence rather
+# than silently becoming "no regression". A cancellation still leaves the
+# runner's journal in $RUNNER_TEMP for attribution and is non-green by GitHub.
+timing_rc=0
+if [[ $lane == portable ]]; then
+    candidate_sha=$(git rev-parse HEAD) || exit 2
+    python3 "$ROOT_DIR/ci/validate-timing-gate.py" \
+        --baseline "$ROOT_DIR/ci/validate-timing-baseline.json" \
+        --candidate-dir "$run_perf_dir" \
+        --sha "$candidate_sha" \
+        --nodes "$sel" || timing_rc=$?
+fi
+
+if (( runner_rc != 0 )); then
+    exit "$runner_rc"
+fi
+exit "$timing_rc"
