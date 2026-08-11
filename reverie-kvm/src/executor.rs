@@ -9824,8 +9824,9 @@ enum SignalDisposition {
 /// `abort()` fell through to its "unreachable" `hlt` trap and the VM reported a
 /// spurious `#GP` (exception vector 13) instead of exiting. A self-directed
 /// fatal signal now terminates the process with the conventional `128 + signo`
-/// status; ignored, stopped, blocked, or user-handled signals are reported as
-/// accepted without altering control flow.
+/// status. Ignored signals are accepted, and blocked signals are queued. Stop
+/// signals and signals with a user handler return `ENOSYS`, because reporting
+/// success without performing either action would make the syscall result lie.
 // TODO-HUMAN-REVIEW(#95): Review self-signal termination and the default-disposition table.
 fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> SyscallAction {
     // tgkill(tgid, tid, sig) carries the signal in its third argument, whereas
@@ -9875,8 +9876,9 @@ fn kill_signal(state: &mut LoadedStaticElf, number: u64, args: &[u64; 6]) -> Sys
 
     match signal_disposition(state, signal) {
         SignalDisposition::Terminate => SyscallAction::Exit(128 + signal),
-        SignalDisposition::Ignore | SignalDisposition::Stop | SignalDisposition::Handled => {
-            continue_with(0)
+        SignalDisposition::Ignore => continue_with(0),
+        SignalDisposition::Stop | SignalDisposition::Handled => {
+            continue_with(negative_errno(libc::ENOSYS))
         }
     }
 }
@@ -21116,7 +21118,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_and_probe_signals_do_not_terminate() {
+    fn ignored_and_probe_signals_succeed() {
         let dir = TestDir::new();
         let mut state = test_state(&dir.0);
         let pid = state.pid;
@@ -21139,32 +21141,69 @@ mod tests {
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
+        // An explicit SIG_IGN disposition is also a real successful no-op.
+        state
+            .signal_actions
+            .insert(libc::SIGUSR1, custom_action(0x1));
+        assert!(matches!(
+            kill_signal(
+                &mut state,
+                libc::SYS_tgkill as u64,
+                &[pid as u64, pid as u64, libc::SIGUSR1 as u64, 0, 0, 0],
+            ),
+            SyscallAction::Continue { result: 0, .. }
+        ));
     }
 
     #[test]
-    fn installed_handler_and_blocked_signal_are_not_terminating() {
+    fn unsupported_handler_fails_while_blocked_signal_is_queued() {
         let dir = TestDir::new();
         let mut state = test_state(&dir.0);
         let pid = state.pid;
 
-        // A user handler that we cannot deliver must not terminate the process.
+        // A user handler that this guest kernel cannot deliver must not report
+        // success. This is the tgkill shape used by pthread_kill.
         state
             .signal_actions
-            .insert(libc::SIGTERM, custom_action(0x4000));
-        assert!(matches!(
-            kill_signal(
-                &mut state,
-                libc::SYS_kill as u64,
-                &[pid as u64, libc::SIGTERM as u64, 0, 0, 0, 0],
-            ),
-            SyscallAction::Continue { result: 0, .. }
-        ));
+            .insert(libc::SIGUSR1, custom_action(0x4000));
+        match kill_signal(
+            &mut state,
+            libc::SYS_tgkill as u64,
+            &[pid as u64, pid as u64, libc::SIGUSR1 as u64, 0, 0, 0],
+        ) {
+            SyscallAction::Continue {
+                result,
+                segment: None,
+            } => assert_eq!(result, negative_errno(libc::ENOSYS)),
+            _ => panic!("expected ENOSYS for an undeliverable user handler"),
+        }
 
-        // A blocked fatal signal stays pending rather than terminating.
+        // Default stop actions are also unsupported rather than successful.
+        match kill_signal(
+            &mut state,
+            libc::SYS_kill as u64,
+            &[pid as u64, libc::SIGTSTP as u64, 0, 0, 0, 0],
+        ) {
+            SyscallAction::Continue {
+                result,
+                segment: None,
+            } => assert_eq!(result, negative_errno(libc::ENOSYS)),
+            _ => panic!("expected ENOSYS for an unsupported stop action"),
+        }
+
+        // A blocked fatal signal really is queued, so success remains truthful.
         let mut blocked = test_state(&dir.0);
         let blocked_pid = blocked.pid;
         let bit = (libc::SIGINT - 1) as usize;
         blocked.signal_mask[bit / 8] |= 1 << (bit % 8);
+        assert!(
+            !blocked
+                .signalfd_state
+                .lock()
+                .unwrap()
+                .pending
+                .contains(&libc::SIGINT)
+        );
         assert!(matches!(
             kill_signal(
                 &mut blocked,
@@ -21173,6 +21212,14 @@ mod tests {
             ),
             SyscallAction::Continue { result: 0, .. }
         ));
+        assert!(
+            blocked
+                .signalfd_state
+                .lock()
+                .unwrap()
+                .pending
+                .contains(&libc::SIGINT)
+        );
 
         // SIGKILL ignores both the mask and any installed handler.
         let mut unkillable = test_state(&dir.0);

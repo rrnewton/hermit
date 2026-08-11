@@ -788,6 +788,88 @@ fn static_elf_self_abort_terminates_instead_of_faulting() {
 }
 
 #[test]
+fn real_glibc_tgkill_reports_unsupported_handler_without_widening_failure() {
+    match Kvm::new() {
+        Ok(_) => {}
+        Err(error) if kvm_is_unavailable(&error) => {
+            eprintln!("skipping KVM tgkill contract test: cannot open /dev/kvm: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to probe /dev/kvm: {error}"),
+    }
+
+    let directory = TestDirectory::new();
+    let executable = compile_c_program(
+        &directory.0,
+        "tgkill-contract",
+        r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t deliveries;
+
+static void handler(int signal_number) {
+  (void)signal_number;
+  deliveries++;
+}
+
+int main(void) {
+  const pid_t pid = getpid();
+  const pid_t tid = (pid_t)syscall(SYS_gettid);
+  struct sigaction action = {.sa_handler = handler};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    return 10;
+  }
+
+  errno = 0;
+  long result = syscall(SYS_tgkill, pid, tid, SIGUSR1);
+  if (result != -1 || errno != ENOSYS || deliveries != 0) {
+    return 11;
+  }
+
+  action.sa_handler = SIG_IGN;
+  if (sigaction(SIGUSR1, &action, NULL) != 0 ||
+      syscall(SYS_tgkill, pid, tid, SIGUSR1) != 0) {
+    return 12;
+  }
+
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR2);
+  if (sigprocmask(SIG_BLOCK, &blocked, NULL) != 0 ||
+      syscall(SYS_tgkill, pid, tid, SIGUSR2) != 0) {
+    return 13;
+  }
+  struct timespec no_wait = {0, 0};
+  siginfo_t information;
+  int received = sigtimedwait(&blocked, &information, &no_wait);
+  if (received != SIGUSR2 || information.si_signo != SIGUSR2) {
+    return 14;
+  }
+
+  puts("tgkill contract ok");
+  return 0;
+}
+"#,
+    );
+    let executable = executable.to_str().unwrap();
+    let (stdout, stderr) =
+        run_host_program_with_tool_captured(executable, &[executable], &directory.0);
+    assert_eq!(stdout, b"tgkill contract ok\n");
+    assert!(
+        stderr.is_empty(),
+        "stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
 fn static_elf_clone_tid_side_effects_reach_guest_memory() {
     match Kvm::new() {
         Ok(_) => {}
