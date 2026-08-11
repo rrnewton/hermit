@@ -69,6 +69,61 @@ function run_hermit_verify {
     local label=$1
     shift
 
+    # Because the guest runs from its private /tmp, callers must explicitly name
+    # any guest-argv positions that carry host-resolved paths. Checking whether
+    # an arbitrary token happens to exist in the host cwd would make admission
+    # depend on unrelated directory contents, and it would miss paths that do
+    # not exist yet. Positions are one-based and are checked lexically, before
+    # the guest is launched:
+    #
+    #   run_hermit_verify label --require-absolute-arg 1 \
+    #       --require-absolute-arg 2 -- /bin/bash /abs/script
+    local -a required_absolute_args=()
+    while (($#)); do
+        case $1 in
+            --require-absolute-arg)
+                if (($# < 2)) || [[ ! $2 =~ ^[1-9][0-9]*$ ]]; then
+                    printf '%s: PATH-CONTRACT: --require-absolute-arg needs a positive guest argument position\n' \
+                        "$label" >&2
+                    return 1
+                fi
+                required_absolute_args+=("$2")
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                printf '%s: PATH-CONTRACT: expected helper options followed by --, got %s\n' \
+                    "$label" "$1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    local -a guest_argv=("$@")
+    if ((${#guest_argv[@]} == 0)); then
+        printf '%s: PATH-CONTRACT: missing guest command after --\n' "$label" >&2
+        return 1
+    fi
+
+    local position index path_arg
+    for position in "${required_absolute_args[@]}"; do
+        index=$((position - 1))
+        if ((index >= ${#guest_argv[@]})); then
+            printf '%s: PATH-CONTRACT: guest argument position %s is not present\n' \
+                "$label" "$position" >&2
+            return 1
+        fi
+        path_arg=${guest_argv[index]}
+        if [[ $path_arg != /* ]]; then
+            printf '%s: PATH-CONTRACT: guest argument %s must be absolute because the guest cwd is /tmp: %s\n' \
+                "$label" "$position" "$path_arg" >&2
+            return 1
+        fi
+    done
+
     local stdout_file stderr_file verdict_file status=0
     stdout_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stdout.XXXXXX")
     stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stderr.XXXXXX")
@@ -77,11 +132,35 @@ function run_hermit_verify {
     # mistaken for a report it produced.
     rm -f -- "$verdict_file"
 
+    # `--workdir=/tmp` makes the guest's working directory HERMETIC, and that is
+    # a correctness requirement of the comparison, not a convenience.
+    #
+    # Without it the guest inherits this harness's cwd. During a full local
+    # validate that cwd is the throwaway checkout under the parent workspace's
+    # shared `ignored/` tree, which a dozen concurrent agents write to. Bash
+    # validates an inherited `$PWD` at startup by stat()ing EVERY ancestor
+    # component of it, so any nested shell the guest spawns -- including the one
+    # behind a `/usr/local/bin/*` wrapper script -- stats those shared
+    # directories. On btrfs a directory's `st_size` tracks its entries, so a
+    # sibling agent creating one file between run 1 and run 2 changes that
+    # st_size and the `--verify` pair diverges on a real, correctly-reported
+    # difference. Hermit does not make a changing filesystem deterministic; it
+    # is the test's job to present a stable one.
+    #
+    # `/tmp` is the right target because Hermit bind-mounts a fresh private
+    # directory over it, and `--workdir` is resolved AFTER guest mounts are
+    # applied, so this names the guest's isolated view. Both properties matter:
+    # merely `cd`ing to /tmp before launching would bind the cwd to the
+    # *shadowed host* /tmp (62k entries on this box, churning constantly).
+    #
+    # The guest's whole ancestor chain is then `/` plus its own private /tmp,
+    # and every mutation under it is the guest's own -- which Hermit already
+    # makes deterministic.
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
-        --max-timeslice=disabled --base-env=minimal --strict \
+        --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
         --verify --verify-strict --verify-json "$verdict_file" -- \
-        "$@" >"$stdout_file" 2>"$stderr_file" || status=$?
+        "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 
     local failure=""
     if [[ ! -s $verdict_file ]]; then
