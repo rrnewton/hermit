@@ -3362,8 +3362,17 @@ fn compat_summary_consumer_bracket() -> Result<(), String> {
             false,
             0,
             false,
+            None,
+            None,
         ),
-        StepOutcome::passed(format!("compat.{listed_b}"), 0.0, String::new(), Some(0)),
+        StepOutcome::passed(
+            format!("compat.{listed_b}"),
+            0.0,
+            String::new(),
+            Some(0),
+            None,
+            None,
+        ),
         StepOutcome::failed(
             "compat.planted-unlisted".to_string(),
             0.0,
@@ -3376,6 +3385,8 @@ fn compat_summary_consumer_bracket() -> Result<(), String> {
             false,
             0,
             false,
+            None,
+            None,
         ),
     ];
     let (passed, measured, blocking, warnings) =
