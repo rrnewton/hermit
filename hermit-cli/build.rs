@@ -39,4 +39,23 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+
+    // Runtime returns from #[test] functions are reported as passes by
+    // libtest. Decide availability before compiling the KVM-only integration
+    // tests so an unavailable device is an explicit ignored/SKIPPED result.
+    // The override exists only to bracket the unavailable-device decision.
+    let kvm_device = std::env::var_os("HERMIT_KVM_TEST_DEVICE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/kvm"));
+    println!("cargo:rustc-check-cfg=cfg(hermit_kvm_tests_available)");
+    println!("cargo:rerun-if-env-changed=HERMIT_KVM_TEST_DEVICE");
+    println!("cargo:rerun-if-changed={}", kvm_device.display());
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&kvm_device)
+        .is_ok()
+    {
+        println!("cargo:rustc-cfg=hermit_kvm_tests_available");
+    }
 }
