@@ -15,12 +15,24 @@
  *   only then is pipefd written
  *     -> a bad pointer with GOOD flags is EFAULT
  *
- * Detcore pins the capacity of scheduler-managed pipes, which requires knowing
- * the caller's pipefd bytes from before the kernel overwrote them. Reading that
- * snapshot EAGERLY, and letting its failure escape, replaced both answers with
- * the tool's own memory error (measured: EIO for both), so a guest could no
- * longer tell a bad pointer from bad flags. The snapshot is now best-effort and
- * the kernel alone decides the errno.
+ * Detcore pins the capacity of scheduler-managed pipes. It used to read the
+ * caller's pipefd bytes BEFORE injecting pipe2, so that a failed capacity pin
+ * could restore them and fabricate a pipe2 error. That pre-call read was the
+ * only access on this path to an address Linux had not yet validated, and it
+ * broke twice over: it replaced both answers above with the tool's own memory
+ * error (measured: EIO for both, so a guest could not tell a bad pointer from
+ * bad flags), and on the backends whose guest memory is `LocalMemory` -- an
+ * unsafe copy_nonoverlapping that always reports success -- a bad pointer was a
+ * hardware fault no error check could catch (measured: DBT SIGSEGV, rc 255).
+ *
+ * The pre-call read is now GONE, not made best-effort. Nothing in the tool
+ * touches pipefd before the kernel does, so Linux alone decides the errno and
+ * its ordering above holds unchanged. Everything the tool reads afterwards runs
+ * only when pipe2 SUCCEEDED, which proves the address valid because the kernel
+ * itself just wrote to it. With no snapshot there is nothing to restore, and
+ * nothing needs restoring: a pin that cannot be applied no longer fabricates a
+ * pipe2 error -- it closes both descriptors and aborts the run, because an
+ * unpinnable pipe means determinism is unavailable.
  *
  * This probe asserts the precedence directly rather than only asserting that
  * two runs agree: a deterministic WRONG errno is still wrong, and a pure
@@ -67,9 +79,9 @@ static void expect_errno(
 
 int main(void) {
   /* A non-null pointer that cannot be written. This is the case that
-   * regressed; NULL never did, because a null pipefd is filtered out before
-   * the snapshot is attempted. Both are asserted so the fix cannot be narrowed
-   * to only the null case. */
+   * regressed; NULL never did, because a null pipefd was filtered out before
+   * the tool touched it at all. Both are asserted so the fix cannot be
+   * narrowed to only the null case. */
   void* bad = (void*)1;
 
   expect_errno("badptr_validflags", bad, 0, EFAULT);
