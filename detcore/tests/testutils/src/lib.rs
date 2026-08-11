@@ -17,6 +17,7 @@ use std::sync::MutexGuard;
 
 use detcore::Config;
 use detcore::Detcore;
+use detcore::DirectVvarAccessPolicy;
 use detcore::SchedHeuristic;
 use pretty_assertions::assert_eq;
 use reverie::Error;
@@ -78,6 +79,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     initial_stack_unavailable_at_post_exec: false,
+    direct_vvar_access_policy: DirectVvarAccessPolicy::Refuse,
     cancel_killed_thread_rpcs: false,
     backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,
@@ -157,6 +159,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     initial_stack_unavailable_at_post_exec: false,
+    direct_vvar_access_policy: DirectVvarAccessPolicy::Refuse,
     cancel_killed_thread_rpcs: false,
     backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,
@@ -236,6 +239,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     detect_host_clock_futex_timeouts: false,
     syscall_clobbers_virtualized_by_backend: false,
     initial_stack_unavailable_at_post_exec: false,
+    direct_vvar_access_policy: DirectVvarAccessPolicy::Refuse,
     cancel_killed_thread_rpcs: false,
     backend_reports_physical_process_exits: false,
     backend_serializes_fork_children: false,

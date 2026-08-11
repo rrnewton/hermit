@@ -637,7 +637,7 @@ impl Backend {
     /// policy that was chosen for a different address-space construction.
     pub const fn direct_vvar_access_policy(self) -> detcore::DirectVvarAccessPolicy {
         match self {
-            Self::Ptrace | Self::Dbi | Self::Liteinst | Self::Sabre | Self::E9patch => {
+            Self::Ptrace | Self::Dbt | Self::Liteinst | Self::Sabre | Self::E9patch => {
                 detcore::DirectVvarAccessPolicy::Refuse
             }
             Self::Kvm => detcore::DirectVvarAccessPolicy::Absent,
@@ -2068,7 +2068,7 @@ mod tests {
     fn every_backend_has_an_explicit_direct_vvar_policy() {
         assert_eq!(Backend::ALL.len(), 6);
         for backend in Backend::ALL {
-            let configured = prepare_backend_config(super::DetConfig::default(), backend);
+            let configured = normalize_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
                 configured.direct_vvar_access_policy,
                 backend.direct_vvar_access_policy(),
