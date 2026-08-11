@@ -1086,11 +1086,11 @@ fn run_dbt_rejects_unfollowed_execveat() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_executes_dynamic_guest() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1112,8 +1112,12 @@ fn run_kvm_executes_dynamic_guest() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_awk_mincore_probe_terminates() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
+    if !Path::new("/usr/bin/awk").exists() {
         return;
     }
 
@@ -1149,11 +1153,11 @@ fn run_kvm_awk_mincore_probe_terminates() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_resolves_bare_program_from_guest_path() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1172,11 +1176,12 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/usr/bin/setpriv").exists()
-        || !Path::new("/bin/date").exists()
-    {
+    if !Path::new("/usr/bin/setpriv").exists() || !Path::new("/bin/date").exists() {
         return;
     }
 
@@ -1202,11 +1207,11 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_propagates_explicit_environment() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1225,9 +1230,12 @@ fn run_kvm_propagates_explicit_environment() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_bash_process_substitution_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/bin/bash").exists()
+    if !Path::new("/bin/bash").exists()
         || !Path::new("/usr/bin/paste").exists()
         || !Path::new("/usr/bin/diff").exists()
     {
@@ -1254,10 +1262,11 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_cpuid_policy_is_deterministic() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
     let compiler = ["cc", "gcc", "clang"]
         .into_iter()
         .find(|program| {
@@ -1310,11 +1319,11 @@ fn run_kvm_cpuid_policy_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_respects_workdir_for_relative_paths() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create KVM cwd fixture");
     fs::write(temp.path().join("message.txt"), b"from-kvm-cwd\n")
         .expect("failed to write KVM cwd fixture");
@@ -1342,11 +1351,11 @@ fn run_kvm_respects_workdir_for_relative_paths() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_lists_host_directory_metadata() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create KVM directory fixture");
     fs::write(temp.path().join("alpha.txt"), b"alpha\n")
         .expect("failed to write KVM directory fixture");
@@ -1395,11 +1404,11 @@ fn run_kvm_lists_host_directory_metadata() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reads_host_file() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let expected = fs::read_to_string("/etc/hostname").expect("failed to read host hostname");
     let args = [
         "run",
@@ -1419,11 +1428,11 @@ fn run_kvm_reads_host_file() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1440,8 +1449,12 @@ fn run_kvm_reads_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_f_getfl_and_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1464,8 +1477,12 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1490,11 +1507,11 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_verify_isolates_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1512,11 +1529,11 @@ fn run_kvm_verify_isolates_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_preserves_closed_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1542,8 +1559,12 @@ fn run_kvm_preserves_closed_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_verify_does_not_write_to_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1579,11 +1600,11 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_counts_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1603,11 +1624,11 @@ fn run_kvm_counts_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reports_hostname() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1627,10 +1648,11 @@ fn run_kvm_reports_hostname() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm the host C compiler is acceptable for this KVM smoke guest.
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
     let compiler = ["cc", "gcc", "clang"]
         .into_iter()
         .find(|program| {
@@ -1708,11 +1730,11 @@ int main(void) {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reports_fixed_supplementary_groups() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let kvm_args = [
         "run",
         "--backend",
