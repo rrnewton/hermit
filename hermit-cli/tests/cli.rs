@@ -1243,9 +1243,11 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
 /// end to end, in the guest's own `env` output.
 ///
 /// So these two lines are *expected* output of `--base-env=empty`. Measured on
-/// devbig014 at hermit `2b6005cf`: `--backend kvm` and `--backend ptrace` both
-/// emit exactly this pair plus the explicit value, byte-identical, 5/5 runs
-/// each.
+/// a self-hosted KVM-capable runner at hermit `2b6005cf`: `--backend kvm` and
+/// `--backend ptrace` both emit exactly this pair plus the explicit value,
+/// byte-identical, 5/5 runs each. (The box name is deliberately not written
+/// here: `check.portability_paths` rejects literal hosts in build/run files,
+/// and the machine belongs in the commit trailer, not in source.)
 const FORCED_GUEST_ENV: [&str; 2] = ["ASAN_OPTIONS=detect_leaks=0", "LSAN_OPTIONS=detect_leaks=0"];
 
 /// Describes how a guest's `env` output differs from *exactly*
