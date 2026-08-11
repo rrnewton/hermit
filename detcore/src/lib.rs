@@ -155,6 +155,9 @@ pub fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
     syscall_classification::all_pinned_syscalls()
 }
 
+pub use syscall_classification::PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS;
+pub use syscall_classification::PtraceRecordReplayPassthroughExemption;
+
 /// Returns whether the audited runtime policy classifies `sysno` as
 /// `Determinized` — that is, Detcore either models the syscall with a handler
 /// or applies an explicit deterministic refusal policy to it.
@@ -2565,6 +2568,20 @@ mod subscription_tests {
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>()
                     .join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_ptrace_record_replay_exemptions_bypass_detcore() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        let intercepted: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+
+        for exemption in crate::PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS {
+            assert!(
+                !intercepted.contains(&exemption.syscall),
+                "{} is documented as native-equivalent under ptrace record/replay, but Detcore now intercepts it; remove or re-derive the exemption",
+                exemption.syscall
             );
         }
     }
