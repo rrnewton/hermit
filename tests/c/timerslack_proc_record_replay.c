@@ -11,8 +11,10 @@
  *
  * Replayer reserves a recorded virtual descriptor with an eventfd. The procfs
  * layer must therefore bind the task incarnation named by the proc path, not
- * the placeholder's anonymous inode. Reading and writing the same virtual
- * scalar drives both affected operations; printing the values makes any
+ * the placeholder's anonymous inode. The first open is AT_FDCWD-relative and
+ * exercises zero-length read/pread plus lseek before a snapshot exists: none
+ * may touch Replayer's placeholder. Reading and writing the same virtual scalar
+ * then drives both affected operations; printing the values makes any
  * record/replay control-flow or state mismatch visible to --verify.
  */
 
@@ -58,10 +60,57 @@ static long read_proc_timer_slack(void) {
   return value;
 }
 
+static long read_relative_proc_timer_slack(void) {
+  if (chdir("/") != 0) {
+    return -1;
+  }
+  const int fd = open("proc/self/timerslack_ns", O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+
+  char untouched = 0;
+  if (read(fd, &untouched, 0) != 0 || pread(fd, &untouched, 0, 0) != 0 ||
+      lseek(fd, 1, SEEK_SET) != 1 || lseek(fd, 0, SEEK_CUR) != 1) {
+    const int saved_errno = errno == 0 ? EIO : errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  errno = 0;
+  if (lseek(fd, 0, SEEK_END) != -1 || errno != EINVAL ||
+      lseek(fd, 0, SEEK_SET) != 0) {
+    const int saved_errno = errno == 0 ? EIO : errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+
+  char buffer[64] = {0};
+  const ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+  const int saved_errno = errno;
+  if (close(fd) != 0 && length >= 0) {
+    return -1;
+  }
+  if (length <= 0) {
+    errno = saved_errno;
+    return -1;
+  }
+
+  char* end = NULL;
+  errno = 0;
+  const long value = strtol(buffer, &end, 10);
+  if (errno != 0 || end == buffer || (*end != '\n' && *end != '\0')) {
+    errno = EINVAL;
+    return -1;
+  }
+  return value;
+}
+
 int main(void) {
-  const long before = read_proc_timer_slack();
+  const long before = read_relative_proc_timer_slack();
   if (before < 0) {
-    return fail("read(/proc/self/timerslack_ns)");
+    return fail("relative timer-slack zero-read/seek probe");
   }
 
   const int fd = open("/proc/self/timerslack_ns", O_WRONLY);
@@ -95,7 +144,8 @@ int main(void) {
   }
 
   printf(
-      "before=%ld after_proc=%ld after_prctl=%ld\n",
+      "relative_zero=ok relative_seek=ok before=%ld after_proc=%ld "
+      "after_prctl=%ld\n",
       before,
       after_proc,
       after_prctl);
