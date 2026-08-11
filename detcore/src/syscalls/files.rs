@@ -60,7 +60,7 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-successor): Review timer-slack procfs parsing,
+// TODO-HUMAN-REVIEW(PR-2150): Review timer-slack procfs parsing,
 // per-operation target checks, and scalar/vector I/O emulation.
 const TIMER_SLACK_PARSE_BYTES: usize = 66;
 

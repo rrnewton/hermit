@@ -1270,7 +1270,7 @@ pub struct ThreadState<T> {
     pub(crate) discover_live_file_metadata: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-successor): Review the per-thread timer-slack state
+    // TODO-HUMAN-REVIEW(PR-2150): Review the per-thread timer-slack state
     // and the creator-current-as-child-default inheritance rule.
     /// Virtualized Linux timer slack for this thread.  Both prctl(2) and the
     /// top-level `/proc/<tid>/timerslack_ns` interface use these fields; the
