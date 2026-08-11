@@ -1006,6 +1006,7 @@ fn finish_and_verify_pin_update(
         cargo_already_current,
         verify_build,
         Path::new("cargo"),
+        &[],
     )
 }
 
@@ -1016,10 +1017,11 @@ fn finish_and_verify_pin_update_with(
     cargo_already_current: bool,
     verify_build: bool,
     cargo_program: &Path,
+    cargo_prefix_args: &[&str],
 ) -> Result<(), String> {
     finish_ci_pin_sites(root, calibrated, main, cargo_already_current)?;
     if verify_build {
-        verify_bumped_tree_builds(root, cargo_program)
+        verify_bumped_tree_builds(root, cargo_program, cargo_prefix_args)
     } else {
         eprintln!(
             "WARNING: --no-verify-build was passed: pin consistency was checked, but pin \
@@ -1030,12 +1032,17 @@ fn finish_and_verify_pin_update_with(
 }
 
 /// Compile the complete bumped tree without permitting lockfile re-resolution.
-fn verify_bumped_tree_builds(root: &Path, cargo_program: &Path) -> Result<(), String> {
+fn verify_bumped_tree_builds(
+    root: &Path,
+    cargo_program: &Path,
+    cargo_prefix_args: &[&str],
+) -> Result<(), String> {
     println!(
         "Verifying the bumped tree compiles (cargo check --locked --workspace --all-targets)..."
     );
     let status = Command::new(cargo_program)
         .current_dir(root)
+        .args(cargo_prefix_args)
         .args(["check", "--locked", "--workspace", "--all-targets"])
         .status()
         .map_err(|error| format!("could not run cargo check for the bumped tree: {error}"))?;
@@ -1593,19 +1600,12 @@ mod tests {
     }
 
     fn fixture_cargo(root: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let path = root.join("fixture-cargo");
         fs::write(
             &path,
             "#!/bin/sh\nset -eu\ncase \"${1:-}\" in\n  metadata)\n    test -f Cargo.toml\n    test -f Cargo.lock\n    printf '{\"packages\":[]}\\n'\n    ;;\n  check)\n    test \"$*\" = 'check --locked --workspace --all-targets'\n    mkdir -p target\n    rustc --edition=2021 --crate-type=lib src/lib.rs --out-dir target \\\n      >target/rustc.stdout 2>target/rustc.stderr\n    ;;\n  *) exit 64 ;;\nesac\n",
         )
         .expect("write fixture cargo");
-        let mut permissions = fs::metadata(&path)
-            .expect("stat fixture cargo")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("make fixture cargo executable");
         path
     }
 
@@ -1620,8 +1620,9 @@ mod tests {
         let building_cargo = fixture_cargo(&building);
         let nonbuilding_cargo = fixture_cargo(&nonbuilding);
 
-        let resolved = Command::new(&nonbuilding_cargo)
+        let resolved = Command::new("/bin/sh")
             .current_dir(&nonbuilding)
+            .arg(&nonbuilding_cargo)
             .args(["metadata", "--locked", "--format-version", "1"])
             .output()
             .expect("run cargo metadata for nonbuilding fixture");
@@ -1639,7 +1640,8 @@ mod tests {
             &main,
             true,
             true,
-            &building_cargo,
+            Path::new("/bin/sh"),
+            &[building_cargo.to_str().expect("UTF-8 fixture cargo path")],
         )
             .expect("a complete pin carry whose tree builds must be accepted");
         accepted += 1;
@@ -1650,7 +1652,10 @@ mod tests {
             &main,
             true,
             true,
-            &nonbuilding_cargo,
+            Path::new("/bin/sh"),
+            &[nonbuilding_cargo
+                .to_str()
+                .expect("UTF-8 fixture cargo path")],
         )
         .expect_err("a resolvable pin carry whose tree does not build must be refused");
         assert!(error.contains("BUMP REFUSED"), "{error}");
@@ -1686,8 +1691,16 @@ mod tests {
 
         let missing_cargo = root.join("must-not-run-cargo");
         let error =
-            finish_and_verify_pin_update_with(&root, Some(&old), &main, false, true, &missing_cargo)
-                .expect_err("an unsettled DBT calibration must refuse before cargo check runs");
+            finish_and_verify_pin_update_with(
+                &root,
+                Some(&old),
+                &main,
+                false,
+                true,
+                &missing_cargo,
+                &[],
+            )
+            .expect_err("an unsettled DBT calibration must refuse before cargo check runs");
         assert!(error.contains("CALIBRATION DECISION REQUIRED"), "{error}");
         assert!(
             !error.contains("BUMP REFUSED"),
