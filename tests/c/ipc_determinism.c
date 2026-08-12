@@ -10,12 +10,16 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -171,6 +175,16 @@ static void pipe_capacity(void) {
   if (capacity <= 0) {
     fail("fcntl(F_GETPIPE_SZ)");
   }
+  verify_blocking_flag_roundtrip(fds[1]);
+  errno = 0;
+  if (fcntl(fds[1], F_SETPIPE_SZ, capacity * 2) != -1 || errno != EPERM) {
+    fprintf(stderr, "scheduler-managed pipe unexpectedly grew beyond %d bytes\n",
+            capacity);
+    exit(1);
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 1) != capacity) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
   uint8_t *fill = malloc((size_t)capacity);
   if (fill == NULL) {
     fail("malloc");
@@ -202,6 +216,293 @@ static void pipe_capacity(void) {
   close(fds[0]);
   close(fds[1]);
   pthread_barrier_destroy(&barrier);
+}
+
+static void wait_for_child(pid_t child, const char *label) {
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    fail("waitpid");
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "%s: child status %d\n", label, status);
+    exit(1);
+  }
+}
+
+static uint8_t *large_pipe_payload(size_t length) {
+  uint8_t *bytes = malloc(length);
+  if (bytes == NULL) {
+    fail("malloc payload");
+  }
+  for (size_t i = 0; i < length; i++) {
+    bytes[i] = (uint8_t)(i * 17 + 3);
+  }
+  return bytes;
+}
+
+static void pipe_large_write(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  verify_blocking_flag_roundtrip(fds[1]);
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    close(fds[1]);
+    uint8_t *received = malloc(length);
+    if (received == NULL) {
+      fail("malloc child");
+    }
+    read_exact(fds[0], received, length);
+    if (memcmp(received, bytes, length) != 0) {
+      fprintf(stderr, "pipe-large-write: payload mismatch\n");
+      _exit(3);
+    }
+    _exit(0);
+  }
+  close(fds[0]);
+  ssize_t written = write(fds[1], bytes, length);
+  if (written != (ssize_t)length) {
+    fprintf(stderr, "pipe-large-write: wrote %zd of %zu\n", written, length);
+    exit(1);
+  }
+  close(fds[1]);
+  wait_for_child(child, "pipe-large-write");
+  printf("pipe-large-write:%zu\n", length);
+  free(bytes);
+}
+
+static void pipe_large_writev(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  verify_blocking_flag_roundtrip(fds[1]);
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    close(fds[1]);
+    uint8_t *received = malloc(length);
+    if (received == NULL) {
+      fail("malloc child");
+    }
+    read_exact(fds[0], received, length);
+    if (memcmp(received, bytes, length) != 0) {
+      fprintf(stderr, "pipe-large-writev: payload mismatch\n");
+      _exit(3);
+    }
+    _exit(0);
+  }
+  close(fds[0]);
+  struct iovec vectors[2] = {
+      {.iov_base = bytes, .iov_len = length / 2},
+      {.iov_base = bytes + length / 2, .iov_len = length - length / 2},
+  };
+  ssize_t written = writev(fds[1], vectors, 2);
+  if (written != (ssize_t)length) {
+    fprintf(stderr, "pipe-large-writev: wrote %zd of %zu\n", written, length);
+    exit(1);
+  }
+  close(fds[1]);
+  wait_for_child(child, "pipe-large-writev");
+  printf("pipe-large-writev:%zu\n", length);
+  free(bytes);
+}
+
+struct blocked_writer_args {
+  int fd;
+  uint8_t *bytes;
+  size_t length;
+  atomic_int started;
+  ssize_t result;
+  int error;
+};
+
+static void *write_after_start_marker(void *opaque) {
+  struct blocked_writer_args *args = opaque;
+  atomic_store_explicit(&args->started, 1, memory_order_release);
+  args->result = write(args->fd, args->bytes, args->length);
+  args->error = errno;
+  return NULL;
+}
+
+static void pipe_close_reuse(void) {
+  int original[2];
+  int replacement[2];
+  if (pipe(original) != 0 || pipe(replacement) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(original[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x6d, (size_t)capacity);
+  write_exact(original[1], fill, (size_t)capacity);
+
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  struct blocked_writer_args args = {
+      .fd = original[1],
+      .bytes = bytes,
+      .length = length,
+      .started = 0,
+      .result = -1,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  // Give the writer a deterministic scheduling opportunity to enter the full-pipe wait.
+  // The read below intentionally starts only after dup2 returns: waiting for the writer from
+  // dup2 would therefore deadlock, unlike Linux's open-file-description lifetime rule.
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (dup2(replacement[1], original[1]) != original[1]) {
+    fail("dup2 replacement");
+  }
+
+  read_exact(original[0], fill, (size_t)capacity);
+  uint8_t *received = malloc(length);
+  if (received == NULL) {
+    fail("malloc received");
+  }
+  read_exact(original[0], received, length);
+  pthread_join(writer, NULL);
+  if (args.result != (ssize_t)length || memcmp(received, bytes, length) != 0) {
+    fprintf(stderr, "pipe-close-reuse: wrote %zd of %zu or changed payload\n",
+            args.result, length);
+    exit(1);
+  }
+  int flags = fcntl(replacement[0], F_GETFL);
+  if (flags < 0 || fcntl(replacement[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl replacement O_NONBLOCK");
+  }
+  uint8_t unexpected = 0;
+  errno = 0;
+  if (read(replacement[0], &unexpected, 1) != -1 || errno != EAGAIN) {
+    fprintf(stderr, "pipe-close-reuse: blocked write followed reused fd\n");
+    exit(1);
+  }
+  printf("pipe-close-reuse:%zu\n", length);
+
+  free(received);
+  free(bytes);
+  free(fill);
+  close(original[0]);
+  close(original[1]);
+  close(replacement[0]);
+  close(replacement[1]);
+}
+
+static void pipe_read_end_write(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  uint8_t byte = 0x5a;
+  errno = 0;
+  if (write(fds[0], &byte, sizeof(byte)) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: write result was not EBADF\n");
+    exit(1);
+  }
+  struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
+  errno = 0;
+  if (writev(fds[0], &vector, 1) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: writev result was not EBADF\n");
+    exit(1);
+  }
+  printf("pipe-read-end-write:EBADF\n");
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static volatile sig_atomic_t sigpipe_count;
+
+static void count_sigpipe(int signal_number) {
+  if (signal_number == SIGPIPE) {
+    sigpipe_count++;
+  }
+}
+
+static void pipe_sigpipe_after_wait(void) {
+  struct sigaction action = {.sa_handler = count_sigpipe};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGPIPE, &action, NULL) != 0) {
+    fail("sigaction");
+  }
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x55, (size_t)capacity);
+  write_exact(fds[1], fill, (size_t)capacity);
+
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = bytes,
+      .length = length,
+      .started = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  sigpipe_count = 0;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  close(fds[0]);
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EPIPE || sigpipe_count != 1) {
+    fprintf(stderr, "pipe-sigpipe: result=%zd errno=%d signals=%d\n",
+            args.result, args.error, (int)sigpipe_count);
+    exit(1);
+  }
+  printf("pipe-sigpipe:%d\n", (int)sigpipe_count);
+  free(bytes);
+  free(fill);
+  close(fds[1]);
 }
 
 static void socketpair_order(void) {
@@ -404,6 +705,16 @@ int main(int argc, char **argv) {
     pipe_order();
   } else if (strcmp(argv[1], "pipe-capacity") == 0) {
     pipe_capacity();
+  } else if (strcmp(argv[1], "pipe-large-write") == 0) {
+    pipe_large_write();
+  } else if (strcmp(argv[1], "pipe-large-writev") == 0) {
+    pipe_large_writev();
+  } else if (strcmp(argv[1], "pipe-close-reuse") == 0) {
+    pipe_close_reuse();
+  } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
+    pipe_read_end_write();
+  } else if (strcmp(argv[1], "pipe-sigpipe") == 0) {
+    pipe_sigpipe_after_wait();
   } else if (strcmp(argv[1], "socketpair") == 0) {
     socketpair_order();
   } else if (strcmp(argv[1], "eventfd") == 0) {

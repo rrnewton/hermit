@@ -13,9 +13,14 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 5] = [
+const PATTERNS: [&str; 10] = [
     "pipe-order",
     "pipe-capacity",
+    "pipe-large-write",
+    "pipe-large-writev",
+    "pipe-close-reuse",
+    "pipe-read-end-write",
+    "pipe-sigpipe",
     "socketpair",
     "eventfd",
     "epoll",
@@ -61,22 +66,27 @@ fn ipc_guest() -> &'static Path {
         .as_path()
 }
 
-fn run_pattern(pattern: &str, iteration: usize) -> String {
+fn run_pattern_with_options(pattern: &str, iteration: usize, options: &[&str]) -> String {
     let mut command = Command::new("timeout");
     command
-        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .args(["--kill-after=5s", &format!("{TIMEOUT_SECONDS}s")])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
         ])
+        .args(options)
+        .arg("--")
         .arg(ipc_guest())
         .arg(pattern);
     let output = command_output(command, &format!("{pattern} iteration {iteration}"));
     String::from_utf8(output.stdout).expect("IPC guest stdout should be UTF-8")
+}
+
+fn run_pattern(pattern: &str, iteration: usize) -> String {
+    run_pattern_with_options(pattern, iteration, &[])
 }
 
 #[test]
@@ -95,4 +105,42 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
             );
         }
     }
+}
+
+#[test]
+fn pipe_descriptor_reuse_is_stable_without_virtual_metadata() {
+    assert_eq!(
+        run_pattern_with_options("pipe-close-reuse", 1, &["--no-virtualize-metadata"]),
+        "pipe-close-reuse:8190\n"
+    );
+}
+
+#[test]
+fn large_blocking_pipe_write_records_and_replays_after_flag_roundtrip() {
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "60s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "record",
+            "start",
+            "--verify",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(ipc_guest())
+        .arg("pipe-large-write");
+    let output = command_output(command, "pipe-large-write record/replay verification");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Success: replay matched recording."),
+        "record/replay output omitted its success marker:\n{combined}"
+    );
 }

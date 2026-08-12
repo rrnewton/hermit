@@ -13,6 +13,7 @@ mod random;
 mod time;
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -439,14 +440,17 @@ impl Recorder {
             return ReplayFdKind::Eventfd;
         }
 
-        if std::fs::metadata(path)
+        std::fs::metadata(path)
             .ok()
-            .is_some_and(|metadata| metadata.file_type().is_file())
-        {
-            ReplayFdKind::RegularFile
-        } else {
-            ReplayFdKind::None
-        }
+            .map_or(ReplayFdKind::None, |metadata| {
+                if metadata.file_type().is_file() {
+                    ReplayFdKind::RegularFile
+                } else if metadata.file_type().is_fifo() {
+                    ReplayFdKind::Pipe
+                } else {
+                    ReplayFdKind::None
+                }
+            })
     }
 
     fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
