@@ -23,9 +23,7 @@ use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::Displayable;
-use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -273,12 +271,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
-        if pinned_pipe.is_none() {
-            if target <= PIPE_BUF {
-                return self.execute_nonblockable_fd_syscall(guest, call).await;
-            }
-            return Err(Errno::ENOSYS.into());
-        }
+        // Retrying by descriptor number after a scheduler yield can target an unrelated object
+        // if another thread closes and reuses that number. A backend that cannot expose the
+        // matching pipe must therefore refuse every blocking write, including atomic writes,
+        // before its first scheduler request.
+        let mut pinned_pipe =
+            require_blocking_pipe_writer(pinned_pipe.take()).map_err(Error::from)?;
 
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
@@ -286,7 +284,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi(call.name());
-        let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut written_total = 0usize;
 
         loop {
@@ -310,16 +307,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(Errno::EFAULT.into())
                 };
             };
-            let attempt = call.with_buf(Some(attempt_buffer)).with_len(attempt_len);
-            let used_pinned_pipe = pinned_pipe.is_some();
-            let result = match pinned_pipe.as_mut() {
-                Some(pipe) => write_guest_bytes(guest, pipe, attempt_buffer, attempt_len),
-                None => match subtool {
-                    Some(detcore) => detcore.record_or_replay(guest, attempt).await,
-                    None => guest.inject_with_retry(attempt).await,
-                },
-            };
-            if used_pinned_pipe && matches!(result, Err(Errno::EPIPE)) {
+            let result = write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len);
+            if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
             match result {
@@ -408,9 +397,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let atomic_pipe_write = target <= PIPE_BUF;
-        if pinned_pipe.is_none() && !atomic_pipe_write {
-            return Err(Errno::ENOSYS.into());
-        }
+        // See execute_blocking_pipe_write: no scheduler yield may precede a write through an
+        // unpinned descriptor number, regardless of whether the write is atomic.
+        let mut pinned_pipe =
+            require_blocking_pipe_writer(pinned_pipe.take()).map_err(Error::from)?;
 
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
@@ -418,8 +408,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi(call.name());
-        let subtool = self.cfg.recordreplay_modes.then_some(self);
-        let mut current = Syscall::Writev(call);
         let mut written_total = 0usize;
 
         loop {
@@ -431,25 +419,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let used_pinned_pipe = pinned_pipe.is_some();
-            let result = if let Some(pipe) = pinned_pipe.as_mut() {
-                write_guest_iovec_bytes(
-                    guest,
-                    pipe,
-                    &iovecs,
-                    written_total,
-                    (target - written_total).min(PIPE_BUF),
-                )
-            } else if atomic_pipe_write {
-                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
-                    .await
-            } else {
-                match subtool {
-                    Some(detcore) => detcore.record_or_replay(guest, current).await,
-                    None => guest.inject_with_retry(current).await,
-                }
-            };
-            if used_pinned_pipe && matches!(result, Err(Errno::EPIPE)) {
+            let result = write_guest_iovec_bytes(
+                guest,
+                &mut pinned_pipe,
+                &iovecs,
+                written_total,
+                (target - written_total).min(PIPE_BUF),
+            );
+            if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
             match result {
@@ -462,32 +439,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if atomic_pipe_write {
                         break Ok(written_total as i64);
                     }
-                    current = match remaining_writev_segment(
-                        call.fd(),
-                        &iovecs,
-                        written_total,
-                        (target - written_total).min(PIPE_BUF),
-                    ) {
-                        Ok(Some(write)) => Syscall::Write(write),
-                        Ok(None) => break Ok(written_total as i64),
-                        Err(_) => break Ok(written_total as i64),
-                    };
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Errno::EAGAIN) => {
-                    if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
-                        current = match remaining_writev_segment(
-                            call.fd(),
-                            &iovecs,
-                            0,
-                            target.min(PIPE_BUF),
-                        ) {
-                            Ok(Some(write)) => Syscall::Write(write),
-                            Ok(None) => break Ok(0),
-                            Err(error) => break Err(error.into()),
-                        };
-                    }
-                }
+                Err(Errno::EAGAIN) => {}
                 Err(error) => {
                     break if written_total > 0 {
                         Ok(written_total as i64)
@@ -510,107 +464,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Writev,
-        iovecs: &[(usize, usize)],
-    ) -> Result<i64, Errno> {
-        // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
-        // path is smaller; this covers common vectors without consuming guest VM mappings.
-        const STACK_IOVECS: usize = 32;
-        if iovecs.len() <= STACK_IOVECS {
-            let mut stack = guest.stack().await;
-            let scratch_array = {
-                let mut raw_iovecs = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; STACK_IOVECS];
-                for (raw, (base, length)) in raw_iovecs.iter_mut().zip(iovecs) {
-                    raw.iov_base = *base as *mut libc::c_void;
-                    raw.iov_len = *length;
-                }
-                stack.push(raw_iovecs)
-            };
-            let scratch_iov: Addr<libc::iovec> = scratch_array.cast();
-            let _guard = stack
-                .commit()
-                .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
-            let scratch_call = call.with_iov(Some(scratch_iov));
-            return if self.cfg.recordreplay_modes {
-                self.record_or_replay(guest, scratch_call).await
-            } else {
-                guest.inject_with_retry(scratch_call).await
-            };
-        }
-
-        let mapping_len = iovecs
-            .len()
-            .checked_mul(std::mem::size_of::<libc::iovec>())
-            .expect("validated iovec count cannot overflow scratch length");
-        let mapped = guest
-            .inject_with_retry(Syscall::Mmap(
-                syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(mapping_len)
-                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
-                    .with_fd(-1)
-                    .with_offset(0),
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("failed to map atomic writev scratch: {error}"));
-        let mapped = usize::try_from(mapped)
-            .unwrap_or_else(|_| panic!("atomic writev scratch mmap returned {mapped}"));
-        let scratch_iov = Addr::<libc::iovec>::from_raw(mapped)
-            .unwrap_or_else(|| panic!("atomic writev scratch mmap returned a null address"));
-        let mapping_addr: Addr<libc::c_void> = scratch_iov.cast();
-        let write_result = {
-            let raw_iovecs: Vec<libc::iovec> = iovecs
-                .iter()
-                .map(|(base, length)| libc::iovec {
-                    iov_base: *base as *mut libc::c_void,
-                    iov_len: *length,
-                })
-                .collect();
-            // SAFETY: the injected anonymous mapping is exclusively owned scratch space.
-            guest
-                .memory()
-                .write_values(unsafe { scratch_iov.into_mut() }, &raw_iovecs)
-        };
-        if let Err(write_error) = write_result {
-            guest
-                .inject_with_retry(Syscall::Munmap(
-                    syscalls::Munmap::new()
-                        .with_addr(Some(mapping_addr))
-                        .with_len(mapping_len),
-                ))
-                .await
-                .unwrap_or_else(|cleanup_error| {
-                    panic!(
-                        "failed to populate atomic writev scratch ({write_error}); cleanup failed ({cleanup_error})"
-                    )
-                });
-            panic!("failed to populate atomic writev scratch: {write_error}");
-        }
-
-        let scratch_call = call.with_iov(Some(scratch_iov));
-        let result = if self.cfg.recordreplay_modes {
-            self.record_or_replay(guest, scratch_call).await
-        } else {
-            guest.inject_with_retry(scratch_call).await
-        };
-        guest
-            .inject_with_retry(Syscall::Munmap(
-                syscalls::Munmap::new()
-                    .with_addr(Some(mapping_addr))
-                    .with_len(mapping_len),
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("failed to unmap atomic writev scratch: {error}"));
-        result
-    }
-
     /// Override physically_nonblocking to true for the file descriptor, if appropriate.
     pub fn maybe_set_nonblocking_fd<G: Guest<Self>>(&self, guest: &G, fd: i32) {
         if self.cfg.sequentialize_threads && !self.cfg.debug_externalize_sockets {
@@ -626,6 +479,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 fn io_errno(error: std::io::Error) -> Errno {
     Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn require_blocking_pipe_writer(pinned_pipe: Option<File>) -> Result<File, Errno> {
+    pinned_pipe.ok_or(Errno::ENOSYS)
 }
 
 fn write_guest_bytes<G, T>(
@@ -686,29 +543,6 @@ where
     pipe.write(&bytes)
         .map(|written| written as i64)
         .map_err(io_errno)
-}
-
-fn remaining_writev_segment(
-    fd: i32,
-    iovecs: &[(usize, usize)],
-    mut consumed: usize,
-    remaining_limit: usize,
-) -> Result<Option<syscalls::Write>, Errno> {
-    for (base, length) in iovecs {
-        if consumed >= *length {
-            consumed -= *length;
-            continue;
-        }
-        let base = base.checked_add(consumed).ok_or(Errno::EFAULT)?;
-        let buffer = Addr::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
-        return Ok(Some(
-            syscalls::Write::new()
-                .with_fd(fd)
-                .with_buf(Some(buffer))
-                .with_len((*length - consumed).min(remaining_limit)),
-        ));
-    }
-    Ok(None)
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:
@@ -1656,6 +1490,14 @@ mod tests {
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
+        );
+    }
+
+    #[test]
+    fn blocking_pipe_write_refuses_before_retry_without_stable_pipe() {
+        assert_eq!(
+            require_blocking_pipe_writer(None).unwrap_err(),
+            Errno::ENOSYS
         );
     }
 }
