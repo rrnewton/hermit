@@ -13,9 +13,13 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 5] = [
+const PATTERNS: [&str; 9] = [
     "pipe-order",
     "pipe-capacity",
+    "pipe-large-write",
+    "pipe-large-writev",
+    "pipe-close-reuse",
+    "pipe-sigpipe",
     "socketpair",
     "eventfd",
     "epoll",
@@ -98,7 +102,7 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
 }
 
 #[test]
-fn fixed_pipe_capacity_records_and_replays_after_flag_roundtrip() {
+fn large_blocking_pipe_write_records_and_replays_after_flag_roundtrip() {
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
     let mut command = Command::new("timeout");
     command
@@ -114,8 +118,8 @@ fn fixed_pipe_capacity_records_and_replays_after_flag_roundtrip() {
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
         .arg(ipc_guest())
-        .arg("pipe-capacity");
-    let output = command_output(command, "pipe-capacity record/replay verification");
+        .arg("pipe-large-write");
+    let output = command_output(command, "pipe-large-write record/replay verification");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

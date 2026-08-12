@@ -922,6 +922,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             touch_file(guest, r).await;
         }
 
+        let blocking_pipe =
+            physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
+        // Pin the kernel pipe object before any scheduler resource request can let another
+        // guest thread close or reuse the numeric descriptor.
+        let pinned_pipe = blocking_pipe
+            .then(|| self.pin_pipe_writer(guest, call.fd(), raw_ino))
+            .flatten();
+
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_sabre_internal_pipe_io(
@@ -942,7 +950,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if blocking_pipe {
+            self.execute_blocking_pipe_write(guest, call, pinned_pipe)
+                .await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
@@ -1102,6 +1113,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
             })?;
 
+        let blocking_pipe =
+            physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
+        // See handle_write: the controller handle is outside the guest descriptor table, so
+        // close/dup/close_range retain normal Linux behavior while this syscall is blocked.
+        let pinned_pipe = blocking_pipe
+            .then(|| self.pin_pipe_writer(guest, call.fd(), raw_ino))
+            .flatten();
+
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_sabre_internal_pipe_io(
@@ -1115,9 +1134,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let result = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking
-        {
-            self.execute_blocking_pipe_writev(guest, call).await
+        let result = if blocking_pipe {
+            self.execute_blocking_pipe_writev(guest, call, pinned_pipe)
+                .await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {

@@ -6,7 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -181,6 +187,150 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Hold the pipe object independently of the guest descriptor table while a logically
+    /// blocking write yields to another guest thread. Linux keeps the open file description
+    /// alive for an in-progress write even if another thread closes or reuses its descriptor;
+    /// opening the procfs descriptor link gives Detcore the same lifetime guarantee without
+    /// reserving a descriptor number in the guest.
+    pub fn pin_pipe_writer<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: i32,
+        expected_inode: Option<u64>,
+    ) -> Option<File> {
+        let expected_inode = expected_inode?;
+        let path = format!("/proc/{}/fd/{fd}", guest.pid().as_raw());
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.file_type().is_fifo() || metadata.ino() != expected_inode {
+            tracing::warn!(
+                %path,
+                expected_inode,
+                observed_inode = metadata.ino(),
+                "refusing a controller pipe handle whose kernel identity does not match the guest descriptor"
+            );
+            return None;
+        }
+        Some(file)
+    }
+
+    async fn deliver_pipe_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let tgid = guest.pid().as_raw();
+        let tid = guest.tid().as_raw();
+        guest
+            .inject_with_retry(
+                syscalls::Tgkill::new()
+                    .with_tgid(tgid)
+                    .with_tid(tid)
+                    .with_sig(libc::SIGPIPE),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Complete a logically blocking scalar pipe write after Hermit has made the guest's
+    /// descriptor physically nonblocking. Operations larger than PIPE_BUF are allowed to
+    /// interleave on Linux, so fixed PIPE_BUF-sized attempts preserve Linux's atomicity bound
+    /// while removing host pipe capacity from the guest-visible return value.
+    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+        mut pinned_pipe: Option<File>,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        const PIPE_BUF: usize = 4096;
+
+        let Some(buffer) = call.buf() else {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        };
+        let target = call.len().min(MAX_RW_COUNT);
+        if target == 0 {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let subtool = self.cfg.recordreplay_modes.then_some(self);
+        let mut written_total = 0usize;
+
+        loop {
+            if resources.poll_attempt > 0
+                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            let attempt_len = (target - written_total).min(PIPE_BUF);
+            let Some(attempt_buffer) = buffer
+                .as_raw()
+                .checked_add(written_total)
+                .and_then(Addr::<u8>::from_raw)
+            else {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(Errno::EFAULT.into())
+                };
+            };
+            let attempt = call.with_buf(Some(attempt_buffer)).with_len(attempt_len);
+            let used_pinned_pipe = pinned_pipe.is_some();
+            let result = match pinned_pipe.as_mut() {
+                Some(pipe) => write_guest_bytes(guest, pipe, attempt_buffer, attempt_len),
+                None => match subtool {
+                    Some(detcore) => detcore.record_or_replay(guest, attempt).await,
+                    None => guest.inject_with_retry(attempt).await,
+                },
+            };
+            if used_pinned_pipe && matches!(result, Err(Errno::EPIPE)) {
+                self.deliver_pipe_sigpipe(guest).await?;
+            }
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    if written > attempt_len {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total += written;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Errno::EAGAIN) => {}
+                Err(error) => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write after {:?}: {}",
+                resources.poll_attempt,
+                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
     /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
@@ -192,6 +342,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Writev,
+        mut pinned_pipe: Option<File>,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
@@ -254,7 +405,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let result = if atomic_pipe_write {
+            let used_pinned_pipe = pinned_pipe.is_some();
+            let result = if let Some(pipe) = pinned_pipe.as_mut() {
+                write_guest_iovec_bytes(
+                    guest,
+                    pipe,
+                    &iovecs,
+                    written_total,
+                    (target - written_total).min(PIPE_BUF),
+                )
+            } else if atomic_pipe_write {
                 self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
                     .await
             } else {
@@ -263,6 +423,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     None => guest.inject_with_retry(current).await,
                 }
             };
+            if used_pinned_pipe && matches!(result, Err(Errno::EPIPE)) {
+                self.deliver_pipe_sigpipe(guest).await?;
+            }
             match result {
                 Ok(written) if written > 0 => {
                     let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
@@ -277,7 +440,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         call.fd(),
                         &iovecs,
                         written_total,
-                        target - written_total,
+                        (target - written_total).min(PIPE_BUF),
                     ) {
                         Ok(Some(write)) => Syscall::Write(write),
                         Ok(None) => break Ok(written_total as i64),
@@ -287,7 +450,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(0) => break Ok(written_total as i64),
                 Err(Errno::EAGAIN) => {
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
-                        current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
+                        current = match remaining_writev_segment(
+                            call.fd(),
+                            &iovecs,
+                            0,
+                            target.min(PIPE_BUF),
+                        ) {
                             Ok(Some(write)) => Syscall::Write(write),
                             Ok(None) => break Ok(0),
                             Err(error) => break Err(error.into()),
@@ -428,6 +596,70 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap();
         }
     }
+}
+
+fn io_errno(error: std::io::Error) -> Errno {
+    Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn write_guest_bytes<G, T>(
+    guest: &G,
+    pipe: &mut File,
+    buffer: Addr<u8>,
+    length: usize,
+) -> Result<i64, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut bytes = vec![0; length];
+    guest.memory().read_exact(buffer, &mut bytes)?;
+    pipe.write(&bytes)
+        .map(|written| written as i64)
+        .map_err(io_errno)
+}
+
+fn write_guest_iovec_bytes<G, T>(
+    guest: &G,
+    pipe: &mut File,
+    iovecs: &[(usize, usize)],
+    mut consumed: usize,
+    length: usize,
+) -> Result<i64, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut bytes = vec![0; length];
+    let mut copied = 0usize;
+    for (base, iovec_len) in iovecs {
+        if consumed >= *iovec_len {
+            consumed -= *iovec_len;
+            continue;
+        }
+        let available = iovec_len - consumed;
+        let take = available.min(length - copied);
+        if take > 0 {
+            let address = base
+                .checked_add(consumed)
+                .and_then(Addr::<u8>::from_raw)
+                .ok_or(Errno::EFAULT)?;
+            guest
+                .memory()
+                .read_exact(address, &mut bytes[copied..copied + take])?;
+            copied += take;
+        }
+        consumed = 0;
+        if copied == length {
+            break;
+        }
+    }
+    if copied != length {
+        return Err(Errno::EIO);
+    }
+    pipe.write(&bytes)
+        .map(|written| written as i64)
+        .map_err(io_errno)
 }
 
 fn remaining_writev_segment(
