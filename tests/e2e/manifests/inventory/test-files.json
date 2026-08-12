@@ -951,8 +951,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/getcpu_identity.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/getcpu_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace and DBT verification)",
+      "why": "tests/c/getcpu_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace and DBT verification): its observed-value contract is blocking CI for ptrace and DBT; KVM remains explicitly disabled with a measured startup-failure reason"
     },
     {
       "disposition": "manifest-test",
@@ -969,8 +969,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/c/getpriority_identity.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/getpriority_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace and DBT verification)",
+      "why": "tests/c/getpriority_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace and DBT verification): its observed-value contract is blocking CI for ptrace and DBT; KVM remains explicitly disabled with a measured startup-failure reason"
     },
     {
       "disposition": "manifest-test",
