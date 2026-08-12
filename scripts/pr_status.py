@@ -33,7 +33,10 @@ from dataclasses import dataclass
 from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-utils" / "py"))
-from ci_hub_check_outcome import classify_check, select_latest_checks  # noqa: E402
+from pr_landing_planner.check_outcome import (  # noqa: E402
+    classify_check,
+    select_latest_checks,
+)
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
@@ -91,7 +94,7 @@ def classify_ci_rollup(repo: str, checks: object, *, head_sha: str = "") -> str:
         return "no-result"
 
     required = REQUIRED_CHECKS.get(repo, (REGULAR_PORTABLE_CHECK,))
-    latest: dict[str, dict[object, object]] = {}
+    latest: dict[str, dict[str, object]] = {}
     for check in checks:
         name = str(check.get("name") or check.get("context") or "")
         if name not in required:

@@ -31,7 +31,7 @@ from harness import (
 class GdbRunGdbserver(DebuggerTestBase):
     require_gdb = True
 
-    def _gdb(self, commands):
+    def _gdb(self, commands: list[str]) -> tuple[str, str]:
         """Start hermit gdbserver, connect gdb with `target remote`, and run
         `commands`."""
         port = pick_free_port()
@@ -42,7 +42,7 @@ class GdbRunGdbserver(DebuggerTestBase):
             )
             return out, srv.read_log()
 
-    def test_breakpoint_hit_and_inspect_args(self):
+    def test_breakpoint_hit_and_inspect_args(self) -> None:
         out, _ = self._gdb(
             ["break compute", "continue", "info args", "print a + b", "kill"]
         )
@@ -53,14 +53,14 @@ class GdbRunGdbserver(DebuggerTestBase):
         # `print a + b` => "$N = 13"
         self.assertRegex(out, r"\$\d+ = %d" % EXPECT_SUM)
 
-    def test_step_over_and_local_variable(self):
+    def test_step_over_and_local_variable(self) -> None:
         # Stop at compute, step over the first statement, then `sum` is defined.
         out, _ = self._gdb(
             ["break compute", "continue", "next", "print sum", "kill"]
         )
         self.assertRegex(out, r"\$\d+ = %d" % EXPECT_SUM)
 
-    def test_step_in_from_main(self):
+    def test_step_in_from_main(self) -> None:
         # Break at the `compute(x, y)` call site in main, then step *into* the
         # callee and verify we entered compute with the expected arguments.
         call_line = _line_of("BP_MAIN")
@@ -75,7 +75,7 @@ class GdbRunGdbserver(DebuggerTestBase):
         )
         self.assertRegex(out, r"compute \(a=%d, b=%d\)" % (EXPECT_A, EXPECT_B))
 
-    def test_step_out_returns_value(self):
+    def test_step_out_returns_value(self) -> None:
         # step-out (`finish`) from compute reports the return value 55.
         # NOTE: `finish` must NOT be followed by `continue` -- that currently
         # panics reverie ("unexpected resume action"), see README. We end with
@@ -85,14 +85,14 @@ class GdbRunGdbserver(DebuggerTestBase):
         )
         self.assertRegex(out, r"Value returned is \$\d+ = %d" % EXPECT_RESULT)
 
-    def test_register_inspection(self):
+    def test_register_inspection(self) -> None:
         out, _ = self._gdb(
             ["break compute", "continue", "info registers rip", "kill"]
         )
         # rip should be a concrete hex value inside the text segment.
         self.assertRegex(out, r"rip\s+0x[0-9a-f]+")
 
-    def test_continue_to_exit(self):
+    def test_continue_to_exit(self) -> None:
         out, log = self._gdb(["break compute", "continue", "continue"])
         self.assertIn("exited normally", out)
         # The guest actually ran under Hermit and produced its output.

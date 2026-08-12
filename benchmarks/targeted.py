@@ -29,6 +29,13 @@ class BenchmarkError(RuntimeError):
     """The benchmark matrix could not be prepared or measured."""
 
 
+def numeric(value: object) -> float:
+    """Convert one value from the benchmark's checked in-memory result schema."""
+    if not isinstance(value, (str, int, float)):
+        raise BenchmarkError(f"expected a numeric result, got {type(value).__name__}")
+    return float(value)
+
+
 @dataclass(frozen=True)
 class Benchmark:
     name: str
@@ -351,12 +358,12 @@ def measure_benchmark(
 
     native = modes["native"]
     assert isinstance(native, dict)
-    native_median = float(native["median_seconds"])
+    native_median = numeric(native["median_seconds"])
     for backend, mode in modes.items():
         assert isinstance(mode, dict)
         if mode["status"] != "ok":
             continue
-        median = float(mode["median_seconds"])
+        median = numeric(mode["median_seconds"])
         mode["ratio_vs_native"] = round(median / native_median, 3)
 
     return {
@@ -402,10 +409,10 @@ def perf_event_paranoid() -> str:
 def format_mode(mode: dict[str, object], native: bool) -> str:
     if mode["status"] != "ok":
         return str(mode["status"])
-    milliseconds = float(mode["median_seconds"]) * 1000.0
+    milliseconds = numeric(mode["median_seconds"]) * 1000.0
     if native:
         return f"{milliseconds:.3f} ms"
-    return f"{milliseconds:.3f} ms ({float(mode['ratio_vs_native']):.2f}x)"
+    return f"{milliseconds:.3f} ms ({numeric(mode['ratio_vs_native']):.2f}x)"
 
 
 def render_summary(results: dict[str, object]) -> str:

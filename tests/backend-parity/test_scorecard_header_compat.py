@@ -27,17 +27,13 @@ Exit 0 = all assertions pass, 1 = a real failure.
 from __future__ import annotations
 
 import csv
-import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("run_matrix", HERE / "run_matrix.py")
-assert spec and spec.loader
-run_matrix = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(run_matrix)
+import run_matrix
 
 LEGACY_19 = (
     "run_id,run_utc,hermit_sha,reverie_sha,dirty,run_mode,lane,bucket,test_id,"
@@ -55,7 +51,7 @@ LEGACY_OPERAND_AWARE_23 = (
 # real byte operands, not from the enclosing PASS/FAIL status.  This is the
 # mutation bracket: either hard-coding parity=1 or deriving it from status makes
 # the divergent assertion below fail.
-PLANTED = [
+PLANTED: list[run_matrix.ResultRow] = [
     {
         "result": "PASS",
         "backend": "dbt",
@@ -102,7 +98,7 @@ def append(header: str | None, *, seed_row: str | None = None) -> tuple[Path, ob
     try:
         run_matrix.append_parent_scorecard(
             path,
-            [dict(r) for r in PLANTED],
+            PLANTED,
             strict=True,
             verify=True,
             probe_gaps=False,
@@ -168,19 +164,28 @@ check(
 print("case PRODUCER-PATH — live run results drive both sides of the mutation")
 
 
-def run_producer(candidate_stdout: bytes):
+def run_producer(
+    candidate_stdout: bytes,
+) -> tuple[
+    tuple[str, str, float],
+    dict[str, str],
+    list[subprocess.CompletedProcess[bytes]],
+]:
     responses = [
-        run_matrix.subprocess.CompletedProcess([], 0, b"hello world\n", b""),
-        run_matrix.subprocess.CompletedProcess([], 0, candidate_stdout, b""),
+        subprocess.CompletedProcess([], 0, b"hello world\n", b""),
+        subprocess.CompletedProcess([], 0, candidate_stdout, b""),
     ]
     if candidate_stdout == b"hello world\n":
         responses.extend(
-            run_matrix.subprocess.CompletedProcess([], 0, candidate_stdout, b"")
+            subprocess.CompletedProcess([], 0, candidate_stdout, b"")
             for _ in range(run_matrix.RUNS - 1)
         )
     original = run_matrix.run_with_timeout
 
-    def planted_run(_command):
+    def planted_run(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        del command
         return responses.pop(0)
 
     evidence: dict[str, str] = {}
@@ -220,18 +225,27 @@ check(
 check("divergent producer consumed 1 reference + 1 candidate run", not remaining, repr(remaining))
 
 
-def run_dynamic_producer(reference_stdout: bytes, candidate_stdout: bytes):
+def run_dynamic_producer(
+    reference_stdout: bytes, candidate_stdout: bytes
+) -> tuple[
+    tuple[str, str, float],
+    dict[str, str],
+    list[subprocess.CompletedProcess[bytes]],
+]:
     """Exercise a marker-only case whose output is not fixed by the catalog."""
     responses = [
-        run_matrix.subprocess.CompletedProcess([], 0, reference_stdout, b""),
+        subprocess.CompletedProcess([], 0, reference_stdout, b""),
         *(
-            run_matrix.subprocess.CompletedProcess([], 0, candidate_stdout, b"")
+            subprocess.CompletedProcess([], 0, candidate_stdout, b"")
             for _ in range(run_matrix.RUNS)
         ),
     ]
     original = run_matrix.run_with_timeout
 
-    def planted_run(_command):
+    def planted_run(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        del command
         return responses.pop(0)
 
     evidence: dict[str, str] = {}
@@ -270,14 +284,18 @@ check(
 )
 
 
-def run_backend_local_dynamic(name: str, candidate_stdout: bytes):
+def run_backend_local_dynamic(
+    name: str, candidate_stdout: bytes
+) -> tuple[tuple[str, str, float], dict[str, str], list[list[str]]]:
     """Exercise a dynamic row whose raw output is not a parity contract."""
     commands: list[list[str]] = []
     original = run_matrix.run_with_timeout
 
-    def planted_run(command):
+    def planted_run(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[bytes] | None:
         commands.append(command)
-        return run_matrix.subprocess.CompletedProcess(
+        return subprocess.CompletedProcess(
             command, 0, candidate_stdout, b""
         )
 
@@ -349,16 +367,18 @@ kvm_commands: list[list[str]] = []
 original = run_matrix.run_with_timeout
 
 
-def planted_memory_advice(command):
+def planted_memory_advice(
+    command: list[str],
+) -> subprocess.CompletedProcess[bytes] | None:
     kvm_commands.append(command)
     if "--backend" not in command and "--kvm" in command:
-        return run_matrix.subprocess.CompletedProcess(
+        return subprocess.CompletedProcess(
             command,
             14,
             b"",
             b"ptrace fixture rejected KVM-only invocation\n",
         )
-    return run_matrix.subprocess.CompletedProcess(command, 0, b"madvise-ok\n", b"")
+    return subprocess.CompletedProcess(command, 0, b"madvise-ok\n", b"")
 
 
 kvm_evidence: dict[str, str] = {}
@@ -401,13 +421,17 @@ check(
 print("case CPUID-BLOCKED — reference capture preserves capability semantics")
 
 
-def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
+def run_cpuid_reference(
+    reference_returncode: int, reference_stderr: bytes
+) -> tuple[tuple[str, str, float], dict[str, str], list[list[str]]]:
     commands: list[list[str]] = []
 
-    def planted_cpuid(command):
+    def planted_cpuid(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[bytes] | None:
         commands.append(command)
         if len(commands) == 1:
-            return run_matrix.subprocess.CompletedProcess(
+            return subprocess.CompletedProcess(
                 command,
                 reference_returncode,
                 (
@@ -417,7 +441,7 @@ def run_cpuid_reference(reference_returncode: int, reference_stderr: bytes):
                 ),
                 reference_stderr,
             )
-        return run_matrix.subprocess.CompletedProcess(
+        return subprocess.CompletedProcess(
             command,
             0,
             b"CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n",
@@ -482,7 +506,13 @@ check(
 
 original = run_matrix.run_with_timeout
 try:
-    run_matrix.run_with_timeout = lambda _command: None
+    def missing_run(
+        command: list[str],
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        del command
+        return None
+
+    run_matrix.run_with_timeout = missing_run
     missing_reference = run_matrix.run_case(
         Path("/planted/hermit"),
         "dbt",

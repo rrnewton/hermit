@@ -25,6 +25,8 @@ import subprocess
 import time
 import unittest
 from pathlib import Path
+from types import TracebackType
+from typing import BinaryIO, ClassVar, Literal
 
 # tests/debugger/harness.py -> repo root is two levels up.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -74,7 +76,10 @@ def pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        port = s.getsockname()[1]
+        if not isinstance(port, int):
+            raise RuntimeError(f"socket returned a non-integer port: {port!r}")
+        return port
 
 
 def compile_guest() -> Path:
@@ -121,7 +126,9 @@ def _port_is_listening(port: int) -> bool:
     return False
 
 
-def _wait_for_port(port: int, proc: subprocess.Popen, timeout: float = 30.0) -> bool:
+def _wait_for_port(
+    port: int, proc: subprocess.Popen[bytes], timeout: float = 30.0
+) -> bool:
     """Poll until localhost:port is LISTENing, the process dies, or we time
     out."""
     deadline = time.time() + timeout
@@ -139,11 +146,12 @@ class HermitGdbserver:
     gdbserver port is reachable. Force host networking so the port is reachable
     from the host debugger (see hermit-cli run.rs / PR #144)."""
 
-    def __init__(self, hermit: Path, guest: Path, port: int):
+    def __init__(self, hermit: Path, guest: Path, port: int) -> None:
         self.hermit = hermit
         self.guest = guest
         self.port = port
-        self.proc: subprocess.Popen | None = None
+        self.proc: subprocess.Popen[bytes] | None = None
+        self._logf: BinaryIO | None = None
         self.log = BUILD_DIR / f"hermit_run_{port}.log"
 
     def __enter__(self) -> "HermitGdbserver":
@@ -177,7 +185,7 @@ class HermitGdbserver:
         except OSError:
             return ""
 
-    def _cleanup(self):
+    def _cleanup(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -186,11 +194,17 @@ class HermitGdbserver:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
         try:
-            self._logf.close()
+            if self._logf is not None:
+                self._logf.close()
         except Exception:
             pass
 
-    def __exit__(self, *exc):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
         self._cleanup()
         return False
 
@@ -291,16 +305,19 @@ def can_run_hermit(hermit: Path) -> tuple[bool, str]:
 class DebuggerTestBase(unittest.TestCase):
     """Common precondition checks + fixtures for the debugger tests."""
 
-    require_gdb = False
-    require_lldb = False
+    require_gdb: ClassVar[bool] = False
+    require_lldb: ClassVar[bool] = False
+    hermit: ClassVar[Path]
+    guest: ClassVar[Path]
 
     @classmethod
-    def setUpClass(cls):
-        cls.hermit = hermit_bin()
-        if cls.hermit is None:
+    def setUpClass(cls) -> None:
+        hermit = hermit_bin()
+        if hermit is None:
             raise unittest.SkipTest(
                 "hermit binary not found (build it or set HERMIT_BIN)"
             )
+        cls.hermit = hermit
         if cls.require_gdb and not have_gdb():
             raise unittest.SkipTest("gdb not found on PATH")
         if cls.require_lldb and not have_lldb_module():

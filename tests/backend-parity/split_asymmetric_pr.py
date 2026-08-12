@@ -49,7 +49,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TypedDict, cast
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -63,6 +63,12 @@ BACKEND_TOKENS = {"ptrace", "dbt", "dynamorio", "kvm", "sabre", "e9patch"}
 
 class SplitError(RuntimeError):
     """A split that is not mechanically lossless and requires a human."""
+
+
+class GitHubPrRecord(TypedDict):
+    number: int
+    url: str
+    state: str
 
 
 @dataclass(frozen=True)
@@ -127,8 +133,17 @@ def _run(
     return proc
 
 
-def _text(args: list[str], **kwargs) -> str:
-    return _run(args, **kwargs).stdout.decode("utf-8", "replace").strip()
+def _text(
+    args: list[str],
+    *,
+    cwd: Path = REPO_ROOT,
+    data: bytes | None = None,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+) -> str:
+    return _run(
+        args, cwd=cwd, data=data, env=env, check=check
+    ).stdout.decode("utf-8", "replace").strip()
 
 
 def _git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
@@ -225,12 +240,17 @@ def changed_paths(repo: Path, base: str, head: str) -> tuple[Change, ...]:
     return tuple(changes)
 
 
-def _show_json(repo: Path, revision: str, path: str) -> dict | None:
+def _show_json(
+    repo: Path, revision: str, path: str
+) -> dict[str, object] | None:
     proc = _run(["git", "show", f"{revision}:{path}"], cwd=repo, check=False)
     if proc.returncode != 0:
         return None
     try:
-        return json.loads(proc.stdout)
+        value = json.loads(proc.stdout)
+        if not isinstance(value, dict):
+            raise SplitError(f"{revision}:{path} is not a JSON object")
+        return {str(key): item for key, item in value.items()}
     except json.JSONDecodeError as error:
         raise SplitError(f"{revision}:{path} is invalid JSON: {error}") from error
 
@@ -242,11 +262,13 @@ def _names_backend(value: str) -> bool:
     )
 
 
-def _backend_private(entry: dict) -> bool:
+def _backend_private(entry: dict[str, object]) -> bool:
     if entry.get("disposition") != "guest-fixture":
         return False
-    path = entry.get("path", "")
-    runner = entry.get("runner", "")
+    path_value = entry.get("path", "")
+    runner_value = entry.get("runner", "")
+    path = path_value if isinstance(path_value, str) else ""
+    runner = runner_value if isinstance(runner_value, str) else ""
     return (
         path.startswith("tests/backend-parity/")
         or "tests/backend-parity/" in runner
@@ -255,13 +277,15 @@ def _backend_private(entry: dict) -> bool:
     )
 
 
-def _inventory_entries(value: dict | None) -> dict[str, dict]:
+def _inventory_entries(
+    value: dict[str, object] | None,
+) -> dict[str, dict[str, object]]:
     if value is None:
         return {}
     files = value.get("files")
     if not isinstance(files, list):
         raise SplitError(f"{INVENTORY}: expected a files array")
-    result = {}
+    result: dict[str, dict[str, object]] = {}
     for entry in files:
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise SplitError(f"{INVENTORY}: malformed entry")
@@ -546,7 +570,7 @@ def _ensure_label(repo_name: str) -> None:
     )
 
 
-def _existing_pr(repo_name: str, branch: str) -> dict | None:
+def _existing_pr(repo_name: str, branch: str) -> GitHubPrRecord | None:
     raw = _gh(
         repo_name,
         "pr",
@@ -558,7 +582,7 @@ def _existing_pr(repo_name: str, branch: str) -> dict | None:
         "--json",
         "number,url,state",
     )
-    values = json.loads(raw)
+    values = cast(list[GitHubPrRecord], json.loads(raw))
     return values[0] if values else None
 
 
@@ -570,7 +594,7 @@ def _create_or_reuse_pr(
     body: str,
     *,
     draft: bool,
-) -> dict:
+) -> GitHubPrRecord:
     existing = _existing_pr(repo_name, branch)
     if existing:
         if existing["state"] != "OPEN":
@@ -628,7 +652,7 @@ def publish(
     partition: Partition,
     objects: SplitObjects,
     role_tag: str,
-) -> dict:
+) -> dict[str, object]:
     _ensure_label(repo_name)
     if not partition.code:
         _gh(repo_name, "pr", "edit", str(pr.number), "--add-label", DEFERRED_LABEL)
@@ -766,7 +790,7 @@ def plan_one(
     target_ref: str,
     publish_changes: bool,
     role_tag: str | None,
-) -> dict:
+) -> dict[str, object]:
     pr = read_pr(repo_name, number)
     if pr.state != "OPEN":
         raise SplitError(f"PR #{number} is {pr.state}, expected OPEN")
@@ -897,8 +921,14 @@ def self_test() -> int:
             raise AssertionError("corrupt generated patch passed losslessness check")
 
         assert set(
+            # partition.code is nonempty in this bracket, so the code commit
+            # must have been materialized by build_split_objects.
             _git_text(
-                repo, "diff", "--name-only", base, objects.code_commit
+                repo,
+                "diff",
+                "--name-only",
+                base,
+                cast(str, objects.code_commit),
             ).splitlines()
         ) == {"src/lib.rs"}
         assert set(

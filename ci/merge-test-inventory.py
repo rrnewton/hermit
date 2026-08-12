@@ -69,17 +69,46 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Sequence, TypedDict
 
 ENTRY_KEYS = ("disposition", "path", "runner", "why")
 
 
-def _load(path: Path) -> dict:
+class InventoryEntry(TypedDict):
+    disposition: str
+    path: str
+    runner: str
+    why: str
+
+
+class Inventory(TypedDict):
+    files: list[InventoryEntry]
+    schema: int
+
+
+def _load(path: Path) -> Inventory:
     with path.open() as handle:
-        doc = json.load(handle)
-    if not isinstance(doc, dict) or not isinstance(doc.get("files"), list):
+        raw: object = json.load(handle)
+    if not isinstance(raw, dict) or not isinstance(raw.get("files"), list):
         raise SystemExit(f"{path}: not a test inventory (missing .files array)")
-    return doc
+    entries: list[InventoryEntry] = []
+    for raw_entry in raw["files"]:
+        if not isinstance(raw_entry, dict) or any(
+            not isinstance(raw_entry.get(key), str) for key in ENTRY_KEYS
+        ):
+            raise SystemExit(f"{path}: malformed inventory entry: {raw_entry!r}")
+        entries.append(
+            {
+                "disposition": raw_entry["disposition"],
+                "path": raw_entry["path"],
+                "runner": raw_entry["runner"],
+                "why": raw_entry["why"],
+            }
+        )
+    schema = raw.get("schema", 2)
+    if not isinstance(schema, int):
+        raise SystemExit(f"{path}: inventory schema must be an integer")
+    return {"files": entries, "schema": schema}
 
 
 def default_repo_root() -> Path:
@@ -101,7 +130,7 @@ def default_repo_root() -> Path:
         return Path(__file__).resolve().parent.parent
 
 
-def existing_test_files(repo_root: Path) -> set:
+def existing_test_files(repo_root: Path) -> set[str]:
     """Enumerate files under tests/ the same way audit_inventory does."""
     try:
         result = subprocess.run(
@@ -130,9 +159,9 @@ def existing_test_files(repo_root: Path) -> set:
 
 
 def merge(
-    docs: Sequence[dict],
-    present: Optional[set],
-) -> Tuple[List[dict], List[str], List[str]]:
+    docs: Sequence[Inventory],
+    present: set[str] | None,
+) -> tuple[list[InventoryEntry], list[str], list[str]]:
     """Union entries by path, prune phantoms, and sort.
 
     Earlier inputs take precedence: a later document's version of a path that
@@ -140,8 +169,8 @@ def merge(
 
     Returns (entries, pruned_paths, overridden_paths).
     """
-    chosen: Dict[str, dict] = {}
-    overrides: List[str] = []
+    chosen: dict[str, InventoryEntry] = {}
+    overrides: list[str] = []
     for doc in docs:
         for entry in doc["files"]:
             path = entry.get("path")
@@ -153,7 +182,7 @@ def merge(
             elif previous != entry and path not in overrides:
                 overrides.append(path)
 
-    pruned: List[str] = []
+    pruned: list[str] = []
     if present is not None:
         for path in sorted(chosen):
             if path not in present:
@@ -168,7 +197,7 @@ def check(path: Path, repo_root: Path) -> int:
     """Verify a committed inventory is canonical: sorted, and free of phantoms."""
     doc = _load(path)
     paths = [entry["path"] for entry in doc["files"]]
-    problems = []
+    problems: list[str] = []
     if paths != sorted(paths):
         problems.append(
             "files[] is not sorted by path; run ci/merge-test-inventory.py to canonicalize"
@@ -190,10 +219,12 @@ def check(path: Path, repo_root: Path) -> int:
 def _self_test() -> int:
     """Bracket the merge from both sides: it must add, and it must refuse."""
 
-    def doc(*entries: dict) -> dict:
+    def doc(*entries: InventoryEntry) -> Inventory:
         return {"files": list(entries), "schema": 2}
 
-    def entry(path: str, disposition: str = "manifest-test") -> dict:
+    def entry(
+        path: str, disposition: str = "manifest-test"
+    ) -> InventoryEntry:
         runner = "ci/test_harness.sh"
         return {
             "disposition": disposition,
@@ -202,7 +233,7 @@ def _self_test() -> int:
             "why": f"{path} is owned by {runner}: fixture used by the self-test.",
         }
 
-    failures = []
+    failures: list[str] = []
 
     def expect(name: str, condition: bool) -> None:
         status = "ok  " if condition else "FAIL"
@@ -276,7 +307,7 @@ def _self_test() -> int:
     return 0
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("inputs", nargs="*", type=Path, help="inventories to merge")
     parser.add_argument("-o", "--output", type=Path, help="destination (default: stdout)")
@@ -323,7 +354,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             )
         return 2
 
-    merged = {"files": entries, "schema": docs[0].get("schema", 2)}
+    merged: Inventory = {"files": entries, "schema": docs[0]["schema"]}
     text = json.dumps(merged, indent=2, sort_keys=True) + "\n"
     if args.output is None:
         sys.stdout.write(text)

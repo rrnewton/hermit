@@ -16,6 +16,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
+from typing import NotRequired, TypedDict
+
+
+class ResultRow(TypedDict):
+    """One matrix result, including evidence that is not serialized to TSV."""
+
+    test_name: str
+    backend: str
+    expectation: str
+    result: str
+    seconds: str
+    detail: str
+    evidence: NotRequired[dict[str, str]]
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -136,7 +150,9 @@ PRODUCED_COLUMNS = tuple(
 )
 
 
-def scorecard_fieldnames(actual_header, path):
+def scorecard_fieldnames(
+    actual_header: Sequence[str], path: Path
+) -> tuple[tuple[str, ...], str]:
     """Bind the writer to the FILE's schema, refusing only a column we must write.
 
     Returns ``(fieldnames, parity_column)``.  ``fieldnames`` is the file's own
@@ -164,6 +180,7 @@ def scorecard_fieldnames(actual_header, path):
             f"producer writes: {', '.join(missing)}; its header has "
             f"{len(actual)} column(s): {','.join(actual)}"
         )
+    assert parity_column is not None
     return actual, parity_column
 
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
@@ -505,7 +522,9 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
     return ("guest" if backend == "kvm" else "stripped"), "-"
 
 
-def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes | None]:
+def case_command(
+    name: str, fixtures: Fixtures | CatalogFixtures
+) -> tuple[list[str], int, bytes | None]:
     cases = case_catalog(fixtures)
     try:
         return cases[name]
@@ -959,7 +978,7 @@ def run_case(
     hermit: Path,
     backend: str,
     name: str,
-    fixtures: Fixtures,
+    fixtures: Fixtures | CatalogFixtures,
     strict: bool,
     verify: bool = False,
     expected_l2: str = "gap",
@@ -1116,7 +1135,7 @@ RESULT_COLUMNS = (
 NON_COLUMN_RESULT_KEYS = frozenset({"evidence"})
 
 
-def write_results(path: Path, results: list[dict[str, str]]) -> None:
+def write_results(path: Path, results: Sequence[ResultRow]) -> None:
     """Write the whole run matrix, or write nothing and name what stopped it.
 
     `csv.DictWriter` defaults to ``extrasaction="raise"``, so once the row
@@ -1271,7 +1290,7 @@ def git_output(*args: str) -> str | None:
 
 def append_parent_scorecard(
     path: Path,
-    results: list[dict[str, str]],
+    results: Sequence[ResultRow],
     *,
     strict: bool,
     verify: bool,
@@ -1407,7 +1426,7 @@ def append_parent_scorecard(
 
 
 def record_parent_observations(
-    results: list[dict[str, str]],
+    results: Sequence[ResultRow],
     *,
     requested_path: Path | None,
     disabled: bool,
@@ -1558,7 +1577,7 @@ def main() -> int:
         raise MatrixError(
             "--parent-scorecard and --no-parent-scorecard cannot be used together"
         )
-    results: list[dict[str, str]] = []
+    results: list[ResultRow] = []
     failures = 0
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
         fixtures = Fixtures(Path(tempdir))

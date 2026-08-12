@@ -40,8 +40,13 @@ import lldb
 
 class LldbRunGdbserver(DebuggerTestBase):
     require_lldb = True
+    port: int
+    _srv: HermitGdbserver
+    dbg: lldb.SBDebugger
+    target: lldb.SBTarget
+    process: lldb.SBProcess | None
 
-    def setUp(self):
+    def setUp(self) -> None:
         self.port = pick_free_port()
         self._srv = HermitGdbserver(self.hermit, self.guest, self.port)
         self._srv.__enter__()
@@ -51,7 +56,7 @@ class LldbRunGdbserver(DebuggerTestBase):
         self.assertTrue(self.target.IsValid(), "could not create lldb target")
         self.process = None
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         try:
             if self.process and self.process.IsValid():
                 self.process.Kill()
@@ -59,7 +64,7 @@ class LldbRunGdbserver(DebuggerTestBase):
             lldb.SBDebugger.Destroy(self.dbg)
             self._srv.__exit__(None, None, None)
 
-    def _connect(self):
+    def _connect(self) -> None:
         err = lldb.SBError()
         self.process = self.target.ConnectRemote(
             self.dbg.GetListener(),
@@ -75,7 +80,7 @@ class LldbRunGdbserver(DebuggerTestBase):
         mod = self.target.GetModuleAtIndex(0)
         self.target.SetModuleLoadAddress(mod, 0)
 
-    def test_connect_and_plant_breakpoint(self):
+    def test_connect_and_plant_breakpoint(self) -> None:
         """The handshake: connect + set a breakpoint that resolves. Always
         asserted."""
         self._connect()
@@ -86,7 +91,7 @@ class LldbRunGdbserver(DebuggerTestBase):
         loc = bp.GetLocationAtIndex(0).GetAddress().GetLoadAddress(self.target)
         self.assertNotEqual(loc, lldb.LLDB_INVALID_ADDRESS, "bp has no load address")
 
-    def _require_inspection(self, thread):
+    def _require_inspection(self, thread: lldb.SBThread) -> None:
         """Skip (don't fail) when this LLDB/gdbserver combo can't provide
         register/frame info."""
         if thread.GetNumFrames() == 0 or not thread.GetFrameAtIndex(
@@ -101,26 +106,38 @@ class LldbRunGdbserver(DebuggerTestBase):
                 "test_connect_and_plant_breakpoint."
             )
 
-    def test_breakpoint_hit_and_inspect(self):
+    def test_breakpoint_hit_and_inspect(self) -> None:
         self._connect()
         self.target.BreakpointCreateByName("compute")
-        self.process.Continue()
-        thread = self.process.GetSelectedThread()
+        process = self.process
+        if process is None:
+            raise AssertionError("LLDB connection did not create a process")
+        process.Continue()
+        thread = process.GetSelectedThread()
         self._require_inspection(thread)
         # If we get here, full inspection works: verify it thoroughly.
         frame = thread.GetFrameAtIndex(0)
         self.assertEqual(frame.GetFunctionName(), "compute")
-        self.assertEqual(int(frame.FindVariable("a").GetValue()), EXPECT_A)
-        self.assertEqual(int(frame.FindVariable("b").GetValue()), EXPECT_B)
+        self.assertEqual(_value_as_int(frame.FindVariable("a")), EXPECT_A)
+        self.assertEqual(_value_as_int(frame.FindVariable("b")), EXPECT_B)
         # Step over one line; `sum` becomes defined.
         thread.StepOver()
         frame = thread.GetFrameAtIndex(0)
-        self.assertEqual(int(frame.FindVariable("sum").GetValue()), EXPECT_A + EXPECT_B)
+        self.assertEqual(
+            _value_as_int(frame.FindVariable("sum")), EXPECT_A + EXPECT_B
+        )
         # Continue to exit.
-        self.process.Continue()
-        self.assertEqual(self.process.GetState(), lldb.eStateExited)
-        self.assertEqual(self.process.GetExitStatus(), 0)
+        process.Continue()
+        self.assertEqual(process.GetState(), lldb.eStateExited)
+        self.assertEqual(process.GetExitStatus(), 0)
         self.assertRegex(self._srv.read_log(), r"result=%d" % EXPECT_RESULT)
+
+
+def _value_as_int(value: lldb.SBValue) -> int:
+    text = value.GetValue()
+    if text is None:
+        raise AssertionError("LLDB value has no textual representation")
+    return int(text)
 
 
 if __name__ == "__main__":

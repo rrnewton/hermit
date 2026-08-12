@@ -27,14 +27,14 @@ THREADS = 4
 ITERATIONS = 64
 
 
-def random_probe():
+def random_probe() -> None:
     token = os.urandom(16).hex()
     value = random.getrandbits(64)
     hash_order = ",".join(set(WORDS))
     print(f"RANDOM token={token} prng={value} hash_order={hash_order}")
 
 
-def time_probe():
+def time_probe() -> None:
     os.environ["TZ"] = "UTC"
     time.tzset()
     now_ns = time.time_ns()
@@ -42,13 +42,13 @@ def time_probe():
     print(f"TIME unix_ns={now_ns} utc={now.isoformat()} zone={time.tzname[0]}")
 
 
-def thread_probe():
+def thread_probe() -> None:
     lock = threading.Lock()
     ready = threading.Barrier(THREADS + 1)
-    schedule = []
+    schedule: list[int] = []
     counter = 0
 
-    def worker(worker_id):
+    def worker(worker_id: int) -> None:
         nonlocal counter
         ready.wait()
         for _ in range(ITERATIONS):
@@ -58,11 +58,11 @@ def thread_probe():
             time.sleep(0)
 
     workers = [threading.Thread(target=worker, args=(index,)) for index in range(THREADS)]
-    for worker in workers:
-        worker.start()
+    for worker_thread in workers:
+        worker_thread.start()
     ready.wait()
-    for worker in workers:
-        worker.join()
+    for worker_thread in workers:
+        worker_thread.join()
 
     expected = THREADS * ITERATIONS
     if counter != expected or len(schedule) != expected:
@@ -71,7 +71,7 @@ def thread_probe():
     print(f"THREAD workers={THREADS} counter={counter} schedule_sha256={digest}")
 
 
-def system_probe():
+def system_probe() -> None:
     uname = os.uname()
     sentinel = os.environ["HERMIT_RUNTIME_SENTINEL"]
     with open("/proc/self/status", encoding="utf-8") as status_file:

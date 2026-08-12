@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_DIR = ROOT / "benchmarks"
@@ -249,6 +249,13 @@ def summarize_samples(samples_ns: list[int]) -> dict[str, object]:
     }
 
 
+def numeric(value: object) -> float:
+    """Convert one value from the benchmark's checked in-memory result schema."""
+    if not isinstance(value, (str, int, float)):
+        raise BenchmarkError(f"expected a numeric result, got {type(value).__name__}")
+    return float(value)
+
+
 def measure_benchmark(
     benchmark: Benchmark,
     hermit: Path,
@@ -364,11 +371,13 @@ def main() -> int:
             args.timeout,
         )
         measured.append(result)
+        native = cast(dict[str, object], result["native"])
+        wrapped = cast(dict[str, object], result["hermit"])
         print(
             "  native={:.3f} ms hermit={:.3f} ms overhead={:+.1f}%".format(
-                float(result["native"]["mean_seconds"]) * 1000.0,
-                float(result["hermit"]["mean_seconds"]) * 1000.0,
-                float(result["overhead_percent"]),
+                numeric(native["mean_seconds"]) * 1000.0,
+                numeric(wrapped["mean_seconds"]) * 1000.0,
+                numeric(result["overhead_percent"]),
             ),
             file=sys.stderr,
         )

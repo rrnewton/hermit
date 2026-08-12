@@ -10,7 +10,7 @@
 import datetime
 
 
-def millis():
+def millis() -> float:
     return datetime.datetime.now().timestamp() * 1000
 
 

@@ -10,10 +10,11 @@ import ssl
 import sys
 
 httpd = http.server.HTTPServer(("0.0.0.0", 0), http.server.SimpleHTTPRequestHandler)
-httpd.socket = ssl.wrap_socket(
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain(certfile="/var/facebook/x509_identities/server.pem")
+context.load_verify_locations(cafile="/var/facebook/rootcanal/ca.pem")
+httpd.socket = context.wrap_socket(
     httpd.socket,
-    certfile="/var/facebook/x509_identities/server.pem",
-    ca_certs="/var/facebook/rootcanal/ca.pem",
     server_side=True,
 )
 

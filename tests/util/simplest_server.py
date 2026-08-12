@@ -5,13 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import http.server
-import socketserver
 import sys
 from http import HTTPStatus
+from typing import cast
 
 
 class Hello(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
+    def do_GET(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.end_headers()
         self.wfile.write(b"Hello world\n")
@@ -22,8 +22,8 @@ if len(sys.argv) > 1:
     requests = int(sys.argv[1])
     sys.stderr.write("[server] Answering only " + str(requests) + " requests.\n")
 
-with socketserver.TCPServer(("", 0), Hello) as server:
-    address, port = server.server_address
+with http.server.HTTPServer(("", 0), Hello) as server:
+    address, port = cast(tuple[str, int], server.server_address)
     print(f"{address}:{port}", flush=True)
     if requests > 0:
         for _i in range(0, requests):

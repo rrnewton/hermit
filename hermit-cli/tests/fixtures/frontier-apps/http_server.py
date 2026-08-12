@@ -13,10 +13,10 @@ import urllib.request
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *_args):
+    def log_message(self, _format: str, *args: object) -> None:
         pass
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         payload = (
             f"path={self.path} time={time.time_ns()} "
             f"token={secrets.token_hex(8)}\n"

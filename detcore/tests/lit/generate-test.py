@@ -91,7 +91,7 @@ RUN: %hermit run --verify -- %me
 """
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generates a new lit test.")
     parser.add_argument("name", type=Path, help="The name of the test.")
     parser.add_argument(
@@ -103,7 +103,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def yes_no(message):
+def yes_no(message: str) -> bool:
     """
     Prompts the user for a boolean.
     """
@@ -117,7 +117,7 @@ def yes_no(message):
         print("Invalid input. Lets try that again...")
 
 
-def gen_test(name, lang):
+def gen_test(name: Path, lang: str) -> None:
     try:
         name.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
@@ -134,7 +134,7 @@ def gen_test(name, lang):
         with (name / "main.go").open("w") as f:
             f.write(GO_TEMPLATE)
 
-    lit_tests = []
+    lit_tests: list[str] = []
 
     if yes_no(
         "Generate lit test for `hermit run --no-sequentialize-threads --no-deterministic-io`"
@@ -166,7 +166,7 @@ def gen_test(name, lang):
     print("")
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
     lang = args.lang

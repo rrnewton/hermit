@@ -38,7 +38,9 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Iterable, Protocol, cast
 
 MODULE_PATH = Path(__file__).resolve().parent / "run_matrix.py"
 
@@ -56,26 +58,43 @@ LEGACY_COLUMNS = (
     "seconds",
     "detail",
 )
+Row = dict[str, object]
 
 
-def declared_columns(module) -> tuple[str, ...]:
-    return tuple(getattr(module, "RESULT_COLUMNS", LEGACY_COLUMNS))
+class MatrixModule(Protocol):
+    MatrixError: type[Exception]
+
+    def write_results(
+        self, path: Path, rows: Sequence[Mapping[str, object]]
+    ) -> None: ...
 
 
-def allowed_non_columns(module) -> frozenset[str]:
-    return frozenset(getattr(module, "NON_COLUMN_RESULT_KEYS", frozenset()))
+def declared_columns(module: MatrixModule) -> tuple[str, ...]:
+    value: object = getattr(module, "RESULT_COLUMNS", LEGACY_COLUMNS)
+    if not isinstance(value, Iterable):
+        raise TypeError("RESULT_COLUMNS is not iterable")
+    return tuple(str(column) for column in value)
 
 
-def load_module():
+def allowed_non_columns(module: MatrixModule) -> frozenset[str]:
+    value: object = getattr(module, "NON_COLUMN_RESULT_KEYS", frozenset())
+    if not isinstance(value, Iterable):
+        raise TypeError("NON_COLUMN_RESULT_KEYS is not iterable")
+    return frozenset(str(column) for column in value)
+
+
+def load_module() -> MatrixModule:
     spec = importlib.util.spec_from_file_location("run_matrix", MODULE_PATH)
     assert spec and spec.loader, f"cannot load {MODULE_PATH}"
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
+    return cast(MatrixModule, module)
 
 
-def make_row(name: str, *, evidence: bool = False, extra: str | None = None):
-    row = {
+def make_row(
+    name: str, *, evidence: bool = False, extra: str | None = None
+) -> Row:
+    row: Row = {
         "test_name": name,
         "backend": "ptrace",
         "expectation": "pass",
