@@ -2752,11 +2752,47 @@ function execute_attempt {
         "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
 }
 
+# Read the machine-readable parity verdict a verify attempt left in the cell
+# directory and reduce it to the three fields a consumer needs to tell a
+# comparator result from a run that never compared.
+#
+# WHY THIS EXISTS. Until now a results.jsonl row carried neither the verdict nor
+# the compared-message counts, so a green asserted only that the command exited
+# 0 -- not that the comparator ran and matched. Measured over 2788 retained rows
+# at the time of writing: 2409 of 2415 passing cells recorded no parity evidence
+# anywhere, in a column or in prose.
+#
+# ALL THREE FIELDS ARE REQUIRED AND bitwise_parity ALONE IS NOT ENOUGH. Across 60
+# retained verdicts the observed shapes were `matched` with parity true and
+# counts present, and `no_result` with parity FALSE and counts null. A genuine
+# divergence is also parity false, so parity cannot separate a refusal from a
+# divergence; `verdict` names the state directly and `compared_log_messages`
+# records whether any comparison happened at all.
+#
+# Emits `null` when no verdict exists -- a mode that never verifies, or a run
+# that died before writing one. That absence is itself the signal, and it is
+# only meaningful because the populated case is now distinguishable from it.
+function parity_verdict_fields {
+    local cell_dir=$1
+    local verdict
+    verdict=$(ls -1 "$cell_dir"/verify-*.json 2>/dev/null | sort | tail -1)
+    if [[ -z $verdict || ! -f $verdict ]]; then
+        printf 'null\n'
+        return 0
+    fi
+    jq -c '{
+        verdict: .verdict,
+        bitwise_parity: .bitwise_parity,
+        compared_log_messages: .compared_log_messages
+    }' "$verdict" 2>/dev/null || printf 'null\n'
+}
+
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
     local error_kind=${10}
     local diversity=${11:-null}
+    local parity=${12:-null}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -2814,6 +2850,11 @@ function append_result {
     if [[ $lane == portable && $mode != naked ]]; then
         relaxations='["no-virtualize-cpuid","max-timeslice=disabled"]'
     fi
+    # The three parity fields below use an explicit null-check, NOT jq alternative
+    # operator //. That operator treats false as empty, so bitwise_parity=false --
+    # a real refusal or a real divergence -- would emit as null and become
+    # indistinguishable from "no verdict exists". That confusion is the precise
+    # defect these fields are being added to end, and // would reintroduce it.
     jq -cn \
         --arg run_id "$RUN_ID" \
         --arg hermit_sha "$SOURCE_TREE_SHA" \
@@ -2836,6 +2877,7 @@ function append_result {
         --argjson relaxations "$relaxations" \
         --argjson path_evidence "$path_evidence" \
         --argjson diversity "$diversity" \
+        --argjson parity "$parity" \
         '{schema:3,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
@@ -2847,6 +2889,9 @@ function append_result {
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
           diversity:$diversity,
+          verdict:(if $parity == null then null else $parity.verdict end),
+          bitwise_parity:(if $parity == null then null else $parity.bitwise_parity end),
+          compared_log_messages:(if $parity == null then null else $parity.compared_log_messages end),
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -3143,7 +3188,7 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity" "$(parity_verdict_fields "$cell_dir")"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
