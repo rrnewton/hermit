@@ -18,6 +18,12 @@ BACKENDS_PATH = "ci/compat/scorecard-backends.json"
 RECEIPT_PATH = "ci/compat/commit-scorecard-receipt.json"
 E2E_PLAN_PATH = "ci/expected-e2e-plan.json"
 BACKEND_ORDER = ["ptrace", "kvm", "liteinst", "e9patch", "sabre", "dbt"]
+DISPLAY_ORDER = [*BACKEND_ORDER, "native"]
+MANIFEST_INPUTS = [
+    "ci/manifest-plan",
+    "ci/matrix-symmetry-baseline.json",
+    "tests/e2e/manifests",
+]
 FINAL_ATTRIBUTION = re.compile(r"^\[[^\]]+\] \[[^\]]+, devbig[0-9]+\]$")
 
 
@@ -62,6 +68,8 @@ class Scorecard:
     checks: int
     drop_reason: str
     backend_green: dict[str, int] | None = None
+    backend_declared: dict[str, int] | None = None
+    backend_ci: dict[str, int] | None = None
     plan_digest: str | None = None
     format_version: int = 1
 
@@ -82,12 +90,24 @@ def parse_object(raw: bytes | str, path: str) -> dict:
     return value
 
 
+def parse_array(raw: bytes | str, path: str) -> list:
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Refusal(f"{path} is not valid JSON: {error}") from error
+    if not isinstance(value, list):
+        raise Refusal(f"{path} must contain a JSON array")
+    return value
+
+
 def validate_receipt_row(
     row: dict,
     digest: str,
     drop_reason: str,
     *,
     backend_green: dict[str, int] | None = None,
+    backend_declared: dict[str, int] | None = None,
+    backend_ci: dict[str, int] | None = None,
     plan_digest: str | None = None,
     format_version: int = 1,
 ) -> Scorecard:
@@ -144,6 +164,8 @@ def validate_receipt_row(
         checks=checks,
         drop_reason=drop_reason.strip(),
         backend_green=backend_green,
+        backend_declared=backend_declared,
+        backend_ci=backend_ci,
         plan_digest=plan_digest,
         format_version=format_version,
     )
@@ -190,14 +212,63 @@ def parse_e2e_plan(raw: bytes | str, row: dict) -> dict[str, int]:
     return counts
 
 
+def parse_manifest_inventory(raw: bytes | str) -> tuple[dict[str, int], dict[str, int]]:
+    cells = parse_array(raw, "manifest inventory")
+    if not cells:
+        raise Refusal("manifest inventory must contain at least one declared cell")
+    declared: dict[str, int] = {}
+    ci: dict[str, int] = {}
+    identities: set[str] = set()
+    for index, cell in enumerate(cells):
+        if not isinstance(cell, dict):
+            raise Refusal(f"manifest inventory cell {index} must be an object")
+        backend = cell.get("backend")
+        if not isinstance(backend, str) or not backend:
+            raise Refusal(f"manifest inventory cell {index} has no backend")
+        if not isinstance(cell.get("ci"), bool):
+            raise Refusal(f"manifest inventory cell {index} has no boolean ci field")
+        identity = json.dumps(cell, sort_keys=True, separators=(",", ":"))
+        if identity in identities:
+            raise Refusal(f"manifest inventory contains a duplicate cell at index {index}")
+        identities.add(identity)
+        declared[backend] = declared.get(backend, 0) + 1
+        if cell["ci"]:
+            ci[backend] = ci.get(backend, 0) + 1
+        else:
+            ci.setdefault(backend, 0)
+    return declared, ci
+
+
+def read_manifest_inventory(commit: str) -> str:
+    head = git("rev-parse", "HEAD").strip()
+    changed = git("diff", "--name-only", commit, head, "--", *MANIFEST_INPUTS).splitlines()
+    dirty = git("status", "--porcelain=v1", "--", *MANIFEST_INPUTS).splitlines()
+    if changed or dirty:
+        raise Refusal(
+            "cannot bind manifest inventory to receipt commit: manifest inputs differ "
+            f"(committed={changed}, dirty={dirty})"
+        )
+    proc = subprocess.run(
+        ["cargo", "run", "--quiet", "-p", "hermit-manifest-plan", "--", "--format", "json"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise Refusal(f"manifest inventory command failed: {proc.stderr.strip()}")
+    canonical = proc.stdout.strip()
+    parse_manifest_inventory(canonical)
+    return canonical
+
+
 def load_scorecard(source: Source) -> Scorecard:
     backends = parse_object(source.read(BACKENDS_PATH), BACKENDS_PATH).get("backends")
     if backends != BACKEND_ORDER:
         raise Refusal(f"{BACKENDS_PATH} must preserve the owner-specified backend order")
     wrapper = parse_object(source.read(RECEIPT_PATH), RECEIPT_PATH)
     schema = wrapper.get("schema")
-    if schema not in {1, 2, 3}:
-        raise Refusal(f"{RECEIPT_PATH} schema must be 1, 2, or 3")
+    if schema not in {1, 2, 3, 4}:
+        raise Refusal(f"{RECEIPT_PATH} schema must be 1, 2, 3, or 4")
     canonical = wrapper.get("canonical_receipt")
     digest = wrapper.get("receipt_sha256")
     drop_reason = wrapper.get("drop_reason", "")
@@ -228,11 +299,32 @@ def load_scorecard(source: Source) -> Scorecard:
     if commit_plan != canonical_plan:
         raise Refusal("stored E2E plan does not equal the plan at the receipt commit")
     backend_green = parse_e2e_plan(canonical_plan, row)
+    backend_declared = None
+    backend_ci = None
+    if schema >= 4:
+        canonical_inventory = wrapper.get("canonical_manifest_inventory")
+        inventory_digest = wrapper.get("manifest_inventory_sha256")
+        if not isinstance(canonical_inventory, str) or not canonical_inventory:
+            raise Refusal(f"{RECEIPT_PATH} canonical_manifest_inventory must be non-empty")
+        if not isinstance(inventory_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", inventory_digest
+        ):
+            raise Refusal(f"{RECEIPT_PATH} manifest_inventory_sha256 must be a lowercase SHA-256")
+        if hashlib.sha256(canonical_inventory.encode()).hexdigest() != inventory_digest:
+            raise Refusal(f"{RECEIPT_PATH} manifest inventory digest mismatch")
+        backend_declared, backend_ci = parse_manifest_inventory(canonical_inventory)
+        for backend, selected in backend_green.items():
+            if selected > backend_ci.get(backend, 0):
+                raise Refusal(
+                    f"selected {backend} cells exceed the manifest's declared CI cells"
+                )
     return validate_receipt_row(
         row,
         digest,
         drop_reason,
         backend_green=backend_green,
+        backend_declared=backend_declared,
+        backend_ci=backend_ci,
         plan_digest=plan_digest,
         format_version=schema,
     )
@@ -272,7 +364,7 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
         for backend in BACKEND_ORDER:
             green = current.backend_green[backend]
             lines.append(f"| {backend} | {current.digest} | {green} | 0 | 0 | 0 | {green} |")
-    else:
+    elif current.format_version == 3:
         lines.extend(
             [
                 "| backend | receipt sha | measurement | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
@@ -289,16 +381,54 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
                 lines.append(
                     f"| {backend} | {current.digest} | MEASURED | {green} | 0 | 0 | 0 | {green} |"
                 )
+    else:
+        if current.backend_declared is None or current.backend_ci is None:
+            raise Refusal("schema-4 scorecard is missing manifest declaration counts")
+        lines.extend(
+            [
+                "| backend | receipt sha | selection | declared cells | declared CI cells | "
+                "GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | selected cells |",
+                "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        actual_backends = set(current.backend_declared)
+        for backend in DISPLAY_ORDER:
+            if backend not in actual_backends:
+                lines.append(
+                    f"| {backend} | {current.digest} | NOT A BACKEND | — | — | — | — | — | — | — |"
+                )
+                continue
+            declared = current.backend_declared[backend]
+            declared_ci = current.backend_ci.get(backend, 0)
+            selected = current.backend_green.get(backend, 0)
+            if selected == 0:
+                lines.append(
+                    f"| {backend} | {current.digest} | DECLARED BUT NOT SELECTED | "
+                    f"{declared} | {declared_ci} | — | — | — | — | 0 |"
+                )
+            else:
+                lines.append(
+                    f"| {backend} | {current.digest} | SELECTED | {declared} | "
+                    f"{declared_ci} | {selected} | 0 | 0 | 0 | {selected} |"
+                )
     if current.backend_green is None or current.format_version == 2:
         lines.append(
             f"| TOTAL | {current.digest} | {current.green} | {current.stable_fail} | "
             f"{current.unstable} | {current.no_verdict} | {current.cells} |"
         )
-    else:
+    elif current.format_version == 3:
         lines.append(
             f"| TOTAL | {current.digest} | MEASURED | {current.green} | "
             f"{current.stable_fail} | {current.unstable} | {current.no_verdict} | "
             f"{current.cells} |"
+        )
+    else:
+        assert current.backend_declared is not None and current.backend_ci is not None
+        lines.append(
+            f"| TOTAL | {current.digest} | SELECTED | "
+            f"{sum(current.backend_declared.values())} | {sum(current.backend_ci.values())} | "
+            f"{current.green} | {current.stable_fail} | {current.unstable} | "
+            f"{current.no_verdict} | {current.cells} |"
         )
     lines.append(
         f"Receipt: commit {current.commit}; record {current.record_id}; checks {current.checks}."
@@ -312,7 +442,7 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
             f"E2E plan: {current.plan_digest}; backend rows and TOTAL are derived from "
             "the plan at the receipt commit."
         )
-    else:
+    elif current.format_version == 3:
         unmeasured = [
             backend for backend in BACKEND_ORDER if current.backend_green[backend] == 0
         ]
@@ -324,6 +454,24 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
         lines.append(
             f"Backend measurement: {measured}/{len(BACKEND_ORDER)} measured; "
             f"unmeasured: {', '.join(unmeasured) if unmeasured else 'none'}."
+        )
+    else:
+        assert current.backend_declared is not None
+        actual_backends = set(current.backend_declared)
+        declared_not_selected = [
+            backend
+            for backend in DISPLAY_ORDER
+            if backend in actual_backends and current.backend_green.get(backend, 0) == 0
+        ]
+        not_backends = [backend for backend in BACKEND_ORDER if backend not in actual_backends]
+        lines.append(
+            f"E2E plan: {current.plan_digest}; GREEN and selected-cell TOTAL are "
+            "derived from the plan at the receipt commit."
+        )
+        lines.append(
+            "Declared but not selected: "
+            f"{', '.join(declared_not_selected) if declared_not_selected else 'none'}; "
+            f"not a backend: {', '.join(not_backends) if not_backends else 'none'}."
         )
     lines.append(
         f"Matrix change: {matrix_change}; GREEN change: {green_change}. "
@@ -413,22 +561,32 @@ def import_receipt(output: Path, drop_reason: str) -> None:
     canonical_plan = Source(commit).read(E2E_PLAN_PATH).decode()
     plan_digest = hashlib.sha256(canonical_plan.encode()).hexdigest()
     backend_green = parse_e2e_plan(canonical_plan, row)
+    canonical_inventory = read_manifest_inventory(commit)
+    inventory_digest = hashlib.sha256(canonical_inventory.encode()).hexdigest()
+    backend_declared, backend_ci = parse_manifest_inventory(canonical_inventory)
+    for backend, selected in backend_green.items():
+        if selected > backend_ci.get(backend, 0):
+            raise Refusal(f"selected {backend} cells exceed the manifest's declared CI cells")
     validate_receipt_row(
         row,
         digest,
         drop_reason,
         backend_green=backend_green,
+        backend_declared=backend_declared,
+        backend_ci=backend_ci,
         plan_digest=plan_digest,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(
             {
-                "schema": 3,
+                "schema": 4,
                 "receipt_sha256": digest,
                 "canonical_receipt": canonical,
                 "e2e_plan_sha256": plan_digest,
                 "canonical_e2e_plan": canonical_plan,
+                "manifest_inventory_sha256": inventory_digest,
+                "canonical_manifest_inventory": canonical_inventory,
                 "drop_reason": drop_reason,
             },
             indent=2,
