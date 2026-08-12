@@ -1356,24 +1356,36 @@ EOF
         die "merge-gate must run the canonical live-query checker on the exact PR head"
 
     local updating_guide="$ROOT_DIR/docs/updating-reverie.md"
-    # These are exact full lines of docs/updating-reverie.md. #2159 rewrote that
-    # guide from flat prose into a numbered list on 2026-08-11, so the previous
-    # flat-prose strings no longer match any line. The four contract POINTS are
-    # unchanged -- linear-main-history pointer, ancestor, monotonic
-    # forward-or-unchanged, and conflict-resolves-to-the-newer-pin -- only the
-    # sentences carrying them moved. The "may lag" clause stays enforced by the
-    # two negative assertions below, which still refuse a guide that restores
-    # tip-equality or rejects a lagging main-history pointer.
+    # Assert the SEMANTIC contract, not the presence of text.
+    #
+    # A full-line match cannot see meaning. #2159 rewrote this guide into a
+    # numbered list, so each rule now WRAPS across lines: the monotonic rule's
+    # "or remain unchanged" sits on the line after "may only advance forward".
+    # A per-line assertion therefore still passed when that continuation was
+    # changed to "or move backward" -- the exact condition monotonicity forbids.
+    # Flatten the guide first so each rule is asserted as one whole clause.
+    local guide_flat
+    guide_flat="$(tr '\n' ' ' <"$updating_guide" | tr -s ' ')"
     local -a guide_contract=(
-        "testing it is a pointer into Reverie's **linear main history**, judged by"
-        '1. **Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.'
-        '2. **Monotonic** — relative to the landing-base pin it may only advance forward'
-        '3. **A conflict resolves to the newer pin** — and this is enforced *by* rule 2'
+        "a pointer into Reverie's **linear main history**"
+        '**Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.'
+        '**Monotonic** — relative to the landing-base pin it may only advance forward or remain unchanged.'
+        '**A conflict resolves to the newer pin** — and this is enforced *by* rule 2'
     )
     local contract_line
     for contract_line in "${guide_contract[@]}"; do
-        [[ $(grep -Fxc "$contract_line" "$updating_guide") == 1 ]] ||
-            die "Reverie pin guide must carry exactly one full-line contract: $contract_line"
+        [[ $(grep -Fo "$contract_line" <<<"$guide_flat" | wc -l) == 1 ]] ||
+            die "Reverie pin guide must carry exactly one intact contract clause: $contract_line"
+    done
+    # Bracket the monotonic clause from the other side: no phrasing may permit a
+    # pin to move off-history, backward, or sideways. Asserting the forward-only
+    # clause above proves the right words are present; these prove the wrong ones
+    # are absent, which a presence check alone can never establish.
+    local forbidden
+    for forbidden in 'or move backward' 'may move backward' 'or move sideways' \
+                     'may regress' 'backward or remain' 'advance or regress'; do
+        ! grep -Fqi "$forbidden" <<<"$guide_flat" ||
+            die "Reverie pin guide must not permit a backward or sideways pin: $forbidden"
     done
     ! grep -Fqx 'testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.' "$updating_guide" ||
         die "Reverie pin guide must not restore live-tip equality"
