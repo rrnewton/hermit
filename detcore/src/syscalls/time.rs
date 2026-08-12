@@ -345,6 +345,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_value(addr)
             .expect("should be able to read from memory");
 
+        // Linux validates the requested interval before sleeping:
+        // nanosleep(2) and clock_nanosleep(2) both fail EINVAL when tv_nsec is
+        // outside [0, 999999999] or tv_sec is negative.
+        //
+        // Detcore previously fed the signed fields through `as u64`, so
+        // `tv_sec = -1` wrapped to u64::MAX and became an effectively
+        // indefinite sleep. A past absolute deadline is not an error and must
+        // still return 0, so reject only malformed fields here.
+        if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec > 999_999_999 {
+            return Err(Errno::EINVAL.into());
+        }
+
         match call.flags() {
             0 => {
                 if self.cfg.sequentialize_threads {
@@ -406,7 +418,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         target_time: LogicalTime,
     ) -> Timespec {
         let base_time = thread_observe_time(guest).await;
-        let relative_logical = target_time - base_time;
+
+        // An absolute deadline already in the past is not an error on Linux:
+        // clock_nanosleep(TIMER_ABSTIME) returns 0 without sleeping. Clamp at
+        // this call site because LogicalTime subtraction itself is unchecked;
+        // changing the shared operator could hide unrelated underflows.
+        let relative_logical = if target_time <= base_time {
+            LogicalTime::from_nanos(0)
+        } else {
+            target_time - base_time
+        };
 
         Timespec {
             tv_sec: relative_logical.as_secs() as i64,

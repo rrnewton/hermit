@@ -397,3 +397,54 @@ fn rdtsc_deltas() {
         true,
     );
 }
+
+/// A malformed `timespec` must fail EINVAL, not become an indefinite sleep.
+///
+/// Detcore fed `Timespec`'s signed fields through `as u64`, so `tv_sec = -1`
+/// wrapped to `u64::MAX` and produced an effectively indefinite sleep. Both
+/// directions matter: rejecting malformed fields must not also reject a valid
+/// zero interval or an absolute deadline already in the past.
+///
+/// `nanosleep(2)` and `clock_nanosleep(2)` share `handle_nanosleep_family`, so
+/// these `clock_nanosleep` calls exercise their common validation path.
+#[test]
+fn nanosleep_rejects_malformed_timespec_but_not_a_past_deadline() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // `clock_nanosleep` returns the error directly rather than via errno.
+            let sleep = |sec: i64, nsec: i64, flags: libc::c_int| -> libc::c_int {
+                let ts = libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: nsec,
+                };
+                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, flags, &ts, ptr::null_mut()) }
+            };
+
+            assert_eq!(sleep(-1, 0, 0), libc::EINVAL, "relative tv_sec=-1");
+            assert_eq!(sleep(0, -1, 0), libc::EINVAL, "relative tv_nsec=-1");
+            assert_eq!(
+                sleep(0, 1_000_000_000, 0),
+                libc::EINVAL,
+                "relative tv_nsec out of range"
+            );
+            assert_eq!(
+                sleep(-1, 0, libc::TIMER_ABSTIME),
+                libc::EINVAL,
+                "absolute tv_sec=-1"
+            );
+
+            assert_eq!(sleep(0, 0, 0), 0, "zero relative interval");
+            assert_eq!(
+                sleep(1, 0, libc::TIMER_ABSTIME),
+                0,
+                "past absolute deadline"
+            );
+        },
+        config,
+        true,
+    );
+}

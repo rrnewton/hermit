@@ -309,6 +309,88 @@ fn replay_reissues_every_flock_against_the_kernel() {
     }
 }
 
+/// A contended blocking conversion is two physical nonblocking operations:
+/// the substituted `LOCK_EX|LOCK_NB` probe and, after `EWOULDBLOCK`, one
+/// `LOCK_SH|LOCK_NB` restore. Record and replay must agree on both operations
+/// while exposing only the deterministic `ENOLCK` refusal to the guest.
+///
+/// This is deliberately separate from the ordinary-run upgrade test above.
+/// A record/replay implementation can pass that test yet consume only the
+/// probe's event, inject the guest's original blocking request, omit or double
+/// consume the restore event, or return the recorded probe errno. Any of those
+/// mistakes either wedges replay, desynchronizes its event stream, or changes
+/// the guest-visible errno. The debug-log count binds the internal restore:
+/// this scenario has one more kernel `flock` injection than guest `flock`
+/// requests, on both record and replay.
+#[test]
+fn replay_preserves_contended_blocking_upgrade_event_shape_and_errno() {
+    let _guard = record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=debug", "record", "start", "--record-timeout=120"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--"])
+        .arg(guest())
+        .arg("upgrade");
+    let recorded = finish(record.output().expect("failed to start hermit record"));
+    assert!(
+        recorded.status.success(),
+        "recording the contended flock upgrade failed or wedged\n{}",
+        recorded.combined()
+    );
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=debug", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(replay.output().expect("failed to start hermit replay"));
+    assert!(
+        replayed.status.success(),
+        "replaying the contended flock upgrade failed, wedged, or desynchronized\n{}",
+        replayed.combined()
+    );
+
+    for (phase, run) in [("record", &recorded), ("replay", &replayed)] {
+        for marker in [
+            "flock-upgrade-parent-holds-shared",
+            "flock-upgrade-child-holds-shared",
+            "flock-upgrade-refused errno=37",
+            "flock-upgrade-preserved-shared-lock",
+            "flock-upgrade-ok",
+        ] {
+            assert!(
+                run.stdout.contains(marker),
+                "{phase} missed {marker}; the guest-visible refusal or restored lock changed\n{}",
+                run.combined()
+            );
+        }
+
+        let requested = run.stderr.matches("inbound syscall: flock").count();
+        let injected = run
+            .stderr
+            .matches("beginning inject of syscall: flock")
+            .count();
+        assert!(
+            requested > 0,
+            "{phase} observed no guest flock requests; the event-shape bracket is inert\n{}",
+            run.combined()
+        );
+        assert_eq!(
+            injected,
+            requested + 1,
+            "{phase} must inject every guest flock request plus exactly one internal restore; \
+             requested={requested}, injected={injected}\n{}",
+            run.combined()
+        );
+    }
+}
+
 /// A recording made before flock forwarding must be refused, not replayed.
 ///
 /// Under the old handler `flock` returned `Ok(0)` before ever reaching
