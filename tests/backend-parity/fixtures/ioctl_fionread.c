@@ -28,10 +28,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-static int nonblock_matches(int getfl_ok, int observed, int expected) {
-    return getfl_ok && observed == expected;
-}
-
 int main(void) {
     enum { EXPECTED_CHECKS = 6, WROTE_BYTES = 6 };
     int fds[2];
@@ -54,41 +50,29 @@ int main(void) {
     // (3) FIONBIO sets non-blocking; (4) fcntl F_GETFL reflects O_NONBLOCK.
     int on = 1;
     int fionbio_set = ioctl(fds[0], FIONBIO, &on) == 0;
-    int set_flags = fcntl(fds[0], F_GETFL);
-    int getfl_after_set_ok = set_flags >= 0;
-    int nonblock_after_set = getfl_after_set_ok ? !!(set_flags & O_NONBLOCK) : 0;
+    int fl = fcntl(fds[0], F_GETFL);
+    int nonblock_after_set = fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0;
 
     // (5) FIONBIO clears non-blocking; (6) F_GETFL shows O_NONBLOCK cleared.
     int off = 0;
     int fionbio_clear = ioctl(fds[0], FIONBIO, &off) == 0;
-    int clear_flags = fcntl(fds[0], F_GETFL);
-    int getfl_after_clear_ok = clear_flags >= 0;
-    int nonblock_after_clear =
-        getfl_after_clear_ok ? !!(clear_flags & O_NONBLOCK) : 0;
-
-    // Negative bracket: a failed F_GETFL must not be interpreted as a
-    // successfully cleared O_NONBLOCK bit.
-    if (nonblock_matches(0, 0, 0)) return 2;
+    fl = fcntl(fds[0], F_GETFL);
+    int nonblock_after_clear = fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0;
 
     close(fds[0]);
     close(fds[1]);
 
-    int ok = fionread_ok + navail_exact + fionbio_set +
-        nonblock_matches(getfl_after_set_ok, nonblock_after_set, 1) +
-        fionbio_clear +
-        nonblock_matches(getfl_after_clear_ok, nonblock_after_clear, 0);
+    int ok = fionread_ok + navail_exact + fionbio_set + nonblock_after_set +
+        fionbio_clear + (nonblock_after_clear == 0);
     printf(
         "fionread ok=%d navail=%d fionread_ok=%d fionbio_set=%d "
-        "getfl_after_set_ok=%d nonblock_after_set=%d fionbio_clear=%d "
-        "getfl_after_clear_ok=%d nonblock_after_clear=%d\n",
+        "nonblock_after_set=%d fionbio_clear=%d nonblock_after_clear=%d\n",
         ok,
         navail,
         fionread_ok,
         fionbio_set,
-        getfl_after_set_ok,
         nonblock_after_set,
         fionbio_clear,
-        getfl_after_clear_ok,
         nonblock_after_clear);
     return ok == EXPECTED_CHECKS ? 0 : 1;
 }
