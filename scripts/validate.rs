@@ -1321,6 +1321,8 @@ fn super_plan_bracket() -> Result<(), String> {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -3021,6 +3023,8 @@ fn step_with_caps(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
