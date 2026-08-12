@@ -22,6 +22,21 @@
 //! with `bitwise_parity: true`), which is strictly stronger than the E2E
 //! harness's `verify` mode: that mode runs plain `--verify` and therefore only
 //! establishes the stripped comparison.
+//!
+//! # Why the guest's own `EOWNERDEAD` is not enough
+//!
+//! `PASS: robust mutex waiter received EOWNERDEAD` does not discriminate this
+//! change on its own. The guest's robust list stays registered with the host
+//! kernel, so when the dying thread's `exit` finally reaches Linux, Linux runs
+//! its own `exit_robust_list()` and writes `FUTEX_OWNER_DIED` into the word
+//! too. A build in which Detcore only issued the wake, and left the word to the
+//! kernel, still prints that line — measured, not assumed.
+//!
+//! The assertions below therefore also require Detcore's own log records: that
+//! Detcore performed the word transition to
+//! `FUTEX_WAITERS | FUTEX_OWNER_DIED` itself, and that its wake reached exactly
+//! one modeled waiter. Those are the two things the host kernel cannot supply
+//! on Detcore's behalf, and they are what fails when the walk regresses.
 
 use std::fs;
 use std::fs::File;
@@ -183,4 +198,70 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
             "verification report lacks {expected}\nreport:\n{report}\nstderr:\n{stderr}"
         );
     }
+}
+
+/// Detcore must be the thing that performs the owner-death protocol, not a
+/// passenger on the host kernel's own `exit_robust_list()`.
+///
+/// `--verify` sends each of its two runs' logs to its own temporary file and
+/// prints only the comparison to stderr, so this evidence needs its own plain
+/// strict run. The transition record is at DEBUG because it carries a raw
+/// guest address and INFO is the surface `--verify-strict` compares, so this
+/// run raises the log level rather than the record's level. It is also the L1
+/// leg of the same behavior; the L2 leg is asserted above.
+#[test]
+fn detcore_itself_marks_the_word_and_wakes_the_modeled_waiter() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-detcore-evidence");
+    let guest = build_guest(&build_root);
+
+    let mut run = Command::new("timeout");
+    run.args(["--kill-after", "5s", "120s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=debug",
+            "run",
+            "--backend=ptrace",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest);
+    let captured = run_captured(
+        run,
+        "robust-futex owner-death instrumented run",
+        &build_root.join("run.out"),
+        &build_root.join("run.err"),
+        true,
+    );
+    let stdout = captured.stdout;
+    let stderr = captured.stderr;
+
+    assert!(
+        stdout.contains("PASS: robust mutex waiter received EOWNERDEAD"),
+        "the waiter did not observe EOWNERDEAD under Hermit\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    // Detcore applied the transition itself. `-> 0xc0000000` is
+    // `FUTEX_WAITERS | FUTEX_OWNER_DIED`: the waiter bit has to survive the
+    // store, because dropping it is how a parked waiter gets stranded. This is
+    // the assertion the guest's own `EOWNERDEAD` line cannot make, since the
+    // host kernel writes that bit as well when the `exit` finally lands.
+    let marked = stderr
+        .lines()
+        .find(|line| line.contains("robust-list owner death: futex word"))
+        .unwrap_or_else(|| {
+            panic!("Detcore did not record applying the owner-death transition\nstderr:\n{stderr}")
+        });
+    assert!(
+        marked.trim_end().ends_with("-> 0xc0000000"),
+        "the futex word must become FUTEX_WAITERS|FUTEX_OWNER_DIED, got: {marked}"
+    );
+
+    // And Detcore's wake reached the modeled waiter. A count of 0 is the
+    // pre-fix state exactly: a wake is issued, but not into the pool where the
+    // precise futex model actually parked the waiter.
+    assert!(
+        stderr.contains("robust-list owner death woke 1 waiter(s)"),
+        "Detcore's owner-death wake did not reach exactly one modeled waiter\nstderr:\n{stderr}"
+    );
 }
