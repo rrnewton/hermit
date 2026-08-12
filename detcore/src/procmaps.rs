@@ -91,7 +91,19 @@ where
     let size = end.saturating_sub(start) as usize;
     let memory = guest.memory();
     let mut buf = vec![0; size];
+    let start_addr = start;
     let start = Addr::<u8>::from_raw(start as usize).unwrap();
     memory.read_values(start, buf.as_mut_slice())?;
+    // TEMPORARY DIAGNOSTIC -- do not commit. Dumps the exact bytes that feed
+    // the hash so two runs can be byte-diffed (task dbi_detlog_stack_hashes).
+    if let Ok(dir) = std::env::var("HERMIT_DEBUG_DUMP_MEM") {
+        use std::io::Write;
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = format!("{}/dump-{:03}-{:#x}.bin", dir, n, start_addr);
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let _ = f.write_all(buf.as_slice());
+        }
+    }
     Ok(Digest::new(buf.as_slice()))
 }
