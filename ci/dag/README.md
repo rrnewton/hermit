@@ -198,6 +198,50 @@ partial, and nothing in the output said so.
   precautionary.** When `--all-features` was added to `doc.rustdoc` it changed
   nothing measurable — 13 crates and 920 pages either way. Recording that stopped
   it being read as a fix for a gap that was not there.
+### Declaring a machine facility a node cannot run without
+
+A node may add one optional field:
+
+```json
+"requires_host_capability": "cpuid-faulting"
+```
+
+It means: this node can only observe what it exists to observe on a machine that
+has that facility. When the facility is present, the node runs exactly as it
+always did and every assertion inside it keeps full force. When it is provably
+absent, `scripts/validate.rs` withholds the node before anything spawns and
+records a **third outcome, host-inapplicable** — neither a pass nor a failure.
+
+Before this existed, `privileged-cpuid.faulting` failed in 0.11 s with exit 101
+and an empty detail block on a machine without CPUID faulting, which reads like a
+broken build, and its eager-exit aborted twelve other in-flight nodes and
+filtered twenty-seven more (hermit#2135, hermit#2148, hermit#2205).
+
+This is **not** a way to get a node out of the way. Every one of these holds:
+
+- The judgement never reads the node. It comes from an out-of-band probe of the
+  machine during plan construction, so a node's exit code, stderr or panic
+  message can never produce it. A node that is merely broken has no declaration,
+  so it runs, fails, and is refused exactly as before.
+- The capability vocabulary is closed in
+  `scripts/lib/validate_plan.rs::HostCapability`. A name that is not in that enum
+  refuses the whole run rather than omitting anything.
+- The probe fails closed toward running: absence requires two independent
+  sources to agree (for `cpuid-faulting`: `arch_prctl(ARCH_SET_CPUID, 0)`
+  returning `ENODEV` **and** `/proc/cpuinfo` not advertising `cpuid_fault`). A
+  probe error, a different errno, an unreadable `/proc/cpuinfo`, or the two
+  sources disagreeing all mean PRESENT.
+- `HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT` can only force a capability
+  *present*. There is no override in the other direction.
+- Withholding a node that a retained node depends on is a refusal, not a
+  cascade.
+- The omission is written to the ledger as a typed intentional skip with reason
+  `host-inapplicable`, is never added to `gates`, and is added back into
+  `gates_expected`. The parent's separately-reviewed consumer allowlist
+  (`ci-hub/validate/gate_completeness.py`, `ci-hub/lib/qualifying_receipt.rs`)
+  admits only `empty-manifest-bucket`, so a run carrying a host-inapplicable node
+  is **not** a qualifying receipt. Recording it honestly is what costs the
+  receipt; the mechanism cannot buy one.
 
 ## Resource model (outer + inner limits)
 

@@ -367,7 +367,13 @@ fn usage() -> &'static str {
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
      VALIDATE_IGNORE_CACHE, VALIDATE_VERBOSITY, VALIDATE_VERBOSE, VALIDATE_FORCE_FULL,\n\
      HERMIT_VALIDATE_LEDGER, PR_NUMBER, SUPER_REPETITIONS, L4_REPS, ENVELOPE_JSON,\n\
-     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT."
+     HERMIT_LAST_GREEN_SHA, CI_HUB_APPLY_LOCAL_LABEL, DEV_HERMIT_PARENT.\n\
+     \n\
+     HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT=<name>[,<name>] asserts that this\n\
+     machine HAS a declared host capability, so its nodes run without probing.\n\
+     It is deliberately one-directional: it can only cause MORE nodes to run.\n\
+     Nothing can force a capability ABSENT, because that would be a way to make\n\
+     a node stop running without anyone measuring the machine."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -1491,6 +1497,7 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
@@ -3384,6 +3391,12 @@ struct Plan {
     /// Forced on for the envelope profile, whose whole point is to measure every
     /// probe: an eager exit on the first probe failure would truncate the vector.
     force_keep_going: bool,
+    /// Nodes withheld because this MACHINE provably cannot run them. Neither a
+    /// pass nor a failure: each is reported by name and written to the ledger as
+    /// a typed intentional skip whose reason is `host-inapplicable`, which the
+    /// parent's separately-reviewed consumer allowlist does not admit, so a run
+    /// carrying one does not qualify as landing authority.
+    host_inapplicable: Vec<validate_plan::HostInapplicableNode>,
     /// May a prior passing record for this tree be reused instead of running?
     ///
     /// The tree-keyed cache is only sound when the run is a pure function of the
@@ -3421,10 +3434,82 @@ impl Default for Plan {
             envelope: None,
             nonblocking: BTreeSet::new(),
             force_keep_going: false,
+            host_inapplicable: Vec::new(),
             cacheable: true,
             cell_evidence_expected: None,
         }
     }
+}
+
+/// Withhold every planned node this MACHINE provably cannot run, and say so.
+///
+/// Applied AFTER the plan is fully assembled — lane fusion, dedup and scorecard
+/// attachment have already happened — so it matches the exact tags the runner
+/// will see. Withholding is the only effect: nothing here can turn a node's
+/// FAILURE into anything else, because a node that is not withheld runs and is
+/// judged exactly as before.
+///
+/// An unknown capability name, or a retained node depending on a withheld one,
+/// is an error that REFUSES the run. Substituting a different node set under the
+/// requested profile name would be worse than refusing.
+fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String> {
+    let requirements = validate_plan::host_capability_requirements(root)?;
+    if requirements.is_empty() {
+        return Ok(());
+    }
+    // Probe only what this plan actually needs, once per capability.
+    let mut needed: BTreeSet<validate_plan::HostCapability> = BTreeSet::new();
+    for cfg in std::iter::once(&plan.cfg).chain(plan.second.iter()) {
+        for step in &cfg.steps {
+            if let Some(capability) = requirements.get(&step.tag()) {
+                needed.insert(*capability);
+            }
+        }
+    }
+    let mut absent: BTreeMap<validate_plan::HostCapability, String> = BTreeMap::new();
+    for capability in needed {
+        let verdict = validate_plan::probe_host_capability(capability);
+        // Print PRESENT verdicts too: a reader must be able to see that the
+        // question was asked and how it was answered, not just its consequences.
+        println!(
+            "Host capability {}: {} — {}",
+            verdict.capability.value(),
+            if verdict.present { "PRESENT" } else { "ABSENT" },
+            verdict.evidence
+        );
+        if !verdict.present {
+            absent.insert(capability, verdict.evidence);
+        }
+    }
+    if absent.is_empty() {
+        return Ok(());
+    }
+    let mut withheld = Vec::new();
+    let mut apply = |cfg: &mut DagConfig| -> Result<(), String> {
+        let steps = std::mem::take(&mut cfg.steps);
+        let (keep, gone) =
+            validate_plan::partition_host_inapplicable(steps, &requirements, &absent)?;
+        cfg.steps = keep;
+        withheld.extend(gone);
+        Ok(())
+    };
+    apply(&mut plan.cfg)?;
+    if let Some(second) = plan.second.as_mut() {
+        apply(second)?;
+    }
+    for node in &withheld {
+        println!(
+            "HOST-INAPPLICABLE: {} will NOT RUN — this machine lacks {} ({}). This is NOT a pass \
+             and carries NO coverage for what that node verifies; it is recorded in the ledger as \
+             an intentional skip with reason '{}'.",
+            node.tag,
+            node.capability.value(),
+            node.evidence,
+            validate_plan::HOST_INAPPLICABLE_REASON
+        );
+    }
+    plan.host_inapplicable = withheld;
+    Ok(())
 }
 
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
@@ -4732,7 +4817,11 @@ fn completed_exit_code(
 }
 
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
-fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
+fn print_cost_table(
+    outcomes: &[StepOutcome],
+    skipped: &[String],
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+) {
     println!("\n=== per-node cost (dagrun) ===");
     println!("{:<44} {:>9}  {:<8} reason/returncode", "node", "seconds", "status");
     println!("{}", "-".repeat(84));
@@ -4765,6 +4854,19 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     println!("{:<44} {:>9.2}  (sum of node wall)", "TOTAL", total);
     if !skipped.is_empty() {
         println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
+    }
+    // Listed AFTER the TOTAL and outside the ok/FAIL/ABORTED column on purpose:
+    // a host-inapplicable node has no status in that vocabulary. It did not
+    // pass, and printing it in a table of statuses is how it would come to look
+    // like one.
+    for node in host_inapplicable {
+        println!(
+            "\nhost-inapplicable (NOT RUN, NOT a pass, no coverage): {} — this machine lacks {} \
+             ({})",
+            node.tag,
+            node.capability.value(),
+            node.evidence
+        );
     }
 }
 
@@ -4980,6 +5082,153 @@ fn possible_missing_artifact_nodes<'a>(
         })
         .map(|outcome| outcome.tag.as_str())
         .collect()
+}
+
+/// Two-sided bracket for the host-capability withholding decision.
+///
+/// Inert: it plants capability verdicts instead of probing, so it exercises the
+/// decision on BOTH the "machine cannot run it" and the "machine can run it"
+/// side without depending on which machine is running the bracket. The
+/// load-bearing case is NEGATIVE 2: a node that is merely BROKEN must never be
+/// withheld, whatever is absent.
+fn host_capability_bracket(root: &Path) -> Result<(), String> {
+    use validate_plan::HostCapability;
+    let step = |group: &str, job: &str, deps: Vec<String>| safe_ci_dag_runner::model::Step {
+        group: group.into(),
+        job: job.into(),
+        desc: String::new(),
+        description: String::new(),
+        cmd: "true".into(),
+        deps,
+        env: BTreeMap::new(),
+        hint: safe_ci_dag_runner::model::ResourceHint::default(),
+        networkonly: false,
+        engine_only: false,
+        timeout: 10,
+        cpu_timeout: 10,
+        jobs_flag: None,
+        skip_reason: None,
+    };
+    let requirements: BTreeMap<String, HostCapability> =
+        [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)].into_iter().collect();
+    let absent: BTreeMap<HostCapability, String> =
+        [(HostCapability::CpuidFaulting, "planted".to_string())].into_iter().collect();
+    let present: BTreeMap<HostCapability, String> = BTreeMap::new();
+    let plan = || {
+        vec![
+            step("cpuid", "faulting", vec!["build.privileged_tests".into()]),
+            step("test", "detcore_unit", vec!["build.privileged_tests".into()]),
+            step("build", "privileged_tests", vec![]),
+        ]
+    };
+
+    // POSITIVE — the declaring node, and only it, is withheld when the machine
+    // provably lacks the capability.
+    let (keep, gone) = validate_plan::partition_host_inapplicable(plan(), &requirements, &absent)?;
+    if gone.len() != 1 || gone[0].tag != "cpuid.faulting" {
+        return Err(format!(
+            "host capability: exactly cpuid.faulting must be withheld, got {:?}",
+            gone.iter().map(|n| n.tag.clone()).collect::<Vec<_>>()
+        ));
+    }
+    if keep.len() != 2 {
+        return Err("host capability: withholding one node must not remove any other".into());
+    }
+
+    // NEGATIVE 1 — with the capability present, nothing is withheld. Without
+    // this the mechanism could be a blanket omission rather than a predicate.
+    let (keep, gone) = validate_plan::partition_host_inapplicable(plan(), &requirements, &present)?;
+    if !gone.is_empty() || keep.len() != 3 {
+        return Err("host capability: a capable machine must run every planned node".into());
+    }
+
+    // NEGATIVE 2 — THE ONE THAT MATTERS. A node that declares NO capability is
+    // never withheld, whatever is absent. This is what stops the mechanism from
+    // being usable to excuse a node that is merely broken: a broken node has no
+    // declaration, so it still runs, still fails, and is still refused.
+    let undeclared: BTreeMap<String, HostCapability> = BTreeMap::new();
+    let (keep, gone) = validate_plan::partition_host_inapplicable(plan(), &undeclared, &absent)?;
+    if !gone.is_empty() || keep.len() != 3 {
+        return Err(
+            "host capability: an undeclared node was withheld; an absent capability must not \
+             excuse a node that never claimed to need it"
+                .into(),
+        );
+    }
+
+    // NEGATIVE 3 — withholding a node that a RETAINED node depends on is a
+    // refusal, not a silent cascade of unrun work.
+    let mut dependent = plan();
+    dependent.push(step("e2e", "needs_cpuid", vec!["cpuid.faulting".into()]));
+    if validate_plan::partition_host_inapplicable(dependent, &requirements, &absent).is_ok() {
+        return Err(
+            "host capability: withholding a node with a retained dependent must REFUSE".into()
+        );
+    }
+
+    // VOCABULARY — closed on both sides of the parse.
+    if HostCapability::from_value("cpuid-faulting") != Some(HostCapability::CpuidFaulting) {
+        return Err("host capability: the shipped capability name must parse".into());
+    }
+    if HostCapability::from_value("cpuid_faulting").is_some()
+        || HostCapability::from_value("anything-at-all").is_some()
+    {
+        return Err("host capability: an unrecognized capability name must NOT parse".into());
+    }
+
+    // NON-VACUITY — the shipped DAG really does declare the requirement this
+    // bracket is about, and every declaration in every lane parses. A bracket
+    // that passed against an empty declaration set would prove nothing.
+    let shipped = validate_plan::host_capability_requirements(root)?;
+    if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
+        || shipped.get("cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
+    {
+        return Err(format!(
+            "host capability: ci/dag/privileged.json must declare cpuid.faulting as requiring \
+             cpuid-faulting under both the bare and fused tag; got {shipped:?}"
+        ));
+    }
+
+    // THE PROBE'S OWN CONJUNCTION, bracketed with planted observations so it is
+    // checked on a machine of either kind. Exactly ONE combination may read as
+    // absent; every form of doubt must run the node.
+    let absent_cases = [
+        // (syscall, /proc/cpuinfo advertises cpuid_fault, must read absent)
+        (Err(libc::ENODEV), Some(false), true),
+        // The kernel accepted it: present however cpuinfo reads.
+        (Ok(()), Some(false), false),
+        (Ok(()), Some(true), false),
+        // The two sources DISAGREE — doubt, so the node runs.
+        (Err(libc::ENODEV), Some(true), false),
+        // /proc/cpuinfo unreadable — doubt, so the node runs.
+        (Err(libc::ENODEV), None, false),
+        // A different errno is doubt about the PROBE, not proof about the
+        // machine. EPERM is what a restricted sandbox returns.
+        (Err(libc::EPERM), Some(false), false),
+        (Err(libc::EINVAL), Some(false), false),
+        // The fork/waitpid probe could not be completed at all.
+        (Err(0), Some(false), false),
+    ];
+    for (syscall, advertised, want_absent) in absent_cases {
+        if validate_plan::cpuid_faulting_absent(syscall, advertised) != want_absent {
+            return Err(format!(
+                "host capability: cpuid-faulting absence for (syscall={syscall:?}, \
+                 cpuinfo={advertised:?}) must be {want_absent}; only a corroborated ENODEV may \
+                 read as absent and every other shape must run the node"
+            ));
+        }
+    }
+
+    // The one override can only force PRESENT; nothing forces ABSENT.
+    let verdict = validate_plan::probe_host_capability(HostCapability::CpuidFaulting);
+    println!(
+        "  host capability: 1 withheld / 3 not-withheld (capable, undeclared, dependent-refusal), \
+         probe conjunction 1 absent / 7 present-on-doubt, vocabulary closed, shipped DAG declares \
+         it; this machine's cpuid-faulting probe says {} ({})",
+        if verdict.present { "PRESENT" } else { "ABSENT" },
+        verdict.evidence
+    );
+    Ok(())
 }
 
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
@@ -8852,6 +9101,8 @@ fn write_ledger(
     // reaches the row instead of being replaced by the one that followed it.
     attempts: &[NodeAttempt],
     skipped: &[String],
+    host_inapplicable: &[validate_plan::HostInapplicableNode],
+    planned_tags: &BTreeSet<String>,
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
@@ -8875,11 +9126,31 @@ fn write_ledger(
     // one carrying `corrects: <this id>`, which is what keeps the shard
     // append-only and safe to union across machines.
     let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
+    // The PLANNED denominator, not the executed one. A node withheld as
+    // host-inapplicable is added back here, so withholding can never shrink the
+    // contract a green is measured against; the consumer's accounting
+    // (`executed + intentionally skipped == expected`) then has to balance.
+    // With nothing withheld this is byte-identical to what it has always been.
     let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run)
+        serde_json::json!(gates_run + host_inapplicable.len())
     } else {
         serde_json::Value::Null
     };
+    // A host-inapplicable node is NEVER in `gates`: that array is the executed
+    // PASS/FAIL list, and a node that did not run belongs in neither state. It
+    // is carried in its own typed field instead, with the observation behind the
+    // judgement, so no reader can mistake absence for coverage.
+    let intentional_skipped_nodes: Vec<serde_json::Value> = host_inapplicable
+        .iter()
+        .map(|n| {
+            serde_json::json!({
+                "name": n.tag,
+                "reason": validate_plan::HOST_INAPPLICABLE_REASON,
+                "capability": n.capability.value(),
+                "evidence": n.evidence,
+            })
+        })
+        .collect();
     let gates: Vec<serde_json::Value> = outcomes
         .iter()
         .map(|outcome| ledger_gate_with_attempts(outcome, attempts))
@@ -8908,6 +9179,17 @@ fn write_ledger(
         names.dedup();
         names
     };
+    let accounted: BTreeSet<&str> = outcomes
+        .iter()
+        .map(|o| o.tag.as_str())
+        .chain(skipped.iter().map(String::as_str))
+        .chain(host_inapplicable.iter().map(|n| n.tag.as_str()))
+        .collect();
+    let unaccounted_nodes: Vec<&str> = planned_tags
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| !accounted.contains(tag))
+        .collect();
     let record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -8980,7 +9262,23 @@ fn write_ledger(
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
-        "skipped_nodes": skipped.len(),
+        "skipped_nodes": skipped.len() + intentional_skipped_nodes.len(),
+        // Typed pre-spawn omissions: nodes this MACHINE provably cannot run.
+        // The reason vocabulary is closed on BOTH sides. The parent consumer
+        // (ci-hub/validate/gate_completeness.py, ci-hub/lib/qualifying_receipt.rs)
+        // admits only `empty-manifest-bucket`, so a row carrying
+        // `host-inapplicable` is NOT a qualifying receipt until the owner opts
+        // that reason in. Recording the omission honestly is what costs the
+        // receipt; it is not a way to buy one.
+        "intentional_skipped_nodes": intentional_skipped_nodes,
+        // Nodes that never ran because something they depend on failed. Named,
+        // not just counted, so a reader can tell the two kinds of absence apart.
+        "dependency_skipped_nodes": skipped,
+        // Planned nodes with NO terminal result and no recorded reason —
+        // computed against the planned tag set rather than asserted empty, so a
+        // deadline cut or a lane that never started is visible instead of
+        // vanishing.
+        "unaccounted_nodes": unaccounted_nodes,
         // A timeout is a RESULT, so it is recorded rather than dropped, and it is
         // named so a reader can separate "the tree is broken" from "a gate blew
         // its budget". Operator interrupts never reach this function at all.
@@ -9252,6 +9550,10 @@ struct RunSummary {
     nodes_executed: usize,
     nodes_failed: usize,
     nodes_skipped: usize,
+    /// Planned nodes withheld because the MACHINE provably cannot run them.
+    /// Counted separately from `nodes_executed` and `nodes_skipped` so the
+    /// one-line accounting can never read as though everything planned ran.
+    nodes_host_inapplicable: usize,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -9277,6 +9579,7 @@ impl RunSummary {
             nodes_executed: 0,
             nodes_failed: 0,
             nodes_skipped: 0,
+            nodes_host_inapplicable: 0,
             wall_s: None,
             jobs: None,
             log: None,
@@ -9324,10 +9627,18 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
     // rather than an absent line a reader has to interpret.
     match s.wall_s {
         Some(wall) => lines.push(format!(
-            "   nodes: {} executed, {} failed, {} skipped in {}{}",
+            "   nodes: {} executed, {} failed, {} skipped{} in {}{}",
             s.nodes_executed,
             s.nodes_failed,
             s.nodes_skipped,
+            if s.nodes_host_inapplicable == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", {} host-inapplicable (NOT RUN, NOT passed)",
+                    s.nodes_host_inapplicable
+                )
+            },
             human_duration(wall),
             s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
         )),
@@ -9725,6 +10036,24 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // nested strict-compat boundary (and default level 1 stays bounded there).
     propagate_verbosity(&mut plan, args.verbosity);
 
+    // A node this machine provably cannot run is withheld here, BEFORE anything
+    // spawns, and recorded as host-inapplicable. Nothing a node DOES can reach
+    // this decision, so a node that is merely broken still runs and still fails.
+    if let Err(e) = withhold_host_inapplicable(&root, &mut plan) {
+        eprintln!("validate: cannot resolve host-capability requirements: {e}");
+        return RunSummary::refused(
+            2,
+            &level_name,
+            "host-capability resolution",
+            vec![
+                e,
+                "no node was omitted and no substitute profile was run: an unevaluable capability \
+                 declaration is refused, never treated as a reason to skip work"
+                    .into(),
+            ],
+        );
+    }
+
     // Per-gate budget overrides, preserved from validate.sh
     // (VALIDATE_GATE_TIMEOUT_SECONDS / VALIDATE_GATE_CPU_TIMEOUT_SECONDS). These
     // LOWER a node's ceiling, never raise it: a caller tightening budgets to
@@ -10088,11 +10417,36 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let started_epoch = epoch_now();
     let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
+    // Every node the profile PLANNED, including the ones withheld as
+    // host-inapplicable. The ledger's `unaccounted_nodes` is computed against
+    // this set, so a node that neither ran nor carries a recorded reason is
+    // named rather than lost.
+    let planned_tags: BTreeSet<String> = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter().map(|s| s.tag()))
+        .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
+        .collect();
 
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
     println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
-    println!("Plan: {node_count} boxed DAG node(s){}", if plan.second.is_some() { " across 2 sequential lanes" } else { "" });
+    println!(
+        "Plan: {node_count} boxed DAG node(s){}{}",
+        if plan.second.is_some() { " across 2 sequential lanes" } else { "" },
+        if plan.host_inapplicable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} planned node(s) withheld as host-inapplicable and NOT counted as passing: {}",
+                plan.host_inapplicable.len(),
+                plan.host_inapplicable
+                    .iter()
+                    .map(|n| n.tag.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    );
     // A measured estimate from THIS machine's own history, or an honest "not
     // enough history" (validate.sh:936). Printed after the durable log is
     // established so the receipt carries the prediction next to the outcome.
@@ -10191,7 +10545,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             run_timeout.unwrap_or(0)
         );
     }
-    print_cost_table(&outcomes, &skipped);
+    print_cost_table(&outcomes, &skipped, &plan.host_inapplicable);
     print_retry_ledger(&attempts);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
@@ -10303,6 +10657,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &outcomes,
                 &attempts,
                 &skipped,
+                &plan.host_inapplicable,
+                &planned_tags,
                 wall,
                 130,
                 &log_path.to_string_lossy(),
@@ -10327,6 +10683,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| outcome_is_failure(o)).count();
         s.nodes_skipped = skipped.len();
+        s.nodes_host_inapplicable = plan.host_inapplicable.len();
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -10556,6 +10913,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &outcomes,
             &attempts,
             &skipped,
+            &plan.host_inapplicable,
+            &planned_tags,
             wall,
             exit_code,
             &log_path.to_string_lossy(),
@@ -10657,6 +11016,23 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 .into(),
         );
     }
+    // Named in the verdict itself, not only in the plan header. A green summary
+    // that omitted this would let a reader take the run for full coverage.
+    if !plan.host_inapplicable.is_empty() {
+        detail.push(format!(
+            "{} planned node(s) were NOT RUN because this machine provably cannot run them, and \
+             are recorded as '{}': {}. This is NOT a pass and NOT coverage — whatever those nodes \
+             verify is UNVERIFIED by this run, and the ledger row carries the omission so the \
+             parent's receipt gate can refuse it.",
+            plan.host_inapplicable.len(),
+            validate_plan::HOST_INAPPLICABLE_REASON,
+            plan.host_inapplicable
+                .iter()
+                .map(|n| format!("{} (needs {})", n.tag, n.capability.value()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     for why in &refusals {
         detail.push(format!("REFUSED ON COMPLETENESS: {why}"));
     }
@@ -10698,6 +11074,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
     s.nodes_skipped = skipped.len();
+    s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
@@ -10821,13 +11198,17 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    // The stop-path fixture runs no DAG, so there is no attempt to record.
+    // The fixture plans exactly the synthetic gates it ran, withholds nothing,
+    // and leaves nothing unaccounted.
+    let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
     write_ledger(
         &ledger,
         &ctx,
         &outcomes,
         &[],
         &[],
+        &[],
+        &planned_tags,
         wall,
         exit_code,
         "",
