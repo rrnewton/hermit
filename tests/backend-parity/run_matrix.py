@@ -425,7 +425,7 @@ def hermit_command(
         # bitwise-identical DETLOG. `--verify-allow both` keeps the guest's own
         # exit status (including deliberate non-zero cases such as exit_status)
         # flowing through so the runner can still enforce exit-status parity.
-        command.extend(["--verify", "--verify-allow", "both"])
+        command.extend(["--verify", "--verify-strict", "--verify-allow", "both"])
     command.extend(
         [
             "--base-env=minimal",
