@@ -13,10 +13,11 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 6] = [
+const PATTERNS: [&str; 7] = [
     "pipe-order",
     "pipe-capacity",
     "pipe-large-write",
+    "pipe-close-reuse-write",
     "socketpair",
     "eventfd",
     "epoll",
@@ -65,7 +66,7 @@ fn ipc_guest() -> &'static Path {
 fn run_pattern(pattern: &str, iteration: usize) -> String {
     let mut command = Command::new("timeout");
     command
-        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .args(["--kill-after=5s", &format!("{TIMEOUT_SECONDS}s")])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "run",
@@ -96,4 +97,34 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
             );
         }
     }
+}
+
+#[test]
+fn pipe_large_write_records_and_replays() {
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "60s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "record",
+            "start",
+            "--verify",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(ipc_guest())
+        .arg("pipe-large-write");
+    let output = command_output(command, "pipe-large-write record/replay verification");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Success: replay matched recording."),
+        "record/replay output omitted its success marker:\n{combined}"
+    );
 }

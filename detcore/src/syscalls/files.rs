@@ -28,6 +28,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
@@ -59,6 +60,7 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+const DETERMINISTIC_PIPE_CAPACITY: i32 = 4096;
 
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
@@ -125,6 +127,46 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    async fn wait_for_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        operation: &str,
+    ) -> Result<(), Errno> {
+        while guest.thread_state().fd_has_blocking_pipe_write(fd) {
+            let mut request = guest
+                .thread_state()
+                .mk_request(ResourceID::InternalIOPolling, Permission::W);
+            request.fyi(operation);
+            if resource_request(guest, request).await == ResumeStatus::Signaled {
+                return Err(Errno::ERESTARTSYS);
+            }
+        }
+        Ok(())
+    }
+
+    async fn wait_for_blocking_pipe_writes_in_range<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        first: u32,
+        last: u32,
+        operation: &str,
+    ) -> Result<(), Errno> {
+        while guest
+            .thread_state()
+            .range_has_blocking_pipe_write(first, last)
+        {
+            let mut request = guest
+                .thread_state()
+                .mk_request(ResourceID::InternalIOPolling, Permission::W);
+            request.fyi(operation);
+            if resource_request(guest, request).await == ResumeStatus::Signaled {
+                return Err(Errno::ERESTARTSYS);
+            }
+        }
+        Ok(())
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
@@ -298,6 +340,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        self.wait_for_blocking_pipe_write(guest, fd, call.name())
+            .await?;
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
@@ -332,6 +376,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if flags != 0 {
             return Err(Errno::ENOSYS.into());
         }
+
+        self.wait_for_blocking_pipe_writes_in_range(guest, first, last, call.name())
+            .await?;
 
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
@@ -935,15 +982,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // Only route writes through the nonblockable-fd path when the fd is actually
-        // physically nonblocking (the "hermit run" case, where pipe2/eventfd2 injected
-        // O_NONBLOCK and we can nonblockize-and-retry deterministically). On a physically
-        // blocking fd (e.g. record/replay mode, where O_NONBLOCK is intentionally not
-        // injected) that path would treat the write as BlockingExternalIO and deschedule it
+        // physically nonblocking (pipe2/eventfd2 injected O_NONBLOCK so Detcore can
+        // nonblockize-and-retry deterministically). On a physically blocking fd that path
+        // would treat the write as BlockingExternalIO and deschedule it
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
-            self.execute_blocking_pipe_write(guest, call).await
+        let blocking_pipe_write =
+            physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
+        if blocking_pipe_write {
+            guest.thread_state().begin_blocking_pipe_write(call.fd())?;
+        }
+
+        let res = if blocking_pipe_write {
+            let result = self.execute_blocking_pipe_write(guest, call).await;
+            guest.thread_state().end_blocking_pipe_write(call.fd());
+            result
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
@@ -1546,6 +1600,34 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => OFlag::empty(),
         };
         match call.cmd() {
+            F_GETPIPE_SZ => {
+                let fixed_pipe = guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.ty() == FdType::Pipe && detfd.physically_nonblocking()
+                })?;
+                if fixed_pipe {
+                    Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY))
+                } else {
+                    Ok(self.record_or_replay(guest, call).await?)
+                }
+            }
+            F_SETPIPE_SZ(requested) => {
+                let fixed_pipe = guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.ty() == FdType::Pipe && detfd.physically_nonblocking()
+                })?;
+                if !fixed_pipe {
+                    return Ok(self.record_or_replay(guest, call).await?);
+                }
+                if requested < 0 {
+                    Err(Errno::EINVAL.into())
+                } else if requested <= DETERMINISTIC_PIPE_CAPACITY {
+                    Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY))
+                } else {
+                    // Growing a pipe is constrained by host-global per-user pipe-page
+                    // pressure. Keep scheduler-managed pipes at one page rather than let
+                    // another workload decide whether this request succeeds.
+                    Err(Errno::EPERM.into())
+                }
+            }
             F_GETFL => {
                 let physical_flags = self.record_or_replay(guest, call).await?;
                 let logical_nonblocking = guest
@@ -1759,6 +1841,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Errno> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
+        if old_fd != new_fd {
+            self.wait_for_blocking_pipe_write(guest, new_fd, call.name())
+                .await?;
+        }
         let res = self.record_or_replay(guest, call).await?;
         let replaced = guest
             .thread_state_mut()
@@ -1778,6 +1864,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let flags = call.flags();
+        if old_fd != new_fd {
+            self.wait_for_blocking_pipe_write(guest, new_fd, call.name())
+                .await?;
+        }
         let res = self.record_or_replay(guest, call).await?;
         let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
         if let Some(open_file_id) = replaced {
@@ -1813,6 +1903,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
+            if internally_nonblocking {
+                let capacity = guest
+                    .inject_with_retry(
+                        syscalls::Fcntl::new()
+                            .with_fd(fds[1])
+                            .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY)),
+                    )
+                    .await?;
+                if capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY) {
+                    return Err(Errno::EIO);
+                }
+            }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
