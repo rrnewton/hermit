@@ -707,9 +707,13 @@ static void pipe_unavailable_alias_status(void) {
   assert_unavailable_pipe_alias_status(duplicate_with_pidfd(fds[1]),
                                        "pidfd_getfd");
 
-  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  int null_fd = open("/dev/null", O_WRONLY);
   if (null_fd < 0) {
     fail("open /dev/null");
+  }
+  int source_descriptor_flags = fcntl(null_fd, F_GETFD);
+  if (source_descriptor_flags < 0 || (source_descriptor_flags & FD_CLOEXEC)) {
+    fail("pidfd_getfd regular-fd source CLOEXEC control");
   }
   int null_alias = duplicate_with_pidfd(null_fd);
   uint8_t byte = 0x62;
