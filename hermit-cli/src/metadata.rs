@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,5 +254,10 @@ mod tests {
     fn record_version_rejects_pre_madvise_policy_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_without_pipe_side_effect_kinds() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
     }
 }
