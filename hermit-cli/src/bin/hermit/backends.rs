@@ -58,6 +58,8 @@ use hermit::ExitStatus;
 use reverie::process::Output as ReverieOutput;
 #[cfg(feature = "dbt")]
 use reverie_dbt::DbtRunner;
+#[cfg(feature = "dbt")]
+use reverie_dbt::OutputWithDiagnostics;
 use tracing::metadata::LevelFilter;
 
 use super::run::VerifyAllow;
@@ -496,20 +498,20 @@ pub(super) fn run_dbt(
             }
             return Ok(process_status(status));
         }
-        let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
-        write_output(&output)?;
+        let captured = run_once(&runner, &guest, &drrun, std::io::stdin())?;
+        write_captured_output(&captured)?;
         if summary {
             // Best-effort: surface the native DBT counters the client already
             // emitted. A parse failure here is non-fatal — the run itself
             // succeeded and the raw `reverie-dbt:` line is still on stderr.
-            match detcore_summary(&output) {
+            match detcore_summary(&captured.diagnostics) {
                 Ok(stats) => eprint!("{}", format_dbt_stats(&stats)),
                 Err(error) => {
                     eprintln!(":: DBT summary unavailable: {error}");
                 }
             }
         }
-        return Ok(output_status(&output));
+        return Ok(output_status(&captured.output));
     }
 
     let mut replay = if stdin_is_terminal {
@@ -529,15 +531,15 @@ pub(super) fn run_dbt(
         }
         None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
-    if !verify_allow.satisfies(process_status(first_output.status)) {
+    if !verify_allow.satisfies(process_status(first_output.output.status)) {
         // The first run exited in a way `--verify-allow` does not permit, so a
         // second run cannot establish determinism for the intended contract.
         // This mirrors the ptrace `--verify` path (see `verify` in run.rs).
         // With `--verify-allow {failure,both}` a deliberate non-zero exit *is*
         // permitted, so the double-run comparison below still executes — that is
         // what lets the `exit_status` backend-parity contract reach L2 on DBT.
-        write_output(&first_output)?;
-        return Ok(output_status(&first_output));
+        write_captured_output(&first_output)?;
+        return Ok(output_status(&first_output.output));
     }
     let (mut log1, mut log2) = temp_log_files("dbt_run1", "dbt_run2").map_err(Error::from)?;
     let first = capture_dbt_verification(first_output, &mut log1)?;
@@ -557,9 +559,9 @@ pub(super) fn run_dbt(
         }
         None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
-    if !verify_allow.satisfies(process_status(second_output.status)) {
-        write_output(&second_output)?;
-        return Ok(output_status(&second_output));
+    if !verify_allow.satisfies(process_status(second_output.output.status)) {
+        write_captured_output(&second_output)?;
+        return Ok(output_status(&second_output.output));
     }
     let second = capture_dbt_verification(second_output, &mut log2)?;
     require_dbt_detlogs(&first, &second)?;
@@ -656,14 +658,13 @@ fn is_dbt_trace(payload: &[u8]) -> bool {
 
 #[cfg(feature = "dbt")]
 fn capture_dbt_verification(
-    output: Output,
+    captured: OutputWithDiagnostics,
     log: &mut impl Write,
 ) -> Result<DbtVerificationRun, Error> {
-    let summary = detcore_summary(&output)?;
-    let mut guest_stderr = Vec::with_capacity(output.stderr.len());
+    let summary = detcore_summary(&captured.diagnostics)?;
     let mut syscall_detlogs = 0;
     let mut in_trace_message = false;
-    for line in output.stderr.split_inclusive(|byte| *byte == b'\n') {
+    for line in captured.diagnostics.split_inclusive(|byte| *byte == b'\n') {
         let payload = line.strip_suffix(b"\n").unwrap_or(line);
         let payload = payload.strip_suffix(b"\r").unwrap_or(payload);
         if is_dbt_trace(payload) {
@@ -688,30 +689,28 @@ fn capture_dbt_verification(
             log.write_all(line)?;
         } else if !payload.starts_with(b"reverie-dbt: tool=Detcore ") {
             in_trace_message = false;
-            guest_stderr.extend_from_slice(line);
         } else {
             in_trace_message = false;
         }
     }
 
-    let mut compared_stderr = guest_stderr.clone();
+    let mut compared_stderr = captured.output.stderr.clone();
     writeln!(
         compared_stderr,
-        "reverie-dbt: tool=Detcore syscalls={} rewritten={} stdin_reads={} memory_hash={}",
-        summary.syscalls, summary.rewritten, summary.stdin_reads, summary.memory_hash
+        "reverie-dbt: tool=Detcore branches={} syscalls={} rewritten={} stdin_reads={} memory_hash={}",
+        summary.branches,
+        summary.syscalls,
+        summary.rewritten,
+        summary.stdin_reads,
+        summary.memory_hash
     )?;
     let compared = ReverieOutput {
-        status: ExitStatus::from_raw(output.status.into_raw()),
-        stdout: output.stdout.clone(),
+        status: ExitStatus::from_raw(captured.output.status.into_raw()),
+        stdout: captured.output.stdout.clone(),
         stderr: compared_stderr,
     };
-    let output = Output {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: guest_stderr,
-    };
     Ok(DbtVerificationRun {
-        output,
+        output: captured.output,
         compared,
         summary,
         syscall_detlogs,
@@ -738,9 +737,9 @@ fn run_once<R: Read + Send + 'static>(
     guest: &StdCommand,
     drrun: &Path,
     input: R,
-) -> Result<Output, Error> {
+) -> Result<OutputWithDiagnostics, Error> {
     runner
-        .output_with_detached_reader(guest, input)
+        .output_with_detached_reader_and_diagnostics(guest, input)
         .map_err(|error| launch_error(drrun, error))
 }
 
@@ -749,9 +748,9 @@ fn run_once_with_terminal_input(
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
-) -> Result<Output, Error> {
+) -> Result<OutputWithDiagnostics, Error> {
     runner
-        .output_with_inherited_stdin(guest)
+        .output_with_inherited_stdin_and_diagnostics(guest)
         .map_err(|error| launch_error(drrun, error))
 }
 
@@ -769,9 +768,9 @@ fn process_status(status: std::process::ExitStatus) -> ExitStatus {
 }
 
 #[cfg(feature = "dbt")]
-fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let summary = stderr
+fn detcore_summary(diagnostics: &[u8]) -> Result<DbtSummary, Error> {
+    let diagnostics = String::from_utf8_lossy(diagnostics);
+    let summary = diagnostics
         .lines()
         .rev()
         .find(|line| line.starts_with("reverie-dbt: tool=Detcore "))
@@ -828,6 +827,13 @@ fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
 fn write_output(output: &Output) -> Result<(), Error> {
     std::io::stdout().write_all(&output.stdout)?;
     std::io::stderr().write_all(&output.stderr)?;
+    Ok(())
+}
+
+#[cfg(feature = "dbt")]
+fn write_captured_output(captured: &OutputWithDiagnostics) -> Result<(), Error> {
+    write_output(&captured.output)?;
+    std::io::stderr().write_all(&captured.diagnostics)?;
     Ok(())
 }
 
@@ -1002,12 +1008,8 @@ mod tests {
     }
 
     #[cfg(feature = "dbt")]
-    fn dbt_output(summary: &str) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: summary.as_bytes().to_vec(),
-        }
+    fn dbt_output(summary: &str) -> Vec<u8> {
+        summary.as_bytes().to_vec()
     }
 
     #[test]
@@ -1043,20 +1045,23 @@ mod tests {
     }
 
     #[cfg(feature = "dbt")]
-    fn dbt_verification_output(stdout: &[u8], detlog: bool) -> Output {
+    fn dbt_verification_output(stdout: &[u8], detlog: bool) -> OutputWithDiagnostics {
         let trace = if detlog {
             "INFO detcore: DETLOG [syscall] getpid result=1000\n  COMMIT turn 1\n"
         } else {
             "INFO detcore: scheduler diagnostic\n"
         };
-        let stderr = format!(
-            "{trace}guest-stderr\nreverie-dbt: tool=Detcore branches=42 syscalls=7 \
+        let diagnostics = format!(
+            "{trace}reverie-dbt: tool=Detcore branches=42 syscalls=7 \
              rewritten=6 stdin_reads=0 memory_hash=cbf29ce484222325\n"
         );
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: stdout.to_vec(),
-            stderr: stderr.into_bytes(),
+        OutputWithDiagnostics {
+            output: Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.to_vec(),
+                stderr: b"INFO guest: guest-stderr\n".to_vec(),
+            },
+            diagnostics: diagnostics.into_bytes(),
         }
     }
 
@@ -1070,18 +1075,17 @@ mod tests {
 
         assert_eq!(captured.syscall_detlogs, 1);
         assert_eq!(captured.output.stdout, b"guest-stdout\n");
-        assert_eq!(captured.output.stderr, b"guest-stderr\n");
+        assert_eq!(captured.output.stderr, b"INFO guest: guest-stderr\n");
         let log = String::from_utf8(log).unwrap();
         assert!(log.starts_with(NORMALIZED_DBT_LOG_TIMESTAMP));
         assert!(log.contains("INFO detcore: DETLOG [syscall] getpid result=1000"));
         assert!(log.contains("  COMMIT turn 1"));
         let compared_stderr = String::from_utf8(captured.compared.stderr).unwrap();
-        assert!(compared_stderr.contains("guest-stderr"));
+        assert!(compared_stderr.contains("INFO guest: guest-stderr"));
         assert!(compared_stderr.contains(
-            "reverie-dbt: tool=Detcore syscalls=7 rewritten=6 stdin_reads=0 \
+            "reverie-dbt: tool=Detcore branches=42 syscalls=7 rewritten=6 stdin_reads=0 \
              memory_hash=cbf29ce484222325"
         ));
-        assert!(!compared_stderr.contains("branches="));
     }
 
     #[test]
@@ -1103,10 +1107,13 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_capture_without_native_summary_refuses_verification() {
-        let output = Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: b"INFO detcore: DETLOG [syscall] getpid result=1000\n".to_vec(),
+        let output = OutputWithDiagnostics {
+            output: Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            diagnostics: b"INFO detcore: DETLOG [syscall] getpid result=1000\n".to_vec(),
         };
         let error = capture_dbt_verification(output, &mut Vec::new()).unwrap_err();
         assert!(error.to_string().contains("did not report tool=Detcore"));
