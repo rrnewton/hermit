@@ -235,6 +235,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return Err(Errno::ENOSYS);
         }
+        if flags & libc::O_DIRECT != 0 {
+            // Opening a procfs fd link creates a new open-file description. Pipe packet mode is
+            // an OFD flag, so restore it explicitly on the controller handle; passing O_DIRECT
+            // to open(2) for the procfs link itself is rejected by Linux.
+            // SAFETY: file owns a valid descriptor, and F_SETFL does not dereference arg 3.
+            let result = unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_SETFL,
+                    libc::O_NONBLOCK | libc::O_DIRECT,
+                )
+            };
+            if result < 0 {
+                return Err(io_errno(std::io::Error::last_os_error()));
+            }
+        }
         Ok(file)
     }
 
@@ -265,13 +281,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MAX_RW_COUNT: usize = 0x7fff_f000;
         const PIPE_BUF: usize = 4096;
 
-        let Some(buffer) = call.buf() else {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        };
         let target = call.len().min(MAX_RW_COUNT);
         if target == 0 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+            return Ok(0);
         }
+        let buffer = call.buf();
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
         );
@@ -290,11 +304,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             let attempt_len = (target - written_total).min(PIPE_BUF);
-            let Some(attempt_buffer) = buffer
-                .as_raw()
-                .checked_add(written_total)
-                .and_then(Addr::<u8>::from_raw)
-            else {
+            let Some(attempt_buffer) = buffer.and_then(|buffer| {
+                buffer
+                    .as_raw()
+                    .checked_add(written_total)
+                    .and_then(Addr::<u8>::from_raw)
+            }) else {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
@@ -365,12 +380,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux guarantees pipe writes through this size are atomic.
         const PIPE_BUF: usize = 4096;
 
-        let Some(iov_addr) = call.iov() else {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        };
-        if call.len() == 0 || call.len() > MAX_IOVECS {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        if call.len() == 0 {
+            return Ok(0);
         }
+        if call.len() > MAX_IOVECS {
+            return Err(Errno::EINVAL.into());
+        }
+        let iov_addr = call.iov().ok_or(Errno::EFAULT)?;
 
         let iovecs: Vec<(usize, usize)> = {
             let mut raw_iovecs = vec![
@@ -380,7 +396,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 call.len()
             ];
-            guest.memory().read_values(iov_addr, &mut raw_iovecs)?;
+            guest
+                .memory()
+                .read_values(iov_addr, &mut raw_iovecs)
+                .map_err(|_| Errno::EFAULT)?;
             raw_iovecs
                 .into_iter()
                 .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
@@ -394,7 +413,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let target = requested.min(MAX_RW_COUNT);
         if target == 0 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+            return Ok(0);
         }
 
         let atomic_pipe_write = target <= PIPE_BUF;
