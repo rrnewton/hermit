@@ -11,11 +11,6 @@ pr-dag-health.json
 # The committed baseline lives in envelope-baseline.json; this is the fresh run.
 envelope.json
 
-# validate.rs checkout-local validation ledger (used when neither
-# HERMIT_VALIDATE_LEDGER nor DEV_HERMIT_PARENT is set). Disposable per-checkout
-# receipts, regenerated on every run.
-.hermit-validate-ledger.jsonl
-
 # Local backup and Python cache files.
 *.orig
 **/__pycache__/
@@ -35,9 +30,3 @@ envelope.json
 # validation") -- a slot self-poisons after exactly one validation. The profiles
 # are useful output, so ignore them in place rather than relocating them.
 /.safe-ci-dag-runner/
-
-# Validate ledger shards: one append-only JSONL per (team, short-machine).
-# Machine-scoped BY DESIGN so concurrent writers never collide, and each row
-# records absolute cwd/log_file paths -- so a tracked shard can never satisfy
-# scripts/check-portable-paths.sh. Kept in-tree for locality, never committed.
-ci/validate-ledger/
