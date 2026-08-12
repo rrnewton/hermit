@@ -26,6 +26,7 @@
 
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -47,6 +48,12 @@ static int query(unsigned *cpu_out, unsigned *node_out) {
 int main(void) {
   unsigned cpu = SENTINEL;
   unsigned node = SENTINEL;
+  /* Last values actually observed, so stdout carries the OBSERVATION rather
+   * than only a verdict word. A divergence is then visible in the parity
+   * comparison itself, not just in an exit code. */
+  unsigned seen_cpu = SENTINEL;
+  unsigned seen_node = SENTINEL;
+  int sentinel_overwritten = 0;
 
   /* Repeat to prove the determinized answer is stable, not incidental. */
   for (int i = 0; i < 4; i++) {
@@ -57,6 +64,21 @@ int main(void) {
       fprintf(stderr, "iter %d: getcpu(cpu,node) did not return 0\n", i);
       return 1;
     }
+#ifdef HERMIT_TEST_GETCPU_PLANT_HOST_LEAK
+    cpu = 7; /* plant a leaked host CPU; the 0/0 check must catch it */
+#endif
+#ifdef HERMIT_TEST_GETCPU_PLANT_UNWRITTEN
+    cpu = SENTINEL; /* plant "handler never wrote"; the sentinel guard must catch it */
+    node = SENTINEL;
+#endif
+    /* NON-VACUITY: the sentinel proves the kernel/handler actually wrote here.
+     * Without it, a handler that writes nothing leaves the caller's zeroed
+     * buffer looking like a perfect 0/0 answer. */
+    if (cpu != SENTINEL || node != SENTINEL) {
+      sentinel_overwritten = 1;
+    }
+    seen_cpu = cpu;
+    seen_node = node;
     if (cpu != 0 || node != 0) {
       fprintf(stderr, "iter %d: getcpu(cpu,node) reported cpu=%u node=%u, expected 0/0\n",
               i, cpu, node);
@@ -78,6 +100,15 @@ int main(void) {
     }
   }
 
+  /* Emit the OBSERVED values. On this host a native run reports the real CPU
+   * the scheduler happened to pick (measured: cpu=55 of 316, and it moves), so
+   * these numbers are the difference between "determinized" and "leaked". */
+  printf("getcpu observed cpu=%u node=%u iters=4 sentinel_overwritten=%s\n",
+         seen_cpu, seen_node, sentinel_overwritten ? "yes" : "no");
+  if (!sentinel_overwritten) {
+    fprintf(stderr, "getcpu: no output pointer was ever written -- vacuous pass\n");
+    return 1;
+  }
   puts("getcpu-identity-ok");
   return 0;
 }
