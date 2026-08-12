@@ -1,1 +1,0 @@
-RUN: %hermit run --verify -- %me
