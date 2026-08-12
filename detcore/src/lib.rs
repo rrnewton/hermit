@@ -338,7 +338,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if panic_on_unsupported_syscalls {
             error!(
-                "[detcore, dtid {}] inbound syscall: {} = ?",
+                "[detcore, dtid {}] unsupported syscall: {} = ?",
                 dettid,
                 call.display(&guest.memory()),
             );
@@ -1126,17 +1126,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
-            // with the complete Determinized classification. Even under the
-            // performance opt-in, Detcore must see every syscall that its audited
-            // policy says it models or deterministically refuses. Otherwise
-            // record/replay can bypass a Detcore handler and execute the syscall
-            // natively against the host.
+            // with the complete Determinized classification AND with the
+            // Unsupported set. Even under the performance opt-in, Detcore must
+            // see every syscall that its audited policy says it models or
+            // deterministically refuses. Otherwise record/replay can bypass a
+            // Detcore handler and execute the syscall natively against the host.
+            //
+            // `Determinized` and `Unsupported` are disjoint classifications, so
+            // the determinized filter alone leaves the Unsupported set
+            // unsubscribed: record/replay would silently execute an unsupported
+            // syscall on the live host instead of invalidating its determinism
+            // claim. Both halves are required; neither implies the other.
             // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
             // stops one short of the end of the table, which silently dropped
             // `lsm_list_modules` out of this sweep.
-            subscription.syscalls(
-                crate::all_pinned_syscalls().filter(|sysno| crate::is_determinized_syscall(*sysno)),
-            );
+            subscription.syscalls(crate::all_pinned_syscalls().filter(|sysno| {
+                crate::is_determinized_syscall(*sysno) || crate::is_unsupported_syscall(*sysno)
+            }));
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
@@ -2662,6 +2668,27 @@ mod subscription_tests {
         );
     }
 
+    #[test]
+    fn passthru_opt_intercepts_every_unsupported_syscall() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        let unsupported: Vec<Sysno> = crate::all_pinned_syscalls()
+            .filter(|sysno| crate::is_unsupported_syscall(*sysno))
+            .collect();
+
+        assert_eq!(unsupported, [Sysno::restart_syscall]);
+        for syscall in unsupported {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|subscribed| subscribed == syscall),
+                "passthru_opt allowed unsupported {syscall} to bypass Detcore"
+            );
+        }
+    }
+
+    /// `passthru_opt` is not a niche flag: `record_or_replay_config` turns it on
+    /// for every `hermit record` / `hermit replay`, so this covers the record
+    /// and replay subscription too.
     #[test]
     fn passthru_opt_subscribes_every_determinized_syscall() {
         let determinized: Vec<Sysno> = crate::all_pinned_syscalls()

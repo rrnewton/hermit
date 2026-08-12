@@ -230,7 +230,8 @@ that subscription into a seccomp filter:
 
 - subscribed syscalls return `SECCOMP_RET_TRACE`;
 - other syscalls are allowed without a ptrace syscall stop;
-- `restart_syscall` and `rt_sigreturn` are always allowed;
+- `restart_syscall` follows the Tool subscription like other ordinary syscalls;
+- `rt_sigreturn` is always allowed for Reverie's private signal-frame restoration path;
 - syscalls executed from Reverie's injection trampoline are allowed so an
   injected syscall does not recursively trap itself.
 
@@ -518,8 +519,10 @@ signal-disposition syscalls (`detcore/src/syscalls/signal.rs`).
   makes runnable. `alarm`/timer expirations are routed through `GlobalState` so
   the deadline is measured in logical time.
 - **Interrupted syscalls.** For operations that Detcore leaves blocking in the
-  kernel, Linux retains its normal restart path; `restart_syscall` and
-  `rt_sigreturn` are allowed through seccomp. Emulated blocking I/O is a current
+  kernel, Linux retains its normal restart path when the Tool does not subscribe
+  to `restart_syscall`; `rt_sigreturn` remains allowed through seccomp. A
+  fail-closed Detcore subscription observes and rejects `restart_syscall`
+  because it is currently Unsupported. Emulated blocking I/O is a current
   gap. Its nonblocking retry loop does not yet turn a signal wakeup into the
   syscall-specific internal restart result, so a queued retry can continue
   polling instead of returning `EINTR` or being transparently restarted. A fix
