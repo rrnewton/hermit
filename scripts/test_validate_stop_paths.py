@@ -95,6 +95,16 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    # Missing must never be interpreted as the desired/normal boxed state.
+    assert row["containment"] in {
+        "run-boxed",
+        "steps-contained-only",
+        "unboxed",
+        "unknown",
+    }, row
+    assert isinstance(row["containment_caps_enforced"], bool), row
+    assert isinstance(row["containment_subtree_killable"], bool), row
+    assert row["containment_detail"], row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row
@@ -183,6 +193,51 @@ def run_incomplete_exit() -> None:
         assert row["result"] == "fail", row
         assert row["gates_run"] == 2 and row["gates_expected"] is None, row
         assert row["interruption_signal"] is None, row
+
+
+def run_containment_artifacts(state: str) -> None:
+    """Bracket every runner-owned containment state through all artifacts."""
+    with tempfile.TemporaryDirectory(prefix=f"validate-containment-{state}-") as tmp:
+        tmpdir = Path(tmp)
+        ledger = tmpdir / "ledger.jsonl"
+        env = stop_test_env(tmpdir, ledger)
+        env.update(
+            # Redirect the production self-tee under this fixture. The stop seam
+            # cannot run a product gate or produce PASS, so this cannot forge a
+            # qualifying containment claim.
+            DEV_HERMIT_PARENT=str(tmpdir),
+            VALIDATE_STOP_TEST_EXIT_EARLY="1",
+            VALIDATE_STOP_TEST_CAPTURE_DURABLE="1",
+            VALIDATE_STOP_TEST_CONTAINMENT_STATE=state,
+        )
+        process = subprocess.run(
+            [str(VALIDATE), "full"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        output = process.stdout.decode(errors="replace")
+        assert process.returncode == 1, output
+
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        assert len(rows) == 1, rows
+        assert_schema5_contract(rows[0])
+        assert rows[0]["containment"] == state, rows[0]
+        expected_caps = state == "run-boxed"
+        expected_killable = state in {"run-boxed", "steps-contained-only"}
+        assert rows[0]["containment_caps_enforced"] is expected_caps, rows[0]
+        assert rows[0]["containment_subtree_killable"] is expected_killable, rows[0]
+
+        logs = list((tmpdir / "ignored" / "validate").glob("validate-*.log"))
+        assert len(logs) == 1, (logs, output)
+        durable = logs[0].read_text(errors="replace")
+        evidence = f"validate: CONTAINMENT[initial]: {state}"
+        banner = f"containment: {state}"
+        assert evidence in durable, durable
+        assert banner in durable, durable
+        assert banner in output, output
 
 
 def run_canonical_adapter_contract(*, refuse: bool) -> None:
@@ -299,6 +354,8 @@ def main() -> None:
     # ignore them: only the canonical authority query can establish admission.
     run_signal(signal.SIGTERM, expect_record=True, forged_owner=True)
     run_incomplete_exit()
+    for state in ("run-boxed", "steps-contained-only", "unboxed", "unknown"):
+        run_containment_artifacts(state)
     run_canonical_adapter_contract(refuse=False)
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
@@ -307,7 +364,8 @@ def main() -> None:
     print(
         "PASS: TERM/INT/HUP => NO-RESULT; KILL => no record; "
         "prior failure remains fail; forged owner path is unadmitted; canonical adapter "
-        "accept/refuse bracketed; cleanup is signal-atomic"
+        "accept/refuse bracketed; all four containment states reach durable log, ledger, and "
+        "banner; cleanup is signal-atomic"
     )
 
 

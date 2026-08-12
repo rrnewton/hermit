@@ -88,10 +88,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
+use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::reexec_in_scope;
+use safe_ci_dag_runner::cgroup::run_containment;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
+use safe_ci_dag_runner::cgroup::RunContainment;
+use safe_ci_dag_runner::cgroup::ScopeAttempt;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_ordered;
@@ -1232,24 +1235,91 @@ fn default_jobs() -> i64 {
 
 // --------------------------------------------------------------------------- boxing
 
-/// Establish two-level cgroup-v2 boxing, mirroring the runner's own
-/// `resolve_cgroups` policy. Returns the manager (`None` = intentional unboxed
-/// run) or `Err(exit_code)`. On the default path this re-execs into a transient
-/// `systemd --user` scope and does not return on success.
-fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
-    if is_in_scope() {
+fn unknown_containment(detail: impl Into<String>) -> RunContainment {
+    RunContainment::Unknown { detail: detail.into() }
+}
+
+/// Observe containment NOW. The manager rechecks a full scope against the live
+/// pid/cgroup roster each time; a stale startup claim therefore degrades to
+/// `unknown` in the final ledger rather than surviving as `run-boxed`.
+fn observe_run_containment(
+    cgroups: &BoxedCgroups,
+    unresolved: Option<&str>,
+) -> RunContainment {
+    match unresolved {
+        Some(detail) => unknown_containment(detail),
+        None => run_containment(cgroups.as_deref()),
+    }
+}
+
+fn print_containment_evidence(phase: &str, state: &RunContainment) {
+    eprintln!(
+        "validate: CONTAINMENT[{phase}]: {} caps_enforced={} subtree_killable={} — {}",
+        state.label(),
+        state.caps_enforced(),
+        state.subtree_killable(),
+        state.describe(),
+    );
+}
+
+/// Inert artifact fixture values. The stop seam always exits nonzero, runs no
+/// product gate, and cannot mint a receipt; these variants test serialization
+/// and rendering only, never containment authority.
+fn stop_test_containment() -> RunContainment {
+    match std::env::var("VALIDATE_STOP_TEST_CONTAINMENT_STATE").as_deref() {
+        Ok("run-boxed") => RunContainment::RunBoxed {
+            cgroup: PathBuf::from("/fixture/run-boxed.scope"),
+            unit: Some("run-boxed.scope".into()),
+            pid: std::process::id(),
+        },
+        Ok("steps-contained-only") => RunContainment::StepsContainedOnly {
+            cgroup: PathBuf::from("/fixture/steps-only"),
+        },
+        Ok("unboxed") => RunContainment::Unboxed {
+            reason: "inert artifact fixture".into(),
+        },
+        _ => unknown_containment("inert artifact fixture"),
+    }
+}
+
+/// Establish two-level cgroup-v2 boxing, consuming the runner's typed scope
+/// outcome end to end. Only `AlreadyInScope` carries a live-pid
+/// [`ContainmentProof`](safe_ci_dag_runner::cgroup::ContainmentProof), so it is
+/// the only outcome allowed to produce `boxed` evidence.
+///
+/// Returns the per-step manager plus the state that must be written to every
+/// artifact. On the default path a successful re-exec replaces this process and
+/// does not return. A forged/stale sentinel accepted under
+/// `--allow-cgroup-failure` is `unknown`, not `unboxed`: absence of proof does
+/// not prove absence of containment.
+fn resolve_cgroups(
+    allow_failure: bool,
+) -> Result<(BoxedCgroups, Option<String>), u8> {
+    let attempt = if is_in_scope() || !allow_failure {
+        Some(attempt_scope_reexec(None, None, None))
+    } else {
+        None
+    };
+
+    if let Some(ScopeAttempt::AlreadyInScope { ref proof }) = attempt {
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
             eprintln!(
-                "validate: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU \
-                 caps + setsid-proof teardown)."
+                "validate: cgroup boxing ACTIVE; containment OBSERVED: pid {} in {}{} \
+                 (two-level cgroup-v2 scope; per-step memory/CPU caps + setsid-proof teardown).",
+                proof.pid,
+                proof.cgroup.display(),
+                proof.unit.as_ref().map(|u| format!(" (promised unit {u})")).unwrap_or_default(),
             );
-            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
+            return Ok((
+                Some(Arc::new(mgr) as Arc<dyn CgroupManager>),
+                None,
+            ));
         }
         if allow_failure {
             eprintln!("validate: WARNING: per-step cgroup setup failed; running UNBOXED (--allow-cgroup-failure).");
-            return Ok(None);
+            return Ok((None, None));
         }
         eprintln!(
             "validate: ERROR: inside a managed scope but per-step cgroups could not be set up; \
@@ -1257,19 +1327,40 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, u8> {
         );
         return Err(3);
     }
+
     if allow_failure {
-        eprintln!(
-            "validate: WARNING: cgroup boxing not established (--allow-cgroup-failure); running \
-             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
-        );
-        return Ok(None);
+        return match attempt {
+            Some(ScopeAttempt::SentinelWithoutContainment { detail }) => {
+                eprintln!(
+                    "validate: WARNING: containment is UNKNOWN ({detail}); proceeding without a \
+                     cgroup manager under --allow-cgroup-failure. This is not evidence of either \
+                     boxed or unboxed execution."
+                );
+                Ok((None, Some(detail)))
+            }
+            Some(other) => {
+                eprintln!(
+                    "validate: WARNING: cgroup boxing not established ({}) under \
+                     --allow-cgroup-failure; running UNBOXED (process-group teardown only, no \
+                     per-step memory/CPU caps).",
+                    other.describe()
+                );
+                Ok((None, None))
+            }
+            None => {
+                eprintln!(
+                    "validate: WARNING: cgroup boxing not established \
+                     (--allow-cgroup-failure); running UNBOXED (process-group teardown only, no \
+                     per-step memory/CPU caps)."
+                );
+                Ok((None, None))
+            }
+        };
     }
-    let reexeced_or_skipped = reexec_in_scope(None, None);
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
-    } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
+    let detail = attempt
+        .as_ref()
+        .map(ScopeAttempt::describe)
+        .unwrap_or_else(|| "scope setup returned no typed outcome".to_string());
     eprintln!(
         "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
          this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
@@ -2986,6 +3077,10 @@ struct LedgerCtx {
     commit_anchored: bool,
     tree_dirty: bool,
     dag_jobs: i64,
+    /// Four-state runner-owned containment record. This is always present in
+    /// schema-5 rows; inability to determine it is `unknown`, never omission or
+    /// inferred boxing.
+    containment: RunContainment,
     /// Only the canonical validate-lock owner ancestry establishes admission.
     admission: Option<&'static str>,
     /// Exact base identities from the parent's single receipt finalizer. Each
@@ -3288,6 +3383,10 @@ fn write_ledger(
         "checks": gates_run,
         "failures": failures,
         "dag_jobs": ctx.dag_jobs,
+        "containment": ctx.containment.label(),
+        "containment_caps_enforced": ctx.containment.caps_enforced(),
+        "containment_subtree_killable": ctx.containment.subtree_killable(),
+        "containment_detail": ctx.containment.describe(),
         // Peak CPU-ACTIVE peer validates, and HOW that was established. `null`
         // means UNKNOWN — a bare run with no observed peer is not proven
         // exclusive, and writing 0 there would be a fabricated exclusivity claim.
@@ -3582,6 +3681,9 @@ struct RunSummary {
     jobs: Option<i64>,
     log: Option<PathBuf>,
     ledger: Option<PathBuf>,
+    /// Explicit on every banner, including paths that stopped before boxing
+    /// could be resolved.  The default is UNKNOWN, not BOXED.
+    containment: RunContainment,
     /// `(wall, user, sys)` seconds for the WHOLE invocation, measured once at the
     /// single cleanup point so the ledger row and the printed summary carry
     /// byte-identical numbers (validate.sh:1855 made the same guarantee, and for
@@ -3606,6 +3708,7 @@ impl RunSummary {
             jobs: None,
             log: None,
             ledger: None,
+            containment: unknown_containment("containment was not resolved on this exit path"),
             cpu_wall: None,
         }
     }
@@ -3658,6 +3761,13 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     if let Some(p) = &s.ledger {
         println!("   ledger: {}", p.display());
     }
+    println!(
+        "   containment: {} (caps_enforced={}, subtree_killable={}) — {}",
+        s.containment.label(),
+        s.containment.caps_enforced(),
+        s.containment.subtree_killable(),
+        s.containment.describe(),
+    );
     // ALWAYS printed, on success, failure, refusal, timeout and interruption
     // alike (validate.sh:1751). Wall alone cannot tell a busy run from a wedged
     // one; CPU (user+sys, this process plus every child it reaped) against wall
@@ -3809,7 +3919,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // the invocation lock: it never runs a gate, and a leaked fixture must never
     // wedge a real run.
     if validate_runtime::stop_test_requested() {
-        return stop_test_seam(&root, &profile_name, parent.as_deref());
+        return stop_test_seam(durable_slot, &root, &profile_name, parent.as_deref());
     }
 
     // ---- concurrent invocation (validate.sh:492) -----------------------------
@@ -4106,8 +4216,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     }
 
-    let cgroups: BoxedCgroups = match resolve_cgroups(args.allow_cgroup_failure) {
-        Ok(c) => {
+    let (cgroups, unresolved_containment): (BoxedCgroups, Option<String>) =
+        match resolve_cgroups(args.allow_cgroup_failure) {
+        Ok((c, unresolved)) => {
             // Claim the re-entrancy marker HERE, not before resolve_cgroups.
             // On the default path resolve_cgroups re-execs into a transient
             // systemd scope and does not return, so the process that reaches
@@ -4116,7 +4227,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             // earlier made the driver read its own boxing re-exec as a nested
             // invocation and refuse itself.
             validate_runtime::claim_active_marker();
-            c
+            (c, unresolved)
         }
         Err(code) => {
             return RunSummary::refused(
@@ -4152,6 +4263,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Safe: just assigned. Cloned so the summary and the ledger can both name it
     // without borrowing the live tee handle.
     let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    // `resolve_cgroups` necessarily runs before the self-tee because it may
+    // re-exec.  Repeat the resolved state after the tee is live so it survives
+    // in the durable record instead of existing only as a transient warning.
+    let initial_containment =
+        observe_run_containment(&cgroups, unresolved_containment.as_deref());
+    print_containment_evidence("initial", &initial_containment);
 
     // ---- box-wide concurrency observation (validate.sh:1499) -----------------
     //
@@ -4201,7 +4318,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
     println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
-    println!("Plan: {node_count} boxed DAG node(s){}", if plan.second.is_some() { " across 2 sequential lanes" } else { "" });
+    println!(
+        "Plan: {node_count} {} DAG node(s){}",
+        initial_containment.label(),
+        if plan.second.is_some() { " across 2 sequential lanes" } else { "" }
+    );
     // A measured estimate from THIS machine's own history, or an honest "not
     // enough history" (validate.sh:936). Printed after the durable log is
     // established so the receipt carries the prediction next to the outcome.
@@ -4299,6 +4420,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
+    let containment = observe_run_containment(&cgroups, unresolved_containment.as_deref());
+    print_containment_evidence("final", &containment);
     let ctx = LedgerCtx {
         started_at,
         host: host.clone(),
@@ -4315,6 +4438,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         commit_anchored,
         tree_dirty: dirty_now,
         dag_jobs: jobs,
+        containment: containment.clone(),
         admission: lock_admitted.then_some("ci-hub-validate-lock"),
         base_sha: receipt.base_sha,
         base_tree: receipt.base_tree,
@@ -4382,6 +4506,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
+        s.containment = containment;
         s.cpu_wall = Some((wall, cpu_user, cpu_sys));
         if !nesting.nested {
             s.ledger = Some(ledger);
@@ -4660,6 +4785,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
+    s.containment = containment;
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
     if !nesting.nested {
         s.ledger = Some(ledger);
@@ -4688,9 +4814,26 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 /// that unrepresentable — orphan detection (`getppid() == 1`) and a lifetime
 /// deadline — and the Python harness additionally tears its own child's process
 /// group down in a `finally`.
-fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSummary {
+fn stop_test_seam(
+    durable_slot: &mut Option<DurableLog>,
+    root: &Path,
+    profile: &str,
+    parent: Option<&Path>,
+) -> RunSummary {
     let started_at = utc_now();
     let started = std::time::Instant::now();
+    let containment = stop_test_containment();
+    // The artifact bracket opts into the production self-tee, redirected under
+    // its temporary DEV_HERMIT_PARENT. Ordinary stop-path tests keep their
+    // historical no-log shape.
+    if env_flag("VALIDATE_STOP_TEST_CAPTURE_DURABLE", "1") {
+        let commit = git_sha();
+        if let Ok(durable) = setup_durable_log(root, profile, &commit) {
+            *durable_slot = Some(durable);
+            print_containment_evidence("initial", &containment);
+        }
+    }
+    let durable_path = durable_slot.as_ref().map(|d| d.path.clone());
     let prior_failure = env_flag("VALIDATE_STOP_TEST_PRIOR_FAILURE", "1");
     let synth = |name: &str, ok: bool| StepOutcome {
         tag: name.to_string(),
@@ -4740,6 +4883,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         commit_anchored: false,
         tree_dirty: tree_dirty(),
         dag_jobs: 0,
+        containment: containment.clone(),
         admission: lock_admitted.then_some("ci-hub-validate-lock"),
         base_sha: serde_json::Value::Null,
         base_tree: serde_json::Value::Null,
@@ -4761,7 +4905,20 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &[],
+        wall,
+        exit_code,
+        &durable_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
@@ -4795,6 +4952,8 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     s.nodes_failed = outcomes.iter().filter(|o| !o.ok).count();
     s.wall_s = Some(wall);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
+    s.log = durable_path;
     s.ledger = Some(ledger);
+    s.containment = containment;
     s
 }
