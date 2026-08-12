@@ -89,9 +89,11 @@ to the jobs a workflow would launch.
   A shard runs iff **any** of its nodes was selected. A release shard also
   declares `needs` (`dbt` / `aux`), which is how the selector decides whether the
   `build-dbt` / `build-aux` release builds are needed.
-- **E2E cells** (`ci/expected-e2e-plan.json`, the 52 portable cells). Cells are
-  filtered by **per-change backend affinity**, not by node membership — see next
-  section.
+- **E2E cells** (`ci/expected-e2e-plan.json`, the checked-in ratcheted portable
+  cell plan). Derive the current total from the length of its `cells` array and
+  per-backend counts by grouping those cells on `backend`; do not copy those
+  growing counts into this document. Cells are filtered by **per-change backend
+  affinity**, not by node membership — see next section.
 - **Release builds.** `build-dbt` / `build-aux` are emitted only when a selected
   shard needs them or a selected e2e cell uses that backend (dbt ⇒ build-dbt;
   sabre/liteinst ⇒ build-aux). `build-debug` is emitted whenever any shard or
@@ -107,10 +109,11 @@ A footprint entry may carry an e2e affinity that filters the cell matrix:
 | `"e2e_all": true` | change can affect any backend (core Detcore, the CLI, a guest fixture) | every cell |
 | *neither* | pure lint/doc/script change | no cells |
 
-So a `detcore-dbt/**` change runs the DBT parity shard + only the 8 DBT cells +
-`build-dbt` (not `build-aux`); a `detcore-sabre/**` change runs the SaBRe shard +
-only the 4 SaBRe cells + `build-aux`; a core `detcore/**` change runs all 52
-cells. `force_full` and unknown paths still run the full cell matrix (fail-safe).
+So a `detcore-dbt/**` change runs the DBT parity shard + every planned cell whose
+backend is `dbt` + `build-dbt` (not `build-aux`); a `detcore-sabre/**` change runs
+the SaBRe shard + every planned cell whose backend is `sabre` + `build-aux`; a
+core `detcore/**` change runs every cell in the current plan. `force_full` and
+unknown paths still run the full cell matrix (fail-safe).
 
 > **KVM note.** KVM is a known backend but is `unsupported` in the portable
 > manifest plan (no `/dev/kvm` in portable CI), so it contributes **zero portable
