@@ -450,6 +450,82 @@ static void pipe_read_end_write(void) {
   close(fds[1]);
 }
 
+static void pipe_edge_write_results(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (write(fds[1], NULL, 0) != 0 || writev(fds[1], NULL, 0) != 0) {
+    fprintf(stderr, "pipe-edge-write-results: zero-length write changed result\n");
+    exit(1);
+  }
+  errno = 0;
+  if (writev(fds[1], NULL, 1) != -1 || errno != EFAULT) {
+    fprintf(stderr, "pipe-edge-write-results: NULL writev was not EFAULT\n");
+    exit(1);
+  }
+  uint8_t byte = 0x19;
+  struct iovec empty = {.iov_base = &byte, .iov_len = 0};
+  if (writev(fds[1], &empty, 1) != 0) {
+    fprintf(stderr, "pipe-edge-write-results: empty vector changed result\n");
+    exit(1);
+  }
+  errno = 0;
+  if (writev(fds[1], &empty, 1025) != -1 || errno != EINVAL) {
+    fprintf(stderr, "pipe-edge-write-results: oversized vector was not EINVAL\n");
+    exit(1);
+  }
+  printf("pipe-edge-write-results:0,EFAULT,EINVAL\n");
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void assert_pipe_packet_boundary(int vectored) {
+  int fds[2];
+  if (pipe2(fds, O_DIRECT) != 0) {
+    fail("pipe2(O_DIRECT)");
+  }
+  const char payload[] = "abc";
+  ssize_t written;
+  if (vectored) {
+    struct iovec vectors[2] = {
+        {.iov_base = (void *)payload, .iov_len = 1},
+        {.iov_base = (void *)(payload + 1), .iov_len = 2},
+    };
+    written = writev(fds[1], vectors, 2);
+  } else {
+    written = write(fds[1], payload, 3);
+  }
+  if (written != 3) {
+    fprintf(stderr, "pipe-packet-mode: vectored=%d wrote=%zd\n", vectored,
+            written);
+    exit(1);
+  }
+  char first;
+  if (read(fds[0], &first, 1) != 1 || first != 'a') {
+    fail("pipe packet first byte");
+  }
+  int flags = fcntl(fds[0], F_GETFL);
+  if (flags < 0 || fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl packet read O_NONBLOCK");
+  }
+  char remainder;
+  errno = 0;
+  if (read(fds[0], &remainder, 1) != -1 || errno != EAGAIN) {
+    fprintf(stderr, "pipe-packet-mode: vectored=%d retained packet remainder\n",
+            vectored);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_packet_mode(void) {
+  assert_pipe_packet_boundary(0);
+  assert_pipe_packet_boundary(1);
+  printf("pipe-packet-mode:scalar,writev\n");
+}
+
 static volatile sig_atomic_t sigpipe_count;
 static void count_sigpipe(int signal_number);
 
@@ -811,6 +887,10 @@ int main(int argc, char **argv) {
     pipe_close_reuse();
   } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
     pipe_read_end_write();
+  } else if (strcmp(argv[1], "pipe-edge-write-results") == 0) {
+    pipe_edge_write_results();
+  } else if (strcmp(argv[1], "pipe-packet-mode") == 0) {
+    pipe_packet_mode();
   } else if (strcmp(argv[1], "pipe-invalid-buffer") == 0) {
     pipe_invalid_buffer_precedence();
   } else if (strcmp(argv[1], "pipe-invalid-sigpipe") == 0) {
