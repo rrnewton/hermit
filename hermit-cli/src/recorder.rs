@@ -655,3 +655,22 @@ impl Recorder {
         result
     }
 }
+
+#[cfg(test)]
+mod passthrough_exemption_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_ptrace_record_replay_exemptions_bypass_recorder() {
+        let subscriptions = Recorder::subscriptions(&Default::default());
+        let intercepted: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+
+        for exemption in detcore::PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS {
+            assert!(
+                !intercepted.contains(&exemption.syscall),
+                "{} is documented as native-equivalent under ptrace record/replay, but Recorder now intercepts it; remove or re-derive the exemption",
+                exemption.syscall
+            );
+        }
+    }
+}

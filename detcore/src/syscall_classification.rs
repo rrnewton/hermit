@@ -34,6 +34,83 @@ pub(crate) fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
     Sysno::iter().chain(std::iter::once(Sysno::last()))
 }
 
+/// One syscall whose native execution is intentionally equivalent under the
+/// current ptrace record/replay substrate.
+///
+/// This is an exemption from interception, not a general claim that the
+/// syscall is harmless. Every entry names the replay-visible equivalence and
+/// the condition that expires it. In-process backends do not inherit these
+/// exemptions because they lack the ptrace container and signal-stop boundary.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PtraceRecordReplayPassthroughExemption {
+    /// The native syscall covered by this exemption.
+    pub syscall: Sysno,
+    /// The replay-visible equivalence that makes native execution safe.
+    pub replay_observable_safety: &'static str,
+    /// The condition that requires this exemption to be removed or re-derived.
+    pub invalidated_when: &'static str,
+}
+
+/// Explicit exemptions for Determinized syscalls that intentionally bypass
+/// both Detcore and Recorder/Replayer interception under ptrace record/replay.
+///
+/// Keep each reason in terms of what record and replay can observe. Keep each
+/// invalidation condition current: an entry without an expiry boundary is an
+/// unauditable omission, not an exemption.
+pub const PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS: [PtraceRecordReplayPassthroughExemption;
+    10] = [
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::getuid,
+        replay_observable_safety: "map_root fixes the native real UID at 0, so record and replay return the same constant and change no state",
+        invalidated_when: "ptrace record/replay stops using the one-entry root UID map, real credentials can change, or another backend inherits this bypass",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::geteuid,
+        replay_observable_safety: "map_root fixes the native effective UID at 0, so record and replay return the same constant and change no state",
+        invalidated_when: "ptrace record/replay stops using the one-entry root UID map, effective credentials can change, or another backend inherits this bypass",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::getgid,
+        replay_observable_safety: "map_root fixes the native real GID at 0, so record and replay return the same constant and change no state",
+        invalidated_when: "ptrace record/replay stops using the one-entry root GID map, real credentials can change, or another backend inherits this bypass",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::getegid,
+        replay_observable_safety: "map_root fixes the native effective GID at 0, so record and replay return the same constant and change no state",
+        invalidated_when: "ptrace record/replay stops using the one-entry root GID map, effective credentials can change, or another backend inherits this bypass",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::getresuid,
+        replay_observable_safety: "the root UID map makes the native kernel write the same three zero uid_t values to guest memory in record and replay",
+        invalidated_when: "any real, effective, or saved UID can differ from 0, credential mutation becomes native, or the root UID map is absent",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::getresgid,
+        replay_observable_safety: "the root GID map makes the native kernel write the same three zero gid_t values to guest memory in record and replay",
+        invalidated_when: "any real, effective, or saved GID can differ from 0, credential mutation becomes native, or the root GID map is absent",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::tgkill,
+        replay_observable_safety: "stable namespace TGID/TID identity and serialized target lifetime fix the native return, while ptrace signal stops still route delivery through Detcore",
+        invalidated_when: "PID identity or target lifetime is unstable, execution is not serialized, external signals compete, or signal-delivery stops bypass Detcore",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::tkill,
+        replay_observable_safety: "stable namespace TID identity and serialized target lifetime fix the native return, while ptrace signal stops still route delivery through Detcore",
+        invalidated_when: "TID identity or target lifetime is unstable, execution is not serialized, external signals compete, or signal-delivery stops bypass Detcore",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::rt_tgsigqueueinfo,
+        replay_observable_safety: "stable target identity and serialized pending-queue state fix the native return; guest siginfo is input and ptrace routes delivery through Detcore",
+        invalidated_when: "target lifetime or realtime queue capacity can vary, external producers perturb pending state, execution is not serialized, or signal stops bypass Detcore",
+    },
+    PtraceRecordReplayPassthroughExemption {
+        syscall: Sysno::rt_sigpending,
+        replay_observable_safety: "the call only copies the pending mask, which is identical after serialized signal generation and delivery with no external signal injection",
+        invalidated_when: "any producer or delivery path changes pending state outside Detcore, external signal injection is admitted, or signal ordering is no longer deterministic",
+    },
+];
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Detcore's execution policy for a named Linux syscall.
 pub(crate) enum SyscallClassification {
@@ -1288,6 +1365,52 @@ pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ptrace_record_replay_passthrough_exemptions_are_exact_and_auditable() {
+        let expected = [
+            Sysno::getuid,
+            Sysno::geteuid,
+            Sysno::getgid,
+            Sysno::getegid,
+            Sysno::getresuid,
+            Sysno::getresgid,
+            Sysno::tgkill,
+            Sysno::tkill,
+            Sysno::rt_tgsigqueueinfo,
+            Sysno::rt_sigpending,
+        ];
+        let actual = PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS.map(|entry| entry.syscall);
+
+        assert_eq!(
+            actual, expected,
+            "the reviewed exemption set is exactly 10 syscalls"
+        );
+        for unsafe_network_syscall in [Sysno::listen, Sysno::shutdown] {
+            assert!(
+                !actual.contains(&unsafe_network_syscall),
+                "{unsafe_network_syscall} is not replay-observable-equivalent while ptrace record/replay shares the host network namespace"
+            );
+        }
+        for entry in PTRACE_RECORD_REPLAY_PASSTHROUGH_EXEMPTIONS {
+            assert_eq!(
+                classify_syscall(entry.syscall),
+                SyscallClassification::Determinized,
+                "{} no longer meets the premise: a Determinized syscall intentionally bypasses ptrace record/replay interception",
+                entry.syscall
+            );
+            assert!(
+                !entry.replay_observable_safety.trim().is_empty(),
+                "{} lacks a replay-observable safety reason",
+                entry.syscall
+            );
+            assert!(
+                !entry.invalidated_when.trim().is_empty(),
+                "{} lacks an invalidation condition",
+                entry.syscall
+            );
+        }
+    }
 
     #[test]
     fn every_pinned_sysno_has_an_explicit_classification() {
