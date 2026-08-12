@@ -29,6 +29,7 @@
  * rather than a tautology.
  */
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/syscall.h>
@@ -49,6 +50,21 @@ int main(void) {
     }
 
     long ret = syscall(SYS_sched_getaffinity, 0, (size_t)VIRTUAL_CPUSET_BYTES, mask);
+
+    /*
+     * Report the OBSERVED return value and mask, then branch on them. Printing
+     * the observation rather than a bare "ok" token matters for a parity
+     * contract: the contract compares stdout across backends, so a constant
+     * success token makes every passing backend look alike no matter what mask
+     * it actually saw, and a backend leaking the host's real affinity has to be
+     * re-derived by hand from stderr. With the mask in the stream, a
+     * cross-backend diff shows the leaked bits directly.
+     */
+    printf("sched_getaffinity[%d]=%ld mask=", i, ret);
+    for (int b = 0; b < VIRTUAL_CPUSET_BYTES; b++) {
+      printf("%02x", mask[b]);
+    }
+    printf("\n");
 
     if (ret != VIRTUAL_CPUSET_BYTES) {
       fprintf(stderr,
@@ -73,6 +89,5 @@ int main(void) {
     }
   }
 
-  puts("sched-getaffinity-identity-ok");
   return 0;
 }

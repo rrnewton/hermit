@@ -23,6 +23,18 @@ use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
+/// Buckets where `ci = false` is not allowed to be a silent default.
+///
+/// `backends_disabled` has always required a per-backend reason, but `ci =
+/// false` switches a whole mode-cell off with no justification at all — so a
+/// generated cell is born not-running and nothing records that it is. In the
+/// buckets listed here, every `ci = false` mode must carry a non-empty
+/// `ci_disabled_reason`, and every `ci = true` mode must omit it (a leftover
+/// reason on a running cell is stale documentation).
+///
+/// This is a ratchet: add a bucket once its cells all carry reasons. Cells
+/// outside these buckets may still carry `ci_disabled_reason` voluntarily.
+const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -599,6 +611,40 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
+/// Enforce that a switched-off mode-cell says why it is switched off.
+///
+/// Only applies to [`CI_REASON_REQUIRED_BUCKETS`]. The rule is symmetric on
+/// purpose: `ci = false` must explain itself, and `ci = true` must not carry a
+/// reason, so flipping a cell on forces the stale justification to be deleted
+/// in the same edit rather than left behind to mislead the next reader.
+fn validate_ci_disabled_reason(
+    id: &str,
+    bucket: &str,
+    mode: &str,
+    spec: &toml::map::Map<String, Value>,
+    ci: bool,
+) {
+    if !CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
+        return;
+    }
+    let reason = spec.get("ci_disabled_reason");
+    if ci {
+        if reason.is_some() {
+            die(format!(
+                "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
+            ));
+        }
+        return;
+    }
+    match reason.and_then(Value::as_str) {
+        Some(text) if !text.trim().is_empty() => {}
+        _ => die(format!(
+            "{id}: modes.{mode} sets ci = false and must state why in a non-empty \
+             ci_disabled_reason (bucket `{bucket}` forbids a silent default-off cell)"
+        )),
+    }
+}
+
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -611,10 +657,16 @@ fn validate_mode(
     let spec = spec_value
         .as_table()
         .unwrap_or_else(|| die(format!("{id}: modes.{mode} must be a table")));
-    let mut allowed = vec!["ci", "backends_enabled", "backends_disabled", "guest_args"];
+    let mut allowed = vec![
+        "ci",
+        "ci_disabled_reason",
+        "backends_enabled",
+        "backends_disabled",
+        "guest_args",
+    ];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
-        "chaos" => allowed.extend(["seeds", "assert"]),
+        "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
         "custom" => allowed.extend(["args", "assert"]),
         // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
         // cell from the lossy default comparator to the L2 parity comparator and
@@ -646,6 +698,7 @@ fn validate_mode(
         .get("ci")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci must be a boolean")));
+    validate_ci_disabled_reason(id, bucket, mode, spec, ci);
     let enabled = string_array(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
@@ -760,13 +813,41 @@ fn validate_mode(
                 "{id}: chaos seeds must contain at least two unique integers"
             ));
         }
+        // How many outcome classes the GUEST can produce at all. This is a
+        // property of the program, not of the sweep, and declaring it is what
+        // makes a saturated oracle visible AS saturated: when
+        // `min_distinct >= outcome_classes` the `distinct >= N` check sits on
+        // the guest's ceiling, so it can only ever catch a TOTAL collapse to one
+        // class and is structurally blind to a PARTIAL narrowing of schedule
+        // diversity. The harness records the count on every chaos row so a
+        // reader can tell "diverse" from "saturated and therefore uninformative"
+        // instead of reading a pinned `distinct=2` as strength.
+        let outcome_classes = spec
+            .get("outcome_classes")
+            .and_then(Value::as_integer)
+            .unwrap_or_else(|| {
+                die(format!(
+                    "{id}: enabled chaos mode requires outcome_classes (the guest's \
+                     observable outcome-class ceiling)"
+                ))
+            });
+        if outcome_classes < 2 {
+            die(format!(
+                "{id}: chaos.outcome_classes must be >= 2, got {outcome_classes}"
+            ));
+        }
         let assertions = spec
             .get("assert")
             .and_then(Value::as_table)
             .unwrap_or_else(|| die(format!("{id}: enabled chaos mode requires assert")));
         ensure_keys(
             spec.get("assert").unwrap(),
-            &["min_distinct", "min_passes", "min_failures"],
+            &[
+                "min_distinct",
+                "min_passes",
+                "min_failures",
+                "min_normalized_entropy",
+            ],
             &format!("{id}.modes.chaos.assert"),
         );
         for key in ["min_distinct", "min_passes", "min_failures"] {
@@ -775,6 +856,38 @@ fn validate_mode(
                 other => die(format!(
                     "{id}: chaos.assert.{key} has invalid value {other:?}"
                 )),
+            }
+        }
+        let min_distinct = assertions
+            .get("min_distinct")
+            .and_then(Value::as_integer)
+            .expect("min_distinct validated above");
+        if min_distinct > outcome_classes {
+            die(format!(
+                "{id}: chaos.assert.min_distinct {min_distinct} exceeds outcome_classes \
+                 {outcome_classes}; the guest cannot produce that many classes"
+            ));
+        }
+        // OPTIONAL degree floor on the outcome-class DISTRIBUTION, expressed as
+        // normalized Shannon entropy in 0.0..=1.0. Absent means not enforced,
+        // which is the correct state for a guest whose seed sweep is not yet wide
+        // enough to populate its classes representatively -- a floor that the
+        // current sweep cannot meet would be a new false red, not a better
+        // oracle. Unlike `min_distinct`, this does NOT saturate on a two-class
+        // guest: the class BALANCE keeps moving as diversity narrows.
+        if let Some(value) = assertions.get("min_normalized_entropy") {
+            let entropy = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|integer| integer as f64))
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "{id}: chaos.assert.min_normalized_entropy must be a number, got {value:?}"
+                    ))
+                });
+            if !(0.0..=1.0).contains(&entropy) {
+                die(format!(
+                    "{id}: chaos.assert.min_normalized_entropy must be 0.0..=1.0, got {entropy}"
+                ));
             }
         }
     }
@@ -923,6 +1036,107 @@ liteinst = "unsupported"
         assert!(rows[0].ci);
     }
 
+    const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];
+
+    fn disabled_verify_spec(extra: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = false
+backends_enabled = ["ptrace"]
+{extra}
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#
+        ))
+    }
+
+    #[test]
+    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    fn rejects_silent_default_off_cell_in_ratcheted_bucket() {
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    fn rejects_blank_ci_disabled_reason() {
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"ci_disabled_reason = "   ""#),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn accepts_default_off_cell_that_states_a_reason() {
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &disabled_verify_spec(r#"ci_disabled_reason = "fixture does not compile""#),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].ci);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not carry ci_disabled_reason")]
+    fn rejects_stale_reason_on_enabled_cell() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+ci_disabled_reason = "left over from when this was off"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            REASON_BUCKET,
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    fn leaves_unratcheted_buckets_alone() {
+        // The ratchet must not silently impose the rule on every other bucket;
+        // those still carry bare `ci = false` and must keep validating.
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "c-programs",
+            "portable",
+            "verify",
+            &disabled_verify_spec(""),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
+    }
+
     #[test]
     fn identifies_backend_private_guest_fixtures() {
         let inventory = json!({
@@ -1064,5 +1278,107 @@ liteinst = "unsupported"
         assert!(is_file_or_symlink(&link));
         assert!(!link.is_file());
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    /// A chaos spec that differs from the accepted one only in the clause under
+    /// test, so each refusal below is attributable to that clause and not to
+    /// unrelated invalidity.
+    fn chaos_spec(outcome_classes: &str, assert_body: &str) -> Value {
+        parse_mode(&format!(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+seeds = [0, 9]
+{outcome_classes}
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+
+[assert]
+{assert_body}
+"#
+        ))
+    }
+
+    fn validate_chaos(spec: &Value, rows: &mut Vec<PlanRow>) {
+        validate_mode("bucket/test", "bucket", "portable", "chaos", spec, rows);
+    }
+
+    // POSITIVE side of the bracket: the qualifying spec is accepted and produces
+    // a plan row, so the refusals below are a real discriminator rather than a
+    // clause that rejects everything.
+    #[test]
+    fn accepts_chaos_mode_declaring_its_outcome_class_ceiling() {
+        let spec = chaos_spec(
+            "outcome_classes = 2",
+            "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\n",
+        );
+        let mut rows = Vec::new();
+        validate_chaos(&spec, &mut rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mode, "chaos");
+    }
+
+    #[test]
+    fn accepts_chaos_mode_with_a_normalized_entropy_floor() {
+        let spec = chaos_spec(
+            "outcome_classes = 4",
+            "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\nmin_normalized_entropy = 0.5\n",
+        );
+        let mut rows = Vec::new();
+        validate_chaos(&spec, &mut rows);
+        assert_eq!(rows.len(), 1);
+    }
+
+    // NEGATIVE side: an undeclared ceiling is what makes a saturated oracle
+    // invisible, so it must be refused rather than defaulted.
+    #[test]
+    #[should_panic(expected = "requires outcome_classes")]
+    fn rejects_chaos_mode_without_an_outcome_class_ceiling() {
+        let spec = chaos_spec("", "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\n");
+        validate_chaos(&spec, &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "outcome_classes must be >= 2")]
+    fn rejects_single_class_guest_as_a_chaos_guest() {
+        let spec = chaos_spec(
+            "outcome_classes = 1",
+            "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\n",
+        );
+        validate_chaos(&spec, &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds outcome_classes")]
+    fn rejects_unsatisfiable_min_distinct_above_the_guest_ceiling() {
+        let spec = chaos_spec(
+            "outcome_classes = 2",
+            "min_distinct = 3\nmin_passes = 1\nmin_failures = 1\n",
+        );
+        validate_chaos(&spec, &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "min_normalized_entropy must be 0.0..=1.0")]
+    fn rejects_out_of_range_normalized_entropy_floor() {
+        let spec = chaos_spec(
+            "outcome_classes = 2",
+            "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\nmin_normalized_entropy = 1.5\n",
+        );
+        validate_chaos(&spec, &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "min_normalized_entropy must be a number")]
+    fn rejects_non_numeric_normalized_entropy_floor() {
+        let spec = chaos_spec(
+            "outcome_classes = 2",
+            "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\nmin_normalized_entropy = \"high\"\n",
+        );
+        validate_chaos(&spec, &mut Vec::new());
     }
 }

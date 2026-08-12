@@ -76,9 +76,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub use config::BlockingMode;
+pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+pub use config::config_wire_fingerprint;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
@@ -121,6 +123,16 @@ use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
+
+fn select_thread_exit_detpid(
+    thread_detpid: Option<DetPid>,
+    process_detpid: DetPid,
+) -> (DetPid, bool) {
+    match thread_detpid {
+        Some(detpid) => (detpid, false),
+        None => (process_detpid, true),
+    }
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
@@ -1373,6 +1385,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     last_accounted_user_time,
                     last_accounted_system_time,
+                    thread_cpu_start_user_time: last_accounted_user_time,
+                    thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -2462,7 +2476,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // event, before the guest parent can consume it with wait. Ptrace also
         // guarantees that the process leader exits after the other threads, so
         // the final published aggregate is complete when wait returns.
-        let detpid = thread_state.detpid.expect("Missing DetPid");
+        // DETERMINISTIC RECOVERY (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
+        // is `Option` and starts as `None` ("Initialized later" at the clone site),
+        // so a thread that reaches the exit hook before its per-thread identity is
+        // populated used to `.expect()` here. That panic fires inside a Reverie
+        // teardown callback, while the backend still owns the exit event, which is
+        // the worst place to abort: it can wedge the supervisor rather than fail one
+        // thread. Fall back to the PROCESS-level `self.detpid` -- the same value
+        // `thread_start` passes to `thread_start_request` -- which is non-optional
+        // and deterministic (minted from the process identity, never host-derived),
+        // so the fallback cannot introduce nondeterminism. Warn so the window is
+        // observable instead of silently papered over.
+        let (detpid, used_process_detpid) =
+            select_thread_exit_detpid(thread_state.detpid, self.detpid);
+        if used_process_detpid {
+            tracing::warn!(
+                "[detcore, dtid {}] thread exited before its per-thread detpid was \
+                 initialized; falling back to the process detpid {}",
+                dettid,
+                self.detpid
+            );
+        }
         if dettid == detpid {
             thread_state.record_exited_child_process_cpu_time(detpid);
         } else {
@@ -2765,5 +2799,69 @@ mod process_tree_guest_clock_tests {
         );
 
         assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
+    }
+}
+
+#[cfg(test)]
+mod thread_exit_identity_tests {
+    use super::*;
+
+    #[test]
+    fn initialized_thread_exit_identity_is_preserved() {
+        let thread_detpid = DetPid::from_raw(41);
+        let process_detpid = DetPid::from_raw(7);
+        assert_eq!(
+            select_thread_exit_detpid(Some(thread_detpid), process_detpid),
+            (thread_detpid, false)
+        );
+    }
+
+    #[test]
+    fn missing_thread_exit_identity_uses_process_identity() {
+        let process_detpid = DetPid::from_raw(7);
+        assert_eq!(
+            select_thread_exit_detpid(None, process_detpid),
+            (process_detpid, true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod thread_cpu_time_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_thread_and_fork_child_start_with_zero_thread_cpu() {
+        for clone_flags in [CloneFlags::CLONE_THREAD, CloneFlags::empty()] {
+            let config = Config::default();
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+
+            // Give the parent nonzero CPU before the child exists. The child's
+            // absolute logical clock inherits this position for scheduler
+            // ordering, but Linux per-thread CPU accounting must not.
+            parent.thread_logical_time.add_rcbs(200);
+            parent.thread_logical_time.add_syscall();
+            parent.clone_flags = Some(clone_flags);
+
+            let mut child = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Tid::from_raw(2),
+                Some((Tid::from_raw(1), &parent)),
+            );
+            assert_eq!(
+                child.thread_cpu_time(),
+                (LogicalTime::ZERO, LogicalTime::ZERO),
+                "clone flags {clone_flags:?} inherited pre-creation CPU"
+            );
+
+            child.thread_logical_time.add_rcbs(4);
+            child.thread_logical_time.add_syscall();
+            let (user, system) = child.thread_cpu_time();
+            assert!(user > LogicalTime::ZERO);
+            assert!(system > LogicalTime::ZERO);
+            assert!(user < parent.thread_logical_time.user_cpu_time());
+            assert!(system <= parent.thread_logical_time.system_cpu_time());
+        }
     }
 }

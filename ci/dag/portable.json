@@ -30,6 +30,15 @@
                "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
+      "group": "check", "job": "backend_parity_mutation",
+      "desc": "Backend-parity identity fixtures are non-vacuous (native mutation harness)",
+      "description": "Proves every backend-parity identity fixture would FAIL if a backend got its value wrong: for each declared field, planting a mutation must diverge the fixture's (exit,stdout); a field that changes nothing is flagged VACUOUS. Native mode (cc only, no hermit build) so it guards the whole growing family cheaply on every PR. Real cross-backend parity (golden ptrace vs dbt/kvm) is covered by the dbt_parity node against the same fixtures.",
+      "cmd": "python3 tests/backend-parity/parity_mutation.py",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 134217728,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "portability_paths",
       "desc": "Reject developer-specific paths in build/run files",
       "cmd": "./scripts/check-portable-paths.sh",
@@ -142,9 +151,19 @@
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results ignored/e2e/portable/backend-parity-c/results.jsonl --junit ignored/e2e/portable/backend-parity-c/junit.xml",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 5,
+      "hint": {"resources": {"manifest_guest": 1}, "est_duration_s": 40,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
                "classification": "latency-bound"}
+    },
+    {
+      "group": "e2e", "job": "audit_compile_backend_parity_c",
+      "desc": "Compile every backend-parity-c guest, ci=false cells included",
+      "cmd": "./ci/test_harness.sh audit-compile --category backend-parity-c",
+      "deps": ["e2e.metadata"],
+      "timeout": 300,
+      "hint": {"est_duration_s": 15,
+               "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
+               "classification": "cpu-bound"}
     },
     {
       "group": "e2e", "job": "manifest_bin_c",

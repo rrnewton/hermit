@@ -28,6 +28,7 @@
  * value-printing, the fallback cwd_roundtrip uses.
  */
 
+#define _GNU_SOURCE
 #include <signal.h>
 #include <stdio.h>
 #include <sys/signalfd.h>
