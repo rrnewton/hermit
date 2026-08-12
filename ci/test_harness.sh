@@ -3344,14 +3344,33 @@ EOF
         RESULTS=$results
         TEST_BY_ID["audit/comparison"]=/bin/true
         METADATA_BY_ID["audit/comparison"]=$metadata
-        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$diverged"
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$comparison"
+        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "no result" null "comparison-unavailable" null "$no_result"
+        append_result "audit/comparison" audit privileged verify ptrace FAIL 1 "diverged" null "" null "$diverged"
+        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "missing" null "comparison-unavailable" null "$missing"
+        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "malformed" null "comparison-unavailable" null "$malformed"
+        append_result "audit/comparison" audit privileged chaos ptrace PASS 1 "" null "" null "$noncomparison"
     )
-    jq -e '.comparison_expected == true and .comparison_unavailable_reason == null and .verdict == "diverged" and .bitwise_parity == false and .compared_log_messages.right == 6' "$results" >/dev/null ||
-        die "results.jsonl emitter did not preserve the actual comparison fields"
+    jq -se '
+      length == 6
+      and ([.[] | select(.comparison_expected == true and .verdict == "matched"
+             and .bitwise_parity == false and .compared_log_messages.left == 7)] | length == 1)
+      and ([.[] | select(.comparison_expected == true and .verdict == "no_result"
+             and .bitwise_parity == false and (.comparison_unavailable_reason | length > 0))] | length == 1)
+      and ([.[] | select(.comparison_expected == true and .verdict == "diverged"
+             and .bitwise_parity == false and .compared_log_messages.right == 6)] | length == 1)
+      and ([.[] | select(.comparison_expected == true and .verdict == null
+             and .comparison_unavailable_reason == "comparison verdict file is missing")] | length == 1)
+      and ([.[] | select(.comparison_expected == true and .verdict == null
+             and .comparison_unavailable_reason == "comparison verdict file is not readable structured evidence")] | length == 1)
+      and ([.[] | select(.comparison_expected == false and .verdict == null
+             and (.comparison_unavailable_reason | length > 0))] | length == 1)
+    ' "$results" >/dev/null ||
+        die "results.jsonl emitter did not preserve all comparison states"
 
     unset FAKE_HERMIT_ARGS FAKE_HERMIT_VERDICT
     rm -rf "$scratch"
-    echo "comparison verdict bracket: verify-report=1 strict-preserved=1 replay-report=1 matched/no_result/diverged/missing/malformed=5/5 noncomparison-reason=1 emitter=false-preserved"
+    echo "comparison verdict bracket: verify-report=1 strict-preserved=1 replay-report=1 matched/no_result/diverged/missing/malformed=5/5 noncomparison-reason=1 emitter-states=6/6 false-preserved=3/3"
 }
 
 function write_junit {
