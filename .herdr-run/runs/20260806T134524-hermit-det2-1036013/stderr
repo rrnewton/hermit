@@ -1,0 +1,7 @@
+Scope: scanned 17 tracked Cargo.toml and 4 tracked Cargo.lock files; 10 files contain 46 Reverie revision entries.
+Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included.
+LiteInst cache keys: 0 revision-keyed token(s) all track the pin (dd3c178).
+Reverie pin is current: dd3c178ea9553004d7bf4c494e1b7fd80e7b6ae6 (46 revision entries across 10 tracked Cargo metadata files)
+Scope: checking 1 nested Cargo workspace(s) for lockfile freshness (liteinst-runtime-build).
+OK: liteinst-runtime-build/Cargo.lock is fresh versus its manifest.
+All 1 nested workspace lockfile(s) are fresh.

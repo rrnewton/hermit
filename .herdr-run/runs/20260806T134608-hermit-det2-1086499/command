@@ -1,0 +1,1 @@
+with-proxy gh pr create -R rrnewton/hermit --draft --base main --head stack1/dbi-honour-log-file --title 'DBI: route DETLOG to --log-file instead of stderr' --body-file /tmp/dbi_pr.md

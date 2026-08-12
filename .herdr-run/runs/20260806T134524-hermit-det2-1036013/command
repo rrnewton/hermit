@@ -1,0 +1,1 @@
+with-proxy git -C /home/newton/work/dev-hermit/worktrees/det2/hermit commit -a -F /tmp/dbi_msg.txt

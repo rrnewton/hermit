@@ -1,0 +1,43 @@
+{
+  "agent": "hermit-det2",
+  "argv": [
+    "with-proxy",
+    "git",
+    "-C",
+    "/home/newton/work/dev-hermit/worktrees/det2/hermit",
+    "ls-remote",
+    "--heads",
+    "origin",
+    "refs/heads/stack1/dbi-honour-log-file"
+  ],
+  "config_source": null,
+  "created": [],
+  "duration_seconds": 0.503,
+  "exit_code": 0,
+  "from_cache": true,
+  "pane_id": "wE:p2",
+  "prefix": [
+    "with-proxy"
+  ],
+  "program": "git",
+  "readiness": {
+    "foreground_pgid": 1565492,
+    "process_idle": true,
+    "process_reason": "shell bash (1565492) owns the foreground group",
+    "prompt_reason": "last line ends with prompt tail '$'",
+    "prompt_tail": "$ ",
+    "prompt_verdict": "clean",
+    "shell_pid": 1565492
+  },
+  "rendered": "with-proxy git -C /home/newton/work/dev-hermit/worktrees/det2/hermit ls-remote --heads origin refs/heads/stack1/dbi-honour-log-file",
+  "run_id": "20260806T134541-hermit-det2-1057451",
+  "subcommand": "ls-remote",
+  "tab": {
+    "id": "wE:t2",
+    "label": "hermit-det2"
+  },
+  "workspace": {
+    "id": "wE",
+    "label": "agent-cmds"
+  }
+}
