@@ -345,14 +345,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_value(addr)
             .expect("should be able to read from memory");
 
-        // Linux validates the requested interval before sleeping:
-        // nanosleep(2) and clock_nanosleep(2) both fail EINVAL when tv_nsec is
-        // outside [0, 999999999] or tv_sec is negative.
+        // Linux validates the requested interval BEFORE sleeping: nanosleep(2)
+        // and clock_nanosleep(2) both fail EINVAL when tv_nsec is outside
+        // [0, 999999999] or tv_sec is negative.
         //
-        // Detcore previously fed the signed fields through `as u64`, so
-        // `tv_sec = -1` wrapped to u64::MAX and became an effectively
-        // indefinite sleep. A past absolute deadline is not an error and must
-        // still return 0, so reject only malformed fields here.
+        // Detcore skipped that check and fed the raw fields through `as u64`.
+        // `Timespec` stores both as i64, so `tv_sec = -1` wrapped to
+        // u64::MAX (~1.8e19 seconds) and became `SleepUntil(INDEFINITE)`: the
+        // only guest thread parked with no deadline, the run queue emptied, and
+        // `step2d_handle_empty_queue` deliberately never jumps the clock for an
+        // indefinite waiter (doing so would also wake a `pause(2)`). The
+        // container then died -- exit 1, "Sandbox container exited
+        // unexpectedly" -- where Linux returns an errno and keeps running.
+        //
+        // A past *absolute* deadline is NOT an error and must still return 0,
+        // so this rejects only malformed fields, never an early deadline.
         if t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec > 999_999_999 {
             return Err(Errno::EINVAL.into());
         }
@@ -419,10 +426,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Timespec {
         let base_time = thread_observe_time(guest).await;
 
-        // An absolute deadline already in the past is not an error on Linux:
-        // clock_nanosleep(TIMER_ABSTIME) returns 0 without sleeping. Clamp at
-        // this call site because LogicalTime subtraction itself is unchecked;
-        // changing the shared operator could hide unrelated underflows.
+        // An absolute deadline already in the past is NOT an error on Linux --
+        // clock_nanosleep(TIMER_ABSTIME) simply returns 0 without sleeping.
+        // `LogicalTime`'s `Sub` is a plain subtraction (unlike its `Add` impls,
+        // which saturate deliberately), so `target_time - base_time` underflows
+        // for a past deadline: a debug build panics with "attempt to subtract
+        // with overflow", and a release build wraps to an enormous interval --
+        // the same effectively-indefinite sleep this handler exists to avoid.
+        //
+        // Clamped here rather than by making the shared operator saturate,
+        // because this is the only subtraction of two `LogicalTime`s in the
+        // tree and a silently-saturating operator could hide a real underflow
+        // in some future caller.
         let relative_logical = if target_time <= base_time {
             LogicalTime::from_nanos(0)
         } else {
