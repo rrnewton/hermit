@@ -1356,11 +1356,19 @@ EOF
         die "merge-gate must run the canonical live-query checker on the exact PR head"
 
     local updating_guide="$ROOT_DIR/docs/updating-reverie.md"
+    # These are exact full lines of docs/updating-reverie.md. #2159 rewrote that
+    # guide from flat prose into a numbered list on 2026-08-11, so the previous
+    # flat-prose strings no longer match any line. The four contract POINTS are
+    # unchanged -- linear-main-history pointer, ancestor, monotonic
+    # forward-or-unchanged, and conflict-resolves-to-the-newer-pin -- only the
+    # sentences carrying them moved. The "may lag" clause stays enforced by the
+    # two negative assertions below, which still refuse a guide that restores
+    # tip-equality or rejects a lagging main-history pointer.
     local -a guide_contract=(
-        "For current testing, the pin is an ancestor pointer into Reverie's linear main history."
-        'It may lag the live tip, but it must be an ancestor of `rrnewton/reverie:main`.'
-        'Relative to the landing-base pin, it may only advance forward or remain unchanged.'
-        'When resolving a pin conflict, choose the newer side; choosing the older side is a regression.'
+        "testing it is a pointer into Reverie's **linear main history**, judged by"
+        '1. **Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.'
+        '2. **Monotonic** — relative to the landing-base pin it may only advance forward'
+        '3. **A conflict resolves to the newer pin** — and this is enforced *by* rule 2'
     )
     local contract_line
     for contract_line in "${guide_contract[@]}"; do
