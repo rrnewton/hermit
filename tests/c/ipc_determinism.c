@@ -330,7 +330,9 @@ struct blocked_writer_args {
   int fd;
   uint8_t *bytes;
   size_t length;
+  int vectored;
   atomic_int started;
+  atomic_int finished;
   ssize_t result;
   int error;
 };
@@ -338,8 +340,14 @@ struct blocked_writer_args {
 static void *write_after_start_marker(void *opaque) {
   struct blocked_writer_args *args = opaque;
   atomic_store_explicit(&args->started, 1, memory_order_release);
-  args->result = write(args->fd, args->bytes, args->length);
+  if (args->vectored) {
+    struct iovec vector = {.iov_base = args->bytes, .iov_len = args->length};
+    args->result = writev(args->fd, &vector, 1);
+  } else {
+    args->result = write(args->fd, args->bytes, args->length);
+  }
   args->error = errno;
+  atomic_store_explicit(&args->finished, 1, memory_order_release);
   return NULL;
 }
 
@@ -443,6 +451,96 @@ static void pipe_read_end_write(void) {
 }
 
 static volatile sig_atomic_t sigpipe_count;
+static void count_sigpipe(int signal_number);
+
+static void assert_invalid_pipe_buffer_waits(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x47, (size_t)capacity);
+  write_exact(fds[1], fill, (size_t)capacity);
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = (uint8_t *)1,
+      .length = 1,
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&args.finished, memory_order_acquire)) {
+    fprintf(stderr, "pipe-invalid-buffer: returned before full pipe became writable\n");
+    exit(1);
+  }
+  read_exact(fds[0], fill, 4096);
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EFAULT) {
+    fprintf(stderr, "pipe-invalid-buffer: vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  free(fill);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_invalid_buffer_precedence(void) {
+  assert_invalid_pipe_buffer_waits(0);
+  assert_invalid_pipe_buffer_waits(1);
+  printf("pipe-invalid-buffer:EFAULT-after-wait\n");
+}
+
+static void pipe_invalid_buffer_sigpipe(void) {
+  struct sigaction action = {.sa_handler = count_sigpipe};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGPIPE, &action, NULL) != 0) {
+    fail("sigaction");
+  }
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  close(fds[0]);
+  sigpipe_count = 0;
+  errno = 0;
+  if (write(fds[1], (void *)1, 1) != -1 || errno != EPIPE) {
+    fprintf(stderr, "pipe-invalid-sigpipe: scalar was not EPIPE\n");
+    exit(1);
+  }
+  struct iovec vector = {.iov_base = (void *)1, .iov_len = 1};
+  errno = 0;
+  if (writev(fds[1], &vector, 1) != -1 || errno != EPIPE) {
+    fprintf(stderr, "pipe-invalid-sigpipe: writev was not EPIPE\n");
+    exit(1);
+  }
+  if (sigpipe_count != 2) {
+    fprintf(stderr, "pipe-invalid-sigpipe: signals=%d\n", (int)sigpipe_count);
+    exit(1);
+  }
+  printf("pipe-invalid-sigpipe:%d\n", (int)sigpipe_count);
+  close(fds[1]);
+}
 
 static void count_sigpipe(int signal_number) {
   if (signal_number == SIGPIPE) {
@@ -713,6 +811,10 @@ int main(int argc, char **argv) {
     pipe_close_reuse();
   } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
     pipe_read_end_write();
+  } else if (strcmp(argv[1], "pipe-invalid-buffer") == 0) {
+    pipe_invalid_buffer_precedence();
+  } else if (strcmp(argv[1], "pipe-invalid-sigpipe") == 0) {
+    pipe_invalid_buffer_sigpipe();
   } else if (strcmp(argv[1], "pipe-sigpipe") == 0) {
     pipe_sigpipe_after_wait();
   } else if (strcmp(argv[1], "socketpair") == 0) {
