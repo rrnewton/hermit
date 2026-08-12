@@ -294,8 +294,14 @@ impl StartOpts {
         Backend::Ptrace.ensure_available()?;
         let target = self.resolve_e9patch_record_target()?;
         if !is_elf_file(&target)? {
+            // The not-measured state belongs in the FIELD, not in adjacent prose.
+            // This branch never runs preprocessing, so there is no site count to
+            // report; printing `mapped_sites=0` told a human reading the whole
+            // line the truth (main_executable=non-ELF) while telling a consumer
+            // keyed on `mapped_sites=` a measured zero.
             eprintln!(
-                ":: Backend: e9patch preprocessing + ptrace record runtime; mapped_sites=0; \
+                ":: Backend: e9patch preprocessing + ptrace record runtime; \
+                 preprocessing_attempted=false; candidate_sites=n/a; mapped_sites=n/a; \
                  main_executable=non-ELF; preprocessing=not-applicable"
             );
             return Ok(None);
@@ -305,13 +311,11 @@ impl StartOpts {
         }
 
         let prepared = hermit::e9patch::prepare(&target)?;
-        let rewrite_cache = if prepared.patched_sites == 0 {
-            "not-applicable"
-        } else if prepared.rewrite_cache_hit {
-            "hit"
-        } else {
-            "miss"
-        };
+        let rewrite_cache = rewrite_cache_status(
+            prepared.candidate_sites,
+            prepared.patched_sites,
+            prepared.rewrite_cache_hit,
+        );
         eprintln!(
             ":: Backend: e9patch preprocessing + ptrace record runtime; candidate_sites={}; \
              mapped_sites={}; b0_sites={}; instruction_map_cache={:?}; rewrite_cache={}; \
@@ -462,10 +466,12 @@ impl StartOpts {
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
+                summary: None,
             },
             ComparedRun {
                 output: &replay,
                 log: log2.into_temp_path(),
+                summary: None,
             },
             ComparisonOptions {
                 success_message: "Success: replay matched recording.",
@@ -566,8 +572,62 @@ impl StartOpts {
     }
 }
 
+/// Classify the `rewrite_cache` field of the e9patch banner.
+///
+/// `patched_sites == 0` cannot say WHY nothing was patched. It is true both when
+/// there was nothing to patch (`candidate_sites == 0`) and when there WERE
+/// candidates and none of them got patched -- a real degradation. Labelling both
+/// "not-applicable" reported that degradation as a cache status, while the
+/// discriminator was being printed one field away in the same line. So consult
+/// the denominator: a count is only self-describing next to the size of the
+/// thing it counted.
+fn rewrite_cache_status(candidate_sites: usize, patched_sites: usize, cache_hit: bool) -> String {
+    if candidate_sites == 0 {
+        // Genuinely nothing to patch: the zero is the whole story.
+        "not-applicable".to_string()
+    } else if patched_sites == 0 {
+        // Candidates existed and none were patched. Carry the denominator.
+        format!("patched-none-of-{candidate_sites}")
+    } else if cache_hit {
+        "hit".to_string()
+    } else {
+        "miss".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    // B2 bracket. Both directions matter: it is easy to make every zero read
+    // "degraded" and call the hazard fixed, so the nothing-to-patch case must
+    // still report not-applicable, and a real cache result must still report
+    // hit/miss.
+    #[test]
+    fn rewrite_cache_zero_candidates_is_not_applicable() {
+        // Genuine nothing-to-patch: the zero IS the whole story.
+        assert_eq!(super::rewrite_cache_status(0, 0, false), "not-applicable");
+        assert_eq!(super::rewrite_cache_status(0, 0, true), "not-applicable");
+    }
+
+    #[test]
+    fn rewrite_cache_candidates_but_none_patched_carries_the_denominator() {
+        // The defect: this used to be indistinguishable from "nothing to patch".
+        assert_eq!(
+            super::rewrite_cache_status(37, 0, false),
+            "patched-none-of-37"
+        );
+        assert_eq!(super::rewrite_cache_status(1, 0, true), "patched-none-of-1");
+        // and it must NOT be reported as a cache status
+        assert_ne!(super::rewrite_cache_status(37, 0, false), "not-applicable");
+        assert_ne!(super::rewrite_cache_status(37, 0, true), "hit");
+    }
+
+    #[test]
+    fn rewrite_cache_real_results_still_score() {
+        assert_eq!(super::rewrite_cache_status(37, 37, true), "hit");
+        assert_eq!(super::rewrite_cache_status(37, 12, false), "miss");
+        assert_eq!(super::rewrite_cache_status(1, 1, false), "miss");
+    }
     use super::*;
 
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm

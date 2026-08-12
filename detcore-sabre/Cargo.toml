@@ -19,3 +19,6 @@ reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/
 reverie-sabre = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "c261050cfd41bec67e31bfd0cf6f56be008d0ebb" }
 reverie-syscalls = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "c261050cfd41bec67e31bfd0cf6f56be008d0ebb" }
 syscalls = { version = "0.6.7", features = ["serde"] }
+
+[lints]
+workspace = true

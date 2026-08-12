@@ -76,20 +76,53 @@ if [[ -z $kernel_image ]]; then
   cached_kernel_sha=""
   [[ -r $kernel_image ]] && \
     cached_kernel_sha=$(sha256sum "$kernel_image" | cut -d' ' -f1)
+
+  # A demo that downloads at run time is not hermetic, and on a network whose
+  # egress allowlist refuses the asset host it does not run at all (the pinned
+  # release URL returns 403 here, direct AND through with-proxy). So before
+  # reaching for the network, look for a copy that already satisfies the pin.
+  #
+  # The per-run cache lives under target/, which `cargo clean` deletes -- so a
+  # clean rebuild silently reintroduces the download. The DURABLE cache below
+  # survives that, and is the only reason a machine needs egress at most once.
+  # Every candidate is accepted ONLY on a sha256 match against the pin, so this
+  # widens where the bytes may come from without widening what is trusted.
+  durable_cache=${QEMU_KERNEL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/hermit-demos}
+  durable_kernel=$durable_cache/bzImage-$kernel_sha256
+  if [[ $cached_kernel_sha != "$kernel_sha256" && -r $durable_kernel ]]; then
+    if [[ $(sha256sum "$durable_kernel" | cut -d' ' -f1) == "$kernel_sha256" ]]; then
+      mkdir -p "$output_dir"
+      cp -f "$durable_kernel" "$kernel_image"
+      cached_kernel_sha=$kernel_sha256
+      printf 'kernel ready: %s (durable cache %s)\n' "$kernel_image" "$durable_kernel" >&2
+    fi
+  fi
+
   if [[ $cached_kernel_sha != "$kernel_sha256" ]]; then
     [[ -n $cached_kernel_sha ]] && printf \
       'kernel: replacing cache with unexpected sha256 %s\n' \
       "$cached_kernel_sha" >&2
     kernel_tmp=$output_dir/.bzImage.$$
     printf 'Downloading pinned QEMU kernel (%s)...\n' "$kernel_url" >&2
-    fetch_url "$kernel_url" "$kernel_tmp" || \
-      fail "kernel download failed: $kernel_url"
+    fetch_url "$kernel_url" "$kernel_tmp" || fail \
+      "kernel download failed: $kernel_url
+  This host's egress allowlist may refuse the asset host. The kernel is pinned by
+  sha256, so ANY byte-identical copy works. Provision it once, then every later
+  run is offline:
+    KERNEL_IMAGE=/path/to/bzImage $0
+  or populate the durable cache (see demos/qemu-kernel-asset.txt for the exact
+  fetch command that works from behind the allowlist):
+    mkdir -p $durable_cache && cp bzImage $durable_kernel"
     downloaded_kernel_sha=$(sha256sum "$kernel_tmp" | cut -d' ' -f1)
     if [[ $downloaded_kernel_sha != "$kernel_sha256" ]]; then
       rm -f "$kernel_tmp"
       fail "kernel sha256 mismatch from $kernel_url: expected $kernel_sha256, got $downloaded_kernel_sha"
     fi
     mv "$kernel_tmp" "$kernel_image"
+    # Seed the durable cache so this download happens at most once per machine.
+    if mkdir -p "$durable_cache" 2>/dev/null; then
+      cp -f "$kernel_image" "$durable_kernel" 2>/dev/null || true
+    fi
     printf 'kernel ready: %s\n' "$kernel_image" >&2
   else
     printf 'kernel ready: %s (cached)\n' "$kernel_image" >&2

@@ -50,6 +50,20 @@ pub struct Output {
 pub struct PathEvidence {
     pub schema: u8,
     pub guest_rpc_observed: bool,
+    /// Global requests the coordinator actually serviced from the guest-side
+    /// Detcore tool. Positive evidence that the plugin routed work to Detcore.
+    pub detcore_rpc_requests: u64,
+    /// Which of three structurally distinct states this run ended in.
+    ///
+    /// `ptrace_fallback_sites: 0` cannot distinguish "no fallback was needed"
+    /// from "nothing was ever observed", and the ambiguous zero read as
+    /// success. This field is the discriminator, carried as one value with
+    /// three names rather than left to be inferred from a pair of counters:
+    ///
+    /// - `not_engaged`    -- no guest tool ever reached the coordinator
+    /// - `connected_idle` -- the plugin connected but routed nothing
+    /// - `routed`         -- the plugin connected and routed work
+    pub routing: &'static str,
     pub ptrace_fallback_sites: usize,
     pub trusted_shared_object_sites: usize,
     pub trusted_shared_objects: Vec<String>,
@@ -254,6 +268,25 @@ struct Supervisor {
     trusted_shared_objects: HashSet<PathBuf>,
     signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+}
+
+/// Classify how far a SaBRe run actually got, as ONE value with three names.
+///
+/// The counters that existed before this could not separate "no fallback was
+/// needed" from "nothing was ever observed": both reported zero, and the
+/// ambiguous zero read as success. Absence of a fallback is not evidence of
+/// coverage; only a positive routed count is. Returning a single discriminant
+/// keeps the three states structurally separable rather than something a
+/// consumer has to infer by combining a boolean with a counter.
+pub fn classify_routing(guest_rpc_observed: bool, detcore_rpc_requests: u64) -> &'static str {
+    match (guest_rpc_observed, detcore_rpc_requests) {
+        // No guest-side tool ever reached the coordinator.
+        (false, _) => "not_engaged",
+        // The plugin connected and then routed nothing: a no-result that
+        // previously looked identical to a clean run.
+        (true, 0) => "connected_idle",
+        (true, _) => "routed",
+    }
 }
 
 impl Supervisor {
@@ -467,6 +500,11 @@ impl Supervisor {
         }
 
         let status = root_status.ok_or_else(|| anyhow!("SaBRe root tracee disappeared"))?;
+        // Read the coordinator's own service count, not a number the guest
+        // reported about itself.
+        let detcore_rpc_requests = self.physical_exit_observer.detcore_rpc_requests();
+        let guest_rpc_observed = self.readiness.load(Ordering::Acquire);
+        let routing = classify_routing(guest_rpc_observed, detcore_rpc_requests);
         let mut trusted_shared_objects = self
             .trusted_shared_objects
             .into_iter()
@@ -476,8 +514,10 @@ impl Supervisor {
         Ok((
             status,
             PathEvidence {
-                schema: 1,
+                schema: 2,
                 guest_rpc_observed: self.readiness.load(Ordering::Acquire),
+                detcore_rpc_requests,
+                routing,
                 ptrace_fallback_sites: self.patched_sites.len(),
                 trusted_shared_object_sites: self.trusted_shared_object_sites.len(),
                 trusted_shared_objects,
@@ -1079,6 +1119,46 @@ fn read_pipe<R: Read>(pipe: Option<R>) -> Result<Vec<u8>, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// The three states must be PAIRWISE DISTINCT, not merely correct
+    /// individually. The defect this replaces was two different situations
+    /// collapsing onto one value, so equality between any pair is the actual
+    /// failure mode and is asserted directly.
+    #[test]
+    fn routing_states_are_pairwise_distinct() {
+        let not_engaged = classify_routing(false, 0);
+        let connected_idle = classify_routing(true, 0);
+        let routed = classify_routing(true, 116);
+        assert_eq!(not_engaged, "not_engaged");
+        assert_eq!(connected_idle, "connected_idle");
+        assert_eq!(routed, "routed");
+        assert_ne!(
+            not_engaged, connected_idle,
+            "a plugin that never engaged must not report the same state as one that connected"
+        );
+        assert_ne!(
+            connected_idle, routed,
+            "routing nothing must not report the same state as routing work"
+        );
+        assert_ne!(not_engaged, routed);
+    }
+
+    /// A connected plugin that routed nothing is the ambiguous zero this
+    /// change exists to break: every legacy counter reads zero here, exactly
+    /// as it does for a clean run.
+    #[test]
+    fn connected_but_zero_requests_is_not_routed() {
+        assert_ne!(classify_routing(true, 0), "routed");
+        assert_eq!(classify_routing(true, 1), "routed");
+    }
+
+    /// Never engaged stays never engaged regardless of any count, so a stray
+    /// request cannot launder a run that had no guest tool.
+    #[test]
+    fn not_engaged_is_independent_of_the_count() {
+        assert_eq!(classify_routing(false, 0), "not_engaged");
+        assert_eq!(classify_routing(false, 9999), "not_engaged");
+    }
+
     use super::*;
 
     #[test]

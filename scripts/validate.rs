@@ -59,7 +59,7 @@
 #![recursion_limit = "512"]
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude; // rust-script cache-key: 4088c02090e5 (regen: scripts/lib/prelude-cache-key.sh --write)
 
 #[path = "lib/validate_corpus.rs"]
 mod validate_corpus;
@@ -98,6 +98,7 @@ use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
+use safe_ci_dag_runner::model::IntentionalSkipReason;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
@@ -800,14 +801,46 @@ fn self_test() -> Result<(), String> {
             missing.len()
         ));
     }
+    let rr_failures = validate_corpus::rr_known_failures();
+    let rr_unqualifiable = validate_corpus::rr_attempted_unqualifiable();
+    for label in rr_failures.keys().chain(rr_unqualifiable.keys()) {
+        if !present.contains(label) {
+            return Err(format!(
+                "R/R named exclusion {label:?} is absent from the rr corpus"
+            ));
+        }
+        if validate_corpus::RR_PASSING_LABELS.contains(label) {
+            return Err(format!(
+                "R/R named exclusion {label:?} is also listed as passing"
+            ));
+        }
+    }
+    let overlap: Vec<&&str> = rr_failures
+        .keys()
+        .filter(|label| rr_unqualifiable.contains_key(*label))
+        .collect();
+    if !overlap.is_empty() {
+        return Err(format!(
+            "R/R exclusions cannot be both FAIL and ATTEMPTED_UNQUALIFIABLE: {overlap:?}"
+        ));
+    }
     // e9patch admits a superset of its gated total (rows gate only when the
     // program is installed), so the invariant is >=, not ==.
-    let e9 = count("e9patch")?;
+    let e9_rows = validate_corpus::load(&root, "e9patch", &paths)?;
+    let e9 = e9_rows.len();
     if e9 < validate_corpus::E9PATCH_COMPAT_TOTAL {
         return Err(format!(
             "e9patch corpus has {e9} rows, below E9PATCH_COMPAT_TOTAL {}",
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
+    }
+    let e9_present: BTreeSet<&str> = e9_rows.iter().map(|r| r.label.as_str()).collect();
+    for label in ["curl-localhost", "wget-localhost"] {
+        if !e9_present.contains(label) {
+            return Err(format!(
+                "measured e9patch localhost L2 pass {label:?} is absent from the e9patch corpus"
+            ));
+        }
     }
     println!(
         "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
@@ -834,8 +867,12 @@ fn self_test() -> Result<(), String> {
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
+    // R/R must consume a machine verdict for every real row. Process success is
+    // insufficient because a matched comparison can contain zero evidence.
+    rr_verdict_bracket()?;
     coverage_schema_bracket()?;
     typed_libtest_count_bracket()?;
+    intentional_skip_accounting_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -1077,6 +1114,197 @@ cleared-caps refusal names {} starved step(s)",
         );
     }
 
+    Ok(())
+}
+
+/// Bracket the R/R report classifier and its wiring into the real corpus.
+///
+/// The fixture checks are deliberately two-sided: refusing every report would
+/// satisfy the negative cases while destroying the lane. Coverage is derived
+/// from the current corpus, never copied from historical task counts.
+fn rr_verdict_bracket() -> Result<(), String> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "rr-verdict-bracket-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).map_err(|e| format!("rr verdict bracket: mkdir: {e}"))?;
+    let judge = |name: &str| -> Result<bool, String> {
+        let path = dir.join(name);
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(validate_plan::rr_verdict_check(&path.to_string_lossy()))
+            .output()
+            .map_err(|e| format!("rr verdict bracket: cannot run bash: {e}"))?;
+        Ok(out.status.success())
+    };
+    let plant = |name: &str, body: &str| -> Result<(), String> {
+        fs::write(dir.join(name), format!("{body}\n"))
+            .map_err(|e| format!("rr verdict bracket: write {name}: {e}"))
+    };
+
+    let refuse: &[(&str, &str)] = &[
+        ("missing.json", ""),
+        ("no-result.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}"#),
+        ("diverged.json", r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        ("stripped.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":true},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        // The defining regression: matched configuration over no compared rows.
+        ("zero-counts.json", r#"{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}"#),
+        ("truthy-string.json", r#"{"bitwise_parity":"true"}"#),
+        ("not-an-object.json", r#"[{"bitwise_parity":true}]"#),
+        ("whitespace-only.json", ""),
+        ("truncated.json", r#"{"verified":true,"bitwise_pari"#),
+        ("two-documents.json", "{\"bitwise_parity\":false}\n{\"bitwise_parity\":true}"),
+    ];
+    let mut refused = 0usize;
+    for (name, body) in refuse {
+        if *name != "missing.json" {
+            plant(name, body)?;
+        }
+        if judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} must be REFUSED; the lane would certify no parity evidence"
+            ));
+        }
+        refused += 1;
+    }
+
+    let accept: &[(&str, &str)] = &[
+        ("matched.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":0,"guest_signal":null}"#),
+        // The report remains authoritative when the guest/wrapper exits nonzero.
+        ("nonzero-guest.json", r#"{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strip_lines":false},"compared_log_messages":{"left":2,"right":2},"guest_exit_code":3,"guest_signal":null}"#),
+    ];
+    let mut accepted = 0usize;
+    for (name, body) in accept {
+        plant(name, body)?;
+        if !judge(name)? {
+            return Err(format!(
+                "rr verdict: {name} is genuine parity and must be ACCEPTED"
+            ));
+        }
+        accepted += 1;
+    }
+
+    let rr = validate_plan::CompatMode::Rr.run_args(
+        "echo",
+        "/nonexistent",
+        Some("/tmp/x.json"),
+    );
+    if !rr.iter().any(|a| a == "--verify-json=/tmp/x.json") {
+        return Err(format!("rr verdict: argv does not request a report: {rr:?}"));
+    }
+    if !rr.iter().any(|a| a == "--verify-strict") {
+        return Err("rr verdict: argv lost --verify-strict".into());
+    }
+
+    let tmp_dir = dir.to_string_lossy().to_string();
+    let fake_hermit = dir.join("fake-hermit");
+    let fake_hermit_text = fake_hermit.to_string_lossy().to_string();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: "/nonexistent",
+        real_compat_fixtures: "/nonexistent",
+        validation_tmp_dir: &tmp_dir,
+        shell_build_dir: "/nonexistent",
+    };
+    let rr_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Rr,
+        &fake_hermit_text,
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    if rr_nodes.is_empty() {
+        return Err("rr verdict: real R/R corpus produced zero nodes".into());
+    }
+    let unjudged: Vec<&str> = rr_nodes
+        .iter()
+        .filter(|s| {
+            !(s.cmd.contains("--verify-json=")
+                && s.cmd.contains("bitwise_parity == true"))
+        })
+        .map(|s| s.job.as_str())
+        .collect();
+    if !unjudged.is_empty() {
+        return Err(format!(
+            "rr verdict: {} of {} real R/R node(s) lack report judgement, e.g. {:?}",
+            unjudged.len(),
+            rr_nodes.len(),
+            &unjudged[..unjudged.len().min(3)]
+        ));
+    }
+
+    // Exercise the generated shell, not only the JSON predicate. A genuine
+    // report remains authoritative when Hermit inherits guest exit 3; then a
+    // second invocation that writes nothing must delete and refuse that old
+    // green report rather than reusing stale evidence.
+    let writer = format!(
+        "#!/bin/sh\nreport=\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --verify-json=*) report=${{arg#*=}} ;;\n  esac\ndone\nprintf '%s\\n' '{}' > \"$report\"\nexit 3\n",
+        accept[0].1
+    );
+    fs::write(&fake_hermit, writer)
+        .map_err(|e| format!("rr verdict bracket: write fake hermit: {e}"))?;
+    fs::set_permissions(&fake_hermit, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("rr verdict bracket: chmod fake hermit: {e}"))?;
+    let run = || -> Result<bool, String> {
+        Command::new("bash")
+            .arg("-c")
+            .arg(&rr_nodes[0].cmd)
+            .status()
+            .map(|s| s.success())
+            .map_err(|e| format!("rr verdict bracket: run generated command: {e}"))
+    };
+    if !run()? {
+        return Err(
+            "rr verdict: generated command rejected a genuine report from exit-3 guest".into(),
+        );
+    }
+    fs::write(&fake_hermit, "#!/bin/sh\nexit 0\n")
+        .map_err(|e| format!("rr verdict bracket: rewrite fake hermit: {e}"))?;
+    if run()? {
+        return Err(
+            "rr verdict: generated command reused a stale green report after no new evidence"
+                .into(),
+        );
+    }
+
+    let strict_nodes = validate_plan::compat_nodes_for(
+        &repo_root(),
+        validate_plan::CompatMode::Strict,
+        "/nonexistent/hermit",
+        "/nonexistent",
+        &paths,
+        None,
+        None,
+        None,
+    )?;
+    let leaked = strict_nodes
+        .iter()
+        .filter(|s| s.cmd.contains("--verify-json="))
+        .count();
+    if leaked != 0 {
+        return Err(format!(
+            "rr verdict: {leaked} of {} strict node(s) acquired an R/R report",
+            strict_nodes.len()
+        ));
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    println!(
+        "  rr verdict: {accepted}/{} genuine parity report(s) accepted; \
+         {refused}/{} non-parity report(s) refused; {}/{} real R/R node(s) \
+         judged by report; {leaked}/{} strict node(s) contaminated; generated \
+         command accepted 1/1 exit-3 report and refused 1/1 stale report",
+        accept.len(),
+        refuse.len(),
+        rr_nodes.len(),
+        rr_nodes.len(),
+        strict_nodes.len()
+    );
     Ok(())
 }
 
@@ -3027,7 +3255,12 @@ fn step_with_caps(
 // --------------------------------------------------------------------------- reporting
 
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
-fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
+fn print_cost_table(
+    outcomes: &[StepOutcome],
+    intentional_skips: &[(String, IntentionalSkipReason)],
+    dependency_skips: &[String],
+    unaccounted: &[String],
+) {
     println!("\n=== per-node cost (safe-ci-dag-runner) ===");
     println!("{:<44} {:>9}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
     println!("{}", "-".repeat(84));
@@ -3056,8 +3289,22 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     }
     println!("{}", "-".repeat(84));
     println!("{:<44} {:>9.2}  (sum of node wall)", "TOTAL", total);
-    if !skipped.is_empty() {
-        println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
+    if !intentional_skips.is_empty() {
+        let rendered = intentional_skips
+            .iter()
+            .map(|(tag, reason)| format!("{tag} ({})", reason.value()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("\nSKIPPED intentionally (never passed, never spawned): {rendered}");
+    }
+    if !dependency_skips.is_empty() {
+        println!(
+            "\nskipped (dependency failed, never ran): {}",
+            dependency_skips.join(", ")
+        );
+    }
+    if !unaccounted.is_empty() {
+        println!("\nUNACCOUNTED (planned but neither run nor skipped): {}", unaccounted.join(", "));
     }
 }
 
@@ -3110,6 +3357,14 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             excluded.len()
         );
         for (label, why) in &excluded {
+            println!("  - {label}: {why}");
+        }
+        let unqualifiable = validate_corpus::rr_attempted_unqualifiable();
+        println!(
+            "R/R ratchet additionally excludes {} ATTEMPTED_UNQUALIFIABLE program(s) that never reached replay comparison:",
+            unqualifiable.len()
+        );
+        for (label, why) in &unqualifiable {
             println!("  - {label}: {why}");
         }
     }
@@ -3315,6 +3570,10 @@ fn interrupted_by() -> Option<&'static str> {
 /// One lane's terminal state after any environmental retries.
 struct LaneResult {
     outcomes: Vec<StepOutcome>,
+    /// Nodes deliberately omitted before process spawn, with a closed reason.
+    /// These are accounted for but never become outcomes or passing gates.
+    intentional_skips: Vec<(String, IntentionalSkipReason)>,
+    /// Nodes that did not run because a dependency failed.
     skipped: Vec<String>,
     ok: bool,
     /// How many retry ROUNDS this lane needed; recorded in the ledger so a green
@@ -3323,6 +3582,121 @@ struct LaneResult {
     env_retries: usize,
     /// The whole-invocation deadline expired during this lane.
     run_timed_out: bool,
+}
+
+/// Exact partition of the nodes in one validate plan.
+///
+/// `intentional_skips` are accounted for, but deliberately remain outside
+/// `outcomes`, `gates_run`, and every passing-gate aggregate. Dependency skips
+/// and unaccounted nodes are different facts and stay separately fail-visible.
+#[derive(Debug, Clone)]
+struct NodeAccounting {
+    expected: usize,
+    intentional_skips: Vec<(String, IntentionalSkipReason)>,
+    dependency_skips: Vec<String>,
+    unaccounted: Vec<String>,
+}
+
+impl NodeAccounting {
+    fn skipped_count(&self) -> usize {
+        self.intentional_skips.len() + self.dependency_skips.len() + self.unaccounted.len()
+    }
+}
+
+fn node_accounting(
+    planned: &[String],
+    outcomes: &[StepOutcome],
+    intentional_skips: &[(String, IntentionalSkipReason)],
+    dependency_skips: &[String],
+) -> Result<NodeAccounting, String> {
+    let planned_set: BTreeSet<&str> = planned.iter().map(String::as_str).collect();
+    if planned_set.len() != planned.len() {
+        return Err("planned DAG contains duplicate node tags".into());
+    }
+    let executed: BTreeSet<&str> = outcomes.iter().map(|o| o.tag.as_str()).collect();
+    if executed.len() != outcomes.len() || !executed.is_subset(&planned_set) {
+        return Err("executed nodes are duplicated or absent from the plan".into());
+    }
+
+    let intentional_set: BTreeSet<&str> = intentional_skips.iter().map(|(tag, _)| tag.as_str()).collect();
+    if intentional_set.len() != intentional_skips.len()
+        || !intentional_set.is_subset(&planned_set)
+        || !intentional_set.is_disjoint(&executed)
+    {
+        return Err("intentional skips are duplicated, unplanned, or also executed".into());
+    }
+    let dependency_set: BTreeSet<&str> = dependency_skips.iter().map(String::as_str).collect();
+    if dependency_set.len() != dependency_skips.len()
+        || !dependency_set.is_subset(&planned_set)
+        || !dependency_set.is_disjoint(&executed)
+        || !dependency_set.is_disjoint(&intentional_set)
+    {
+        return Err("dependency skips are duplicated, unplanned, executed, or intentional".into());
+    }
+
+    let accounted: BTreeSet<&str> = executed
+        .union(&intentional_set)
+        .copied()
+        .chain(dependency_set.iter().copied())
+        .collect();
+    let unaccounted = planned_set
+        .difference(&accounted)
+        .map(|tag| (*tag).to_string())
+        .collect();
+    let mut intentional_skips = intentional_skips.to_vec();
+    intentional_skips.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut dependency_skips = dependency_skips.to_vec();
+    dependency_skips.sort();
+    Ok(NodeAccounting {
+        expected: planned.len(),
+        intentional_skips,
+        dependency_skips,
+        unaccounted,
+    })
+}
+
+/// Two-sided receipt bracket: an empty bucket is accounted without becoming a
+/// pass, while a real non-empty peer remains an executed outcome. Mutations
+/// that overlap, invent, or lose a node must refuse.
+fn intentional_skip_accounting_bracket() -> Result<(), String> {
+    let planned = vec!["bucket.empty".to_string(), "bucket.nonempty".to_string()];
+    let ran = StepOutcome {
+        tag: "bucket.nonempty".into(),
+        ok: true,
+        duration_s: 0.01,
+        summary: "ran".into(),
+        executed_tests: None,
+        filtered_tests: None,
+        returncode: Some(0),
+        reason: String::new(),
+        aborted: false,
+    };
+    let skips = vec![("bucket.empty".into(), IntentionalSkipReason::EmptyManifestBucket)];
+    let accounting = node_accounting(&planned, std::slice::from_ref(&ran), &skips, &[])?;
+    if accounting.expected != 2
+        || accounting.intentional_skips.len() != 1
+        || accounting.dependency_skips.len() != 0
+        || !accounting.unaccounted.is_empty()
+    {
+        return Err("typed skip bracket: 1/2 skipped + 1/2 executed was not exactly accounted".into());
+    }
+    // The skipped node has no StepOutcome at all: it therefore cannot enter a
+    // pass/fail gate aggregate by construction.
+    if ran.tag == accounting.intentional_skips[0].0 {
+        return Err("typed skip bracket: skipped node leaked into executed outcomes".into());
+    }
+    for (why, outcomes, skips) in [
+        ("skip also executed", vec![ran.clone()], vec![(ran.tag.clone(), IntentionalSkipReason::EmptyManifestBucket)]),
+        ("unknown skipped node", vec![ran.clone()], vec![("bucket.unknown".into(), IntentionalSkipReason::EmptyManifestBucket)]),
+    ] {
+        if node_accounting(&planned, &outcomes, &skips, &[]).is_ok() {
+            return Err(format!("typed skip bracket: mutation '{why}' must refuse"));
+        }
+    }
+    println!(
+        "  typed skip accounting: 1/1 empty bucket accounted outside pass; 1/1 nonempty peer executed; 2/2 invalid mutations refused"
+    );
+    Ok(())
 }
 
 /// Read the durable log once it has stopped growing.
@@ -3527,7 +3901,10 @@ fn run_lane_with_env_retries(
         );
         return LaneResult {
             outcomes: Vec::new(),
-            skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            intentional_skips: Vec::new(),
+            // The whole-run clock, not a dependency, prevented these nodes from
+            // starting. Leave them unaccounted so the receipt names that fact.
+            skipped: Vec::new(),
             ok: false,
             env_retries: 0,
             run_timed_out: true,
@@ -3549,6 +3926,7 @@ fn run_lane_with_env_retries(
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
+    let mut intentional_skips = first.intentional_skips.clone();
     let mut env_retries = 0usize;
 
     while env_retries < max {
@@ -3637,6 +4015,7 @@ fn run_lane_with_env_retries(
             by_tag.insert(o.tag.clone(), o.clone());
         }
         skipped = again.skipped.clone();
+        intentional_skips.extend(again.intentional_skips.iter().cloned());
     }
 
     // Retries exhausted with an environmental block still standing is a RED, but
@@ -3663,7 +4042,9 @@ fn run_lane_with_env_retries(
     // by the whole-run clock are not a green. Without the typed run bit here an
     // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
     let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
+    intentional_skips.sort_by(|a, b| a.0.cmp(&b.0));
+    intentional_skips.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    LaneResult { outcomes, intentional_skips, skipped, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -3949,7 +4330,7 @@ fn write_ledger(
     ledger: &Path,
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
-    skipped: &[String],
+    accounting: &NodeAccounting,
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
@@ -3972,7 +4353,7 @@ fn write_ledger(
     // append-only and safe to union across machines.
     let record_id = format!("{}-{}-{}", ctx.host, epoch_now(), std::process::id());
     let gates_expected = if ctx.profile == "full" && suite_complete {
-        serde_json::json!(gates_run)
+        serde_json::json!(accounting.expected)
     } else {
         serde_json::Value::Null
     };
@@ -3986,6 +4367,16 @@ fn write_ledger(
                 "reason": o.reason,
                 "aborted": o.aborted,
                 "real_seconds": o.duration_s,
+            })
+        })
+        .collect();
+    let intentional_skipped_nodes: Vec<serde_json::Value> = accounting
+        .intentional_skips
+        .iter()
+        .map(|(name, reason)| {
+            serde_json::json!({
+                "name": name,
+                "reason": reason.value(),
             })
         })
         .collect();
@@ -4051,7 +4442,13 @@ fn write_ledger(
         "filtered_tests": ctx.filtered_tests,
         "gates_run": gates_run,
         "gates_expected": gates_expected,
-        "skipped_nodes": skipped.len(),
+        // Every non-executed state stays typed. An intentional skip is exact
+        // planned-node accounting, but it is never a gate, never executed, and
+        // never a pass. Dependency and unaccounted states remain disqualifying.
+        "skipped_nodes": accounting.skipped_count(),
+        "intentional_skipped_nodes": intentional_skipped_nodes,
+        "dependency_skipped_nodes": accounting.dependency_skips,
+        "unaccounted_nodes": accounting.unaccounted,
         // A timeout is a RESULT, so it is recorded rather than dropped, and it is
         // named so a reader can separate "the tree is broken" from "a gate blew
         // its budget". Operator interrupts never reach this function at all.
@@ -4413,9 +4810,56 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     );
 }
 
+/// Refuse to run out of a checkout that could not have built this binary.
+///
+/// A freshly allocated worktree slot registers the `agent-utils` submodule
+/// without checking it out, so `agent-utils/` exists but is EMPTY. This driver
+/// declares `safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }`,
+/// so that checkout cannot build it. Measured 2026-08-08 with the directory empty:
+///
+///   cold rust-script cache -> exit 1 in 0.034s with a raw `cargo` dependency
+///                             error. Exit 1 is ALSO this driver's ordinary
+///                             "blocking failure(s)" code, so an environment
+///                             fault is indistinguishable from a product red.
+///   warm rust-script cache -> exit 0 in 0.80s printing a COMPLETE, green-looking
+///                             self-test, because rust-script re-executes the
+///                             cached binary and never consults cargo. A checkout
+///                             that cannot build certifies itself.
+///
+/// The warm case is the one this catches, and it is the dangerous one: nothing
+/// else in the run will ever notice. The cold case is unreachable from here by
+/// construction -- if the dependency is missing there is no binary to run -- so
+/// this is deliberately not a claim to cover both.
+///
+/// This lived in `validate.sh` until that shim was deleted (93575493f). Direct
+/// invocation is now the only path, so the check belongs in the driver.
+fn refuse_incomplete_checkout() -> Option<ExitCode> {
+    let root = repo_root();
+    let dep = root.join("agent-utils/rs/safe-ci-dag-runner/Cargo.toml");
+    if dep.is_file() {
+        return None;
+    }
+    eprintln!(
+        "🚫 validate REFUSED (exit 2) — the checkout is incomplete, nothing was validated\n   \
+         missing: agent-utils/rs/safe-ci-dag-runner (this driver's DAG runner dependency)\n   \
+         cause:   a freshly allocated worktree slot registers the agent-utils submodule\n            \
+         without checking it out, so the directory exists but is empty\n   \
+         fix:     git -C {} submodule update --init agent-utils\n   \
+         NOTE:    with a warm rust-script cache this condition otherwise exits 0 and\n            \
+         prints a full green self-test over a checkout that cannot build.",
+        root.display()
+    );
+    Some(ExitCode::from(2))
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
     install_stop_handlers();
+    // Before anything else: a run out of an unbuildable checkout must not be able
+    // to report a verdict at all.
+    if let Some(refusal) = refuse_incomplete_checkout() {
+        return refusal;
+    }
     let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
@@ -5022,6 +5466,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let started_epoch = epoch_now();
     let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
+    let planned_node_tags: Vec<String> = plan
+        .cfg
+        .steps
+        .iter()
+        .chain(plan.second.iter().flat_map(|cfg| cfg.steps.iter()))
+        .map(|step| step.tag())
+        .collect();
 
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
     println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
@@ -5052,6 +5503,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let keep_going = args.keep_going || plan.force_keep_going;
 
     let mut outcomes: Vec<StepOutcome> = Vec::new();
+    let mut intentional_skips: Vec<(String, IntentionalSkipReason)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut ok = true;
     let mut env_retries = 0usize;
@@ -5074,6 +5526,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
+    intentional_skips.extend(r.intentional_skips.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
     env_retries += r.env_retries;
@@ -5083,6 +5536,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         if ok || keep_going {
             let r2 = lane(second);
             outcomes.extend(r2.outcomes.iter().cloned());
+            intentional_skips.extend(r2.intentional_skips.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
             env_retries += r2.env_retries;
@@ -5101,7 +5555,33 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             run_timeout.unwrap_or(0)
         );
     }
-    print_cost_table(&outcomes, &skipped);
+    let (accounting, accounting_error) = match node_accounting(
+        &planned_node_tags,
+        &outcomes,
+        &intentional_skips,
+        &skipped,
+    ) {
+        Ok(accounting) => (accounting, None),
+        Err(error) => {
+            eprintln!("validate: ERROR: node accounting is inconsistent: {error}");
+            ok = false;
+            (
+                NodeAccounting {
+                    expected: planned_node_tags.len(),
+                    intentional_skips: Vec::new(),
+                    dependency_skips: Vec::new(),
+                    unaccounted: planned_node_tags.clone(),
+                },
+                Some(error),
+            )
+        }
+    };
+    print_cost_table(
+        &outcomes,
+        &accounting.intentional_skips,
+        &accounting.dependency_skips,
+        &accounting.unaccounted,
+    );
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -5204,7 +5684,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &ledger,
                 &ctx,
                 &outcomes,
-                &skipped,
+                &accounting,
                 wall,
                 130,
                 &log_path.to_string_lossy(),
@@ -5227,7 +5707,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
-        s.nodes_skipped = skipped.len();
+        s.nodes_skipped = accounting.skipped_count();
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -5350,7 +5830,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
     // these conditions are checked separately and named individually.
-    let refusals = verdict_refusals(compat_measured, structural_failures, executed_tests);
+    let mut refusals = verdict_refusals(compat_measured, structural_failures, executed_tests);
+    if let Some(error) = &accounting_error {
+        refusals.push(format!("node accounting is inconsistent: {error}"));
+    }
+    if !accounting.dependency_skips.is_empty() {
+        refusals.push(format!(
+            "{} planned node(s) were dependency-skipped",
+            accounting.dependency_skips.len()
+        ));
+    }
+    if !accounting.unaccounted.is_empty() {
+        refusals.push(format!(
+            "{} planned node(s) were unaccounted",
+            accounting.unaccounted.len()
+        ));
+    }
     if exit_code == 0 && !refusals.is_empty() {
         for why in &refusals {
             eprintln!("validate: ERROR: {why}");
@@ -5388,7 +5883,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &ledger,
             &ctx,
             &outcomes,
-            &skipped,
+            &accounting,
             wall,
             exit_code,
             &log_path.to_string_lossy(),
@@ -5469,6 +5964,18 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
     }
+    if !accounting.intentional_skips.is_empty() {
+        detail.push(format!(
+            "{} node(s) were intentionally skipped with a typed reason; none counted as executed or passing",
+            accounting.intentional_skips.len()
+        ));
+    }
+    if !accounting.unaccounted.is_empty() {
+        detail.push(format!(
+            "{} planned node(s) were unaccounted and remain fail-visible",
+            accounting.unaccounted.len()
+        ));
+    }
     for why in &refusals {
         detail.push(format!("REFUSED ON COMPLETENESS: {why}"));
     }
@@ -5504,7 +6011,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     );
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
-    s.nodes_skipped = skipped.len();
+    s.nodes_skipped = accounting.skipped_count();
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
@@ -5611,7 +6118,23 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    let accounting = NodeAccounting {
+        expected: outcomes.len(),
+        intentional_skips: Vec::new(),
+        dependency_skips: Vec::new(),
+        unaccounted: Vec::new(),
+    };
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &accounting,
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
