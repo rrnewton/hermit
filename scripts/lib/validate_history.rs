@@ -120,7 +120,39 @@ pub struct CacheKey<'a> {
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     match (i(row, "gates_expected"), i(row, "gates_run")) {
         (None, _) => true, // gates_expected null: no obligation was recorded
-        (Some(exp), Some(run)) => run >= exp,
+        (Some(exp), Some(run)) => {
+            let Some(raw_skips) = row.get("intentional_skipped_nodes") else {
+                // Historical rows predate typed skips and remain exact only when
+                // every expected gate actually ran.
+                return run >= exp;
+            };
+            let Some(skips) = raw_skips.as_array() else { return false };
+            let mut names = std::collections::BTreeSet::new();
+            for skip in skips {
+                let Some(object) = skip.as_object() else { return false };
+                if object.len() != 2
+                    || object.get("reason").and_then(serde_json::Value::as_str)
+                        != Some("empty-manifest-bucket")
+                {
+                    return false;
+                }
+                let Some(name) = object.get("name").and_then(serde_json::Value::as_str) else {
+                    return false;
+                };
+                if name.is_empty() || !names.insert(name) {
+                    return false;
+                }
+            }
+            let explicit_empty = |field: &str| {
+                row.get(field)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty)
+            };
+            explicit_empty("dependency_skipped_nodes")
+                && explicit_empty("unaccounted_nodes")
+                && i(row, "skipped_nodes") == i64::try_from(skips.len()).ok()
+                && run.checked_add(i64::try_from(skips.len()).unwrap_or(i64::MAX)) == Some(exp)
+        }
         (Some(_), None) => false,
     }
 }
@@ -143,6 +175,13 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
                 return false;
             }
             if i(row, "executed_nodes").unwrap_or(0) <= 0 {
+                return false;
+            }
+            if i(row, "gates_run").is_some()
+                && i(row, "executed_nodes") != i(row, "gates_run")
+            {
+                // An intentional skip is never an executed node, even when it
+                // satisfies the plan's accounting obligation.
                 return false;
             }
             // Coverage is a first-class part of the claim: a run that PLANNED
@@ -370,23 +409,48 @@ pub fn self_test() -> Result<String, String> {
     };
     let key = CacheKey { tree: "T", profile: "full", host: "h1", toolchain: "rustc 1.0" };
 
-    // POSITIVE, both producers. A predicate that refuses everything would look
-    // correct with negatives alone, so each authority gets a counted accept.
+    // POSITIVE, both producers plus the typed-skip form. A predicate that
+    // refuses everything would look correct with negatives alone, so each
+    // authority gets a counted accept and the Rust authority proves that an
+    // intentional skip accounts for a node without becoming an executed gate.
     let rs_pass = base(serde_json::json!({
         "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 47,
         "gates_expected": 47, "gates_run": 47,
+        "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+    }));
+    let rs_typed_skip_pass = base(serde_json::json!({
+        "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 46,
+        "gates_expected": 47, "gates_run": 46, "skipped_nodes": 1,
+        "intentional_skipped_nodes": [{
+            "name": "privileged-e2e.manifest_applications",
+            "reason": "empty-manifest-bucket"
+        }],
+        "dependency_skipped_nodes": [], "unaccounted_nodes": [],
         "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
     }));
     let sh_pass = base(serde_json::json!({
         "producer": "validate.sh", "executed_tests": 1234, "gates_expected": 12, "gates_run": 12,
     }));
     let mut accepted = 0usize;
-    for (why, row) in [("validate.rs row", &rs_pass), ("validate.sh row", &sh_pass)] {
+    for (why, row) in [
+        ("validate.rs row", &rs_pass),
+        ("validate.rs row with one typed empty-bucket skip", &rs_typed_skip_pass),
+        ("validate.sh row", &sh_pass),
+    ] {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
             return Err(format!("cache: a fully qualifying {why} must be a HIT"));
         }
         accepted += 1;
     }
+
+    let altered = |mut row: serde_json::Value, extra: serde_json::Value| {
+        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                row.insert(key.clone(), value.clone());
+            }
+        }
+        row
+    };
 
     // NEGATIVE: every single missing condition must REFUSE. Each row below is
     // the positive row with exactly one field spoiled, so a refusal is
@@ -406,6 +470,11 @@ pub fn self_test() -> Result<String, String> {
         ("absent coverage block", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5}))),
         ("planned node never ran", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "coverage": {"executed_test_nodes": 4, "absent_nodes": ["test.x"]}}))),
         ("gates_run below gates_expected", base(serde_json::json!({"producer": "validate.rs", "executed_tests": 873, "executed_nodes": 5, "gates_expected": 47, "gates_run": 12, "coverage": {"executed_test_nodes": 5, "absent_nodes": []}}))),
+        ("typed skip with unknown reason", altered(rs_typed_skip_pass.clone(), serde_json::json!({"intentional_skipped_nodes": [{"name": "privileged-e2e.manifest_applications", "reason": "looks-empty"}]}))),
+        ("typed skip also counted as executed", altered(rs_typed_skip_pass.clone(), serde_json::json!({"executed_nodes": 47}))),
+        ("typed skip plus dependency skip", altered(rs_typed_skip_pass.clone(), serde_json::json!({"dependency_skipped_nodes": ["test.lost"]}))),
+        ("typed skip plus unaccounted node", altered(rs_typed_skip_pass.clone(), serde_json::json!({"unaccounted_nodes": ["test.lost"]}))),
+        ("typed skip count mismatch", altered(rs_typed_skip_pass.clone(), serde_json::json!({"skipped_nodes": 0}))),
         ("bash row with zero executed_tests", base(serde_json::json!({"producer": "validate.sh", "executed_tests": 0}))),
         ("bash row with no executed_tests", base(serde_json::json!({"producer": "validate.sh"}))),
         // The cross-producer trap this module exists to close: a validate.rs row

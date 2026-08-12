@@ -25,11 +25,13 @@
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude; // rust-script cache-key: 9754dbf04d4f (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitCode;
 
 use toml::Value;
@@ -237,6 +239,66 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
     format!("{guest} {rendered}")
 }
 
+/// The verify-mode flags and expected status for one cell, as produced by
+/// `hermit-manifest-plan --format verify-flags`.
+///
+/// THIS SCRIPT DERIVES NONE OF IT. Choosing the flag set is policy, and policy
+/// re-implemented per consumer drifts even while the copies agree; a
+/// cross-check cannot save it, because a cross-check can only iterate cells a
+/// consumer names, so a consumer that names none is indistinguishable from one
+/// that agrees. The plan crate owns the derivation and both runners transport
+/// it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VerifyFlags {
+    flags: Vec<String>,
+    shell_status: i64,
+}
+
+/// Parse the plan crate's TSV. Separate from the subprocess call so the wire
+/// format is testable without a build.
+fn parse_verify_flags(tsv: &str) -> BTreeMap<String, VerifyFlags> {
+    let mut out = BTreeMap::new();
+    for line in tsv.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 3 {
+            fail(format!(
+                "hermit-manifest-plan --format verify-flags emitted {} field(s), expected 3: {line:?}",
+                f.len()
+            ));
+        }
+        let shell_status = f[2].parse::<i64>().unwrap_or_else(|_| {
+            fail(format!("verify-flags shell status is not an integer: {line:?}"))
+        });
+        out.insert(
+            f[0].to_owned(),
+            VerifyFlags {
+                flags: f[1].split_whitespace().map(str::to_owned).collect(),
+                shell_status,
+            },
+        );
+    }
+    out
+}
+
+/// Ask the plan crate. Failing loudly matters: silently treating every cell as
+/// unasserted would regenerate commands that measure the lossy comparator or a
+/// `no_result` instead of the cell -- the exact defect this channel prevents.
+fn load_verify_flags(root: &Path) -> BTreeMap<String, VerifyFlags> {
+    let output = Command::new("cargo")
+        .args(["run", "--quiet", "-p", "hermit-manifest-plan", "--", "--format", "verify-flags"])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| fail(format!("cannot run hermit-manifest-plan: {e}")));
+    if !output.status.success() {
+        fail(format!(
+            "hermit-manifest-plan --format verify-flags failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_verify_flags(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -245,6 +307,7 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     guest: &str,
+    verify: &VerifyFlags,
 ) -> String {
     let portable = lane == "portable";
     let profile = if portable {
@@ -252,9 +315,19 @@ fn hermit_command(
     } else {
         ""
     };
+    // Transported verbatim, except the record path: only a runner knows where
+    // its cell writes the verdict, so the plan crate emits the bare flag.
+    let mut declared = String::new();
+    for flag in &verify.flags {
+        declared.push(' ');
+        declared.push_str(&shell_quote(flag));
+        if flag == "--verify-json" {
+            declared.push_str(" \"$cell/verify.json\"");
+        }
+    }
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{declared}{profile} -- {guest}",
             shell_quote(backend)
         ),
         "replay" => format!(
@@ -294,7 +367,11 @@ fn repeat(command: &str, count: i64) -> String {
     format!("for _run in {iterations}; do {command} || exit; done")
 }
 
-fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+fn commands_for_test(
+    test: &Value,
+    bucket: &str,
+    flags: &BTreeMap<String, VerifyFlags>,
+) -> Vec<String> {
     let id = test_id(test, bucket);
     let lane = test
         .get("lane")
@@ -330,7 +407,13 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             &format!("{id}.modes.{mode}.backends_enabled"),
         );
         if backends.is_empty() {
-            fail(format!("{id}: mode `{mode}` has no enabled backend"));
+            // Schema v2 explicitly allows a mode with zero enabled backends
+            // (`ci = false` plus a reason per disabled backend), and
+            // hermit-manifest-plan accepts it, so there is simply no command to
+            // emit. Aborting made the whole generator unusable: it died on the
+            // FIRST manifest, at applications/timed-progress-bar's
+            // single-threaded chaos gap.
+            continue;
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
         // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
@@ -340,6 +423,14 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             .and_then(|a| a.get("runs"))
             .and_then(Value::as_integer)
             .unwrap_or(1);
+        // Only `verify` has an `assert`-driven flag set; every other mode's
+        // `assert` table means something else entirely.
+        let verify = if mode == "verify" {
+            flags.get(&id).cloned().unwrap_or_default()
+        } else {
+            VerifyFlags::default()
+        };
+        let shell_status = verify.shell_status;
         let seeds = if mode == "chaos" {
             let seeds = integer_array(spec.get("seeds"), &format!("{id}.modes.chaos.seeds"));
             if seeds.is_empty() { vec![0, 1] } else { seeds }
@@ -352,15 +443,32 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             let guest = guest_with_args(&guest, &guest_args);
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
-                let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
+                let command = hermit_command(
+                    mode,
+                    &backend,
+                    lane,
+                    timeout,
+                    seed,
+                    &extra,
+                    &guest,
+                    &verify,
+                );
                 let runs = match mode {
                     "chaos" => 2,
                     "custom" => custom_runs,
                     _ => 1,
                 };
                 let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
+                // A cell with a declared guest termination EXITS non-zero when
+                // it succeeds, so the note has to say so or a reader (or a
+                // shell `|| exit`) reads the reproduction as a failure.
+                let status_note = if shell_status == 0 {
+                    String::new()
+                } else {
+                    format!(" expect_shell_status={shell_status}")
+                };
                 lines.push(format!(
-                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
+                    "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}{status_note}",
                     repeat(&command, runs)
                 ));
             }
@@ -418,7 +526,12 @@ TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
   --guest-args  Write nothing; print the declared per-backend guest arguments as
-                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
+                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.
+
+Verify-mode flags for a cell whose `assert` asks for L2 parity or a guest
+termination are NOT derived here: they come from
+`cargo run -p hermit-manifest-plan -- --format verify-flags`, which is also the
+channel an out-of-tree harness should read.";
 
 /// Parse every manifest under `manifests`, validating schema and bucket naming,
 /// and return `(bucket, test)` pairs in file order.
@@ -503,9 +616,10 @@ fn main() -> ExitCode {
         }
     }
 
+    let verify_flags = load_verify_flags(&root);
     let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
     for (bucket, test) in load_manifest_tests(&manifests) {
-        let lines = commands_for_test(&test, &bucket);
+        let lines = commands_for_test(&test, &bucket, &verify_flags);
         match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
             Some((_, existing)) => existing.extend(lines),
             None => by_bucket.push((bucket, lines)),
@@ -629,6 +743,60 @@ guest_args = { ptrace = ["multi"] }
         );
         let spec = &tests[0].1["modes"]["verify"];
         assert!(mode_guest_args(spec, "verify", "kvm", "c-programs/partial").is_empty());
+    }
+
+    const FLAGS_TSV: &str = "c-programs/crasher\t--verify-strict --verify-json --verify-allow both\t139\nc-programs/parity-only\t--verify-strict --verify-json\t0\n";
+
+    /// POSITIVE: the plan crate's flag set must reach the generated line intact,
+    /// with the record path this script owns spliced in after --verify-json.
+    /// Dropping any of it makes the reproduction measure something weaker than
+    /// the cell: no allowance -> a NO_RESULT, no --verify-strict -> the lossy
+    /// comparator, no record -> no guest-termination provenance at all.
+    #[test]
+    fn transported_flags_reach_the_generated_command() {
+        let flags = parse_verify_flags(FLAGS_TSV);
+        let verify = flags.get("c-programs/crasher").expect("crasher flags");
+        assert_eq!(verify.shell_status, 139);
+        let command = hermit_command(
+            "verify", "ptrace", "portable", 60, None, &[], "\"$cell/guest\"", verify,
+        );
+        assert!(
+            command.contains(
+                "--verify --verify-strict --verify-json \"$cell/verify.json\" \
+                 --verify-allow both --no-virtualize-cpuid"
+            ),
+            "expected the full transported flag set, got: {command}"
+        );
+    }
+
+    /// NEGATIVE: a cell the plan crate does not name gains nothing. If any of it
+    /// leaked in unconditionally, every cell would stop enforcing the exit-0
+    /// contract Hermit applies by default.
+    #[test]
+    fn unasserted_cell_leaves_the_command_untouched() {
+        let verify = VerifyFlags::default();
+        let command = hermit_command(
+            "verify", "ptrace", "portable", 60, None, &[], "\"$cell/guest\"", &verify,
+        );
+        assert!(!command.contains("--verify-allow"));
+        assert!(!command.contains("--verify-strict"));
+        assert!(!command.contains("--verify-json"));
+        assert_eq!(verify.shell_status, 0);
+    }
+
+    /// The wire format is the contract between the plan crate and this script,
+    /// so a field-count change must fail loudly rather than silently downgrade a
+    /// cell to the default.
+    #[test]
+    fn flags_tsv_round_trips_every_field() {
+        let flags = parse_verify_flags(FLAGS_TSV);
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags["c-programs/parity-only"].shell_status, 0);
+        assert_eq!(
+            flags["c-programs/parity-only"].flags,
+            vec!["--verify-strict", "--verify-json"]
+        );
+        assert!(parse_verify_flags("").is_empty());
     }
 
     /// The TSV dump is the out-of-tree harness's only source for these

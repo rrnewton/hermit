@@ -1128,6 +1128,8 @@ async fn run_sabre(
         target: "hermit::sabre::fallback",
         ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
         trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
+        detcore_rpc_requests = supervised.path_evidence.detcore_rpc_requests,
+        routing = supervised.path_evidence.routing,
         guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
         "SaBRe ptrace fallback completed",
     );
@@ -1145,6 +1147,19 @@ async fn run_sabre(
     // whose counters are zero.
     let backend_evidence = sabre_backend_evidence_line(&supervised.path_evidence);
     tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
+    match supervised.path_evidence.routing {
+        "not_engaged" => tracing::warn!(
+            target: "hermit::sabre",
+            "no guest-side Detcore tool ever reached this coordinator: the run \
+             was NOT determinized and its result is a no-result, not a pass.",
+        ),
+        "connected_idle" => tracing::warn!(
+            target: "hermit::sabre",
+            "the SaBRe plugin connected but routed ZERO requests to Detcore: \
+             nothing was determinized. This is a no-result, not a pass.",
+        ),
+        _ => {}
+    }
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1213,9 +1228,12 @@ fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> 
 fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
     format!(
         ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
-         evidence_schema={}; preplugin_coverage=absent; ptrace_fallback_sites={}; \
-         trusted_shared_object_sites={}; guest_rpc_observed={}; reach_state={}",
+         evidence_schema={}; preplugin_coverage=absent; detcore_rpc_requests={}; routing={}; \
+         ptrace_fallback_sites={}; trusted_shared_object_sites={}; guest_rpc_observed={}; \
+         reach_state={}",
         evidence.schema,
+        evidence.detcore_rpc_requests,
+        evidence.routing,
         evidence.ptrace_fallback_sites,
         evidence.trusted_shared_object_sites,
         evidence.guest_rpc_observed,
@@ -2179,8 +2197,10 @@ mod tests {
     #[test]
     fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
         let exercised = super::sabre_ptrace::PathEvidence {
-            schema: 1,
+            schema: 2,
             guest_rpc_observed: true,
+            detcore_rpc_requests: 116,
+            routing: "routed",
             ptrace_fallback_sites: 0,
             trusted_shared_object_sites: 2,
             trusted_shared_objects: vec!["/usr/lib/libc.so.6".to_owned()],
@@ -2188,17 +2208,22 @@ mod tests {
         assert_eq!(
             sabre_backend_evidence_line(&exercised),
             ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
-             evidence_schema=1; preplugin_coverage=absent; ptrace_fallback_sites=0; \
-             trusted_shared_object_sites=2; guest_rpc_observed=true; \
+             evidence_schema=2; preplugin_coverage=absent; detcore_rpc_requests=116; \
+             routing=routed; ptrace_fallback_sites=0; trusted_shared_object_sites=2; \
+             guest_rpc_observed=true; \
              reach_state=sabre-exercised"
         );
 
         let unengaged = super::sabre_ptrace::PathEvidence {
             guest_rpc_observed: false,
+            detcore_rpc_requests: 0,
+            routing: "not_engaged",
             ..exercised
         };
         let fact = sabre_backend_evidence_line(&unengaged);
         assert!(fact.contains("preplugin_coverage=absent"));
+        assert!(fact.contains("detcore_rpc_requests=0"));
+        assert!(fact.contains("routing=not_engaged"));
         assert!(fact.contains("reach_state=no-detcore-reached"));
         assert!(!fact.contains("reach_state=sabre-exercised"));
     }

@@ -19,3 +19,6 @@ reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.c
 reverie-dbt = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "c261050cfd41bec67e31bfd0cf6f56be008d0ebb", default-features = false }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tracing = "0.1.41"
+
+[lints]
+workspace = true
