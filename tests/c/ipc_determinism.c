@@ -634,9 +634,63 @@ static void assert_invalid_pipe_buffer_waits(int vectored) {
   close(fds[1]);
 }
 
+static void assert_invalid_partial_pipe_buffer_waits(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  uint8_t fill[4000];
+  uint8_t consumed[2000];
+  memset(fill, 0x58, sizeof(fill));
+  write_exact(fds[1], fill, sizeof(fill));
+  read_exact(fds[0], consumed, sizeof(consumed));
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = NULL,
+      .length = 100,
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&args.finished, memory_order_acquire)) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: partial vectored=%d touched NULL before space existed\n",
+            vectored);
+    exit(1);
+  }
+  read_exact(fds[0], consumed, sizeof(consumed));
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EFAULT) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: partial vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
 static void pipe_invalid_buffer_precedence(void) {
   assert_invalid_pipe_buffer_waits(0);
   assert_invalid_pipe_buffer_waits(1);
+  assert_invalid_partial_pipe_buffer_waits(0);
+  assert_invalid_partial_pipe_buffer_waits(1);
   printf("pipe-invalid-buffer:EFAULT-after-wait\n");
 }
 
