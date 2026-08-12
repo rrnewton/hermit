@@ -24,7 +24,10 @@ MANIFEST_INPUTS = [
     "ci/matrix-symmetry-baseline.json",
     "tests/e2e/manifests",
 ]
-FINAL_ATTRIBUTION = re.compile(r"^\[[^\]]+\] \[[^\]]+, devbig[0-9]+\]$")
+FINAL_ATTRIBUTION = re.compile(
+    r"^(?:\[[^\]]+\] \[[^\]]+, devbig[0-9]+\]"
+    r"|\[[^,\[\]]+, [^,\[\]]+, [^,\[\]]+, devbig[0-9]+, role=[a-z-]+\])$"
+)
 
 
 class Refusal(RuntimeError):

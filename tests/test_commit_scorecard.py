@@ -441,6 +441,23 @@ class ScorecardTests(unittest.TestCase):
         self.assertEqual(1, refused.returncode)
         self.assertIn("exactly one compatibility scorecard", refused.stderr)
 
+    def test_insert_keeps_resolved_disclosure_as_the_final_line(self) -> None:
+        message = self.repo.root / "message-with-disclosure"
+        disclosure = "[hermit2, codex-reviewB, unresolved, devbig014, role=impl]"
+        message.write_text(f"subject\n\nTask: scorecard-table-in-every-commit\n{disclosure}\n")
+        self.repo.stage()
+        run(
+            self.repo.root,
+            "python3",
+            "scripts/commit-scorecard.py",
+            "insert",
+            str(message),
+        )
+        rendered = message.read_text()
+        self.assertIn("Task: scorecard-table-in-every-commit", rendered)
+        self.assertEqual(disclosure, rendered.rstrip().splitlines()[-1])
+        self.assertLess(rendered.index("<!-- COMPATIBILITY-SCORECARD:END -->"), rendered.index(disclosure))
+
     def test_insert_for_amend_compares_with_the_commit_parent(self) -> None:
         feature = self.repo.commit("feature")
         message = self.repo.root / "amend-message"

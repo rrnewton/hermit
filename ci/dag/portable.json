@@ -16,7 +16,7 @@
     {
       "group": "check", "job": "commit_scorecard",
       "desc": "Require every commit to carry the compatibility scorecard from its qualifying VALIDATE receipt",
-      "cmd": "python3 scripts/commit-scorecard.py check-range --base origin/main --head HEAD",
+      "cmd": "python3 tests/test_commit_scorecard.py && python3 scripts/commit-scorecard.py check-range --base origin/main --head HEAD",
       "timeout": 60,
       "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
                "hard_mem_max_bytes": 536870912, "classification": "light"}

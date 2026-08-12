@@ -3181,6 +3181,12 @@
       "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
+      "disposition": "special-driver",
+      "path": "tests/test_commit_scorecard.py",
+      "runner": "ci/dag/portable.json check.commit_scorecard",
+      "why": "tests/test_commit_scorecard.py is owned by ci/dag/portable.json check.commit_scorecard: it exercises the host-side compatibility-scorecard renderer and commit-message gate, including the fail-closed receipt and mutation brackets. It observes no guest program, so the validation DAG runs it directly rather than scheduling it through the end-to-end manifest."
+    },
+    {
       "disposition": "support-data",
       "path": "tests/util/README.md",
       "runner": "developers invoking tests/util probes",
