@@ -126,12 +126,13 @@ def process_start_ticks(pid: int) -> int:
 
 def authority_status(kind: str, target: str) -> str:
     host = subprocess.check_output(["hostname", "-s"], text=True).strip()
+    is_validate = kind == "validate"
     return json.dumps(
         {
             "schema_version": 1,
-            "admissible": True,
+            "admissible": is_validate,
             "state": "held",
-            "reason_code": None,
+            "reason_code": None if is_validate else "canonical-holder-kind-not-validate",
             "canonical_anchor_held": True,
             "cleanup_state": "none",
             "holder": {"kind": kind, "target": target, "host": host},

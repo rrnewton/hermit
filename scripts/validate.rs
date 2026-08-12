@@ -880,6 +880,7 @@ fn self_test() -> Result<(), String> {
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     product_front_door_bracket()?;
+    peer_authority_effects_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -4361,10 +4362,69 @@ enum PeerAuthorityMode {
     InheritOuter,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerAuthorityEffects {
+    start_monitor: bool,
+    inherit_outer: bool,
+    write_ledger: bool,
+    publish: bool,
+}
+
 impl PeerAuthorityMode {
     fn for_nesting(nested: bool) -> Self {
         if nested { Self::InheritOuter } else { Self::EstablishTopLevel }
     }
+
+    fn effects(self) -> PeerAuthorityEffects {
+        match self {
+            Self::EstablishTopLevel => PeerAuthorityEffects {
+                start_monitor: true,
+                inherit_outer: false,
+                write_ledger: true,
+                publish: true,
+            },
+            Self::InheritOuter => PeerAuthorityEffects {
+                start_monitor: false,
+                inherit_outer: true,
+                write_ledger: false,
+                publish: false,
+            },
+        }
+    }
+}
+
+impl PeerAuthorityEffects {
+    fn dispatch_allowed(self, monitor_exclusion_held: bool) -> bool {
+        self.inherit_outer || (self.start_monitor && monitor_exclusion_held)
+    }
+}
+
+fn peer_authority_effects_bracket() -> Result<(), String> {
+    let top = PeerAuthorityMode::for_nesting(false).effects();
+    let nested = PeerAuthorityMode::for_nesting(true).effects();
+    let expected_top = PeerAuthorityEffects {
+        start_monitor: true,
+        inherit_outer: false,
+        write_ledger: true,
+        publish: true,
+    };
+    let expected_nested = PeerAuthorityEffects {
+        start_monitor: false,
+        inherit_outer: true,
+        write_ledger: false,
+        publish: false,
+    };
+    if top != expected_top || !top.dispatch_allowed(true) || top.dispatch_allowed(false) {
+        return Err(format!("top-level peer-authority effects drifted: {top:?}"));
+    }
+    if nested != expected_nested || !nested.dispatch_allowed(false) {
+        return Err(format!("nested peer-authority effects drifted: {nested:?}"));
+    }
+    println!(
+        "  peer authority effects: top-level starts 1 monitor + owns ledger/publisher; \
+         nested starts 0 + owns neither + inherits dispatch"
+    );
+    Ok(())
 }
 
 /// Ask the canonical parent lock authority for the exact owner identity of this
@@ -4423,10 +4483,25 @@ fn canonical_validate_lock_authority(
     let Some(owner) = value.get("owner").and_then(serde_json::Value::as_object) else {
         return Err("canonical-lock-authority-owner-missing".into());
     };
+    // `authority-status` is intentionally validate-oriented: a real held bench
+    // lock is authenticated and reported as held, but is not generally
+    // admissible for validation. Historical-debug is the sole consumer allowed
+    // to accept that exact bench-held shape, and its row is independently typed
+    // NON-QUALIFYING. Cross-kind or differently refused holders remain rejected.
+    let expected_admission_shape = match expected_kind {
+        CanonicalLockKind::Validate => {
+            value.get("admissible").and_then(serde_json::Value::as_bool) == Some(true)
+                && value.get("reason_code").is_some_and(serde_json::Value::is_null)
+        }
+        CanonicalLockKind::Bench => {
+            value.get("admissible").and_then(serde_json::Value::as_bool) == Some(false)
+                && value.get("reason_code").and_then(serde_json::Value::as_str)
+                    == Some("canonical-holder-kind-not-validate")
+        }
+    };
     if value.get("schema_version").and_then(serde_json::Value::as_i64) != Some(1)
-        || value.get("admissible").and_then(serde_json::Value::as_bool) != Some(true)
+        || !expected_admission_shape
         || value.get("state").and_then(serde_json::Value::as_str) != Some("held")
-        || !value.get("reason_code").is_some_and(serde_json::Value::is_null)
         || value.get("canonical_anchor_held").and_then(serde_json::Value::as_bool) != Some(true)
         || !matches!(
             value.get("cleanup_state").and_then(serde_json::Value::as_str),
@@ -5096,6 +5171,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // PAYLOAD — the outer run owns the ledger, receipt, cache, lock and
     // concurrency accounting; a nested non-focused level is refused outright.
     let nesting = validate_runtime::detect_nesting();
+    let peer_authority_mode = PeerAuthorityMode::for_nesting(nesting.nested);
+    let peer_authority_effects = peer_authority_mode.effects();
     if let Some(stale) = nesting.stale_marker {
         eprintln!(
             "validate: ignoring a STALE {} marker naming pid {stale}: that pid is not an ancestor \
@@ -5207,7 +5284,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             );
         }
 
-        let peer_authority_mode = PeerAuthorityMode::for_nesting(nesting.nested);
         match std::env::var(ADMISSION_TEST_MODE_ENV).as_deref() {
             Ok("front-door") => {
                 return RunSummary::new(
@@ -5220,7 +5296,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     )],
                 );
             }
-            Ok("nested-peer") if peer_authority_mode == PeerAuthorityMode::InheritOuter => {
+            Ok("nested-peer")
+                if peer_authority_effects.inherit_outer
+                    && !peer_authority_effects.start_monitor
+                    && !peer_authority_effects.write_ledger
+                    && !peer_authority_effects.publish
+                    && peer_authority_effects.dispatch_allowed(false) =>
+            {
                 return RunSummary::new(
                     Verdict::SelfTest,
                     0,
@@ -5242,8 +5324,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             _ => {}
         }
     }
-
-    let peer_authority_mode = PeerAuthorityMode::for_nesting(nesting.nested);
 
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
     // durable-log setup, and registration.  A nested focused payload inherits the enclosing
@@ -5685,23 +5765,23 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // because a point-in-time probe misses a peer that starts and ends in the
     // middle.
     let registry = validate_runtime::registry_dir(parent.as_deref());
-    let run_record = if nesting.nested {
-        None
-    } else {
+    let run_record = if peer_authority_effects.start_monitor {
         validate_runtime::register_run(&registry, &plan.profile, &root)
-    };
-    let monitor = if nesting.nested {
-        None
     } else {
+        None
+    };
+    let monitor = if peer_authority_effects.start_monitor {
         Some(validate_runtime::ConcurrencyMonitor::start(
             registry.clone(),
             std::time::Duration::from_secs(2),
         ))
+    } else {
+        None
     };
     // The authority-bearing monitor is separate from the legacy CPU telemetry
     // above. Its owner comes only from the canonical parent query; its production
     // proc root and per-uid exclusion lock are not caller-selectable.
-    let lock_authority_start = if peer_authority_mode == PeerAuthorityMode::InheritOuter {
+    let lock_authority_start = if !peer_authority_effects.start_monitor {
         Err("nested-payload-inherits-outer-authority".to_string())
     } else {
         canonical_validate_lock_authority(parent.as_deref(), lock_kind, &commit, &host)
@@ -5712,9 +5792,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         .as_ref()
         .map(|authority| authority.owner_pid)
         .unwrap_or(std::process::id() as i32);
-    let mut peer_monitor = match (peer_authority_mode, controller_start) {
-        (PeerAuthorityMode::InheritOuter, _) => None,
-        (PeerAuthorityMode::EstablishTopLevel, Some(controller_start)) => {
+    let mut peer_monitor = match (peer_authority_effects.start_monitor, controller_start) {
+        (false, _) => None,
+        (true, Some(controller_start)) => {
             match validate_runtime::PeerSnapshotMonitor::start_production(
                 monitor_owner_pid,
                 controller_start,
@@ -5738,13 +5818,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 }
             }
         }
-        (PeerAuthorityMode::EstablishTopLevel, None) => {
+        (true, None) => {
             peer_monitor_start_detail = Some("monitor-controller-identity-unavailable".into());
             None
         }
     };
-    let peer_monitor_excludes_competitors = peer_authority_mode == PeerAuthorityMode::InheritOuter
-        || peer_monitor.as_ref().is_some_and(|monitor| monitor.exclusion_held());
+    let peer_monitor_excludes_competitors = peer_authority_effects.dispatch_allowed(
+        peer_monitor.as_ref().is_some_and(|monitor| monitor.exclusion_held()),
+    );
     if nesting.nested {
         println!(
             "Nested validate (payload of outer pid {}): focused mode {} only; the outer run owns \
@@ -5899,7 +5980,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         concurrent_validates,
         concurrency_proof,
         concurrency_indeterminate_detail,
-    ) = if peer_authority_mode == PeerAuthorityMode::InheritOuter {
+    ) = if peer_authority_effects.inherit_outer {
         // A nested focused process is a DAG payload, not a second validation
         // producer. The live ancestor marker established that relationship
         // above, and the outer driver owns the monitor, ledger, and publisher.
@@ -6072,7 +6153,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // no_result verdict. A TIMEOUT, by contrast, is a completed run and falls
     // through to the normal verdict below.
     if let Some(sig) = &interruption {
-        if !nesting.nested {
+        if peer_authority_effects.write_ledger {
             write_ledger(
                 &ctx,
                 parent.as_deref(),
@@ -6106,7 +6187,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.jobs = Some(jobs);
         s.log = Some(log_path);
         s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-        if !nesting.nested {
+        if peer_authority_effects.write_ledger {
             s.ledger = Some(ledger);
         }
         return s;
@@ -6266,7 +6347,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
-    if !nesting.nested {
+    if peer_authority_effects.write_ledger {
         write_ledger(
             &ctx,
             parent.as_deref(),
@@ -6285,7 +6366,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // first would label the PR from the previous run's newest row. Non-fatal by
     // contract — the exit code is already decided above and nothing here can
     // change it (validate.sh:1735).
-    let publication_eligibility = if concurrency_indeterminate {
+    let publication_eligibility = if !peer_authority_effects.publish {
+        Err("nested payload inherits the outer publisher".to_string())
+    } else if concurrency_indeterminate {
         Err("peer-snapshot authority is indeterminate".to_string())
     } else if concurrent_validates != Some(0) {
         Err("external validation peer was observed".to_string())
@@ -6293,7 +6376,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         validate_receipt::eligible(
         exit_code,
         effective_failures,
-        args.label_pr && !nesting.nested,
+        args.label_pr,
         commit_anchored,
         dirty_now,
         &plan.profile,
@@ -6418,7 +6501,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.jobs = Some(jobs);
     s.log = Some(log_path);
     s.cpu_wall = Some((wall, cpu_user, cpu_sys));
-    if !nesting.nested {
+    if peer_authority_effects.write_ledger {
         s.ledger = Some(ledger);
     }
     s
