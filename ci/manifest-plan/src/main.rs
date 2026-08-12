@@ -1550,10 +1550,14 @@ liteinst = "unsupported"
     }
 
     /// Write a baseline file into a throwaway repo root and run the check.
-    /// `tag` keeps concurrent tests from sharing a directory; `tempfile` is not
-    /// a dependency of this crate and its Cargo manifest is generated.
+    /// The process id separates concurrent test processes and `tag` separates
+    /// concurrent tests within one process, so no two runs share a directory
+    /// and the `remove_dir_all` below cannot truncate another run's fixture;
+    /// `tempfile` is not a dependency of this crate and its Cargo manifest is
+    /// generated.
     fn run_baseline_check(tag: &str, cells: &[&str], documents: &[Value]) {
-        let root = std::env::temp_dir().join(format!("hermit-ci-reason-{tag}"));
+        let root =
+            std::env::temp_dir().join(format!("hermit-ci-reason-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("ci")).expect("mkdir ci");
         let body = json!({"schema": 1, "unreasoned_ci_false_cells": cells});
