@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -524,9 +525,44 @@ static int receive_pipe_writer_alias(int fd) {
   return alias;
 }
 
+static int open_cross_process_pipe_writer_alias(int fd) {
+  int release_child[2];
+  if (pipe(release_child) != 0) {
+    fail("pipe cross-process alias synchronization");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork cross-process alias");
+  }
+  if (child == 0) {
+    close(release_child[1]);
+    uint8_t release;
+    read_exact(release_child[0], &release, sizeof(release));
+    close(release_child[0]);
+    _exit(0);
+  }
+
+  close(release_child[0]);
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long)child, fd);
+  int alias = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+  if (alias < 0) {
+    fail("open cross-process proc pipe writer alias");
+  }
+  uint8_t release = 1;
+  write_exact(release_child[1], &release, sizeof(release));
+  close(release_child[1]);
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fail("waitpid cross-process alias");
+  }
+  return alias;
+}
+
 static int open_pipe_writer_alias(int fd, int alias_kind) {
   if (alias_kind == 2) {
-    return receive_pipe_writer_alias(fd);
+    return open_cross_process_pipe_writer_alias(fd);
   }
   char path[64];
   snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
@@ -606,6 +642,43 @@ static void pipe_partial_read_write(void) {
   assert_nonblocking_then_blocking_tail(0, 2);
   assert_nonblocking_then_blocking_tail(1, 2);
   printf("pipe-partial-read-write:scalar,writev\n");
+}
+
+static void pipe_unavailable_alias_status(void) {
+  int fds[2];
+  if (pipe2(fds, O_NONBLOCK) != 0) {
+    fail("pipe2 unavailable alias status");
+  }
+  int alias = receive_pipe_writer_alias(fds[1]);
+  uint8_t byte = 0x61;
+  struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
+
+  errno = 0;
+  if (fcntl(alias, F_GETFL) != -1 || errno != ENOSYS) {
+    fail("SCM_RIGHTS pipe F_GETFL did not fail closed");
+  }
+  errno = 0;
+  if (fcntl(alias, F_SETFL, 0) != -1 || errno != ENOSYS) {
+    fail("SCM_RIGHTS pipe F_SETFL did not fail closed");
+  }
+  int disabled = 0;
+  errno = 0;
+  if (ioctl(alias, FIONBIO, &disabled) != -1 || errno != ENOSYS) {
+    fail("SCM_RIGHTS pipe FIONBIO did not fail closed");
+  }
+  errno = 0;
+  if (write(alias, &byte, sizeof(byte)) != -1 || errno != ENOSYS) {
+    fail("SCM_RIGHTS pipe write did not fail closed");
+  }
+  errno = 0;
+  if (writev(alias, &vector, 1) != -1 || errno != ENOSYS) {
+    fail("SCM_RIGHTS pipe writev did not fail closed");
+  }
+
+  close(alias);
+  close(fds[0]);
+  close(fds[1]);
+  printf("pipe-unavailable-alias-status:ENOSYS\n");
 }
 
 static void pipe_read_end_write(void) {
@@ -1207,6 +1280,8 @@ int main(int argc, char **argv) {
     pipe_close_reuse();
   } else if (strcmp(argv[1], "pipe-partial-read-write") == 0) {
     pipe_partial_read_write();
+  } else if (strcmp(argv[1], "pipe-unavailable-alias-status") == 0) {
+    pipe_unavailable_alias_status();
   } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
     pipe_read_end_write();
   } else if (strcmp(argv[1], "pipe-edge-write-results") == 0) {

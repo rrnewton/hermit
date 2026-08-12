@@ -109,6 +109,13 @@ struct OpenFileDescription {
     #[serde(default)]
     deterministic_pipe_capacity: bool,
 
+    /// True when this descriptor reached Detcore through an alias operation whose
+    /// source open-file status flags are not available. Linux shares O_NONBLOCK
+    /// across SCM_RIGHTS and pidfd_getfd aliases; until Detcore can join that
+    /// existing open-file description, status-sensitive operations fail closed.
+    #[serde(default)]
+    pipe_status_flags_unknown: bool,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -184,6 +191,7 @@ impl DetFd {
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
                 deterministic_pipe_capacity: false,
+                pipe_status_flags_unknown: false,
             })),
         }
     }
@@ -426,6 +434,16 @@ impl DetFd {
     /// Whether this open file description has Detcore's fixed pipe capacity.
     pub(crate) fn has_deterministic_pipe_capacity(&self) -> bool {
         self.description().deterministic_pipe_capacity
+    }
+
+    /// Mark a pipe alias whose shared Linux status flags Detcore cannot model.
+    pub(crate) fn mark_pipe_status_flags_unknown(&self) {
+        self.description().pipe_status_flags_unknown = true;
+    }
+
+    /// Whether status-sensitive operations on this pipe alias must fail closed.
+    pub(crate) fn pipe_status_flags_unknown(&self) -> bool {
+        self.description().pipe_status_flags_unknown
     }
 
     /// Update file status flags for every alias of this open file description.
