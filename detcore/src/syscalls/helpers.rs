@@ -30,6 +30,7 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::WaitPidFlag;
 
+use crate::fd::DetFd;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
@@ -277,6 +278,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Write,
         mut pinned_pipe: File,
+        pipe_description: DetFd,
     ) -> Result<i64, Error> {
         const MAX_RW_COUNT: usize = 0x7fff_f000;
         const PIPE_BUF: usize = 4096;
@@ -304,7 +306,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             let attempt_len = (target - written_total).min(PIPE_BUF);
-            let result = match pipe_write_readiness(&pinned_pipe, attempt_len) {
+            let readiness = pipe_write_readiness(&pinned_pipe, &pipe_description, attempt_len);
+            let attempted_write = matches!(readiness, Ok(PipeWriteReadiness::Ready));
+            let result = match readiness {
                 Ok(PipeWriteReadiness::Ready) => match buffer.and_then(|buffer| {
                     buffer
                         .as_raw()
@@ -320,6 +324,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
                 Err(error) => Err(error),
             };
+            match result {
+                Ok(written) if written > 0 => pipe_description
+                    .advance_deterministic_pipe_write_tail(
+                        usize::try_from(written).map_err(|_| Errno::EIO)?,
+                    ),
+                Err(Errno::EAGAIN) if attempted_write => {
+                    pipe_description.invalidate_deterministic_pipe_write_tail();
+                }
+                _ => {}
+            }
             if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
@@ -369,6 +383,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
         mut pinned_pipe: File,
+        pipe_description: DetFd,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
@@ -431,7 +446,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             let attempt_len = (target - written_total).min(PIPE_BUF);
-            let result = match pipe_write_readiness(&pinned_pipe, attempt_len) {
+            let readiness = pipe_write_readiness(&pinned_pipe, &pipe_description, attempt_len);
+            let attempted_write = matches!(readiness, Ok(PipeWriteReadiness::Ready));
+            let result = match readiness {
                 Ok(PipeWriteReadiness::Ready) => write_guest_iovec_bytes(
                     guest,
                     &mut pinned_pipe,
@@ -443,6 +460,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
                 Err(error) => Err(error),
             };
+            match result {
+                Ok(written) if written > 0 => pipe_description
+                    .advance_deterministic_pipe_write_tail(
+                        usize::try_from(written).map_err(|_| Errno::EIO)?,
+                    ),
+                Err(Errno::EAGAIN) if attempted_write => {
+                    pipe_description.invalidate_deterministic_pipe_write_tail();
+                }
+                _ => {}
+            }
             if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
@@ -505,7 +532,11 @@ enum PipeWriteReadiness {
     Closed,
 }
 
-fn pipe_write_readiness(pipe: &File, requested: usize) -> Result<PipeWriteReadiness, Errno> {
+fn pipe_write_readiness(
+    pipe: &File,
+    pipe_description: &DetFd,
+    requested: usize,
+) -> Result<PipeWriteReadiness, Errno> {
     let mut descriptor = libc::pollfd {
         fd: pipe.as_raw_fd(),
         events: libc::POLLOUT,
@@ -529,17 +560,18 @@ fn pipe_write_readiness(pipe: &File, requested: usize) -> Result<PipeWriteReadin
         return Ok(PipeWriteReadiness::Closed);
     }
     if result > 0 && descriptor.revents & libc::POLLOUT != 0 {
+        pipe_description.reset_deterministic_pipe_write_tail();
         return Ok(PipeWriteReadiness::Ready);
     }
 
     // poll(2) reports POLLOUT only when the pipe has an unused buffer slot. A one-page
     // stream pipe can nevertheless accept bytes into the tail of its existing buffer after
-    // a partial read. Account for that space so a blocking writer does not wait for the
-    // whole page to drain. FIONREAD does not expose the consumed head offset or the kernel's
-    // buffer merge flag, so this is intentionally optimistic: the nonblocking write below
-    // remains authoritative and an overestimate returns EAGAIN and retries. The unambiguous
-    // full- and closed-pipe cases are still decided before guest memory is copied. Packet-
-    // mode pipe buffers are deliberately not treated as mergeable.
+    // a partial read. FIONREAD does not expose the consumed head offset or the kernel's
+    // buffer merge flag, so capacity minus unread bytes is not writable space. Use only the
+    // write offset tracked from successful writes to Detcore-created one-page pipes. If the
+    // kernel ever contradicts that state, the caller invalidates it and waits for an empty
+    // pipe rather than touching guest memory early. Packet-mode pipe buffers are deliberately
+    // not treated as mergeable.
     // SAFETY: pipe owns a valid descriptor, and these fcntl operations do not dereference
     // their third argument.
     let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
@@ -560,8 +592,19 @@ fn pipe_write_readiness(pipe: &File, requested: usize) -> Result<PipeWriteReadin
     if result < 0 {
         return Err(io_errno(std::io::Error::last_os_error()));
     }
-    let available = capacity.checked_sub(unread).ok_or(Errno::EIO)?;
-    if requested <= usize::try_from(available).map_err(|_| Errno::EIO)? {
+    if unread == 0 {
+        pipe_description.reset_deterministic_pipe_write_tail();
+        return Ok(PipeWriteReadiness::Ready);
+    }
+    let Some(tail) = pipe_description.deterministic_pipe_write_tail() else {
+        return Ok(PipeWriteReadiness::Full);
+    };
+    let capacity = usize::try_from(capacity).map_err(|_| Errno::EIO)?;
+    if usize::try_from(unread).map_err(|_| Errno::EIO)? > tail {
+        pipe_description.invalidate_deterministic_pipe_write_tail();
+        return Ok(PipeWriteReadiness::Full);
+    }
+    if requested <= capacity.checked_sub(tail).ok_or(Errno::EIO)? {
         Ok(PipeWriteReadiness::Ready)
     } else {
         Ok(PipeWriteReadiness::Full)

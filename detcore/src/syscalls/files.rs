@@ -905,16 +905,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
-                    detfd.resource(),
-                    detfd.stat().map(|x| x.inode),
-                )
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            resource,
+            raw_ino,
+            pipe_description,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.resource(),
+                detfd.stat().map(|x| x.inode),
+                detfd.clone(),
+            )
+        })?;
         let blocking_pipe =
             physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
         // Pin the kernel pipe object before any scheduler resource request can let another
@@ -950,6 +957,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 call,
                 pinned_pipe.expect("blocking pipe must be pinned before scheduler yield"),
+                pipe_description,
             )
             .await
         } else if physically_nonblocking
@@ -1107,16 +1115,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
     ) -> Result<i64, Error> {
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, raw_ino) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
-                    detfd.resource(),
-                    detfd.stat().map(|x| x.inode),
-                )
-            })?;
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            resource,
+            raw_ino,
+            pipe_description,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.resource(),
+                detfd.stat().map(|x| x.inode),
+                detfd.clone(),
+            )
+        })?;
 
         let blocking_pipe =
             physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
@@ -1146,6 +1161,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 call,
                 pinned_pipe.expect("blocking pipe must be pinned before scheduler yield"),
+                pipe_description,
             )
             .await
         } else if physically_nonblocking
