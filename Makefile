@@ -33,13 +33,14 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
 		-p detcore-dbt -p detcore-sabre -p hermit-install
 
-# Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
-# fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
-# non-blocking forward-advance advisory without a manual step. An ancestral,
-# monotonic pin may remain behind the live Reverie tip. core.hooksPath is
-# per-repo local config (not tracked), so it must be set once per checkout;
-# wiring it into install-deps is that step.
-install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
+# Install this clone's tracked git hooks (core.hooksPath -> .githooks) so a
+# fresh clone/worktree gets the BLOCKING local pin-consistency check, the
+# non-blocking forward-advance advisory, and the compatibility-scorecard
+# message gates without a manual step. An ancestral, monotonic pin may remain
+# behind the live Reverie tip. core.hooksPath is per-repo local config (not
+# tracked), so it must be set once per checkout; wiring it into install-deps is
+# that step.
+install-hooks: ## Install this checkout's tracked git hooks
 	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)

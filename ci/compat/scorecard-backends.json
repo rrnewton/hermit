@@ -1,0 +1,3 @@
+{
+  "backends": ["ptrace", "kvm", "liteinst", "e9patch", "sabre", "dbt"]
+}

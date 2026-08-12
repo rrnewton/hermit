@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+state=$(git rev-parse --git-path commit-scorecard-previous)
+previous=HEAD
+if [[ -f $state ]]; then
+  previous=$(<"$state")
+  rm -f -- "$state"
+fi
+exec python3 "$root/scripts/commit-scorecard.py" check-message "$1" --previous "$previous"

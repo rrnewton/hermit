@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+previous=HEAD
+if [[ ${2:-} == commit && -n ${3:-} ]]; then
+  previous="${3}^"
+fi
+printf '%s\n' "$previous" > "$(git rev-parse --git-path commit-scorecard-previous)"
+exec python3 "$root/scripts/commit-scorecard.py" insert "$1" --previous "$previous"
