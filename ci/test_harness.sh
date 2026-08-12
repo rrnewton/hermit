@@ -2811,11 +2811,19 @@ function comparison_result_fields {
         jq -cn '{expected:true,unavailable_reason:"comparison verdict file is missing",verdict:null,bitwise_parity:null,compared_log_messages:null}'
         return 0
     fi
+    # `comparison` is null exactly when no verdict was reached: the producer's
+    # VerificationReport::no_result() hardcodes it, and that record is stamped
+    # before every --verify-json run, so it survives any early exit. Demanding
+    # the comparison object unconditionally would route that honest state into
+    # the malformed branch below and republish it as a corrupt artifact, which
+    # is the same collapse the emitter comment further down refuses. The sibling
+    # reader assert_bitwise_parity_verdict already tolerates the null shape.
     if ! jq -e '
         (.verdict | type == "string")
         and (.bitwise_parity | type == "boolean")
-        and (.comparison.strictness | type == "string")
-        and (.comparison.compare_logs | type == "boolean")
+        and (if .verdict == "no_result" and .comparison == null then true
+             else (.comparison.strictness | type == "string")
+                  and (.comparison.compare_logs | type == "boolean") end)
         and ((.compared_log_messages | type) == "object" or (.compared_log_messages == null))
     ' "$verdict" >/dev/null 2>&1; then
         jq -cn '{expected:true,unavailable_reason:"comparison verdict file is not readable structured evidence",verdict:null,bitwise_parity:null,compared_log_messages:null}'
@@ -3284,7 +3292,10 @@ EOF
         custom:{guest_args:{ptrace:[]},assert:{},comparison:{expected:false,reason:"custom mode has no comparison contract"}}
       }}')
     matched='{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":7,"right":7}}'
-    no_result='{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":{"strictness":"stripped","compare_logs":false},"compared_log_messages":null}'
+    # The exact bytes VerificationReport::no_result() writes: comparison is
+    # null, not an object. An invented object here would let the audit pass
+    # while the only shape the producer can emit still failed the reader.
+    no_result='{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}'
     diverged='{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":7,"right":6}}'
     export FAKE_HERMIT_ARGS="$args" FAKE_HERMIT_VERDICT="$matched"
     prepare_cell_dirs "$scratch/verify"
