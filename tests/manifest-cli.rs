@@ -33,6 +33,7 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! clap = { version = "4", features = ["derive"] }
 //! toml = "0.8"
 //! ```
 
@@ -46,6 +47,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
+use clap::Args as ClapArgs;
+use clap::Parser;
+use clap::Subcommand;
 use toml::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
@@ -422,55 +426,90 @@ fn find_test<'a>(manifests: &'a Manifests, id: &str) -> &'a Value {
         })
 }
 
-// ---- argument parsing --------------------------------------------------------
+// ---- command line ------------------------------------------------------------
 
-/// Split argv into flags (--k v / --k=v), positionals, and a passthrough tail
-/// after a literal `--`.
+#[derive(Parser)]
+#[command(
+    name = "manifest-cli",
+    about = "Inspect and run cells from Hermit's end-to-end test manifests",
+    long_about = "Inspect and run cells from Hermit's end-to-end test manifests.\n\n\
+Global cell selectors may appear before or after the subcommand. Use `list` to \
+discover test IDs, `get` to print a pasteable command without running it, and \
+`run` to execute one selected cell."
+)]
+struct Cli {
+    /// Backend used or selected by the cell (for example ptrace, DBT, or KVM).
+    #[arg(long, global = true, value_name = "BACKEND")]
+    backend: Option<String>,
+
+    /// Manifest mode to inspect or run: verify, naked, replay, chaos, or custom.
+    #[arg(long, global = true, value_name = "MODE")]
+    mode: Option<String>,
+
+    /// Validation lane to inspect or run: portable or privileged.
+    #[arg(long, global = true, value_name = "LANE")]
+    lane: Option<String>,
+
+    /// Hermit log level for get/run: info, debug, trace, or off.
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log: Option<String>,
+
+    #[command(subcommand)]
+    command: CommandKind,
+}
+
+#[derive(Subcommand)]
+enum CommandKind {
+    /// List test IDs and the lanes and backends available for each test.
+    List(ListArgs),
+    /// Print the exact shell command for one test cell without executing it.
+    Get(GetArgs),
+    /// Execute one test cell from the repository root.
+    Run(RunArgs),
+}
+
+#[derive(ClapArgs)]
+struct ListArgs {
+    /// Restrict results to one manifest bucket.
+    #[arg(long, value_name = "BUCKET")]
+    bucket: Option<String>,
+
+    /// Restrict results to tests requiring this capability token.
+    #[arg(long, value_name = "CAPABILITY")]
+    tag: Option<String>,
+
+    /// Include requirements and the backend list for every mode.
+    #[arg(long)]
+    verbose: bool,
+}
+
+#[derive(ClapArgs)]
+struct GetArgs {
+    /// Manifest test ID, as printed by `manifest-cli list`.
+    #[arg(value_name = "TEST_ID")]
+    test_id: String,
+
+    /// Print one command for every enabled mode/backend pair.
+    #[arg(long)]
+    all_modes: bool,
+}
+
+#[derive(ClapArgs)]
+struct RunArgs {
+    /// Manifest test ID, as printed by `manifest-cli list`.
+    #[arg(value_name = "TEST_ID")]
+    test_id: String,
+
+    /// Extra Hermit flags inserted before the guest command; pass after `--`.
+    #[arg(last = true, value_name = "HERMIT_FLAG")]
+    extra: Vec<String>,
+}
+
+#[derive(Default)]
 struct Args {
     positional: Vec<String>,
     flags: Vec<(String, Option<String>)>,
     passthrough: Vec<String>,
-}
-
-fn parse_args(argv: &[String]) -> Args {
-    let mut positional = Vec::new();
-    let mut flags = Vec::new();
-    let mut passthrough = Vec::new();
-    let mut iter = argv.iter().peekable();
-    let mut after_dashdash = false;
-    while let Some(arg) = iter.next() {
-        if after_dashdash {
-            passthrough.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            after_dashdash = true;
-            continue;
-        }
-        if let Some(rest) = arg.strip_prefix("--") {
-            if let Some((k, v)) = rest.split_once('=') {
-                flags.push((k.to_owned(), Some(v.to_owned())));
-            } else {
-                // consume a following value unless the next token is a flag
-                let takes_value = iter
-                    .peek()
-                    .map(|n| !n.starts_with("--") && *n != "--")
-                    .unwrap_or(false);
-                if takes_value {
-                    flags.push((rest.to_owned(), Some(iter.next().unwrap().clone())));
-                } else {
-                    flags.push((rest.to_owned(), None));
-                }
-            }
-        } else {
-            positional.push(arg.clone());
-        }
-    }
-    Args {
-        positional,
-        flags,
-        passthrough,
-    }
 }
 
 impl Args {
@@ -651,7 +690,7 @@ fn cmd_get(manifests: &Manifests, args: &Args) -> ExitCode {
         names.sort();
         for name in names {
             for be in mode_backends(&modes[name.as_str()], &name, id) {
-                let mut sub = parse_args(&[]);
+                let mut sub = Args::default();
                 sub.flags.push(("mode".to_owned(), Some(name.clone())));
                 sub.flags.push(("backend".to_owned(), Some(be.clone())));
                 if let Some(l) = args.flag("log") {
@@ -705,56 +744,52 @@ fn cmd_run(manifests: &Manifests, args: &Args, root: &Path) -> ExitCode {
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "manifest-cli — front-door to the e2e manifest corpus
-
-USAGE:
-  manifest-cli list [--bucket B] [--backend BE] [--tag T] [--mode M] [--lane L] [--verbose]
-  manifest-cli get  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL] [--all-modes]
-  manifest-cli run  <test-id> [--mode M] [--backend BE] [--lane L] [--log LVL] [-- <extra hermit flags>]
-
-FILTERS (list):
-  --bucket   manifest bucket (e.g. system-utils, c-programs)
-  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, native)
-  --tag      a `requires` capability token (e.g. python3, bash, kvm, cpuid)
-  --mode     verify | naked | replay | chaos | custom
-  --lane     portable | privileged
-  --verbose  also print requires + per-mode backend breakdown
-
-get/run:
-  --mode/--backend/--lane pick the cell (defaults: verify mode, first enabled backend, test lane)
-  --log      override the --log= level (info|debug|trace|off); default info (off for chaos)
-  --all-modes (get only) print every enabled (mode,backend) command
-  -- <flags> (run only) extra hermit flags injected before the `-- <guest>` separator
-
-ENV:
-  HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)"
-    );
-    std::process::exit(2)
-}
-
 fn main() -> ExitCode {
     rust_script_prelude::init();
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.is_empty() {
-        usage();
+    let cli = Cli::parse();
+    let mut args = Args::default();
+    for (name, value) in [
+        ("backend", cli.backend),
+        ("mode", cli.mode),
+        ("lane", cli.lane),
+        ("log", cli.log),
+    ] {
+        if let Some(value) = value {
+            args.flags.push((name.to_owned(), Some(value)));
+        }
     }
-    let sub = argv[0].clone();
-    if sub == "-h" || sub == "--help" || sub == "help" {
-        usage();
-    }
-    let rest = &argv[1..];
-    let args = parse_args(rest);
+    let sub = match cli.command {
+        CommandKind::List(list) => {
+            if let Some(value) = list.bucket {
+                args.flags.push(("bucket".to_owned(), Some(value)));
+            }
+            if let Some(value) = list.tag {
+                args.flags.push(("tag".to_owned(), Some(value)));
+            }
+            if list.verbose {
+                args.flags.push(("verbose".to_owned(), None));
+            }
+            "list"
+        }
+        CommandKind::Get(get) => {
+            args.positional.push(get.test_id);
+            if get.all_modes {
+                args.flags.push(("all-modes".to_owned(), None));
+            }
+            "get"
+        }
+        CommandKind::Run(run) => {
+            args.positional.push(run.test_id);
+            args.passthrough = run.extra;
+            "run"
+        }
+    };
     let root = repo_root();
     let manifests = load_manifests(&root);
-    match sub.as_str() {
+    match sub {
         "list" => cmd_list(&manifests, &args),
         "get" => cmd_get(&manifests, &args),
         "run" => cmd_run(&manifests, &args, &root),
-        other => {
-            eprintln!("manifest-cli: unknown subcommand `{other}`\n");
-            usage();
-        }
+        _ => unreachable!("Clap only constructs known subcommands"),
     }
 }
