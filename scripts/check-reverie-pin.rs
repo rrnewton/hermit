@@ -1,4 +1,5 @@
 #!/usr/bin/env rust-script
+#![deny(warnings)]
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.

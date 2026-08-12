@@ -49,6 +49,7 @@
 //! serde_json = "1"
 //! libc = "0.2"
 //! ```
+#![deny(warnings)]
 
 // `serde_json::json!` expands one recursive macro level PER FIELD, and the ledger
 // record is one literal carrying every qualification a reader needs. Keeping it a

@@ -1,3 +1,4 @@
+#![deny(warnings)]
 //! Fail-closed authority for strict determinism greens.
 //!
 //! This binary is the only writer of accepted strict-green records. It does
