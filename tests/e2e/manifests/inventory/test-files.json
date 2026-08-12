@@ -226,7 +226,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/event_delivery_ordering.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
-      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM omits the inotify family"
+      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM omits the inotify family"
     },
     {
       "disposition": "manifest-test",
@@ -321,8 +321,8 @@
     {
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/host_identity.c",
-      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbi)",
-      "why": "tests/backend-parity/fixtures/host_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbi): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbt)",
+      "why": "tests/backend-parity/fixtures/host_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (verify mode; ci=true on ptrace and dbt): Host-identity contract guest emitting the OBSERVED virtualized uname/gethostname/sysinfo/CPU values so cross-backend parity is checkable and a backend leaking the real host identity is caught; runs in blocking CI on the two backends that execute it"
     },
     {
       "disposition": "manifest-test",
@@ -562,7 +562,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/short_io_split_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
-      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM does not start"
+      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM does not start"
     },
     {
       "disposition": "manifest-test",
@@ -964,7 +964,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/hardware_trap_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/hardware_trap_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend identity of HARDWARE-generated traps (#UD, #DE, #PF) by both wait status and siginfo si_code, with ptrace and dbi measured identical to native; SaBRe is disabled on a measured undelivered #UD and a hang on #DE"
+      "why": "tests/c/hardware_trap_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend identity of HARDWARE-generated traps (#UD, #DE, #PF) by both wait status and siginfo si_code, with ptrace and dbt measured identical to native; SaBRe is disabled on a measured undelivered #UD and a hang on #DE"
     },
     {
       "disposition": "manifest-test",
@@ -1552,7 +1552,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/signal_waitstatus_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
-      "why": "tests/c/signal_waitstatus_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend wait-status identity (WIFSIGNALED/WTERMSIG/WCOREDUMP/WIFEXITED) with ptrace and dbi measured byte-identical to native; SaBRe is disabled on a measured SIGILL hang"
+      "why": "tests/c/signal_waitstatus_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): pins cross-backend wait-status identity (WIFSIGNALED/WTERMSIG/WCOREDUMP/WIFEXITED) with ptrace and dbt measured byte-identical to native; SaBRe is disabled on a measured SIGILL hang"
     },
     {
       "disposition": "manifest-test",
