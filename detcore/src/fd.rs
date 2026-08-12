@@ -104,6 +104,11 @@ struct OpenFileDescription {
     /// purposes.
     physically_nonblocking: bool,
 
+    /// True when Detcore created this pipe at a fixed one-page capacity. This is
+    /// distinct from guest-requested O_NONBLOCK on an inherited pipe.
+    #[serde(default)]
+    deterministic_pipe_capacity: bool,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -178,6 +183,7 @@ impl DetFd {
                 loopback_peer: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
+                deterministic_pipe_capacity: false,
             })),
         }
     }
@@ -410,6 +416,16 @@ impl DetFd {
     /// Mark every alias of this open file description physically nonblocking.
     pub fn set_physically_nonblocking(&self) {
         self.description().physically_nonblocking = true;
+    }
+
+    /// Mark a pipe whose kernel capacity Detcore fixed when it created the pipe.
+    pub(crate) fn set_deterministic_pipe_capacity(&self) {
+        self.description().deterministic_pipe_capacity = true;
+    }
+
+    /// Whether this open file description has Detcore's fixed pipe capacity.
+    pub(crate) fn has_deterministic_pipe_capacity(&self) -> bool {
+        self.description().deterministic_pipe_capacity
     }
 
     /// Update file status flags for every alias of this open file description.
