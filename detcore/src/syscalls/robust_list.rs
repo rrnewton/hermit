@@ -155,6 +155,20 @@ enum DeathStep {
     Abort,
 }
 
+/// What one attempted futex-word replacement reported, mirroring the kernel's
+/// `futex_cmpxchg_value_locked()` and the `nval != uval` test that follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FutexCasOutcome {
+    /// The word still held the expected value and now holds the new one.
+    Stored,
+    /// The word held this other value instead, so nothing was written. The
+    /// kernel's `goto retry`.
+    Changed(u32),
+    /// The access faulted and could not be completed. The kernel's `return -1`
+    /// after `fault_in_user_writeable()` also fails.
+    Faulted,
+}
+
 /// Guest-memory and wake effects the walk needs.
 ///
 /// Splitting these out is what makes [`exit_robust_list`] testable: the walk
@@ -168,9 +182,13 @@ pub(crate) trait RobustDeathEffects {
     /// Read the 32-bit futex word. `None` models `get_user()` faulting.
     fn read_u32(&mut self, address: usize) -> Option<u32>;
 
-    /// Apply the owner-death transition to the futex word. `false` models an
-    /// unrecoverable `futex_cmpxchg_value_locked()` fault.
-    fn mark_dead(&mut self, address: usize, before: u32, after: u32) -> bool;
+    /// Replace the futex word, but only while it still holds `expected`.
+    ///
+    /// This is `futex_cmpxchg_value_locked(&nval, uaddr, uval, mval)` plus the
+    /// `if (nval != uval) goto retry;` immediately after it: the kernel never
+    /// stores `desired` over a word whose value moved since it was read,
+    /// because that word may have been re-acquired by a live thread.
+    fn compare_and_swap(&mut self, address: usize, expected: u32, desired: u32) -> FutexCasOutcome;
 
     /// Wake exactly one waiter on the futex word, as the kernel's
     /// `futex_wake(uaddr, 1, ...)` does.
@@ -193,6 +211,9 @@ pub(crate) struct WalkOutcome {
     pub next_faulted: bool,
     /// `ROBUST_LIST_LIMIT` entries were followed without reaching the head.
     pub truncated: bool,
+    /// How many times a futex word changed between being read and being
+    /// written, forcing the kernel's `goto retry`.
+    pub cas_retries: usize,
 }
 
 /// Replay Linux's `exit_robust_list()` (`kernel/futex/core.c`) over `effects`.
@@ -236,7 +257,15 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
         // The kernel skips `pending` here and handles it once at the end.
         if pending.map(|slot| slot.address) != Some(entry.address) {
             outcome.entries_visited += 1;
-            if handle_futex_death(effects, entry, futex_offset, owner_tid, false).await
+            if handle_futex_death(
+                effects,
+                entry,
+                futex_offset,
+                owner_tid,
+                false,
+                &mut outcome.cas_retries,
+            )
+            .await
                 == DeathStep::Abort
             {
                 outcome.aborted = true;
@@ -263,7 +292,15 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
     // it last and with `pending_op` set.
     if let Some(pending) = pending {
         outcome.entries_visited += 1;
-        if handle_futex_death(effects, pending, futex_offset, owner_tid, true).await
+        if handle_futex_death(
+            effects,
+            pending,
+            futex_offset,
+            owner_tid,
+            true,
+            &mut outcome.cas_retries,
+        )
+        .await
             == DeathStep::Abort
         {
             outcome.aborted = true;
@@ -274,12 +311,16 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
 }
 
 /// Replay the kernel's `handle_futex_death()` for one list entry.
+///
+/// `cas_retries` accumulates every `goto retry` taken because the futex word
+/// changed between being read and being written.
 async fn handle_futex_death<E: RobustDeathEffects>(
     effects: &mut E,
     entry: RobustEntry,
     futex_offset: i64,
     owner_tid: u32,
     pending_op: bool,
+    cas_retries: &mut usize,
 ) -> DeathStep {
     let Some(word) = futex_word_address(entry.address, futex_offset) else {
         // The kernel computes the same wild address and faults in `get_user()`,
@@ -293,37 +334,67 @@ async fn handle_futex_death<E: RobustDeathEffects>(
         trace!("robust-list entry has a misaligned futex word {:#x}", word);
         return DeathStep::Abort;
     }
-    let Some(uval) = effects.read_u32(word) else {
-        return DeathStep::Abort;
-    };
 
-    // The pending-op special case. The owner died between releasing the futex
-    // word and issuing its wake, or after being woken but before taking the
-    // lock, so a waiter may be parked on an already-free futex. Linux wakes one
-    // waiter WITHOUT marking the word: setting `FUTEX_OWNER_DIED` on a zero
-    // word would create exactly the inconsistent state that user-space
-    // owner-died handling cannot recover from.
-    if pending_op && !entry.is_pi && uval == 0 {
-        effects.wake_one(word, uval).await;
-        return DeathStep::Continue;
-    }
+    // Linux's `retry:` label. Every decision below is made from a freshly read
+    // word and is only committed by a compare-and-swap against that same word,
+    // so a futex re-acquired by a live thread in the meantime is never stamped
+    // with the dying thread's `FUTEX_OWNER_DIED`. The kernel's loop is
+    // unbounded — its only exits are a successful store, a word that no longer
+    // names the dying owner, and a fault — and this one is deliberately the
+    // same shape rather than a bound this code would have had to invent.
+    loop {
+        let Some(uval) = effects.read_u32(word) else {
+            // `if (get_user(uval, uaddr)) return -1;`
+            return DeathStep::Abort;
+        };
 
-    let Some(transition) = futex_death_transition(uval, owner_tid, entry.is_pi) else {
-        return DeathStep::Continue;
-    };
-    if !effects.mark_dead(word, uval, transition.new_value) {
-        return DeathStep::Abort;
+        // The pending-op special case. The owner died between releasing the
+        // futex word and issuing its wake, or after being woken but before
+        // taking the lock, so a waiter may be parked on an already-free futex.
+        // Linux wakes one waiter WITHOUT marking the word: setting
+        // `FUTEX_OWNER_DIED` on a zero word would create exactly the
+        // inconsistent state that user-space owner-died handling cannot
+        // recover from. The kernel re-tests this after every retry too,
+        // because the word may have reached zero in the meantime.
+        if pending_op && !entry.is_pi && uval == 0 {
+            effects.wake_one(word, uval).await;
+            return DeathStep::Continue;
+        }
+
+        let Some(transition) = futex_death_transition(uval, owner_tid, entry.is_pi) else {
+            // `if ((uval & FUTEX_TID_MASK) != task_pid_vnr(curr)) return 0;`
+            // On the first pass this is an entry the dying thread never owned.
+            // On a retry it is the race this loop exists for: the futex was
+            // acquired by another thread after the read, and marking it now
+            // would tell that live owner's waiters the lock is abandoned.
+            return DeathStep::Continue;
+        };
+
+        match effects.compare_and_swap(word, uval, transition.new_value) {
+            FutexCasOutcome::Stored => {
+                if transition.wake_one {
+                    effects.wake_one(word, transition.new_value).await;
+                }
+                return DeathStep::Continue;
+            }
+            FutexCasOutcome::Changed(observed) => {
+                // `if (nval != uval) goto retry;`
+                *cas_retries += 1;
+                trace!(
+                    "robust-list futex word {:#x} moved {:#x} -> {:#x} under the walk; retrying",
+                    word, uval, observed,
+                );
+            }
+            FutexCasOutcome::Faulted => return DeathStep::Abort,
+        }
     }
-    if transition.wake_one {
-        effects.wake_one(word, transition.new_value).await;
-    }
-    DeathStep::Continue
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
+    use std::collections::VecDeque;
 
     use super::*;
 
@@ -343,6 +414,11 @@ mod tests {
         unreadable: BTreeSet<usize>,
         /// Addresses whose write faults.
         unwritable: BTreeSet<usize>,
+        /// Values a concurrent writer stores into a word immediately after the
+        /// walk reads it, one per read, consumed in order. This is the only way
+        /// to reach the compare-and-swap retry path from a test, because the
+        /// walk itself is single-threaded.
+        races: BTreeMap<usize, VecDeque<u32>>,
         /// `(word, before, after)` for each applied transition, in order.
         marks: Vec<(usize, u32, u32)>,
         /// `(word, observed)` for each wake, in order.
@@ -350,6 +426,12 @@ mod tests {
     }
 
     impl FakeGuest {
+        /// Arrange for `value` to appear in `address` after the next read of
+        /// it, as another thread's store would.
+        fn race_after_read(&mut self, address: usize, value: u32) {
+            self.races.entry(address).or_default().push_back(value);
+        }
+
         fn put_u64(&mut self, address: usize, value: u64) {
             for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
                 self.bytes.insert(address + i, byte);
@@ -409,16 +491,32 @@ mod tests {
             if self.unreadable.contains(&address) {
                 return None;
             }
-            self.get_u32(address)
+            let value = self.get_u32(address)?;
+            // A racing store lands after the read has already taken its value.
+            if let Some(raced) = self.races.get_mut(&address).and_then(VecDeque::pop_front) {
+                self.put_u32(address, raced);
+            }
+            Some(value)
         }
 
-        fn mark_dead(&mut self, address: usize, before: u32, after: u32) -> bool {
+        fn compare_and_swap(
+            &mut self,
+            address: usize,
+            expected: u32,
+            desired: u32,
+        ) -> FutexCasOutcome {
             if self.unwritable.contains(&address) {
-                return false;
+                return FutexCasOutcome::Faulted;
             }
-            self.put_u32(address, after);
-            self.marks.push((address, before, after));
-            true
+            let Some(observed) = self.get_u32(address) else {
+                return FutexCasOutcome::Faulted;
+            };
+            if observed != expected {
+                return FutexCasOutcome::Changed(observed);
+            }
+            self.put_u32(address, desired);
+            self.marks.push((address, expected, desired));
+            FutexCasOutcome::Stored
         }
 
         async fn wake_one(&mut self, address: usize, observed: u32) {
@@ -673,6 +771,15 @@ mod tests {
     }
 
     #[test]
+    fn the_walk_bound_is_the_kernel_s_literal_robust_list_limit() {
+        // `#define ROBUST_LIST_LIMIT 2048` in `kernel/futex/core.c`. Compared
+        // against the literal on purpose: a test that compared against
+        // `ROBUST_LIST_LIMIT` itself would stay green for any value of it, so
+        // it could not tell a faithful bound from a retuned one.
+        assert_eq!(ROBUST_LIST_LIMIT, 2048);
+    }
+
+    #[test]
     fn a_cycle_is_bounded_by_robust_list_limit() {
         let mut guest = FakeGuest::default();
         // Two nodes pointing at each other, never reaching the head.
@@ -683,7 +790,140 @@ mod tests {
         let outcome = walk(&mut guest, 0x1000, OWNER);
 
         assert!(outcome.truncated);
-        assert_eq!(outcome.entries_visited, ROBUST_LIST_LIMIT);
+        // Also the kernel's literal 2048, for the same reason: the assertion
+        // has to fail if the walk follows a different number of entries than
+        // Linux does, whatever this crate's constant happens to say.
+        assert_eq!(
+            outcome.entries_visited, 2048,
+            "a cyclic list must be followed for exactly the kernel's 2048 entries"
+        );
+    }
+
+    // ---- the compare-and-swap retry ---------------------------------------
+
+    #[test]
+    fn a_futex_re_owned_between_the_read_and_the_write_is_left_to_its_new_owner() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        // Thread 7 acquires the mutex after the walk has read the word and
+        // before it writes: the window `futex_cmpxchg_value_locked()` exists to
+        // detect. A blind write would stamp a live thread's lock
+        // FUTEX_OWNER_DIED and tell its waiters the owner is gone.
+        guest.race_after_read(0x2000, FUTEX_WAITERS | 7);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(
+            guest.marks,
+            vec![],
+            "thread 7's live mutex must not be stamped FUTEX_OWNER_DIED"
+        );
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(FUTEX_WAITERS | 7),
+            "the word must still be thread 7's"
+        );
+        assert!(guest.wakes.is_empty());
+        assert_eq!(outcome.entries_visited, 1);
+        assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn a_waiter_arriving_between_the_read_and_the_write_is_still_woken() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        // The first read sees an uncontended mutex, so the decision made from
+        // it is "mark FUTEX_OWNER_DIED, wake nobody".
+        guest.node(0x2020, 0x1000, OWNER);
+        // A waiter sets FUTEX_WAITERS inside the window. A blind write would
+        // store bare FUTEX_OWNER_DIED over it, erasing FUTEX_WAITERS and
+        // issuing no wake, and that waiter would never be woken by anyone.
+        guest.race_after_read(0x2000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(
+            guest.wakes,
+            vec![(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED)],
+            "the arriving waiter must be woken; the wake decision has to be \
+             recomputed from the re-read word"
+        );
+        assert_eq!(
+            guest.marks,
+            vec![(
+                0x2000,
+                FUTEX_WAITERS | OWNER,
+                FUTEX_WAITERS | FUTEX_OWNER_DIED
+            )],
+            "the stored value must be recomputed from the re-read word, so \
+             FUTEX_WAITERS survives"
+        );
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(FUTEX_WAITERS | FUTEX_OWNER_DIED)
+        );
+        assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn the_walk_retries_until_the_word_stops_moving() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, OWNER);
+        // Three stores by the same owner land in three successive windows.
+        guest.race_after_read(0x2000, FUTEX_WAITERS | OWNER);
+        guest.race_after_read(0x2000, OWNER);
+        guest.race_after_read(0x2000, FUTEX_WAITERS | OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(FUTEX_WAITERS | FUTEX_OWNER_DIED)
+        );
+        assert_eq!(guest.marked_words(), vec![0x2000]);
+        assert_eq!(
+            outcome.cas_retries, 3,
+            "one retry per store that landed inside the window"
+        );
+    }
+
+    #[test]
+    fn a_word_freed_between_the_read_and_the_write_is_not_marked_dead() {
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        // The dying thread's own unlock lands in the window. `uval` no longer
+        // names it, so Linux returns 0 and leaves the free word alone.
+        guest.race_after_read(0x2000, 0);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(0),
+            "stamping FUTEX_OWNER_DIED on a free word is the corruption the \
+             comparison prevents"
+        );
+        assert!(guest.marks.is_empty() && guest.wakes.is_empty());
+        assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn an_uncontended_word_is_still_marked_when_nothing_races() {
+        // The bracket's other direction: with no racing store the walk must
+        // still perform the transition, so the retry logic cannot be satisfied
+        // by simply never writing.
+        let mut guest = FakeGuest::default();
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, OWNER);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.cas_retries, 0);
+        assert_eq!(guest.marks, vec![(0x2000, OWNER, FUTEX_OWNER_DIED)]);
+        assert!(guest.wakes.is_empty());
     }
 
     #[test]
