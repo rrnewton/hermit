@@ -168,6 +168,22 @@ pub fn rr_known_failures() -> BTreeMap<&'static str, &'static str> {
     ])
 }
 
+/// Strict-corpus programs that were exercised under record/replay but did not
+/// reach a replay comparison. Keep these distinct from [`rr_known_failures`]:
+/// a bounded recording timeout establishes ATTEMPTED_UNQUALIFIABLE, not FAIL.
+pub fn rr_attempted_unqualifiable() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "curl-localhost",
+            "recording did not finish within the unchanged 90s compatibility budget in 5/5 exact-main runs (raw 90.007-90.009s); structured verdict was no_result before replay",
+        ),
+        (
+            "wget-localhost",
+            "recording did not finish within the unchanged 90s compatibility budget in 5/5 exact-main runs (raw 90.006-90.009s); structured verdict was no_result before replay",
+        ),
+    ])
+}
+
 /// `RR_COMPAT_PASSING_LABELS` (validate.sh:1191) — exactly the rows measured to
 /// pass record/replay. Size is asserted against [`RR_COMPAT_EXPECTED`] at startup,
 /// reproducing the bash's own parse-time guard (validate.sh:1219).

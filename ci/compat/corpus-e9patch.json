@@ -1436,6 +1436,26 @@
     "/usr/bin/free",
     "-m"
    ]
+  },
+  {
+   "label": "wget-localhost",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "wget-localhost"
+   ]
+  },
+  {
+   "label": "curl-localhost",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "curl-localhost"
+   ]
   }
  ]
 }

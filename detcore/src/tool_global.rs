@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::SystemTime;
@@ -296,6 +298,22 @@ pub struct GlobalState {
     // False initially after fork, and true when we begin executing the guest binary.
     past_first_execve: AtomicBool,
 
+    /// Count of global requests this coordinator has actually SERVICED from a
+    /// guest-side Detcore tool.
+    ///
+    /// This exists to break an ambiguous zero. For out-of-process backends
+    /// (SaBRe) the Detcore tool runs inside the guest and only its global
+    /// operations reach this coordinator, so "the plugin connected" and "the
+    /// plugin actually routed work to Detcore" are different facts. The
+    /// SaBRe path-evidence counters could not tell them apart: a run that
+    /// observed nothing reported the same zeros as a run that needed no
+    /// fallback, and the ambiguous zero read as success.
+    ///
+    /// Counted at the RECEIVING end rather than reported by the guest: this
+    /// is what the coordinator itself did, not a claim the plugin makes about
+    /// itself.
+    detcore_rpc_requests: AtomicU64,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Pre-exec identity and descriptor state awaiting a SaBRe exec reload.
@@ -397,6 +415,7 @@ impl GlobalState {
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
+            detcore_rpc_requests: AtomicU64::new(0),
             pending_exec_states: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
             inodes: Arc::new(Mutex::new(InodePool::new())),
@@ -446,6 +465,13 @@ impl GlobalState {
                 detpid
             );
         }
+    }
+
+    /// Global requests this coordinator has actually serviced from a
+    /// guest-side Detcore tool. Zero means no guest tool ever routed work
+    /// here -- which is a different fact from "no fallback was needed".
+    pub fn detcore_rpc_requests(&self) -> u64 {
+        self.detcore_rpc_requests.load(Relaxed)
     }
 
     /// Releases all physical-process-exit barriers after a backend supervisor has drained every
@@ -614,6 +640,10 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        // Every global request serviced is positive evidence that a guest-side
+        // Detcore tool engaged this coordinator. Counted before any dispatch
+        // so no request kind can be silently excluded.
+        self.detcore_rpc_requests.fetch_add(1, Relaxed);
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;

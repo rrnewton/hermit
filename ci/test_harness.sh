@@ -945,6 +945,61 @@ function assert_privileged_diagnostics {
 # implementation must stay absent; the root validate.sh is an exact, behaviorless
 # reminder alias, while Make, workflows, and DAGs call Rust directly.
 #
+# The merged backend-agnostic corpus (`ci/compat/corpus.json`) is the single
+# source of truth for WHICH PROGRAMS Hermit is measured against; the four
+# `corpus-<mode>.json` files are VIEWS of it, kept for the mode-driven validate
+# path. This asserts the views are still exactly re-derivable.
+#
+# Why it is a gate and not a comment: the merge's entire value is that it changed
+# STRUCTURE and not BEHAVIOUR. Without a check, editing one side and not the
+# other silently changes what CI runs — and it would change it in the direction
+# nobody notices, since a program quietly dropped from a view simply stops being
+# measured and no cell goes red. Absence is silence; that is the defect this
+# whole corpus exists to remove, so it must not reappear in the corpus itself.
+#
+# Implemented in python3 (already a hard dependency of this gate, cf. the
+# `split_asymmetric_pr.py --self-test` call) rather than by shelling out to
+# `ci/compat/merge-corpus.rs`, so the assertion cannot be skipped on a host
+# without the rust-script interpreter. A gate that silently skips is worse than
+# no gate. `ci/compat/merge-corpus.rs verify` performs the identical comparison
+# for humans and prints a fuller diff.
+function assert_compat_corpus_equivalence {
+    local dir="$ROOT_DIR/ci/compat"
+    [[ -f $dir/corpus.json ]] ||
+        die "ci/compat/corpus.json is missing; regenerate with ci/compat/merge-corpus.rs generate"
+    python3 - "$dir" <<'PY' || die "compat corpus views are not re-derivable from corpus.json"
+import json, sys, pathlib
+d = pathlib.Path(sys.argv[1])
+merged = json.loads((d / "corpus.json").read_text())
+if merged.get("schema") != "hermit-compat-corpus/v1":
+    print(f"corpus.json schema is {merged.get('schema')!r}, expected 'hermit-compat-corpus/v1'")
+    raise SystemExit(1)
+bad, counts = [], []
+for mode in ("strict", "sabre", "e9patch", "rr"):
+    legacy = {r["label"]: r["argv"] for r in json.loads((d / f"corpus-{mode}.json").read_text())["rows"]}
+    derived = {}
+    for p in merged["programs"]:
+        if mode not in p.get("modes", []):
+            continue
+        derived[p["label"]] = p.get("mode_argv", {}).get(mode, p["argv"])
+    counts.append(f"{mode} {len(derived)}/{len(legacy)}")
+    for label, argv in legacy.items():
+        if label not in derived:
+            bad.append(f"{mode}: LOST program {label!r}")
+        elif derived[label] != argv:
+            bad.append(f"{mode}: {label!r} argv differs")
+    for label in derived:
+        if label not in legacy:
+            bad.append(f"{mode}: INVENTED program {label!r}")
+if bad:
+    for b in bad[:20]:
+        print(b)
+    print(f"{len(bad)} discrepanc(y/ies)")
+    raise SystemExit(1)
+print(f"PASS: {len(merged['programs'])} corpus programs; every per-mode view re-derived exactly [{', '.join(counts)}]")
+PY
+}
+
 # These assertions replace the former `assert_validate_entrypoint` audits over
 # bash function bodies. The property audited is unchanged and is the one that
 # matters: a validate profile's node set comes from the AUDITED DAG FILES and
@@ -1897,6 +1952,27 @@ EOF
             rm -rf "$scratch"
             die "$lane DAG manifest nodes do not select the exact ratcheted cells"
         fi
+
+        # A static intentional skip is valid only when the exact ratcheted plan
+        # selects zero CI cells for that (lane, category). Conversely, every
+        # non-empty bucket must remain executable. This makes the typed reason
+        # a checked consequence of the manifest plan rather than a hand-written
+        # escape hatch that could silently suppress real coverage.
+        jq -e --arg lane "$lane" --slurpfile cells "$current_plan" '
+            [.steps[] | select(has("manifest"))
+             | . as $step
+             | ([$cells[0][]
+                 | select(.lane == $lane)
+                 | select(.category == $step.manifest.category)] | length) as $selected
+             | if $selected == 0
+               then .skip_reason == "empty-manifest-bucket"
+               else (.skip_reason // null) == null
+               end]
+            | all
+        ' "$dag" >/dev/null || {
+            rm -rf "$scratch"
+            die "$lane DAG typed empty-bucket skips do not match the exact ratcheted cell plan"
+        }
     done
 
     local portable_fingerprint privileged_fingerprint e2e_cells
@@ -2439,22 +2515,28 @@ function summarize_sabre_path_evidence {
     shift
     jq -s --argjson expected "$expected" '
         if all(.[];
-            .schema == 1
+            .schema == 2
             and (.guest_rpc_observed | type == "boolean")
+            and (.detcore_rpc_requests | type == "number")
+            and (.routing | type == "string")
             and (.ptrace_fallback_sites | type == "number")
             and (.trusted_shared_object_sites | type == "number")
             and (.trusted_shared_objects | type == "array"))
         then {
-            schema: 1,
+            schema: 2,
             expected_execution_count: $expected,
             complete: (length == $expected),
             execution_count: length,
             guest_rpc_observed: (length > 0 and all(.[]; .guest_rpc_observed)),
+            detcore_rpc_requests: (map(.detcore_rpc_requests) | add // 0),
+            routing: (map(.routing) | unique),
             ptrace_fallback_sites: (map(.ptrace_fallback_sites) | add // 0),
             trusted_shared_object_sites: (map(.trusted_shared_object_sites) | add // 0),
             trusted_shared_objects: (map(.trusted_shared_objects) | add // [] | unique),
             eligible: (length == $expected and length > 0 and all(.[];
                 .guest_rpc_observed
+                and .routing == "routed"
+                and .detcore_rpc_requests > 0
                 and .ptrace_fallback_sites == 0
                 and .trusted_shared_object_sites == 0)),
             executions: .
@@ -2472,9 +2554,9 @@ function collect_sabre_path_evidence {
     files=("$cell_dir"/captures/*.sabre-path.jsonl)
     shopt -u nullglob
     if ((${#files[@]} == 0)); then
-        jq -cn --argjson expected "$expected" '{schema:1,
+        jq -cn --argjson expected "$expected" '{schema:2,
             expected_execution_count:$expected,complete:false,execution_count:0,
-            guest_rpc_observed:false,
+            guest_rpc_observed:false,detcore_rpc_requests:0,routing:[],
             ptrace_fallback_sites:0,trusted_shared_object_sites:0,
             trusted_shared_objects:[],eligible:false,executions:[]}'
         return
@@ -2493,23 +2575,29 @@ function expected_sabre_execution_count {
 }
 
 function audit_sabre_path_evidence_contract {
-    local eligible fallback trusted shortfall
+    local eligible fallback trusted shortfall idle unengaged
     eligible=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' \
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 2)
     fallback=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 1)
     trusted=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":1,"trusted_shared_objects":["/usr/lib/libc.so.6"]}' |
         summarize_sabre_path_evidence 1)
     # PLANTED NEGATIVE for the execution-count obligation: one otherwise-clean
     # record where the mode contracts for two. Every per-record predicate here
     # passes, so this is refused only if the count itself is enforced.
     shortfall=$(printf '%s\n' \
-        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":116,"routing":"routed","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
         summarize_sabre_path_evidence 2)
+    idle=$(printf '%s\n' \
+        '{"schema":2,"guest_rpc_observed":true,"detcore_rpc_requests":0,"routing":"connected_idle","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
+    unengaged=$(printf '%s\n' \
+        '{"schema":2,"guest_rpc_observed":false,"detcore_rpc_requests":0,"routing":"not_engaged","ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1)
     jq -e '.eligible and .complete and .execution_count == 2' <<<"$eligible" >/dev/null ||
         die "legitimate SaBRe path evidence must remain eligible"
     jq -e '(.eligible | not) and .ptrace_fallback_sites == 1' <<<"$fallback" >/dev/null ||
@@ -2519,6 +2607,29 @@ function audit_sabre_path_evidence_contract {
     jq -e '(.eligible | not) and (.complete | not)
         and .execution_count == 1 and .expected_execution_count == 2' <<<"$shortfall" >/dev/null ||
         die "an execution-count shortfall must be ineligible even when every record is clean"
+    # THE AMBIGUOUS ZERO. Both planted records below carry the exact counters a
+    # clean run carries -- ptrace_fallback_sites 0, trusted_shared_object_sites
+    # 0, guest_rpc_observed true. Before the routed signal existed they were
+    # INDISTINGUISHABLE from the eligible fixture above and passed. They are
+    # refused only if positive routing evidence is required.
+    jq -e '(.eligible | not) and .detcore_rpc_requests == 0
+        and (.routing == ["connected_idle"])' <<<"$idle" >/dev/null ||
+        die "a plugin that connected but routed nothing must be ineligible"
+    jq -e '(.eligible | not) and (.routing == ["not_engaged"])' <<<"$unengaged" >/dev/null ||
+        die "a run where no guest tool reached the coordinator must be ineligible"
+    # POSITIVE CONTROL for the new axis specifically: identical to the idle
+    # record except for the routed evidence, so this proves the clause fires on
+    # the routing fact and is not just rejecting everything.
+    jq -e '.eligible and .detcore_rpc_requests == 232
+        and (.routing == ["routed"])' <<<"$eligible" >/dev/null ||
+        die "a genuinely routed run must remain eligible"
+    # A schema-1 record predates the routed signal, so its zeros cannot carry
+    # the distinction. Refuse it outright rather than read it as clean.
+    if printf '%s\n' \
+        '{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}' |
+        summarize_sabre_path_evidence 1 >/dev/null 2>&1; then
+        die "pre-routing schema-1 SaBRe path evidence must be refused, not accepted as clean"
+    fi
 }
 
 function prepare_test {
@@ -2592,10 +2703,83 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the L2 parity assertion?
+# Prove assert_bitwise_parity_verdict accepts the qualifying verdict and refuses
+# every impersonation of it. Pure -- synthetic verdicts, no Hermit run -- so it
+# is cheap enough to gate `validate` and cannot rot into a decorative check.
+#
+# Cases 2, 5 and 6 are the reason a declaring cell may not be gated on its
+# process status: ALL of them exit 139, exactly like the qualifying run.
+function verify_provenance_selftest {
+    local dir cases=0 failures=0 name verdict termination expectation got
+    dir=$(mktemp -d)
+    local -a table=(
+        # name | verdict JSON | declared termination | expectation
+        "qualifying-sigsegv|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null,\"terminating_action\":\"reraise-guest-signal:11\"}|signal:11|accept"
+        "guest-exited-139-not-signalled|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":null,\"guest_exit_code\":139}|signal:11|refuse"
+        "different-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":6,\"guest_exit_code\":null}|signal:11|refuse"
+        "declared-that-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":6,\"guest_exit_code\":null,\"terminating_action\":\"reraise-guest-signal:6\"}|signal:6|accept"
+        "hermit-reached-no-verdict|{\"verified\":false,\"bitwise_parity\":false,\"verdict\":\"no_result\",\"guest_signal\":null,\"guest_exit_code\":null}|signal:11|refuse"
+        "stripped-comparator-only|{\"verified\":true,\"bitwise_parity\":false,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null}|signal:11|refuse"
+        "signal-and-code-both-set|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":139}|signal:11|refuse"
+        # THE POST-VERDICT HOLE: Hermit segfaults AFTER publishing a green
+        # verdict. Guest fields, parity and shell status (139) are all
+        # indistinguishable from the qualifying run; only the absent
+        # terminating_action separates them.
+        "hermit-crashed-after-a-green-verdict|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null}|signal:11|refuse"
+        "terminating-action-for-another-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null,\"terminating_action\":\"reraise-guest-signal:6\"}|signal:11|refuse"
+        "terminating-action-null|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null,\"terminating_action\":null}|signal:11|refuse"
+        "exit-code-action-on-a-signal-claim|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":11,\"guest_exit_code\":null,\"terminating_action\":\"exit-guest-code:139\"}|signal:11|refuse"
+        "exit-code-declared|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":null,\"guest_exit_code\":7,\"terminating_action\":\"exit-guest-code:7\"}|exit_code:7|accept"
+        "exit-code-was-a-signal|{\"verified\":true,\"bitwise_parity\":true,\"verdict\":\"matched\",\"guest_signal\":7,\"guest_exit_code\":null}|exit_code:7|refuse"
+        "unparsable|not json at all|signal:11|refuse"
+    )
+    local row
+    for row in "${table[@]}"; do
+        IFS='|' read -r name verdict termination expectation <<<"$row"
+        cases=$((cases + 1))
+        printf '%s' "$verdict" >"$dir/$name.json"
+        if assert_bitwise_parity_verdict "$dir/$name.json" "$termination" >/dev/null 2>&1; then
+            got=accept
+        else
+            got=refuse
+        fi
+        [[ $got == "$expectation" ]] || {
+            echo "verify_provenance_selftest: $name expected $expectation, got $got" >&2
+            failures=$((failures + 1))
+        }
+    done
+    # A verdict file that was never created is distinct from an empty one: an
+    # aborted Hermit may never reach the path at all.
+    cases=$((cases + 1))
+    if assert_bitwise_parity_verdict "$dir/absent.json" "signal:11" >/dev/null 2>&1; then
+        echo "verify_provenance_selftest: absent-file expected refuse, got accept" >&2
+        failures=$((failures + 1))
+    fi
+    rm -rf "$dir"
+    ((failures == 0)) || die "verify_provenance_selftest: $failures of $cases case(s) failed"
+    echo "PASS: verify verdict check refuses every impersonation ($cases cases: 3 accept, $((cases - 3)) refuse)"
+}
+
+# The extra Hermit flags this cell's verify `assert` requires, one per line.
+#
+# DERIVED NOWHERE HERE. hermit-manifest-plan is the single source and injects
+# the result into `--format harness-json`, which load_tests already reads; this
+# harness and scripts/manifest-to-commands.rs both consume that one derivation.
+# An earlier revision kept a second copy here and policed it with a cross-check,
+# which could not work: a cross-check can only iterate cells some consumer
+# names, so a consumer that names NONE -- total policy loss -- looks exactly
+# like a consumer that agrees.
+function verify_flags {
+    local metadata=$1
+    jq -r '.modes.verify.verify_flags[]?' <<<"$metadata"
+}
+
+# Does this test's verify mode opt into the L2 parity assertion? Keyed off the
+# emitted flag set, not off the raw manifest key, so it cannot disagree with the
+# flags the run actually used.
 function verify_asserts_bitwise_parity {
     local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+    jq -r '[.modes.verify.verify_flags[]?] | index("--verify-strict") != null' <<<"$metadata"
 }
 
 # Where a verify attempt writes its machine-readable verdict.
@@ -2604,10 +2788,49 @@ function verify_verdict_path {
     printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
 }
 
+# How this cell's guest is declared to terminate: `signal:N`, `exit_code:N`, or
+# empty for the default "ran to completion and exited 0".
+#
+# A guest whose deterministic outcome is a crash or a deliberate non-zero exit
+# could not be a verify cell at all: `--verify` defaults to
+# `--verify-allow success`, refuses the second run, and publishes
+# `verdict: "no_result"`, so the cell measured nothing. The manifest validator
+# rejects these keys outside `modes.verify.assert` and requires
+# `bitwise_parity = true` beside them.
+function verify_declared_termination {
+    local metadata=$1 mode=$2
+    [[ $mode == verify ]] || return 0
+    jq -r '
+        (.modes.verify.assert // {}) as $a
+        | if   ($a.guest_signal    | type) == "number" then "signal:\($a.guest_signal)"
+          elif ($a.guest_exit_code | type) == "number" then "exit_code:\($a.guest_exit_code)"
+          else "" end
+    ' <<<"$metadata"
+}
+
+# The whole-invocation status this cell must produce, from the same single
+# derivation as the flags.
+function verify_shell_status {
+    local metadata=$1 mode=$2
+    [[ $mode == verify ]] || { printf '0'; return 0; }
+    jq -r '.modes.verify.verify_shell_status // 0' <<<"$metadata"
+}
+
 # Fail closed on anything short of a full parity verdict: a missing, unparsable,
 # or non-parity verdict is NOT a pass. Echoes a reason on failure.
+#
+# With a declared termination this ALSO checks the verdict's provenance, and
+# that is the load-bearing part. A declaring cell is allowed to exit non-zero,
+# so its process status is bound to nothing: `139` is the same number for a
+# guest `exit(139)`, a guest killed by SIGSEGV, and HERMIT ITSELF dying of
+# SIGSEGV -- and only the last is a product defect that must never pass. Only
+# the verdict carries which process died and how: Hermit derives
+# `guest_signal` / `guest_exit_code` from the GUEST's wait status, and stamps
+# the record `no_result` before any fallible work, so a Hermit-side abort leaves
+# a refusal behind rather than a stale pass. `null` is meaningful on the other
+# field: a record reporting both a signal and an exit code is not this claim.
 function assert_bitwise_parity_verdict {
-    local verdict=$1
+    local verdict=$1 termination=${2:-}
     if [[ ! -f $verdict ]]; then
         printf 'verify wrote no parity verdict to %s\n' "${verdict##*/}"
         return 1
@@ -2617,7 +2840,9 @@ function assert_bitwise_parity_verdict {
         "verified=\(.verified) bitwise_parity=\(.bitwise_parity) "
         + "verdict=\(.verdict) strictness=\(.comparison.strictness // "none") "
         + "compared=\(.comparison.compare_logs // false) "
-        + "messages=\(.compared_log_messages.left // 0)/\(.compared_log_messages.right // 0)"
+        + "messages=\(.compared_log_messages.left // 0)/\(.compared_log_messages.right // 0) "
+        + "guest_signal=\(.guest_signal|tojson) guest_exit_code=\(.guest_exit_code|tojson) "
+        + "terminating_action=\(.terminating_action // "absent"|tojson)"
     ' "$verdict" 2>/dev/null); then
         printf 'verify parity verdict %s is not readable JSON\n' "${verdict##*/}"
         return 1
@@ -2625,6 +2850,46 @@ function assert_bitwise_parity_verdict {
     if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
         printf 'verify did not reach L2 parity: %s\n' "$summary"
         return 1
+    fi
+    local want action
+    case "$termination" in
+        '') ;;
+        signal:*)
+            want=${termination#signal:}
+            action="reraise-guest-signal:$want"
+            if [[ $(jq -r --argjson want "$want" \
+                '(.guest_signal == $want) and (.guest_exit_code == null)' "$verdict") != true ]]; then
+                printf 'verify did not show the guest killed by signal %s: %s\n' "$want" "$summary"
+                return 1
+            fi
+            ;;
+        exit_code:*)
+            want=${termination#exit_code:}
+            action="exit-guest-code:$want"
+            if [[ $(jq -r --argjson want "$want" \
+                '(.guest_exit_code == $want) and (.guest_signal == null)' "$verdict") != true ]]; then
+                printf 'verify did not show the guest exiting %s: %s\n' "$want" "$summary"
+                return 1
+            fi
+            ;;
+        *)
+            printf 'unrecognized declared termination %s\n' "$termination"
+            return 1
+            ;;
+    esac
+    # Everything checked so far describes the GUEST. A declaring cell accepts a
+    # non-zero Hermit exit, so its wait status is unbound: 139 is the same
+    # number for "Hermit re-raised the guest's SIGSEGV" and "Hermit itself died
+    # of SIGSEGV". Hermit records the intent one atomic rename before acting on
+    # it; absence means it never got to, so absence is a refusal. Only a
+    # declaring cell needs this -- an exit-0 cell is still bound by its status
+    # check, which any Hermit crash breaks all by itself.
+    if [[ -n ${action:-} ]]; then
+        if [[ $(jq -r --arg want "$action" '(.terminating_action // null) == $want' "$verdict") != true ]]; then
+            printf 'verify did not record Hermit terminating deliberately as %s (got %s): %s\n' \
+                "$action" "$(jq -rc '.terminating_action // "absent"' "$verdict")" "$summary"
+            return 1
+        fi
     fi
     printf 'L2 parity: %s\n' "$summary"
     return 0
@@ -2711,11 +2976,16 @@ function execute_attempt {
             # parity comparator and made to emit a machine-readable verdict, which
             # run_cell then checks -- otherwise the cell would be justified by a
             # parity measurement it never actually performs.
-            local verify_strict_flags=()
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict --verify-json
-                    "$(verify_verdict_path "$cell_dir" "$attempt")")
-            fi
+            # Transported verbatim from hermit-manifest-plan; only the record
+            # path is ours, because only we know where this cell writes it.
+            local -a verify_strict_flags=()
+            local flag
+            while IFS= read -r flag; do
+                [[ -n $flag ]] || continue
+                verify_strict_flags+=("$flag")
+                [[ $flag == --verify-json ]] &&
+                    verify_strict_flags+=("$(verify_verdict_path "$cell_dir" "$attempt")")
+            done < <(verify_flags "$metadata")
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
                 "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
@@ -2790,9 +3060,9 @@ function append_result {
             # bare `--strict --verify` for a cell that ran the parity comparator
             # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
+                --argjson extra "$(jq -c '[.modes.verify.verify_flags[]?]' \
+                    <<<"${METADATA_BY_ID[$test_id]}")" \
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"] + $extra')
             log_level=info
             ;;
         replay)
@@ -3095,6 +3365,9 @@ function run_cell {
         fi
     else
         local row status _hash stdout_file stderr_file attempt_execution
+        local termination expect_shell_status
+        termination=$(verify_declared_termination "$metadata" "$mode")
+        expect_shell_status=$(verify_shell_status "$metadata" "$mode")
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
         IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution <<<"$row"
         if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
@@ -3104,16 +3377,16 @@ function run_cell {
         elif reason=$(individual_test_timeout_reason \
             "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status"); then
             outcome=FAIL
-        elif [[ $status != 0 ]]; then
+        elif [[ $status != "$expect_shell_status" ]]; then
             outcome=FAIL
-            reason="$mode exited with status $status"
+            reason="$mode exited with status $status, expected $expect_shell_status"
         elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
             # A zero exit only means the comparator this run used was satisfied.
             # For an L2 cell, read the verdict the run itself published and
             # require full parity; anything else is a FAIL, not a PASS.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
-                "$(verify_verdict_path "$cell_dir" 1)"); then
+                "$(verify_verdict_path "$cell_dir" 1)" "$termination"); then
                 reason=$parity_reason
             else
                 outcome=FAIL
@@ -3288,10 +3561,12 @@ case "$subcommand" in
         (($# == 0)) || true
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
+        verify_provenance_selftest
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
+        assert_compat_corpus_equivalence
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
