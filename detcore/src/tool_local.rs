@@ -86,12 +86,6 @@ pub struct FileMetadata {
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
-    /// Descriptor slots with logically blocking pipe writes being completed through more
-    /// than one physically nonblocking kernel operation. Descriptor-table replacements
-    /// wait until every logical syscall finishes so they cannot retarget a later chunk to
-    /// a reused descriptor number.
-    #[serde(default)]
-    blocking_pipe_writes: BTreeMap<RawFd, usize>,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -321,7 +315,6 @@ impl FileMetadata {
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
             file_handles: HashMap::new(),
-            blocking_pipe_writes: BTreeMap::new(),
         }
     }
 
@@ -359,7 +352,6 @@ impl FileMetadata {
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             file_handles: self.file_handles.clone(),
-            blocking_pipe_writes: BTreeMap::new(),
         }
     }
 
@@ -373,38 +365,7 @@ impl FileMetadata {
                 .iter()
                 .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
                 .collect(),
-            blocking_pipe_writes: BTreeMap::new(),
         }
-    }
-
-    fn begin_blocking_pipe_write(&mut self, fd: RawFd) -> Result<(), Errno> {
-        self.with_detfd(fd, |_| ())?;
-        *self.blocking_pipe_writes.entry(fd).or_default() += 1;
-        Ok(())
-    }
-
-    fn end_blocking_pipe_write(&mut self, fd: RawFd) {
-        let count = self
-            .blocking_pipe_writes
-            .get_mut(&fd)
-            .expect("blocking pipe write completion was not registered");
-        *count -= 1;
-        if *count == 0 {
-            self.blocking_pipe_writes.remove(&fd);
-        }
-    }
-
-    fn fd_has_blocking_pipe_write(&self, fd: RawFd) -> bool {
-        self.blocking_pipe_writes.contains_key(&fd)
-    }
-
-    fn range_has_blocking_pipe_write(&self, first: u32, last: u32) -> bool {
-        self.file_handles.keys().any(|&fd| {
-            fd >= 0
-                && first <= fd as u32
-                && fd as u32 <= last
-                && self.blocking_pipe_writes.contains_key(&fd)
-        })
     }
 
     pub(crate) fn exec_blocking_overrides(&self) -> ExecFdBlockingOverrides {
@@ -1835,26 +1796,6 @@ impl<T> ThreadState<T> {
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
         self.metadata().remove_fd(fd)
-    }
-
-    /// Register a logically blocking pipe write that will span scheduler turns.
-    pub(crate) fn begin_blocking_pipe_write(&self, fd: RawFd) -> Result<(), Errno> {
-        self.metadata().begin_blocking_pipe_write(fd)
-    }
-
-    /// Finish a previously registered logically blocking pipe write.
-    pub(crate) fn end_blocking_pipe_write(&self, fd: RawFd) {
-        self.metadata().end_blocking_pipe_write(fd);
-    }
-
-    /// Whether replacing this descriptor could retarget an in-progress logical write.
-    pub(crate) fn fd_has_blocking_pipe_write(&self, fd: RawFd) -> bool {
-        self.metadata().fd_has_blocking_pipe_write(fd)
-    }
-
-    /// Whether replacing any descriptor in this range could retarget a logical write.
-    pub(crate) fn range_has_blocking_pipe_write(&self, first: u32, last: u32) -> bool {
-        self.metadata().range_has_blocking_pipe_write(first, last)
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.

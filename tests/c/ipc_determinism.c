@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +17,6 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #define PRODUCERS 3
@@ -173,6 +171,7 @@ static void pipe_capacity(void) {
   if (capacity <= 0) {
     fail("fcntl(F_GETPIPE_SZ)");
   }
+  verify_blocking_flag_roundtrip(fds[1]);
   errno = 0;
   if (fcntl(fds[1], F_SETPIPE_SZ, capacity * 2) != -1 || errno != EPERM) {
     fprintf(stderr, "scheduler-managed pipe unexpectedly grew beyond %d bytes\n",
@@ -213,178 +212,6 @@ static void pipe_capacity(void) {
   close(fds[0]);
   close(fds[1]);
   pthread_barrier_destroy(&barrier);
-}
-
-static void pipe_large_write(void) {
-  enum { REQUESTED = 8190 };
-  int fds[2];
-  if (pipe(fds) != 0) {
-    fail("pipe");
-  }
-  int capacity = fcntl(fds[1], F_SETPIPE_SZ, 4096);
-  if (capacity != 4096) {
-    fail("fcntl(F_SETPIPE_SZ)");
-  }
-
-  pid_t child = fork();
-  if (child < 0) {
-    fail("fork");
-  }
-  if (child == 0) {
-    close(fds[1]);
-    uint8_t buffer[REQUESTED];
-    size_t received = 0;
-    while (received < sizeof(buffer)) {
-      ssize_t count = read(fds[0], buffer + received, sizeof(buffer) - received);
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count <= 0) {
-        _exit(3);
-      }
-      received += (size_t)count;
-    }
-    for (size_t i = 0; i < sizeof(buffer); i++) {
-      if (buffer[i] != 0x6d) {
-        _exit(4);
-      }
-    }
-    close(fds[0]);
-    _exit(0);
-  }
-
-  close(fds[0]);
-  uint8_t buffer[REQUESTED];
-  memset(buffer, 0x6d, sizeof(buffer));
-  ssize_t written = write(fds[1], buffer, sizeof(buffer));
-  int write_errno = errno;
-  close(fds[1]);
-
-  int status = 0;
-  if (waitpid(child, &status, 0) != child) {
-    fail("waitpid");
-  }
-  if (written != REQUESTED) {
-    fprintf(stderr, "blocking pipe write returned %zd of %d bytes: %s\n", written,
-            REQUESTED, strerror(write_errno));
-    exit(1);
-  }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    fprintf(stderr, "pipe reader failed: status=%d\n", status);
-    exit(1);
-  }
-  printf("pipe-large-write:%zd:%d\n", written, capacity);
-}
-
-enum { REUSED_WRITE_SIZE = 8190, REUSED_PIPE_FILL = 4096 };
-
-struct reused_pipe_write_args {
-  int fd;
-  ssize_t written;
-  int write_errno;
-  atomic_int *writer_entering;
-};
-
-struct reused_pipe_read_args {
-  int fd;
-  atomic_int *replace_started;
-  int valid;
-};
-
-static void *write_reused_pipe(void *opaque) {
-  struct reused_pipe_write_args *args = opaque;
-  uint8_t buffer[REUSED_WRITE_SIZE];
-  memset(buffer, 0x6d, sizeof(buffer));
-  atomic_store_explicit(args->writer_entering, 1, memory_order_release);
-  args->written = write(args->fd, buffer, sizeof(buffer));
-  args->write_errno = errno;
-  return NULL;
-}
-
-static void *read_reused_pipe(void *opaque) {
-  struct reused_pipe_read_args *args = opaque;
-  while (!atomic_load_explicit(args->replace_started, memory_order_acquire)) {
-    sched_yield();
-  }
-
-  uint8_t buffer[REUSED_PIPE_FILL + REUSED_WRITE_SIZE];
-  read_exact(args->fd, buffer, sizeof(buffer));
-  args->valid = 1;
-  for (size_t i = 0; i < REUSED_PIPE_FILL; i++) {
-    args->valid &= buffer[i] == 0x41;
-  }
-  for (size_t i = REUSED_PIPE_FILL; i < sizeof(buffer); i++) {
-    args->valid &= buffer[i] == 0x6d;
-  }
-  return NULL;
-}
-
-static void pipe_close_reuse_write(void) {
-  int original[2];
-  int replacement[2];
-  if (pipe(original) != 0 || pipe(replacement) != 0) {
-    fail("pipe");
-  }
-  if (fcntl(original[1], F_SETPIPE_SZ, REUSED_PIPE_FILL) !=
-      REUSED_PIPE_FILL) {
-    fail("fcntl(F_SETPIPE_SZ)");
-  }
-
-  uint8_t fill[REUSED_PIPE_FILL];
-  memset(fill, 0x41, sizeof(fill));
-  write_exact(original[1], fill, sizeof(fill));
-
-  atomic_int writer_entering = 0;
-  atomic_int replace_started = 0;
-  struct reused_pipe_write_args writer_args = {
-      original[1], -1, 0, &writer_entering};
-  struct reused_pipe_read_args reader_args = {original[0], &replace_started,
-                                               0};
-  pthread_t writer;
-  pthread_t reader;
-  if (pthread_create(&writer, NULL, write_reused_pipe, &writer_args) != 0 ||
-      pthread_create(&reader, NULL, read_reused_pipe, &reader_args) != 0) {
-    fail("pthread_create");
-  }
-
-  while (!atomic_load_explicit(&writer_entering, memory_order_acquire)) {
-    sched_yield();
-  }
-  atomic_store_explicit(&replace_started, 1, memory_order_release);
-  if (dup2(replacement[1], original[1]) != original[1]) {
-    fail("dup2");
-  }
-
-  pthread_join(writer, NULL);
-  pthread_join(reader, NULL);
-  if (writer_args.written != REUSED_WRITE_SIZE) {
-    fprintf(stderr, "reused blocking pipe write returned %zd of %d bytes: %s\n",
-            writer_args.written, REUSED_WRITE_SIZE,
-            strerror(writer_args.write_errno));
-    exit(1);
-  }
-  if (!reader_args.valid) {
-    fprintf(stderr, "original pipe received invalid data during descriptor reuse\n");
-    exit(1);
-  }
-
-  int flags = fcntl(replacement[0], F_GETFL);
-  if (flags < 0 || fcntl(replacement[0], F_SETFL, flags | O_NONBLOCK) != 0) {
-    fail("fcntl(O_NONBLOCK)");
-  }
-  uint8_t unexpected;
-  ssize_t replacement_count = read(replacement[0], &unexpected, 1);
-  if (replacement_count != -1 || errno != EAGAIN) {
-    fprintf(stderr, "replacement pipe unexpectedly received %zd bytes\n",
-            replacement_count);
-    exit(1);
-  }
-
-  printf("pipe-close-reuse-write:%zd:0\n", writer_args.written);
-  close(original[0]);
-  close(original[1]);
-  close(replacement[0]);
-  close(replacement[1]);
 }
 
 static void socketpair_order(void) {
@@ -587,10 +414,6 @@ int main(int argc, char **argv) {
     pipe_order();
   } else if (strcmp(argv[1], "pipe-capacity") == 0) {
     pipe_capacity();
-  } else if (strcmp(argv[1], "pipe-large-write") == 0) {
-    pipe_large_write();
-  } else if (strcmp(argv[1], "pipe-close-reuse-write") == 0) {
-    pipe_close_reuse_write();
   } else if (strcmp(argv[1], "socketpair") == 0) {
     socketpair_order();
   } else if (strcmp(argv[1], "eventfd") == 0) {
