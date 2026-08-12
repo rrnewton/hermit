@@ -926,9 +926,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
         // Pin the kernel pipe object before any scheduler resource request can let another
         // guest thread close or reuse the numeric descriptor.
-        let pinned_pipe = blocking_pipe
-            .then(|| self.pin_pipe_writer(guest, call.fd(), raw_ino))
-            .flatten();
+        let pinned_pipe = if blocking_pipe {
+            self.pin_pipe_writer(guest, call.fd()).await?
+        } else {
+            None
+        };
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
@@ -1117,9 +1119,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
         // See handle_write: the controller handle is outside the guest descriptor table, so
         // close/dup/close_range retain normal Linux behavior while this syscall is blocked.
-        let pinned_pipe = blocking_pipe
-            .then(|| self.pin_pipe_writer(guest, call.fd(), raw_ino))
-            .flatten();
+        let pinned_pipe = if blocking_pipe {
+            self.pin_pipe_writer(guest, call.fd()).await?
+        } else {
+            None
+        };
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);

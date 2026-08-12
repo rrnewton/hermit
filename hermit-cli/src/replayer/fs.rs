@@ -582,12 +582,12 @@ impl Replayer {
             _ => unreachable!("readv-family handler received {syscall:?}"),
         };
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd => {
+            ReplayFdKind::Eventfd | ReplayFdKind::Pipe => {
                 let actual = inject_kernel_side_effect(guest, fd, syscall).await;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
-                    "replayed readv eventfd side effect diverged"
+                    "replayed readv kernel side effect diverged"
                 );
             }
             ReplayFdKind::RegularFile if advances_offset => {
@@ -610,12 +610,12 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd => {
+            ReplayFdKind::Eventfd | ReplayFdKind::Pipe => {
                 let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
-                    "replayed read eventfd side effect diverged"
+                    "replayed read kernel side effect diverged"
                 );
             }
             ReplayFdKind::RegularFile => {
@@ -765,12 +765,12 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, WriteV2)?;
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd => {
+            ReplayFdKind::Eventfd | ReplayFdKind::Pipe => {
                 let actual =
                     inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
                 assert_eq!(
                     actual, event.result,
-                    "replayed eventfd write side effect diverged"
+                    "replayed write kernel side effect diverged"
                 );
             }
             ReplayFdKind::RegularFile => {

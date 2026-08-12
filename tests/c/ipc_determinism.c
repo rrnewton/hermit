@@ -420,6 +420,28 @@ static void pipe_close_reuse(void) {
   close(replacement[1]);
 }
 
+static void pipe_read_end_write(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  uint8_t byte = 0x5a;
+  errno = 0;
+  if (write(fds[0], &byte, sizeof(byte)) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: write result was not EBADF\n");
+    exit(1);
+  }
+  struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
+  errno = 0;
+  if (writev(fds[0], &vector, 1) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: writev result was not EBADF\n");
+    exit(1);
+  }
+  printf("pipe-read-end-write:EBADF\n");
+  close(fds[0]);
+  close(fds[1]);
+}
+
 static volatile sig_atomic_t sigpipe_count;
 
 static void count_sigpipe(int signal_number) {
@@ -689,6 +711,8 @@ int main(int argc, char **argv) {
     pipe_large_writev();
   } else if (strcmp(argv[1], "pipe-close-reuse") == 0) {
     pipe_close_reuse();
+  } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
+    pipe_read_end_write();
   } else if (strcmp(argv[1], "pipe-sigpipe") == 0) {
     pipe_sigpipe_after_wait();
   } else if (strcmp(argv[1], "socketpair") == 0) {

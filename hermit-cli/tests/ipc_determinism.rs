@@ -13,12 +13,13 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 9] = [
+const PATTERNS: [&str; 10] = [
     "pipe-order",
     "pipe-capacity",
     "pipe-large-write",
     "pipe-large-writev",
     "pipe-close-reuse",
+    "pipe-read-end-write",
     "pipe-sigpipe",
     "socketpair",
     "eventfd",
@@ -65,7 +66,7 @@ fn ipc_guest() -> &'static Path {
         .as_path()
 }
 
-fn run_pattern(pattern: &str, iteration: usize) -> String {
+fn run_pattern_with_options(pattern: &str, iteration: usize, options: &[&str]) -> String {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after=5s", &format!("{TIMEOUT_SECONDS}s")])
@@ -75,12 +76,17 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
         ])
+        .args(options)
+        .arg("--")
         .arg(ipc_guest())
         .arg(pattern);
     let output = command_output(command, &format!("{pattern} iteration {iteration}"));
     String::from_utf8(output.stdout).expect("IPC guest stdout should be UTF-8")
+}
+
+fn run_pattern(pattern: &str, iteration: usize) -> String {
+    run_pattern_with_options(pattern, iteration, &[])
 }
 
 #[test]
@@ -99,6 +105,14 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
             );
         }
     }
+}
+
+#[test]
+fn pipe_descriptor_reuse_is_stable_without_virtual_metadata() {
+    assert_eq!(
+        run_pattern_with_options("pipe-close-reuse", 1, &["--no-virtualize-metadata"]),
+        "pipe-close-reuse:8190\n"
+    );
 }
 
 #[test]

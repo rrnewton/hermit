@@ -187,35 +187,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2168): Audit controller-held pipe lifetime and blocking-write completion.
     /// Hold the pipe object independently of the guest descriptor table while a logically
     /// blocking write yields to another guest thread. Linux keeps the open file description
     /// alive for an in-progress write even if another thread closes or reuses its descriptor;
     /// opening the procfs descriptor link gives Detcore the same lifetime guarantee without
     /// reserving a descriptor number in the guest.
-    pub fn pin_pipe_writer<G: Guest<Self>>(
+    pub async fn pin_pipe_writer<G: Guest<Self>>(
         &self,
-        guest: &G,
+        guest: &mut G,
         fd: i32,
-        expected_inode: Option<u64>,
-    ) -> Option<File> {
-        let expected_inode = expected_inode?;
+    ) -> Result<Option<File>, Errno> {
+        let flags = guest
+            .inject_with_retry(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(syscalls::FcntlCmd::F_GETFL),
+            )
+            .await? as i32;
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(Errno::EBADF);
+        }
+        let expected = self.inject_fstat(guest, fd).await?;
         let path = format!("/proc/{}/fd/{fd}", guest.pid().as_raw());
-        let file = OpenOptions::new()
+        let Ok(file) = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(&path)
-            .ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.file_type().is_fifo() || metadata.ino() != expected_inode {
+        else {
+            tracing::warn!(%path, "backend cannot expose a controller handle for this guest pipe");
+            return Ok(None);
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Ok(None);
+        };
+        if !metadata.file_type().is_fifo()
+            || metadata.dev() != expected.st_dev
+            || metadata.ino() != expected.st_ino
+        {
             tracing::warn!(
                 %path,
-                expected_inode,
+                expected_device = expected.st_dev,
+                expected_inode = expected.st_ino,
+                observed_device = metadata.dev(),
                 observed_inode = metadata.ino(),
                 "refusing a controller pipe handle whose kernel identity does not match the guest descriptor"
             );
-            return None;
+            return Ok(None);
         }
-        Some(file)
+        Ok(Some(file))
     }
 
     async fn deliver_pipe_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
@@ -252,6 +273,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
+        if pinned_pipe.is_none() {
+            if target <= PIPE_BUF {
+                return self.execute_nonblockable_fd_syscall(guest, call).await;
+            }
+            return Err(Errno::ENOSYS.into());
+        }
 
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
@@ -263,9 +290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut written_total = 0usize;
 
         loop {
-            if resources.poll_attempt > 0
-                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
-            {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
@@ -383,6 +408,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let atomic_pipe_write = target <= PIPE_BUF;
+        if pinned_pipe.is_none() && !atomic_pipe_write {
+            return Err(Errno::ENOSYS.into());
+        }
 
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
@@ -395,9 +423,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut written_total = 0usize;
 
         loop {
-            if resources.poll_attempt > 0
-                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
-            {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
