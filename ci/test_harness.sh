@@ -53,6 +53,8 @@ MANIFEST_ROOT="$TEST_ROOT/manifests"
 INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
 EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
+# CI DAG result and JUnit paths use the same override while retaining their
+# explicit lane/category layout.
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/ignored/e2e}
 RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
 SOURCE_TREE_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
@@ -1832,7 +1834,7 @@ EOF
                 (if $m.lane == "portable"
                  then "./ci/run-with-hermit-e2e-artifact.sh --require-install "
                  else "./ci/run-with-hermit-e2e-artifact.sh " end)
-                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ignored/e2e/\($m.lane)/\($m.category)/results.jsonl --junit ignored/e2e/\($m.lane)/\($m.category)/junit.xml";
+                + "./ci/test_harness.sh run --lane \($m.lane) --category \($m.category) --ci-only --allow-empty --prebuilt --results ${E2E_RESULT_ROOT:-ignored/e2e}/\($m.lane)/\($m.category)/results.jsonl --junit ${E2E_RESULT_ROOT:-ignored/e2e}/\($m.lane)/\($m.category)/junit.xml";
             def artifact_producer($lane):
                 if $lane == "portable" then "build.e2e_artifact" else "build.privileged_tests" end;
             ([.steps[] | select(.cmd | contains("./ci/test_harness.sh run "))] | all(has("manifest")))
