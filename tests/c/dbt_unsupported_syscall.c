@@ -35,6 +35,11 @@ static int call_unsupported(void) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "replay-control") == 0) {
+    puts("dbt-supported-replay-control");
+    return 0;
+  }
+
   if (argc == 2 && strcmp(argv[1], "after-exec") == 0) {
     if (call_unsupported() != 0) {
       return 1;
