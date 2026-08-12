@@ -76,9 +76,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub use config::BlockingMode;
+pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
+pub use config::config_wire_fingerprint;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
@@ -122,6 +124,16 @@ use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
 
+fn select_thread_exit_detpid(
+    thread_detpid: Option<DetPid>,
+    process_detpid: DetPid,
+) -> (DetPid, bool) {
+    match thread_detpid {
+        Some(detpid) => (detpid, false),
+        None => (process_detpid, true),
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
 /// Identifies an unsupported syscall that a backend must terminate without unwinding.
@@ -144,6 +156,32 @@ pub fn is_unsupported_syscall(sysno: Sysno) -> bool {
     matches!(
         syscall_classification::classify_syscall(sysno),
         syscall_classification::SyscallClassification::Unsupported
+    )
+}
+
+/// Every syscall in the pinned x86_64 table, including the final entry.
+///
+/// Backends that sweep the classification table must use this rather than
+/// `Sysno::iter()`, which stops one short and silently drops the last row.
+pub fn all_pinned_syscalls() -> impl Iterator<Item = Sysno> {
+    syscall_classification::all_pinned_syscalls()
+}
+
+/// Returns whether the audited runtime policy classifies `sysno` as
+/// `Determinized` — that is, Detcore either models the syscall with a handler
+/// or applies an explicit deterministic refusal policy to it.
+///
+/// This is the complement of the refusal boundary below. A backend that
+/// executes guest syscalls outside `handle_syscall_event` needs BOTH: the
+/// refusal set tells it which syscalls to answer with a fixed errno, and this
+/// predicate tells it which syscalls Detcore claims to determinize at all.
+/// Running a `Determinized` syscall natively is a determinism hole even when it
+/// is not in the refusal set, because the modelling that makes it deterministic
+/// lives in a handler the backend never entered.
+pub fn is_determinized_syscall(sysno: Sysno) -> bool {
+    matches!(
+        syscall_classification::classify_syscall(sysno),
+        syscall_classification::SyscallClassification::Determinized
     )
 }
 
@@ -1074,9 +1112,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
             // strict guests execute those syscalls natively against the host,
             // exactly the leak the DBT copied-child path also had to close.
-            subscription.syscalls(Sysno::iter().filter(|sysno| {
-                syscall_classification::is_deterministically_refused_syscall(*sysno)
-            }));
+            // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
+            // stops one short of the end of the table, which silently dropped
+            // `lsm_list_modules` out of this sweep.
+            subscription.syscalls(
+                syscall_classification::all_pinned_syscalls().filter(|sysno| {
+                    syscall_classification::is_deterministically_refused_syscall(*sysno)
+                }),
+            );
 
             // Make sure we also intercept everything that the record-or-replay tool
             // wants.
@@ -1342,6 +1385,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     last_accounted_user_time,
                     last_accounted_system_time,
+                    thread_cpu_start_user_time: last_accounted_user_time,
+                    thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
 
@@ -2431,7 +2476,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // event, before the guest parent can consume it with wait. Ptrace also
         // guarantees that the process leader exits after the other threads, so
         // the final published aggregate is complete when wait returns.
-        let detpid = thread_state.detpid.expect("Missing DetPid");
+        // DETERMINISTIC RECOVERY (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
+        // is `Option` and starts as `None` ("Initialized later" at the clone site),
+        // so a thread that reaches the exit hook before its per-thread identity is
+        // populated used to `.expect()` here. That panic fires inside a Reverie
+        // teardown callback, while the backend still owns the exit event, which is
+        // the worst place to abort: it can wedge the supervisor rather than fail one
+        // thread. Fall back to the PROCESS-level `self.detpid` -- the same value
+        // `thread_start` passes to `thread_start_request` -- which is non-optional
+        // and deterministic (minted from the process identity, never host-derived),
+        // so the fallback cannot introduce nondeterminism. Warn so the window is
+        // observable instead of silently papered over.
+        let (detpid, used_process_detpid) =
+            select_thread_exit_detpid(thread_state.detpid, self.detpid);
+        if used_process_detpid {
+            tracing::warn!(
+                "[detcore, dtid {}] thread exited before its per-thread detpid was \
+                 initialized; falling back to the process detpid {}",
+                dettid,
+                self.detpid
+            );
+        }
         if dettid == detpid {
             thread_state.record_exited_child_process_cpu_time(detpid);
         } else {
@@ -2476,6 +2541,65 @@ mod subscription_tests {
             deterministic_io: true,
             passthru_opt,
             ..Default::default()
+        }
+    }
+
+    /// The last row of the pinned table is the one a `Sysno::iter()` sweep
+    /// drops. `lsm_list_modules` is Determinized AND deterministically refused,
+    /// so before this was fixed it executed natively against the host under
+    /// `--passthru-opt` — which is the default for `hermit record` and
+    /// `hermit replay` — instead of receiving its fixed refusal.
+    #[test]
+    fn passthru_opt_covers_the_final_row_of_the_pinned_table() {
+        let last = Sysno::last();
+        // Guard the premise: if the table endpoint moves, this test must be
+        // re-derived rather than silently passing on a different syscall.
+        assert_eq!(last, Sysno::lsm_list_modules);
+        assert!(crate::is_determinized_syscall(last));
+        assert!(crate::is_deterministically_refused_syscall(last));
+        // The bug this pins: the final row is absent from `Sysno::iter()`.
+        assert!(!Sysno::iter().any(|sysno| sysno == last));
+
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        assert!(
+            subscriptions.iter_syscalls().any(|sysno| sysno == last),
+            "{last} must be intercepted under passthru_opt; it is deterministically refused"
+        );
+    }
+
+    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
+    /// syscalls does each subscription path actually deliver to Detcore?
+    ///
+    /// `passthru_opt` is not a niche flag: `record_or_replay_config` turns it on
+    /// for every `hermit record` / `hermit replay`, so this census is the record
+    /// and replay coverage too.
+    #[test]
+    fn census_determinized_syscalls_reaching_each_subscription_path() {
+        let determinized: Vec<Sysno> = crate::all_pinned_syscalls()
+            .filter(|sysno| crate::is_determinized_syscall(*sysno))
+            .collect();
+        let m = determinized.len();
+
+        for passthru_opt in [false, true] {
+            let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
+            let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+            let (reached, missing): (Vec<Sysno>, Vec<Sysno>) = determinized
+                .iter()
+                .partition(|sysno| delivered.contains(sysno));
+            println!(
+                "subscriptions passthru_opt={passthru_opt}: {}/{m} Determinized syscalls \
+                 delivered to Detcore; {} bypass it",
+                reached.len(),
+                missing.len()
+            );
+            println!(
+                "  bypassing: {}",
+                missing
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
     }
 
@@ -2675,5 +2799,69 @@ mod process_tree_guest_clock_tests {
         );
 
         assert!(Arc::ptr_eq(&parent.guest_clock, &child.guest_clock));
+    }
+}
+
+#[cfg(test)]
+mod thread_exit_identity_tests {
+    use super::*;
+
+    #[test]
+    fn initialized_thread_exit_identity_is_preserved() {
+        let thread_detpid = DetPid::from_raw(41);
+        let process_detpid = DetPid::from_raw(7);
+        assert_eq!(
+            select_thread_exit_detpid(Some(thread_detpid), process_detpid),
+            (thread_detpid, false)
+        );
+    }
+
+    #[test]
+    fn missing_thread_exit_identity_uses_process_identity() {
+        let process_detpid = DetPid::from_raw(7);
+        assert_eq!(
+            select_thread_exit_detpid(None, process_detpid),
+            (process_detpid, true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod thread_cpu_time_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_thread_and_fork_child_start_with_zero_thread_cpu() {
+        for clone_flags in [CloneFlags::CLONE_THREAD, CloneFlags::empty()] {
+            let config = Config::default();
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+            let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+
+            // Give the parent nonzero CPU before the child exists. The child's
+            // absolute logical clock inherits this position for scheduler
+            // ordering, but Linux per-thread CPU accounting must not.
+            parent.thread_logical_time.add_rcbs(200);
+            parent.thread_logical_time.add_syscall();
+            parent.clone_flags = Some(clone_flags);
+
+            let mut child = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Tid::from_raw(2),
+                Some((Tid::from_raw(1), &parent)),
+            );
+            assert_eq!(
+                child.thread_cpu_time(),
+                (LogicalTime::ZERO, LogicalTime::ZERO),
+                "clone flags {clone_flags:?} inherited pre-creation CPU"
+            );
+
+            child.thread_logical_time.add_rcbs(4);
+            child.thread_logical_time.add_syscall();
+            let (user, system) = child.thread_cpu_time();
+            assert!(user > LogicalTime::ZERO);
+            assert!(system > LogicalTime::ZERO);
+            assert!(user < parent.thread_logical_time.user_cpu_time());
+            assert!(system <= parent.thread_logical_time.system_cpu_time());
+        }
     }
 }

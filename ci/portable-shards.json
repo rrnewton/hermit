@@ -12,6 +12,7 @@
     "check.reverie_pin",
     "check.skill_discovery",
     "check.backend_abstraction",
+    "check.backend_parity_mutation",
     "check.portability_paths",
     "check.script_sigpipe",
     "lint.rustfmt"
@@ -19,6 +20,7 @@
   "build_debug_nodes": [
     "setup.manifest_plan",
     "e2e.metadata",
+    "e2e.audit_compile_backend_parity_c",
     "setup.nextest",
     "build.workspace",
     "build.manifest_guests"
@@ -48,6 +50,7 @@
     {
       "slug": "integration",
       "nodes": [
+        "build.e2e_artifact",
         "test.hermit_integration",
         "test.cli",
         "test.arbitrary_binaries",

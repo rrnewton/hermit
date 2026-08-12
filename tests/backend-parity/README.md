@@ -4,8 +4,12 @@ This directory tracks executable parity contracts across Hermit's ptrace,
 DynamoRIO (DBT), and KVM backends. The case catalog and its small set of known
 gaps live in `run_matrix.py`; new cases are green contracts by default. Live
 results are compatibility measurement state, so when Hermit is checked out
-inside dev-hermit the runner appends them to the outer
-`compat-envelope/scorecard.csv` instead of maintaining a generated TSV here.
+inside dev-hermit the runner writes them to one ignored per-run observation
+file under `compat-envelope/ignored/backend-parity/` instead of maintaining a
+generated TSV here. It does **not** touch the tracked
+`compat-envelope/scorecard.csv`; that artifact is advanced only by the parent
+publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
+runner prints at the end of the run.
 
 ## Current ratchet
 
@@ -152,6 +156,15 @@ and KVM and across the `--verify` double run.
 The authoritative exceptions and their reasons live in `L1_GAPS` and
 `L2_GAPS` in the runner. The runner executes each passing pair three times and
 checks exit status, stdout, and (for determinism cases) byte-identical repeated output.
+Cross-backend stdout SHA-256 equality is an exact-byte contract only for rows
+that already define one: fixed `expected_stdout` rows, the dynamic
+`virtual_pid` row, and DBT's pre-existing ptrace root-stream comparison for
+`random_sources`. Those rows capture both raw operands without normalization,
+and a missing side or unequal digest fails regardless of whether an observation
+artifact is written. Dynamic memory-layout and clock rows remain explicitly
+within-backend repeatability contracts; their observation rows do not invent a
+cross-backend digest verdict. In particular, the absolute-address cases below
+remain outside the raw stdout-parity contract.
 Passing `--strict` adds `hermit run --strict` to every probe; the hosted DBT
 gate uses this mode.
 The DBT random-source contract also compares the root thread's post-fault
@@ -191,6 +204,42 @@ currently execute in the backend's deterministic `ElfExecutor` personality
 without per-child Detcore tool callbacks. The CPUID row similarly validates
 reverie-kvm's backend-local `KVM_SET_CPUID2` policy, not Detcore CPUID-event
 parity.
+
+### Memory-layout ADDRESSES are not a parity contract under DBT
+
+`anonymous_mmap_layout` checks that a backend places anonymous mappings
+**repeatably across its own runs**. Its name invites a stronger reading, so
+state the limit explicitly: it does **not** compare layout between backends, and
+it cannot — the guest prints absolute addresses (`multiple %p %p %p`), which a
+translator necessarily shifts.
+
+Do not add a cross-backend fixture that asserts anonymous-mmap addresses, either
+absolute **or relative**. It is unreachable for DBI, and the reason is
+structural rather than a bug to fix:
+
+* DynamoRIO's runtime makes the guest-visible address space **185 VMAs instead
+  of 25**, which changes where the kernel's top-down allocator puts the
+  **guest's own** mappings.
+* This is *not* translator allocations interleaving with the guest's. Measured:
+  under DBI four successive anonymous mmaps of 1+2+3+4 pages occupy a span of
+  **exactly the 10 pages requested, coalesced into one VMA, with zero DynamoRIO
+  allocations inside it**. The ptrace arm needs 14 pages for the same 10,
+  because of glibc loader slack. DBI packs *tighter*, not looser.
+* It is therefore also not a separability problem. DR's allocations are
+  separable by provenance (`dr_memory_is_dr_internal`, `dr_query_memory_ex`);
+  perfect separability would not move the guest's own mappings by one byte.
+  Attribution and placement are different properties.
+* There is no stable ptrace layout to match in any case. Varying the guest's
+  allocation prefix by 0–8 pages produces **nine distinct ptrace layouts and one
+  DBI layout**, and at a 7-page prefix the two backends are byte-identical.
+  Native itself shows a 1–2% tail on the same measurement.
+
+What **is** a parity contract, and does hold on every backend measured: pointer
+**ordering** between mappings, and mapping **contents**. Assert those.
+
+Evidence and reproduction: `dev-hermit` PR #60,
+`experiments/dbi-anon-mmap-layout-divergence_20260806/` (`VERDICT.md`,
+`README-prefix-sweep.md`, `interleave.txt`).
 
 ## e9patch preprocessing corpus
 
@@ -303,9 +352,17 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
 (in `--verify` mode the probe reports which L2 kind a gap actually reached).
-Every non-check run auto-discovers an outer dev-hermit checkout and appends
-scorecard rows to `compat-envelope/scorecard.csv`. Use `--parent-scorecard PATH`
-to select another outer scorecard, `--no-parent-scorecard` for a deliberately
-side-effect-free run, or `--output /tmp/backend-parity.tsv` for the legacy
-standalone observation TSV. `BLOCKED` means a required host capability or
-runtime artifact was absent; it does not change the known-gap contract.
+Every non-check run auto-discovers an outer dev-hermit checkout and writes its
+observation rows to one ignored per-run file,
+`compat-envelope/ignored/backend-parity/<run-id>.csv`; the tracked
+`compat-envelope/scorecard.csv` is left unchanged. The run then prints the exact
+`publish-scorecard.py --observation ... --current ... --history ...` command that
+folds that observation into the tracked scorecard and its history, so publishing
+is a reviewed step rather than a side effect of measuring. Use
+`--parent-scorecard PATH` to write the observation to that exact artifact
+instead of the default per-run file (the tracked
+`compat-envelope/scorecard.csv` is always refused), `--no-parent-scorecard` to
+skip only observation output without weakening any comparison, or `--output
+/tmp/backend-parity.tsv` for the legacy standalone observation TSV. `BLOCKED`
+means a required host capability or runtime artifact was absent; it does not
+change the known-gap contract.

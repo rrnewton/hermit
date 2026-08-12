@@ -47,7 +47,7 @@ if [[ $build_job_context == launcher ]]; then
     unset REVERIE_DBT_BUDGET_CHILD
 
     # Cargo converts this explicit pool width into build-script NUM_JOBS. Keep
-    # the nested native-build knob identical so validate.sh cannot widen it.
+    # the nested native-build knob identical so the Rust validator cannot widen it.
     export CARGO_BUILD_JOBS=$CI_DAG_BUILD_JOBS
     export THIRD_PARTY_BUILD_JOBS=$CI_DAG_BUILD_JOBS
     return 0
@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0384d673319bf139cf7d71fda820245a9266364d ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 0384d673319bf139cf7d71fda820245a9266364d" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
     return 2
 fi
 
@@ -336,6 +336,34 @@ fi
 # none of which can affect the DynamoRIO content-key miss measured by this
 # budget. They remain build-relevant and therefore require fresh validation;
 # this carry does not authorize receipt reuse.
+#
+# CARRY TO 8f4eb9ef (2026-08-09). The calibration carries unchanged because
+# neither input to source_recipe_key() changed across 0384d673..8f4eb9ef:
+#
+#   git diff --name-status 0384d673..8f4eb9ef -- reverie-dbt -> no output
+#   git rev-parse 0384d673:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 8f4eb9ef:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 0384d673:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#   git rev-parse 8f4eb9ef:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#
+# The 14 intervening commits are build-relevant but cannot affect the
+# DynamoRIO content-key miss measured by this budget. MAX_PARALLEL_JOBS=16 and
+# the 1050 effective-job-second threshold carry unchanged. Fresh validation is
+# still required; this carry does not authorize receipt reuse.
+#
+# CARRY TO 99437f05 (2026-08-09). The calibration carries unchanged because
+# neither input to source_recipe_key() changed across 8f4eb9ef..99437f05:
+#
+#   git diff --name-status 8f4eb9ef..99437f05 -- reverie-dbt -> no output
+#   git rev-parse 8f4eb9ef:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 99437f05:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 8f4eb9ef:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#   git rev-parse 99437f05:reverie-dbt/build.rs -> af2faa442335c1914f24a633d9cf2aa12820034b
+#
+# The sole intervening commit changes only Reverie's validation entrypoint,
+# outside the DynamoRIO content-key recipe. MAX_PARALLEL_JOBS=16 and the 1050
+# effective-job-second threshold carry unchanged. Fresh validation is still
+# required; this carry does not authorize receipt reuse.
 REVERIE_DBT_MAX_PARALLEL_JOBS=16
 REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS=1050
 REVERIE_DBT_EFFECTIVE_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
@@ -350,6 +378,141 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
         REVERIE_DBT_EFFECTIVE_BUILD_JOBS - 1) /
         REVERIE_DBT_EFFECTIVE_BUILD_JOBS
 ))
+
+# CARRY TO 3494609 (2026-08-10). RECIPE IDENTITY MOVES; THE BUDGET CARRIES.
+# This is the e159d6c case, not the ab44bbf7 case: reverie-dbt/build.rs CHANGED,
+# so source_recipe_key() necessarily changes, but the work it keys has not.
+#
+#   git rev-parse 99437f05:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 3494609 :reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#                                                          IDENTICAL -- the compiled source is the same tree.
+#
+# The five commits 99437f05..3494609 are DynamoRIO BUILD-CACHE MANAGEMENT:
+#   5dffda1 Share DynamoRIO installs across Cargo fingerprints
+#   1a227a9 Exercise concurrent DynamoRIO cache publication
+#   3d9756a Reject incomplete DynamoRIO cache installs
+#   4664b5e Bind DynamoRIO cache hits to build provenance
+#   3494609 Handle both Cargo OUT_DIR cache layouts
+# They relocate the install under a shared cache root, stage into a temporary
+# directory, quarantine an install that fails a usability check, and rebuild.
+# Every one of them changes whether a build is a HIT or a MISS. NONE changes
+# what a MISS compiles: the vendored tree is byte-identical and the cmake
+# invocation is unchanged. The budget governs exactly one quantity -- the
+# elapsed time of a content-key MISS -- so its worst case is bounded by the same
+# cold DynamoRIO compile as before. The staging copy/rename these commits add is
+# negligible beside that compile, and the added quarantine path leads to the
+# already-budgeted cold build.
+#
+# NEW RECIPE IDENTITY, DERIVED NOT GUESSED. source_recipe_key() was
+# reimplemented from the build.rs at 3494609 (hash_tree/hash_file/hash_value/
+# hash_name, usize::to_le_bytes framing) and FIRST VALIDATED AGAINST THE
+# RECORDED VALUE: fed the vendored tree and build.rs at 99437f05 it reproduces
+# sha256:019b79670b3572c1afc2690932dd3fbbf70bbc9d0d96b5086ea121422de4bbb9
+# exactly -- the identity this chain already recorded. Only then was it used to
+# derive the value at 3494609:
+#   sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# A key computed by a reimplementation that could not reproduce the known
+# answer would be a number, not evidence; the positive control is what makes
+# this one usable.
+#
+# CONFIRMED BY THE REAL BUILD, not only by the reimplementation. A cold
+# `cargo build --workspace` at this pin ran the actual build.rs at 3494609 and
+# printed its own content key:
+#   cargo:warning=DynamoRIO build cache MISS key=sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# identical to the derived value. The derivation and the running code agree.
+# This is still NOT a substitute for the hosted-runner calibration, exactly as
+# the e159d6c entry noted for its own identity transition.
+#
+# Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
+# max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement
+# bar is unmet, so nothing is recalibrated here.
+#
+# BUILD-RELEVANT ANYWAY: reverie-dbt/build.rs is compiled by hermit, so this
+# bump requires REAL revalidation; no prior receipt may be reused.
+
+# CARRY TO 0fd04fe (2026-08-11). The calibration carries unchanged because
+# every versioned input to the DynamoRIO content-key miss is object-identical
+# across 3494609..0fd04fe:
+#
+#   git diff --name-status 3494609..0fd04fe -- reverie-dbt -> no output
+#   git rev-parse 3494609:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 0fd04fe:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 3494609:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 0fd04fe:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 3494609:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 0fd04fe:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#
+# The two intervening commits modify only AGENTS.md. They do not change the
+# vendored DynamoRIO source, the build recipe or commands, workspace/toolchain
+# metadata, or the CI cache/build invocation. With CMAKE=cmake and
+# CMAKE_GENERATOR unset, source_recipe_key() therefore remains
+# sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429.
+# MAX_PARALLEL_JOBS=16 and the measured 1050 effective-job-second threshold
+# (263s at 4 effective jobs; 66s at 16) carry unchanged. Fresh validation is
+# still required; this carry does not authorize receipt reuse.
+
+# CARRY TO 6b62f91 (2026-08-11). The calibration carries unchanged across
+# 0fd04fe..6b62f91 because every input to the DynamoRIO content-key miss is
+# object-identical:
+#
+#   git rev-parse 0fd04fe:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 6b62f91:reverie-dbt -> bffe51c6a6e47ebd64ab1e055eed5165f83237a6
+#   git rev-parse 0fd04fe:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 6b62f91:reverie-dbt/build.rs -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse 0fd04fe:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 6b62f91:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#
+# The two intervening commits change only AGENTS.md and wording/test naming in
+# reverie-kvm/tests/static_elf.rs. They do not change a crate manifest, runtime
+# source, toolchain, DBT build recipe, or vendored DynamoRIO input. Therefore
+# source_recipe_key(), MAX_PARALLEL_JOBS=16, and the measured 1050
+# effective-job-second threshold (263s at 4 jobs; 66s at 16) carry unchanged.
+# Fresh exact-head validation remains required.
+
+#
+# CARRY TO c261050 (2026-08-11, third bump of the day). RECIPE IDENTITY MOVES;
+# THE BUDGET CARRIES. This is the e159d6c case, not the 108f9ab case:
+# reverie-dbt/build.rs CHANGED, so source_recipe_key() necessarily changes, but
+# the work it keys has not.
+#
+#   git rev-parse 5d42e32:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse c261050:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#                                                         IDENTICAL -- the compiled source is the same tree.
+#   git rev-parse 5d42e32:reverie-dbt/build.rs         -> 209bca718ea9b6d026a26abf5cbd8accbd346068
+#   git rev-parse c261050:reverie-dbt/build.rs         -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#
+# The two commits 5d42e32..c261050 are rrnewton/reverie#440 ("Make SaBRe CMake
+# state relocatable" + "Keep the Reverie DBT cleanup lint-clean"). The only
+# reverie-dbt change is a let-chain rewrite of StagingDirectory::drop's error
+# path -- same control flow, same message, no build behaviour. build_dynamorio()
+# still cmake-configures and cmake-builds only vendor/dynamorio, which is
+# byte-identical, so the measured MISS cost cannot have moved.
+#
+# NEW RECIPE IDENTITY, DERIVED NOT GUESSED, exactly as the 3494609 entry above
+# requires. source_recipe_key() was reimplemented from the build.rs at c261050
+# (hash_tree/hash_file/hash_value/hash_name, usize::to_le_bytes framing, CMAKE
+# defaulting to "cmake" and CMAKE_GENERATOR to "<unset>") and FIRST VALIDATED
+# AGAINST THE RECORDED VALUE: fed the same on-disk vendored tree together with
+# the build.rs at 209bca71 it reproduces
+# sha256:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429
+# exactly -- the identity this chain already records. Only then was it used to
+# derive the value at c261050:
+#   sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
+# A key computed by a reimplementation that could not reproduce the known answer
+# would be a number, not evidence; the positive control is what makes this one
+# usable. The negative direction was checked too: swapping only build.rs moves
+# the key, so the derivation is not insensitive to the input that changed.
+#
+# NOT confirmed by a real cold build at this pin. The 3494609 entry additionally
+# quoted `cargo:warning=DynamoRIO build cache MISS key=...` from an actual build;
+# that has not been done here, so this identity rests on the validated
+# reimplementation alone. Exact-head validation will exercise the real build.rs
+# and is the check that would surface a disagreement.
+#
+# Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
+# max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
+# is still unmet, so nothing is recalibrated here.
+
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
 export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS

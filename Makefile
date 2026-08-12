@@ -15,7 +15,8 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 .DEFAULT_GOAL := build
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
-	install-build-tools check-submodules check-skill-discovery validate lint \
+	install-build-tools check-submodules check-skill-discovery validate validate-plan \
+	validate-self-test validate-timeout-layers-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
@@ -33,10 +34,12 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 		-p detcore-dbt -p detcore-sabre -p hermit-install
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
-# fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
-# step. core.hooksPath is per-repo local config (not tracked), so it must be set
-# once per checkout; wiring it into install-deps is that step.
-install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+# fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
+# non-blocking forward-advance advisory without a manual step. An ancestral,
+# monotonic pin may remain behind the live Reverie tip. core.hooksPath is
+# per-repo local config (not tracked), so it must be set once per checkout;
+# wiring it into install-deps is that step.
+install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin policy)
 	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)
@@ -68,12 +71,19 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	rm -f "$$bin"; \
 	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
-# NOTE: `validate` MUST stay a .PHONY target with an explicit recipe. Without it,
-# GNU Make's built-in implicit rule "%: %.sh" (cat $< >$@; chmod a+x $@) fires
-# against validate.sh and merely COPIES it to a file named `validate` instead of
-# running validation. .PHONY + this recipe overrides that implicit rule.
-validate: check-submodules ## Run the full multi-backend validation suite (pass extra flags via ARGS="--help")
-	./validate.sh $(ARGS)
+# Keep `validate` as an explicit .PHONY convenience target for the sole Rust
+# validation entrypoint.
+validate: check-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
+	./scripts/validate.rs $(ARGS)
+
+validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
+	./scripts/validate.rs --show-plan $(ARGS)
+
+validate-self-test: ## Run the validate driver's inert policy/quoting/corpus brackets
+	./scripts/validate.rs --self-test
+
+validate-timeout-layers-test: ## Live bracket for step/scope timeouts (requires systemd --user + cgroup v2)
+	./ci/validate-timeout-layers-test.sh
 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
 	./scripts/check-skill-discovery.rs
@@ -81,18 +91,19 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
 # reproduce every lint failure locally before pushing. Cheap checks run first for
 # fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
-# invariant run last. The exact clippy/rustfmt invocations match
+# ancestry/monotonicity policy run last. The exact clippy/rustfmt invocations match
 # ci/dag/portable.json (lint.clippy / lint.rustfmt).
 #
 # shellcheck runs at --severity=error: an enforceable floor that is clean on
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
 # warning/style findings. Ratchet the severity down (warning -> style) as that
 # debt is retired rather than blocking the target on it today.
-lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, reverie pin, nested lockfiles)
+lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles)
 	./scripts/check-skill-discovery.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	./scripts/check-merge-gate-policy.sh
+	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
 	$(CARGO) fmt --all -- --check
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
@@ -119,7 +130,7 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
-	@printf '\nThe full multi-backend suite is ./validate.sh (see ./validate.sh --help).\n'
+	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
 # third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO
@@ -205,8 +216,8 @@ check-submodules: checkout-all ## Verify every pinned submodule is checked out a
 # They wrap the pre-existing mechanisms rather than adding new ones:
 #   * KVM and DBT (real Detcore backends) -> the backend-parity matrix,
 #     scoped to one backend with `run_matrix.py --backend <backend>`, exactly
-#     as validate.sh's full "Real backend compatibility matrix" gate invokes it.
-#   * SaBRe / LiteInst / e9patch          -> validate.sh's focused
+#     as the Rust validation driver's full backend-compatibility gate invokes it.
+#   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
 #     `--<backend>-compat-only` profiles, which self-build the release binary
 #     and any backend artifacts.
 # ---------------------------------------------------------------------------
@@ -220,10 +231,10 @@ validate-dbt: check-submodules ## Run ONLY the DBT backend parity corpus (third-
 	$(RUN_MATRIX) --hermit $(HERMIT_DEBUG_BIN) --backend dbt --probe-gaps --require-backend
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
-	./validate.sh --sabre-compat-only
+	./scripts/validate.rs --sabre-compat-only
 
 validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./validate.sh --liteinst-compat-only
+	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
-	./validate.sh --e9patch-compat-only
+	./scripts/validate.rs --e9patch-compat-only

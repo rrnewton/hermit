@@ -52,7 +52,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Enable namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -66,7 +66,7 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: GitHub-managed portable test lane
-        run: ./validate.sh --portable-only --no-label-pr
+        run: ./scripts/validate.rs --portable-only --no-label-pr
       - name: Upload nextest JUnit report
         if: always()
         uses: actions/upload-artifact@v4
@@ -138,7 +138,7 @@ jobs:
         # (pre-pin behavior) so this self-hosted lane does not regress RED.
         run: env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
       - name: Record/replay compatibility ratchet (139 programs)
-        run: ./validate.sh --rr-compat-only --no-label-pr --verbose
+        run: ./scripts/validate.rs --rr-compat-only --no-label-pr --verbose
       - name: Upload privileged DAG performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -205,4 +205,4 @@ jobs:
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Repeated and long-form privileged validation
         # No flock: retired with the disproven PMU counter-exhaustion premise.
-        run: ./validate.sh super --no-label-pr
+        run: ./scripts/validate.rs super --no-label-pr

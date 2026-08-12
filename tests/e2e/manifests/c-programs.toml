@@ -1003,11 +1003,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm", "sabre"]
-guest_args = { ptrace = ["multi"], kvm = ["multi"], sabre = ["multi"] }
+backends_enabled = ["ptrace", "kvm", "sabre", "liteinst"]
+guest_args = { ptrace = ["multi"], kvm = ["multi"], sabre = ["multi"], liteinst = ["multi"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -2916,11 +2915,10 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace", "kvm", "sabre"]
-guest_args = { ptrace = ["multiple"], kvm = ["multiple"], sabre = ["multiple"] }
+backends_enabled = ["ptrace", "kvm", "sabre", "liteinst"]
+guest_args = { ptrace = ["multiple"], kvm = ["multiple"], sabre = ["multiple"], liteinst = ["multiple"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -3686,6 +3684,65 @@ ci = false
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
+
+[test.modes.replay]
+ci = false
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
+dbt = "Record/replay is unsupported by DBT"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
+dbt = "Chaos scheduling is unsupported by DBT"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "c-programs/pause-alarm-interrupt"
+description = "Strict verification for tests/c/pause_alarm_interrupt.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/c/pause_alarm_interrupt.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+# Run the canonical parity comparator and require the run's own verdict to
+# report it. Plain `--verify` is the lossy Stripped comparator and would leave
+# this cell asserting L1 while its justification claims L2.
+assert = { bitwise_parity = true }
+[test.modes.verify.backends_disabled]
+dbt = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately"
+kvm = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately"
+sabre = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify SaBRe separately"
+liteinst = "pause(2) scheduler interaction is qualified against the ptrace reference first; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "This guest asserts interrupted-pause semantics under strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
@@ -6955,13 +7012,12 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
-backends_enabled = ["ptrace"]
-guest_args = { ptrace = ["v4-us"] }
+backends_enabled = ["ptrace", "liteinst"]
+guest_args = { ptrace = ["v4-us"], liteinst = ["v4-us"] }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false

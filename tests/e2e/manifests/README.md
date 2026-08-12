@@ -142,7 +142,7 @@ known-green envelope, use all three exact cell filters:
 the bounded expansion path: a passing probe is evidence for a later manifest
 ratchet, not an implicit promotion into the regression envelope.
 Callers that combine explicit mode/backend filters with CI policy must add
-`--ci-only`. This is how `validate.sh quick` avoids expanding the manual C
+`--ci-only`. This is how `scripts/validate.rs quick` avoids expanding the manual C
 inventory.
 
 ## Inventory and validation
@@ -161,6 +161,33 @@ inventory is mechanically complete.
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
 
+A `ci = false` cell is never executed **and never compiled**, so its guest can
+rot without any node noticing. `manifest-plan` seals the exact current set of
+enabled backend cells that have neither a non-empty mode-wide
+`ci_disabled_reason` nor an explicit per-backend terminal `cell_verdicts`
+entry. A newly declared cell must provide one or the other. The accepted
+terminal states are `performs-no-comparison-by-design` and
+`unavailable-with-reason`; both require a non-empty reason and a separate
+`comparison_tier` field. The four accepted cell tiers are
+`canonical-bitwise`, `exit-and-stream-equality`,
+`execution-only-self-consistent`, and `declared-but-unverifiable`.
+
+The reason-only form carries its per-backend tiers in `cell_tiers`; the
+terminal form carries `state`, `comparison_tier`, and `reason` as three
+distinct fields inside each `cell_verdicts` entry. A tier alone does not explain
+why a cell is off, and a reason alone does not classify its evidence. The two
+explanation forms are mutually exclusive, and both tier maps cover every
+enabled backend exactly, so a limitation cannot be hidden behind an invented
+mode-wide reason or silently applied to another backend. Exact identity
+baselines independently seal the existing cells without explanations and the
+existing cells without tiers. Improving either population requires shrinking
+its baseline in the same review; adding a new cell requires satisfying both.
+A stale `ci_disabled_reason` on a `ci = true` mode is also refused.
+
+Separately, `./ci/test_harness.sh audit-compile --category <bucket>` compiles
+every C guest the bucket declares regardless of its `ci` flag; it is wired into
+the portable DAG for `backend-parity-c` and fails closed on zero compiled.
+
 Use the load-bearing entrypoints:
 
 ```sh
@@ -175,7 +202,7 @@ cargo run -p hermit-manifest-plan -- --format text
 ./ci/test_harness.sh run --mode naked --test system-utils/random-device
 ```
 
-Both GitHub workflows and `validate.sh` execute the same portable and
+Both GitHub workflows and `scripts/validate.rs` execute the same portable and
 privileged DAG files. Each DAG has a manifest guest-build barrier followed by
 one structured selector per bucket. `audit-ci` fails if either caller stops
 delegating to the shared plans, a bucket node disappears, a command diverges

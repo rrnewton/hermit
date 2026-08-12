@@ -37,7 +37,7 @@ on:
   # NO `pull_request` trigger (owner directive 2026-08-03). This is the ONLY lane
   # on GitHub's shared public hosted-runner pool (runs-on: ubuntu-latest); auto-
   # firing its ~34-min build on every PR push flooded that pool and throttled our
-  # own queue (runs sat queued for hours). PRs are validated via local validate.sh
+  # own queue (runs sat queued for hours). PRs are validated via the Rust driver
   # (the `locally-validated` label -> merge-gate), NOT a hosted PR build. Run a
   # hosted build on a PR MANUALLY via `workflow_dispatch` when actually needed.
   # The self-hosted privileged/demo lanes are handled separately.
@@ -181,15 +181,23 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
-  # Exact dependency currency is part of the authoritative product-test result:
-  # an old Reverie pin cannot produce current Hermit validation evidence.
+  # The Reverie pin is a forward-only pointer into its linear main history.
+  # An off-history or regressing pin cannot produce validation evidence.
   reverie-pin:
-    name: Reverie pin is latest main
+    name: Reverie pin is an ancestor and advances monotonically
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Require the exact latest Reverie main revision
+      # MONOTONICITY NEEDS A BASE, and a bare checkout@v4 is depth 1 with no
+      # origin/main -- so the monotonicity clause would have been INERT in the
+      # very job that exists to enforce it. The checker now refuses rather than
+      # skipping when the base is unresolvable, which turns that silent hole
+      # into a loud one; this fetch is what makes the job answerable. Fetching
+      # just main is far cheaper than fetch-depth: 0.
+      - name: Fetch the monotonicity base (origin/main)
+        run: git fetch --no-tags --quiet origin main:refs/remotes/origin/main
+      - name: Require an ancestor of Reverie main that never regresses
         run: |
           set -euo pipefail
           ./ci/run-reverie-pin-check.sh --self-test
@@ -262,9 +270,10 @@ jobs:
     needs: select
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    # The selected debug DAG has a 1260s critical path. Keep the hosted job
+    # The selected debug DAG has a 1560s critical path after e2e.metadata's
+    # measured budget rose from 60s to 180s. Keep the hosted job
     # outside that path plus at least 300s for setup and artifact overhead.
-    timeout-minutes: 30
+    timeout-minutes: 35
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}
@@ -283,7 +292,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       # Reproduce the debug build nodes EXACTLY from portable.json (no drift):
@@ -520,7 +529,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Install cargo-nextest (unit-parallel shard)
@@ -528,8 +537,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # The strict-compat node runs `./validate.sh`, which is a shim that
-      # `exec`s `scripts/validate.rs` through `#!/usr/bin/env rust-script`. No
+      # The strict-compat node runs `scripts/validate.rs` directly through
+      # `#!/usr/bin/env rust-script`. No
       # runner image ships that interpreter, and no workflow installed it, so
       # the exec fails with status 127 before any test runs -- a step that dies
       # in 0.1s having measured nothing, which reads like a product failure.
@@ -555,7 +564,7 @@ jobs:
         if: matrix.slug == 'strict-compat'
         run: |
           if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; ./validate.sh execs scripts/validate.rs through it and would die at exec with status 127."
+            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
@@ -648,6 +657,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+      # Release shards now execute individual tests through the same pinned
+      # nextest timeout policy as debug shards. The release artifact contains
+      # product binaries, not Cargo subcommand tooling, so provision it here.
+      - name: Install cargo-nextest (release shards)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -690,7 +706,6 @@ jobs:
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
     env:
       E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
-      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit
     steps:
       - uses: actions/checkout@v4
       - name: Initialize safe-ci-dag-runner submodule
@@ -698,7 +713,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -722,20 +737,22 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/debug/hermit
           test -x target/release/hermit
+      - name: Publish verified immutable Hermit E2E artifact
+        run: ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg
       - name: Run cell (${{ matrix.mode }} x ${{ matrix.category }} x ${{ matrix.backend }})
         run: |
           set -euo pipefail
           out="ignored/e2e/portable/${{ matrix.slug }}"
+          args=(./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+            --mode "${{ matrix.mode }}")
           if [[ "${{ matrix.backend }}" == "naked" ]]; then
-            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
-              --mode "${{ matrix.mode }}" --ci-only --allow-empty --prebuilt \
-              --results "$out/results.jsonl" --junit "$out/junit.xml"
+            :
           else
-            ./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
-              --mode "${{ matrix.mode }}" --backend "${{ matrix.backend }}" \
-              --ci-only --allow-empty --prebuilt \
-              --results "$out/results.jsonl" --junit "$out/junit.xml"
+            args+=(--backend "${{ matrix.backend }}")
           fi
+          ./ci/run-with-hermit-e2e-artifact.sh --require-install "${args[@]}" \
+            --ci-only --allow-empty --prebuilt \
+            --results "$out/results.jsonl" --junit "$out/junit.xml"
       - name: Pack deterministic parity transport archive
         if: always()
         env:
