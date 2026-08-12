@@ -16,6 +16,7 @@ BEGIN = "<!-- COMPATIBILITY-SCORECARD:BEGIN -->"
 END = "<!-- COMPATIBILITY-SCORECARD:END -->"
 BACKENDS_PATH = "ci/compat/scorecard-backends.json"
 RECEIPT_PATH = "ci/compat/commit-scorecard-receipt.json"
+E2E_PLAN_PATH = "ci/expected-e2e-plan.json"
 BACKEND_ORDER = ["ptrace", "kvm", "liteinst", "e9patch", "sabre", "dbt"]
 FINAL_ATTRIBUTION = re.compile(r"^\[[^\]]+\] \[[^\]]+, devbig[0-9]+\]$")
 
@@ -60,9 +61,13 @@ class Scorecard:
     no_verdict: int
     checks: int
     drop_reason: str
+    backend_green: dict[str, int] | None = None
+    plan_digest: str | None = None
 
     @property
     def cells(self) -> int:
+        if self.backend_green is not None:
+            return sum(self.backend_green.values())
         return self.green + self.stable_fail + self.unstable + self.no_verdict
 
 
@@ -76,13 +81,22 @@ def parse_object(raw: bytes | str, path: str) -> dict:
     return value
 
 
-def validate_receipt_row(row: dict, digest: str, drop_reason: str) -> Scorecard:
+def validate_receipt_row(
+    row: dict,
+    digest: str,
+    drop_reason: str,
+    *,
+    backend_green: dict[str, int] | None = None,
+    plan_digest: str | None = None,
+) -> Scorecard:
     commit = row.get("commit")
     record_id = row.get("record_id")
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise Refusal("receipt commit must be a full lowercase SHA")
     if not isinstance(record_id, str) or not record_id:
         raise Refusal("receipt record_id must be non-empty")
+    if row.get("repo") != "hermit":
+        raise Refusal("scorecard source must name the Hermit repository")
     if row.get("producer") != "hermit-validate-rs":
         raise Refusal("scorecard source must be a Hermit VALIDATE receipt")
     if row.get("profile") != "full" or row.get("selection_mode") != "full":
@@ -115,17 +129,62 @@ def validate_receipt_row(row: dict, digest: str, drop_reason: str) -> Scorecard:
     if coverage.get("planned_test_nodes") != coverage.get("executed_test_nodes"):
         raise Refusal("receipt did not execute every planned test node")
 
+    green = sum(backend_green.values()) if backend_green is not None else executed
+    no_verdict = 0 if backend_green is not None else filtered
     return Scorecard(
         commit=commit,
         record_id=record_id,
         digest=digest,
-        green=executed,
+        green=green,
         stable_fail=0,
         unstable=0,
-        no_verdict=filtered,
+        no_verdict=no_verdict,
         checks=checks,
         drop_reason=drop_reason.strip(),
+        backend_green=backend_green,
+        plan_digest=plan_digest,
     )
+
+
+def parse_e2e_plan(raw: bytes | str, row: dict) -> dict[str, int]:
+    plan = parse_object(raw, E2E_PLAN_PATH)
+    cells = plan.get("cells")
+    if plan.get("schema") != 1 or not isinstance(cells, list) or not cells:
+        raise Refusal(f"{E2E_PLAN_PATH} must be a nonempty schema-1 cell plan")
+
+    counts = {backend: 0 for backend in BACKEND_ORDER}
+    identities: set[str] = set()
+    expected_gates: set[str] = {"gate.manifest"}
+    for index, cell in enumerate(cells):
+        if not isinstance(cell, dict):
+            raise Refusal(f"{E2E_PLAN_PATH} cell {index} must be an object")
+        backend = cell.get("backend")
+        lane = cell.get("lane")
+        category = cell.get("category")
+        if backend not in counts:
+            raise Refusal(f"{E2E_PLAN_PATH} cell {index} has unknown backend {backend!r}")
+        if lane not in {"portable", "privileged"} or not isinstance(category, str) or not category:
+            raise Refusal(f"{E2E_PLAN_PATH} cell {index} has invalid lane/category")
+        identity = json.dumps(cell, sort_keys=True, separators=(",", ":"))
+        if identity in identities:
+            raise Refusal(f"{E2E_PLAN_PATH} contains a duplicate cell at index {index}")
+        identities.add(identity)
+        counts[backend] += 1
+        gate_category = category.replace("-", "_")
+        prefix = "e2e" if lane == "portable" else "privileged-e2e"
+        expected_gates.add(f"{prefix}.manifest_{gate_category}")
+
+    gates = row.get("gates")
+    if not isinstance(gates, list):
+        raise Refusal("receipt must carry typed gate results for its E2E plan")
+    results: dict[str, list[str]] = {}
+    for gate in gates:
+        if isinstance(gate, dict) and isinstance(gate.get("name"), str):
+            results.setdefault(gate["name"], []).append(gate.get("result"))
+    for gate in sorted(expected_gates):
+        if results.get(gate) != ["pass"]:
+            raise Refusal(f"receipt does not carry exactly one passing {gate} result")
+    return counts
 
 
 def load_scorecard(source: Source) -> Scorecard:
@@ -133,8 +192,9 @@ def load_scorecard(source: Source) -> Scorecard:
     if backends != BACKEND_ORDER:
         raise Refusal(f"{BACKENDS_PATH} must preserve the owner-specified backend order")
     wrapper = parse_object(source.read(RECEIPT_PATH), RECEIPT_PATH)
-    if wrapper.get("schema") != 1:
-        raise Refusal(f"{RECEIPT_PATH} schema must be 1")
+    schema = wrapper.get("schema")
+    if schema not in {1, 2}:
+        raise Refusal(f"{RECEIPT_PATH} schema must be 1 or 2")
     canonical = wrapper.get("canonical_receipt")
     digest = wrapper.get("receipt_sha256")
     drop_reason = wrapper.get("drop_reason", "")
@@ -147,7 +207,31 @@ def load_scorecard(source: Source) -> Scorecard:
         raise Refusal(f"{RECEIPT_PATH} canonical receipt digest mismatch")
     if not isinstance(drop_reason, str):
         raise Refusal(f"{RECEIPT_PATH} drop_reason must be a string")
-    return validate_receipt_row(parse_object(canonical, "canonical receipt"), digest, drop_reason)
+    row = parse_object(canonical, "canonical receipt")
+    if schema == 1:
+        # Read-only compatibility for the first, superseded aggregate commit.
+        # New imports always write schema 2 and must carry the receipt-bound plan.
+        return validate_receipt_row(row, digest, drop_reason)
+
+    canonical_plan = wrapper.get("canonical_e2e_plan")
+    plan_digest = wrapper.get("e2e_plan_sha256")
+    if not isinstance(canonical_plan, str) or not canonical_plan:
+        raise Refusal(f"{RECEIPT_PATH} canonical_e2e_plan must be a non-empty string")
+    if not isinstance(plan_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_digest):
+        raise Refusal(f"{RECEIPT_PATH} e2e_plan_sha256 must be a lowercase SHA-256")
+    if hashlib.sha256(canonical_plan.encode()).hexdigest() != plan_digest:
+        raise Refusal(f"{RECEIPT_PATH} E2E plan digest mismatch")
+    commit_plan = Source(row.get("commit", "")).read(E2E_PLAN_PATH).decode()
+    if commit_plan != canonical_plan:
+        raise Refusal("stored E2E plan does not equal the plan at the receipt commit")
+    backend_green = parse_e2e_plan(canonical_plan, row)
+    return validate_receipt_row(
+        row,
+        digest,
+        drop_reason,
+        backend_green=backend_green,
+        plan_digest=plan_digest,
+    )
 
 
 def signed(value: int) -> str:
@@ -155,9 +239,14 @@ def signed(value: int) -> str:
 
 
 def render(current: Scorecard, previous: Scorecard | None) -> str:
-    green_change = signed(current.green - previous.green) if previous else "BASELINE"
-    matrix_change = signed(current.cells - previous.cells) if previous else "BASELINE"
-    if previous and current.green < previous.green and not current.drop_reason:
+    comparable = bool(
+        previous
+        and current.backend_green is not None
+        and previous.backend_green is not None
+    )
+    green_change = signed(current.green - previous.green) if comparable else "BASELINE"
+    matrix_change = signed(current.cells - previous.cells) if comparable else "BASELINE"
+    if comparable and current.green < previous.green and not current.drop_reason:
         raise Refusal("GREEN decreased but drop_reason is empty")
     lines = [
         BEGIN,
@@ -165,10 +254,13 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
         "| backend | receipt sha | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
         "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for backend in BACKEND_ORDER:
-        lines.append(
-            f"| {backend} | {current.digest} | — | — | — | — | — |"
-        )
+    if current.backend_green is None:
+        for backend in BACKEND_ORDER:
+            lines.append(f"| {backend} | {current.digest} | — | — | — | — | — |")
+    else:
+        for backend in BACKEND_ORDER:
+            green = current.backend_green[backend]
+            lines.append(f"| {backend} | {current.digest} | {green} | 0 | 0 | 0 | {green} |")
     lines.append(
         f"| TOTAL | {current.digest} | {current.green} | {current.stable_fail} | "
         f"{current.unstable} | {current.no_verdict} | {current.cells} |"
@@ -176,14 +268,22 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
     lines.append(
         f"Receipt: commit {current.commit}; record {current.record_id}; checks {current.checks}."
     )
-    lines.append(
-        "Backend split: unavailable in this receipt; no counts were inferred from gate names."
-    )
+    if current.backend_green is None:
+        lines.append(
+            "Backend split: unavailable in this receipt; no counts were inferred from gate names."
+        )
+    else:
+        lines.append(
+            f"E2E plan: {current.plan_digest}; backend rows and TOTAL are derived from "
+            "the plan at the receipt commit."
+        )
     lines.append(
         f"Matrix change: {matrix_change}; GREEN change: {green_change}. "
         "Matrix growth is reported separately and is not a GREEN regression."
     )
-    if previous and current.green < previous.green:
+    if previous and not comparable:
+        lines.append("Comparison: source transition; no delta is claimed against the legacy aggregate.")
+    if comparable and current.green < previous.green:
         lines.append(f"GREEN DROP: {green_change}; reason: {current.drop_reason}")
     else:
         lines.append("GREEN DROP: none.")
@@ -258,14 +358,29 @@ def check_range(base: str, head: str) -> None:
 def import_receipt(output: Path, drop_reason: str) -> None:
     canonical = sys.stdin.read().strip()
     digest = hashlib.sha256(canonical.encode()).hexdigest()
-    validate_receipt_row(parse_object(canonical, "canonical receipt"), digest, drop_reason)
+    row = parse_object(canonical, "canonical receipt")
+    commit = row.get("commit")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise Refusal("receipt commit must be a full lowercase SHA")
+    canonical_plan = Source(commit).read(E2E_PLAN_PATH).decode()
+    plan_digest = hashlib.sha256(canonical_plan.encode()).hexdigest()
+    backend_green = parse_e2e_plan(canonical_plan, row)
+    validate_receipt_row(
+        row,
+        digest,
+        drop_reason,
+        backend_green=backend_green,
+        plan_digest=plan_digest,
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(
             {
-                "schema": 1,
+                "schema": 2,
                 "receipt_sha256": digest,
                 "canonical_receipt": canonical,
+                "e2e_plan_sha256": plan_digest,
+                "canonical_e2e_plan": canonical_plan,
                 "drop_reason": drop_reason,
             },
             indent=2,

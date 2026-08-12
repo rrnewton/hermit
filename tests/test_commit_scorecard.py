@@ -26,6 +26,22 @@ def run(
     return proc
 
 
+def plan(counts: dict[str, int]) -> dict:
+    cells = []
+    for backend, count in counts.items():
+        for index in range(count):
+            cells.append(
+                {
+                    "backend": backend,
+                    "category": "applications",
+                    "lane": "portable",
+                    "mode": "verify",
+                    "test": f"applications/{backend}-{index}",
+                }
+            )
+    return {"schema": 1, "cells": cells}
+
+
 def receipt(commit: str, executed: int = 10, filtered: int = 3, failures: int = 0) -> dict:
     return {
         "repo": "hermit",
@@ -42,6 +58,10 @@ def receipt(commit: str, executed: int = 10, filtered: int = 3, failures: int = 
         "filtered_tests": filtered,
         "failures": failures,
         "checks": 7,
+        "gates": [
+            {"name": "gate.manifest", "result": "pass"},
+            {"name": "e2e.manifest_applications", "result": "pass"},
+        ],
         "coverage": {
             "planned_test_nodes": 2,
             "executed_test_nodes": 2,
@@ -63,6 +83,14 @@ class Repository:
         shutil.copy2(SCRIPT, self.root / "scripts/commit-scorecard.py")
         (self.root / "ci/compat/scorecard-backends.json").write_text(
             json.dumps({"backends": BACKENDS}) + "\n"
+        )
+        self.write_plan({"ptrace": 2, "dbt": 1})
+        self.stage()
+        run(self.root, "git", "commit", "-q", "--no-verify", "-m", "source")
+
+    def write_plan(self, counts: dict[str, int]) -> None:
+        (self.root / "ci/expected-e2e-plan.json").write_text(
+            json.dumps(plan(counts), sort_keys=True, indent=2) + "\n"
         )
 
     def close(self) -> None:
@@ -99,28 +127,31 @@ class Repository:
 class ScorecardTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = Repository()
-        self.first = "1" * 40
+        self.first = run(self.repo.root, "git", "rev-parse", "HEAD").stdout.strip()
         accepted = self.repo.import_row(receipt(self.first))
         self.assertEqual(0, accepted.returncode, accepted.stderr)
 
     def tearDown(self) -> None:
         self.repo.close()
 
-    def test_total_comes_only_from_receipt(self) -> None:
+    def test_total_and_backend_rows_come_from_receipt_bound_plan(self) -> None:
         rendered = self.repo.render().stdout
         self.assertIn("| TOTAL |", rendered)
-        self.assertIn("| 10 | 0 | 0 | 3 | 13 |", rendered)
-        self.assertIn("Backend split: unavailable in this receipt", rendered)
-        for backend in BACKENDS:
-            row = next(line for line in rendered.splitlines() if line.startswith(f"| {backend} |"))
-            self.assertIn("| — | — | — | — | — |", row)
+        self.assertIn("| 3 | 0 | 0 | 0 | 3 |", rendered)
+        ptrace = next(line for line in rendered.splitlines() if line.startswith("| ptrace |"))
+        dbt = next(line for line in rendered.splitlines() if line.startswith("| dbt |"))
+        kvm = next(line for line in rendered.splitlines() if line.startswith("| kvm |"))
+        self.assertIn("| 2 | 0 | 0 | 0 | 2 |", ptrace)
+        self.assertIn("| 1 | 0 | 0 | 0 | 1 |", dbt)
+        self.assertIn("| 0 | 0 | 0 | 0 | 0 |", kvm)
 
     def test_growth_does_not_read_as_green_drop(self) -> None:
         self.repo.commit("baseline")
-        second = "2" * 40
-        self.assertEqual(0, self.repo.import_row(receipt(second, executed=10, filtered=5)).returncode)
+        self.repo.write_plan({"ptrace": 3, "dbt": 2})
+        second = self.repo.commit("matrix growth")
+        self.assertEqual(0, self.repo.import_row(receipt(second)).returncode)
         rendered = self.repo.render().stdout
-        self.assertIn("Matrix change: +2; GREEN change: +0", rendered)
+        self.assertIn("Matrix change: +2; GREEN change: +2", rendered)
         self.assertIn("GREEN DROP: none", rendered)
 
     def test_nonzero_failures_refuse_uninvented_classification(self) -> None:
@@ -137,6 +168,23 @@ class ScorecardTests(unittest.TestCase):
         refused = self.repo.render(check=False)
         self.assertEqual(1, refused.returncode)
         self.assertIn("digest mismatch", refused.stderr)
+
+    def test_plan_digest_tamper_refuses(self) -> None:
+        self.repo.stage()
+        path = self.repo.root / "ci/compat/commit-scorecard-receipt.json"
+        wrapper = json.loads(path.read_text())
+        wrapper["canonical_e2e_plan"] += " "
+        path.write_text(json.dumps(wrapper) + "\n")
+        refused = self.repo.render(check=False)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("E2E plan digest mismatch", refused.stderr)
+
+    def test_missing_plan_gate_refuses_before_import(self) -> None:
+        row = receipt(self.first)
+        row["gates"] = [gate for gate in row["gates"] if gate["name"] != "e2e.manifest_applications"]
+        refused = self.repo.import_row(row)
+        self.assertEqual(1, refused.returncode)
+        self.assertIn("passing e2e.manifest_applications", refused.stderr)
 
     def test_range_catches_hook_bypass(self) -> None:
         baseline = self.repo.commit("baseline")
@@ -156,8 +204,11 @@ class ScorecardTests(unittest.TestCase):
         self.assertIn("exactly one compatibility scorecard", refused.stderr)
 
     def test_scorecard_only_child_is_exact(self) -> None:
+        self.repo.commit("baseline snapshot")
+        (self.repo.root / "code-change").write_text("validated content\n")
+        run(self.repo.root, "git", "add", "code-change")
         parent = self.repo.commit("validated parent")
-        self.assertEqual(0, self.repo.import_row(receipt(parent, executed=11, filtered=2)).returncode)
+        self.assertEqual(0, self.repo.import_row(receipt(parent)).returncode)
         child = self.repo.commit("receipt child")
         accepted = run(
             self.repo.root,
