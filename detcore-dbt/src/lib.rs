@@ -19,6 +19,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::Command;
@@ -705,6 +706,32 @@ fn lock_native_client_build(directory: &std::path::Path) -> io::Result<fs::File>
     }
 }
 
+fn native_client_source_path_hash(source: &Path) -> u64 {
+    source
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        })
+}
+
+fn native_client_build_directory(runtime: &Path, source: &Path) -> PathBuf {
+    let source_identity = source
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
+    runtime
+        .parent()
+        .expect("runtime library path must have a parent")
+        .join(format!(
+            "detcore-dbt-native-{}-{:016x}",
+            source_identity.to_string_lossy(),
+            native_client_source_path_hash(source)
+        ))
+}
+
 /// Builds the DynamoRIO native client against the Detcore runtime if needed.
 // TODO-HUMAN-REVIEW(PR-1002): Review packaged DBT runtime and client discovery.
 pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
@@ -725,25 +752,14 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     }
 
     let runtime = runtime_library_path()?;
-    let source = reverie_dbt::native_client_source_dir();
-    let source_identity = source
-        .parent()
-        .and_then(std::path::Path::parent)
-        .and_then(std::path::Path::file_name)
-        .unwrap_or_else(|| std::ffi::OsStr::new("source"));
-    let directory = runtime
-        .parent()
-        .expect("runtime library path must have a parent")
-        .join(format!(
-            "detcore-dbt-native-{}",
-            source_identity.to_string_lossy()
-        ));
+    let source = fs::canonicalize(reverie_dbt::native_client_source_dir())?;
+    let directory = native_client_build_directory(&runtime, &source);
     fs::create_dir_all(&directory)?;
     let _build_lock = lock_native_client_build(&directory)?;
 
     let configure = Command::new("cmake")
         .arg("-S")
-        .arg(source)
+        .arg(&source)
         .arg("-B")
         .arg(&directory)
         .arg("-DCMAKE_BUILD_TYPE=Release")
@@ -1781,6 +1797,107 @@ mod tests {
         );
     }
 
+    struct NativeClientCacheTestDir(PathBuf);
+
+    impl NativeClientCacheTestDir {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time must follow the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "detcore-dbt-native-cache-key-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create native-client cache-key test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for NativeClientCacheTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_native_client_cache_test_project(source: &Path) {
+        fs::create_dir_all(source).expect("create native-client CMake source directory");
+        fs::write(
+            source.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.15)\nproject(native_client_cache_key NONE)\n",
+        )
+        .expect("write native-client CMake test project");
+    }
+
+    fn configure_and_build_native_client_cache_test_project(
+        source: &Path,
+        build: &Path,
+    ) -> Result<(), String> {
+        let configure = Command::new("cmake")
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(build)
+            .output()
+            .map_err(|error| format!("failed to execute CMake configure: {error}"))?;
+        if !configure.status.success() {
+            return Err(format!(
+                "CMake configure failed: {}",
+                String::from_utf8_lossy(&configure.stderr)
+            ));
+        }
+        let build_result = Command::new("cmake")
+            .arg("--build")
+            .arg(build)
+            .output()
+            .map_err(|error| format!("failed to execute CMake build: {error}"))?;
+        if !build_result.status.success() {
+            return Err(format!(
+                "CMake build failed: {}",
+                String::from_utf8_lossy(&build_result.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_client_cache_misses_changed_source_path_and_hits_unchanged_path() {
+        let temp = NativeClientCacheTestDir::new();
+        let runtime = temp.0.join("target/debug/deps/libdetcore_dbt.so");
+        let source_a = temp
+            .0
+            .join("cargo-a/git/checkouts/reverie/source-rev/reverie-dbt/native");
+        let source_b = temp
+            .0
+            .join("cargo-b/git/checkouts/reverie/source-rev/reverie-dbt/native");
+        write_native_client_cache_test_project(&source_a);
+        write_native_client_cache_test_project(&source_b);
+
+        let first_build = native_client_build_directory(&runtime, &source_a);
+        configure_and_build_native_client_cache_test_project(&source_a, &first_build)
+            .expect("first source path must configure and build");
+        let cache_sentinel = first_build.join("same-source-cache-sentinel");
+        fs::write(&cache_sentinel, b"cache remains reusable")
+            .expect("write same-source cache sentinel");
+
+        let repeated_build = native_client_build_directory(&runtime, &source_a);
+        assert_eq!(repeated_build, first_build);
+        configure_and_build_native_client_cache_test_project(&source_a, &repeated_build)
+            .expect("unchanged source path must reuse its CMake cache");
+        assert!(
+            cache_sentinel.is_file(),
+            "unchanged source path must hit the existing build directory"
+        );
+
+        let changed_build = native_client_build_directory(&runtime, &source_b);
+        configure_and_build_native_client_cache_test_project(&source_b, &changed_build)
+            .expect("changed source path must miss the old CMake cache and build cleanly");
+        assert_ne!(
+            changed_build, first_build,
+            "changed source path must select a distinct CMake cache"
+        );
+    }
+
     #[test]
     fn only_dynamorio_managed_lifecycle_stays_native() {
         for sysnum in [
@@ -1801,6 +1918,323 @@ mod tests {
         ] {
             assert!(!requires_native_lifecycle(sysnum));
         }
+    }
+
+    /// Every `Determinized` syscall that this gate currently lets run natively
+    /// in a copied child under strict execution.
+    ///
+    /// THIS LIST IS AN ACKNOWLEDGED-ESCAPE REGISTER, NOT AN APPROVAL. A copied
+    /// pre-exec child runs no Detcore tool, so each of these executes against
+    /// the host while the ptrace path would have determinized it. `ioprio_get`
+    /// is the clearest live example: `handle_ioprio_get` returns a fixed
+    /// host-independent priority on the ptrace path, and a copied child returns
+    /// the real host I/O priority instead.
+    ///
+    /// It is pinned so the failure mode that produced this list cannot recur
+    /// silently. Reclassifying a syscall from `Unsupported` to `Determinized`
+    /// without giving the copied child a policy adds a row here and FAILS this
+    /// test, forcing an explicit decision at the moment of reclassification
+    /// rather than leaving a host escape to be discovered in review months
+    /// later. That is the whole defect this test exists to prevent: the gate
+    /// was correct for the classification table it was written against, and
+    /// later table rows routed around it.
+    ///
+    /// Shrinking this list is the goal. Do not grow it without a stated reason.
+    const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
+        "accept",
+        "accept4",
+        "adjtimex",
+        "alarm",
+        "arch_prctl",
+        "bind",
+        "clock_adjtime",
+        "clock_getres",
+        "clock_gettime",
+        "clock_nanosleep",
+        "clone",
+        "clone3",
+        "close",
+        "close_range",
+        "connect",
+        "creat",
+        "dup",
+        "dup2",
+        "dup3",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "epoll_wait",
+        "epoll_wait_old",
+        "eventfd",
+        "eventfd2",
+        "execve",
+        "execveat",
+        "exit",
+        "exit_group",
+        "fadvise64",
+        "fcntl",
+        "flock",
+        "fork",
+        "fstat",
+        "fstatfs",
+        "futex",
+        "get_mempolicy",
+        "getcpu",
+        "getdents",
+        "getdents64",
+        "getegid",
+        "geteuid",
+        "getgid",
+        "getitimer",
+        "getpeername",
+        "getpriority",
+        "getrandom",
+        "getresgid",
+        "getresuid",
+        "getrlimit",
+        "getrusage",
+        "getsockname",
+        "getsockopt",
+        "gettimeofday",
+        "getuid",
+        "inotify_add_watch",
+        "inotify_init",
+        "inotify_init1",
+        "inotify_rm_watch",
+        "ioprio_get",
+        "ioprio_set",
+        "kill",
+        "listen",
+        "lseek",
+        "lstat",
+        "madvise",
+        "mbind",
+        "membarrier",
+        "memfd_create",
+        "migrate_pages",
+        "mincore",
+        "mmap",
+        "move_pages",
+        "mremap",
+        "munmap",
+        "nanosleep",
+        "newfstatat",
+        "open",
+        "openat",
+        "pause",
+        "pidfd_getfd",
+        "pidfd_open",
+        "pidfd_send_signal",
+        "pipe",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "prctl",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "prlimit64",
+        "process_madvise",
+        "pselect6",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "read",
+        "readv",
+        "recvfrom",
+        "rt_sigaction",
+        "rt_sigpending",
+        "rt_sigprocmask",
+        "rt_sigqueueinfo",
+        "rt_sigsuspend",
+        "rt_sigtimedwait",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity",
+        "sched_getattr",
+        "sched_getparam",
+        "sched_getscheduler",
+        "sched_rr_get_interval",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "sched_yield",
+        "seccomp",
+        "select",
+        "sendfile",
+        "sendmmsg",
+        "sendmsg",
+        "sendto",
+        "set_mempolicy",
+        "set_mempolicy_home_node",
+        "setfsgid",
+        "setfsuid",
+        "setgid",
+        "setgroups",
+        "setitimer",
+        "setpriority",
+        "setregid",
+        "setresgid",
+        "setresuid",
+        "setreuid",
+        "setrlimit",
+        "setsid",
+        "setsockopt",
+        "setuid",
+        "shutdown",
+        "signalfd",
+        "signalfd4",
+        "socket",
+        "socketpair",
+        "stat",
+        "statfs",
+        "statx",
+        "sysinfo",
+        "syslog",
+        "tgkill",
+        "time",
+        "timer_create",
+        "timer_delete",
+        "timer_getoverrun",
+        "timer_gettime",
+        "timer_settime",
+        "timerfd_create",
+        "timerfd_gettime",
+        "timerfd_settime",
+        "times",
+        "tkill",
+        "uname",
+        "userfaultfd",
+        "utime",
+        "utimensat",
+        "utimes",
+        "vfork",
+        "wait4",
+        "waitid",
+        "write",
+        "writev",
+    ];
+
+    /// Disposition of the three reviewer findings this gate was opened for, so
+    /// the positive side of the bracket is a test rather than a claim.
+    ///
+    /// `perf_event_open` (#876) and `remap_file_pages` (#882) reach the gate and
+    /// are refused. `ioprio_get` / `ioprio_set` (#881) are NOT: they are
+    /// Determinized by emulation rather than by refusal, and this ABI returns
+    /// only native / fail-closed / errno, so it cannot carry the fixed priority
+    /// `handle_ioprio_get` produces on the ptrace path. A copied child therefore
+    /// still reports the host's real I/O priority. Pinned as a known divergence
+    /// so it is visible rather than assumed fixed.
+    #[test]
+    fn copied_child_disposition_of_the_covered_reviewer_findings() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+
+        // Refused before reaching the host.
+        for sysno in [Sysno::perf_event_open, Sysno::remap_file_pages] {
+            assert!(detcore::is_determinized_syscall(sysno));
+            assert_eq!(
+                copied_child_action(sysno.id() as i64),
+                1,
+                "{sysno} must not reach the host from a strict copied child"
+            );
+        }
+
+        // Still diverging: emulated on the ptrace path, native here.
+        for sysno in [Sysno::ioprio_get, Sysno::ioprio_set] {
+            assert!(detcore::is_determinized_syscall(sysno));
+            assert!(!detcore::is_deterministically_refused_syscall(sysno));
+            assert_eq!(
+                copied_child_action(sysno.id() as i64),
+                0,
+                "{sysno} disposition changed; update this test and issue #1793"
+            );
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
+    /// Fails when a `Determinized` syscall gains a silent native escape in a
+    /// strict copied child. See `ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES`.
+    #[test]
+    fn no_new_determinized_syscall_silently_escapes_the_copied_child() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        COPIED_PANIC_ON_UNSUPPORTED.store(true, Ordering::Release);
+
+        let observed: Vec<String> = detcore::all_pinned_syscalls()
+            .filter(|sysno| detcore::is_determinized_syscall(*sysno))
+            .filter(|sysno| copied_child_action(sysno.id() as i64) == 0)
+            .map(|sysno| sysno.to_string())
+            .collect();
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+
+        let expected: Vec<String> = ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let added: Vec<&String> = observed.iter().filter(|s| !expected.contains(s)).collect();
+        let removed: Vec<&String> = expected.iter().filter(|s| !observed.contains(s)).collect();
+
+        assert!(
+            added.is_empty(),
+            "these Determinized syscalls newly run NATIVELY in a strict copied child, \
+             bypassing Detcore: {added:?}. Give each one a copied-child policy \
+             (fixed errno or fail-closed), or add it to \
+             ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES with a stated reason."
+        );
+        assert!(
+            removed.is_empty(),
+            "these syscalls no longer escape — remove them from \
+             ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES so the register stays exact: {removed:?}"
+        );
+    }
+
+    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
+    /// syscalls does the copied-child gate actually stop before the host?
+    ///
+    /// Printed as N-of-M so a coverage regression is visible as a number rather
+    /// than as an absent test.
+    #[test]
+    fn census_determinized_syscalls_reaching_the_copied_child_gate() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+
+        for strict in [true, false] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            let mut determinized = 0usize;
+            let mut stopped = 0usize;
+            let mut escaping: Vec<String> = Vec::new();
+            for sysno in detcore::all_pinned_syscalls() {
+                if !detcore::is_determinized_syscall(sysno) {
+                    continue;
+                }
+                determinized += 1;
+                if copied_child_action(sysno.id() as i64) == 0 {
+                    escaping.push(sysno.to_string());
+                } else {
+                    stopped += 1;
+                }
+            }
+            println!(
+                "copied-child strict={strict}: {stopped}/{determinized} Determinized syscalls \
+                 stopped before the host; {} run natively",
+                escaping.len()
+            );
+            println!("  escaping: {}", escaping.join(" "));
+        }
+
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
 
     // TODO-HUMAN-REVIEW(PR-916): Regression for the copied-DBT-child keyring

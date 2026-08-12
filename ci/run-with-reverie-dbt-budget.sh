@@ -25,7 +25,7 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-expected_pin=349460925ee56f2aca686a3392b534e8861ba375
+expected_pin=c261050cfd41bec67e31bfd0cf6f56be008d0ebb
 recorded_pin=$(
     "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
 )
@@ -39,6 +39,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d}" >&2
 
 exec "$@"

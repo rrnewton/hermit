@@ -1382,12 +1382,12 @@ function audit_ci_correspondence {
         die "DBT wrapper must select the explicit portable child-budget mode"
     [[ $(grep -Fxc '    "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin' "$budget_wrapper") == 1 ]] ||
         die "DBT wrapper must bind its calibration through the canonical local-pin verifier"
-    [[ $(grep -Fc '349460925ee56f2aca686a3392b534e8861ba375' "$budget_wrapper") == 1 ]] ||
+    [[ $(grep -Fc 'c261050cfd41bec67e31bfd0cf6f56be008d0ebb' "$budget_wrapper") == 1 ]] ||
         die "DBT wrapper must name exactly one calibrated Reverie pin"
-    [[ $(grep -Fc '349460925ee56f2aca686a3392b534e8861ba375' "$budget_config") == 2 ]] ||
+    [[ $(grep -Fc 'c261050cfd41bec67e31bfd0cf6f56be008d0ebb' "$budget_config") == 2 ]] ||
         die "DBT derivation must independently require and diagnose the calibrated Reverie pin"
     # shellcheck disable=SC2016
-    local budget_record='reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:63e29544455c901f05e37224b52e7f9734480d7c05914083bdcbd335968e6429}'
+    local budget_record='reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d}'
     [[ $(grep -Fc "$budget_record" "$budget_wrapper") == 1 ]] ||
         die "DBT child wrapper must log the pin and every derivation condition"
 
@@ -1545,14 +1545,14 @@ function audit_ci_correspondence {
         budget_probe='source "$1" reverie-dbt-budget-child; printf "%s %s %s %s %s %s %s %s %s %s\n" "$REVERIE_DBT_BUILD_JOBS_SOURCE" "$REVERIE_DBT_RAW_BUILD_JOBS" "$CARGO_BUILD_JOBS" "$THIRD_PARTY_BUILD_JOBS" "$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE" "$REVERIE_DBT_EFFECTIVE_CPUS" "$REVERIE_DBT_MAX_PARALLEL_JOBS" "$REVERIE_DBT_EFFECTIVE_BUILD_JOBS" "$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS" "$REVERIE_DBT_MAX_BUILD_SECONDS"'
         budget_tuple=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+                REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         ) || budget_tuple="[probe exited $?] $budget_tuple"
         [[ $budget_tuple == 'inherited-launch-cargo-build-jobs 8 8 8 child-nproc 4 16 4 1050 263' ]] ||
             die "hosted j8/child-CPU4 budget tuple drifted: $budget_tuple"
         budget_tuple=$(
             PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+                REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
                 SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 \
                 bash -c "$budget_probe" _ "$budget_config"
         ) || budget_tuple="[probe exited $?] $budget_tuple"
@@ -1562,12 +1562,12 @@ function audit_ci_correspondence {
         run_audit_probe_expect_status hosted-budget-wrapper 0 hosted_wrapper_log \
             "${clean_budget_env[@]}" PATH="$scratch/nproc-4:$PATH" \
             CARGO_BUILD_JOBS=8 "$budget_wrapper" true
-        [[ $hosted_wrapper_log == *'pin:349460925ee56f2aca686a3392b534e8861ba375,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
+        [[ $hosted_wrapper_log == *'pin:c261050cfd41bec67e31bfd0cf6f56be008d0ebb,source:inherited-launch-cargo-build-jobs,raw-build-jobs:8,effective-cpus-source:child-nproc,effective-cpus:4,reverie-max-jobs:16,effective-native-jobs:4,effective-job-seconds:1050,max-elapsed-seconds:263'* ]] ||
             die "production wrapper did not log the bound hosted tuple: $hosted_wrapper_log"
         run_audit_probe_expect_status boxed-budget-wrapper 0 boxed_wrapper_log \
             "${clean_budget_env[@]}" PATH="$scratch/nproc-64:$PATH" \
             SAFE_CI_IN_SCOPE=1 CARGO_BUILD_JOBS=32 "$budget_wrapper" true
-        [[ $boxed_wrapper_log == *'pin:349460925ee56f2aca686a3392b534e8861ba375,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
+        [[ $boxed_wrapper_log == *'pin:c261050cfd41bec67e31bfd0cf6f56be008d0ebb,source:runner-child-cargo-build-jobs,raw-build-jobs:32,effective-cpus-source:child-nproc,effective-cpus:64,reverie-max-jobs:16,effective-native-jobs:16,effective-job-seconds:1050,max-elapsed-seconds:66'* ]] ||
             die "production wrapper did not log the bound boxed tuple: $boxed_wrapper_log"
 
         # Mutation bracket for the evidence path itself: a Rust-style panic
@@ -1598,7 +1598,7 @@ EOF
         clamp_boundaries=$(
             for requested in 15 16 17 64; do
                 PATH="$scratch/nproc-64:$PATH" "${clean_budget_env[@]}" \
-                    REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+                    REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
                     CARGO_BUILD_JOBS=$requested bash -c "$budget_probe" _ "$budget_config"
             done
         ) || clamp_boundaries="[probe exited $?] $clamp_boundaries"
@@ -1606,10 +1606,10 @@ EOF
             die "Reverie clamp boundary did not hold W at 16: $clamp_boundaries"
         cpu_boundaries=$(
             PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+                REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
                 CARGO_BUILD_JOBS=17 bash -c "$budget_probe" _ "$budget_config"
             PATH="$scratch/nproc-2:$PATH" "${clean_budget_env[@]}" \
-                REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+                REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
                 CARGO_BUILD_JOBS=8 bash -c "$budget_probe" _ "$budget_config"
         ) || cpu_boundaries="[probe exited $?] $cpu_boundaries"
         [[ $cpu_boundaries == $'inherited-launch-cargo-build-jobs 17 17 17 child-nproc 4 16 4 1050 263\ninherited-launch-cargo-build-jobs 8 8 8 child-nproc 2 16 2 1050 525' ]] ||
@@ -1648,23 +1648,23 @@ EOF
             die "child derivation accepted an uncalibrated Reverie pin"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb \
             CI_DAG_REVERIE_DBT_MAX_BUILD_JOB_SECONDS=1050 CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a retired unconditioned DBT threshold"
         fi
         if PATH="$scratch/nproc-zero:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=8 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted nproc=0"
         fi
         if PATH="$scratch/nproc-invalid:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=8 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb CARGO_BUILD_JOBS=8 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a noninteger nproc observation"
         fi
         if PATH="$scratch/nproc-4:$PATH" "${clean_budget_env[@]}" \
-            REVERIE_DBT_BUDGET_BOUND_PIN=349460925ee56f2aca686a3392b534e8861ba375 CARGO_BUILD_JOBS=0 \
+            REVERIE_DBT_BUDGET_BOUND_PIN=c261050cfd41bec67e31bfd0cf6f56be008d0ebb CARGO_BUILD_JOBS=0 \
             bash -c 'source "$1" reverie-dbt-budget-child' _ "$budget_config" 2>/dev/null; then
             die "child derivation accepted a zero Cargo width"
         fi
@@ -2104,6 +2104,113 @@ function run_capture {
         </dev/null >"$stdout_file" 2>"$stderr_file"
 }
 
+# Give the timeout's owner, not the enclosing DAG node, a durable identity.
+# GNU timeout's 124/137 statuses are otherwise indistinguishable from an
+# arbitrary child exit once execute_attempt returns its compact TSV row.
+function individual_test_timeout_reason {
+    local test_id=$1 mode=$2 backend=$3 attempt=$4 timeout_seconds=$5 status=$6
+    local disposition
+    case $status in
+        124) disposition="deadline reached (exit 124)" ;;
+        137) disposition="SIGKILL after 10 s grace (exit 137)" ;;
+        *) return 1 ;;
+    esac
+    [[ -n $backend ]] || backend=native
+    printf 'test %s/%s/%s exceeded %s s in attempt %s (innermost E2E timeout: %s)' \
+        "$test_id" "$mode" "$backend" "$timeout_seconds" "$attempt" "$disposition"
+}
+
+# Bracket the actual process-group wrapper and the exact message constructor.
+# This runs inside the metadata audit, far below safe-ci-dag-runner's node
+# timeout: the planted 2 s sleeper must be named after 1 s, while a healthy
+# command under the same wrapper must remain unaffected.
+function audit_innermost_e2e_timeout {
+    local scratch status reason expected
+    scratch=$(mktemp -d)
+
+    status=0
+    run_capture "$scratch/hang.stdout" "$scratch/hang.stderr" 1 sleep 2 || status=$?
+    [[ $status == 124 ]] || {
+        rm -rf "$scratch"
+        die "innermost E2E negative bracket returned $status, expected timeout exit 124"
+    }
+    reason=$(individual_test_timeout_reason \
+        timeout-probe/deliberate-hang verify ptrace 1 1 "$status")
+    expected='test timeout-probe/deliberate-hang/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))'
+    [[ $reason == "$expected" ]] || {
+        rm -rf "$scratch"
+        die "innermost E2E negative bracket lost test identity: $reason"
+    }
+
+    status=0
+    run_capture "$scratch/pass.stdout" "$scratch/pass.stderr" 5 true || status=$?
+    rm -rf "$scratch"
+    [[ $status == 0 ]] || die "innermost E2E positive bracket rejected a healthy command: exit $status"
+    printf 'INNERMOST-TIMEOUT negative=1 named: %s\n' "$reason"
+    printf 'INNERMOST-TIMEOUT positive=1 passed within 5 s\n'
+}
+
+# Refuse a future regression from a named individual timeout back to an opaque
+# safe-ci-dag-runner node kill. The 630 s floor is the 600 s slow-test override
+# plus its 30 s grace; ordinary tests retain the much wider 300 s limit.
+function audit_innermost_timeout_coverage {
+    local config="$ROOT_DIR/.config/nextest.toml"
+    "$ROOT_DIR/ci/run-nextest-counted.sh" --self-test ||
+        die "counted nextest wrapper failed its two-sided parser bracket"
+    grep -Fqx 'slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }' "$config" ||
+        die "nextest default must terminate an individual test after 300 s plus 30 s grace"
+    grep -Fqx 'slow-timeout = { period = "600s", terminate-after = 1, grace-period = "30s" }' "$config" ||
+        die "nextest slow-test override must terminate after 600 s plus 30 s grace"
+
+    # cargo-nextest 0.9.100 does not execute rustdoc tests. Keep `--doc` as the
+    # explicit upstream limitation; `--no-run` is compilation, and the single
+    # privileged `--exact` case owns an equivalent named timeout wrapper.
+    jq -s -e '
+        all(.[]; all(.steps[];
+            if ((.cmd // "") | contains("./ci/run-nextest-counted.sh")) then
+                (((.deps // []) | index("setup.nextest")) != null)
+                and (.timeout > 630)
+            elif ((.cmd // "") | contains("cargo nextest run")) then
+                false
+            elif ((.cmd // "") | contains("cargo test")) then
+                ((.cmd | contains("--doc"))
+                 or (.cmd | contains("--no-run"))
+                 or ((.cmd | contains("--exact"))
+                     and (.cmd | contains("innermost exact Cargo timeout"))))
+            else true end))
+    ' "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json" >/dev/null ||
+        die "an executing Cargo test lacks a named inner timeout or its DAG node is not outside the 630 s hard-kill bound"
+
+    local id metadata lane category timeout key job outer hard_floor
+    declare -A category_max=()
+    for id in "${!METADATA_BY_ID[@]}"; do
+        metadata=${METADATA_BY_ID[$id]}
+        jq -e '[.modes[] | select(.ci == true)] | length > 0' <<<"$metadata" >/dev/null || continue
+        lane=$(jq -r .lane <<<"$metadata")
+        category=$(jq -r .category <<<"$metadata")
+        timeout=$(jq -r .timeout_seconds <<<"$metadata")
+        key="$lane/$category"
+        if ((timeout > ${category_max[$key]:-0})); then
+            category_max[$key]=$timeout
+        fi
+    done
+    for key in "${!category_max[@]}"; do
+        lane=${key%%/*}
+        category=${key#*/}
+        job="manifest_${category//-/_}"
+        outer=$(jq -r --arg job "$job" \
+            '.steps[] | select(.group == "e2e" and .job == $job) | .timeout' \
+            "$DAG_ROOT/$lane.json")
+        [[ $outer =~ ^[1-9][0-9]*$ ]] ||
+            die "E2E category $key has no numeric DAG-node timeout"
+        hard_floor=$((${category_max[$key]} + 10))
+        ((outer > hard_floor)) ||
+            die "E2E category $key node ${outer}s must exceed its ${category_max[$key]}s individual timeout plus 10s grace"
+    done
+    printf 'INNERMOST-TIMEOUT coverage: Cargo nextest=300/600 s (+30 s grace); E2E categories=%s all nested inside DAG nodes\n' \
+        "${#category_max[@]}"
+}
+
 # Emit WHY a prepare/compile step failed. Guaranteed to write at least one line.
 #
 # The reason is normally the child's own stderr, which is the right answer when
@@ -2397,7 +2504,7 @@ function prepare_test {
         if ((status != 0)); then
             echo "C program compilation failed for ${test#"$ROOT_DIR/"}" >&2
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-            return 1
+            return "$status"
         fi
         return 0
     fi
@@ -2409,7 +2516,7 @@ function prepare_test {
         if ((status != 0)); then
             echo "Rust program compilation failed for ${test#"$ROOT_DIR/"}" >&2
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-            return 1
+            return "$status"
         fi
         return 0
     fi
@@ -2421,7 +2528,7 @@ function prepare_test {
     if ((status != 0)); then
         echo "prepare failed for ${test#"$TEST_ROOT/"}" >&2
         emit_failure_reason "$status" "$stdout_file" "$stderr_file"
-        return 1
+        return "$status"
     fi
 }
 
@@ -2693,9 +2800,16 @@ function run_cell {
     start_ms=$(date +%s%3N)
 
     local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
-    if ! prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
+    local timeout_reason='' prepare_status=0
+    prepare_test "$test" "$cell_dir" "$timeout_seconds" || prepare_status=$?
+    if ((prepare_status != 0)); then
         outcome=ERROR
-        reason="fixture preparation failed"
+        if reason=$(individual_test_timeout_reason \
+            "$id" prepare "$backend" 1 "$timeout_seconds" "$prepare_status"); then
+            :
+        else
+            reason="fixture preparation failed"
+        fi
     elif [[ $mode == naked ]]; then
         local runs min_distinct attempt row status hash _stdout_file _stderr_file attempt_execution
         local failed_runs=0
@@ -2706,11 +2820,19 @@ function run_cell {
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
             IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
             hashes+=("$hash")
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" native "$attempt" "$timeout_seconds" "$status"); then
+                break
+            fi
+            timeout_reason=''
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
         local distinct
         distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-        if ((failed_runs > 0)); then
+        if [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
+        elif ((failed_runs > 0)); then
             outcome=FAIL
             reason="naked control had $failed_runs failed native run(s) across $runs attempts"
         elif ((distinct < min_distinct)); then
@@ -2734,12 +2856,22 @@ function run_cell {
                 launch_refusal_stderr=$stderr1
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "seed-$seed-a" "$timeout_seconds" "$status1"); then
+                break
+            fi
+            timeout_reason=''
             row2=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-b" "$seed")
             IFS=$'\t' read -r status2 hash2 stdout2 stderr2 execution2 <<<"$row2"
             if [[ $execution2 == LAUNCH_REFUSED ]]; then
                 launch_refusal_stderr=$stderr2
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "seed-$seed-b" "$timeout_seconds" "$status2"); then
+                break
+            fi
+            timeout_reason=''
             hashes+=("$hash1")
             if [[ $status1 == 0 ]]; then
                 ((passes += 1))
@@ -2752,6 +2884,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
+        elif [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
@@ -2775,6 +2910,11 @@ function run_cell {
                 launch_refusal_stderr=$stderr_file
                 break
             fi
+            if timeout_reason=$(individual_test_timeout_reason \
+                "$id" "$mode" "$backend" "$attempt" "$timeout_seconds" "$status"); then
+                break
+            fi
+            timeout_reason=''
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
@@ -2782,6 +2922,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
+        elif [[ -n $timeout_reason ]]; then
+            outcome=FAIL
+            reason=$timeout_reason
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
@@ -2800,6 +2943,9 @@ function run_cell {
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$stderr_file")
+        elif reason=$(individual_test_timeout_reason \
+            "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status"); then
+            outcome=FAIL
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
@@ -2934,6 +3080,8 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        audit_innermost_e2e_timeout
+        audit_innermost_timeout_coverage
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract
