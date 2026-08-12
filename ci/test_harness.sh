@@ -2592,16 +2592,39 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the L2 parity assertion?
-function verify_asserts_bitwise_parity {
-    local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
-}
-
 # Where a verify attempt writes its machine-readable verdict.
 function verify_verdict_path {
     local cell_dir=$1 attempt=$2
     printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
+}
+
+# The compatibility matrix has one comparison standard.  Keep its argv in one
+# function so the runner, the recorded evidence, and the negative bracket below
+# cannot silently choose different comparators.
+function canonical_verify_flags {
+    local verdict=$1
+    printf '%s\n' --verify --verify-strict --verify-json "$verdict"
+}
+
+function assert_canonical_verify_flags {
+    (($# == 4)) && [[ $1 == --verify && $2 == --verify-strict &&
+        $3 == --verify-json && -n $4 ]]
+}
+
+function audit_canonical_verify_flags {
+    local -a flags planted
+    mapfile -t flags < <(canonical_verify_flags /tmp/verdict.json)
+    assert_canonical_verify_flags "${flags[@]}" ||
+        die "canonical verify flags are incomplete: ${flags[*]}"
+    planted=()
+    local flag
+    for flag in "${flags[@]}"; do
+        [[ $flag == --verify-strict ]] || planted+=("$flag")
+    done
+    if assert_canonical_verify_flags "${planted[@]}"; then
+        die "canonical comparator audit accepted a planted --verify-strict omission"
+    fi
+    printf 'PASS: canonical verify flags 1/1; planted omission refused 1/1\n'
 }
 
 # Fail closed on anything short of a full parity verdict: a missing, unparsable,
@@ -2704,20 +2727,16 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
-            # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
-            # which normalizes numbers/addresses/paths away wholesale and so
-            # "cannot establish L2" (AGENTS.md). A cell that opts into
-            # `assert = { bitwise_parity = true }` is upgraded to the canonical
-            # parity comparator and made to emit a machine-readable verdict, which
-            # run_cell then checks -- otherwise the cell would be justified by a
-            # parity measurement it never actually performs.
-            local verify_strict_flags=()
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict --verify-json
-                    "$(verify_verdict_path "$cell_dir" "$attempt")")
-            fi
-            command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
+            # Plain `--strict --verify` is the lossy legacy comparator.  Every
+            # matrix verify cell now uses the canonical comparator and publishes
+            # a verdict that run_cell checks; there is no per-row fallback.
+            local -a verify_flags
+            mapfile -t verify_flags < <(canonical_verify_flags \
+                "$(verify_verdict_path "$cell_dir" "$attempt")")
+            assert_canonical_verify_flags "${verify_flags[@]}" ||
+                die "verify cell constructed a non-canonical comparator argv"
+            command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict
+                "${verify_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -2786,13 +2805,9 @@ function append_result {
             log_level=
             ;;
         verify)
-            # The receipt must record the flags that actually ran. Reporting a
-            # bare `--strict --verify` for a cell that ran the parity comparator
-            # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
+            # The receipt records the single standard every verify cell runs.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify","--verify-strict","--verify-json"]')
             log_level=info
             ;;
         replay)
@@ -3107,10 +3122,10 @@ function run_cell {
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
-        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-            # A zero exit only means the comparator this run used was satisfied.
-            # For an L2 cell, read the verdict the run itself published and
-            # require full parity; anything else is a FAIL, not a PASS.
+        elif [[ $mode == verify ]]; then
+            # A zero exit is insufficient evidence. Read the verdict the run
+            # itself published and require full parity for every verify cell;
+            # anything else is a FAIL, not a PASS.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
                 "$(verify_verdict_path "$cell_dir" 1)"); then
@@ -3292,6 +3307,7 @@ case "$subcommand" in
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
+        audit_canonical_verify_flags
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory

@@ -119,22 +119,40 @@ impl CompatMode {
         }
     }
 
-    /// The `hermit run ...` flags preceding `--`, reproducing the `run_args`
-    /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
+    /// The `hermit run ...` flags preceding `--`.
+    ///
+    /// Every compatibility mode uses the canonical comparator.  Before
+    /// 2026-08-12, Strict, PortableStrict, SaBRe, and e9patch stopped at bare
+    /// `--verify`, whose stripped comparison normalizes numeric values,
+    /// addresses, PIDs, durations, and temporary paths.  Those modes still
+    /// advertised L2 evidence, so 766/905 selected mode-row executions claimed
+    /// more than they measured.  Record/replay already selected
+    /// `--verify-strict`; keep one standard across the complete corpus.
     pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::Strict => vec![s("run"), s("--strict"), s("--verify"), s("--")],
+            CompatMode::Strict => {
+                vec![s("run"), s("--strict"), s("--verify"), s("--verify-strict"), s("--")]
+            }
             CompatMode::PortableStrict => vec![
                 s("run"),
                 s("--strict"),
                 s("--verify"),
+                s("--verify-strict"),
                 s("--no-virtualize-cpuid"),
                 s("--max-timeslice=disabled"),
                 s("--"),
             ],
             CompatMode::Sabre => {
-                vec![s("run"), s("--backend"), s("sabre"), s("--strict"), s("--verify"), s("--")]
+                vec![
+                    s("run"),
+                    s("--backend"),
+                    s("sabre"),
+                    s("--strict"),
+                    s("--verify"),
+                    s("--verify-strict"),
+                    s("--"),
+                ]
             }
             CompatMode::E9patch => {
                 let mut v = vec![s("run"), s("--backend"), s("e9patch")];
@@ -148,6 +166,7 @@ impl CompatMode {
                 }
                 v.push(s("--strict"));
                 v.push(s("--verify"));
+                v.push(s("--verify-strict"));
                 v.push(s("--"));
                 v
             }

@@ -668,12 +668,10 @@ fn validate_mode(
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
         "custom" => allowed.extend(["args", "assert"]),
-        // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
-        // cell from the lossy default comparator to the L2 parity comparator and
-        // requires the run's own verdict JSON to report parity. Without it a
-        // `verify` cell runs `--strict --verify` only, which per
-        // AGENTS.md "cannot establish L2" -- so a cell justified by a
-        // hand-measured `bitwise_parity: true` does not actually ratchet it.
+        // Every `verify` cell runs the canonical parity comparator.  The
+        // optional `bitwise_parity` assertion remains accepted as an explicit
+        // statement of the row's expected property; it no longer selects a
+        // weaker or stronger execution path.
         "verify" => allowed.push("assert"),
         _ => {}
     }
