@@ -942,7 +942,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
+            self.execute_blocking_pipe_write(guest, call).await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await

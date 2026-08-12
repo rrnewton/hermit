@@ -17,6 +17,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PRODUCERS 3
@@ -202,6 +203,67 @@ static void pipe_capacity(void) {
   close(fds[0]);
   close(fds[1]);
   pthread_barrier_destroy(&barrier);
+}
+
+static void pipe_large_write(void) {
+  enum { REQUESTED = 8190 };
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(fds[1], F_SETPIPE_SZ, 4096);
+  if (capacity != 4096) {
+    fail("fcntl(F_SETPIPE_SZ)");
+  }
+
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    close(fds[1]);
+    uint8_t buffer[REQUESTED];
+    size_t received = 0;
+    while (received < sizeof(buffer)) {
+      ssize_t count = read(fds[0], buffer + received, sizeof(buffer) - received);
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      if (count <= 0) {
+        _exit(3);
+      }
+      received += (size_t)count;
+    }
+    for (size_t i = 0; i < sizeof(buffer); i++) {
+      if (buffer[i] != 0x6d) {
+        _exit(4);
+      }
+    }
+    close(fds[0]);
+    _exit(0);
+  }
+
+  close(fds[0]);
+  uint8_t buffer[REQUESTED];
+  memset(buffer, 0x6d, sizeof(buffer));
+  ssize_t written = write(fds[1], buffer, sizeof(buffer));
+  int write_errno = errno;
+  close(fds[1]);
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    fail("waitpid");
+  }
+  if (written != REQUESTED) {
+    fprintf(stderr, "blocking pipe write returned %zd of %d bytes: %s\n", written,
+            REQUESTED, strerror(write_errno));
+    exit(1);
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "pipe reader failed: status=%d\n", status);
+    exit(1);
+  }
+  printf("pipe-large-write:%zd:%d\n", written, capacity);
 }
 
 static void socketpair_order(void) {
@@ -404,6 +466,8 @@ int main(int argc, char **argv) {
     pipe_order();
   } else if (strcmp(argv[1], "pipe-capacity") == 0) {
     pipe_capacity();
+  } else if (strcmp(argv[1], "pipe-large-write") == 0) {
+    pipe_large_write();
   } else if (strcmp(argv[1], "socketpair") == 0) {
     socketpair_order();
   } else if (strcmp(argv[1], "eventfd") == 0) {

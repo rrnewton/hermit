@@ -13,9 +13,10 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 5] = [
+const PATTERNS: [&str; 6] = [
     "pipe-order",
     "pipe-capacity",
+    "pipe-large-write",
     "socketpair",
     "eventfd",
     "epoll",
