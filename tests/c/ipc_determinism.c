@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
@@ -525,6 +526,19 @@ static int receive_pipe_writer_alias(int fd) {
   return alias;
 }
 
+static int duplicate_with_pidfd(int fd) {
+  int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (pidfd < 0) {
+    fail("pidfd_open self");
+  }
+  int alias = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
+  if (alias < 0) {
+    fail("pidfd_getfd self");
+  }
+  close(pidfd);
+  return alias;
+}
+
 static int open_cross_process_pipe_writer_alias(int fd) {
   int release_child[2];
   if (pipe(release_child) != 0) {
@@ -644,41 +658,74 @@ static void pipe_partial_read_write(void) {
   printf("pipe-partial-read-write:scalar,writev\n");
 }
 
-static void pipe_unavailable_alias_status(void) {
-  int fds[2];
-  if (pipe2(fds, O_NONBLOCK) != 0) {
-    fail("pipe2 unavailable alias status");
-  }
-  int alias = receive_pipe_writer_alias(fds[1]);
+static void assert_unavailable_pipe_alias_status(int alias, const char *route) {
   uint8_t byte = 0x61;
   struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
 
   errno = 0;
   if (fcntl(alias, F_GETFL) != -1 || errno != ENOSYS) {
-    fail("SCM_RIGHTS pipe F_GETFL did not fail closed");
+    fprintf(stderr, "%s pipe F_GETFL did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
   }
   errno = 0;
   if (fcntl(alias, F_SETFL, 0) != -1 || errno != ENOSYS) {
-    fail("SCM_RIGHTS pipe F_SETFL did not fail closed");
+    fprintf(stderr, "%s pipe F_SETFL did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
   }
   int disabled = 0;
   errno = 0;
   if (ioctl(alias, FIONBIO, &disabled) != -1 || errno != ENOSYS) {
-    fail("SCM_RIGHTS pipe FIONBIO did not fail closed");
+    fprintf(stderr, "%s pipe FIONBIO did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
   }
   errno = 0;
   if (write(alias, &byte, sizeof(byte)) != -1 || errno != ENOSYS) {
-    fail("SCM_RIGHTS pipe write did not fail closed");
+    fprintf(stderr, "%s pipe write did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
   }
   errno = 0;
   if (writev(alias, &vector, 1) != -1 || errno != ENOSYS) {
-    fail("SCM_RIGHTS pipe writev did not fail closed");
+    fprintf(stderr, "%s pipe writev did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
   }
 
   close(alias);
+}
+
+static void pipe_unavailable_alias_status(void) {
+  int fds[2];
+  if (pipe2(fds, O_NONBLOCK) != 0) {
+    fail("pipe2 unavailable alias status");
+  }
+  assert_unavailable_pipe_alias_status(receive_pipe_writer_alias(fds[1]),
+                                       "SCM_RIGHTS");
+  assert_unavailable_pipe_alias_status(duplicate_with_pidfd(fds[1]),
+                                       "pidfd_getfd");
+
+  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  if (null_fd < 0) {
+    fail("open /dev/null");
+  }
+  int null_alias = duplicate_with_pidfd(null_fd);
+  uint8_t byte = 0x62;
+  if (write(null_alias, &byte, sizeof(byte)) != (ssize_t)sizeof(byte)) {
+    fail("pidfd_getfd regular-fd positive control");
+  }
+  int descriptor_flags = fcntl(null_alias, F_GETFD);
+  if (descriptor_flags < 0 || !(descriptor_flags & FD_CLOEXEC)) {
+    fail("pidfd_getfd regular-fd CLOEXEC control");
+  }
+
+  close(null_alias);
+  close(null_fd);
   close(fds[0]);
   close(fds[1]);
-  printf("pipe-unavailable-alias-status:ENOSYS\n");
+  printf("pipe-unavailable-alias-status:SCM_RIGHTS,pidfd_getfd,ENOSYS\n");
 }
 
 static void pipe_read_end_write(void) {
