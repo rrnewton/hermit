@@ -304,22 +304,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             let attempt_len = (target - written_total).min(PIPE_BUF);
-            let Some(attempt_buffer) = buffer.and_then(|buffer| {
-                buffer
-                    .as_raw()
-                    .checked_add(written_total)
-                    .and_then(Addr::<u8>::from_raw)
-            }) else {
-                break if written_total > 0 {
-                    Ok(written_total as i64)
-                } else {
-                    Err(Errno::EFAULT.into())
-                };
-            };
-            let result = match pipe_write_readiness(&pinned_pipe) {
-                Ok(PipeWriteReadiness::Ready) => {
-                    write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len)
-                }
+            let result = match pipe_write_readiness(&pinned_pipe, attempt_len) {
+                Ok(PipeWriteReadiness::Ready) => match buffer.and_then(|buffer| {
+                    buffer
+                        .as_raw()
+                        .checked_add(written_total)
+                        .and_then(Addr::<u8>::from_raw)
+                }) {
+                    Some(attempt_buffer) => {
+                        write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len)
+                    }
+                    None => Err(Errno::EFAULT),
+                },
                 Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
                 Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
                 Err(error) => Err(error),
@@ -434,13 +430,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let result = match pipe_write_readiness(&pinned_pipe) {
+            let attempt_len = (target - written_total).min(PIPE_BUF);
+            let result = match pipe_write_readiness(&pinned_pipe, attempt_len) {
                 Ok(PipeWriteReadiness::Ready) => write_guest_iovec_bytes(
                     guest,
                     &mut pinned_pipe,
                     &iovecs,
                     written_total,
-                    (target - written_total).min(PIPE_BUF),
+                    attempt_len,
                 ),
                 Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
                 Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
@@ -508,7 +505,7 @@ enum PipeWriteReadiness {
     Closed,
 }
 
-fn pipe_write_readiness(pipe: &File) -> Result<PipeWriteReadiness, Errno> {
+fn pipe_write_readiness(pipe: &File, requested: usize) -> Result<PipeWriteReadiness, Errno> {
     let mut descriptor = libc::pollfd {
         fd: pipe.as_raw_fd(),
         events: libc::POLLOUT,
@@ -532,6 +529,39 @@ fn pipe_write_readiness(pipe: &File) -> Result<PipeWriteReadiness, Errno> {
         return Ok(PipeWriteReadiness::Closed);
     }
     if result > 0 && descriptor.revents & libc::POLLOUT != 0 {
+        return Ok(PipeWriteReadiness::Ready);
+    }
+
+    // poll(2) reports POLLOUT only when the pipe has an unused buffer slot. A one-page
+    // stream pipe can nevertheless accept bytes into the tail of its existing buffer after
+    // a partial read. Account for that space so a blocking writer does not wait for the
+    // whole page to drain. FIONREAD does not expose the consumed head offset or the kernel's
+    // buffer merge flag, so this is intentionally optimistic: the nonblocking write below
+    // remains authoritative and an overestimate returns EAGAIN and retries. The unambiguous
+    // full- and closed-pipe cases are still decided before guest memory is copied. Packet-
+    // mode pipe buffers are deliberately not treated as mergeable.
+    // SAFETY: pipe owns a valid descriptor, and these fcntl operations do not dereference
+    // their third argument.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    if flags & libc::O_DIRECT != 0 {
+        return Ok(PipeWriteReadiness::Full);
+    }
+    // SAFETY: as above; F_GETPIPE_SZ ignores the third argument.
+    let capacity = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    if capacity < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    let mut unread: libc::c_int = 0;
+    // SAFETY: unread points to one writable c_int for the duration of the ioctl.
+    let result = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) };
+    if result < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    let available = capacity.checked_sub(unread).ok_or(Errno::EIO)?;
+    if requested <= usize::try_from(available).map_err(|_| Errno::EIO)? {
         Ok(PipeWriteReadiness::Ready)
     } else {
         Ok(PipeWriteReadiness::Full)

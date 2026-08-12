@@ -915,13 +915,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.stat().map(|x| x.inode),
                 )
             })?;
-        // It doesn't matter much where the linearization point for this mtime bump falls:
-        if guest.config().virtualize_metadata {
-            let r =
-                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
-            touch_file(guest, r).await;
-        }
-
         let blocking_pipe =
             physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
         // Pin the kernel pipe object before any scheduler resource request can let another
@@ -1001,6 +994,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Ok(self.record_or_replay(guest, call).await?)
         };
+
+        if guest.config().virtualize_metadata && matches!(&res, Ok(written) if *written > 0) {
+            let inode =
+                raw_ino.expect("virtualized metadata requires stat data for every tracked fd");
+            touch_file(guest, inode).await;
+        }
 
         resource_release_all(guest).await;
         res

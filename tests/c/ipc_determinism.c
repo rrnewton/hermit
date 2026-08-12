@@ -428,6 +428,59 @@ static void pipe_close_reuse(void) {
   close(replacement[1]);
 }
 
+static void assert_partial_pipe_write(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  uint8_t initial[100];
+  uint8_t consumed[50];
+  uint8_t appended[50];
+  memset(initial, 0x31, sizeof(initial));
+  memset(appended, 0x72, sizeof(appended));
+  write_exact(fds[1], initial, sizeof(initial));
+  read_exact(fds[0], consumed, sizeof(consumed));
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = appended,
+      .length = sizeof(appended),
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  pthread_join(writer, NULL);
+  if (args.result != (ssize_t)sizeof(appended)) {
+    fprintf(stderr, "pipe-partial-read-write: vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  uint8_t remaining[100];
+  read_exact(fds[0], remaining, sizeof(remaining));
+  if (memcmp(remaining, initial + sizeof(consumed), sizeof(consumed)) != 0 ||
+      memcmp(remaining + sizeof(consumed), appended, sizeof(appended)) != 0) {
+    fprintf(stderr, "pipe-partial-read-write: vectored=%d changed payload\n", vectored);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_partial_read_write(void) {
+  assert_partial_pipe_write(0);
+  assert_partial_pipe_write(1);
+  printf("pipe-partial-read-write:scalar,writev\n");
+}
+
 static void pipe_read_end_write(void) {
   int fds[2];
   if (pipe(fds) != 0) {
@@ -547,7 +600,7 @@ static void assert_invalid_pipe_buffer_waits(int vectored) {
 
   struct blocked_writer_args args = {
       .fd = fds[1],
-      .bytes = (uint8_t *)1,
+      .bytes = NULL,
       .length = 1,
       .vectored = vectored,
       .started = 0,
@@ -600,11 +653,11 @@ static void pipe_invalid_buffer_sigpipe(void) {
   close(fds[0]);
   sigpipe_count = 0;
   errno = 0;
-  if (write(fds[1], (void *)1, 1) != -1 || errno != EPIPE) {
+  if (write(fds[1], NULL, 1) != -1 || errno != EPIPE) {
     fprintf(stderr, "pipe-invalid-sigpipe: scalar was not EPIPE\n");
     exit(1);
   }
-  struct iovec vector = {.iov_base = (void *)1, .iov_len = 1};
+  struct iovec vector = {.iov_base = NULL, .iov_len = 1};
   errno = 0;
   if (writev(fds[1], &vector, 1) != -1 || errno != EPIPE) {
     fprintf(stderr, "pipe-invalid-sigpipe: writev was not EPIPE\n");
@@ -885,6 +938,8 @@ int main(int argc, char **argv) {
     pipe_large_writev();
   } else if (strcmp(argv[1], "pipe-close-reuse") == 0) {
     pipe_close_reuse();
+  } else if (strcmp(argv[1], "pipe-partial-read-write") == 0) {
+    pipe_partial_read_write();
   } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
     pipe_read_end_write();
   } else if (strcmp(argv[1], "pipe-edge-write-results") == 0) {
