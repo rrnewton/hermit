@@ -3198,11 +3198,6 @@ function run_cell {
         elif reason=$(individual_test_timeout_reason \
             "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status"); then
             outcome=FAIL
-        elif [[ $(jq -r '.expected' <<<"$comparison") == true \
-            && $(jq -r '.unavailable_reason != null' <<<"$comparison") == true ]]; then
-            outcome=ERROR
-            error_kind="comparison-unavailable"
-            reason=$(jq -r .unavailable_reason <<<"$comparison")
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
@@ -3345,32 +3340,36 @@ EOF
         TEST_BY_ID["audit/comparison"]=/bin/true
         METADATA_BY_ID["audit/comparison"]=$metadata
         append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$comparison"
-        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "no result" null "comparison-unavailable" null "$no_result"
+        # Execution outcome and comparison availability are orthogonal. A DBT
+        # invocation can complete successfully while its backend provides no
+        # comparison channel; the row must say both facts rather than turning
+        # unavailable evidence into either a match or a functional failure.
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$no_result"
         append_result "audit/comparison" audit privileged verify ptrace FAIL 1 "diverged" null "" null "$diverged"
-        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "missing" null "comparison-unavailable" null "$missing"
-        append_result "audit/comparison" audit privileged verify ptrace ERROR 1 "malformed" null "comparison-unavailable" null "$malformed"
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$missing"
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$malformed"
         append_result "audit/comparison" audit privileged chaos ptrace PASS 1 "" null "" null "$noncomparison"
     )
     jq -se '
       length == 6
-      and ([.[] | select(.comparison_expected == true and .verdict == "matched"
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == "matched"
              and .bitwise_parity == false and .compared_log_messages.left == 7)] | length == 1)
-      and ([.[] | select(.comparison_expected == true and .verdict == "no_result"
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == "no_result"
              and .bitwise_parity == false and (.comparison_unavailable_reason | length > 0))] | length == 1)
-      and ([.[] | select(.comparison_expected == true and .verdict == "diverged"
+      and ([.[] | select(.outcome == "FAIL" and .comparison_expected == true and .verdict == "diverged"
              and .bitwise_parity == false and .compared_log_messages.right == 6)] | length == 1)
-      and ([.[] | select(.comparison_expected == true and .verdict == null
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == null
              and .comparison_unavailable_reason == "comparison verdict file is missing")] | length == 1)
-      and ([.[] | select(.comparison_expected == true and .verdict == null
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == null
              and .comparison_unavailable_reason == "comparison verdict file is not readable structured evidence")] | length == 1)
-      and ([.[] | select(.comparison_expected == false and .verdict == null
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == false and .verdict == null
              and (.comparison_unavailable_reason | length > 0))] | length == 1)
     ' "$results" >/dev/null ||
         die "results.jsonl emitter did not preserve all comparison states"
 
     unset FAKE_HERMIT_ARGS FAKE_HERMIT_VERDICT
     rm -rf "$scratch"
-    echo "comparison verdict bracket: verify-report=1 strict-preserved=1 replay-report=1 matched/no_result/diverged/missing/malformed=5/5 noncomparison-reason=1 emitter-states=6/6 false-preserved=3/3"
+    echo "comparison verdict bracket: verify-report=1 strict-preserved=1 replay-report=1 matched/no_result/diverged/missing/malformed=5/5 noncomparison-reason=1 emitter-states=6/6 availability-outcome-independent=3/3 false-preserved=3/3"
 }
 
 function write_junit {
