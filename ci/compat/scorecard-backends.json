@@ -1,0 +1,5 @@
+{
+  "population_id": "hermit-e2e-manifests-v2",
+  "standard_id": "strict-canonical-bitwise",
+  "backends": ["ptrace", "kvm", "liteinst", "e9patch", "sabre", "dbt"]
+}

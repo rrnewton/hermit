@@ -37,7 +37,7 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 # fresh clone/worktree gets the BLOCKING Reverie pin-drift gate without a manual
 # step. core.hooksPath is per-repo local config (not tracked), so it must be set
 # once per checkout; wiring it into install-deps is that step.
-install-hooks: ## Install this checkout's git pre-commit hooks (Reverie pin gate)
+install-hooks: ## Install this checkout's tracked git hooks
 	@./scripts/setup-hooks.sh
 
 release-core: check-submodules ## Build the lean core-only release binary (ptrace/kvm/liteinst)

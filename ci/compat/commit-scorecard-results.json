@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "population_id": "hermit-e2e-manifests-v2",
+  "standard_id": "strict-canonical-bitwise",
+  "measured_hermit_sha": "82a8e853357584a3a567fd80812e015572a607c7",
+  "evidence": {
+    "repository": "rrnewton/dev-hermit",
+    "commit": "f21dd0d13a3cf570d4b36d6dbfb6445475d42978",
+    "path": "compat-envelope/fullcorpus-scorecard.csv",
+    "sha256": "ee57af9d77a27bcfdd68958be0baeb58095344c8844dd59441f42fe1b267154d",
+    "qualification": "legacy comparator; no cell qualifies under the strict standard"
+  },
+  "states": {
+    "ptrace": {"green": [], "stable_fail": [], "unstable": []},
+    "kvm": {"green": [], "stable_fail": [], "unstable": []},
+    "liteinst": {"green": [], "stable_fail": [], "unstable": []},
+    "e9patch": {"green": [], "stable_fail": [], "unstable": []},
+    "sabre": {"green": [], "stable_fail": [], "unstable": []},
+    "dbt": {"green": [], "stable_fail": [], "unstable": []}
+  },
+  "drop_reason": ""
+}
