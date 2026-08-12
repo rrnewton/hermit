@@ -83,6 +83,7 @@ Usage:
   ci/test_harness.sh audit-test-footprints
   ci/test_harness.sh audit-test-binary-registration
   ci/test_harness.sh audit-ci
+  ci/test_harness.sh audit-compile [--lane LANE] [--category CATEGORY] [--test ID]
 
 Filters:
   --lane LANE             portable or privileged
@@ -1001,7 +1002,7 @@ function assert_validate_driver_entrypoint {
         die "the validate driver must refuse an unplannable profile, never substitute one"
 }
 
-# Keep the latest-Reverie invariant attached to every testing evidence path.
+# Keep the Reverie ancestor-and-monotonic invariant attached to every testing evidence path.
 # The checker unit tests plant stale/current pins; these structural assertions
 # prove that those same fail-closed semantics cannot be bypassed by selecting a
 # different local, DAG, hosted-CI, merge-gate, or receipt path.
@@ -1009,16 +1010,30 @@ function assert_reverie_pin_enforcement {
     local checker="$ROOT_DIR/scripts/check-reverie-pin.rs"
     local runner="$ROOT_DIR/ci/run-reverie-pin-check.sh"
     local liteinst_stage="$ROOT_DIR/scripts/stage-liteinst-runtime.sh"
+    [[ $(grep -Fxc '        "BLOCKED. The pin must be on rrnewton/reverie:main history and must not regress the landing base."' "$checker") == 1 ]] ||
+        die "Reverie pin checker must describe the ancestry-and-monotonicity refusal exactly once"
+    ! grep -Fq 'Testing must use the latest rrnewton/reverie:main.' "$checker" ||
+        die "Reverie pin checker must not restore the superseded live-tip equality rule"
+    [[ $(grep -Fxc '//!                    and tip equality is allowed but not required. A lagging' "$checker") == 1 ]] ||
+        die "Reverie pin checker must state exactly that tip equality is allowed but not required"
+    ! grep -Fq 'not equal to its tip' "$checker" ||
+        die "Reverie pin checker must not falsely forbid equality with the tip"
+    [[ $(grep -Fxc '    fn exact_latest_pin_passes() {' "$checker") == 1 ]] ||
+        die "Reverie pin checker must retain the exact-tip positive bracket"
+    [[ $(grep -Fxc '    fn regressed_pin_is_refused() {' "$checker") == 1 ]] ||
+        die "Reverie pin checker must retain the backward-pin negative bracket"
+    [[ $(grep -Fxc '        assert_eq!(code, 1, "a pin that REGRESSES below its base must be REFUSED");' "$checker") == 1 ]] ||
+        die "Reverie pin backward-pin bracket must assert the exact fail-closed result"
     grep -Fq '.args(["ls-remote", "--exit-code", remote, MAIN_REF])' "$checker" ||
-        die "latest-Reverie checker must dereference refs/heads/main with git ls-remote"
+        die "Reverie ancestor-and-monotonic checker must dereference refs/heads/main with git ls-remote"
     ! grep -Fq 'main_sha' "$checker" ||
-        die "latest-Reverie checker must not accept a pre-recorded main SHA"
+        die "Reverie ancestor-and-monotonic checker must not accept a pre-recorded main SHA"
     ! grep -Fq -- '--reverie-remote' "$checker" ||
-        die "production callers must not redirect the latest-Reverie authority"
+        die "production callers must not redirect the Reverie ancestor-and-monotonic authority"
     [[ -x $runner ]] ||
-        die "latest-Reverie CI runner must be executable"
+        die "Reverie ancestor-and-monotonic CI runner must be executable"
     [[ $(grep -Fxc '"$checker" "$@"' "$runner") == 1 ]] ||
-        die "latest-Reverie runner must forward every verifier argument exactly"
+        die "Reverie ancestor-and-monotonic runner must forward every verifier argument exactly"
 
     # Exhaustive tracked-reference audit. Any new direct source reference fails
     # until it is classified in this explicit trusted allowlist; checking a few
@@ -1037,7 +1052,7 @@ $direct_references"
     # and merge-gate's trusted-main compiler. The harness is this audit; the
     # remaining allowlisted references are documentation or checker source.
     [[ $(grep -Fxc '        scripts/check-reverie-pin.rs -o "$checker"' "$runner") == 2 ]] ||
-        die "latest-Reverie runner must compile the canonical source in both modes"
+        die "Reverie ancestor-and-monotonic runner must compile the canonical source in both modes"
     [[ $(grep -Fxc $'\t$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh' "$ROOT_DIR/Makefile") == 1 ]] ||
         die "Makefile lint must use the canonical Reverie-pin launcher"
     [[ $(grep -Fxc 'checker="$root/ci/run-reverie-pin-check.sh"' "$ROOT_DIR/.githooks/pre-commit") == 1 ]] ||
@@ -1071,15 +1086,23 @@ $direct_references"
         die "LiteInst staging must obtain its cache pin through the exact-repository launcher"
 
     local dag
-    for dag in "$DAG_ROOT/portable.json" "$DAG_ROOT/privileged.json"; do
-        jq -e '
+    local reverie_pin_desc="Require Hermit's recorded Reverie revision to be an ANCESTOR of rrnewton/reverie:main and to never regress below the base pin"
+    local stale_reverie_pin_desc="Require Hermit's recorded Reverie revision to equal latest rrnewton/reverie:main"
+    local -a dag_files=("$DAG_ROOT"/*.json)
+    for dag in "${dag_files[@]}"; do
+        jq -e --arg desc "$reverie_pin_desc" '
             [.steps[] | select(
                 .group == "check"
                 and .job == "reverie_pin"
                 and .cmd == "./ci/run-reverie-pin-check.sh"
+                and .desc == $desc
             )] | length == 1
         ' "$dag" >/dev/null ||
-            die "${dag#"$ROOT_DIR/"} must contain exactly one latest-Reverie pin gate"
+            die "${dag#"$ROOT_DIR/"} must contain exactly one accurately described Reverie-pin ancestor-and-monotonic gate"
+        jq -e --arg stale "$stale_reverie_pin_desc" '
+            [.steps[] | select(.desc == $stale)] | length == 0
+        ' "$dag" >/dev/null ||
+            die "${dag#"$ROOT_DIR/"} must not restore the superseded live-tip equality description"
     done
 
     # Execute the same rustc wrapper with a PATH that deliberately excludes
@@ -1301,17 +1324,17 @@ EOF
     # node waits on it: the archival pin is proved current BEFORE anything is
     # built or tested, on every profile.
     [[ $(grep -Fc '"Reverie pin consistency",' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate driver must plan the latest-Reverie gate exactly once"
+        die "the validate driver must plan the Reverie-pin ancestor-and-monotonic gate exactly once"
     [[ $(grep -Fc 'vec!["pre.reverie_pin".to_string()]' "$ROOT_DIR/scripts/lib/validate_plan.rs") == 1 ]] ||
-        die "the validate manifest gate must depend on the latest-Reverie gate"
+        die "the validate manifest gate must depend on the Reverie-pin ancestor-and-monotonic gate"
     [[ $(grep -Fc 'reverie_pin_current: pin_gate_passed' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
-        die "the Rust validate receipt must derive pin currency from the observed gate"
+        die "the Rust validate receipt must derive pin ancestry and monotonicity from the observed gate"
     [[ $(grep -Fc '"reverie_pin_current": ctx.reverie_pin_current' "$ROOT_DIR/scripts/validate.rs") == 1 ]] ||
-        die "the Rust validate receipt must state whether the latest-Reverie gate passed"
+        die "the Rust validate receipt must state whether the Reverie-pin ancestor-and-monotonic gate passed"
 
     local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
-    [[ $(grep -Fxc '    name: Reverie pin is latest main' "$portable_workflow") == 1 ]] ||
-        die "portable CI must expose exactly one latest-Reverie job"
+    [[ $(grep -Fxc '    name: Reverie pin is an ancestor and advances monotonically' "$portable_workflow") == 1 ]] ||
+        die "portable CI must expose exactly one Reverie-pin ancestor-and-monotonic job"
     [[ $(grep -Fxc '      - reverie-pin' "$portable_workflow") == 1 ]] ||
         die "the authoritative portable aggregate must depend on the Reverie pin job"
     [[ $(grep -Fxc '          ./ci/run-reverie-pin-check.sh --self-test' "$portable_workflow") == 1 ]] ||
@@ -1322,7 +1345,7 @@ EOF
         die "portable CI must not retain a stale-Reverie override"
 
     local merge_workflow="$ROOT_DIR/.github/workflows/merge-gate.yml"
-    [[ $(grep -Fxc '    name: reverie-pin-is-latest-main' "$merge_workflow") == 1 ]] ||
+    [[ $(grep -Fxc '    name: reverie-pin-ancestor-and-monotonic' "$merge_workflow") == 1 ]] ||
         die "merge-gate must check exact PR heads with the trusted pin checker"
     [[ $(grep -Fxc '    needs: [invalidate-local-validation, core-review-protocol, reverie-pin]' "$merge_workflow") == 1 ]] ||
         die "merge-gate must depend on its exact-head Reverie pin job"
@@ -1332,6 +1355,43 @@ EOF
         die "merge-gate must inspect the exact PR head"
     grep -Fq 'with-proxy "$checker" --repo "$checkout"' "$merge_workflow" ||
         die "merge-gate must run the canonical live-query checker on the exact PR head"
+
+    local updating_guide="$ROOT_DIR/docs/updating-reverie.md"
+    # Assert the SEMANTIC contract, not the presence of text.
+    #
+    # A full-line match cannot see meaning. #2159 rewrote this guide into a
+    # numbered list, so each rule now WRAPS across lines: the monotonic rule's
+    # "or remain unchanged" sits on the line after "may only advance forward".
+    # A per-line assertion therefore still passed when that continuation was
+    # changed to "or move backward" -- the exact condition monotonicity forbids.
+    # Flatten the guide first so each rule is asserted as one whole clause.
+    local guide_flat
+    guide_flat="$(tr '\n' ' ' <"$updating_guide" | tr -s ' ')"
+    local -a guide_contract=(
+        "a pointer into Reverie's **linear main history**"
+        '**Ancestry** — the pin must be an ancestor of `rrnewton/reverie:main`.'
+        '**Monotonic** — relative to the landing-base pin it may only advance forward or remain unchanged.'
+        '**A conflict resolves to the newer pin** — and this is enforced *by* rule 2'
+    )
+    local contract_line
+    for contract_line in "${guide_contract[@]}"; do
+        [[ $(grep -Fo "$contract_line" <<<"$guide_flat" | wc -l) == 1 ]] ||
+            die "Reverie pin guide must carry exactly one intact contract clause: $contract_line"
+    done
+    # Bracket the monotonic clause from the other side: no phrasing may permit a
+    # pin to move off-history, backward, or sideways. Asserting the forward-only
+    # clause above proves the right words are present; these prove the wrong ones
+    # are absent, which a presence check alone can never establish.
+    local forbidden
+    for forbidden in 'or move backward' 'may move backward' 'or move sideways' \
+                     'may regress' 'backward or remain' 'advance or regress'; do
+        ! grep -Fqi "$forbidden" <<<"$guide_flat" ||
+            die "Reverie pin guide must not permit a backward or sideways pin: $forbidden"
+    done
+    ! grep -Fqx 'testing it is a pointer: it must equal the live `rrnewton/reverie:main` tip.' "$updating_guide" ||
+        die "Reverie pin guide must not restore live-tip equality"
+    ! grep -Fqx 'Being an ancestor of main is not sufficient. A Hermit validation or pre-land' "$updating_guide" ||
+        die "Reverie pin guide must not reject a valid lagging main-history pointer"
 }
 
 function dag_critical_path_seconds {
@@ -2696,6 +2756,7 @@ function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
     local error_kind=${10}
+    local diversity=${11:-null}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -2774,7 +2835,8 @@ function append_result {
         --argjson guest_args "$guest_args" \
         --argjson relaxations "$relaxations" \
         --argjson path_evidence "$path_evidence" \
-        '{schema:2,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
+        --argjson diversity "$diversity" \
+        '{schema:3,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
           backend:(if $backend == "" then null else $backend end),classification:$classification,
@@ -2784,6 +2846,7 @@ function append_result {
           log_level:(if $log_level == "" then null else $log_level end),
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
+          diversity:$diversity,
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -2799,7 +2862,7 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
+    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr='' diversity=null
     local timeout_reason='' prepare_status=0
     prepare_test "$test" "$cell_dir" "$timeout_seconds" || prepare_status=$?
     if ((prepare_status != 0)); then
@@ -2844,11 +2907,15 @@ function run_cell {
     elif [[ $mode == chaos ]]; then
         local min_distinct min_passes min_failures seed row1 row2 status1 hash1 status2 hash2
         local stdout1 stderr1 execution1 stdout2 stderr2 execution2
+        local outcome_classes min_normalized_entropy
         local passes=0 failures=0 repeat_mismatches=0
         local -a hashes=()
         min_distinct=$(jq -r '.modes.chaos.assert.min_distinct // 2' <<<"$metadata")
         min_passes=$(jq -r '.modes.chaos.assert.min_passes // 0' <<<"$metadata")
         min_failures=$(jq -r '.modes.chaos.assert.min_failures // 0' <<<"$metadata")
+        outcome_classes=$(jq -r '.modes.chaos.outcome_classes // 0' <<<"$metadata")
+        min_normalized_entropy=$(jq -r \
+            '.modes.chaos.assert.min_normalized_entropy // "none"' <<<"$metadata")
         while IFS= read -r seed; do
             row1=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-a" "$seed")
             IFS=$'\t' read -r status1 hash1 stdout1 stderr1 execution1 <<<"$row1"
@@ -2890,11 +2957,102 @@ function run_cell {
         else
             local distinct
             distinct=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort -u | wc -l)
-            if ((repeat_mismatches > 0 || distinct < min_distinct || passes < min_passes || failures < min_failures)); then
+            # DEGREE-SENSITIVE DIVERSITY. `distinct` saturates at the guest's
+            # outcome-class ceiling: on a two-class guest it can only read 1 or 2, so
+            # `distinct >= 2` is simultaneously the floor and the ceiling and cannot
+            # distinguish a healthy 32/32 split from a nearly-collapsed 63/1 one. Both
+            # are "distinct=2" and both pass. The distribution over classes does not
+            # saturate, so we compute it and record it on every chaos row:
+            #   * entropy_bits        raw Shannon entropy of the class histogram
+            #   * normalized_entropy  entropy / log2(outcome_classes), i.e. relative to
+            #                         what THIS guest could possibly express. Dividing
+            #                         by log2(observed classes) instead would report
+            #                         1.0 for any uniform split and would saturate in
+            #                         the same way `distinct` does.
+            #   * minority_share      smallest class as a fraction of the sweep; the
+            #                         plain-language version of the same signal.
+            # A partial narrowing moves all three while `distinct` stays pinned.
+            local class_histogram spread entropy_bits normalized_entropy minority_share
+            class_histogram=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort | uniq -c \
+                | LC_ALL=C sort -rn \
+                | awk '{printf "%s%s:%s", (NR > 1 ? "," : ""), substr($2, 1, 12), $1}')
+            spread=$(printf '%s\n' "${hashes[@]}" | LC_ALL=C sort | uniq -c \
+                | awk -v classes="$outcome_classes" '
+                    { count[NR] = $1; total += $1 }
+                    END {
+                        if (total == 0) { printf "0.0000 0.0000 0.0000"; exit }
+                        bits = 0
+                        least = count[1]
+                        for (i = 1; i <= NR; i++) {
+                            share = count[i] / total
+                            if (share > 0) bits -= share * log(share) / log(2)
+                            if (count[i] < least) least = count[i]
+                        }
+                        norm = (classes >= 2) ? bits / (log(classes) / log(2)) : 0
+                        printf "%.4f %.4f %.4f", bits, norm, least / total
+                    }')
+            read -r entropy_bits normalized_entropy minority_share <<<"$spread"
+            # An oracle whose pass threshold sits ON the guest ceiling can only catch
+            # total collapse. Say so in the record rather than letting a pinned
+            # `distinct` read as strength.
+            local oracle_saturated=false
+            if ((outcome_classes > 0 && min_distinct >= outcome_classes)); then
+                oracle_saturated=true
+            fi
+            local entropy_short=0
+            if [[ $min_normalized_entropy != none ]]; then
+                entropy_short=$(awk -v observed="$normalized_entropy" \
+                    -v floor="$min_normalized_entropy" \
+                    'BEGIN { print (observed < floor) ? 1 : 0 }')
+            fi
+            diversity=$(jq -cn \
+                --argjson distinct "$distinct" \
+                --argjson outcome_classes "$outcome_classes" \
+                --argjson seeds "${#hashes[@]}" \
+                --argjson entropy_bits "$entropy_bits" \
+                --argjson normalized_entropy "$normalized_entropy" \
+                --argjson minority_share "$minority_share" \
+                --argjson oracle_saturated "$oracle_saturated" \
+                --arg class_histogram "$class_histogram" \
+                --arg min_normalized_entropy "$min_normalized_entropy" \
+                '{distinct:$distinct,
+                  outcome_classes:(if $outcome_classes == 0 then null else $outcome_classes end),
+                  seeds:$seeds,entropy_bits:$entropy_bits,
+                  normalized_entropy:$normalized_entropy,minority_share:$minority_share,
+                  oracle_saturated:$oracle_saturated,class_histogram:$class_histogram,
+                  min_normalized_entropy:(if $min_normalized_entropy == "none" then null
+                                          else ($min_normalized_entropy | tonumber) end)}')
+            local diversity_summary
+            diversity_summary="distinct=$distinct/${outcome_classes:-?}"
+            diversity_summary+=" entropy=$normalized_entropy ($entropy_bits bits)"
+            diversity_summary+=" minority_share=$minority_share classes=[$class_histogram]"
+            diversity_summary+=" oracle_saturated=$oracle_saturated"
+            # Name EVERY unmet leg, not just the first or the most recently added.
+            # A chaos cell asserts up to five independent things, and reporting one
+            # while three others are also unmet is how "distinct=1" got read as the
+            # whole story when min_failures was unmet too. The count is stated so a
+            # reader can tell a single-leg failure from a broad one.
+            local -a unmet=()
+            ((repeat_mismatches > 0)) &&
+                unmet+=("repeat_mismatches=$repeat_mismatches (a seed did not reproduce; this is a DETERMINISM failure, not a diversity one)")
+            ((distinct < min_distinct)) &&
+                unmet+=("distinct $distinct < min_distinct $min_distinct")
+            ((passes < min_passes)) && unmet+=("passes $passes < min_passes $min_passes")
+            ((failures < min_failures)) &&
+                unmet+=("failures $failures < min_failures $min_failures")
+            ((entropy_short == 1)) &&
+                unmet+=("normalized entropy $normalized_entropy < min_normalized_entropy $min_normalized_entropy (diversity narrowed without collapsing)")
+            if ((${#unmet[@]} > 0)); then
                 outcome=FAIL
-                reason="chaos distinct=$distinct passes=$passes failures=$failures repeat_mismatches=$repeat_mismatches"
+                reason="chaos $diversity_summary passes=$passes failures=$failures"
+                reason+=" repeat_mismatches=$repeat_mismatches"
+                reason+="; ${#unmet[@]} of 5 assertions unmet: "
+                local joined
+                printf -v joined '%s; ' "${unmet[@]}"
+                reason+="${joined%; }"
             else
-                reason="chaos distinct=$distinct passes=$passes failures=$failures; every seed reproduced"
+                reason="chaos $diversity_summary passes=$passes failures=$failures;"
+                reason+=" every seed reproduced"
             fi
         fi
     elif [[ $mode == custom ]]; then
@@ -2985,7 +3143,7 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind"
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
@@ -3071,6 +3229,54 @@ function run_required {
     ((failures == 0))
 }
 
+# Compile every C guest a bucket declares, DELIBERATELY IGNORING each cell's `ci`
+# flag and its modes. A `ci = false` cell is never compiled by any other node, so
+# its fixture rots invisibly -- -Werror is never reached, and "the file is in the
+# repo" degrades to something that does not even build. This is the only node that
+# sees a disabled fixture, so it must fail closed: zero compiled is a failure, not
+# a vacuous pass.
+function audit_compile {
+    ((PREBUILT == 0)) || die "audit-compile does not accept --prebuilt; it exists to compile from source"
+    local test test_id metadata kind category lane timeout_seconds cell_dir scratch
+    local checked=0 failed=0 skipped=0 considered=0
+    scratch=$(mktemp -d)
+    for test in "${TESTS[@]}"; do
+        metadata=$(metadata_json "$test")
+        test_id=$(jq -r .id <<<"$metadata")
+        category=$(jq -r .category <<<"$metadata")
+        lane=$(jq -r .lane <<<"$metadata")
+        [[ $CATEGORY_FILTER == "" || $category == "$CATEGORY_FILTER" ]] || continue
+        [[ $LANE_FILTER == "" || $lane == "$LANE_FILTER" ]] || continue
+        [[ $TEST_FILTER == "" || $test_id == "$TEST_FILTER" ]] || continue
+        considered=$((considered + 1))
+        kind=$(jq -r .program_kind <<<"$metadata")
+        if [[ $kind != c ]]; then
+            skipped=$((skipped + 1))
+            printf 'SKIP    %-11s %s\n' "$kind" "$test_id"
+            continue
+        fi
+        timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
+        cell_dir="$scratch/${test_id//\//-}"
+        prepare_cell_dirs "$cell_dir"
+        if prepare_test "$test" "$cell_dir" "$timeout_seconds"; then
+            checked=$((checked + 1))
+            printf 'COMPILE %-11s %s\n' "$kind" "$test_id"
+        else
+            failed=$((failed + 1))
+            printf 'FAIL    %-11s %s\n' "$kind" "$test_id"
+        fi
+    done
+    rm -rf "$scratch"
+    printf 'compile audit: considered=%d compiled=%d failed=%d skipped-non-c=%d\n' \
+        "$considered" "$checked" "$failed" "$skipped"
+    ((considered > 0)) ||
+        die "compile audit selected no tests; a filter that matches nothing is a vacuous pass"
+    ((checked > 0)) ||
+        die "compile audit compiled zero guests; a vacuous pass is the failure class this audit exists to catch"
+    ((failed == 0)) ||
+        die "$failed declared C guest(s) do not compile"
+}
+
 subcommand=${1:-}
 [[ -n $subcommand ]] || { usage; exit 2; }
 shift
@@ -3119,6 +3325,9 @@ case "$subcommand" in
         ;;
     audit-ci)
         audit_ci_correspondence
+        ;;
+    audit-compile)
+        audit_compile
         ;;
     *)
         usage
