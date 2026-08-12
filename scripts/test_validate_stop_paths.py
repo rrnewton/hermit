@@ -95,6 +95,12 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    expected_depth = int(
+        subprocess.check_output(
+            ["git", "rev-list", "--count", row["commit"]], cwd=ROOT, text=True
+        ).strip()
+    )
+    assert row["git_depth"] == expected_depth > 0, row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row

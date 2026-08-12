@@ -1028,6 +1028,19 @@ fn self_test() -> Result<(), String> {
     {
         return Err("prebuilt strict-compat path stopped being a lightweight existence check".into());
     }
+    if parse_git_depth(" 42\n")? != 42 {
+        return Err("git-depth parser changed the measured value".into());
+    }
+    for bad in ["", "0", "-1", "not-a-depth", "1 2"] {
+        if parse_git_depth(bad).is_ok() {
+            return Err(format!("git-depth parser accepted invalid measurement {bad:?}"));
+        }
+    }
+    let head = git_sha();
+    let depth = measure_git_depth(&head)?;
+    if depth == 0 {
+        return Err("git-depth measurement accepted an impossible zero".into());
+    }
     // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
     // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
     // missing, future, and contradictory sources are refused.
@@ -2544,6 +2557,35 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
 
 fn git_sha() -> String {
     sh("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_git_depth(raw: &str) -> Result<u64, String> {
+    let depth = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("git rev-list returned a non-integer depth {raw:?}: {error}"))?;
+    if depth == 0 {
+        return Err("git rev-list returned zero depth for a commit".into());
+    }
+    Ok(depth)
+}
+
+/// Measure the exact quantity carried by the historical `git_depth` field.
+/// Failure is a refusal, never a fabricated zero or an omitted JSON key.
+fn measure_git_depth(commit: &str) -> Result<u64, String> {
+    let output = Command::new("git")
+        .args(["rev-list", "--count", commit])
+        .output()
+        .map_err(|error| format!("cannot execute git rev-list --count {commit}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "git rev-list --count {commit} failed with {}{}",
+            output.status,
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
+    }
+    parse_git_depth(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Content-addressed identity of exactly what validate builds and tests: the root
@@ -5197,6 +5239,7 @@ struct LedgerCtx {
     cache_state: String,
     commit: String,
     tree: String,
+    git_depth: u64,
     git_ahead: i64,
     git_behind: i64,
     commit_anchored: bool,
@@ -5713,6 +5756,7 @@ fn write_ledger(
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
         "tree": ctx.tree,
+        "git_depth": ctx.git_depth,
         "git_ahead": ctx.git_ahead,
         "git_behind": ctx.git_behind,
         "commit_anchored": ctx.commit_anchored,
@@ -6661,6 +6705,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         };
 
     let commit = git_sha();
+    let git_depth = match measure_git_depth(&commit) {
+        Ok(depth) => depth,
+        Err(error) => {
+            return RunSummary::refused(
+                2,
+                &plan.profile,
+                "git depth measurement",
+                vec![
+                    error,
+                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
+                        .into(),
+                ],
+            )
+        }
+    };
     match setup_durable_log(&root, &plan.profile, &commit) {
         Ok(d) => *durable_slot = Some(d),
         Err(code) => {
@@ -6892,6 +6951,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         cache_state: cache.into(),
         commit: commit.clone(),
         tree: git_tree(),
+        git_depth,
         git_ahead,
         git_behind,
         commit_anchored,
@@ -7302,6 +7362,23 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let outcomes =
         vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
 
+    let commit = git_sha();
+    let git_depth = match measure_git_depth(&commit) {
+        Ok(depth) => depth,
+        Err(error) => {
+            return RunSummary::refused(
+                2,
+                profile,
+                "git depth measurement",
+                vec![
+                    error,
+                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
+                        .into(),
+                ],
+            )
+        }
+    };
+
     validate_runtime::stop_test_announce();
     let exit = validate_runtime::stop_test_park(interrupted_by);
 
@@ -7320,7 +7397,6 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let wall = started.elapsed().as_secs_f64();
     let ledger = ledger_path(root);
     let host = short_hostname();
-    let commit = git_sha();
     let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
     let ctx = LedgerCtx {
         started_at,
@@ -7333,6 +7409,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
+        git_depth,
         git_ahead: 0,
         git_behind: 0,
         commit_anchored: false,
