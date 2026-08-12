@@ -687,8 +687,6 @@ fn capture_dbt_verification(
             // indented. Keep them in the same log message instead of leaking
             // backend evidence into the guest-stderr comparison.
             log.write_all(line)?;
-        } else if !payload.starts_with(b"reverie-dbt: tool=Detcore ") {
-            in_trace_message = false;
         } else {
             in_trace_message = false;
         }
