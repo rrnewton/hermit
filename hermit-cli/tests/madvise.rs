@@ -75,11 +75,18 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
             verify.arg("--strict");
         }
         if let Some(arg) = extra_arg {
-            verify.arg(arg);
+            verify.args(["--allow-unsupported-syscalls", arg]);
         }
         verify.arg("--").arg(&guest);
         let output = command_output(verify, label);
         assert_marker(&output, "Determinism verified", label);
+        if !strict {
+            assert_marker(
+                &output,
+                "a successful exit does not establish complete deterministic execution",
+                "passthru-opt madvise compatibility warning",
+            );
+        }
     }
 
     if Path::new("/dev/kvm").exists() {

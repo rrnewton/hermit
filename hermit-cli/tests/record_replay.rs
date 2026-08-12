@@ -222,6 +222,7 @@ fn workloads() -> &'static [Workload] {
                 "ftruncate_ignore_output_error.c",
             ),
             ("c_write_ignore_output_error", "write_ignore_output_error.c"),
+            ("c_unsupported_syscall", "dbt_unsupported_syscall.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -499,6 +500,43 @@ fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
     assert!(
         !stderr.contains("panicked") && !stderr.contains("desync") && !stderr.contains("expected"),
         "captured-output ftruncate escaped as a panic or stream divergence:\n{stderr}"
+
+fn recording_rejects_an_unsupported_syscall_by_name() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_unsupported_syscall");
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start unsupported recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "unsupported recording hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "unsupported recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported syscall: restart_syscall"),
+        "unsupported recording did not name restart_syscall:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("dbt-unsupported-ok"),
+        "unsupported guest published its former success marker: {stdout}"
     );
 }
 
