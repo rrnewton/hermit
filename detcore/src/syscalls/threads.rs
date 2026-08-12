@@ -1350,21 +1350,56 @@ where
         self.guest.memory().read_value::<_, u32>(at).ok()
     }
 
-    fn mark_dead(&mut self, address: usize, before: u32, after: u32) -> bool {
-        let Some(at) = AddrMut::<u32>::from_raw(address) else {
-            return false;
+    fn compare_and_swap(
+        &mut self,
+        address: usize,
+        expected: u32,
+        desired: u32,
+    ) -> robust_list::FutexCasOutcome {
+        use robust_list::FutexCasOutcome;
+
+        let (Some(read_at), Some(write_at)) = (
+            Addr::<u32>::from_raw(address),
+            AddrMut::<u32>::from_raw(address),
+        ) else {
+            return FutexCasOutcome::Faulted;
         };
-        // The dying thread holds the scheduler turn here, so no other guest
-        // thread can observe or race this read-modify-write; it is the
-        // deterministic equivalent of the kernel's cmpxchg loop.
-        if self.guest.memory().write_value(at, &after).is_err() {
-            return false;
+        // Reverie's guest-memory interface offers reads and writes, not a
+        // cross-address-space cmpxchg, so this re-reads the word immediately
+        // before storing and refuses to store when the value has moved.
+        //
+        // Within Detcore's model that is exact rather than approximate: the
+        // dying thread holds the scheduler turn for the whole walk, and the
+        // walk performs no `await` between this read and the write below, so
+        // no modeled thread can run in between. What the comparison adds is
+        // refusal against a writer OUTSIDE the model — a process-shared robust
+        // mutex (`FutexID::Shared`) touched by a task Detcore does not
+        // sequentialize — where a blind write would stamp
+        // `FUTEX_OWNER_DIED` onto a lock that is currently held by someone
+        // alive. Linux compares for the same reason.
+        let observed = match self.guest.memory().read_value::<_, u32>(read_at) {
+            Ok(value) => value,
+            Err(_) => return FutexCasOutcome::Faulted,
+        };
+        if observed != expected {
+            return FutexCasOutcome::Changed(observed);
         }
+        // `MemoryAccess::write_value` writes through to the guest immediately
+        // (`write_exact`); it is not the scratch-stack path, which buffers
+        // until `commit()`.
+        if self.guest.memory().write_value(write_at, &desired).is_err() {
+            return FutexCasOutcome::Faulted;
+        }
+        // Deliberately DEBUG, not INFO: this line carries a raw guest address,
+        // and INFO is the surface `--verify-strict` compares. The
+        // `detcore_itself_marks_the_word_and_wakes_the_modeled_waiter`
+        // regression test reads it from a `--log=debug` run, which is why the
+        // exact wording is load-bearing.
         debug!(
             "[detcore, dtid {}] robust-list owner death: futex word {:#x} {:#x} -> {:#x}",
-            self.dettid, address, before, after,
+            self.dettid, address, expected, desired,
         );
-        true
+        FutexCasOutcome::Stored
     }
 
     async fn wake_one(&mut self, address: usize, observed: u32) {
