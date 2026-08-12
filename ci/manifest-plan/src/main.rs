@@ -35,6 +35,27 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 /// This is a ratchet: add a bucket once its cells all carry reasons. Cells
 /// outside these buckets may still carry `ci_disabled_reason` voluntarily.
 const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
+/// Every `ci = false` mode that carries no `ci_disabled_reason`, listed by
+/// identity.
+///
+/// [`CI_REASON_REQUIRED_BUCKETS`] refuses these cells outright, but it can only
+/// be extended one bucket at a time, once that bucket's cells all carry
+/// reasons. Measured at c6c6d695, one bucket is covered (397 cells, all
+/// reasoned) and twelve are not (1130 cells, none reasoned). Turning the exact
+/// rule on everywhere today would refuse those 1130 and fail the build, so the
+/// uncovered buckets would otherwise keep growing while they are drained.
+///
+/// This file lists each of those cells as `<test-id>::<mode>` and the set must
+/// match exactly. A NEW unreasoned cell is refused BY NAME; writing a reason
+/// makes an entry stale and the entry must be deleted in the same review. The
+/// set is what makes a compensating swap visible: adding one unreasoned cell
+/// while writing a reason for a different cell in the same bucket reports both
+/// the addition and the deletion, where a per-bucket count would net to zero
+/// and pass.
+///
+/// A bucket whose entries all disappear should be promoted into
+/// [`CI_REASON_REQUIRED_BUCKETS`], which is exact and needs no inventory.
+const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -153,6 +174,7 @@ fn main() {
     }
 
     validate_front_door(&repo_root, &documents);
+    validate_ci_reason_baseline(&repo_root, &documents);
 
     rows.sort_by(|left, right| {
         (&left.bucket, &left.id, &left.mode, &left.backend).cmp(&(
@@ -316,6 +338,112 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
     if !unexpected.is_empty() || !stale.is_empty() {
         die(format!(
             "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 TOML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+        ));
+    }
+}
+
+/// Identify every `ci = false` mode carrying no usable `ci_disabled_reason`, as
+/// `<test-id>::<mode>`. A present-but-blank reason counts as missing, matching
+/// [`validate_ci_disabled_reason`], so a cell cannot be drained with
+/// whitespace. Buckets already covered by [`CI_REASON_REQUIRED_BUCKETS`] are
+/// excluded: that rule refuses these cells outright.
+fn unreasoned_ci_false_cells(documents: &[Value]) -> BTreeSet<String> {
+    let mut cells = BTreeSet::new();
+    for document in documents {
+        let Some(bucket) = document.get("bucket").and_then(Value::as_str) else {
+            continue;
+        };
+        if CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
+            continue;
+        }
+        let Some(tests) = document.get("test").and_then(Value::as_array) else {
+            continue;
+        };
+        for test in tests {
+            let Some(id) = test.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(modes) = test.get("modes").and_then(Value::as_table) else {
+                continue;
+            };
+            for (mode, spec) in modes {
+                let Some(spec) = spec.as_table() else {
+                    continue;
+                };
+                if spec.get("ci").and_then(Value::as_bool) != Some(false) {
+                    continue;
+                }
+                let reasoned = spec
+                    .get("ci_disabled_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty());
+                if !reasoned {
+                    cells.insert(format!("{id}::{mode}"));
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Refuse any `ci = false` cell without a reason that is not already recorded
+/// in [`CI_REASON_BASELINE`], and refuse a recorded entry that no longer needs
+/// recording. Both directions are named, so neither growth nor a compensating
+/// swap can pass.
+fn validate_ci_reason_baseline(repo_root: &Path, documents: &[Value]) {
+    let baseline_path = repo_root.join(CI_REASON_BASELINE);
+    let baseline_text = std::fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", baseline_path.display())));
+    let baseline: JsonValue = serde_json::from_str(&baseline_text).unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid JSON: {error}",
+            baseline_path.display()
+        ))
+    });
+    let keys: BTreeSet<_> = baseline
+        .as_object()
+        .unwrap_or_else(|| die(format!("{CI_REASON_BASELINE}: expected an object")))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected_keys: BTreeSet<_> = ["schema", "unreasoned_ci_false_cells"]
+        .into_iter()
+        .collect();
+    if keys != expected_keys {
+        die(format!(
+            "{CI_REASON_BASELINE}: keys must be exactly {expected_keys:?}, got {keys:?}"
+        ));
+    }
+    if baseline.get("schema").and_then(JsonValue::as_u64) != Some(1) {
+        die(format!("{CI_REASON_BASELINE}: schema must be 1"));
+    }
+    let recorded = json_string_set(&baseline, "unreasoned_ci_false_cells", CI_REASON_BASELINE);
+    for entry in &recorded {
+        let bucket = entry.split('/').next().unwrap_or_default();
+        if CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
+            die(format!(
+                "{CI_REASON_BASELINE}: `{entry}` is in bucket `{bucket}`, which is in \
+                 CI_REASON_REQUIRED_BUCKETS and refuses these cells outright; delete the entry \
+                 rather than recording it"
+            ));
+        }
+    }
+
+    let observed = unreasoned_ci_false_cells(documents);
+    let added: Vec<_> = observed.difference(&recorded).cloned().collect();
+    let fixed: Vec<_> = recorded.difference(&observed).cloned().collect();
+    if !added.is_empty() {
+        die(format!(
+            "a `ci = false` mode states no ci_disabled_reason: {added:?}. Every default-off cell \
+             must say why it is off. Write the reason -- do NOT add the cell to \
+             {CI_REASON_BASELINE}, which records only cells that predate this rule"
+        ));
+    }
+    if !fixed.is_empty() {
+        die(format!(
+            "these cells now state a reason and must be deleted from {CI_REASON_BASELINE} in the \
+             same review: {fixed:?}. A bucket whose entries all disappear should be added to \
+             CI_REASON_REQUIRED_BUCKETS instead"
         ));
     }
 }
@@ -1380,5 +1508,158 @@ liteinst = "unsupported"
             "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\nmin_normalized_entropy = \"high\"\n",
         );
         validate_chaos(&spec, &mut Vec::new());
+    }
+
+    // ---- ci = false reason inventory ratchet ---------------------------
+
+    fn reason_doc(bucket: &str, tests: &str) -> Value {
+        format!("schema = 2\nbucket = \"{bucket}\"\n{tests}")
+            .parse()
+            .expect("test document parses")
+    }
+
+    fn one_test(id: &str, extra: &str) -> String {
+        format!(
+            "\n[[test]]\nid = \"{id}\"\n\n[test.modes.verify]\nci = false\nbackends_enabled = [\"ptrace\"]\n{extra}\n"
+        )
+    }
+
+    /// Write a baseline file into a throwaway repo root and run the check.
+    /// `tag` keeps concurrent tests from sharing a directory; `tempfile` is not
+    /// a dependency of this crate and its Cargo manifest is generated.
+    fn run_baseline_check(tag: &str, cells: &[&str], documents: &[Value]) {
+        let root = std::env::temp_dir().join(format!("hermit-ci-reason-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("ci")).expect("mkdir ci");
+        let body = json!({"schema": 1, "unreasoned_ci_false_cells": cells});
+        std::fs::write(
+            root.join(CI_REASON_BASELINE),
+            serde_json::to_string_pretty(&body).expect("encode"),
+        )
+        .expect("write baseline");
+        validate_ci_reason_baseline(&root, documents);
+    }
+
+    /// A cell with no reason is identified by name.
+    #[test]
+    fn identifies_a_silent_default_off_cell() {
+        let doc = reason_doc("c-programs", &one_test("c-programs/alpha", ""));
+        let cells = unreasoned_ci_false_cells(std::slice::from_ref(&doc));
+        assert!(cells.contains("c-programs/alpha::verify"), "{cells:?}");
+    }
+
+    /// The positive half: a stated reason is not recorded.
+    #[test]
+    fn ignores_a_cell_that_states_a_reason() {
+        let doc = reason_doc(
+            "c-programs",
+            &one_test(
+                "c-programs/alpha",
+                "ci_disabled_reason = \"measured red on dbt\"",
+            ),
+        );
+        assert!(unreasoned_ci_false_cells(std::slice::from_ref(&doc)).is_empty());
+    }
+
+    /// A blank reason is missing, so a cell cannot be drained with whitespace.
+    #[test]
+    fn treats_a_blank_reason_as_missing() {
+        let doc = reason_doc(
+            "c-programs",
+            &one_test("c-programs/alpha", "ci_disabled_reason = \"   \""),
+        );
+        assert!(!unreasoned_ci_false_cells(std::slice::from_ref(&doc)).is_empty());
+    }
+
+    /// A recorded cell that matches the baseline passes -- legacy data is
+    /// grandfathered rather than failing the build.
+    #[test]
+    fn recorded_legacy_cell_is_accepted() {
+        let doc = reason_doc("c-programs", &one_test("c-programs/alpha", ""));
+        run_baseline_check(
+            "legacy",
+            &["c-programs/alpha::verify"],
+            std::slice::from_ref(&doc),
+        );
+    }
+
+    /// A NEW unreasoned cell is refused, and named.
+    #[test]
+    #[should_panic(expected = "c-programs/beta::verify")]
+    fn refuses_a_new_unreasoned_cell_by_name() {
+        let doc = reason_doc(
+            "c-programs",
+            &(one_test("c-programs/alpha", "") + &one_test("c-programs/beta", "")),
+        );
+        run_baseline_check(
+            "newcell",
+            &["c-programs/alpha::verify"],
+            std::slice::from_ref(&doc),
+        );
+    }
+
+    /// THE CASE THAT CLOSED THE COUNT VERSION: add one unreasoned cell and
+    /// write a reason for a different cell in the SAME bucket. A per-bucket
+    /// count nets to zero and passes; the inventory names both sides.
+    #[test]
+    #[should_panic(expected = "c-programs/beta::verify")]
+    fn refuses_a_compensating_swap_within_one_bucket() {
+        let doc = reason_doc(
+            "c-programs",
+            &(one_test("c-programs/alpha", "ci_disabled_reason = \"now explained\"")
+                + &one_test("c-programs/beta", "")),
+        );
+        // Baseline recorded alpha as unreasoned. alpha was fixed, beta added:
+        // the count is unchanged at 1, so only a set can see this.
+        run_baseline_check(
+            "swap",
+            &["c-programs/alpha::verify"],
+            std::slice::from_ref(&doc),
+        );
+    }
+
+    /// A reason written without deleting the entry is refused too, so the
+    /// inventory cannot rot into a permanent allowance.
+    #[test]
+    #[should_panic(expected = "must be deleted")]
+    fn refuses_a_stale_entry_after_a_reason_is_written() {
+        let doc = reason_doc(
+            "c-programs",
+            &one_test("c-programs/alpha", "ci_disabled_reason = \"now explained\""),
+        );
+        run_baseline_check(
+            "stale",
+            &["c-programs/alpha::verify"],
+            std::slice::from_ref(&doc),
+        );
+    }
+
+    /// THE CASE THAT DECIDES LANDABILITY: the real manifests must satisfy the
+    /// recorded inventory exactly. Reads production data, and fails closed on
+    /// an empty read rather than reporting "0 of 0 agree".
+    #[test]
+    fn recorded_inventory_matches_the_real_manifests() {
+        let manifest_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
+        let repo_root = manifest_dir.join("../../..");
+        let mut documents = Vec::new();
+        for entry in std::fs::read_dir(&manifest_dir).expect("manifest dir is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "toml") {
+                documents.push(
+                    std::fs::read_to_string(&path)
+                        .expect("readable")
+                        .parse::<Value>()
+                        .expect("parses"),
+                );
+            }
+        }
+        assert!(!documents.is_empty(), "no manifests read; proves nothing");
+        assert!(
+            !unreasoned_ci_false_cells(&documents).is_empty(),
+            "expected the recorded legacy cells; an empty set means the walk is wrong"
+        );
+        // Does not panic == the 1130 legacy cells do not break the build.
+        validate_ci_reason_baseline(&repo_root, &documents);
     }
 }
