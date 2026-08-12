@@ -927,7 +927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Pin the kernel pipe object before any scheduler resource request can let another
         // guest thread close or reuse the numeric descriptor.
         let pinned_pipe = if blocking_pipe {
-            self.pin_pipe_writer(guest, call.fd()).await?
+            Some(self.pin_pipe_writer(guest, call.fd()).await?)
         } else {
             None
         };
@@ -953,8 +953,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
         let res = if blocking_pipe {
-            self.execute_blocking_pipe_write(guest, call, pinned_pipe)
-                .await
+            self.execute_blocking_pipe_write(
+                guest,
+                call,
+                pinned_pipe.expect("blocking pipe must be pinned before scheduler yield"),
+            )
+            .await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
@@ -1120,7 +1124,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // See handle_write: the controller handle is outside the guest descriptor table, so
         // close/dup/close_range retain normal Linux behavior while this syscall is blocked.
         let pinned_pipe = if blocking_pipe {
-            self.pin_pipe_writer(guest, call.fd()).await?
+            Some(self.pin_pipe_writer(guest, call.fd()).await?)
         } else {
             None
         };
@@ -1139,8 +1143,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let result = if blocking_pipe {
-            self.execute_blocking_pipe_writev(guest, call, pinned_pipe)
-                .await
+            self.execute_blocking_pipe_writev(
+                guest,
+                call,
+                pinned_pipe.expect("blocking pipe must be pinned before scheduler yield"),
+            )
+            .await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {

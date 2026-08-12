@@ -10,6 +10,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -186,7 +187,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#2168): Audit controller-held pipe lifetime and blocking-write completion.
+    // TODO-HUMAN-REVIEW(#2176): Audit controller-held pipe lifetime and blocking-write completion.
     /// Hold the pipe object independently of the guest descriptor table while a logically
     /// blocking write yields to another guest thread. Linux keeps the open file description
     /// alive for an in-progress write even if another thread closes or reuses its descriptor;
@@ -196,7 +197,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         fd: i32,
-    ) -> Result<Option<File>, Errno> {
+    ) -> Result<File, Errno> {
         let flags = guest
             .inject_with_retry(
                 syscalls::Fcntl::new()
@@ -215,10 +216,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .open(&path)
         else {
             tracing::warn!(%path, "backend cannot expose a controller handle for this guest pipe");
-            return Ok(None);
+            return Err(Errno::ENOSYS);
         };
         let Ok(metadata) = file.metadata() else {
-            return Ok(None);
+            return Err(Errno::ENOSYS);
         };
         if !metadata.file_type().is_fifo()
             || metadata.dev() != expected.st_dev
@@ -232,9 +233,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 observed_inode = metadata.ino(),
                 "refusing a controller pipe handle whose kernel identity does not match the guest descriptor"
             );
-            return Ok(None);
+            return Err(Errno::ENOSYS);
         }
-        Ok(Some(file))
+        Ok(file)
     }
 
     async fn deliver_pipe_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
@@ -259,7 +260,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Write,
-        mut pinned_pipe: Option<File>,
+        mut pinned_pipe: File,
     ) -> Result<i64, Error> {
         const MAX_RW_COUNT: usize = 0x7fff_f000;
         const PIPE_BUF: usize = 4096;
@@ -271,13 +272,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
-        // Retrying by descriptor number after a scheduler yield can target an unrelated object
-        // if another thread closes and reuses that number. A backend that cannot expose the
-        // matching pipe must therefore refuse every blocking write, including atomic writes,
-        // before its first scheduler request.
-        let mut pinned_pipe =
-            require_blocking_pipe_writer(pinned_pipe.take()).map_err(Error::from)?;
-
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
         );
@@ -307,7 +301,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(Errno::EFAULT.into())
                 };
             };
-            let result = write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len);
+            let result = match pipe_write_readiness(&pinned_pipe) {
+                Ok(PipeWriteReadiness::Ready) => {
+                    write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len)
+                }
+                Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
+                Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
+                Err(error) => Err(error),
+            };
             if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
@@ -356,7 +357,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Writev,
-        mut pinned_pipe: Option<File>,
+        mut pinned_pipe: File,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
@@ -397,11 +398,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let atomic_pipe_write = target <= PIPE_BUF;
-        // See execute_blocking_pipe_write: no scheduler yield may precede a write through an
-        // unpinned descriptor number, regardless of whether the write is atomic.
-        let mut pinned_pipe =
-            require_blocking_pipe_writer(pinned_pipe.take()).map_err(Error::from)?;
-
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
@@ -419,13 +415,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let result = write_guest_iovec_bytes(
-                guest,
-                &mut pinned_pipe,
-                &iovecs,
-                written_total,
-                (target - written_total).min(PIPE_BUF),
-            );
+            let result = match pipe_write_readiness(&pinned_pipe) {
+                Ok(PipeWriteReadiness::Ready) => write_guest_iovec_bytes(
+                    guest,
+                    &mut pinned_pipe,
+                    &iovecs,
+                    written_total,
+                    (target - written_total).min(PIPE_BUF),
+                ),
+                Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
+                Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
+                Err(error) => Err(error),
+            };
             if matches!(result, Err(Errno::EPIPE)) {
                 self.deliver_pipe_sigpipe(guest).await?;
             }
@@ -481,8 +482,41 @@ fn io_errno(error: std::io::Error) -> Errno {
     Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
-fn require_blocking_pipe_writer(pinned_pipe: Option<File>) -> Result<File, Errno> {
-    pinned_pipe.ok_or(Errno::ENOSYS)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeWriteReadiness {
+    Ready,
+    Full,
+    Closed,
+}
+
+fn pipe_write_readiness(pipe: &File) -> Result<PipeWriteReadiness, Errno> {
+    let mut descriptor = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let result = loop {
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result >= 0 {
+            break result;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(io_errno(error));
+        }
+    };
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(Errno::EBADF);
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+        return Ok(PipeWriteReadiness::Closed);
+    }
+    if result > 0 && descriptor.revents & libc::POLLOUT != 0 {
+        Ok(PipeWriteReadiness::Ready)
+    } else {
+        Ok(PipeWriteReadiness::Full)
+    }
 }
 
 fn write_guest_bytes<G, T>(
@@ -496,7 +530,10 @@ where
     G: Guest<Detcore<T>>,
 {
     let mut bytes = vec![0; length];
-    guest.memory().read_exact(buffer, &mut bytes)?;
+    guest
+        .memory()
+        .read_exact(buffer, &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
     pipe.write(&bytes)
         .map(|written| written as i64)
         .map_err(io_errno)
@@ -529,7 +566,8 @@ where
                 .ok_or(Errno::EFAULT)?;
             guest
                 .memory()
-                .read_exact(address, &mut bytes[copied..copied + take])?;
+                .read_exact(address, &mut bytes[copied..copied + take])
+                .map_err(|_| Errno::EFAULT)?;
             copied += take;
         }
         consumed = 0;
@@ -1490,14 +1528,6 @@ mod tests {
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
-        );
-    }
-
-    #[test]
-    fn blocking_pipe_write_refuses_before_retry_without_stable_pipe() {
-        assert_eq!(
-            require_blocking_pipe_writer(None).unwrap_err(),
-            Errno::ENOSYS
         );
     }
 }

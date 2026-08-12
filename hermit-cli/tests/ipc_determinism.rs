@@ -13,13 +13,15 @@ use std::process::Command;
 use std::process::Output;
 use std::sync::OnceLock;
 
-const PATTERNS: [&str; 10] = [
+const PATTERNS: [&str; 12] = [
     "pipe-order",
     "pipe-capacity",
     "pipe-large-write",
     "pipe-large-writev",
     "pipe-close-reuse",
     "pipe-read-end-write",
+    "pipe-invalid-buffer",
+    "pipe-invalid-sigpipe",
     "pipe-sigpipe",
     "socketpair",
     "eventfd",
