@@ -63,6 +63,7 @@ class Scorecard:
     drop_reason: str
     backend_green: dict[str, int] | None = None
     plan_digest: str | None = None
+    format_version: int = 1
 
     @property
     def cells(self) -> int:
@@ -88,6 +89,7 @@ def validate_receipt_row(
     *,
     backend_green: dict[str, int] | None = None,
     plan_digest: str | None = None,
+    format_version: int = 1,
 ) -> Scorecard:
     commit = row.get("commit")
     record_id = row.get("record_id")
@@ -143,6 +145,7 @@ def validate_receipt_row(
         drop_reason=drop_reason.strip(),
         backend_green=backend_green,
         plan_digest=plan_digest,
+        format_version=format_version,
     )
 
 
@@ -193,8 +196,8 @@ def load_scorecard(source: Source) -> Scorecard:
         raise Refusal(f"{BACKENDS_PATH} must preserve the owner-specified backend order")
     wrapper = parse_object(source.read(RECEIPT_PATH), RECEIPT_PATH)
     schema = wrapper.get("schema")
-    if schema not in {1, 2}:
-        raise Refusal(f"{RECEIPT_PATH} schema must be 1 or 2")
+    if schema not in {1, 2, 3}:
+        raise Refusal(f"{RECEIPT_PATH} schema must be 1, 2, or 3")
     canonical = wrapper.get("canonical_receipt")
     digest = wrapper.get("receipt_sha256")
     drop_reason = wrapper.get("drop_reason", "")
@@ -210,7 +213,7 @@ def load_scorecard(source: Source) -> Scorecard:
     row = parse_object(canonical, "canonical receipt")
     if schema == 1:
         # Read-only compatibility for the first, superseded aggregate commit.
-        # New imports always write schema 2 and must carry the receipt-bound plan.
+        # New imports always write schema 3 and must carry the receipt-bound plan.
         return validate_receipt_row(row, digest, drop_reason)
 
     canonical_plan = wrapper.get("canonical_e2e_plan")
@@ -231,6 +234,7 @@ def load_scorecard(source: Source) -> Scorecard:
         drop_reason,
         backend_green=backend_green,
         plan_digest=plan_digest,
+        format_version=schema,
     )
 
 
@@ -248,23 +252,54 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
     matrix_change = signed(current.cells - previous.cells) if comparable else "BASELINE"
     if comparable and current.green < previous.green and not current.drop_reason:
         raise Refusal("GREEN decreased but drop_reason is empty")
-    lines = [
-        BEGIN,
-        "Compatibility scorecard (source: qualifying VALIDATE receipt)",
-        "| backend | receipt sha | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
-        "|---|---|---:|---:|---:|---:|---:|",
-    ]
+    lines = [BEGIN, "Compatibility scorecard (source: qualifying VALIDATE receipt)"]
     if current.backend_green is None:
+        lines.extend(
+            [
+                "| backend | receipt sha | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
+                "|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
         for backend in BACKEND_ORDER:
             lines.append(f"| {backend} | {current.digest} | — | — | — | — | — |")
-    else:
+    elif current.format_version == 2:
+        lines.extend(
+            [
+                "| backend | receipt sha | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
+                "|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
         for backend in BACKEND_ORDER:
             green = current.backend_green[backend]
             lines.append(f"| {backend} | {current.digest} | {green} | 0 | 0 | 0 | {green} |")
-    lines.append(
-        f"| TOTAL | {current.digest} | {current.green} | {current.stable_fail} | "
-        f"{current.unstable} | {current.no_verdict} | {current.cells} |"
-    )
+    else:
+        lines.extend(
+            [
+                "| backend | receipt sha | measurement | GREEN | STABLE FAIL | UNSTABLE | NO VERDICT | cells |",
+                "|---|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for backend in BACKEND_ORDER:
+            green = current.backend_green[backend]
+            if green == 0:
+                lines.append(
+                    f"| {backend} | {current.digest} | UNMEASURED | — | — | — | — | 0 |"
+                )
+            else:
+                lines.append(
+                    f"| {backend} | {current.digest} | MEASURED | {green} | 0 | 0 | 0 | {green} |"
+                )
+    if current.backend_green is None or current.format_version == 2:
+        lines.append(
+            f"| TOTAL | {current.digest} | {current.green} | {current.stable_fail} | "
+            f"{current.unstable} | {current.no_verdict} | {current.cells} |"
+        )
+    else:
+        lines.append(
+            f"| TOTAL | {current.digest} | MEASURED | {current.green} | "
+            f"{current.stable_fail} | {current.unstable} | {current.no_verdict} | "
+            f"{current.cells} |"
+        )
     lines.append(
         f"Receipt: commit {current.commit}; record {current.record_id}; checks {current.checks}."
     )
@@ -272,10 +307,23 @@ def render(current: Scorecard, previous: Scorecard | None) -> str:
         lines.append(
             "Backend split: unavailable in this receipt; no counts were inferred from gate names."
         )
-    else:
+    elif current.format_version == 2:
         lines.append(
             f"E2E plan: {current.plan_digest}; backend rows and TOTAL are derived from "
             "the plan at the receipt commit."
+        )
+    else:
+        unmeasured = [
+            backend for backend in BACKEND_ORDER if current.backend_green[backend] == 0
+        ]
+        measured = len(BACKEND_ORDER) - len(unmeasured)
+        lines.append(
+            f"E2E plan: {current.plan_digest}; backend rows and TOTAL are derived from "
+            "the plan at the receipt commit."
+        )
+        lines.append(
+            f"Backend measurement: {measured}/{len(BACKEND_ORDER)} measured; "
+            f"unmeasured: {', '.join(unmeasured) if unmeasured else 'none'}."
         )
     lines.append(
         f"Matrix change: {matrix_change}; GREEN change: {green_change}. "
@@ -376,7 +424,7 @@ def import_receipt(output: Path, drop_reason: str) -> None:
     output.write_text(
         json.dumps(
             {
-                "schema": 2,
+                "schema": 3,
                 "receipt_sha256": digest,
                 "canonical_receipt": canonical,
                 "e2e_plan_sha256": plan_digest,

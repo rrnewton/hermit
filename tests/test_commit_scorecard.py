@@ -141,9 +141,11 @@ class ScorecardTests(unittest.TestCase):
         ptrace = next(line for line in rendered.splitlines() if line.startswith("| ptrace |"))
         dbt = next(line for line in rendered.splitlines() if line.startswith("| dbt |"))
         kvm = next(line for line in rendered.splitlines() if line.startswith("| kvm |"))
-        self.assertIn("| 2 | 0 | 0 | 0 | 2 |", ptrace)
-        self.assertIn("| 1 | 0 | 0 | 0 | 1 |", dbt)
-        self.assertIn("| 0 | 0 | 0 | 0 | 0 |", kvm)
+        self.assertIn("| MEASURED | 2 | 0 | 0 | 0 | 2 |", ptrace)
+        self.assertIn("| MEASURED | 1 | 0 | 0 | 0 | 1 |", dbt)
+        self.assertIn("| UNMEASURED | — | — | — | — | 0 |", kvm)
+        self.assertNotIn("| 0 | 0 | 0 | 0 | 0 |", kvm)
+        self.assertIn("Backend measurement: 2/6 measured; unmeasured: kvm, liteinst, e9patch, sabre", rendered)
 
     def test_growth_does_not_read_as_green_drop(self) -> None:
         self.repo.commit("baseline")
@@ -178,6 +180,16 @@ class ScorecardTests(unittest.TestCase):
         refused = self.repo.render(check=False)
         self.assertEqual(1, refused.returncode)
         self.assertIn("E2E plan digest mismatch", refused.stderr)
+
+    def test_schema2_history_keeps_pre_measurement_table(self) -> None:
+        path = self.repo.root / "ci/compat/commit-scorecard-receipt.json"
+        wrapper = json.loads(path.read_text())
+        wrapper["schema"] = 2
+        path.write_text(json.dumps(wrapper) + "\n")
+        rendered = self.repo.render().stdout
+        self.assertNotIn("| measurement |", rendered)
+        kvm = next(line for line in rendered.splitlines() if line.startswith("| kvm |"))
+        self.assertIn("| 0 | 0 | 0 | 0 | 0 |", kvm)
 
     def test_missing_plan_gate_refuses_before_import(self) -> None:
         row = receipt(self.first)
