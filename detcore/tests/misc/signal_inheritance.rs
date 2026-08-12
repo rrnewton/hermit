@@ -25,6 +25,7 @@
 //! whether the behaviour change was intended.
 
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::FromRawFd;
 
 /// Read the current blocked-signal mask.
@@ -81,6 +82,68 @@ fn in_child<F: FnOnce()>(what: &str, f: F) {
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         "child violated the {what} contract; status {status:#x}"
+    );
+}
+
+/// Exec this test binary into a query-only probe. The probe does not install a
+/// disposition: its result therefore distinguishes state inherited across exec
+/// from state manufactured by the helper itself.
+fn run_exec_disposition_probe(
+    usr1_before_exec: libc::sighandler_t,
+    usr2_before_exec: libc::sighandler_t,
+) -> i32 {
+    let exe = std::env::current_exe().expect("resolve current test executable");
+    let exe = std::ffi::CString::new(exe.as_os_str().as_bytes()).expect("test path has no NUL");
+    let exact = c"--exact";
+    let ignored = c"--ignored";
+    let probe = c"signal_inheritance::exec_disposition_probe";
+    let argv = [
+        exe.as_ptr(),
+        exact.as_ptr(),
+        probe.as_ptr(),
+        ignored.as_ptr(),
+        std::ptr::null(),
+    ];
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+    assert!(devnull >= 0, "open(/dev/null) failed");
+
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "forking exec disposition probe failed");
+    if pid == 0 {
+        // The negative brackets intentionally make the helper fail. Silence its
+        // libtest panic text because that text embeds host PIDs; the exit status
+        // below is the stable, discriminating result this fixture consumes.
+        assert_eq!(unsafe { libc::dup2(devnull, libc::STDOUT_FILENO) }, 1);
+        assert_eq!(unsafe { libc::dup2(devnull, libc::STDERR_FILENO) }, 2);
+        unsafe { libc::close(devnull) };
+        set_disposition(libc::SIGUSR1, usr1_before_exec);
+        set_disposition(libc::SIGUSR2, usr2_before_exec);
+        unsafe { libc::execv(exe.as_ptr(), argv.as_ptr()) };
+        unsafe { libc::_exit(127) };
+    }
+    unsafe { libc::close(devnull) };
+
+    let mut status: libc::c_int = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(
+        libc::WIFEXITED(status),
+        "exec disposition probe died by signal; status {status:#x}"
+    );
+    libc::WEXITSTATUS(status)
+}
+
+#[test]
+#[ignore = "exec-only helper; invoked by exec_resets_custom_handlers_but_keeps_ignore"]
+fn exec_disposition_probe() {
+    assert_eq!(
+        disposition(libc::SIGUSR1),
+        libc::SIG_DFL,
+        "exec did not reset the inherited custom SIGUSR1 handler to SIG_DFL"
+    );
+    assert_eq!(
+        disposition(libc::SIGUSR2),
+        libc::SIG_IGN,
+        "exec did not preserve the inherited SIG_IGN disposition for SIGUSR2"
     );
 }
 
@@ -233,51 +296,27 @@ fn exec_resets_custom_handlers_but_keeps_ignore() {
         // handler's code no longer exists in the new image. Signals set to SIG_IGN
         // stay ignored. Getting this backwards is a classic source of a "lost"
         // signal after exec, and it is invisible until that signal arrives.
-        set_disposition(
-            libc::SIGUSR1,
-            noop_handler as *const () as libc::sighandler_t,
-        );
-        set_disposition(libc::SIGUSR2, libc::SIG_IGN);
-
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork() failed");
-        if pid == 0 {
-            let sh = c"/bin/sh";
-            let dash_c = c"-c";
-            // Exit 0 only if both dispositions are what execve promises: a shell
-            // reports an ignored signal as un-trappable, and a reset one as
-            // trappable. `trap` returns nonzero for a signal ignored at entry.
-            let script = c"trap '' USR2 2>/dev/null; exit 0";
-            let argv = [
-                sh.as_ptr(),
-                dash_c.as_ptr(),
-                script.as_ptr(),
-                std::ptr::null(),
-            ];
-            unsafe { libc::execv(sh.as_ptr(), argv.as_ptr()) };
-            unsafe { libc::_exit(127) };
-        }
-        let mut status: libc::c_int = 0;
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-        assert!(
-            libc::WIFEXITED(status),
-            "exec'd disposition probe did not exit normally; status {status:#x}"
-        );
-        assert_ne!(
-            libc::WEXITSTATUS(status),
-            127,
-            "execv itself failed in the disposition probe"
+        let custom = noop_handler as *const () as libc::sighandler_t;
+        assert_eq!(
+            run_exec_disposition_probe(custom, libc::SIG_IGN),
+            0,
+            "exec'd query probe rejected custom->default plus ignore->ignore"
         );
 
-        // In THIS process the custom handler is still installed -- exec replaced
-        // the child's image, not ours.
+        // Negative brackets: the query-only helper must reject both tempting
+        // false positives independently. The first proves it does not accept an
+        // inherited SIG_IGN where the custom SIGUSR1 handler should have reset;
+        // the second proves it does not manufacture SIGUSR2 ignore itself.
         assert_ne!(
-            disposition(libc::SIGUSR1),
-            libc::SIG_DFL,
-            "the parent's own custom handler was cleared by the child's exec"
+            run_exec_disposition_probe(libc::SIG_IGN, libc::SIG_IGN),
+            0,
+            "probe accepted inherited SIG_IGN for SIGUSR1 as if exec reset a custom handler"
         );
-        set_disposition(libc::SIGUSR1, libc::SIG_DFL);
-        set_disposition(libc::SIGUSR2, libc::SIG_DFL);
+        assert_ne!(
+            run_exec_disposition_probe(custom, libc::SIG_DFL),
+            0,
+            "probe accepted SIG_DFL for SIGUSR2 as if exec preserved inherited SIG_IGN"
+        );
     });
 }
 

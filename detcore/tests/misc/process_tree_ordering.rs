@@ -172,34 +172,80 @@ fn vfork_child_satisfies_the_parent_wait_within_budget() {
         const BUDGET: Duration = Duration::from_secs(20);
         let started = Instant::now();
 
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork() failed");
-        if pid == 0 {
-            // Child: exit promptly. This is the satisfiable case; the fixture
-            // guards that it STAYS satisfiable.
+        // Put the real vfork in a supervisor process. The outer test process can
+        // then enforce the wall budget even while the supervisor is suspended in
+        // vfork(), and the dedicated process group lets the timeout path clean up
+        // exactly the descendants this test created.
+        let supervisor = unsafe { libc::fork() };
+        assert!(supervisor >= 0, "forking the vfork supervisor failed");
+        if supervisor == 0 {
+            assert_eq!(unsafe { libc::setpgid(0, 0) }, 0, "setpgid failed");
+
+            #[allow(deprecated)]
+            let vfork_child = unsafe { libc::vfork() };
+            if vfork_child == 0 {
+                // POSIX permits only _exit() or exec*() before the vfork child
+                // releases its parent. Keep this path deliberately vfork-safe.
+                unsafe { libc::_exit(0) };
+            }
+            if vfork_child < 0 {
+                unsafe { libc::_exit(125) };
+            }
+
+            // vfork() may return to the parent only after this child exits or
+            // execs. Because this child used _exit(), WNOHANG must reap it now.
+            // Replacing vfork() with fork() makes this assertion discriminate
+            // the exact parent-suspension contract instead of merely creating a
+            // child that eventually exits.
+            let mut status: libc::c_int = 0;
+            let reaped = unsafe { libc::waitpid(vfork_child, &mut status, libc::WNOHANG) };
+            if reaped != vfork_child || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                unsafe { libc::_exit(126) };
+            }
             unsafe { libc::_exit(0) };
         }
 
-        // Poll rather than blocking, so an unsatisfiable wait is reported as a
-        // budget breach instead of hanging until the harness kills the run.
+        // Win the setpgid race from either side. EACCES means the child already
+        // exec'd/exited; ESRCH means it already exited, both handled by waitpid.
+        let setpgid_rc = unsafe { libc::setpgid(supervisor, supervisor) };
+        if setpgid_rc != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(
+                matches!(errno, Some(libc::EACCES | libc::ESRCH)),
+                "setpgid({supervisor}) failed unexpectedly: {errno:?}"
+            );
+        }
+
         let mut status: libc::c_int = 0;
         loop {
-            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if reaped == pid {
+            let reaped = unsafe { libc::waitpid(supervisor, &mut status, libc::WNOHANG) };
+            if reaped == supervisor {
                 break;
             }
             assert!(reaped >= 0, "waitpid failed with {reaped}");
-            assert!(
-                started.elapsed() < BUDGET,
-                "VFORK WAIT UNSATISFIABLE: child {pid} neither exec'd nor exited within {BUDGET:?}. \
-                 This is the detcore_misc livelock signature (cpu/wall ~= 1.0 at the budget, \
-                 retry-futile). Do NOT raise the budget to make this pass -- a vfork child that \
-                 is ptrace-stopped and never resumed will never satisfy its parent."
-            );
+            if started.elapsed() >= BUDGET {
+                // supervisor is our child and its process group contains only
+                // the vfork subtree created above.
+                unsafe { libc::kill(-supervisor, libc::SIGKILL) };
+                unsafe { libc::waitpid(supervisor, &mut status, 0) };
+                panic!(
+                    "VFORK WAIT UNSATISFIABLE: the real vfork child neither exec'd nor exited \
+                     within {BUDGET:?}. This is the detcore_misc livelock signature \
+                     (cpu/wall ~= 1.0 at the budget, retry-futile). Do NOT raise the budget \
+                     to make this pass -- a ptrace-stopped vfork child cannot release its parent."
+                );
+            }
             std::thread::yield_now();
         }
-        assert!(libc::WIFEXITED(status), "vfork child did not exit normally");
-        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert!(
+            libc::WIFEXITED(status),
+            "vfork supervisor did not exit normally: {status:#x}"
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "vfork contract probe failed (125=vfork failed, 126=parent resumed before child exit)"
+        );
     });
 }
 
