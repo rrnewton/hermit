@@ -95,6 +95,12 @@ def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row
     assert row["producer"] == "hermit-validate-rs", row
+    expected_depth = int(
+        subprocess.check_output(
+            ["git", "rev-list", "--count", row["commit"]], cwd=ROOT, text=True
+        ).strip()
+    )
+    assert row["git_depth"] == expected_depth > 0, row
     if admitted:
         assert row["admission"] == "ci-hub-validate-lock", row
         assert row["concurrent_validates"] == 0, row
@@ -238,9 +244,18 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            # Storage may be an unpublished durable spool or an already-published
+            # shard.  The adapter's event union is the contract consumers read.
+            queried = subprocess.run(
+                ["python3", str(parent / "ci-hub/ledger/validate_rows.py"), "events"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            query_output = queried.stdout.decode(errors="replace")
+            assert queried.returncode == 0, query_output
+            events = [json.loads(line) for line in query_output.splitlines()]
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
