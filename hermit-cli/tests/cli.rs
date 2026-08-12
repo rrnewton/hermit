@@ -553,41 +553,127 @@ fn run_dbt_verifies_simple_env_shebang() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
 // After pidfd_send_signal/pidfd_getfd were determinized, restart_syscall is the
-// lone remaining Unsupported syscall. Under ptrace it is consumed by reverie's
-// syscall-restart machinery before Detcore classification, so it never surfaces
-// as a guest aggregate "used but not yet supported" warning. The ptrace verify
-// path therefore emits zero such warnings for this fixture; the DBT backend
-// (which routes it through Detcore classification) still aggregates it, covered
-// by run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them.
+// lone remaining Unsupported syscall. The ptrace seccomp filter must honor the
+// Detcore subscription so ordinary execution fails closed before the guest can
+// publish its success marker. The explicit compatibility opt-out remains noisy
+// and preserves the native -EINTR result.
 #[test]
-fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
+fn run_ptrace_fails_closed_by_default_on_unsupported_syscall() {
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
-    let args = ["--log", "info", "run", "--verify", "--", program];
-    let output = hermit(&args);
-    assert_success(&output, &args);
+
+    let supported_args = ["run", "--", "/bin/echo", "ptrace-supported-ok"];
+    let supported = hermit(&supported_args);
+    assert_success(&supported, &supported_args);
+    assert_eq!(stdout(&supported), "ptrace-supported-ok\n");
+
+    let default_args = ["run", "--", program];
+    let default = hermit(&default_args);
+    assert!(
+        !default.status.success(),
+        "default ptrace unexpectedly allowed restart_syscall:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("unsupported syscall: restart_syscall"),
+        "default ptrace failure omitted restart_syscall:\n{}",
+        stderr(&default)
+    );
+    assert_eq!(
+        stdout(&default),
+        "",
+        "unsupported guest published its success marker"
+    );
+
+    let compatibility_args = [
+        "run",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+    ];
+    let compatibility = hermit(&compatibility_args);
+    assert_success(&compatibility, &compatibility_args);
+    assert_eq!(stdout(&compatibility), "dbt-unsupported-ok\n");
+    let compatibility_stderr = stderr(&compatibility);
     let warning = "used but not yet supported";
     assert_eq!(
-        stderr(&output).matches(warning).count(),
-        0,
-        "ptrace verify unexpectedly emitted an unsupported-syscall warning:\n{}",
-        stderr(&output)
+        compatibility_stderr.matches(warning).count(),
+        1,
+        "ptrace compatibility run omitted or duplicated the unsupported warning:\n\
+         {compatibility_stderr}"
+    );
+    assert_eq!(
+        compatibility_stderr
+            .matches("a successful exit does not establish complete deterministic execution")
+            .count(),
+        1,
+        "ptrace compatibility run omitted or duplicated its determinism warning:\n\
+         {compatibility_stderr}"
     );
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.
 #[test]
-fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
+fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls() {
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("DBT unsupported-syscall guest path should be UTF-8");
 
-    let normal_args = ["run", "--backend", "dbt", "--verify", "--", program];
+    // Positive bracket: fail-closed changes only unsupported behavior. A supported
+    // guest still succeeds through the same default DBT front door.
+    let supported_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--",
+        "/bin/echo",
+        "dbt-supported-ok",
+    ];
+    let supported = hermit(&supported_args);
+    assert_success(&supported, &supported_args);
+    assert_eq!(stdout(&supported), "dbt-supported-ok\n");
+
+    // Negative bracket: the real unsupported restart_syscall must fail and name
+    // itself before the guest can publish its former success marker.
+    let default_args = ["run", "--backend", "dbt", "--", program];
+    let default = hermit(&default_args);
+    assert!(
+        !default.status.success(),
+        "default DBT unexpectedly allowed an unsupported syscall:\n{}",
+        stderr(&default)
+    );
+    assert!(
+        stderr(&default).contains("unsupported syscall: restart_syscall"),
+        "default DBT failure omitted unsupported syscall:\n{}",
+        stderr(&default)
+    );
+    assert_eq!(
+        stdout(&default),
+        "",
+        "unsupported guest published its success marker"
+    );
+
+    let normal_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+    ];
     let normal = hermit(&normal_args);
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbt-unsupported-ok\n");
     let normal_stderr = stderr(&normal);
+    let opt_out_warning = "a successful exit does not establish complete deterministic execution";
+    assert_eq!(
+        normal_stderr.matches(opt_out_warning).count(),
+        1,
+        "compatibility opt-out warning missing or duplicated:\n{normal_stderr}"
+    );
     let warning = "syscalls restart_syscall used but not yet supported";
     assert_eq!(
         normal_stderr.matches(warning).count(),
@@ -595,7 +681,15 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "expected one aggregate warning:\n{normal_stderr}"
     );
 
-    let tamper_args = ["run", "--backend", "dbt", "--", program, "report-tamper"];
+    let tamper_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--",
+        program,
+        "report-tamper",
+    ];
     let tamper = hermit(&tamper_args);
     assert_success(&tamper, &tamper_args);
     assert_eq!(stdout(&tamper), "dbt-unsupported-report-tamper-ok\n");
@@ -610,6 +704,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbt",
+        "--allow-unsupported-syscalls",
         "--",
         program,
         "fork-report-tamper",
@@ -639,7 +734,16 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "strict DBT failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
-    let normal_fork_args = ["run", "--backend", "dbt", "--verify", "--", program, "fork"];
+    let normal_fork_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+        "fork",
+    ];
     let normal_fork = hermit(&normal_fork_args);
     assert_success(&normal_fork, &normal_fork_args);
     assert_eq!(stdout(&normal_fork), "dbt-unsupported-fork-ok\n");
@@ -654,6 +758,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbt",
+        "--allow-unsupported-syscalls",
         "--verify",
         "--",
         program,

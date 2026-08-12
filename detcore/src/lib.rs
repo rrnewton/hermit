@@ -325,7 +325,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if panic_on_unsupported_syscalls {
             error!(
-                "[detcore, dtid {}] inbound syscall: {} = ?",
+                "[detcore, dtid {}] unsupported syscall: {} = ?",
                 dettid,
                 call.display(&guest.memory()),
             );
@@ -1095,17 +1095,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
-            // with the deterministic-refusal boundary. Even under the performance
-            // opt-in, Detcore MUST still see every syscall it deterministically
-            // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
-            // strict guests execute those syscalls natively against the host,
-            // exactly the leak the DBT copied-child path also had to close.
+            // with both fail-closed boundaries. Even under the performance
+            // opt-in, Detcore MUST see every syscall it deterministically refuses
+            // with a fixed ENOSYS/EPERM and every syscall classified Unsupported.
+            // Otherwise record/replay could silently execute an unsupported
+            // syscall on the live host instead of invalidating its determinism
+            // claim.
             // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
             // stops one short of the end of the table, which silently dropped
             // `lsm_list_modules` out of this sweep.
             subscription.syscalls(
                 syscall_classification::all_pinned_syscalls().filter(|sysno| {
                     syscall_classification::is_deterministically_refused_syscall(*sysno)
+                        || matches!(
+                            syscall_classification::classify_syscall(*sysno),
+                            SyscallClassification::Unsupported
+                        )
                 }),
             );
 
@@ -2531,6 +2536,24 @@ mod subscription_tests {
             subscriptions.iter_syscalls().any(|sysno| sysno == last),
             "{last} must be intercepted under passthru_opt; it is deterministically refused"
         );
+    }
+
+    #[test]
+    fn passthru_opt_intercepts_every_unsupported_syscall() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        let unsupported: Vec<Sysno> = crate::all_pinned_syscalls()
+            .filter(|sysno| crate::is_unsupported_syscall(*sysno))
+            .collect();
+
+        assert_eq!(unsupported, [Sysno::restart_syscall]);
+        for syscall in unsupported {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|subscribed| subscribed == syscall),
+                "passthru_opt allowed unsupported {syscall} to bypass Detcore"
+            );
+        }
     }
 
     /// CENSUS (measurement, not a policy assertion): how many `Determinized`

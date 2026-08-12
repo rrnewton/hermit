@@ -90,7 +90,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
         }
         if let Some(arg) = extra_arg {
-            verify.arg(arg);
+            verify.args(["--allow-unsupported-syscalls", arg]);
         }
         verify.arg("--").arg(&guest);
         let verify_output = command_output(verify, label);
@@ -102,6 +102,15 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             "Hermit omitted its determinism marker for {label}\n\
              stdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
         );
+        if !strict {
+            assert!(
+                verify_stderr.contains(
+                    "a successful exit does not establish complete deterministic execution",
+                ),
+                "passthru-opt writev run omitted the compatibility warning\n\
+                 stderr:\n{verify_stderr}",
+            );
+        }
     }
 
     // Exercise record mode on pipe retries separately. Replaying dynamically allocated
