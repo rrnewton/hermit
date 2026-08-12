@@ -109,11 +109,6 @@ struct OpenFileDescription {
     #[serde(default)]
     deterministic_pipe_capacity: bool,
 
-    /// Bytes appended to the current page of a fixed-capacity stream pipe. `None` means
-    /// that Detcore cannot prove the kernel buffer's write offset.
-    #[serde(default)]
-    deterministic_pipe_write_tail: Option<usize>,
-
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -189,7 +184,6 @@ impl DetFd {
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
                 deterministic_pipe_capacity: false,
-                deterministic_pipe_write_tail: None,
             })),
         }
     }
@@ -426,40 +420,12 @@ impl DetFd {
 
     /// Mark a pipe whose kernel capacity Detcore fixed when it created the pipe.
     pub(crate) fn set_deterministic_pipe_capacity(&self) {
-        let mut description = self.description();
-        description.deterministic_pipe_capacity = true;
-        description.deterministic_pipe_write_tail = Some(0);
+        self.description().deterministic_pipe_capacity = true;
     }
 
     /// Whether this open file description has Detcore's fixed pipe capacity.
     pub(crate) fn has_deterministic_pipe_capacity(&self) -> bool {
         self.description().deterministic_pipe_capacity
-    }
-
-    /// Return the known write offset within the current one-page pipe buffer.
-    pub(crate) fn deterministic_pipe_write_tail(&self) -> Option<usize> {
-        self.description().deterministic_pipe_write_tail
-    }
-
-    /// Record that the fixed-capacity pipe is empty and its next buffer starts at offset 0.
-    pub(crate) fn reset_deterministic_pipe_write_tail(&self) {
-        let mut description = self.description();
-        if description.deterministic_pipe_capacity {
-            description.deterministic_pipe_write_tail = Some(0);
-        }
-    }
-
-    /// Advance the known write offset after a successful write.
-    pub(crate) fn advance_deterministic_pipe_write_tail(&self, written: usize) {
-        let mut description = self.description();
-        description.deterministic_pipe_write_tail = description
-            .deterministic_pipe_write_tail
-            .and_then(|tail| tail.checked_add(written));
-    }
-
-    /// Stop using the tracked offset after the kernel contradicts it.
-    pub(crate) fn invalidate_deterministic_pipe_write_tail(&self) {
-        self.description().deterministic_pipe_write_tail = None;
     }
 
     /// Update file status flags for every alias of this open file description.
