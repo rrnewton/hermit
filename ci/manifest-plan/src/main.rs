@@ -1036,6 +1036,31 @@ liteinst = "unsupported"
         assert!(rows[0].ci);
     }
 
+    #[test]
+    #[should_panic(expected = "must partition")]
+    fn rejects_legacy_dbi_backend_key() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbi = "pre-rename backend key"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
     const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];
 
     fn disabled_verify_spec(extra: &str) -> Value {
