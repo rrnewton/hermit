@@ -254,6 +254,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): this inventoried C guest keeps ci = false until it is calibrated; only calibrated C guests run in blocking CI."
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
@@ -263,12 +264,14 @@ liteinst = "Initial C-corpus migration preserves the established ptrace baseline
 
 [test.modes.naked]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."
 backends_enabled = []
 [test.modes.naked.backends_disabled]
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
@@ -279,6 +282,7 @@ liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
@@ -289,6 +293,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = false
+ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
