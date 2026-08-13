@@ -177,8 +177,15 @@ check("dbt verify contract is guest-visible",
       expectation("dbt", "hello_stdout", True)[0] == "guest")
 check("deterministic non-zero DBT exit reaches guest-visible verification",
       expectation("dbt", "exit_status", True)[0] == "guest")
-check("a real declared dbt L2 gap still reports 'gap'",
-      expectation("dbt", "file_metadata", True)[0] == "gap")
+measured_l2_gaps = (
+    ("dbt", "file_metadata"),
+    ("dbt", "pthread_lifecycle"),
+    ("kvm", "process_wait_accounting"),
+    ("kvm", "process_wait_lifecycle"),
+)
+for backend, case in measured_l2_gaps:
+    check(f"measured {backend} {case} L2 gap remains declared",
+          expectation(backend, case, True)[0] == "gap")
 check("kvm verify contract stays 'guest'",
       expectation("kvm", "exit_status", True)[0] == "guest")
 
