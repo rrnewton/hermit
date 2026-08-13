@@ -185,7 +185,7 @@ Do not work around them by trusting the output of the failed run.
 | `PreemptionRecord: cannot re-register`, `before registering thread`, or priority/time assertions | Preemption recording and thread registration are out of order. |
 | `Thread state should be explicitly initialized in init_thread_state` | Recorder/replayer thread-local state was requested before initialization. |
 | `Serialization is not yet implemented` from `event_stream` | Internal code attempted to serialize an event stream object directly; normal record/replay serializes individual events. |
-| `FINISHME` from `mvar`, bare `not implemented`, or `internal invariant`/`impossible` assertions | An unfinished or supposedly unreachable Detcore path ran. |
+| Bare `not implemented` or `internal invariant`/`impossible` assertions | An unfinished or supposedly unreachable Detcore path ran. |
 | Rust's `called Option::unwrap() on a None value`, `called Result::unwrap() on an Err value`, assertion failure, poisoned-lock panic, or integer overflow | An unchecked internal assumption failed. Use the backtrace's first Hermit frame to identify the subsystem and report it. |
 
 ## Coverage And Maintenance
