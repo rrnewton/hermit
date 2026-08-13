@@ -56,7 +56,8 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
-use super::verify::temp_log_files;
+use super::verify::retain_verification_logs;
+use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
 use super::verify::write_pending_verification_json;
@@ -324,7 +325,7 @@ pub struct RunOpts {
     /// diverge), and compare every INFO message's remaining bytes — virtual-time
     /// timestamps, raw syscall argument/result values, counts, sizes, flags —
     /// exactly. An explicit `--log=debug` or `--log=trace` remains captured for
-    /// `--verify-logs` diagnostics but does not change this INFO verdict; use
+    /// `--print-verify-logs` diagnostics but does not change this INFO verdict; use
     /// `--verify-verbose` to request an all-level diagnostic comparison. Without
     /// this (and without --verify-verbose) the default `--verify` normalizes away
     /// numbers, addresses, tmp paths, and timestamps before comparing, so a
@@ -346,8 +347,19 @@ pub struct RunOpts {
     /// otherwise diverted to a temporary file for comparison, so the user never
     /// sees it. This restores observability of `--log` output while still
     /// performing the two-run determinism check.
+    #[clap(long = "print-verify-logs", alias = "verify-logs", requires = "verify")]
+    print_verify_logs: bool,
+
+    /// Retain both captured verification logs after either a match or a
+    /// divergence. Logs are written under --verify-log-dir when provided;
+    /// otherwise under $XDG_STATE_HOME/hermit/verify-logs (normally
+    /// ~/.local/state/hermit/verify-logs). The final paths are printed.
     #[clap(long, requires = "verify")]
-    verify_logs: bool,
+    keep_logs: bool,
+
+    /// Directory for logs retained by --keep-logs.
+    #[clap(long, value_name = "DIRECTORY", requires = "keep_logs")]
+    verify_log_dir: Option<PathBuf>,
 
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
@@ -357,7 +369,9 @@ pub struct RunOpts {
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
-    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
+    /// "first_divergent_virtual_nanoseconds":int|null}`. This is the
+    /// exit-code-independent verdict
     /// channel: `verified` reflects whether the two runs matched, regardless of
     /// what the guest exited with, so a caller need not (and must not) infer the
     /// verdict from the process exit code. A determinism / record-replay parity
@@ -607,6 +621,16 @@ impl fmt::Display for RunOpts {
         }
         if self.verify_strict {
             write!(f, " --verify-strict")?;
+        }
+        if self.print_verify_logs {
+            write!(f, " --print-verify-logs")?;
+        }
+        if self.keep_logs {
+            write!(f, " --keep-logs")?;
+        }
+        if let Some(p) = &self.verify_log_dir {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --verify-log-dir={}", shell_words::quote(s))?;
         }
         if let Some(p) = &self.verify_json {
             let s = p.to_str().expect("valid unicode path");
@@ -1819,6 +1843,35 @@ impl RunOpts {
         self.verify.then_some(self.verify_json.as_deref()).flatten()
     }
 
+    fn retained_verify_log_dir(&self) -> Result<Option<PathBuf>, Error> {
+        if !self.keep_logs {
+            return Ok(None);
+        }
+        let directory = match &self.verify_log_dir {
+            Some(directory) => directory.clone(),
+            None => dirs::state_dir()
+                .ok_or_else(|| {
+                    Error::msg(
+                        "--keep-logs needs --verify-log-dir because no user state directory is available",
+                    )
+                })?
+                .join("hermit")
+                .join("verify-logs"),
+        };
+        fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "could not create verification log directory {}",
+                directory.display()
+            )
+        })?;
+        Ok(Some(fs::canonicalize(&directory).with_context(|| {
+            format!(
+                "could not resolve verification log directory {}",
+                directory.display()
+            )
+        })?))
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -2721,30 +2774,48 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
-        let (log1, log2) =
-            temp_log_files("run1", "run2").context("Failed to create temporary log files")?;
+        let retained_log_dir = self.retained_verify_log_dir()?;
+        let (log1, log2) = temp_log_files_in("run1", "run2", retained_log_dir.as_deref())
+            .context("Failed to create verification log files")?;
 
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let mut out1: Output = self.run_verify(log1_file, global)?;
-        let sabre_syscalls1 = (self.selected_backend() == Backend::Sabre)
+        let mut out1: Output = match self.run_verify(log1_file, global) {
+            Ok(output) => output,
+            Err(error) => {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(error);
+            }
+        };
+        let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
             .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
-            .transpose()?;
+            .transpose()
+        {
+            Ok(count) => count,
+            Err(error) => {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(error);
+            }
+        };
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
-        // When --verify-logs is set, echo that first run's log to stderr so the
+        // When --print-verify-logs is set, echo that first run's log to stderr so the
         // user still sees `--log` output, matching a normal (non-verify) run.
         // The log file is fully flushed here because run_verify runs each
         // execution in a child process that has already exited.
-        if self.verify_logs {
+        if self.print_verify_logs {
             match fs::read(&log1_path) {
                 Ok(bytes) => std::io::stderr().write_all(&bytes)?,
                 Err(err) => eprintln!(
-                    "WARNING: --verify-logs could not read first-run log {}: {}",
+                    "WARNING: --print-verify-logs could not read first-run log {}: {}",
                     log1_path.display(),
                     err
                 ),
@@ -2757,14 +2828,36 @@ impl RunOpts {
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
             return Err(Error::msg("First run during --verify exited in error"));
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let mut out2 = self.run_verify(log2_file, global)?;
+        let mut out2 = match self.run_verify(log2_file, global) {
+            Ok(output) => output,
+            Err(error) => {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+                }
+                return Err(error);
+            }
+        };
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = extract_sabre_detlogs(&log2_path, &mut out2.stderr)?;
+            let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
+                Ok(count) => count,
+                Err(error) => {
+                    if self.keep_logs {
+                        retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+                    }
+                    return Err(error);
+                }
+            };
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+                }
                 return Err(Error::msg(format!(
                     "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
                 )));
@@ -2802,6 +2895,7 @@ impl RunOpts {
                 },
                 compare_logs: !kvm_output_only,
                 diagnostic_full_trace: self.verify_verbose,
+                keep_logs: self.keep_logs,
             },
         )?;
 
@@ -3175,7 +3269,69 @@ impl<'a> Tmpfs<'a> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
+
+    #[test]
+    fn verification_log_flags_are_discoverable_and_old_print_spelling_still_parses() {
+        let current = RunOpts::try_parse_from([
+            "run",
+            "--verify",
+            "--print-verify-logs",
+            "--keep-logs",
+            "--verify-log-dir",
+            "/tmp/logs",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert!(current.print_verify_logs);
+        assert!(current.keep_logs);
+        assert_eq!(current.verify_log_dir, Some(PathBuf::from("/tmp/logs")));
+
+        let compatible =
+            RunOpts::try_parse_from(["run", "--verify", "--verify-logs", "/bin/true"]).unwrap();
+        assert!(compatible.print_verify_logs);
+
+        let mut help = Vec::new();
+        RunOpts::command().write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("--print-verify-logs"));
+        assert!(help.contains("--keep-logs"));
+        assert!(help.contains("--verify-log-dir"));
+        assert!(!help.contains("--verify-logs"));
+
+        assert!(
+            RunOpts::try_parse_from([
+                "run",
+                "--verify",
+                "--verify-log-dir",
+                "/tmp/logs",
+                "/bin/true",
+            ])
+            .is_err(),
+            "a retention directory without --keep-logs must be refused"
+        );
+    }
+
+    #[test]
+    fn user_selected_retention_directory_is_resolved_and_created() {
+        let parent = tempfile::tempdir().unwrap();
+        let requested = parent.path().join("retained");
+        let options = RunOpts::try_parse_from([
+            "run",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+            requested.to_str().unwrap(),
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.retained_verify_log_dir().unwrap(),
+            Some(fs::canonicalize(requested).unwrap())
+        );
+    }
 
     #[test]
     fn extracts_sabre_detlogs_and_preserves_guest_stderr() {

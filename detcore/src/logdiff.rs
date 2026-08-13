@@ -39,7 +39,7 @@ pub enum LogComparisonMode {
 }
 
 /// Options for calling `log_diff`.
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub struct LogDiffOpts {
     /// UNSAFE: strips numbers and temporary paths before comparison.
     ///
@@ -61,8 +61,7 @@ pub struct LogDiffOpts {
     /// sequence), and aliasing (two names for one address collapse to one
     /// ordinal), and it leaves every other byte -- virtual-time timestamps,
     /// syscall argument/result values, counts, sizes, flags -- untouched for an
-    /// exact comparison. This is the tier-2 normalization of the `Canonical`
-    /// parity policy: canonicalizing preserves the ability to DETECT a
+    /// exact comparison. In canonical parity, this preserves the ability to DETECT a
     /// difference (allocation-order or aliasing changes still diverge), which
     /// wholesale stripping throws away.
     ///
@@ -272,8 +271,8 @@ pub fn host_addr(addr: usize) -> String {
 /// start at 1 and the same `map`/`next` must be reused for every line of one run
 /// (and a FRESH pair used for the other run).
 ///
-/// This is the tier-2 CANONICALIZE step (as opposed to tier-1 STRIP of the
-/// wall-clock prefix and tier-3 EXACT comparison of everything else). It differs
+/// Canonical parity strips the wall-clock prefix, canonicalizes these marked
+/// addresses, and compares everything else exactly. This step differs
 /// from [`strip_log_entry`]'s `<ADDR>` erasure in one decisive way: erasure maps
 /// every address to a single token, so two runs that allocate in a DIFFERENT
 /// ORDER, or that ALIAS differently (one address printed twice vs. two distinct
@@ -313,6 +312,56 @@ fn canonicalize_addresses_in_line(
             format!("<addr{ord}>")
         })
         .into_owned()
+}
+
+fn messages_for_comparison(messages: &[(usize, &str)], opts: &LogDiffOpts) -> Vec<String> {
+    if opts.strip_lines {
+        messages
+            .iter()
+            .map(|(_, message)| strip_log_entry(message))
+            .collect()
+    } else if opts.canonicalize_addresses {
+        let mut addresses = HashMap::new();
+        let mut next_address = 1usize;
+        messages
+            .iter()
+            .map(|(_, message)| {
+                canonicalize_addresses_in_line(message, &mut addresses, &mut next_address)
+            })
+            .collect()
+    } else {
+        messages
+            .iter()
+            .map(|(_, message)| (*message).to_owned())
+            .collect()
+    }
+}
+
+fn canonical_info_from_str(contents: &str) -> Vec<String> {
+    let info = filter_infos(&extract_log_messages(contents));
+    let opts = LogDiffOpts {
+        canonicalize_addresses: true,
+        comparison: LogComparisonMode::Info,
+        ..Default::default()
+    };
+    messages_for_comparison(&info, &opts)
+}
+
+/// Print the canonical INFO messages that strict verification would compare for
+/// one captured log.
+///
+/// This removes the real wall-clock prefix and rewrites only explicitly marked
+/// host addresses to first-appearance ordinals. It does not run the lossy
+/// `--unsafe-strip-lines` transformation: scheduler turns, virtual time, syscall
+/// values, counts, flags, and every other substantive byte are preserved.
+pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
+    let bytes = std::fs::read(file)?;
+    let contents = String::from_utf8_lossy(&bytes);
+    let messages = canonical_info_from_str(&contents);
+    for message in &messages {
+        writeln!(writer, "{message}")?;
+    }
+    Ok(messages.len())
 }
 
 /// Separate a full, continuous log into discrete (possibly-multiline) log messages,
@@ -441,6 +490,83 @@ fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
         .collect()
 }
 
+fn first_different_message_indices(
+    left: &[(usize, &str)],
+    right: &[(usize, &str)],
+    opts: &LogDiffOpts,
+) -> Option<(Option<usize>, Option<usize>)> {
+    let compared_left = messages_for_comparison(left, opts);
+    let compared_right = messages_for_comparison(right, opts);
+    let common = compared_left.len().min(compared_right.len());
+
+    if let Some(position) =
+        (0..common).find(|&position| compared_left[position] != compared_right[position])
+    {
+        return Some((Some(left[position].0), Some(right[position].0)));
+    }
+
+    match compared_left.len().cmp(&compared_right.len()) {
+        Ordering::Less => Some((None, Some(right[common].0))),
+        Ordering::Greater => Some((Some(left[common].0), None)),
+        Ordering::Equal => None,
+    }
+}
+
+fn parse_underscored_u64(value: &str) -> Option<u64> {
+    value.replace('_', "").parse().ok()
+}
+
+fn parse_virtual_nanoseconds(value: &str, unit: Option<&str>) -> Option<u64> {
+    match unit {
+        None | Some("ns") if !value.contains('.') => parse_underscored_u64(value),
+        Some("s") => {
+            let value = value.replace('_', "");
+            let (seconds, fraction) = value.split_once('.').unwrap_or((&value, ""));
+            if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let seconds = seconds.parse::<u64>().ok()?;
+            let fraction = if fraction.is_empty() {
+                0
+            } else {
+                let digits = fraction.parse::<u64>().ok()?;
+                digits.checked_mul(10_u64.pow((9 - fraction.len()) as u32))?
+            };
+            seconds.checked_mul(1_000_000_000)?.checked_add(fraction)
+        }
+        _ => None,
+    }
+}
+
+fn commit_position(message: &str) -> Option<(u64, Option<u64>)> {
+    static TURN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\bCOMMIT turn ([0-9][0-9_]*)\b").unwrap());
+    static TIME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(?:at time|on previously committed) ([0-9][0-9_]*(?:\.[0-9_]+)?)(ns|s)?\b")
+            .unwrap()
+    });
+
+    let turn = parse_underscored_u64(TURN.captures(message)?.get(1)?.as_str())?;
+    let virtual_nanoseconds = TIME.captures(message).and_then(|captures| {
+        parse_virtual_nanoseconds(
+            captures.get(1)?.as_str(),
+            captures.get(2).map(|unit| unit.as_str()),
+        )
+    });
+    Some((turn, virtual_nanoseconds))
+}
+
+fn commit_position_at_or_before(
+    messages: &[(usize, &str)],
+    message_index: usize,
+) -> Option<(u64, Option<u64>)> {
+    messages
+        .iter()
+        .rev()
+        .filter(|(index, _)| *index <= message_index)
+        .find_map(|(_, message)| commit_position(message))
+}
+
 fn syscall_at_or_before<'a>(
     syscalls: &[(usize, &'a str)],
     index: usize,
@@ -564,39 +690,18 @@ fn diff_vecs(
         return Ok(false);
     }
 
-    // Canonicalize addresses in a full pre-pass, per run, BEFORE the compare
-    // loop: the ordinal-by-first-appearance numbering must reflect the whole
-    // ordered message list, not be truncated when the loop breaks at `limit`.
-    // Each run gets its own fresh map/counter so the two numberings are
-    // independent (an ASLR shift compares equal) yet order- and alias-sensitive.
-    let (canon_left, canon_right): (Vec<String>, Vec<String>) = if opts.canonicalize_addresses {
-        let mut left_map = HashMap::new();
-        let mut left_next = 1usize;
-        let mut right_map = HashMap::new();
-        let mut right_next = 1usize;
-        (
-            v1.iter()
-                .map(|(_, s)| canonicalize_addresses_in_line(s, &mut left_map, &mut left_next))
-                .collect(),
-            v2.iter()
-                .map(|(_, s)| canonicalize_addresses_in_line(s, &mut right_map, &mut right_next))
-                .collect(),
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    // Prepare both complete streams before the compare loop: address ordinals
+    // are assigned by first appearance across the full selected stream, not by
+    // however many differences the caller asks us to print.
+    let compared_left = messages_for_comparison(v1, opts);
+    let compared_right = messages_for_comparison(v2, opts);
 
     let mut diff_count = 0;
     for (position, ((left_index, left), (right_index, right))) in
         v1.iter().zip(v2.iter()).enumerate()
     {
-        let (left_compared, right_compared) = if opts.strip_lines {
-            (strip_log_entry(left), strip_log_entry(right))
-        } else if opts.canonicalize_addresses {
-            (canon_left[position].clone(), canon_right[position].clone())
-        } else {
-            (left.to_string(), right.to_string())
-        };
+        let left_compared = &compared_left[position];
+        let right_compared = &compared_right[position];
         if left_compared == right_compared {
             continue;
         }
@@ -613,7 +718,7 @@ fn diff_vecs(
         write!(
             w,
             "({which}) Mismatch at log messages {left_index} (run 1) and {right_index} (run 2): {}",
-            Comparison::new(opts.no_color, &left_compared, &right_compared)
+            Comparison::new(opts.no_color, left_compared, right_compared)
         )?;
         if opts.strip_lines || opts.canonicalize_addresses {
             write!(
@@ -715,6 +820,12 @@ pub struct LogDiffSummary {
     pub compared_left: usize,
     /// Number of messages actually selected for comparison from the second run.
     pub compared_right: usize,
+    /// Scheduler turn at the first different selected message, when the first
+    /// run has a preceding scheduler COMMIT message that identifies it.
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// Virtual nanoseconds at that same scheduler COMMIT, when its time is
+    /// present and parseable.
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
 impl LogDiffSummary {
@@ -748,15 +859,24 @@ pub fn log_diff(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> bool {
 /// Like [`log_diff`], but returns the counted comparison evidence rather than a
 /// bare boolean.
 pub fn log_diff_detailed(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> LogDiffSummary {
+    try_log_diff_detailed(file_a, file_b, opts).expect("could not read or compare log inputs")
+}
+
+/// Fallible form of [`log_diff_detailed`] for user-facing callers. Missing or
+/// unreadable inputs are ordinary command errors, not process panics.
+pub fn try_log_diff_detailed(
+    file_a: &Path,
+    file_b: &Path,
+    opts: &LogDiffOpts,
+) -> std::io::Result<LogDiffSummary> {
     // For now the log-diff mode reads both logs fully into memory. This could be
     // modified in the future for a streaming solution, at least for scrolling through
     // the identical prefixes of very large logs.
-    let vec_a = std::fs::read(file_a).expect("Could not open first input file.");
-    let vec_b = std::fs::read(file_b).expect("Could not open second input file.");
+    let vec_a = std::fs::read(file_a)?;
+    let vec_b = std::fs::read(file_b)?;
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
     log_diff_summary_from_strs(str_a, str_b, opts, &mut std::io::stderr())
-        .expect("should write succesfully")
 }
 
 /// Boolean-only wrapper retained for tests that only ask "did it differ?".
@@ -838,6 +958,13 @@ fn log_diff_summary_from_strs(
         LogComparisonMode::FullTrace => ("full trace", &all_a, &all_b),
     };
 
+    let first_different = first_different_message_indices(compared_a, compared_b, opts);
+    let first_position_candidate = first_different.and_then(|(left_index, right_index)| {
+        left_index
+            .and_then(|index| commit_position_at_or_before(&all_a, index))
+            .or_else(|| right_index.and_then(|index| commit_position_at_or_before(&all_b, index)))
+    });
+
     let diff_found = if opts.git_diff {
         git_diff(
             which,
@@ -864,6 +991,14 @@ fn log_diff_summary_from_strs(
         diff_found,
         compared_left: compared_a.len(),
         compared_right: compared_b.len(),
+        first_divergent_scheduler_turn: diff_found
+            .then_some(first_position_candidate)
+            .flatten()
+            .map(|(turn, _)| turn),
+        first_divergent_virtual_nanoseconds: diff_found
+            .then_some(first_position_candidate)
+            .flatten()
+            .and_then(|(_, time)| time),
     };
 
     if diff_found {
@@ -1327,7 +1462,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 2 positive: two runs that differ ONLY in their raw
+    /// Canonical parity positive control: two runs that differ ONLY in their raw
     /// host addresses -- same structure, same introduction order, same aliasing
     /// (a pure ASLR shift) -- compare EQUAL after canonicalization. The same
     /// inputs compared RAW (neither stripped nor canonicalized) diverge, proving
@@ -1367,7 +1502,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 2 negative (allocation order): two runs whose only
+    /// Canonical parity negative control (allocation order): two runs whose only
     /// difference is the ORDER in which two addresses are introduced must compare
     /// UNEQUAL. This is exactly the divergence wholesale stripping hides -- it is
     /// the positive control that canonicalization preserves distinguishability.
@@ -1394,8 +1529,8 @@ mod test {
             "an allocation-order difference must compare UNEQUAL under canonicalization"
         );
 
-        // And wholesale stripping DOES hide it (documents the defect the tier-2
-        // policy fixes): both addresses collapse to a single <ADDR> token.
+        // And wholesale stripping DOES hide it: both addresses collapse to a
+        // single <ADDR> token.
         let stripped = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
             strip_lines: true,
@@ -1409,7 +1544,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 2 negative (aliasing): a run that prints ONE address
+    /// Canonical parity negative control (aliasing): a run that prints ONE address
     /// twice (aliased) must not match a run that prints TWO distinct addresses in
     /// the same positions. `<addr1>,<addr1>` vs `<addr1>,<addr2>` diverges.
     #[test]
@@ -1430,7 +1565,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 3 (the finding this design fixes): a reproducible
+    /// Canonical parity exact-value control: a reproducible
     /// hex value printed as a syscall argument (`flock` `operation={:#x}`) is
     /// NOT a host address and must be compared EXACTLY. Two runs differing only
     /// in `operation=0x2` vs `0x6` must compare UNEQUAL under canonicalization --
@@ -1468,7 +1603,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 3: a single virtual-time timestamp difference (a
+    /// Canonical parity exact-value control: a single virtual-time timestamp difference (a
     /// decimal value, NOT a `0x` address) must compare UNEQUAL -- canonicalization
     /// touches only host addresses and leaves every other byte for exact
     /// comparison. This is the sharp edge: virtual time is compared exactly even
@@ -1491,7 +1626,7 @@ mod test {
         Ok(())
     }
 
-    /// Canonical parity, tier 1: runs that differ ONLY in the real wall-clock
+    /// Canonical parity wall-clock control: runs that differ ONLY in the real wall-clock
     /// timestamp PREFIX compare EQUAL -- the prefix is stripped by
     /// `extract_log_messages` before any comparison, so nothing else needs to see
     /// it. This is the one genuinely-irreproducible datum the policy discards.
@@ -1513,6 +1648,70 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
             !super::log_diff_from_strs(run_a, run_b, &canonical, &mut Vec::new())?,
             "a wall-clock-prefix-only difference must compare EQUAL"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn one_log_canonical_info_preserves_values_and_only_rewrites_marked_addresses() {
+        let log = "2026-08-13T01:02:03.000000Z INFO detcore: COMMIT turn 17 at time 123456 bare=0x2 marked=<hostaddr 0xaaaa>\n\
+2026-08-13T01:02:03.000001Z DEBUG detcore: diagnostic=999\n\
+2026-08-13T01:02:03.000002Z INFO detcore: DETLOG count=42 bare=0x6 marked=<hostaddr 0xaaaa> other=<hostaddr 0xbbbb>";
+
+        assert_eq!(
+            super::canonical_info_from_str(log),
+            vec![
+                "INFO detcore: COMMIT turn 17 at time 123456 bare=0x2 marked=<addr1>",
+                "INFO detcore: DETLOG count=42 bare=0x6 marked=<addr1> other=<addr2>",
+            ]
+        );
+    }
+
+    #[test]
+    fn first_log_divergence_reports_preceding_commit_turn_and_virtual_time() -> std::io::Result<()>
+    {
+        let left = "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 12.345_678_901s\n\
+2026-08-13T01:02:03.000001Z INFO detcore: DETLOG count=42";
+        let right = "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 12.345_678_901s\n\
+2026-08-13T01:02:04.000001Z INFO detcore: DETLOG count=43";
+        let opts = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let diverged = super::log_diff_summary_from_strs(left, right, &opts, &mut Vec::new())?;
+        assert!(diverged.diff_found);
+        assert_eq!(diverged.first_divergent_scheduler_turn, Some(17));
+        assert_eq!(
+            diverged.first_divergent_virtual_nanoseconds,
+            Some(12_345_678_901)
+        );
+
+        let matched = super::log_diff_summary_from_strs(left, left, &opts, &mut Vec::new())?;
+        assert!(matched.matched_with_evidence());
+        assert_eq!(matched.first_divergent_scheduler_turn, None);
+        assert_eq!(matched.first_divergent_virtual_nanoseconds, None);
+        Ok(())
+    }
+
+    #[test]
+    fn log_divergence_without_commit_metadata_reports_no_position() -> std::io::Result<()> {
+        let opts = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let summary = super::log_diff_summary_from_strs(
+            "INFO detcore: DETLOG count=42",
+            "INFO detcore: DETLOG count=43",
+            &opts,
+            &mut Vec::new(),
+        )?;
+        assert!(summary.diff_found);
+        assert_eq!(summary.first_divergent_scheduler_turn, None);
+        assert_eq!(summary.first_divergent_virtual_nanoseconds, None);
         Ok(())
     }
 
@@ -1611,7 +1810,7 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         let mut next = 1usize;
         // First appearance numbers marked addresses by order; a repeated address
         // reuses its ordinal (identity + aliasing). A BARE `0x...` literal and
-        // decimal values are left untouched (tier 3, exact comparison).
+        // decimal values are left untouched and compared exactly.
         assert_eq!(
             super::canonicalize_addresses_in_line(
                 "a=<hostaddr 0x1111> b=<hostaddr 0x2222> c=<hostaddr 0x1111> raw=0x4444 n=42",

@@ -8,13 +8,13 @@ These are the current pre-basic-sanity contracts. In particular, bare `--verify`
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 149 | 1195 | 1344 |
-| `dbt` | 9 | 1335 | 1344 |
-| `kvm` | 0 | 1344 | 1344 |
-| `sabre` | 9 | 1335 | 1344 |
-| `liteinst` | 3 | 1341 | 1344 |
+| `ptrace` | 148 | 860 | 1008 |
+| `dbt` | 9 | 999 | 1008 |
+| `kvm` | 0 | 1008 | 1008 |
+| `sabre` | 9 | 999 | 1008 |
+| `liteinst` | 2 | 1006 | 1008 |
 | `native` | 0 | 336 | 336 |
-| **Total** | **170** | **6886** | **7056** |
+| **Total** | **168** | **5208** | **5376** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
@@ -23,8 +23,27 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 2 / 336 | — | 167 | 1513 | 1680 |
 | `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
 | `chaos` | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 0 | 1680 | 1680 |
-| `custom` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 1 / 336 | — | 2 | 1678 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
-| **Total** | | | | | | | **170** | **6886** | **7056** |
+| **Total** | | | | | | | **168** | **5208** | **5376** |
 
-Ordinary full validation executes 172 selected regression cells: the 170 green compatibility cells above plus 2 chaos-mode race-exposure checks. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+## Ptrace by manifest category
+
+This view uses the same pre-basic-sanity contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
+
+| Manifest category | Verify | Replay | Chaos | Green | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
+| `backend-parity-c` | 78 / 95 | 0 / 95 | 0 / 95 | 78 | 285 |
+| `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
+| `c-programs` | 10 / 160 | 0 / 160 | 0 / 160 | 10 | 480 |
+| `chaos-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
+| `data-handling` | 5 / 5 | 0 / 5 | 0 / 5 | 5 | 15 |
+| `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
+| `determinism-stress` | 4 / 6 | 0 / 6 | 0 / 6 | 4 | 18 |
+| `determinism-stress-c` | 6 / 11 | 0 / 11 | 0 / 11 | 6 | 33 |
+| `language-runtimes` | 18 / 19 | 0 / 19 | 0 / 19 | 18 | 57 |
+| `shared-futex-c` | 0 / 4 | 0 / 4 | 0 / 4 | 0 | 12 |
+| `system-utils` | 23 / 25 | 1 / 25 | 0 / 25 | 24 | 75 |
+| `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
+
+Ordinary full validation executes 172 selected regression cells: the 168 green compatibility cells above, 2 chaos-mode race-exposure checks, and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

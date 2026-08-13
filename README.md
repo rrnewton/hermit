@@ -139,7 +139,7 @@ ptrace-owned Detcore lifecycle.
 
 `--verify` compares captured status and output and applies the `Stripped`
 comparison to selected Detcore scheduler messages. A successful result is a
-useful diagnostic, but it is not L2. L2 additionally requires
+useful diagnostic, but it is not strict determinism. Strict verification requires
 `--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
 compared-message counts.
 Current support is limited to single-threaded, single-process guests. Thread
@@ -206,7 +206,7 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not L2 |
+| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not strict determinism |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |

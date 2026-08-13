@@ -217,7 +217,7 @@ enum Subcommand {
     #[clap(name = "replay")]
     Replay(ReplayOpts),
 
-    /// Take the difference of two (run/record) logs written to files.
+    /// Print one log canonically, or compare two run/record logs.
     LogDiff(LogDiffCLIOpts),
 
     /// Analyze Pass and failing runs
