@@ -59,8 +59,9 @@ Error: Sandbox container exited unexpectedly
      > Process exited with code: Exited(1)
 ```
 
-The run now ends promptly with a nonzero status (measured 0.02s). It previously
-reported the same deadlock as a scheduler *panic* and then hung, so a host
+At the historical main revision captured above, the run ended promptly with a
+nonzero status (measured 0.02s). It previously reported the same deadlock as a
+scheduler *panic* and then hung, so a host
 `timeout` exited 124 with the tracees still stopped: the scheduler is a spawned
 task, so its panic was captured by the task harness while every guest thread
 stayed parked on a scheduler response that could no longer arrive. The verdict
@@ -115,9 +116,14 @@ PASS: robust mutex waiter received EOWNERDEAD
 with, at DEBUG:
 
 ```text
-[detcore, dtid 5] robust-list owner death: futex word 0x404100 0x80000005 -> 0xc0000000
+[detcore, dtid 5] robust-list owner death: leaving futex word 0x404100 for backend exit cleanup
 [detcore, dtid 5] robust-list owner death woke 1 waiter(s) on futex Private { ..., address: 4210944 }
 ```
+
+That is the ptrace path: Linux performs the atomic owner-word transition before
+the backend's exit callback releases another modeled thread. DBT, KVM, and
+SaBRe still use Detcore's separate read and write and therefore do not yet
+satisfy the process-shared atomicity requirement.
 
 The futex word after owner death, probed directly, shows which half was missing
 where — the host kernel already performed the transition under ptrace, so only
