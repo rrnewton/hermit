@@ -46,15 +46,34 @@ pub const DEFAULT_LOG_MAX_BYTES: u64 = 1 << 30;
 /// A truncated log MUST say so. Output that simply stops reads as a run that
 /// ENDED, which would be a worse evidence defect than the disk hazard this
 /// bound removes: a reader would draw conclusions from an absence we created.
+///
+/// The surrounding newlines are load-bearing, not cosmetic. The marker must
+/// occupy a LINE OF ITS OWN at the very END of the file, because that is what
+/// [`detcore::logdiff::log_was_truncated`] anchors on to tell a truncated log
+/// apart from a log that merely quotes the text. This literal is deliberately
+/// NOT `detcore::logdiff::TRUNCATION_MARKER` itself: keeping the two texts
+/// independent is what leaves
+/// `the_written_marker_is_the_text_the_comparator_matches` able to fail.
 const TRUNCATION_MARKER: &[u8] =
     b"\n=== HERMIT LOG TRUNCATED: reached the configured size bound (HERMIT_LOG_MAX_BYTES). \
 Output beyond this point was DISCARDED. The run itself continued and was NOT affected. ===\n";
 
-/// Resolve the configured ceiling; `0` (or an unparsable value) means unlimited.
-pub fn log_max_bytes() -> u64 {
+/// Resolve the configured ceiling; `0` means unlimited.
+///
+/// A malformed value is an ERROR rather than a fallback. Silently substituting
+/// the 1 GiB default would mean `HERMIT_LOG_MAX_BYTES=unlimited`, or any typo
+/// in the value used to disable the bound, quietly re-enabled it -- i.e. the
+/// documented way to turn the bound off is one keystroke away from turning it
+/// back on without saying so.
+pub fn log_max_bytes() -> Result<u64, String> {
     match std::env::var(LOG_MAX_BYTES_ENV) {
-        Ok(raw) => raw.trim().parse().unwrap_or(DEFAULT_LOG_MAX_BYTES),
-        Err(_) => DEFAULT_LOG_MAX_BYTES,
+        Ok(raw) => raw.trim().parse().map_err(|_| {
+            format!(
+                "{LOG_MAX_BYTES_ENV}={raw:?} is not a byte count. Set a non-negative integer \
+                 number of bytes, or 0 to disable the bound."
+            )
+        }),
+        Err(_) => Ok(DEFAULT_LOG_MAX_BYTES),
     }
 }
 
@@ -198,7 +217,13 @@ pub fn init_stderr_tracing(level: Option<LevelFilter>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// `log_max_bytes` reads the process environment, which libtest's threads
+    /// share.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Bracketed both ways on purpose: a bound that always fires would silently
     /// truncate ordinary diagnostic logs, which is the failure mode opposite to
@@ -267,22 +292,102 @@ mod tests {
         assert_eq!(sink.iter().filter(|b| **b == b'q').count(), 10);
     }
 
-    /// The writer's marker and the comparator's marker must be the same text.
+    /// What this writer produces must be what the comparator recognizes.
     ///
-    /// `detcore::logdiff` refuses to return a comparison verdict for a log
-    /// containing [`detcore::logdiff::TRUNCATION_MARKER`]. If the text written
-    /// here ever drifts from the text matched there, that refusal stops firing
-    /// and a truncated pair silently returns to comparing only its prefix --
-    /// with nothing failing to say so. This test is the binding between them.
+    /// `detcore::logdiff` refuses to return a comparison verdict for a
+    /// truncated log. If the bytes written here ever drift from what
+    /// [`detcore::logdiff::log_was_truncated`] accepts, that refusal stops
+    /// firing and a truncated pair silently returns to comparing only its
+    /// prefix -- with nothing failing to say so. This test is the binding
+    /// between them.
+    ///
+    /// It runs the REAL writer's output through the REAL predicate rather than
+    /// comparing two constants, so it binds the anchoring as well as the text:
+    /// the marker must survive as a whole line at end of file, which is what
+    /// the comparator actually keys on. Drift in this file's literal or in
+    /// detcore's constant or predicate all fail it.
     #[test]
     fn the_written_marker_is_the_text_the_comparator_matches() {
-        let written = String::from_utf8(TRUNCATION_MARKER.to_vec()).unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut writer = BoundedWriter::new(&mut sink, 64);
+            // A realistic tail: whole "lines", the last of which straddles the
+            // bound, so the marker has to terminate a partial line.
+            for _ in 0..20 {
+                writer
+                    .write_all(b"2022-09-06T14:15:47.000000Z INFO detcore: DETLOG x\n")
+                    .unwrap();
+            }
+            writer.flush().unwrap();
+        }
+        let written = String::from_utf8(sink).unwrap();
         assert!(
-            written.contains(detcore::logdiff::TRUNCATION_MARKER),
-            "the bounded writer emits {written:?}, which does not contain the marker the \
-             comparator matches ({:?}); detcore::logdiff would no longer detect truncation",
-            detcore::logdiff::TRUNCATION_MARKER
+            detcore::logdiff::log_was_truncated(&written),
+            "the bounded writer produced {written:?}, which detcore::logdiff does not classify \
+             as truncated; a truncated pair would silently be compared on its prefix"
         );
+
+        // The other direction, so this cannot pass by the predicate accepting
+        // everything: the same content under a bound it never reaches is NOT
+        // truncated.
+        let mut unbounded: Vec<u8> = Vec::new();
+        {
+            let mut writer = BoundedWriter::new(&mut unbounded, 0);
+            writer
+                .write_all(b"2022-09-06T14:15:47.000000Z INFO detcore: DETLOG x\n")
+                .unwrap();
+        }
+        assert!(
+            !detcore::logdiff::log_was_truncated(&String::from_utf8(unbounded).unwrap()),
+            "an untruncated log must not be classified as truncated"
+        );
+    }
+
+    /// A malformed bound must be an error, not a silent 1 GiB.
+    ///
+    /// `HERMIT_LOG_MAX_BYTES=0` is the documented way to disable the bound, so
+    /// a value that fails to parse must not quietly become the default: that
+    /// would re-enable the bound for anyone who typed `unlimited`, `none`, or
+    /// `1GiB` and reasonably believed it was off.
+    ///
+    /// Serialized against the other env-var cases in this file because the
+    /// process environment is global; `log_max_bytes` reads it directly.
+    #[test]
+    fn a_malformed_bound_is_an_error_not_a_silent_default() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let restore = std::env::var(LOG_MAX_BYTES_ENV).ok();
+
+        // SAFETY: guarded by ENV_LOCK; no other thread in this test binary
+        // reads the environment concurrently.
+        unsafe {
+            for bad in ["unlimited", "none", "1GiB", "-1", "", "1 000"] {
+                std::env::set_var(LOG_MAX_BYTES_ENV, bad);
+                assert!(
+                    log_max_bytes().is_err(),
+                    "{bad:?} must be rejected, not silently read as {DEFAULT_LOG_MAX_BYTES}"
+                );
+            }
+            // Bracket the accepting direction, including the documented
+            // "disable" value, so this is not a check that rejects everything.
+            for (good, expected) in [("0", 0u64), ("4096", 4096), (" 4096 ", 4096)] {
+                std::env::set_var(LOG_MAX_BYTES_ENV, good);
+                assert_eq!(
+                    log_max_bytes().unwrap(),
+                    expected,
+                    "{good:?} must be accepted"
+                );
+            }
+            std::env::remove_var(LOG_MAX_BYTES_ENV);
+            assert_eq!(
+                log_max_bytes().unwrap(),
+                DEFAULT_LOG_MAX_BYTES,
+                "an unset variable is the only thing that means the default"
+            );
+            match restore {
+                Some(v) => std::env::set_var(LOG_MAX_BYTES_ENV, v),
+                None => std::env::remove_var(LOG_MAX_BYTES_ENV),
+            }
+        }
     }
 
     /// The non-obvious correctness point: `tracing_appender` treats a short
