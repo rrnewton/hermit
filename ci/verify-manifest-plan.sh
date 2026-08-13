@@ -21,7 +21,7 @@
 #   4  absent     -> nothing published; caller may rebuild
 set -euo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # The exact input set the published document is bound to. Directories are
 # hashed recursively; `target` directories are pruned so a generated tree can
@@ -46,43 +46,46 @@ function fail {
     exit "$code"
 }
 
-# Hash one input without following a repository-controlled symlink outside the
-# checkout. The type marker binds regular-file versus symlink identity; for a
-# symlink the link text is the input, matching the producer's explicit
-# file-or-symlink acceptance check without reading the target.
+# Hash one regular input only after proving that its canonical path is the
+# literal checkout path. Requiring equality, rather than merely checking the
+# final component with `-L`, also refuses a symlinked ancestor before `cat` can
+# follow it outside the checkout.
 function emit_input_path {
-    local relative=$1 path target resolved hash
+    local relative=$1 path resolved hash
     [[ $relative != /* && $relative != *".."* ]] ||
         fail 2 "manifest-plan input must be a repo-relative path without '..': $relative"
     path="$ROOT_DIR/$relative"
-    if [[ -L $path ]]; then
-        target=$(readlink -- "$path")
-        [[ $target != /* ]] || fail 2 "manifest-plan input symlink is absolute: $relative -> $target"
-        resolved=$(realpath -m -- "$(dirname -- "$path")/$target")
-        [[ $resolved == "$ROOT_DIR"/* ]] ||
-            fail 2 "manifest-plan input symlink escapes the checkout: $relative -> $target"
-        hash=$(printf 'symlink\0%s' "$target" | sha256sum | cut -d' ' -f1)
-    elif [[ -f $path ]]; then
-        hash=$({ printf 'regular\0'; cat -- "$path"; } | sha256sum | cut -d' ' -f1)
-    else
-        fail 2 "manifest-plan input is missing or is not a file/symlink: $relative"
-    fi
+    [[ -f $path ]] || fail 2 "manifest-plan input is missing or is not a regular file: $relative"
+    resolved=$(realpath -e -- "$path") ||
+        fail 2 "manifest-plan input cannot be resolved: $relative"
+    [[ $resolved == "$ROOT_DIR"/* ]] ||
+        fail 2 "manifest-plan input resolves outside the checkout: $relative -> $resolved"
+    [[ $resolved == "$path" ]] ||
+        fail 2 "manifest-plan input resolves through a symlink: $relative -> $resolved"
+    hash=$({ printf 'regular\0'; cat -- "$resolved"; } | sha256sum | cut -d' ' -f1)
     printf '%s  %s\n' "$hash" "$relative"
 }
 
 # Deterministic `<sha256>  <path-relative-to-ROOT_DIR>` lines over the input set.
 function emit_input_manifest {
-    local dir file relative symlink
+    local dir dir_path dir_resolved file relative symlink
     local -a programs=()
     {
         for dir in "${MANIFEST_PLAN_INPUT_DIRS[@]}"; do
-            [[ -d $ROOT_DIR/$dir ]] || fail 2 "manifest-plan input directory is missing: $dir"
-            symlink=$(cd "$ROOT_DIR/$dir" && find . \( -type d -name target -prune \) -o -type l -print -quit)
+            dir_path="$ROOT_DIR/$dir"
+            [[ -d $dir_path ]] || fail 2 "manifest-plan input directory is missing: $dir"
+            dir_resolved=$(realpath -e -- "$dir_path") ||
+                fail 2 "manifest-plan input directory cannot be resolved: $dir"
+            [[ $dir_resolved == "$ROOT_DIR"/* ]] ||
+                fail 2 "manifest-plan input directory resolves outside the checkout: $dir -> $dir_resolved"
+            [[ $dir_resolved == "$dir_path" ]] ||
+                fail 2 "manifest-plan input directory resolves through a symlink: $dir -> $dir_resolved"
+            symlink=$(cd "$dir_resolved" && find . \( -type d -name target -prune \) -o -type l -print -quit)
             [[ -z $symlink ]] ||
                 fail 2 "manifest-plan input directory contains a symlink: $dir/${symlink#./}"
             while IFS= read -r -d '' relative; do
                 emit_input_path "$dir/$relative"
-            done < <(cd "$ROOT_DIR/$dir" && find . \( -type d -name target -prune \) -o -type f -printf '%P\0')
+            done < <(cd "$dir_resolved" && find . \( -type d -name target -prune \) -o -type f -printf '%P\0')
         done
         for file in "${MANIFEST_PLAN_INPUT_FILES[@]}"; do
             emit_input_path "$file"
@@ -91,7 +94,9 @@ function emit_input_manifest {
         # The producer reads every manifest-declared program path to enforce
         # that it exists as a file or symlink. Bind those dynamic inputs too;
         # otherwise a published document could verify after a program vanished
-        # even though rerunning the producer would refuse the same tree.
+        # even though rerunning the producer would refuse the same tree. The
+        # publisher is intentionally stricter than that existence check and
+        # refuses symlinks so no runner-external content becomes an input.
         mapfile -t programs < <(
             sed -nE 's/^[[:space:]]*program = "([^"]+)"[[:space:]]*$/\1/p' \
                 "$ROOT_DIR"/tests/e2e/manifests/*.toml | LC_ALL=C sort -u
