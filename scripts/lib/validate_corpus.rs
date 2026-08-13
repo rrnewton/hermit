@@ -133,7 +133,6 @@ pub const E9PATCH_COMPAT_TOTAL: usize = 155;
 /// visible, mirroring the gcc vfork precedent.
 pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        ("lsof", "fail-closed --strict rejects the unsupported close_range syscall"),
         ("make", "fail-closed --strict rejects the unsupported setresuid syscall"),
     ])
 }

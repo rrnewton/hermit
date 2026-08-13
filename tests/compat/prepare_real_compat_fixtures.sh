@@ -16,7 +16,8 @@ fi
 
 readonly FIXTURE_ROOT=$1
 rm -rf "$FIXTURE_ROOT"
-mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov"
+mkdir -p "$FIXTURE_ROOT/binutils" "$FIXTURE_ROOT/gprof" "$FIXTURE_ROOT/gcov" \
+    "$FIXTURE_ROOT/lsof"
 
 cat >"$FIXTURE_ROOT/binutils/fixture.c" <<'EOF'
 __attribute__((noinline)) int compat_line(int value) {
@@ -64,6 +65,18 @@ EOF
 )
 test -s "$FIXTURE_ROOT/gcov/coverage.gcno"
 test -s "$FIXTURE_ROOT/gcov/coverage.gcda"
+
+# lsof unconditionally walks /proc/mounts before applying its PID/FD filters.
+# Serve that read from an inherited descriptor for a fixed, valid mount table
+# so other users creating or removing host mounts cannot change the
+# strict-verify syscall stream.  The preload library refuses a descriptor on
+# procfs, so pointing it back at the live table cannot satisfy the marker.
+gcc -shared -fPIC -Wall -Wextra -Werror \
+    "$PWD/tests/compat/lsof_mount_redirect.c" -ldl \
+    -o "$FIXTURE_ROOT/lsof/libmount_redirect.so"
+cat >"$FIXTURE_ROOT/lsof/mounts" <<'EOF'
+fixture /tmp fixture rw 0 0
+EOF
 
 # Prevent host build time from becoming guest-visible input.
 find "$FIXTURE_ROOT" -exec touch -h -d @1 {} +
