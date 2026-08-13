@@ -491,8 +491,10 @@ race-exposure check, and is therefore required to pass by ordinary validation. *
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
-These are the current pre-basic-sanity contracts. In particular, bare `--verify` uses the \
-Stripped comparator and this table does not relabel it as strict INFO-log parity.\n\n\
+These are the current pre-basic-sanity contracts. Every `verify` cell runs the same backend \
+twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
+same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
+parity.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
     );
@@ -568,7 +570,13 @@ not exist for that backend.\n\n| Mode",
         total - green_total
     ));
     out.push_str(
-        "## Ptrace by manifest category\n\n\
+        "## Cross-backend parity\n\n\
+The manifest-backed scorecard does not yet contain cross-backend parity cells. In particular, \
+a DBT, KVM, SaBRe, or LiteInst `verify` cell compares that backend with itself, not with ptrace. \
+Standalone backend gates exercise selected comparisons, but their results are not counted here. \
+Until a cell actually compares a fresh ptrace log with the corresponding backend log, this table \
+reports no cross-backend parity number.\n\n\
+## Ptrace by manifest category\n\n\
 This view uses the same pre-basic-sanity contracts as the tables above, but makes the ptrace \
 workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
 denominator.\n\n\

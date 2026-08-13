@@ -108,13 +108,12 @@ impl CompatMode {
         }
     }
 
-    /// The assurance label printed per row, mirroring `assurance` in
-    /// `strict_compatibility_probe`.
-    pub fn assurance(self) -> &'static str {
+    /// Plain-language name printed per row and in the summary.
+    pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "L2",
+            CompatMode::Strict | CompatMode::PortableStrict => "legacy stripped verify",
             CompatMode::Sabre => "SaBRe",
-            CompatMode::E9patch => "e9patch L2",
+            CompatMode::E9patch => "e9patch legacy stripped verify",
             CompatMode::Rr => "rr",
         }
     }
@@ -422,7 +421,7 @@ pub fn compat_nodes_for(
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
-            &format!("{} compatibility: {}", mode.assurance(), row.label),
+            &format!("{} compatibility: {}", mode.display_name(), row.label),
             format!("{} </dev/null", shell_join(&argv)),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,

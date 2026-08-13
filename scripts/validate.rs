@@ -277,11 +277,11 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking L2 app matrix.\n\
-     \x20 --portable-strict-compat-only Portable L2 matrix with bounded diagnostics.\n\
+     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
+     \x20 --portable-strict-compat-only Portable legacy stripped matrix with bounded diagnostics.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
-     \x20 --e9patch-compat-only         Gate core + installed e9patch L2 apps.\n\
+     \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
@@ -2978,7 +2978,7 @@ fn prepare_fixtures_node_dep(
 }
 
 /// `require_e9patch_artifacts`' files-only NSS fixture (validate.sh:4095): keeps
-/// host identity-daemon races out of the e9patch L2 measurement.
+/// host identity-daemon races out of the e9patch compatibility measurement.
 fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
     let entries = [
         "aliases", "automount", "ethers", "group", "gshadow", "hosts", "initgroups", "netgroup",
@@ -3120,7 +3120,7 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             blocking_failures.push(label.to_string());
         }
     }
-    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.assurance());
+    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.display_name());
     println!("{:<22} | {:>8} | {:>9}", "Category", "Programs", "passing");
     println!("{}", "-".repeat(46));
     for cat in validate_corpus::CATEGORIES {
@@ -5284,14 +5284,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         };
         if let Some(f) = floor {
             if passed < f {
-                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.assurance());
+                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.display_name());
                 ok = false;
             } else {
-                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.assurance());
+                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.display_name());
             }
         }
         if !blocking.is_empty() {
-            println!("❌ {} blocking failures ({}): {}", mode.assurance(), blocking.len(), blocking.join(", "));
+            println!("❌ {} blocking failures ({}): {}", mode.display_name(), blocking.len(), blocking.join(", "));
         }
     }
 

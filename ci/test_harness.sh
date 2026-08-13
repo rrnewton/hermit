@@ -2169,11 +2169,31 @@ function run_capture {
     local stderr_file=$2
     local timeout_seconds=$3
     shift 3
+    local timeout_evidence_file="${stderr_file}.timeout"
+    local lc_all_was_set=0 lc_all_value=${LC_ALL-}
+    [[ ${LC_ALL+x} ]] && lc_all_was_set=1
 
-    # Without --foreground, GNU timeout owns a fresh process group and its
-    # TERM/KILL sequence reaches the complete Hermit guest subtree.
-    timeout --kill-after=10s "${timeout_seconds}s" "$@" \
-        </dev/null >"$stdout_file" 2>"$stderr_file"
+    # Keep the child's stderr separate from GNU timeout's --verbose signal
+    # report. A child can naturally exit 124 or 137, so status alone cannot
+    # prove that the deadline owner sent TERM/KILL. Without --foreground, GNU
+    # timeout owns a fresh process group and reaches the complete guest subtree.
+    : >"$timeout_evidence_file"
+    LC_ALL=C timeout --verbose --kill-after=10s "${timeout_seconds}s" \
+        bash -c '
+            lc_all_was_set=$1
+            lc_all_value=$2
+            stdout_file=$3
+            stderr_file=$4
+            shift 4
+            if [[ $lc_all_was_set == 1 ]]; then
+                export LC_ALL=$lc_all_value
+            else
+                unset LC_ALL
+            fi
+            exec "$@" </dev/null >"$stdout_file" 2>"$stderr_file"
+        ' run-capture "$lc_all_was_set" "$lc_all_value" \
+        "$stdout_file" "$stderr_file" "$@" \
+        2>"$timeout_evidence_file"
 }
 
 # Give the timeout's owner, not the enclosing DAG node, a durable identity.
@@ -2181,7 +2201,11 @@ function run_capture {
 # arbitrary child exit once execute_attempt returns its compact TSV row.
 function individual_test_timeout_reason {
     local test_id=$1 mode=$2 backend=$3 attempt=$4 timeout_seconds=$5 status=$6
+    local timeout_evidence_file=$7
     local disposition
+    [[ -f $timeout_evidence_file ]] || return 1
+    grep -Eq '^timeout: sending signal (TERM|KILL) to command ' \
+        "$timeout_evidence_file" || return 1
     case $status in
         124) disposition="deadline reached (exit 124)" ;;
         137) disposition="SIGKILL after 10 s grace (exit 137)" ;;
@@ -2207,7 +2231,8 @@ function audit_innermost_e2e_timeout {
         die "innermost E2E negative bracket returned $status, expected timeout exit 124"
     }
     reason=$(individual_test_timeout_reason \
-        timeout-probe/deliberate-hang verify ptrace 1 1 "$status")
+        timeout-probe/deliberate-hang verify ptrace 1 1 "$status" \
+        "$scratch/hang.stderr.timeout")
     expected='test timeout-probe/deliberate-hang/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))'
     [[ $reason == "$expected" ]] || {
         rm -rf "$scratch"
@@ -2215,7 +2240,26 @@ function audit_innermost_e2e_timeout {
     }
 
     status=0
+    run_capture "$scratch/exit-124.stdout" "$scratch/exit-124.stderr" 5 \
+        bash -c 'exit 124' || status=$?
+    [[ $status == 124 ]] || {
+        rm -rf "$scratch"
+        die "innermost E2E child-status bracket returned $status, expected 124"
+    }
+    if individual_test_timeout_reason timeout-probe/child-exit verify ptrace 1 5 \
+        "$status" "$scratch/exit-124.stderr.timeout" >/dev/null; then
+        rm -rf "$scratch"
+        die "a child that exited 124 before its deadline was labelled timeout"
+    fi
+
+    status=0
     run_capture "$scratch/pass.stdout" "$scratch/pass.stderr" 5 true || status=$?
+    LC_ALL=POSIX run_capture "$scratch/locale.stdout" "$scratch/locale.stderr" 5 \
+        bash -c 'printf %s "$LC_ALL"' || status=$?
+    [[ $(cat "$scratch/locale.stdout") == POSIX ]] || {
+        rm -rf "$scratch"
+        die "timeout diagnostics changed the child LC_ALL environment"
+    }
     rm -rf "$scratch"
     [[ $status == 0 ]] || die "innermost E2E positive bracket rejected a healthy command: exit $status"
     printf 'INNERMOST-TIMEOUT negative=1 named: %s\n' "$reason"
@@ -3020,7 +3064,8 @@ function run_cell {
     if ((prepare_status != 0)); then
         outcome=ERROR
         if reason=$(individual_test_timeout_reason \
-            "$id" prepare "$backend" 1 "$timeout_seconds" "$prepare_status"); then
+            "$id" prepare "$backend" 1 "$timeout_seconds" "$prepare_status" \
+            "$cell_dir/captures/prepare.stderr.timeout"); then
             :
         else
             reason="fixture preparation failed"
@@ -3036,7 +3081,8 @@ function run_cell {
             IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
             hashes+=("$hash")
             if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" native "$attempt" "$timeout_seconds" "$status"); then
+                "$id" "$mode" native "$attempt" "$timeout_seconds" "$status" \
+                "${_stderr_file}.timeout"); then
                 break
             fi
             timeout_reason=''
@@ -3076,7 +3122,8 @@ function run_cell {
                 break
             fi
             if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" "$backend" "seed-$seed-a" "$timeout_seconds" "$status1"); then
+                "$id" "$mode" "$backend" "seed-$seed-a" "$timeout_seconds" "$status1" \
+                "${stderr1}.timeout"); then
                 break
             fi
             timeout_reason=''
@@ -3087,7 +3134,8 @@ function run_cell {
                 break
             fi
             if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" "$backend" "seed-$seed-b" "$timeout_seconds" "$status2"); then
+                "$id" "$mode" "$backend" "seed-$seed-b" "$timeout_seconds" "$status2" \
+                "${stderr2}.timeout"); then
                 break
             fi
             timeout_reason=''
@@ -3221,7 +3269,8 @@ function run_cell {
                 break
             fi
             if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" "$backend" "$attempt" "$timeout_seconds" "$status"); then
+                "$id" "$mode" "$backend" "$attempt" "$timeout_seconds" "$status" \
+                "${stderr_file}.timeout"); then
                 break
             fi
             timeout_reason=''
@@ -3255,7 +3304,8 @@ function run_cell {
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$stderr_file")
         elif reason=$(individual_test_timeout_reason \
-            "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status"); then
+            "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status" \
+            "${stderr_file}.timeout"); then
             outcome=FAIL
         elif [[ $status != 0 ]]; then
             outcome=FAIL
