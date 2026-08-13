@@ -2160,6 +2160,9 @@ impl RunOpts {
             | Backend::E9patch => {}
             Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
+                // Keep the dedicated DynamoRIO launcher, but give it the same
+                // backend capability configuration as the public library path.
+                let config = hermit::prepare_backend_config(self.effective_det_config(), backend);
                 return super::backends::run_dbt(
                     &self.program,
                     &self.args,
@@ -2167,7 +2170,7 @@ impl RunOpts {
                     self.verify_allow,
                     self.summary,
                     global.log,
-                    &self.effective_det_config(),
+                    &config,
                     environment,
                 );
             }
