@@ -39,12 +39,12 @@ const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
 /// Every `ci = false` mode that carries no `ci_disabled_reason`, listed by
 /// identity.
 ///
-/// [`CI_REASON_REQUIRED_BUCKETS`] refuses these cells outright, but it can only
-/// be extended one bucket at a time, once that bucket's cells all carry
-/// reasons. Measured at c6c6d695, one bucket is covered (397 cells, all
-/// reasoned) and twelve are not (1130 cells, none reasoned). Turning the exact
-/// rule on everywhere today would refuse those 1130 and fail the build, so the
-/// uncovered buckets would otherwise keep growing while they are drained.
+/// The rule applies to every bucket, but twelve of the thirteen were populated
+/// before it existed. Measured at c6c6d695, one bucket is covered (397 cells,
+/// all reasoned) and twelve are not (1130 cells, none reasoned). Refusing
+/// those 1130 today would fail the build, so they are recorded here by
+/// identity while they are drained, and the uncovered buckets cannot grow
+/// meanwhile.
 ///
 /// This file lists each of those cells as `<test-id>::<mode>` and the set must
 /// match exactly. A NEW unreasoned cell is refused BY NAME; writing a reason
@@ -370,16 +370,12 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
 
 /// Identify every `ci = false` mode carrying no usable `ci_disabled_reason`, as
 /// `<test-id>::<mode>`. A present-but-blank reason counts as missing, so a
-/// cell cannot be drained with whitespace. Buckets already covered by
-/// [`CI_REASON_REQUIRED_BUCKETS`] are excluded: that rule refuses these cells
-/// outright.
+/// cell cannot be drained with whitespace. Every bucket is scanned, including
+/// the buckets in [`CI_REASON_REQUIRED_BUCKETS`].
 fn unreasoned_ci_false_cells(documents: &[Value]) -> BTreeSet<String> {
     let mut cells = BTreeSet::new();
     for document in documents {
-        let Some(bucket) = document.get("bucket").and_then(Value::as_str) else {
-            continue;
-        };
-        if CI_REASON_REQUIRED_BUCKETS.contains(&bucket) {
+        if document.get("bucket").and_then(Value::as_str).is_none() {
             continue;
         }
         let Some(tests) = document.get("test").and_then(Value::as_array) else {
