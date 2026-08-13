@@ -38,7 +38,7 @@ stripped_root_dirs = hermetic_infra/hermit
 prefix_mappings = fbcode//hermetic_infra/reverie->reverie// fbcode//common/rust/build_info->gh_facebook_buck2_shims_meta//common/rust/build_info
 
 [rust]
-default_edition = 2021
+default_edition = 2024
 
 [buck2]
 forkserver = false
