@@ -768,7 +768,12 @@ fn liteinst_strict_verify_python_random_example() {
     );
 }
 
-fn assert_clone_boundary(mode: &str) {
+/// Runs one task-creating guest mode under LiteInst and requires it to finish.
+///
+/// `marker` is the guest's own success line, so the assertion fails both when
+/// the run is refused (the old `ENOTSUPP` clone boundary) and when it exits
+/// zero without having reached the end of the mode.
+fn assert_multi_task_mode(mode: &str, marker: &str) {
     liteinst_runtime::ensure_liteinst_runtime();
     let mut child = Command::new(liteinst_runtime::hermit_binary())
         .args([
@@ -784,7 +789,7 @@ fn assert_clone_boundary(mode: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start Hermit LiteInst clone-boundary guest");
+        .expect("failed to start Hermit LiteInst multi-task guest");
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().expect("failed to poll Hermit LiteInst") {
@@ -793,25 +798,28 @@ fn assert_clone_boundary(mode: &str) {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("Hermit LiteInst hung while rejecting {mode}");
+            panic!("Hermit LiteInst hung running {mode}");
         }
         thread::sleep(Duration::from_millis(10));
     };
     let output = child
         .wait_with_output()
-        .expect("failed to collect Hermit LiteInst clone-boundary output");
+        .expect("failed to collect Hermit LiteInst multi-task output");
     assert_eq!(output.status, status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         status.code(),
-        Some(1),
-        "status={:?}\nstdout={}\nstderr={}",
+        Some(0),
+        "status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ENOTSUPP (Operation is not supported)"),
+        stdout.contains(marker),
+        "guest did not reach the end of {mode}\nstdout={stdout}\nstderr={stderr}",
+    );
+    assert!(
+        !stderr.contains("ENOTSUPP (Operation is not supported)"),
         "{stderr}"
     );
     assert!(!stderr.contains("Bad system call"), "{stderr}");
@@ -865,13 +873,13 @@ fn liteinst_preload_is_inert_without_host_runtime_selector() {
 }
 
 #[test]
-fn liteinst_thread_clone_fails_closed_without_sigsys() {
-    assert_clone_boundary("threads");
+fn liteinst_thread_clone_runs_without_sigsys() {
+    assert_multi_task_mode("threads", "threads-ok");
 }
 
 #[test]
-fn liteinst_fork_fails_closed_without_hanging() {
-    assert_clone_boundary("fork");
+fn liteinst_fork_runs_without_hanging() {
+    assert_multi_task_mode("fork", "fork-ok");
 }
 
 #[test]
