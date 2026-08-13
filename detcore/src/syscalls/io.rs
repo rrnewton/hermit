@@ -566,7 +566,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
             write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-            let result = guest.inject(probe).await;
+            let result = match guest.inject(probe).await {
+                // The injected syscall runs outside the guest's original
+                // restart frame.  Do not expose the kernel-internal restart
+                // instruction at the rewritten pselect6 call site.
+                Err(Errno::ERESTARTSYS) => Err(Errno::EINTR),
+                result => result,
+            };
             if result != Ok(0) {
                 let copy_result = if result.is_ok() {
                     self.copy_pselect6_results(guest, probe, call, len)
