@@ -404,33 +404,21 @@ for that repository-side change.
 
 ## Task Closure Policy
 
-**The dev-hermit parent `AGENTS.md` is authoritative for task lifecycle.** This
-section restates it for work done inside this repository and adds the
-Hermit-specific evidence a claim must carry. Where the two could be read
-differently, the parent wins; report the discrepancy rather than following this
-file.
+A task is not finished when the code is written; it is finished when the change
+is on `main`. Phantom closures — tasks marked closed while the work never landed
+— are a recurring, expensive failure mode. Do not create one. The rules below
+are mandatory for every implementation and review agent.
 
-`closed` means **published and evidenced, NOT landed**. Landing debt does not
-ride on the status — it rides on the `implemented` tag, which is what
-`drain-implemented-to-landed` and `health-tick` enumerate. Holding an evidenced,
-published task open until its PR merges is itself a defect: it is invisible to
-the drain while still occupying the live queue.
-
-The failure to avoid is not an agent closing its own task. It is an **unevidenced
-close** — a task marked closed with no PR link, no exact SHA, and no validation.
-Nothing mechanically blocks that, so the note *is* the audit trail. The rules
-below are mandatory for every implementation and review agent.
-
-1. **Record the evidence BEFORE you change status.** The order is load-bearing:
-   commit and push the branch, post the PR link with its exact SHA and
-   validation, add the `implemented` tag — and only then close. A close that
-   precedes its evidence cannot be audited afterwards, because nobody can tell
-   which SHA the claim was ever about.
+1. **Agents MUST NOT close tasks.** Never run `tg update <task> --status
+   closed` (or any equivalent close/complete transition). Closing is reserved
+   for the coordinator, who does it only after confirming the work is on
+   `main`. An agent that closes its own task is asserting a landing it cannot
+   witness.
 2. **When your work is complete, add the `implemented` tag and post the PR
-   link.** `IMPLEMENTED` is a tag, not a TaskGraph status, and it is what
-   carries the landing debt after the task closes. "Complete" means the feature
-   branch is pushed and a pull request is open against `rrnewton/hermit:main`.
-   Preserve the task's existing tags when recording the transition and evidence:
+   link.** `IMPLEMENTED` is a tag, not a TaskGraph status. The task remains
+   `in_progress`. "Complete" means the feature branch is pushed and a pull
+   request is open against `rrnewton/hermit:main`. Preserve the task's existing
+   tags when recording the transition and evidence:
 
    ```bash
    tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
@@ -446,65 +434,42 @@ below are mandatory for every implementation and review agent.
    change is actually present in the pull request diff, that the cited tests
    exist and were run at the PR head SHA, and that the reported assurance level
    (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check must lose the `implemented` tag. **This step comes before
-   the close, not after it.** An approval issued after a task is already closed
-   is a *record*, not a *check*. Reopening remains available when review lands
-   late anyway, but that is the exception; do not read the availability of a
-   remedy as permission to skip the step it remedies.
-4. **Then the owning agent closes its own task** — `tg update <task> --status
-   closed`. No coordinator, no gateway. Close once rules 1 and 3 are satisfied
-   and the PR is published; do **not** hold it open waiting for the merge. Work
-   that is genuinely blocked is different: a task with no published artifact, or
-   one whose published artifact is red or unvalidated at its exact head, stays
-   `in_progress` with the blocker and partial SHA recorded, and is never tagged
-   `implemented`. If a published artifact disappears or the implementation claim
-   proves false, strip the tag and reopen; do not invent a status TaskGraph does
-   not have.
-5. **After the PR lands, discharge the landing debt.** `./ci-hub/bin/close-task`
-   is no longer a closure gate, but it is still the only writer of
-   `CLOSURE-VERIFIED`, the note `health-tick` derives `landed` from. A task
-   closed without it stays counted as owed forever. Once the PR is on `main`:
-
-   ```bash
-   ./ci-hub/bin/close-task <id> --code <PR-or-full-SHA> --repo rrnewton/hermit \
-     --source <checkout>
-   ```
-
-   It verifies ancestry before recording. `REFUSED` (rc 1) and `UNVERIFIABLE`
-   (rc 2) never close anything — leave the task closed and fix the evidence. A
-   local green run, a GitHub state field, or a label is not landing evidence.
+   survive this check must lose the `implemented` tag.
+4. **The task stays `in_progress` + `implemented` until the PR lands on
+   `main`.** Open, in-review, validation-red, awaiting-merge, and
+   blocked-on-a-dependency PRs are never `closed`. If the published artifact
+   disappears or the implementation claim proves false, remove the tag; do not
+   invent a status that TaskGraph does not have.
+5. **Only the coordinator closes tasks, through the verified gateway.** After
+   freshly verifying that the landed commit is reachable from the target
+   `main`, the coordinator uses the dev-hermit parent's
+   `./ci-hub/bin/close-task` with the PR or full SHA. Never use raw
+   `tg update --status closed`. A local green run, a GitHub state field, or a
+   label is not landing evidence.
 
 ### Done vs. Not Done
 
 Use these concrete examples to decide the correct status. When in doubt, choose
 the lower status and say why in a task note.
 
-**`closed` + `implemented` (the owning agent closes, once evidenced):**
+**Done (coordinator may close):**
 
-- Branch pushed, PR open, adversarial review satisfied, exact-head validation
-  green, awaiting **only** the merge. "Do not hold it open waiting for the
-  merge" means exactly that and nothing broader: a pending merge is not a
-  blocker, so it is not grounds to stay open. A pending *fix* is.
-
-**`closed` + `CLOSURE-VERIFIED` (landing debt discharged):**
-
-- PR #### is merged into `rrnewton/hermit:main` and `close-task` has verified
-  the merge commit's freshly fetched ancestry. This is a later event than the
-  close, not a precondition for it.
+- PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
+  and the verified closure gateway accepts its freshly fetched ancestry.
 - A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
   updated to the exact landed SHAs, and the pair revalidated.
+
+**`in_progress` + `implemented` (agent's terminal state — do NOT close):**
+
+- Branch pushed, PR open, exact-head validation green, awaiting merge.
+- PR open but validation red, or an exact-head receipt missing/stale — still
+  `in_progress` + `implemented`; report the exact failure, do not close.
+- Work committed and pushed but blocked on another PR or a reverie pin bump —
+  `in_progress` + `implemented` with the blocker and dependency SHAs named.
 
 **Not done (stays `in_progress`, never tagged `implemented` or closed):**
 
 - Code written but uncommitted or not pushed. Do not use a stash as a handoff.
-- PR open but validation red, or an exact-head receipt missing or stale. Report
-  the exact failure in the note and leave the task open. A red PR is published
-  but it is **not evidenced**: red validation is evidence *against* the claim,
-  and rule 3 requires a reviewer to confirm real validation at the handoff SHA,
-  which a red head does not have. Closing it does not discharge the work, it
-  only removes it from the live queue while the defect survives.
-- Work committed and pushed but blocked on another PR or a reverie pin bump —
-  stays open with the blocker and the dependency SHAs named.
 - "It builds/tests pass locally" with no pushed branch and no open PR.
 - A green local `cargo test` presented as project completion — a local run is
   not a landing, and one backend passing is not "done" across all backends.
