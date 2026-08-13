@@ -183,10 +183,10 @@ rejected rather than silently falling back.
 LiteInst uses the normal Hermit run and verification paths. A successful
 `--strict --verify` run compares status/stdout/stderr exactly and applies the
 `Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not L2. L2 additionally requires
+diagnostic evidence, but it is not strict determinism. Strict verification requires
 `--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification currently supplies
-`/dev/null` as guest stdin. The supported execution scope is dynamically
+compared-message counts. Verification snapshots guest stdin once and supplies
+the identical bytes to both runs. The supported execution scope is dynamically
 linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
 `fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
 unsupported because the patch runtime is not yet re-bootstrapped and
@@ -291,8 +291,24 @@ the compared observations differ or if the guest exit status is not allowed.
 
 The default log comparison is `Stripped`: it can erase numbers, addresses,
 temporary paths, and time values from selected messages. It is a fast
-diagnostic, not L2. Use `--verify-strict --verify-json REPORT.json` when a
-canonical L2 result is required.
+diagnostic, not strict determinism. Use
+`--verify-strict --verify-json REPORT.json` when a canonical strict result is
+required.
+
+Matching verification logs are temporary by default; divergent comparisons
+retain both. Keep both runs regardless of verdict with `--keep-logs`; Hermit
+prints only the final, readable paths. The default
+destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
+`~/.local/state/hermit/verify-logs`, and `--verify-log-dir=DIR` selects another
+durable directory. `--print-verify-logs` instead copies the first run's captured
+log to stderr; it does not retain either file.
+
+`hermit log-diff LOG` prints the canonical INFO stream from one retained log.
+`hermit log-diff LEFT RIGHT --json REPORT.json` compares the same canonical
+INFO stream and atomically records a one-line result, including the first
+divergent scheduler turn and virtual nanoseconds when the logs contain that
+position. An empty or unreadable comparison exits with an error rather than
+reporting a match.
 
 The guest must be idempotent. A first run that modifies an input file,
 database, cache, or other host-visible state can legitimately change the

@@ -206,7 +206,9 @@ pub struct StartOpts {
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
-    /// "guest_signal":int|null}`. This is the exit-code-independent verdict
+    /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
+    /// "first_divergent_virtual_nanoseconds":int|null}`. This is the
+    /// exit-code-independent verdict
     /// channel: `verified` reflects whether the record and replay runs matched,
     /// regardless of what the guest exited with, so a caller need not (and must
     /// not) infer the verdict from the process exit code. A record/replay parity
@@ -474,6 +476,7 @@ impl StartOpts {
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                keep_logs: false,
             },
         )?;
 

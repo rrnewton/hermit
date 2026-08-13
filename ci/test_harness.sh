@@ -2592,7 +2592,7 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the L2 parity assertion?
+# Does this test's verify mode opt into the strict bitwise-parity assertion?
 function verify_asserts_bitwise_parity {
     local metadata=$1
     jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
@@ -2623,10 +2623,10 @@ function assert_bitwise_parity_verdict {
         return 1
     fi
     if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
-        printf 'verify did not reach L2 parity: %s\n' "$summary"
+        printf 'verify did not reach strict bitwise parity: %s\n' "$summary"
         return 1
     fi
-    printf 'L2 parity: %s\n' "$summary"
+    printf 'strict bitwise parity: %s\n' "$summary"
     return 0
 }
 
@@ -2669,7 +2669,7 @@ function execute_attempt {
         : >"$path_evidence_file"
         env_args+=(HERMIT_SABRE_PATH_EVIDENCE="$path_evidence_file")
     fi
-    local -a command guest_command profile run_args guest_args custom_args
+    local -a command guest_command profile run_args guest_args custom_args verify_log_flags
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     mapfile -t guest_args < <(
         jq -r --arg mode "$mode" --arg backend "$guest_backend" \
@@ -2698,6 +2698,12 @@ function execute_attempt {
     if [[ $(jq -r .lane <<<"$metadata") == portable && $mode != naked ]]; then
         profile=(--no-virtualize-cpuid --max-timeslice=disabled)
     fi
+    verify_log_flags=()
+    if [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 && $mode == verify ]]; then
+        local verify_log_dir="$cell_dir/verify-logs/verify-$attempt"
+        mkdir -p "$verify_log_dir"
+        verify_log_flags=(--keep-logs --verify-log-dir "$verify_log_dir")
+    fi
 
     case "$mode" in
         naked)
@@ -2706,21 +2712,22 @@ function execute_attempt {
         verify)
             # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
             # which normalizes numbers/addresses/paths away wholesale and so
-            # "cannot establish L2" (AGENTS.md). A cell that opts into
+            # cannot establish strict determinism. A cell that opts into
             # `assert = { bitwise_parity = true }` is upgraded to the canonical
             # parity comparator and made to emit a machine-readable verdict, which
             # run_cell then checks -- otherwise the cell would be justified by a
             # parity measurement it never actually performs.
-            local verify_strict_flags=()
+            local verify_strict_flags=(--verify-json
+                "$(verify_verdict_path "$cell_dir" "$attempt")")
             if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict --verify-json
-                    "$(verify_verdict_path "$cell_dir" "$attempt")")
+                verify_strict_flags=(--verify-strict "${verify_strict_flags[@]}")
             fi
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
+                "${verify_strict_flags[@]}" "${verify_log_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
+                --verify-json "$(verify_verdict_path "$cell_dir" "$attempt")"
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
@@ -2744,6 +2751,29 @@ function execute_attempt {
         "${env_args[@]}" "${command[@]}"
     status=$?
     set -e
+
+    # Pressure runs retain verify logs. For the ptrace column, also retain the
+    # canonical INFO stream that future backend-parity comparisons consume.
+    # This uses the exact Hermit binary that produced the raw log.
+    if [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 && $mode == verify && $backend == ptrace ]]; then
+        local -a run1_logs=("$verify_log_dir"/run1_log_*)
+        local normalized_log="$verify_log_dir/normalized-ptrace-golden.log"
+        local normalized_tmp="$normalized_log.tmp"
+        local normalized_status=2
+        if ((${#run1_logs[@]} == 1)) && [[ -s ${run1_logs[0]} ]]; then
+            set +e
+            "$HERMIT_BIN" log-diff "${run1_logs[0]}" >"$normalized_tmp"
+            normalized_status=$?
+            set -e
+            if ((normalized_status == 0)); then
+                mv "$normalized_tmp" "$normalized_log"
+            else
+                : >"$normalized_log"
+                [[ ! -e $normalized_tmp ]] || unlink "$normalized_tmp"
+            fi
+        fi
+        printf '%s\n' "$normalized_status" >"$verify_log_dir/normalized-ptrace-golden.status"
+    fi
 
     local hash attempt_execution
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
@@ -2788,18 +2818,24 @@ function append_result {
         verify)
             # The receipt must record the flags that actually ran. Reporting a
             # bare `--strict --verify` for a cell that ran the parity comparator
-            # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
+            # (or vice versa) is how a stripped result gets mistaken for a
+            # strict bitwise-parity result.
+            local keep_verify_logs=false
+            [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 ]] && keep_verify_logs=true
             effective_args=$(jq -cn --arg backend "$backend" \
                 --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
+                --argjson keep "$keep_verify_logs" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
+                 + (if $strict then ["--verify-strict"] else [] end)
+                 + ["--verify-json","<cell-verify-report>"]
+                 + (if $keep then ["--keep-logs","--verify-log-dir","<cell-verify-log-dir>"] else [] end)')
             log_level=info
             ;;
         replay)
             timeout_seconds=$(jq -r .timeout_seconds <<<"${METADATA_BY_ID[$test_id]}")
             effective_args=$(jq -cn --arg backend "$backend" --arg timeout "$timeout_seconds" \
                 '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify",
-                  "--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
+                  "--verify-json","<cell-verify-report>","--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
             log_level=info
             ;;
         chaos)
@@ -3119,7 +3155,7 @@ function run_cell {
             reason="$mode exited with status $status"
         elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
             # A zero exit only means the comparator this run used was satisfied.
-            # For an L2 cell, read the verdict the run itself published and
+            # For a strict bitwise-parity cell, read the verdict the run itself published and
             # require full parity; anything else is a FAIL, not a PASS.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
