@@ -134,18 +134,24 @@ afterward while the run directory remains retained.
 Enabled red cells use the ordinary exact-cell selector; disabled red cells use
 the harness's explicit `--probe-disabled` selector. Each cell gets at most the
 shipped portable DAG's existing 600-second bucket allowance; the manifest's
-smaller timeout still applies inside it. Expected nonzero exits, timeouts,
-OOMs, and no-result outcomes stay red but do not stop later cells. If the
+smaller per-attempt timeout still applies inside it. Expected nonzero exits,
+timeouts, OOMs, and no-result outcomes stay red but do not stop later cells. If the
 cgroup runner itself stops after a bounded cell is killed, the command keeps a
 conservative attempt marker and starts another DAG pass; completed builds,
 preparations, and cells are not repeated. KVM cells retain the canonical
 privileged DAG's 16 GiB hard cap even when their manifest lane is portable. A
-malformed per-cell artifact, or a missing artifact without the narrowly proven
-OOM case below, becomes an infrastructure-error row; the tool finishes the
-table and writes `summary.json`, then returns nonzero rather than claiming a
-complete population. The retained runner profile is
-what distinguishes an OOM or node timeout from an ordinary nonzero harness
-exit. The combined `crash-error` result contains remaining nonzero harness
+malformed published per-cell artifact, or a missing artifact without a
+narrowly proven runner timeout or OOM, becomes an infrastructure-error row;
+the tool finishes the table and writes `summary.json`, then returns nonzero
+rather than claiming a complete population. The retained runner profile is
+what distinguishes an OOM or boxed cell timeout from an ordinary nonzero
+harness exit. A timeout requires either that exact runner row plus the attempt marker,
+or the test harness's separate GNU-timeout signal report plus its named
+per-attempt timeout result; exit 124 alone is not timeout evidence. Cell results
+are published from an `in-progress` path only after the harness returns; that
+path is never terminal evidence, so an empty file created before a runner kill
+cannot masquerade as a malformed terminal result. The combined `crash-error`
+result contains remaining nonzero harness
 exits, including signal-caused crashes when the shell reports a nonzero status;
 the pressure runner does not currently distinguish the originating signal. A
 missing result, verification report, or retained log is accepted only when an

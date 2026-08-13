@@ -108,7 +108,7 @@ Bounded-batch options (run and plan):
                            not a CPU budget and never weakens per-cell limits.
 
 Examples:
-  # Probe one currently red ptrace/verify cell with a 60-second wrapper cap.
+  # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
   ./ci/compat-envelope/pressure-test.rs run \
     --test applications/example-timed-progress-bar \
     --mode verify --backend ptrace --cell-timeout 60
@@ -796,10 +796,10 @@ fn print_exact_manifest_command(
         .get(&(cell.test.clone(), cell.mode.clone()))
         .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
     println!(
-        "Pressure wrapper wall cap: {}s (the manifest's own timeout remains nested and cannot extend this cap)",
+        "Boxed cell wall cap: {}s (the manifest's per-attempt timeout remains nested and cannot extend this cap)",
         pressure_timeout(budget, selection.cell_timeout_seconds)
     );
-    println!("Manifest command inside that wrapper:");
+    println!("Manifest command inside that boxed cell:");
     let output = Command::new(root.join("tests/manifest-cli.rs"))
         .args([
             "get",
@@ -1121,7 +1121,7 @@ fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> i64 {
     )
 }
 
-fn pressure_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> i64 {
+fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> i64 {
     pressure_timeout(budget, selected_cap) + 20
 }
 
@@ -1142,7 +1142,7 @@ fn require_cell_occupancy_fits(
                     tracked.id.test, tracked.id.mode
                 )
             })?;
-        let seconds = pressure_node_timeout(budget, selected_cap);
+        let seconds = pressure_timeout(budget, selected_cap);
         all_seconds = all_seconds.saturating_add(seconds);
         if tracked.id.backend == "kvm" {
             kvm_seconds = kvm_seconds.saturating_add(seconds);
@@ -1411,7 +1411,7 @@ fn write_plan(
             status = shell_quote(&status_path.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
-        let wall = pressure_node_timeout(budget, selection.cell_timeout_seconds);
+        let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds);
         steps.push(json!({
             "group": "prepare",
             "job": job,
@@ -1431,6 +1431,7 @@ fn write_plan(
     }
 
     let mut cell_tags = Vec::new();
+    let mut cell_timeouts = BTreeMap::new();
     for tracked in &cells {
         let cell = &tracked.id;
         let budget = budgets
@@ -1443,7 +1444,9 @@ fn write_plan(
         let tag = format!("cell.{slug}");
         let cell_dir = results.join("cells").join(&slug);
         let result_file = cell_dir.join("results.jsonl");
+        let result_in_progress = cell_dir.join("results.in-progress.jsonl");
         let junit = cell_dir.join("junit.xml");
+        let junit_in_progress = cell_dir.join("junit.in-progress.xml");
         let status_file = cell_dir.join("harness-status");
         let (selector, backend) = if tracked.enabled {
             let backend = if cell.backend == "native" {
@@ -1458,7 +1461,6 @@ fn write_plan(
                 format!(" --backend {}", shell_quote(&cell.backend)),
             )
         };
-        let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds);
         let preparation_guard = if selection.is_exact() {
             String::new()
         } else {
@@ -1480,8 +1482,8 @@ fn write_plan(
                 test = shell_quote(&cell.test),
                 mode = shell_quote(&cell.mode),
                 backend = backend,
-                result_file = shell_quote(&result_file.to_string_lossy()),
-                junit = shell_quote(&junit.to_string_lossy()),
+                result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                junit = shell_quote(&junit_in_progress.to_string_lossy()),
             )
         } else {
             format!(
@@ -1490,28 +1492,35 @@ fn write_plan(
                 test = shell_quote(&cell.test),
                 mode = shell_quote(&cell.mode),
                 backend = backend,
-                result_file = shell_quote(&result_file.to_string_lossy()),
-                junit = shell_quote(&junit.to_string_lossy()),
+                result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                junit = shell_quote(&junit_in_progress.to_string_lossy()),
             )
         };
         let cmd = format!(
             "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
-             timeout --kill-after=10s {pressure_seconds}s env \
-             E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
+             env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
              E2E_KEEP_VERIFY_LOGS=1 \
              {harness} \
-             || status=$?; printf '%s\\n' \"$status\" > {status_file}; exit 0",
+             || status=$?; \
+             if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
+             if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit} || status=$?; fi; \
+             printf '%s\\n' \"$status\" > {status_file}; exit \"$status\"",
             cell_dir = shell_quote(&cell_dir.to_string_lossy()),
             results = shell_quote(&results.to_string_lossy()),
             build_root = shell_quote(&build_root.to_string_lossy()),
             run_id = shell_quote(&slug),
             harness = harness,
+            result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
+            result_file = shell_quote(&result_file.to_string_lossy()),
+            junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
+            junit = shell_quote(&junit.to_string_lossy()),
             status_file = shell_quote(&status_file.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
             preparation_guard = preparation_guard,
         );
-        let wall = pressure_node_timeout(budget, selection.cell_timeout_seconds);
+        let wall = pressure_timeout(budget, selection.cell_timeout_seconds);
+        cell_timeouts.insert(tag.clone(), wall);
         // KVM's canonical privileged nodes are boxed at 16 GiB even when the
         // manifest cell itself is in the portable lane. Preserve that safety
         // boundary here; a 3 GiB generic portable cap kills the VM before its
@@ -1579,7 +1588,7 @@ fn write_plan(
         "default_step_cpu_timeout": max_timeout * 2,
         "steps": steps,
     });
-    audit_dag(&dag, cells.len(), run_timeout_seconds)?;
+    audit_dag(&dag, cells.len(), run_timeout_seconds, &cell_timeouts)?;
     let mut dag_text = serde_json::to_string_pretty(&dag)
         .map_err(|e| format!("cannot serialize pressure DAG: {e}"))?;
     dag_text.push('\n');
@@ -1616,7 +1625,12 @@ fn write_plan(
     Ok(metadata)
 }
 
-fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result<(), String> {
+fn audit_dag(
+    dag: &JsonValue,
+    expected_cells: usize,
+    run_timeout: i64,
+    expected_cell_timeouts: &BTreeMap<String, i64>,
+) -> Result<(), String> {
     let steps = dag["steps"]
         .as_array()
         .ok_or("generated DAG has no steps array")?;
@@ -1652,12 +1666,24 @@ fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result
         }
         if group == "cell" {
             cells += 1;
+            let expected_timeout = expected_cell_timeouts
+                .get(&tag)
+                .ok_or_else(|| format!("{tag} has no derived cell wall cap"))?;
+            if timeout != *expected_timeout {
+                return Err(format!(
+                    "{tag} wall timeout {timeout}s does not equal its derived {expected_timeout}s cap"
+                ));
+            }
             let cmd = step["cmd"].as_str().unwrap_or("");
             let enabled_selector = cmd.contains("--include-manual");
             let disabled_selector = cmd.contains("--probe-disabled");
             let prepared_input = cmd.contains("--prebuilt")
                 || cmd.contains("HERMIT_BIN=\"$PWD/target/release/hermit\"");
-            if !cmd.contains("timeout --kill-after=10s")
+            if cmd.contains("timeout --kill-after=10s")
+                || !cmd.contains("printf '125")
+                || !cmd.contains("exit \"$status\"")
+                || !cmd.contains("results.in-progress.jsonl")
+                || !cmd.contains("mv --")
                 || enabled_selector == disabled_selector
                 || !prepared_input
                 || !cmd.contains("--test")
@@ -1665,7 +1691,9 @@ fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result
                 || !cmd.contains("--results")
                 || !cmd.contains("--junit")
             {
-                return Err(format!("{tag} lost its bounded exact-cell harness command"));
+                return Err(format!(
+                    "{tag} lost its runner-bounded exact-cell harness command"
+                ));
             }
             if cmd.contains("--prebuilt")
                 && (!cmd.contains("/prepare/")
@@ -1686,9 +1714,10 @@ fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result
             return Err(format!("{tag} depends on absent step {dep}"));
         }
     }
-    if cells != expected_cells || summaries != 1 {
+    if cells != expected_cells || expected_cell_timeouts.len() != expected_cells || summaries != 1 {
         return Err(format!(
-            "generated DAG shape mismatch: cells={cells}/{expected_cells}, summaries={summaries}/1"
+            "generated DAG shape mismatch: cells={cells}/{expected_cells}, timeout_caps={}/{expected_cells}, summaries={summaries}/1",
+            expected_cell_timeouts.len()
         ));
     }
     Ok(())
@@ -1758,7 +1787,27 @@ fn validate_run_contract(
             .map_err(|e| format!("cannot read {}: {e}", dag_path.display()))?,
     )
     .map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
-    audit_dag(&dag, expected.len(), metadata.run_timeout_seconds)?;
+    let budgets = load_budgets(root)?;
+    let mut expected_cell_timeouts = BTreeMap::new();
+    for cell in expected.keys() {
+        let budget = budgets
+            .get(&(cell.test.clone(), cell.mode.clone()))
+            .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
+        let tag = format!(
+            "cell.{}",
+            sanitize(&format!(
+                "{}-{}-{}-{}-{}",
+                cell.lane, cell.category, cell.test, cell.mode, cell.backend
+            ))
+        );
+        expected_cell_timeouts.insert(tag, pressure_timeout(budget, metadata.cell_timeout_seconds));
+    }
+    audit_dag(
+        &dag,
+        expected.len(),
+        metadata.run_timeout_seconds,
+        &expected_cell_timeouts,
+    )?;
     let dag_cells: BTreeSet<_> = dag["steps"]
         .as_array()
         .into_iter()
@@ -1899,15 +1948,17 @@ fn load_runner_evidence(
 
 fn reason_reports_timeout(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| {
-        reason.contains("timeout") || reason.contains("timed out") || reason.contains("exit 124")
+        reason.ends_with("(innermost E2E timeout: deadline reached (exit 124))")
+            || reason.ends_with("(innermost E2E timeout: SIGKILL after 10 s grace (exit 137))")
     })
 }
 
-fn status_reports_timeout(status: Option<i32>) -> bool {
-    // GNU timeout's unambiguous deadline status is 124. Raw 137 is also the
-    // ordinary shell status for a guest killed by SIGKILL, so it remains a
-    // crash/error unless the retained cgroup row or result reason says timeout.
-    status == Some(124)
+fn is_proven_timeout_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
+    // safe-ci owns the cell wall clock. Its exact-SHA/exact-step timeout row
+    // and the marker written before the harness starts are both required.
+    // A child may exit 124 on its own, so a terminal status is never timeout
+    // proof by itself.
+    runner.seen && runner.timed_out && harness_status == Some(INCOMPLETE_ATTEMPT_STATUS)
 }
 
 fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -1916,6 +1967,18 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
     // cgroup reported an OOM kill; without both records, absence of terminal
     // artifacts is not evidence of a guest OOM.
     runner.seen && runner.oom && harness_status.is_some()
+}
+
+fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
+    runner.seen
+        && !runner.oom
+        && !runner.timed_out
+        && harness_status.is_some_and(|status| {
+            !matches!(
+                status,
+                INCOMPLETE_ATTEMPT_STATUS | PREPARATION_FAILED_STATUS
+            )
+        })
 }
 
 fn result_row_matches_cell(
@@ -1975,12 +2038,15 @@ fn classify_result(
         } else {
             "infrastructure-error"
         }
-    } else if !verification_evidence_valid {
+    } else if is_proven_timeout_attempt(runner, harness_status) {
+        if verification_evidence_valid {
+            "timeout"
+        } else {
+            "infrastructure-error"
+        }
+    } else if runner.timed_out || !verification_evidence_valid {
         "infrastructure-error"
-    } else if runner.timed_out
-        || status_reports_timeout(harness_status)
-        || reason_reports_timeout(reason)
-    {
+    } else if reason_reports_timeout(reason) {
         "timeout"
     } else if mode == "verify"
         && matches!(verification_verdict, Some("matched" | "diverged"))
@@ -2271,6 +2337,7 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
             None
         };
         let proven_oom = is_proven_oom_attempt(runner, harness_status);
+        let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
         let result_file = cell_dir.join("results.jsonl");
         let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
             match fs::read_to_string(&result_file) {
@@ -2298,7 +2365,7 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
                                     harness_status,
                                 );
                                 let runner_completed =
-                                    runner.seen && runner.ok && !runner.oom && !runner.timed_out;
+                                    runner_observed_terminal_attempt(runner, harness_status);
                                 if row_matches && (proven_oom || runner_completed) {
                                     (row.outcome, true, row.reason, row.error_kind)
                                 } else {
@@ -2327,7 +2394,7 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
                     ("NO_RESULT".to_string(), false, None, None)
                 }
             }
-        } else if !proven_oom {
+        } else if !proven_oom && !proven_timeout {
             evidence_errors.push(format!("missing result row {}", result_file.display()));
             ("NO_RESULT".to_string(), false, None, None)
         } else {
@@ -2335,7 +2402,11 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         };
         let verification = match read_verification_report(results, cell) {
             Ok(Some(report)) => Some(report),
-            Ok(None) if matches!(cell.mode.as_str(), "verify" | "replay") && !proven_oom => {
+            Ok(None)
+                if matches!(cell.mode.as_str(), "verify" | "replay")
+                    && !proven_oom
+                    && !proven_timeout =>
+            {
                 evidence_errors.push(format!(
                     "missing verification report {}",
                     verification_report_path(results, cell).display()
@@ -2422,6 +2493,7 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
             "runner_timed_out": runner.timed_out,
             "runner_oom": runner.oom,
             "oom_proven_by_runner_and_attempt_marker": proven_oom,
+            "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
         }));
     }
     println!("# Red-cell pressure-test results");
@@ -2625,9 +2697,15 @@ fn self_test() -> Result<(), String> {
         return Err("shell quoting did not round-trip".into());
     }
 
-    let exact_cell_command = "timeout --kill-after=10s 20s HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run \
+    let exact_cell_command = "printf '125\\n' > harness-status; status=0; \
+        env HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run \
         --include-manual --test fixture --mode verify \
-        --results result.jsonl --junit result.xml";
+        --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; \
+        if test -e results.in-progress.jsonl; then \
+        mv -- results.in-progress.jsonl results.jsonl || status=$?; fi; \
+        if test -e junit.in-progress.xml; then \
+        mv -- junit.in-progress.xml junit.xml || status=$?; fi; \
+        printf '%s\\n' \"$status\" > harness-status; exit \"$status\"";
     let fixture = json!({
         "steps": [
             {
@@ -2635,8 +2713,8 @@ fn self_test() -> Result<(), String> {
                 "job": "fixture",
                 "cmd": exact_cell_command,
                 "deps": [],
-                "timeout": 40,
-                "cpu_timeout": 80,
+                "timeout": 20,
+                "cpu_timeout": 40,
                 "hint": {"hard_mem_max_bytes": 1024}
             },
             {
@@ -2650,25 +2728,34 @@ fn self_test() -> Result<(), String> {
             }
         ]
     });
-    audit_dag(&fixture, 1, 100)
+    let fixture_timeouts = BTreeMap::from([("cell.fixture".to_string(), 20)]);
+    audit_dag(&fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive generated-DAG bracket failed: {e}"))?;
+    let mut widened_cell_timeout = fixture.clone();
+    widened_cell_timeout["steps"][0]["timeout"] = json!(21);
+    if audit_dag(&widened_cell_timeout, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("cell wall timeout wider than its selected cap was accepted".into());
+    }
     let mut disabled_fixture = fixture.clone();
     disabled_fixture["steps"][0]["cmd"] = json!(
         exact_cell_command
             .replace("--include-manual", "--probe-disabled")
             .replace("--test fixture", "--test fixture --backend kvm")
     );
-    audit_dag(&disabled_fixture, 1, 100)
+    audit_dag(&disabled_fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
     let mut prepared_fixture = fixture.clone();
     prepared_fixture["steps"][0]["cmd"] = json!(
         "printf '125\\n' > '/results/cells/fixture/harness-status'; \
          if ! test \"$(cat '/results/prepare/fixture/status' 2>/dev/null)\" = 0; then \
          printf '126\\n' > '/results/cells/fixture/harness-status'; exit 0; fi; \
-         timeout --kill-after=10s 20s ./ci/test_harness.sh run --include-manual --prebuilt \
-         --test fixture --mode verify --results result.jsonl --junit result.xml"
+         status=0; env ./ci/test_harness.sh run --include-manual --prebuilt \
+         --test fixture --mode verify --results results.in-progress.jsonl \
+         --junit junit.in-progress.xml || status=$?; \
+         mv -- results.in-progress.jsonl results.jsonl || status=$?; \
+         printf '%s\\n' \"$status\" > harness-status; exit \"$status\""
     );
-    audit_dag(&prepared_fixture, 1, 100)
+    audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive preparation-refusal bracket failed: {e}"))?;
     prepared_fixture["steps"][0]["cmd"] = json!(
         prepared_fixture["steps"][0]["cmd"]
@@ -2676,13 +2763,36 @@ fn self_test() -> Result<(), String> {
             .unwrap()
             .replace("printf '126", "printf '0")
     );
-    if audit_dag(&prepared_fixture, 1, 100).is_ok() {
+    if audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts).is_ok() {
         return Err("prebuilt cell without the preparation-failure refusal was accepted".into());
+    }
+    let mut nested_timeout_fixture = fixture.clone();
+    nested_timeout_fixture["steps"][0]["cmd"] = json!(exact_cell_command.replace(
+        "env HERMIT_BIN",
+        "timeout --kill-after=10s 20s env HERMIT_BIN"
+    ));
+    if audit_dag(&nested_timeout_fixture, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("cell with a nested wall timeout was accepted".into());
+    }
+    let mut swallowed_failure_fixture = fixture.clone();
+    swallowed_failure_fixture["steps"][0]["cmd"] =
+        json!(exact_cell_command.replace("exit \"$status\"", "exit 0"));
+    if audit_dag(&swallowed_failure_fixture, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("cell command that hid its terminal status was accepted".into());
+    }
+    let mut direct_result_fixture = fixture.clone();
+    direct_result_fixture["steps"][0]["cmd"] = json!(
+        exact_cell_command
+            .replace("results.in-progress.jsonl", "results.jsonl")
+            .replace("mv --", "cp --")
+    );
+    if audit_dag(&direct_result_fixture, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("cell command without terminal result publication was accepted".into());
     }
     let mut missing_exact_selector = fixture;
     missing_exact_selector["steps"][0]["cmd"] =
         json!(exact_cell_command.replace("--mode verify", ""));
-    if audit_dag(&missing_exact_selector, 1, 100).is_ok() {
+    if audit_dag(&missing_exact_selector, 1, 100, &fixture_timeouts).is_ok() {
         return Err("negative generated-DAG bracket accepted a cell without an exact mode".into());
     }
 
@@ -2743,12 +2853,13 @@ fn self_test() -> Result<(), String> {
     {
         return Err("retained runner evidence did not preserve pass/OOM/timeout identity".into());
     }
-    if !reason_reports_timeout(Some("deadline reached (exit 124)"))
+    if !reason_reports_timeout(Some(
+        "test fixture/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))",
+    )) || !reason_reports_timeout(Some(
+        "test fixture/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: SIGKILL after 10 s grace (exit 137))",
+    )) || reason_reports_timeout(Some("deadline reached (exit 124)"))
+        || reason_reports_timeout(Some("guest timed out"))
         || reason_reports_timeout(Some("verify exited with status 1"))
-        || !status_reports_timeout(Some(124))
-        || status_reports_timeout(Some(137))
-        || status_reports_timeout(Some(1))
-        || status_reports_timeout(None)
     {
         return Err("timeout failure bucketing lost its positive or negative bracket".into());
     }
@@ -2767,12 +2878,37 @@ fn self_test() -> Result<(), String> {
         timed_out: true,
         ..runner_ok
     };
+    let runner_failed = RunnerEvidence {
+        ok: false,
+        ..runner_ok
+    };
     if !is_proven_oom_attempt(runner_oom, Some(INCOMPLETE_ATTEMPT_STATUS))
         || is_proven_oom_attempt(runner_oom, None)
         || is_proven_oom_attempt(runner_ok, Some(INCOMPLETE_ATTEMPT_STATUS))
     {
         return Err(
             "OOM proof did not require both an exact runner OOM row and numeric attempt marker"
+                .into(),
+        );
+    }
+    if !is_proven_timeout_attempt(runner_timeout, Some(INCOMPLETE_ATTEMPT_STATUS))
+        || is_proven_timeout_attempt(runner_timeout, Some(124))
+        || is_proven_timeout_attempt(runner_timeout, None)
+        || is_proven_timeout_attempt(runner_ok, Some(INCOMPLETE_ATTEMPT_STATUS))
+    {
+        return Err(
+            "timeout proof did not require both an exact runner timeout row and the incomplete-attempt marker"
+                .into(),
+        );
+    }
+    if !runner_observed_terminal_attempt(runner_ok, Some(0))
+        || !runner_observed_terminal_attempt(runner_failed, Some(1))
+        || runner_observed_terminal_attempt(runner_ok, Some(INCOMPLETE_ATTEMPT_STATUS))
+        || runner_observed_terminal_attempt(runner_ok, Some(PREPARATION_FAILED_STATUS))
+        || runner_observed_terminal_attempt(runner_timeout, Some(1))
+    {
+        return Err(
+            "terminal runner evidence accepted an incomplete, preparation-failed, or runner-killed attempt"
                 .into(),
         );
     }
@@ -2823,8 +2959,8 @@ fn self_test() -> Result<(), String> {
         ),
         classify_result(
             runner_timeout,
-            Some(124),
-            "FAIL",
+            Some(INCOMPLETE_ATTEMPT_STATUS),
+            "NO_RESULT",
             false,
             None,
             "verify",
@@ -2834,14 +2970,38 @@ fn self_test() -> Result<(), String> {
         ),
         classify_result(
             runner_timeout,
-            Some(124),
-            "FAIL",
+            Some(INCOMPLETE_ATTEMPT_STATUS),
+            "NO_RESULT",
             false,
             None,
             "verify",
             None,
             false,
             false,
+        ),
+        classify_result(
+            runner_failed,
+            Some(1),
+            "FAIL",
+            true,
+            Some(
+                "test fixture/verify/ptrace exceeded 1 s in attempt 1 (innermost E2E timeout: deadline reached (exit 124))",
+            ),
+            "verify",
+            Some("no_result"),
+            true,
+            true,
+        ),
+        classify_result(
+            runner_failed,
+            Some(124),
+            "FAIL",
+            true,
+            None,
+            "naked",
+            None,
+            false,
+            true,
         ),
         classify_result(
             runner_oom,
@@ -2929,6 +3089,8 @@ fn self_test() -> Result<(), String> {
             "crash-error",
             "timeout",
             "infrastructure-error",
+            "timeout",
+            "crash-error",
             "oom",
             "infrastructure-error",
             "infrastructure-error",
