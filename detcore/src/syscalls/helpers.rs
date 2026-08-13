@@ -6,7 +6,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -178,6 +184,177 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             // Otherwise, the socket was already nonblocking, so we can safely execute it just once.
             Ok(self.record_or_replay(guest, wrapped).await?)
+        }
+    }
+
+    /// Keep the pipe object alive while a logically blocking write yields. Linux pins the
+    /// open file description when the syscall starts, so closing and reusing the guest's fd
+    /// must not redirect a later completion attempt. Some backends do not expose guest fds
+    /// through procfs; those keep the existing injected-syscall path.
+    pub async fn pin_pipe_writer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+    ) -> Result<Option<File>, Errno> {
+        let flags = guest
+            .inject_with_retry(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(syscalls::FcntlCmd::F_GETFL),
+            )
+            .await? as i32;
+        let access_mode = flags & libc::O_ACCMODE;
+        if access_mode == libc::O_RDONLY {
+            return Err(Errno::EBADF);
+        }
+
+        let expected = self.inject_fstat(guest, fd).await?;
+        let path = format!("/proc/{}/fd/{fd}", guest.pid().as_raw());
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if access_mode == libc::O_RDWR {
+            options.read(true);
+        }
+        let Ok(file) = options
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | (flags & libc::O_DIRECT))
+            .open(&path)
+        else {
+            tracing::debug!(%path, "backend does not expose a controller handle for this guest pipe");
+            return Ok(None);
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Ok(None);
+        };
+        if !metadata.file_type().is_fifo()
+            || metadata.dev() != expected.st_dev
+            || metadata.ino() != expected.st_ino
+        {
+            tracing::warn!(
+                %path,
+                expected_device = expected.st_dev,
+                expected_inode = expected.st_ino,
+                observed_device = metadata.dev(),
+                observed_inode = metadata.ino(),
+                "refusing a controller pipe handle whose kernel identity does not match the guest descriptor"
+            );
+            return Ok(None);
+        }
+        Ok(Some(file))
+    }
+
+    async fn deliver_pipe_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest
+            .inject_with_retry(
+                syscalls::Tgkill::new()
+                    .with_tgid(guest.pid().as_raw())
+                    .with_tid(guest.tid().as_raw())
+                    .with_sig(libc::SIGPIPE),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Complete a logically blocking scalar pipe write after Hermit has made the guest fd
+    /// physically nonblocking. The first attempt retains the original syscall so Linux keeps
+    /// its error precedence and large-write behavior. Positive shorts and EAGAIN then yield;
+    /// later attempts use the pinned pipe object so guest fd reuse cannot redirect them.
+    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+        mut pinned_pipe: File,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+        let Some(buffer) = call.buf() else {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        };
+        let target = call.len().min(MAX_RW_COUNT);
+        if target == 0 {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let mut written_total = 0usize;
+        let mut first_attempt = true;
+
+        loop {
+            if resources.poll_attempt > 0 {
+                let resume = resource_request(guest, resources.clone()).await;
+                if resume == ResumeStatus::Signaled {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(call.signal_interrupt_errno().into())
+                    };
+                }
+            }
+
+            let remaining = target - written_total;
+            let Some(attempt_buffer) = buffer
+                .as_raw()
+                .checked_add(written_total)
+                .and_then(Addr::<u8>::from_raw)
+            else {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(Errno::EFAULT.into())
+                };
+            };
+            let used_pinned_pipe = !first_attempt;
+            let attempt_len = if first_attempt {
+                remaining
+            } else {
+                remaining.min(4096)
+            };
+            let attempt = call.with_buf(Some(attempt_buffer)).with_len(attempt_len);
+            let result = if first_attempt {
+                first_attempt = false;
+                guest.inject_with_retry(attempt).await
+            } else {
+                write_guest_bytes(guest, &mut pinned_pipe, attempt_buffer, attempt_len)
+            };
+            if used_pinned_pipe && matches!(result, Err(Errno::EPIPE)) {
+                self.deliver_pipe_sigpipe(guest).await?;
+            }
+
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    if written > attempt_len {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Errno::EAGAIN) => {}
+                Err(error) => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write after {:?}: {}",
+                resources.poll_attempt,
+                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
         }
     }
 
@@ -428,6 +605,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap();
         }
     }
+}
+
+fn io_errno(error: std::io::Error) -> Errno {
+    Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn write_guest_bytes<G, T>(
+    guest: &G,
+    pipe: &mut File,
+    buffer: Addr<u8>,
+    length: usize,
+) -> Result<i64, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut bytes = vec![0; length];
+    guest.memory().read_exact(buffer, &mut bytes)?;
+    pipe.write(&bytes)
+        .map(|written| written as i64)
+        .map_err(io_errno)
 }
 
 fn remaining_writev_segment(

@@ -914,6 +914,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.stat().map(|x| x.inode),
                 )
             })?;
+        let blocking_pipe =
+            physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking;
+        // Pin before metadata or scheduler resource requests can let another thread close and
+        // reuse the numeric fd. Backends without a host-visible procfs fd keep the old path.
+        let pinned_pipe = if blocking_pipe {
+            self.pin_pipe_writer(guest, call.fd()).await?
+        } else {
+            None
+        };
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
@@ -942,7 +951,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if let Some(pinned_pipe) = pinned_pipe {
+            self.execute_blocking_pipe_write(guest, call, pinned_pipe)
+                .await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
