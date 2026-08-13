@@ -1113,11 +1113,11 @@ fn run_dbt_rejects_unfollowed_execveat() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_executes_dynamic_guest() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1139,11 +1139,11 @@ fn run_kvm_executes_dynamic_guest() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(hermit_kvm_tests_available, hermit_test_awk_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/awk"
+)]
 fn run_kvm_awk_mincore_probe_terminates() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1176,11 +1176,11 @@ fn run_kvm_awk_mincore_probe_terminates() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_resolves_bare_program_from_guest_path() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1199,14 +1199,15 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(
+        hermit_kvm_tests_available,
+        hermit_test_setpriv_available,
+        hermit_test_date_available
+    )),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/setpriv and /bin/date"
+)]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/usr/bin/setpriv").exists()
-        || !Path::new("/bin/date").exists()
-    {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1228,12 +1229,120 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
     assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
 }
 
-#[test]
-fn run_kvm_propagates_explicit_environment() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
+/// The two sanitizer variables Hermit forces into *every* guest, on *every*
+/// backend.
+///
+/// `hermit-cli/src/bin/hermit/run.rs` sets both to `detect_leaks=0` in one
+/// backend-independent place. That is a deliberate cross-backend parity fix,
+/// not a leak: the ptrace family forces them at spawn time inside
+/// `reverie-ptrace`, while the out-of-process KVM backend has no such spawn
+/// hook, so without this the guest would see two fewer variables under KVM than
+/// under ptrace -- directly observable as a differing DETLOG `[env ...]` hash.
+/// The unit test `guest_env_disables_sanitizer_leak_detection_on_every_backend`
+/// pins that invariant where the command is constructed; this file observes it
+/// end to end, in the guest's own `env` output.
+///
+/// So these two lines are *expected* output of `--base-env=empty`. Measured on
+/// a self-hosted KVM-capable runner at hermit `2b6005cf`: `--backend kvm` and
+/// `--backend ptrace` both emit exactly this pair plus the explicit value,
+/// byte-identical, 5/5 runs each. (The box name is deliberately not written
+/// here: `check.portability_paths` rejects literal hosts in build/run files,
+/// and the machine belongs in the commit trailer, not in source.)
+const FORCED_GUEST_ENV: [&str; 2] = ["ASAN_OPTIONS=detect_leaks=0", "LSAN_OPTIONS=detect_leaks=0"];
 
+/// Describes how a guest's `env` output differs from *exactly*
+/// [`FORCED_GUEST_ENV`] plus `explicit`; `None` means it matched exactly.
+///
+/// This is an EXCLUSIVE set comparison on purpose. A `contains` check would
+/// pass when a host variable leaks in *and* pass when the explicit variable is
+/// dropped, so it could not tell a working `--base-env=empty` from a broken
+/// one. This test has already been non-discriminating once -- it silently
+/// skipped and reported success -- and a `contains` check would be the same
+/// defect wearing a different costume.
+fn guest_env_difference(stdout: &str, explicit: &[&str]) -> Option<String> {
+    let mut expected: Vec<&str> = FORCED_GUEST_ENV
+        .iter()
+        .copied()
+        .chain(explicit.iter().copied())
+        .collect();
+    expected.sort_unstable();
+    let mut actual: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    actual.sort_unstable();
+    if actual == expected {
+        return None;
+    }
+    let missing: Vec<&str> = expected
+        .iter()
+        .filter(|value| !actual.contains(value))
+        .copied()
+        .collect();
+    let unexpected: Vec<&str> = actual
+        .iter()
+        .filter(|value| !expected.contains(value))
+        .copied()
+        .collect();
+    Some(format!(
+        "guest environment mismatch: missing {missing:?}, unexpected {unexpected:?} \
+         (observed {actual:?})"
+    ))
+}
+
+// The four controls below deliberately do NOT invoke Hermit and are NOT named
+// `run_kvm_*`. They therefore run on every host, including one without
+// `/dev/kvm`, and survive the `--skip run_kvm_` filter that the portable DAG
+// applies to `test.cli`. A control that only runs where the thing it controls
+// runs is not a control.
+
+#[test]
+fn guest_env_difference_accepts_the_forced_pair_plus_the_explicit_value() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nKVM_M3C=passed\nLSAN_OPTIONS=detect_leaks=0\n";
+    assert_eq!(guest_env_difference(observed, &["KVM_M3C=passed"]), None);
+}
+
+/// The exact string this test asserted before it was corrected -- which is also
+/// the *pre-parity-fix* KVM behaviour, where the guest saw the explicit value
+/// and not the two sanitizer variables. The corrected expectation must reject
+/// it, or it would still pass against the divergence the product already fixed.
+#[test]
+fn guest_env_difference_rejects_the_pre_parity_fix_output() {
+    let difference = guest_env_difference("KVM_M3C=passed\n", &["KVM_M3C=passed"])
+        .expect("the pre-parity-fix output must not satisfy the corrected expectation");
+    assert!(
+        difference.contains("ASAN_OPTIONS=detect_leaks=0"),
+        "{difference}"
+    );
+    assert!(
+        difference.contains("LSAN_OPTIONS=detect_leaks=0"),
+        "{difference}"
+    );
+}
+
+#[test]
+fn guest_env_difference_rejects_a_leaked_host_variable() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nKVM_HOST_ONLY=must-not-leak\n\
+                    KVM_M3C=passed\nLSAN_OPTIONS=detect_leaks=0\n";
+    let difference = guest_env_difference(observed, &["KVM_M3C=passed"])
+        .expect("a leaked host variable must fail the expectation");
+    assert!(
+        difference.contains("KVM_HOST_ONLY=must-not-leak"),
+        "{difference}"
+    );
+}
+
+#[test]
+fn guest_env_difference_rejects_a_dropped_explicit_variable() {
+    let observed = "ASAN_OPTIONS=detect_leaks=0\nLSAN_OPTIONS=detect_leaks=0\n";
+    let difference = guest_env_difference(observed, &["KVM_M3C=passed"])
+        .expect("a dropped explicit variable must fail the expectation");
+    assert!(difference.contains("KVM_M3C=passed"), "{difference}");
+}
+
+#[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
+fn run_kvm_propagates_explicit_environment() {
     let args = [
         "run",
         "--backend",
@@ -1245,22 +1354,37 @@ fn run_kvm_propagates_explicit_environment() {
         "--",
         "/usr/bin/env",
     ];
-    let output = hermit(&args);
+    // Plant a host-only value, as `run_dbt_uses_the_requested_guest_environment`
+    // does: `--base-env=empty` only means something if there was something to
+    // exclude. The exclusive comparison below fails on this value specifically
+    // and on any other unexpected one.
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("KVM_HOST_ONLY", "must-not-leak")
+        .args(args)
+        .output()
+        .expect("failed to run the KVM guest-environment regression");
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "KVM_M3C=passed\n");
+    let stdout = stdout(&output);
+    assert_eq!(
+        guest_env_difference(&stdout, &["KVM_M3C=passed"]),
+        None,
+        "guest environment was not exactly the forced sanitizer pair plus the \
+         explicit value:\n{stdout}",
+    );
 }
 
 #[test]
+#[cfg_attr(
+    not(all(
+        hermit_kvm_tests_available,
+        hermit_test_bash_available,
+        hermit_test_paste_available,
+        hermit_test_diff_available
+    )),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /bin/bash, /usr/bin/paste and /usr/bin/diff"
+)]
 fn run_kvm_bash_process_substitution_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
-        || !Path::new("/bin/bash").exists()
-        || !Path::new("/usr/bin/paste").exists()
-        || !Path::new("/usr/bin/diff").exists()
-    {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1281,10 +1405,11 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_cpuid_policy_is_deterministic() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
     let compiler = ["cc", "gcc", "clang"]
         .into_iter()
         .find(|program| {
@@ -1337,11 +1462,11 @@ fn run_kvm_cpuid_policy_is_deterministic() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_respects_workdir_for_relative_paths() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create KVM cwd fixture");
     fs::write(temp.path().join("message.txt"), b"from-kvm-cwd\n")
         .expect("failed to write KVM cwd fixture");
@@ -1369,11 +1494,11 @@ fn run_kvm_respects_workdir_for_relative_paths() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_lists_host_directory_metadata() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create KVM directory fixture");
     fs::write(temp.path().join("alpha.txt"), b"alpha\n")
         .expect("failed to write KVM directory fixture");
@@ -1422,11 +1547,11 @@ fn run_kvm_lists_host_directory_metadata() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reads_host_file() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let expected = fs::read_to_string("/etc/hostname").expect("failed to read host hostname");
     let args = [
         "run",
@@ -1446,11 +1571,11 @@ fn run_kvm_reads_host_file() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1467,11 +1592,11 @@ fn run_kvm_reads_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
+)]
 fn run_kvm_f_getfl_and_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1491,11 +1616,11 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
+)]
 fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1517,11 +1642,11 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_verify_isolates_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1539,11 +1664,11 @@ fn run_kvm_verify_isolates_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_preserves_closed_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1569,11 +1694,11 @@ fn run_kvm_preserves_closed_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(hermit_kvm_tests_available, hermit_test_perl_available)),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm and /usr/bin/perl"
+)]
 fn run_kvm_verify_does_not_write_to_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
-        return;
-    }
-
     let temp = tempfile::tempdir().expect("failed to create stdin fixture");
     let path = temp.path().join("stdin");
     fs::write(&path, b"original-data").expect("failed to write stdin fixture");
@@ -1606,11 +1731,11 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_counts_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1630,11 +1755,11 @@ fn run_kvm_counts_standard_input() {
 }
 
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reports_hostname() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let args = [
         "run",
         "--backend",
@@ -1654,10 +1779,11 @@ fn run_kvm_reports_hostname() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm the host C compiler is acceptable for this KVM smoke guest.
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
     let compiler = ["cc", "gcc", "clang"]
         .into_iter()
         .find(|program| {
@@ -1735,11 +1861,11 @@ int main(void) {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
 #[test]
+#[cfg_attr(
+    not(hermit_kvm_tests_available),
+    ignore = "SKIPPED: requires readable and writable /dev/kvm"
+)]
 fn run_kvm_reports_fixed_supplementary_groups() {
-    if !Path::new("/dev/kvm").exists() {
-        return;
-    }
-
     let kvm_args = [
         "run",
         "--backend",
