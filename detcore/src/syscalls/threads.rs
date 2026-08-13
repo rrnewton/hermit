@@ -930,11 +930,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let poll_call = call.with_options(call.options() | libc::WNOHANG);
-        let mut first_poll = true;
         loop {
-            let signaled = !first_poll
-                && resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
-            first_poll = false;
+            // Matches `retry_nonblocking_syscall_helper`, which `wait4` uses: the
+            // scheduler is consulted at the TOP of EVERY iteration, including the
+            // first, and a signal returns immediately. The earlier form skipped the
+            // request on the first poll (`!first_poll && ...`) and deferred the
+            // check until after the physical poll, so the polling thread was never
+            // presented to the scheduler as a plain blocking request. It stayed
+            // perpetually runnable, every turn was a SkipTurn, logical time never
+            // advanced to the pending timer's deadline, and the loop spun without
+            // bound -- measured at 203k retries with committed time pinned.
+            if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                return Err(Errno::ERESTARTSYS.into());
+            }
 
             guest.memory().write_value(info, &empty_info)?;
             let result = guest.inject_with_retry(poll_call).await;
@@ -962,9 +970,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Ok(value);
                     }
 
-                    if signaled {
-                        return Err(Errno::ERESTARTSYS.into());
-                    }
+                    // The signal check now happens at the top of the loop, before
+                    // the physical poll, exactly as the shared helper does. A child
+                    // event observed on this pass is still reported in preference
+                    // to a pending signal, which is the return above.
                     rsrc.poll_attempt += 1;
                     trace!(
                         "Retry #{} for waitid because no child state is ready",
