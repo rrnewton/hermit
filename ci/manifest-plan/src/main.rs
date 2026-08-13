@@ -369,10 +369,10 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
 }
 
 /// Identify every `ci = false` mode carrying no usable `ci_disabled_reason`, as
-/// `<test-id>::<mode>`. A present-but-blank reason counts as missing, matching
-/// [`validate_ci_disabled_reason`], so a cell cannot be drained with
-/// whitespace. Buckets already covered by [`CI_REASON_REQUIRED_BUCKETS`] are
-/// excluded: that rule refuses these cells outright.
+/// `<test-id>::<mode>`. A present-but-blank reason counts as missing, so a
+/// cell cannot be drained with whitespace. Buckets already covered by
+/// [`CI_REASON_REQUIRED_BUCKETS`] are excluded: that rule refuses these cells
+/// outright.
 fn unreasoned_ci_false_cells(documents: &[Value]) -> BTreeSet<String> {
     let mut cells = BTreeSet::new();
     for document in documents {
