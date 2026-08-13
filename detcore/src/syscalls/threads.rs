@@ -62,6 +62,8 @@ use crate::tool_global::wait_for_child_lifecycle;
 use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
+use crate::tool_local::RobustListExit;
+use crate::tool_local::RobustListWake;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -1023,7 +1025,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(_) if len != robust_list::ROBUST_LIST_HEAD_LEN => None,
             Some(addr) => Some(addr),
         };
-        guest.thread_state_mut().robust_list_head = recorded;
+        guest.thread_state_mut().record_robust_list_head(recorded);
         trace!(
             "[detcore, dtid {}] robust-list head registered: {:?}",
             guest.thread_state().dettid,
@@ -1075,6 +1077,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             dettid,
             defer_owner_death_to_backend: self.cfg.backend_runs_exit_robust_list,
+            staged_wakes: None,
             tool: PhantomData,
         };
         let outcome = robust_list::exit_robust_list(&mut effects, head, owner_tid).await;
@@ -1088,6 +1091,46 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[detcore, dtid {}] robust-list walk stopped early after {} entr(ies): {:?}",
                 dettid, outcome.entries_visited, outcome,
             );
+        }
+    }
+
+    /// Read every registered robust list in the current thread group while
+    /// its address space still exists, but hold its modeled wakes until the
+    /// corresponding ptrace exit callback confirms Linux has completed the
+    /// atomic owner-word update.
+    pub(crate) async fn stage_thread_group_robust_list_wakes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: RobustListExit,
+    ) {
+        if !self.cfg.backend_runs_exit_robust_list
+            || !self.cfg.sequentialize_threads
+            || self.cfg.debug_futex_mode != BlockingMode::Precise
+        {
+            return;
+        }
+
+        let heads = guest.thread_state().robust_list_heads();
+        for (owner, head) in heads {
+            let mut wakes = Vec::new();
+            let mut effects = GuestRobustEffects::<'_, G, T> {
+                guest,
+                dettid: owner,
+                defer_owner_death_to_backend: true,
+                staged_wakes: Some(&mut wakes),
+                tool: PhantomData,
+            };
+            let outcome =
+                robust_list::exit_robust_list(&mut effects, head, owner.as_raw() as u32).await;
+            if outcome.head_unreadable || outcome.aborted {
+                trace!(
+                    "[detcore, dtid {}] could not stage complete robust-list owner-death effects: {:?}",
+                    owner, outcome,
+                );
+            }
+            guest
+                .thread_state()
+                .stage_robust_list_wakes(owner, reason, wakes);
         }
     }
 
@@ -1126,32 +1169,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        // KNOWN PARTIAL, and not a bookkeeping one -- see
-        // https://github.com/rrnewton/hermit/issues/2082.
-        //
-        // Linux puts EVERY task in the thread group through `do_exit` ->
-        // `futex_exit_release` -> `exit_robust_list`, so it walks N lists here.
-        // Detcore walks exactly one: this caller's. Siblings torn down by
-        // `exit_group` never execute `SYS_exit`, so they never reach
-        // `handle_exit`, and there is no other hook that could cover them:
-        // `Tool::on_exit_thread` does see them, but it is bounded
-        // `G: GlobalRPC<Self::GlobalState>` with no `Guest`, so it cannot read
-        // guest memory to walk a list at all.
-        //
-        // Do NOT assume this has the reach of `wake_futex_child_cleartid`, which
-        // fires from `Scheduler::logically_kill_thread` and DOES cover those
-        // siblings. That is the other half of `mm_release()`, and it needs no
-        // guest memory, which is exactly why it can be modeled process-wide and
-        // this cannot.
-        //
-        // Consequence: a process-shared robust mutex (`FutexID::Shared`) still
-        // held by a sibling when the group exits is never marked
-        // `FUTEX_OWNER_DIED`, so a waiter in another process parks forever.
-        // Single-process guests are unaffected, because every waiter dies with
-        // the group. The same gap applies to `execve`'s `de_thread` and to fatal
-        // signals; `handle_signal_event` does carry a `Guest`, so the
-        // fatal-signal half is not architecturally blocked the way this is.
-        self.run_robust_list_owner_death(guest).await;
+        if self.cfg.backend_runs_exit_robust_list {
+            self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
+                .await;
+        } else {
+            // DBT and SaBRe report exit before native cleanup, while KVM has no
+            // native Linux cleanup. Their existing current-thread walk remains
+            // the best available behavior until they have an atomic update or
+            // a post-cleanup callback.
+            self.run_robust_list_owner_death(guest).await;
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -2409,6 +2436,7 @@ struct GuestRobustEffects<'a, G, T> {
     guest: &'a mut G,
     dettid: DetTid,
     defer_owner_death_to_backend: bool,
+    staged_wakes: Option<&'a mut Vec<RobustListWake>>,
     tool: PhantomData<T>,
 }
 
@@ -2491,6 +2519,14 @@ where
         // glibc always issues robust-mutex futex operations with the shared
         // flag, and so does the kernel's owner-death wake; resolve the same key.
         let futexid = self.guest.thread_state().futex_id(address, false);
+        if let Some(wakes) = self.staged_wakes.as_mut() {
+            wakes.push(RobustListWake { futex: futexid });
+            debug!(
+                "[detcore, dtid {}] staged robust-list owner-death wake until physical exit",
+                self.dettid,
+            );
+            return;
+        }
         let woken = match futex_action(
             self.guest,
             FutexAction::WakeRequest(1),

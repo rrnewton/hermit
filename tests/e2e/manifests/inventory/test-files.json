@@ -1561,6 +1561,12 @@
       "why": "tests/c/rlimit_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "integration-fixture",
+      "path": "tests/c/robust_futex_owner_lifecycle.c",
+      "runner": "hermit-cli/tests/robust_futex_owner_death.rs",
+      "why": "tests/c/robust_futex_owner_lifecycle.c is owned by hermit-cli/tests/robust_futex_owner_death.rs: the integration test compiles this multi-mode process-shared robust-mutex guest, requires the waiter to set FUTEX_WAITERS before triggering owner death, exercises native Linux signal, exit_group, and de_thread behavior, and checks the supported ptrace signal and exit_group paths for EOWNERDEAD plus one post-exit modeled wake"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/sabre_exit_group_parked.c",
       "runner": "hermit-cli/tests/hermit_modes.rs",

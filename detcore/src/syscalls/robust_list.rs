@@ -38,12 +38,16 @@
 //! so the remaining process-shared race is visible rather than hidden by an
 //! atomic test double.
 //!
-//! # Scope: voluntary thread exit only
+//! # Lifecycle scope
 //!
-//! Detcore replays this walk from the `exit`/`exit_group` syscall handlers, but
-//! an `exit_group` caller still walks only its own registration. Sibling
-//! cleanup, successful exec's `de_thread` cleanup, and fatal signals need
-//! lifecycle handling that is not available on every backend.
+//! Ptrace mirrors every thread's registration and can read all sibling lists
+//! before `exit_group` or a Guest-observed fatal signal destroys the address
+//! space. It holds those modeled wakes until the physical-exit callback, after
+//! Linux has performed the atomic owner-word transition. Fatal signals that
+//! terminate an injected blocking syscall do not currently provide that
+//! Guest-bearing callback, and successful exec's `de_thread` path is blocked by
+//! a separate ptrace exec-lifecycle failure. DBT, KVM, and SaBRe also need
+//! backend-specific lifecycle or atomic-memory support.
 //!
 //! # Structure
 //!
@@ -363,7 +367,7 @@ async fn handle_futex_death<E: RobustDeathEffects>(
         // inconsistent state that user-space owner-died handling cannot
         // recover from. The kernel re-tests this after every retry too,
         // because the word may have reached zero in the meantime.
-        if pending_op && !entry.is_pi && uval == 0 {
+        if pending_op && !entry.is_pi && uval & FUTEX_TID_MASK == 0 {
             effects.wake_one(word, uval).await;
             return DeathStep::Continue;
         }
@@ -770,6 +774,26 @@ mod tests {
             "setting FUTEX_OWNER_DIED on a free word would corrupt user-space state"
         );
         assert_eq!(guest.get_u32(0x3000), Some(0));
+    }
+
+    #[test]
+    fn a_pending_op_with_no_owner_wakes_with_flag_bits_set() {
+        for flags in [
+            FUTEX_OWNER_DIED,
+            FUTEX_WAITERS,
+            FUTEX_OWNER_DIED | FUTEX_WAITERS,
+        ] {
+            let mut guest = FakeGuest::default();
+            guest.head(0x1000, 0x1000, 0x3020);
+            guest.node(0x3020, 0x1000, flags);
+
+            let outcome = walk(&mut guest, 0x1000, OWNER);
+
+            assert_eq!(outcome.entries_visited, 1);
+            assert_eq!(guest.wakes, vec![(0x3000, flags)]);
+            assert!(guest.marks.is_empty());
+            assert_eq!(guest.get_u32(0x3000), Some(flags));
+        }
     }
 
     #[test]
