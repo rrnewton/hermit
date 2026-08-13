@@ -7,15 +7,21 @@
  */
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 const DETERMINISM_RUNS: usize = 5;
+const DEADLOCK_RUNS: usize = 3;
+const DEADLOCK_BOUND: Duration = Duration::from_secs(5);
 
 static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -33,6 +39,47 @@ fn command_output(mut command: Command, label: &str) -> Output {
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn kill_created_process_group(pid: u32, label: &str) {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            panic!("failed to kill created {label} process group {pid}: {error}");
+        }
+    }
+}
+
+fn bounded_command_output(mut command: Command, label: &str) -> (Output, bool, Duration) {
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let rendered = format!("{command:?}");
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if started.elapsed() >= DEADLOCK_BOUND => {
+                kill_created_process_group(child.id(), label);
+                break true;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                kill_created_process_group(child.id(), label);
+                let _ = child.wait();
+                panic!("failed to poll {label}: {rendered}: {error}");
+            }
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to collect {label}: {rendered}: {error}"));
+    (output, timed_out, started.elapsed())
 }
 
 fn hermit_signal_lock() -> MutexGuard<'static, ()> {
@@ -168,6 +215,71 @@ fn blocking_sigsuspend_releases_the_scheduler() {
         "blocking-sigsuspend",
         "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
     );
+}
+
+#[test]
+fn sigsuspend_without_signal_reports_terminal_deadlock() {
+    let _guard = hermit_signal_lock();
+    let mut baseline_stderr = None;
+
+    for iteration in 0..DEADLOCK_RUNS {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command.args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--base-env=minimal",
+            "--",
+        ]);
+        command
+            .arg(signal_guest())
+            .arg("blocking-sigsuspend-no-signal");
+        let label = format!("no-signal sigsuspend scenario, iteration {}", iteration + 1);
+        let (output, timed_out, elapsed) = bounded_command_output(command, &label);
+        assert!(
+            !timed_out,
+            "{label} exceeded the {DEADLOCK_BOUND:?} host bound; the scheduler emitted no terminal verdict"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label} did not exit with the scheduler deadlock status in {elapsed:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            output.stdout, b"sigsuspend waiting without a signal\n",
+            "{label} did not reach rt_sigsuspend"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for expected in [
+            "Deadlock detected: thread(s) waiting in rt_sigsuspend with no possible signal, but no runnable threads left.",
+            "external IO blockers: none",
+            "rt_sigsuspend blockers (1), by dettid:",
+        ] {
+            assert!(
+                stderr.contains(expected),
+                "{label} missing {expected:?}:\n{stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("unexpected sigsuspend return"),
+            "{label} returned from sigsuspend instead of diagnosing the wait:\n{stderr}"
+        );
+
+        if let Some(first) = &baseline_stderr {
+            assert_eq!(
+                output.stderr,
+                *first,
+                "no-signal sigsuspend diagnostic changed on iteration {}",
+                iteration + 1
+            );
+        } else {
+            baseline_stderr = Some(output.stderr);
+        }
+    }
 }
 
 #[test]

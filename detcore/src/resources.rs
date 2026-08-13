@@ -307,6 +307,11 @@ pub enum ResourceID {
     /// endpoint has not yet fired. The contained value is the post-increment
     /// syscall count observed by the guest.
     HappensBeforeCheckpoint(u64),
+
+    /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
+    /// atomically installs its temporary signal mask. Unlike arbitrary external
+    /// IO, this operation cannot complete without a signal.
+    BlockingRtSigsuspend(ExternalOpId),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -461,6 +466,10 @@ mod tests {
         assert_ne!(
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid2, 7))
+        );
+        assert_ne!(
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(tid1, 7))
         );
         assert_ne!(
             ResourceID::ParentContinue {

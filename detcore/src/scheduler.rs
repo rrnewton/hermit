@@ -252,6 +252,11 @@ pub struct BlockedPool {
     /// different than the normal relationship
     pub external_io_blockers: BTreeMap<DetTid, ExternalOpId>,
 
+    /// Threads executing the real `rt_sigsuspend` outside the runnable set.
+    /// These retain the kernel's atomic temporary-mask semantics, but unlike
+    /// arbitrary external IO they cannot complete without a signal.
+    pub rt_sigsuspend_blockers: BTreeMap<DetTid, ExternalOpId>,
+
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
     /// When a guest child process exits, the kernel raises `SIGCHLD` on the
@@ -283,6 +288,7 @@ impl BlockedPool {
             && self.physical_child_waiters.is_empty()
             && self.physical_child_ready.is_empty()
             && self.external_io_blockers.is_empty()
+            && self.rt_sigsuspend_blockers.is_empty()
             && self.sigchld_deferred.is_empty()
     }
 
@@ -294,7 +300,7 @@ impl BlockedPool {
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
             && self.physical_child_ready.is_empty()
-            && has_external_wait
+            && (has_external_wait || !self.rt_sigsuspend_blockers.is_empty())
     }
 
     /// Returns true if there are zero threads blocked on futexes.
@@ -303,12 +309,23 @@ impl BlockedPool {
     }
 }
 
-/// Record the expectations about requests to continue after blocking IO.
-fn external_continue_id(req: &Resources) -> ExternalOpId {
+/// Validate a request made by a thread executing outside the runnable set.
+/// A signal may interrupt a real blocking syscall before its ordinary
+/// continuation request is posted, so an inbound-signal request is ready too.
+/// `vfork` is excluded because a signal does not satisfy its child barrier.
+fn blocking_request_is_ready(
+    req: &Resources,
+    expected: ExternalOpId,
+    signal_can_complete: bool,
+) -> bool {
     assert_eq!(req.resources.len(), 1);
     let rsrc = req.resources.iter().next().unwrap().0;
     match rsrc {
-        ResourceID::BlockedExternalContinue(op_id) | ResourceID::VforkFailed(op_id) => *op_id,
+        ResourceID::BlockedExternalContinue(op_id) | ResourceID::VforkFailed(op_id) => {
+            assert_eq!(*op_id, expected);
+            true
+        }
+        ResourceID::InboundSignal(_) if signal_can_complete => true,
         other => panic!("expected external continue request, got {other:?}"),
     }
 }
@@ -1911,6 +1928,7 @@ impl Scheduler {
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
+        let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
@@ -2488,7 +2506,8 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid);
+        let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
+            || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
             self.backend_reports_physical_process_exits && has_external_blocker;
         if cfg!(debug_assertions) && !await_external_continuation {
@@ -2572,34 +2591,62 @@ impl Scheduler {
         }
     }
 
-    /// Check on threads that were backgrounded performing external IO.
+    /// Check on threads executing blocking syscalls outside the runnable set.
     fn step2c_process_io_blockers(&mut self) -> Result<(), SkipTurn> {
-        if !self.blocked.external_io_blockers.is_empty() {
-            // A nondeterministic snapshot of which blocking IO actions are ready right now:
-            let ready: Vec<DetTid> = self
+        if !self.blocked.external_io_blockers.is_empty()
+            || !self.blocked.rt_sigsuspend_blockers.is_empty()
+        {
+            // A nondeterministic snapshot of which backgrounded actions are ready right now:
+            let mut blockers: Vec<(DetTid, ExternalOpId, bool)> = self
                 .blocked
                 .external_io_blockers
                 .iter()
-                .filter(|(dtid, op_id)| {
+                .map(|(dtid, op_id)| (*dtid, *op_id, !self.vfork_barriers.contains_key(dtid)))
+                .chain(
+                    self.blocked
+                        .rt_sigsuspend_blockers
+                        .iter()
+                        .map(|(dtid, op_id)| (*dtid, *op_id, true)),
+                )
+                .collect();
+            blockers.sort_by_key(|(dtid, _, _)| *dtid);
+            let ready: Vec<DetTid> = blockers
+                .iter()
+                .filter(|(dtid, op_id, signal_can_complete)| {
                     let nt = self
                         .next_turns
                         .get(dtid)
                         .expect("internal invariant broken");
                     if let Some(Ok(req)) = nt.req.try_read() {
-                        assert_eq!(external_continue_id(&req), **op_id);
-                        true
+                        blocking_request_is_ready(&req, *op_id, *signal_can_complete)
                     } else {
                         false
                     }
                 })
-                .map(|(dtid, _)| *dtid)
+                .map(|(dtid, _, _)| *dtid)
                 .collect();
             debug!(
-                "Nondeterministic status of blocking IO: out of {}, completed on {}, dtids: {:?}",
-                self.blocked.external_io_blockers.len(),
+                "Nondeterministic status of backgrounded operations: out of {}, completed on {}, dtids: {:?}",
+                blockers.len(),
                 ready.len(),
                 ready
             );
+
+            let requeue_ready = |scheduler: &mut Self, ready: &[DetTid]| {
+                for ready_dtid in ready {
+                    info!(
+                        "[step2] Reschedule formerly backgrounded dtid {:?}",
+                        ready_dtid
+                    );
+                    let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
+                    let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
+                    assert!(
+                        external.is_some() ^ sigsuspend.is_some(),
+                        "ready thread must belong to exactly one blocking pool"
+                    );
+                    scheduler.run_queue.push_eager_io_repoll(*ready_dtid);
+                }
+            };
 
             // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
             // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
@@ -2633,14 +2680,14 @@ impl Scheduler {
                 // return early forever, so the completed read/write was never rescheduled
                 // and the poller spun on data that never arrived.
                 if !ready.is_empty() {
-                    for ready_dtid in &ready {
-                        info!(
-                            "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
-                            ready_dtid
-                        );
-                        self.blocked.external_io_blockers.remove(ready_dtid);
-                        self.run_queue.push_eager_io_repoll(*ready_dtid);
-                    }
+                    requeue_ready(self, &ready);
+                    return Ok(());
+                }
+
+                // `rt_sigsuspend` has no spontaneous completion: with no real
+                // external IO left, continue to step2d so a finite timer can
+                // fire or the signal-less wait can receive a terminal verdict.
+                if self.blocked.external_io_blockers.is_empty() {
                     return Ok(());
                 }
 
@@ -2670,14 +2717,7 @@ impl Scheduler {
             }
 
             if !ready.is_empty() {
-                for ready_dtid in &ready {
-                    info!(
-                        "[step2] Reschedule formerly (external IO) blocked dtid {:?}",
-                        ready_dtid
-                    );
-                    self.blocked.external_io_blockers.remove(ready_dtid);
-                    self.run_queue.push_eager_io_repoll(*ready_dtid);
-                }
+                requeue_ready(self, &ready);
             }
             if self.run_queue.is_empty()
                 && self.blocked.timed_waiters.is_empty()
@@ -2786,6 +2826,9 @@ impl Scheduler {
             classes.push(
                 "thread(s) waiting indefinitely (pause, or a timer beyond the end of logical time)",
             );
+        }
+        if !self.blocked.rt_sigsuspend_blockers.is_empty() {
+            classes.push("thread(s) waiting in rt_sigsuspend with no possible signal");
         }
         if classes.is_empty() {
             // Defensive: every caller fires with at least one class present.
@@ -2927,6 +2970,19 @@ impl Scheduler {
             }
         }
 
+        if self.blocked.rt_sigsuspend_blockers.is_empty() {
+            let _ = writeln!(out, "  rt_sigsuspend blockers: none");
+        } else {
+            let _ = writeln!(
+                out,
+                "  rt_sigsuspend blockers ({}), by dettid:",
+                self.blocked.rt_sigsuspend_blockers.len()
+            );
+            for (dettid, op) in self.blocked.rt_sigsuspend_blockers.iter() {
+                let _ = writeln!(out, "    dtid {}: {:?}", dettid, op);
+            }
+        }
+
         // Both are BTreeSets, so already ordered.
         let deferred: Vec<DetTid> = self.blocked.sigchld_deferred.iter().copied().collect();
         let ready: Vec<DetTid> = self.blocked.sigchld_ready.iter().copied().collect();
@@ -2978,9 +3034,10 @@ impl Scheduler {
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
         let timed_empty = self.blocked.timed_waiters.is_empty();
-        let blockers_empty = self.blocked.external_io_blockers.is_empty()
+        let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
             && self.blocked.physical_child_waiters.is_empty();
+        let rt_sigsuspend_empty = self.blocked.rt_sigsuspend_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
@@ -2996,7 +3053,7 @@ impl Scheduler {
                 return Err(SkipTurn);
             }
             // When the run queue is empty, we sometimes need to give things a kick.
-            if futex_empty && timed_empty && blockers_empty {
+            if futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty {
                 // `info!`, and that level is load-bearing. Restored from `trace!`
                 // by owner ruling after 08ff51a33e demoted it.
                 //
@@ -3036,7 +3093,7 @@ impl Scheduler {
                 // to lower the level.
                 info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
-            } else if !futex_empty && timed_empty && blockers_empty {
+            } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty) {
                 return Err(self.report_terminal_deadlock());
             } else if !timed_empty {
                 // Only a *reachable* deadline justifies fast-forwarding the clock.
@@ -3054,7 +3111,7 @@ impl Scheduler {
                     .next_deadline()
                     .expect("internal error: no timed events found");
                 if next_deadline.is_indefinite() {
-                    if !blockers_empty {
+                    if !external_waits_empty {
                         // Blocking external IO may still complete and produce the
                         // signal/wake the indefinite waiter needs, so this is not a
                         // deadlock yet. Spin as step2c does for the same reason.
@@ -3311,8 +3368,10 @@ impl Scheduler {
                 }
             }
 
-            // Thread BEGINS [potentially] blocking external IO
-            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingVfork(op_id) => {
+            // Thread BEGINS a blocking syscall outside the runnable set.
+            ResourceID::BlockingExternalIO(op_id)
+            | ResourceID::BlockingVfork(op_id)
+            | ResourceID::BlockingRtSigsuspend(op_id) => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
                 }
@@ -3339,10 +3398,13 @@ impl Scheduler {
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp);
 
-                // Only once the ivars are cleared, and the guest is officially past the
-                // BlockingExternalIO phase ready to issue BlockedExternalContinue, do we
-                // then put it into the external_io_blockers struct.
-                let old = self.blocked.external_io_blockers.insert(dettid, *op_id);
+                // Only once the ivars are cleared and the guest is ready to issue
+                // BlockedExternalContinue do we record which blocked pool owns it.
+                let old = if matches!(rid, ResourceID::BlockingRtSigsuspend(_)) {
+                    self.blocked.rt_sigsuspend_blockers.insert(dettid, *op_id)
+                } else {
+                    self.blocked.external_io_blockers.insert(dettid, *op_id)
+                };
                 assert!(old.is_none(), "thread started a second external operation");
                 Err(SkipTurn)
             }
@@ -4179,7 +4241,8 @@ impl Scheduler {
             if self.blocked.external_io_blockers.contains_key(&dtid) {
                 return ThreadStatus::NotRunning;
             }
-            if self.blocked.child_waiters.contains_key(&dtid)
+            if self.blocked.rt_sigsuspend_blockers.contains_key(&dtid)
+                || self.blocked.child_waiters.contains_key(&dtid)
                 || self
                     .blocked
                     .physical_child_waiters
@@ -4392,6 +4455,16 @@ impl Scheduler {
         )
         .unwrap();
         for x in &self.blocked.external_io_blockers {
+            writeln!(&mut buf, "    {:?}", x).unwrap();
+        }
+
+        writeln!(
+            &mut buf,
+            "\n  Rt-sigsuspend-blocked, {}:",
+            self.blocked.rt_sigsuspend_blockers.len(),
+        )
+        .unwrap();
+        for x in &self.blocked.rt_sigsuspend_blockers {
             writeln!(&mut buf, "    {:?}", x).unwrap();
         }
 
@@ -5544,6 +5617,61 @@ mod test {
     }
 
     #[test]
+    fn inbound_signal_releases_rt_sigsuspend_blocker() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        let mut signal = Resources::new(waiter);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            Permission::RW,
+        );
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, op_id);
+        scheduler.next_turns.insert(
+            waiter,
+            ThreadNextTurn {
+                dettid: waiter,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(signal)),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(waiter));
+    }
+
+    #[test]
+    fn inbound_signal_releases_interruptible_external_io_blocker() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiter = DetTid::from_raw(11);
+        let op_id = ExternalOpId::new(waiter, 291);
+        let mut signal = Resources::new(waiter);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper(Signal::SIGUSR1)),
+            Permission::RW,
+        );
+        scheduler.blocked.external_io_blockers.insert(waiter, op_id);
+        scheduler.next_turns.insert(
+            waiter,
+            ThreadNextTurn {
+                dettid: waiter,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(signal)),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(waiter));
+    }
+
+    #[test]
     fn futex_wake_bitset_only_selects_intersecting_waiters() {
         let mut waiters = vec![
             futex_waiter(1, 0b0001),
@@ -6176,6 +6304,105 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_none());
         assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
         assert!(!scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn rt_sigsuspend_without_possible_signal_is_reported_as_a_deadlock() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let waiter = DetTid::from_raw(100);
+        let op_id = ExternalOpId::new(waiter, 7);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, op_id);
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("rt_sigsuspend with no possible signal is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting in rt_sigsuspend with no possible signal"),
+            "unexpected report:\n{report}"
+        );
+        assert!(report.contains("external IO blockers: none"));
+        assert!(report.contains("rt_sigsuspend blockers (1), by dettid:"));
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
+            Some(&op_id)
+        );
+    }
+
+    #[test]
+    fn finite_deadline_runs_before_rt_sigsuspend_deadlock_verdict() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let initial_time = global_time.lock().unwrap().as_nanos();
+        let deadline = initial_time + LogicalTime::from_nanos(1_000);
+        let waiter = DetTid::from_raw(100);
+        let sleeper = DetTid::from_raw(101);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, ExternalOpId::new(waiter, 7));
+        scheduler.blocked.timed_waiters.insert(deadline, sleeper);
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            sleeper,
+            ThreadNextTurn {
+                dettid: sleeper,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+            },
+        );
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert!(
+            scheduler
+                .blocked
+                .rt_sigsuspend_blockers
+                .contains_key(&waiter)
+        );
+    }
+
+    #[test]
+    fn genuine_external_io_defers_rt_sigsuspend_deadlock_verdict() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let waiter = DetTid::from_raw(100);
+        let io_thread = DetTid::from_raw(101);
+        scheduler
+            .blocked
+            .rt_sigsuspend_blockers
+            .insert(waiter, ExternalOpId::new(waiter, 7));
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(io_thread, ExternalOpId::new(io_thread, 8));
+        for dettid in [waiter, io_thread] {
+            scheduler.next_turns.insert(
+                dettid,
+                ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                },
+            );
+        }
+
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+        assert_eq!(scheduler.blocked.external_io_blockers.len(), 1);
+        assert_eq!(scheduler.blocked.rt_sigsuspend_blockers.len(), 1);
     }
 
     /// The `SignalEvt` arm is the sub-case whose behaviour this change actually
