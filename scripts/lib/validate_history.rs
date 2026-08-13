@@ -118,11 +118,12 @@ pub struct CacheKey<'a> {
 
 /// The gate-coverage half of the predicate, shared by both producers.
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
-    match (i(row, "gates_expected"), i(row, "gates_run")) {
-        (None, _) => true, // gates_expected null: no obligation was recorded
-        (Some(exp), Some(run)) => run >= exp,
-        (Some(_), None) => false,
-    }
+    let (Some(expected), Some(run)) =
+        (i(row, "gates_expected"), i(row, "gates_run"))
+    else {
+        return false;
+    };
+    run >= expected
 }
 
 /// Does this PASS row carry everything a reuse needs?
@@ -381,12 +382,97 @@ pub fn self_test() -> Result<String, String> {
         "producer": "validate.sh", "executed_tests": 1234, "gates_expected": 12, "gates_run": 12,
     }));
     let mut accepted = 0usize;
+    let mut refused = 0usize;
     for (why, row) in [("validate.rs row", &rs_pass), ("validate.sh row", &sh_pass)] {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
             return Err(format!("cache: a fully qualifying {why} must be a HIT"));
         }
         accepted += 1;
     }
+
+    // These are the four historical rows that exposed the completeness gap.
+    // They ran 861 tests and five gates, so they contain real work, but their
+    // absent gates_expected field leaves it unknowable whether five gates were
+    // enough. Keep their two exact cache keys and distinct completion records
+    // in the regression: the cache is derived from ledger rows on every lookup,
+    // so refusing these fixtures is also the proof that no purge is needed.
+    let unknown_completeness = [
+        serde_json::json!({
+            "commit": "61edbef424ad83e0434730ec24eb83389a196243",
+            "tree": "840f369568225c5541a2a7a245ad89f235600e4e",
+            "profile": "portable-only", "host": "devbig014",
+            "toolchain": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)",
+            "selection_mode": "full", "result": "pass", "commit_anchored": true,
+            "tree_dirty": false, "failures": 0, "executed_tests": 861,
+            "gates_expected": null, "gates_run": 5, "checks": 5,
+            "finished_at": "2026-08-08T00:12:30Z", "real_seconds": 514,
+            "user_seconds": 2756.762, "sys_seconds": 780.769,
+        }),
+        serde_json::json!({
+            "commit": "61edbef424ad83e0434730ec24eb83389a196243",
+            "tree": "840f369568225c5541a2a7a245ad89f235600e4e",
+            "profile": "portable-only", "host": "devbig014",
+            "toolchain": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)",
+            "selection_mode": "full", "result": "pass", "commit_anchored": true,
+            "tree_dirty": false, "failures": 0, "executed_tests": 861,
+            "gates_expected": null, "gates_run": 5, "checks": 5,
+            "finished_at": "2026-08-08T00:21:00Z", "real_seconds": 353,
+            "user_seconds": 456.99, "sys_seconds": 450.441,
+        }),
+        serde_json::json!({
+            "commit": "61edbef424ad83e0434730ec24eb83389a196243",
+            "tree": "840f369568225c5541a2a7a245ad89f235600e4e",
+            "profile": "portable-only", "host": "devbig014",
+            "toolchain": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)",
+            "selection_mode": "full", "result": "pass", "commit_anchored": true,
+            "tree_dirty": false, "failures": 0, "executed_tests": 861,
+            "gates_expected": null, "gates_run": 5, "checks": 5,
+            "finished_at": "2026-08-08T00:43:47Z", "real_seconds": 424,
+            "user_seconds": 846.62, "sys_seconds": 523.392,
+        }),
+        serde_json::json!({
+            "commit": "f65f74462931c10ce822a2d46fbb8a9ea9d86305",
+            "tree": "03df7e3592bc0f32df7b34a8ffb98f39770a90c8",
+            "profile": "portable-only", "host": "devbig014",
+            "toolchain": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)",
+            "selection_mode": "full", "result": "pass", "commit_anchored": true,
+            "tree_dirty": false, "failures": 0, "executed_tests": 861,
+            "gates_expected": null, "gates_run": 5, "checks": 5,
+            "finished_at": "2026-08-08T05:42:25Z", "real_seconds": 554,
+            "user_seconds": 2870.516, "sys_seconds": 801.455,
+        }),
+    ];
+    for row in &unknown_completeness {
+        let historical_key = CacheKey {
+            tree: s(row, "tree"),
+            profile: s(row, "profile"),
+            host: s(row, "host"),
+            toolchain: s(row, "toolchain"),
+        };
+        if cache_lookup(std::slice::from_ref(row), "pass", &historical_key).is_some() {
+            return Err(format!(
+                "cache: historical row {} at {} has unknown gate completeness and must NOT hit",
+                s(row, "commit"),
+                s(row, "finished_at")
+            ));
+        }
+        refused += 1;
+    }
+    let mut declared_complete = unknown_completeness[0].clone();
+    declared_complete
+        .as_object_mut()
+        .expect("fixture is an object")
+        .insert("gates_expected".into(), serde_json::json!(5));
+    let declared_key = CacheKey {
+        tree: s(&declared_complete, "tree"),
+        profile: s(&declared_complete, "profile"),
+        host: s(&declared_complete, "host"),
+        toolchain: s(&declared_complete, "toolchain"),
+    };
+    if cache_lookup(std::slice::from_ref(&declared_complete), "pass", &declared_key).is_none() {
+        return Err("cache: the same historical shape with declared 5/5 coverage must HIT".into());
+    }
+    accepted += 1;
 
     // NEGATIVE: every single missing condition must REFUSE. Each row below is
     // the positive row with exactly one field spoiled, so a refusal is
@@ -414,7 +500,6 @@ pub fn self_test() -> Result<String, String> {
         ("bash row carrying only executed_nodes", base(serde_json::json!({"producer": "validate.sh", "executed_nodes": 999}))),
         ("unknown producer", base(serde_json::json!({"producer": "some-other-tool", "executed_nodes": 9, "executed_tests": 9}))),
     ];
-    let mut refused = 0usize;
     for (why, row) in &negatives {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_some() {
             return Err(format!("cache: a row with {why} must NOT be a hit"));
