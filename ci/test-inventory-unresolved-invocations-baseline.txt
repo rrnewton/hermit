@@ -1,0 +1,20 @@
+# Inventory paths that currently claim integration invocation without a
+# machine-resolvable tracked Rust caller. This list is shrink-only: repairing or
+# retiring a claim requires deleting its path, and new paths are refused.
+tests/shell/date.sh
+tests/shell/devrand.sh
+tests/shell/non_strict/curl.sh
+tests/shell/py_hello.sh
+tests/shell/race.sh
+tests/standalone/cat_proc_uptime.sh
+tests/standalone/curl_client_only.sh
+tests/standalone/env_var_passthru.sh
+tests/standalone/minimal_hello_backtraces.sh
+tests/standalone/replay_and_print_stacktraces.sh
+tests/standalone/replay_chaos_trace.sh
+tests/standalone/replay_trace.sh
+tests/standalone/stacktrace_signal.sh
+tests/standalone/strict_setitimer.sh
+tests/standalone/strict_timer_create.sh
+tests/standalone/test_no_networking_network_bind.sh
+tests/standalone/validate_race_example_properties.sh

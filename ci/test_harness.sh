@@ -50,7 +50,7 @@ trap '__harness_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TEST_ROOT="$ROOT_DIR/tests/e2e"
 MANIFEST_ROOT="$TEST_ROOT/manifests"
-INVENTORY="$MANIFEST_ROOT/inventory/test-files.json"
+INVENTORY=${E2E_INVENTORY_OVERRIDE:-"$MANIFEST_ROOT/inventory/test-files.json"}
 EXPECTED_PLAN="$ROOT_DIR/ci/expected-e2e-plan.json"
 HERMIT_BIN=${HERMIT_BIN:-$ROOT_DIR/target/debug/hermit}
 RESULT_ROOT=${E2E_RESULT_ROOT:-$ROOT_DIR/ignored/e2e}
@@ -397,6 +397,252 @@ function load_tests {
     ((${#TESTS[@]} > 0)) || die "no tests discovered below $MANIFEST_ROOT"
 }
 
+# Print Rust source without line or block comments. This is deliberately a
+# source-level check: an inventory row that claims a Rust integration caller
+# must name static evidence that exists in the tracked tree. It is not a claim
+# that the named test ran in this invocation.
+function rust_source_without_comments {
+    local source=$1
+    awk '
+        {
+            line = $0
+            code = ""
+            while (length(line) > 0) {
+                if (in_block) {
+                    closing = index(line, "*/")
+                    if (closing == 0) {
+                        line = ""
+                        break
+                    }
+                    line = substr(line, closing + 2)
+                    in_block = 0
+                    continue
+                }
+
+                slash = index(line, "//")
+                block = index(line, "/*")
+                if (slash > 0 && (block == 0 || slash < block)) {
+                    code = code substr(line, 1, slash - 1)
+                    line = ""
+                    break
+                }
+                if (block > 0) {
+                    code = code substr(line, 1, block - 1)
+                    line = substr(line, block + 2)
+                    in_block = 1
+                    continue
+                }
+                code = code line
+                line = ""
+            }
+            print code
+        }
+    ' "$source"
+}
+
+function inventory_runner_reaches_path {
+    local root=$1 path=$2 runner=$3 source symbol code workload
+    [[ $runner == *::* ]] || return 1
+    source=${runner%::*}
+    symbol=${runner##*::}
+    [[ $source == *.rs && $symbol =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    [[ -f $root/$source ]] || return 1
+    git -C "$root" ls-files --error-unmatch -- "$source" >/dev/null 2>&1 || return 1
+
+    code=$(rust_source_without_comments "$root/$source")
+    # The current integration table maps `test_symbol => "workload-key"`, and
+    # its workload table maps that exact key to the exact test path. Requiring
+    # both links prevents an unrelated symbol elsewhere in the same large Rust
+    # source from laundering a path into a caller claim.
+    local -a workloads=()
+    mapfile -t workloads < <(
+        awk -v symbol="$symbol" '
+            $0 ~ ("(^|[^A-Za-z0-9_])" symbol "[[:space:]]*=>[[:space:]]*\"[^\"]+\"") {
+                line = $0
+                sub(".*" symbol "[[:space:]]*=>[[:space:]]*\"", "", line)
+                sub("\".*", "", line)
+                print line
+            }
+        ' <<<"$code"
+    )
+    ((${#workloads[@]} == 1)) || return 1
+    workload=${workloads[0]}
+    awk -v workload="\"$workload\"" -v path="\"$path\"" '
+        index($0, workload) && index($0, path) && index($0, workload) < index($0, path) {
+            found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' <<<"$code"
+}
+
+# Emit only rows that make an integration-invocation claim. The two historical
+# prose-only runner values remain selected even if their explanations are
+# reworded, while a new source::symbol runner is selected structurally.
+function inventory_invocation_claims {
+    local inventory=$1
+    jq -r '
+        .files[]
+        | select(
+            (.why | contains(" is invoked by "))
+            or .runner == "hermit-cli shell integration targets"
+            or .runner == "hermit-cli/tests integration targets"
+            or (.runner | test("[.]rs::[A-Za-z_][A-Za-z0-9_]*$")))
+        | [.path, .runner]
+        | @tsv
+    ' "$inventory"
+}
+
+# The baseline records already-unresolved claims without deciding whether their
+# scripts should be repaired and wired or retired. It is shrink-only: a new
+# unresolved claim fails, and a repaired/removed claim still listed fails too.
+function assert_inventory_invocation_reachability {
+    local root=$1 inventory=$2 baseline=$3 path runner
+    [[ -f $baseline ]] || die "missing unresolved-invocation baseline: ${baseline#"$root/"}"
+
+    local scratch
+    scratch=$(mktemp -d) || die "inventory invocation audit: mktemp failed"
+    local claims="$scratch/claims" unresolved="$scratch/unresolved" expected="$scratch/expected"
+    local new_unresolved="$scratch/new-unresolved" fixed="$scratch/fixed"
+    inventory_invocation_claims "$inventory" | LC_ALL=C sort -u >"$claims"
+    : >"$unresolved"
+    while IFS=$'\t' read -r path runner; do
+        [[ -n $path ]] || continue
+        if ! inventory_runner_reaches_path "$root" "$path" "$runner"; then
+            printf '%s\n' "$path" >>"$unresolved"
+        fi
+    done <"$claims"
+    LC_ALL=C sort -u -o "$unresolved" "$unresolved"
+    grep -Ev '^[[:space:]]*(#|$)' "$baseline" | LC_ALL=C sort -u >"$expected" || true
+
+    comm -23 "$unresolved" "$expected" >"$new_unresolved"
+    comm -13 "$unresolved" "$expected" >"$fixed"
+    if [[ -s $new_unresolved ]]; then
+        printf 'NEW inventory invocation claim(s) without a tracked literal Rust caller:\n' >&2
+        sed 's/^/  /' "$new_unresolved" >&2
+        rm -rf "$scratch"
+        die "an integration invocation claim must name runner=<tracked .rs source>::<test symbol>, with the exact quoted test path and symbol in non-comment source"
+    fi
+    if [[ -s $fixed ]]; then
+        printf 'inventory invocation claim(s) resolved or removed but still baselined:\n' >&2
+        sed 's/^/  /' "$fixed" >&2
+        rm -rf "$scratch"
+        die "remove resolved paths from ci/test-inventory-unresolved-invocations-baseline.txt so the baseline can only shrink"
+    fi
+
+    local total unresolved_count resolved
+    total=$(wc -l <"$claims")
+    unresolved_count=$(wc -l <"$unresolved")
+    resolved=$((total - unresolved_count))
+    printf 'inventory invocation reachability: resolved=%d total=%d unresolved-baseline=%d\n' \
+        "$resolved" "$total" "$unresolved_count"
+    rm -rf "$scratch"
+}
+
+function assert_inventory_invocation_reachability_brackets {
+    local scratch
+    scratch=$(mktemp -d) || die "inventory invocation bracket: mktemp failed"
+    mkdir -p "$scratch/hermit-cli/tests" "$scratch/tests"
+    git -C "$scratch" init -q
+    printf '#!/usr/bin/env bash\n' >"$scratch/tests/fixture.sh"
+    printf '#!/usr/bin/env bash\n' >"$scratch/tests/comment-only.sh"
+    printf '#!/usr/bin/env bash\n' >"$scratch/tests/other.sh"
+    cat >"$scratch/hermit-cli/tests/runner.rs" <<'RUST'
+const WORKLOADS: &[(&str, &str)] = &[
+    ("fixture", "tests/fixture.sh"),
+    ("other", "tests/other.sh"),
+];
+register_tests! {
+    real_test => "fixture",
+    other_test => "other",
+}
+// const COMMENTED: (&str, &str) = ("comment-only", "tests/comment-only.sh");
+// register_tests! { comment_only_test => "comment-only", }
+RUST
+    git -C "$scratch" add hermit-cli/tests/runner.rs tests/fixture.sh tests/comment-only.sh tests/other.sh
+    : >"$scratch/baseline.txt"
+
+    _write_invocation_fixture() {
+        local path=$1 runner=$2
+        jq -n --arg path "$path" --arg runner "$runner" '{schema:2,files:[{
+            path:$path,
+            disposition:"integration-helper",
+            runner:$runner,
+            why:($path + " is owned by " + $runner + ": This workload is invoked by a Rust integration case; the deliberately long fixture explanation keeps the legacy prose checks satisfied while caller reachability is tested independently.")
+        }]}' >"$scratch/inventory.json"
+    }
+    _invocation_guard_in() (
+        assert_inventory_invocation_reachability "$scratch" "$scratch/inventory.json" \
+            "$scratch/baseline.txt" >/dev/null 2>&1
+    )
+
+    # ACCEPT: a tracked source names both the exact literal and its test symbol.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/runner.rs::real_test
+    _invocation_guard_in || die "inventory invocation bracket: a real literal caller must PASS"
+
+    # REFUSE: a well-formed, long, unique claim cannot substitute a fabricated runner.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/nonexistent.rs::real_test
+    ! _invocation_guard_in || die "inventory invocation bracket: a fabricated nonexistent runner must FAIL"
+
+    # REFUSE: a real source does not substantiate a test symbol it does not contain.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/runner.rs::missing_test
+    ! _invocation_guard_in || die "inventory invocation bracket: a nonexistent test symbol must FAIL"
+
+    # REFUSE: a different genuine symbol in the same source does not own this path.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/runner.rs::other_test
+    ! _invocation_guard_in || die "inventory invocation bracket: an unrelated test symbol must not launder another workload path"
+
+    # REFUSE: a source comment is not an invocation.
+    _write_invocation_fixture tests/comment-only.sh hermit-cli/tests/runner.rs::comment_only_test
+    ! _invocation_guard_in || die "inventory invocation bracket: a comment-only path and symbol must FAIL"
+
+    # REFUSE: removing the quoted literal makes the formerly real caller unresolved.
+    printf 'register_tests! { real_test => "fixture", }\n' >"$scratch/hermit-cli/tests/runner.rs"
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/runner.rs::real_test
+    ! _invocation_guard_in || die "inventory invocation bracket: a caller with its workload literal removed must FAIL"
+
+    # REFUSE: resolved evidence cannot remain in the shrink-only baseline.
+    cat >"$scratch/hermit-cli/tests/runner.rs" <<'RUST'
+const WORKLOADS: &[(&str, &str)] = &[("fixture", "tests/fixture.sh")];
+register_tests! {
+    real_test => "fixture",
+}
+RUST
+    printf 'tests/fixture.sh\n' >"$scratch/baseline.txt"
+    ! _invocation_guard_in || die "inventory invocation bracket: a resolved claim still in the baseline must FAIL"
+
+    # ACCEPT BOTH REAL CONTROLS from the repository, independently of the 17-row baseline.
+    jq '{schema,files:[.files[] | select(
+        .path == "tests/shell/par_work.sh" or .path == "tests/shell/taskset.sh")]
+    }' "$INVENTORY" >"$scratch/real-controls.json"
+    : >"$scratch/baseline.txt"
+    (assert_inventory_invocation_reachability "$ROOT_DIR" "$scratch/real-controls.json" \
+        "$scratch/baseline.txt" >/dev/null 2>&1) ||
+        die "inventory invocation bracket: both pre-inventory literal callers must PASS"
+
+    # Exercise the public audit-inventory entrypoint, not just its helper. This
+    # catches the production reachability call being deleted while the helper's
+    # direct unit-style brackets continue to pass.
+    jq '(.files[] | select(.path == "tests/shell/par_work.sh")) |= (
+        .runner = "hermit-cli/tests/nonexistent.rs::fabricated_test"
+        | .why = (.path + " is owned by " + .runner + ": This shell guest is invoked by a fabricated Rust integration case whose deliberately long and unique explanation satisfies every legacy prose check but supplies no caller evidence."))
+    ' "$INVENTORY" >"$scratch/full-fabricated-inventory.json"
+    local report status
+    if report=$(E2E_INVENTORY_OVERRIDE="$scratch/full-fabricated-inventory.json" \
+        INVENTORY_REACHABILITY_BRACKET_CHILD=1 \
+        "$ROOT_DIR/ci/test_harness.sh" audit-inventory 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    ((status != 0)) ||
+        die "inventory invocation bracket: public audit-inventory accepted a fabricated nonexistent runner"
+    [[ $report == *"tests/shell/par_work.sh"* && $report == *"NEW inventory invocation claim"* ]] ||
+        die "inventory invocation bracket: public refusal must name the fabricated path and reason, got: $report"
+
+    unset -f _write_invocation_fixture _invocation_guard_in
+    rm -rf "$scratch"
+}
+
 function audit_inventory {
     [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
     jq -e '
@@ -421,6 +667,12 @@ function audit_inventory {
                 | ltrimstr($entry.path + " is owned by " + $entry.runner + ": ")
                 | length >= 120)))
     ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
+
+    assert_inventory_invocation_reachability "$ROOT_DIR" "$INVENTORY" \
+        "$ROOT_DIR/ci/test-inventory-unresolved-invocations-baseline.txt"
+    if [[ ${INVENTORY_REACHABILITY_BRACKET_CHILD:-0} != 1 ]]; then
+        assert_inventory_invocation_reachability_brackets
+    fi
 
     local scratch expected actual
     scratch=$(mktemp -d)

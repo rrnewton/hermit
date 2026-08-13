@@ -158,6 +158,15 @@ owner supplies. Each exception names its exact owning runner and the file's
 specific role; generic category-only justifications fail review even when the
 inventory is mechanically complete.
 
+An entry that says a Rust integration case invokes its test file uses a
+machine-resolvable runner of the form `<tracked .rs source>::<test symbol>`.
+The inventory audit requires non-comment source to map that symbol to one
+workload key and that key to the exact quoted test path. Existing invocation
+claims without that evidence remain visible in
+`ci/test-inventory-unresolved-invocations-baseline.txt`; the baseline can only
+shrink, and it does not decide whether a script should be repaired and wired or
+retired.
+
 `ci/expected-e2e-plan.json` ratchets the exact blocking cells. Adding, removing,
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.

@@ -3045,8 +3045,8 @@
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/par_work.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/par_work.sh is owned by hermit-cli shell integration targets: The `par_work.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-cli/tests/hermit_modes.rs::default_shell_parallel_work",
+      "why": "tests/shell/par_work.sh is owned by hermit-cli/tests/hermit_modes.rs::default_shell_parallel_work: The `par_work.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
     },
     {
       "disposition": "guest-fixture",
@@ -3063,8 +3063,8 @@
     {
       "disposition": "guest-fixture",
       "path": "tests/shell/taskset.sh",
-      "runner": "hermit-cli shell integration targets",
-      "why": "tests/shell/taskset.sh is owned by hermit-cli shell integration targets: The `taskset.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
+      "runner": "hermit-cli/tests/hermit_modes.rs::default_shell_taskset",
+      "why": "tests/shell/taskset.sh is owned by hermit-cli/tests/hermit_modes.rs::default_shell_taskset: The `taskset.sh` shell guest is invoked by a Rust integration case that supplies scheduler/network flags and expected output. It remains a fixture because direct manifest execution would omit those caller-owned semantics."
     },
     {
       "disposition": "support-data",
