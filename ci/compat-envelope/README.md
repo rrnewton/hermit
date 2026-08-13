@@ -54,7 +54,7 @@ The path is deliberately direct:
 commands remain required validation checks even though they are outside this
 uniform comparable denominator.
 
-The pre-Basic-Sanity `verify` cells run each selected backend twice against
+The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
 itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
 therefore measure same-backend repeatability under the current contract; they
 do not establish strict INFO-log determinism or cross-backend parity. The

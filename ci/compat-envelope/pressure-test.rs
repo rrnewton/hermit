@@ -4,6 +4,7 @@
 //! ```cargo
 //! [dependencies]
 //! csv = "1"
+//! safe-ci-dag-runner = { path = "../../agent-utils/rs/safe-ci-dag-runner" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! toml = "0.8"
@@ -24,6 +25,14 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use safe_ci_dag_runner::io::dag_from_json;
+use safe_ci_dag_runner::io::dag_to_json;
+use safe_ci_dag_runner::model::DagConfig;
+use safe_ci_dag_runner::model::ResourceHint;
+use safe_ci_dag_runner::model::Step;
+use safe_ci_dag_runner::model::StepClass;
+use safe_ci_dag_runner::model::effective_cpu_count;
+use safe_ci_dag_runner::model::effective_cpu_timeout;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -614,7 +623,7 @@ fn run() -> Result<(), String> {
             if args.next().is_some() {
                 return Err("self-test accepts no options".into());
             }
-            self_test()?;
+            self_test(&root)?;
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
@@ -1301,8 +1310,8 @@ fn write_plan(
 
     let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
-    let canonical: JsonValue = serde_json::from_str(&canonical_text)
-        .map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+    let canonical =
+        dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
     let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
     let exact_cell = selection.is_exact().then(|| {
         (
@@ -1315,56 +1324,39 @@ fn write_plan(
     });
     let required_builds = required_build_tags(exact_cell, includes_liteinst);
     let mut steps = Vec::new();
-    for mut step in canonical["steps"]
-        .as_array()
-        .ok_or("portable DAG has no steps array")?
-        .iter()
-        .cloned()
-    {
-        let tag = format!(
-            "{}.{}",
-            step["group"].as_str().unwrap_or(""),
-            step["job"].as_str().unwrap_or("")
-        );
+    for mut step in canonical.steps.iter().cloned() {
+        let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let canonical_command = step["cmd"]
-                .as_str()
-                .ok_or_else(|| format!("canonical node {tag} has no command"))?;
             let direct_backend_build = selection.is_exact()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
-                "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit"
+                "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
             } else {
-                canonical_command
+                step.cmd.clone()
             };
-            step["cmd"] = json!(format!(
+            step.cmd = format!(
                 "mkdir -p {state}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
                 marker = shell_quote(&marker.to_string_lossy()),
-            ));
+            );
             if selection.is_exact() && selection.backend.as_deref() != Some("liteinst") {
-                step["deps"] = json!([]);
+                step.deps.clear();
             }
             if direct_backend_build {
-                step["timeout"] = json!(600);
-                step["cpu_timeout"] = json!(1200);
-                step["hint"] = json!({
-                    "resources": {"cargo_writer": 1},
-                    "rss_baseline_bytes": 4294967296_i64,
-                    "hard_mem_max_bytes": 17179869184_i64,
-                    "classification": "cpu-bound",
-                    "preferred_inner_jobs": 8
-                });
+                step.timeout = 600;
+                step.cpu_timeout = 1200;
+                step.hint = ResourceHint {
+                    resources: BTreeMap::from([("cargo_writer".into(), 1)]),
+                    rss_baseline_bytes: Some(4_294_967_296),
+                    hard_mem_max_bytes: Some(17_179_869_184),
+                    classification: StepClass::CpuBound,
+                    preferred_inner_jobs: Some(8),
+                    ..ResourceHint::default()
+                };
             }
-            if step
-                .get("cpu_timeout")
-                .and_then(JsonValue::as_i64)
-                .unwrap_or(0)
-                <= 0
-            {
-                let wall = step["timeout"].as_i64().unwrap_or(120);
-                step["cpu_timeout"] = json!(wall * 2);
+            if step.cpu_timeout <= 0 {
+                step.cpu_timeout = step.timeout * 2;
             }
             steps.push(step);
         }
@@ -1412,21 +1404,28 @@ fn write_plan(
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
         let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds);
-        steps.push(json!({
-            "group": "prepare",
-            "job": job,
-            "desc": format!("Prepare red-cell fixture {test}"),
-            "cmd": cmd,
-            "deps": ["build.e2e_artifact"],
-            "timeout": wall,
-            "cpu_timeout": wall * 2,
-            "hint": {
-                "resources": {"cargo_writer": 1},
-                "rss_baseline_bytes": 1073741824_i64,
-                "hard_mem_max_bytes": 3221225472_i64,
-                "classification": "cpu-bound"
-            }
-        }));
+        steps.push(Step {
+            group: "prepare".into(),
+            job,
+            desc: format!("Prepare red-cell fixture {test}"),
+            description: String::new(),
+            cmd,
+            deps: vec!["build.e2e_artifact".into()],
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                resources: BTreeMap::from([("cargo_writer".into(), 1)]),
+                rss_baseline_bytes: Some(1_073_741_824),
+                hard_mem_max_bytes: Some(3_221_225_472),
+                classification: StepClass::CpuBound,
+                ..ResourceHint::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: wall,
+            cpu_timeout: wall * 2,
+            jobs_flag: None,
+            skip_reason: None,
+        });
         preparation_tags.insert(test, tag);
     }
 
@@ -1530,10 +1529,9 @@ fn write_plan(
         } else {
             3_i64 * 1024 * 1024 * 1024
         };
-        let mut resources = serde_json::Map::new();
-        resources.insert("manifest_guest".into(), json!(1));
+        let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
         if cell.backend == "kvm" {
-            resources.insert("kvm".into(), json!(1));
+            resources.insert("kvm".into(), 1);
         }
         let deps = selected_cell_dependencies(
             selection.is_exact(),
@@ -1541,57 +1539,74 @@ fn write_plan(
             &cell.backend,
             preparation_tags.get(&cell.test).map(String::as_str),
         );
-        steps.push(json!({
-            "group": "cell",
-            "job": slug,
-            "desc": format!("Attempt red cell {}/{}/{}@{}", cell.test, cell.mode, cell.backend, cell.lane),
-            "cmd": cmd,
-            "deps": deps,
-            "timeout": wall,
-            "cpu_timeout": wall * 2,
-            "hint": {
-                "resources": resources,
-                "rss_baseline_bytes": memory / 3,
-                "hard_mem_max_bytes": memory,
-                "classification": "latency-bound"
-            }
-        }));
+        steps.push(Step {
+            group: "cell".into(),
+            job: slug,
+            desc: format!(
+                "Attempt red cell {}/{}/{}@{}",
+                cell.test, cell.mode, cell.backend, cell.lane
+            ),
+            description: String::new(),
+            cmd,
+            deps,
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                resources,
+                rss_baseline_bytes: Some(memory / 3),
+                hard_mem_max_bytes: Some(memory),
+                classification: StepClass::LatencyBound,
+                ..ResourceHint::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: wall,
+            cpu_timeout: wall * 2,
+            jobs_flag: None,
+            skip_reason: None,
+        });
         cell_tags.push(tag);
     }
 
-    steps.push(json!({
-        "group": "pressure",
-        "job": "summarize",
-        "desc": "Wait for every red-cell attempt before the outer command reads retained runner evidence",
-        "cmd": "true",
-        "deps": cell_tags,
-        "timeout": 120,
-        "cpu_timeout": 120,
-        "hint": {
-            "rss_baseline_bytes": 268435456_i64,
-            "hard_mem_max_bytes": 1073741824_i64,
-            "classification": "light"
-        }
-    }));
-
-    let max_timeout = steps
-        .iter()
-        .filter_map(|step| step["timeout"].as_i64())
-        .max()
-        .unwrap_or(120);
-    let dag = json!({
-        "resource_caps": {"cargo_writer": 1, "manifest_guest": 4, "kvm": 1},
-        "mem_cap_factor": canonical.get("mem_cap_factor").cloned().unwrap_or(json!(1.25)),
-        "mem_cap_floor_bytes": canonical.get("mem_cap_floor_bytes").cloned().unwrap_or(json!(8589934592_i64)),
-        "outer_mem_safety_factor": canonical.get("outer_mem_safety_factor").cloned().unwrap_or(json!(1.0)),
-        "default_step_timeout": max_timeout,
-        "default_step_cpu_timeout": max_timeout * 2,
-        "steps": steps,
+    steps.push(Step {
+        group: "pressure".into(),
+        job: "summarize".into(),
+        desc: "Wait for every red-cell attempt before the outer command reads retained runner evidence"
+            .into(),
+        description: String::new(),
+        cmd: "true".into(),
+        deps: cell_tags,
+        env: BTreeMap::new(),
+        hint: ResourceHint {
+            rss_baseline_bytes: Some(268_435_456),
+            hard_mem_max_bytes: Some(1_073_741_824),
+            classification: StepClass::Light,
+            ..ResourceHint::default()
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 120,
+        cpu_timeout: 120,
+        jobs_flag: None,
+        skip_reason: None,
     });
+
+    let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
+    let mut dag = canonical;
+    dag.resource_caps = BTreeMap::from([
+        ("cargo_writer".into(), 1),
+        ("manifest_guest".into(), 4),
+        ("kvm".into(), 1),
+    ]);
+    dag.default_step_timeout = max_timeout;
+    dag.default_step_cpu_timeout = max_timeout * 2;
+    dag.steps = steps;
     audit_dag(&dag, cells.len(), run_timeout_seconds, &cell_timeouts)?;
-    let mut dag_text = serde_json::to_string_pretty(&dag)
-        .map_err(|e| format!("cannot serialize pressure DAG: {e}"))?;
+    let mut dag_text = dag_to_json(&dag);
     dag_text.push('\n');
+    let reparsed = dag_from_json(&dag_text)
+        .map_err(|e| format!("generated pressure DAG does not parse: {e}"))?;
+    assert_plan_round_trip(&dag, &reparsed)?;
+    audit_dag(&reparsed, cells.len(), run_timeout_seconds, &cell_timeouts)?;
     let retained_output = results.join("dag.json");
     fs::write(&retained_output, &dag_text)
         .map_err(|e| format!("cannot write {}: {e}", retained_output.display()))?;
@@ -1626,45 +1641,42 @@ fn write_plan(
 }
 
 fn audit_dag(
-    dag: &JsonValue,
+    dag: &DagConfig,
     expected_cells: usize,
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
 ) -> Result<(), String> {
-    let steps = dag["steps"]
-        .as_array()
-        .ok_or("generated DAG has no steps array")?;
     let mut tags = BTreeSet::new();
     let mut deps = Vec::new();
     let mut cells = 0usize;
     let mut summaries = 0usize;
-    for step in steps {
-        let group = step["group"]
-            .as_str()
-            .ok_or("generated step has no group")?;
-        let job = step["job"].as_str().ok_or("generated step has no job")?;
-        let tag = format!("{group}.{job}");
+    for step in &dag.steps {
+        let tag = step.tag();
         if !tags.insert(tag.clone()) {
             return Err(format!("generated DAG has duplicate tag {tag}"));
         }
-        let timeout = step["timeout"]
-            .as_i64()
-            .ok_or_else(|| format!("{tag} has no wall timeout"))?;
-        let cpu_timeout = step["cpu_timeout"]
-            .as_i64()
-            .ok_or_else(|| format!("{tag} has no CPU timeout"))?;
+        let timeout = step.timeout;
+        let cpu_timeout = step.cpu_timeout;
         if timeout <= 0 || cpu_timeout <= 0 || timeout >= run_timeout {
             return Err(format!(
                 "{tag} has invalid timeout ladder wall={timeout} cpu={cpu_timeout} run={run_timeout}"
             ));
         }
-        if step["hint"]["hard_mem_max_bytes"].as_i64().unwrap_or(0) <= 0 {
+        if step.hint.hard_mem_max_bytes.unwrap_or(0) <= 0 {
             return Err(format!("{tag} has no hard memory cap"));
         }
-        for dep in step["deps"].as_array().into_iter().flatten() {
-            deps.push((tag.clone(), dep.as_str().unwrap_or("").to_string()));
+        for (resource, demand) in &step.hint.resources {
+            let capacity = dag.resource_caps.get(resource).copied().unwrap_or(0);
+            if *demand <= 0 || capacity < *demand {
+                return Err(format!(
+                    "{tag} requests {demand} unit(s) of {resource}, but the DAG grants {capacity}"
+                ));
+            }
         }
-        if group == "cell" {
+        for dep in &step.deps {
+            deps.push((tag.clone(), dep.clone()));
+        }
+        if step.group == "cell" {
             cells += 1;
             let expected_timeout = expected_cell_timeouts
                 .get(&tag)
@@ -1674,7 +1686,7 @@ fn audit_dag(
                     "{tag} wall timeout {timeout}s does not equal its derived {expected_timeout}s cap"
                 ));
             }
-            let cmd = step["cmd"].as_str().unwrap_or("");
+            let cmd = &step.cmd;
             let enabled_selector = cmd.contains("--include-manual");
             let disabled_selector = cmd.contains("--probe-disabled");
             let prepared_input = cmd.contains("--prebuilt")
@@ -1719,6 +1731,41 @@ fn audit_dag(
             "generated DAG shape mismatch: cells={cells}/{expected_cells}, timeout_caps={}/{expected_cells}, summaries={summaries}/1",
             expected_cell_timeouts.len()
         ));
+    }
+    Ok(())
+}
+
+/// Prove that the JSON consumed by run-dag.sh preserves the typed plan's
+/// commands, dependencies, and effective containment. The pinned serializer
+/// intentionally omits DagConfig's default step CPU/memory/core fields. That
+/// is harmless only because every generated node declares wall, CPU, and hard
+/// memory caps; compare their effective values here rather than assuming a
+/// structural round trip.
+fn assert_plan_round_trip(expected: &DagConfig, actual: &DagConfig) -> Result<(), String> {
+    if dag_to_json(expected) != dag_to_json(actual) {
+        return Err("generated pressure DAG changed during typed JSON round trip".into());
+    }
+    if expected.resource_caps != actual.resource_caps {
+        return Err("generated pressure DAG changed named resource capacities".into());
+    }
+    if expected.steps.len() != actual.steps.len() {
+        return Err("generated pressure DAG changed its step count".into());
+    }
+    for (before, after) in expected.steps.iter().zip(&actual.steps) {
+        let tag = before.tag();
+        if tag != after.tag()
+            || before.timeout != after.timeout
+            || before.hint.hard_mem_max_bytes != after.hint.hard_mem_max_bytes
+            || before.hint.resources != after.hint.resources
+            || effective_cpu_timeout(before, expected.default_step_cpu_timeout)
+                != effective_cpu_timeout(after, actual.default_step_cpu_timeout)
+            || effective_cpu_count(before, expected.default_step_cpu_count)
+                != effective_cpu_count(after, actual.default_step_cpu_count)
+        {
+            return Err(format!(
+                "generated pressure DAG changed effective caps or resource demand for {tag}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1782,11 +1829,10 @@ fn validate_run_contract(
     }
 
     let dag_path = results.join("dag.json");
-    let dag: JsonValue = serde_json::from_str(
-        &fs::read_to_string(&dag_path)
-            .map_err(|e| format!("cannot read {}: {e}", dag_path.display()))?,
-    )
-    .map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
+    let dag_text = fs::read_to_string(&dag_path)
+        .map_err(|e| format!("cannot read {}: {e}", dag_path.display()))?;
+    let dag =
+        dag_from_json(&dag_text).map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
     let budgets = load_budgets(root)?;
     let mut expected_cell_timeouts = BTreeMap::new();
     for cell in expected.keys() {
@@ -1808,13 +1854,11 @@ fn validate_run_contract(
         metadata.run_timeout_seconds,
         &expected_cell_timeouts,
     )?;
-    let dag_cells: BTreeSet<_> = dag["steps"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|step| step["group"].as_str() == Some("cell"))
-        .filter_map(|step| step["job"].as_str())
-        .map(str::to_string)
+    let dag_cells: BTreeSet<_> = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .map(|step| step.job.clone())
         .collect();
     let expected_jobs: BTreeSet<_> = expected
         .keys()
@@ -2620,7 +2664,7 @@ fn display_id(cell: &CellId) -> String {
     )
 }
 
-fn self_test() -> Result<(), String> {
+fn self_test(root: &Path) -> Result<(), String> {
     let budget = CellBudget {
         timeout_seconds: 7,
         attempts: 3,
@@ -2706,7 +2750,8 @@ fn self_test() -> Result<(), String> {
         if test -e junit.in-progress.xml; then \
         mv -- junit.in-progress.xml junit.xml || status=$?; fi; \
         printf '%s\\n' \"$status\" > harness-status; exit \"$status\"";
-    let fixture = json!({
+    let fixture_json = json!({
+        "resource_caps": {"manifest_guest": 1},
         "steps": [
             {
                 "group": "cell",
@@ -2715,7 +2760,10 @@ fn self_test() -> Result<(), String> {
                 "deps": [],
                 "timeout": 20,
                 "cpu_timeout": 40,
-                "hint": {"hard_mem_max_bytes": 1024}
+                "hint": {
+                    "resources": {"manifest_guest": 1},
+                    "hard_mem_max_bytes": 1024
+                }
             },
             {
                 "group": "pressure",
@@ -2728,25 +2776,52 @@ fn self_test() -> Result<(), String> {
             }
         ]
     });
+    let fixture_text = serde_json::to_string(&fixture_json)
+        .map_err(|e| format!("cannot serialize generated-DAG fixture: {e}"))?;
+    let fixture = dag_from_json(&fixture_text)
+        .map_err(|e| format!("cannot parse generated-DAG fixture: {e}"))?;
     let fixture_timeouts = BTreeMap::from([("cell.fixture".to_string(), 20)]);
     audit_dag(&fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive generated-DAG bracket failed: {e}"))?;
+    let fixture_round_trip = dag_from_json(&dag_to_json(&fixture))
+        .map_err(|e| format!("cannot reparse generated-DAG fixture: {e}"))?;
+    assert_plan_round_trip(&fixture, &fixture_round_trip)
+        .map_err(|e| format!("positive generated-DAG round-trip bracket failed: {e}"))?;
+    let mut missing_memory_cap = fixture.clone();
+    missing_memory_cap.steps[0].hint.hard_mem_max_bytes = None;
+    if audit_dag(&missing_memory_cap, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("step without a hard memory cap was accepted".into());
+    }
+    let mut missing_cpu_cap = fixture.clone();
+    missing_cpu_cap.steps[0].cpu_timeout = 0;
+    if audit_dag(&missing_cpu_cap, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("step without an explicit CPU cap was accepted".into());
+    }
+    let mut missing_resource_cap = fixture.clone();
+    missing_resource_cap.resource_caps.remove("manifest_guest");
+    if audit_dag(&missing_resource_cap, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("step whose named resource has no capacity was accepted".into());
+    }
+    let mut ungrantable_resource = fixture.clone();
+    ungrantable_resource
+        .resource_caps
+        .insert("manifest_guest".into(), 0);
+    if audit_dag(&ungrantable_resource, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("step whose named resource demand exceeds capacity was accepted".into());
+    }
     let mut widened_cell_timeout = fixture.clone();
-    widened_cell_timeout["steps"][0]["timeout"] = json!(21);
+    widened_cell_timeout.steps[0].timeout = 21;
     if audit_dag(&widened_cell_timeout, 1, 100, &fixture_timeouts).is_ok() {
         return Err("cell wall timeout wider than its selected cap was accepted".into());
     }
     let mut disabled_fixture = fixture.clone();
-    disabled_fixture["steps"][0]["cmd"] = json!(
-        exact_cell_command
-            .replace("--include-manual", "--probe-disabled")
-            .replace("--test fixture", "--test fixture --backend kvm")
-    );
+    disabled_fixture.steps[0].cmd = exact_cell_command
+        .replace("--include-manual", "--probe-disabled")
+        .replace("--test fixture", "--test fixture --backend kvm");
     audit_dag(&disabled_fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
     let mut prepared_fixture = fixture.clone();
-    prepared_fixture["steps"][0]["cmd"] = json!(
-        "printf '125\\n' > '/results/cells/fixture/harness-status'; \
+    prepared_fixture.steps[0].cmd = "printf '125\\n' > '/results/cells/fixture/harness-status'; \
          if ! test \"$(cat '/results/prepare/fixture/status' 2>/dev/null)\" = 0; then \
          printf '126\\n' > '/results/cells/fixture/harness-status'; exit 0; fi; \
          status=0; env ./ci/test_harness.sh run --include-manual --prebuilt \
@@ -2754,44 +2829,38 @@ fn self_test() -> Result<(), String> {
          --junit junit.in-progress.xml || status=$?; \
          mv -- results.in-progress.jsonl results.jsonl || status=$?; \
          printf '%s\\n' \"$status\" > harness-status; exit \"$status\""
-    );
+        .into();
     audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive preparation-refusal bracket failed: {e}"))?;
-    prepared_fixture["steps"][0]["cmd"] = json!(
-        prepared_fixture["steps"][0]["cmd"]
-            .as_str()
-            .unwrap()
-            .replace("printf '126", "printf '0")
-    );
+    prepared_fixture.steps[0].cmd = prepared_fixture.steps[0]
+        .cmd
+        .replace("printf '126", "printf '0");
     if audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts).is_ok() {
         return Err("prebuilt cell without the preparation-failure refusal was accepted".into());
     }
     let mut nested_timeout_fixture = fixture.clone();
-    nested_timeout_fixture["steps"][0]["cmd"] = json!(exact_cell_command.replace(
+    nested_timeout_fixture.steps[0].cmd = exact_cell_command.replace(
         "env HERMIT_BIN",
-        "timeout --kill-after=10s 20s env HERMIT_BIN"
-    ));
+        "timeout --kill-after=10s 20s env HERMIT_BIN",
+    );
     if audit_dag(&nested_timeout_fixture, 1, 100, &fixture_timeouts).is_ok() {
         return Err("cell with a nested wall timeout was accepted".into());
     }
     let mut swallowed_failure_fixture = fixture.clone();
-    swallowed_failure_fixture["steps"][0]["cmd"] =
-        json!(exact_cell_command.replace("exit \"$status\"", "exit 0"));
+    swallowed_failure_fixture.steps[0].cmd =
+        exact_cell_command.replace("exit \"$status\"", "exit 0");
     if audit_dag(&swallowed_failure_fixture, 1, 100, &fixture_timeouts).is_ok() {
         return Err("cell command that hid its terminal status was accepted".into());
     }
     let mut direct_result_fixture = fixture.clone();
-    direct_result_fixture["steps"][0]["cmd"] = json!(
-        exact_cell_command
-            .replace("results.in-progress.jsonl", "results.jsonl")
-            .replace("mv --", "cp --")
-    );
+    direct_result_fixture.steps[0].cmd = exact_cell_command
+        .replace("results.in-progress.jsonl", "results.jsonl")
+        .replace("mv --", "cp --");
     if audit_dag(&direct_result_fixture, 1, 100, &fixture_timeouts).is_ok() {
         return Err("cell command without terminal result publication was accepted".into());
     }
     let mut missing_exact_selector = fixture;
-    missing_exact_selector["steps"][0]["cmd"] =
-        json!(exact_cell_command.replace("--mode verify", ""));
+    missing_exact_selector.steps[0].cmd = exact_cell_command.replace("--mode verify", "");
     if audit_dag(&missing_exact_selector, 1, 100, &fixture_timeouts).is_ok() {
         return Err("negative generated-DAG bracket accepted a cell without an exact mode".into());
     }
@@ -2819,6 +2888,51 @@ fn self_test() -> Result<(), String> {
     }
     fs::remove_file(scratch.join("old-row"))
         .map_err(|e| format!("cannot remove self-test stale row: {e}"))?;
+
+    let unfiltered = pressure_cells(root, &CellSelection::default())?;
+    let exact_id = unfiltered
+        .red
+        .iter()
+        .find(|tracked| tracked.id.backend == "ptrace" && tracked.id.mode == "verify")
+        .or_else(|| unfiltered.red.first())
+        .ok_or("self-test needs at least one red compatibility cell")?
+        .id
+        .clone();
+    let exact_selection = CellSelection {
+        test: Some(exact_id.test.clone()),
+        mode: Some(exact_id.mode.clone()),
+        backend: Some(exact_id.backend.clone()),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let exact_results = scratch.join("exact-plan");
+    let exact_metadata = write_plan(
+        root,
+        &exact_results,
+        &exact_results.join("dag.json"),
+        &exact_selection,
+    )?;
+    if exact_metadata.cells != [exact_id] {
+        return Err("generated exact-cell plan did not retain exactly its requested cell".into());
+    }
+
+    let sample_selection = CellSelection {
+        sample: Some(2),
+        seed: Some(7),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let sample_results = scratch.join("sample-plan");
+    let sample_metadata = write_plan(
+        root,
+        &sample_results,
+        &sample_results.join("dag.json"),
+        &sample_selection,
+    )?;
+    if sample_metadata.cells.len() != 2 {
+        return Err("generated sampled plan did not retain its requested two cells".into());
+    }
+
     let profile_dir = scratch.join("runner-profile");
     fs::create_dir(&profile_dir)
         .map_err(|e| format!("cannot create self-test profile directory: {e}"))?;

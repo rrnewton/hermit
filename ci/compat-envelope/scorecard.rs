@@ -491,7 +491,7 @@ race-exposure check, and is therefore required to pass by ordinary validation. *
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
-These are the current pre-basic-sanity contracts. Every `verify` cell runs the same backend \
+These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend \
 twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
 same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
 parity.\n\n\
@@ -577,7 +577,7 @@ Standalone backend gates exercise selected comparisons, but their results are no
 Until a cell actually compares a fresh ptrace log with the corresponding backend log, this table \
 reports no cross-backend parity number.\n\n\
 ## Ptrace by manifest category\n\n\
-This view uses the same pre-basic-sanity contracts as the tables above, but makes the ptrace \
+This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
 workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
 denominator.\n\n\
 | Manifest category | Verify | Replay | Chaos | Green | Total |\n\

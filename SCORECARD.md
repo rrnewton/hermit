@@ -4,7 +4,7 @@ This table is derived from the manifest, not from a separately maintained parent
 
 **Green** means the cell is in `ci/expected-e2e-plan.json`, is not a chaos-mode race-exposure check, and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
 
-These are the current pre-basic-sanity contracts. Every `verify` cell runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity.
+These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity.
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
@@ -32,7 +32,7 @@ The manifest-backed scorecard does not yet contain cross-backend parity cells. I
 
 ## Ptrace by manifest category
 
-This view uses the same pre-basic-sanity contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
+This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
 
 | Manifest category | Verify | Replay | Chaos | Green | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
