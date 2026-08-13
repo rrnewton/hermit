@@ -104,6 +104,9 @@ still attempts the complete red population.
 
 The command reuses the canonical Hermit/resource build nodes, serializes
 fixture preparation, and gives every red cell its own cgroup-boxed node.
+`run` first materializes the exact committed SHA in a temporary fresh worktree,
+so ignored Cargo output in the primary checkout cannot change the experiment;
+the worktree is removed afterward while the run directory remains retained.
 Enabled red cells use the ordinary exact-cell selector; disabled red cells use
 the harness's explicit `--probe-disabled` selector. Each cell gets at most the
 shipped portable DAG's existing 600-second bucket allowance; the manifest's

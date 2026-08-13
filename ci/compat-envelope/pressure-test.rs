@@ -94,6 +94,113 @@ struct PressureCells {
     preparation_by_test: BTreeMap<String, CellId>,
 }
 
+struct FreshCheckout {
+    source: PathBuf,
+    path: PathBuf,
+}
+
+impl FreshCheckout {
+    fn prepare(source: &Path, sha: &str) -> Result<Self, String> {
+        let parent = source
+            .parent()
+            .filter(|path| path.join("ci-hub").is_dir())
+            .map(|path| path.join("ignored"))
+            .unwrap_or_else(env::temp_dir);
+        fs::create_dir_all(&parent).map_err(|e| {
+            format!(
+                "cannot create fresh-checkout parent {}: {e}",
+                parent.display()
+            )
+        })?;
+        let template = parent.join("pressure-fresh-XXXXXXXX");
+        let output = Command::new("mktemp")
+            .args(["-d", &template.to_string_lossy()])
+            .output()
+            .map_err(|e| format!("cannot create fresh checkout: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "mktemp refused fresh checkout creation: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        let checkout = Self {
+            source: source.to_path_buf(),
+            path,
+        };
+        let initialize = (|| {
+            command_ok(
+                Command::new("git")
+                    .args([
+                        "-C",
+                        &source.to_string_lossy(),
+                        "worktree",
+                        "add",
+                        "--detach",
+                    ])
+                    .arg(&checkout.path)
+                    .arg(sha),
+                "materialize fresh pressure-test checkout",
+            )?;
+            let observed = git_output(&checkout.path, &["rev-parse", "HEAD"])?;
+            if observed != sha {
+                return Err(format!(
+                    "fresh pressure-test checkout resolved to {observed}, expected {sha}"
+                ));
+            }
+            command_ok(
+                Command::new("git").args([
+                    "-C",
+                    &checkout.path.to_string_lossy(),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                ]),
+                "initialize pressure-test submodules",
+            )?;
+            for required in [
+                "ci/compat-envelope/pressure-test.rs",
+                "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+            ] {
+                if !checkout.path.join(required).is_file() {
+                    return Err(format!(
+                        "fresh pressure-test checkout is missing required file {required}"
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = initialize {
+            let cleanup = checkout.cleanup();
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; fresh-checkout cleanup also failed: {cleanup}"),
+            });
+        }
+        Ok(checkout)
+    }
+
+    fn cleanup(&self) -> Result<(), String> {
+        command_ok(
+            Command::new("git")
+                .args([
+                    "-C",
+                    &self.source.to_string_lossy(),
+                    "worktree",
+                    "remove",
+                    "--force",
+                ])
+                .arg(&self.path),
+            "remove generated pressure-test checkout",
+        )?;
+        command_ok(
+            Command::new("git").args(["-C", &self.source.to_string_lossy(), "worktree", "prune"]),
+            "prune generated pressure-test worktree record",
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CellBudget {
     timeout_seconds: i64,
@@ -170,28 +277,44 @@ fn run() -> Result<(), String> {
             if worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
+            let sha = git_output(&root, &["rev-parse", "HEAD"])?;
+            let fresh = FreshCheckout::prepare(&root, &sha)?;
+            println!("Fresh checkout: {}", fresh.path.display());
             let output = output.unwrap_or_else(|| results.join("dag.json"));
-            let metadata = write_plan(&root, &results, &output, mode.as_deref())?;
-            let status = Command::new(root.join("ci/run-dag.sh"))
-                .args([
-                    "portable",
-                    "-k",
-                    "--profile",
-                    "--run-timeout",
-                    &metadata.run_timeout_seconds.to_string(),
-                ])
-                .env("RUN_DAG_FILE_OVERRIDE", &output)
-                .current_dir(&root)
-                .status()
-                .map_err(|e| format!("cannot start safe-ci-dag-runner: {e}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "safe-ci-dag-runner failed with {}; retained artifacts are in {}",
-                    status,
-                    results.display()
-                ));
+            let run_result = (|| {
+                let metadata = write_plan(&fresh.path, &results, &output, mode.as_deref())?;
+                let status = Command::new(fresh.path.join("ci/run-dag.sh"))
+                    .args([
+                        "portable",
+                        "-k",
+                        "--profile",
+                        "--run-timeout",
+                        &metadata.run_timeout_seconds.to_string(),
+                    ])
+                    .env("RUN_DAG_FILE_OVERRIDE", &output)
+                    .current_dir(&fresh.path)
+                    .status()
+                    .map_err(|e| format!("cannot start safe-ci-dag-runner: {e}"))?;
+                if !status.success() {
+                    return Err(format!(
+                        "safe-ci-dag-runner failed with {}; retained artifacts are in {}",
+                        status,
+                        results.display()
+                    ));
+                }
+                summarize(&fresh.path, &results)
+            })();
+            let cleanup_result = fresh.cleanup();
+            match (run_result, cleanup_result) {
+                (Ok(()), Ok(())) => {}
+                (Err(run), Ok(())) => return Err(run),
+                (Ok(()), Err(cleanup)) => return Err(cleanup),
+                (Err(run), Err(cleanup)) => {
+                    return Err(format!(
+                        "{run}; fresh-checkout cleanup also failed: {cleanup}"
+                    ));
+                }
             }
-            summarize(&root, &results)?;
         }
         "summarize" => {
             let (results, output, _) = result_options(&root, &mut args, false, false)?;
@@ -314,6 +437,17 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
         return Err(format!("git {} failed", args.join(" ")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn command_ok(command: &mut Command, purpose: &str) -> Result<(), String> {
+    let status = command
+        .status()
+        .map_err(|e| format!("cannot {purpose}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cannot {purpose}: {status}"))
+    }
 }
 
 fn check_scorecard(root: &Path) -> Result<(), String> {
