@@ -4,7 +4,7 @@ This table is derived from the manifest, not from a separately maintained parent
 
 **Green** means the cell is in `ci/expected-e2e-plan.json`, is not a chaos-mode race-exposure check, and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
 
-These are the current pre-basic-sanity contracts. In particular, bare `--verify` uses the Stripped comparator and this table does not relabel it as strict INFO-log parity.
+These are the current pre-basic-sanity contracts. Every `verify` cell runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity.
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
@@ -25,6 +25,10 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | `chaos` | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 0 | 1680 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
 | **Total** | | | | | | | **168** | **5208** | **5376** |
+
+## Cross-backend parity
+
+The manifest-backed scorecard does not yet contain cross-backend parity cells. In particular, a DBT, KVM, SaBRe, or LiteInst `verify` cell compares that backend with itself, not with ptrace. Standalone backend gates exercise selected comparisons, but their results are not counted here. Until a cell actually compares a fresh ptrace log with the corresponding backend log, this table reports no cross-backend parity number.
 
 ## Ptrace by manifest category
 

@@ -54,6 +54,13 @@ The path is deliberately direct:
 commands remain required validation checks even though they are outside this
 uniform comparable denominator.
 
+The pre-Basic-Sanity `verify` cells run each selected backend twice against
+itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
+therefore measure same-backend repeatability under the current contract; they
+do not establish strict INFO-log determinism or cross-backend parity. The
+scorecard says this directly and reports no cross-backend parity count until
+the manifest has cells that really compare fresh ptrace and non-ptrace logs.
+
 A green cell turning red makes validate fail. The normal response is to fix the
 regression. Moving the cell out of the selected plan is not a fix, and
 `scorecard.rs update` refuses green-to-red movement unless an explicit
@@ -163,7 +170,8 @@ The ignored run directory retains `dag.json`, `run.json`, captured per-cell
 stdout/stderr, result rows, runner profiles, and `summary.json`. Verify-mode
 attempts also retain both raw INFO logs named by Hermit. A ptrace verify attempt
 runs the same Hermit binary's one-input `log-diff` command and retains the
-normalized first-run INFO stream for later cross-backend parity work.
+normalized first-run INFO stream for later cross-backend parity work. Retaining
+that input is preparation, not a parity result.
 Replay-mode raw-log retention is not implemented yet. A one-time PASS is
 printed as a candidate for repeated confirmation; it never edits the tracked
 green set automatically.
