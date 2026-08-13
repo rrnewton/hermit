@@ -24,17 +24,27 @@ use toml::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
-/// Buckets where `ci = false` is not allowed to be a silent default.
+/// Buckets that may not be recorded in [`CI_REASON_BASELINE`] at all.
 ///
 /// `backends_disabled` has always required a per-backend reason, but `ci =
 /// false` switches a whole mode-cell off with no justification at all — so a
-/// generated cell is born not-running and nothing records that it is. In the
-/// buckets listed here, every `ci = false` mode must carry a non-empty
-/// `ci_disabled_reason`, and every `ci = true` mode must omit it (a leftover
-/// reason on a running cell is stale documentation).
+/// generated cell is born not-running and nothing records that it is. That
+/// requirement is now universal: [`unreasoned_ci_false_cells`] scans every
+/// bucket, so a `ci = false` mode anywhere must carry a non-empty
+/// `ci_disabled_reason`.
 ///
-/// This is a ratchet: add a bucket once its cells all carry reasons. Cells
-/// outside these buckets may still carry `ci_disabled_reason` voluntarily.
+/// What listing a bucket here does is withdraw the baseline's grandfathering.
+/// A cell that predates the rule is tolerated while it is drained by being
+/// recorded in [`CI_REASON_BASELINE`] by identity; a cell in a bucket listed
+/// here may not be recorded there at all, so it is refused by name with no
+/// deferral available. Adding a bucket therefore does not turn the reason
+/// requirement on — it takes away the only way to postpone it, which is why a
+/// bucket is added only once its cells all carry reasons.
+///
+/// The converse direction — a stale `ci_disabled_reason` left behind on a
+/// `ci = true` cell — is enforced nowhere today, in these buckets or outside
+/// them. The check that enforced it was deleted in be4c09050; restoring it is
+/// tracked as issue #2249.
 const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
 /// Every `ci = false` mode that carries no `ci_disabled_reason`, listed by
 /// identity.
@@ -1478,6 +1488,25 @@ liteinst = "unsupported"
         let doc = reason_doc("c-programs", &one_test("c-programs/alpha", ""));
         let cells = unreasoned_ci_false_cells(std::slice::from_ref(&doc));
         assert!(cells.contains("c-programs/alpha::verify"), "{cells:?}");
+    }
+
+    /// The scan reaches a bucket in [`CI_REASON_REQUIRED_BUCKETS`], which it
+    /// used to skip. Every other case in this section uses `c-programs`, which
+    /// is outside that list, so none of them can observe the skip: restoring it
+    /// leaves them all green. This case is the one that fails.
+    #[test]
+    fn scans_a_ci_reason_required_bucket_too() {
+        assert!(
+            CI_REASON_REQUIRED_BUCKETS.contains(&"backend-parity-c"),
+            "this fixture must name a bucket the scan used to skip; pick \
+             another member of CI_REASON_REQUIRED_BUCKETS if it changes"
+        );
+        let doc = reason_doc("backend-parity-c", &one_test("backend-parity-c/alpha", ""));
+        let cells = unreasoned_ci_false_cells(std::slice::from_ref(&doc));
+        assert!(
+            cells.contains("backend-parity-c/alpha::verify"),
+            "{cells:?}"
+        );
     }
 
     /// The positive half: a stated reason is not recorded.
