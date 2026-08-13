@@ -1904,6 +1904,7 @@ impl RunOpts {
                     self.verify_allow,
                     self.verify_strict,
                     self.verify_verbose,
+                    self.verify_logs,
                     self.verify_json.as_deref(),
                     self.summary,
                     global.log,
