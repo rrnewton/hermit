@@ -486,6 +486,62 @@ fn run_dbt_executes_integrated_backend() {
 }
 
 #[test]
+fn run_dbt_emits_a_typed_verdict_for_the_comparison_it_performs() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT verification-report directory");
+    let report_path = directory.path().join("verify.json");
+    let report_arg = format!("--verify-json={}", report_path.display());
+    let args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        report_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "dbt-typed-verdict",
+    ];
+
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report_path).expect("DBT verify run did not write its JSON report"),
+    )
+    .expect("DBT verification report is valid JSON");
+
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["verified"], true, "{report}");
+    assert_eq!(report["bitwise_parity"], false, "{report}");
+    assert_eq!(report["comparison"]["backend"], "dbt", "{report}");
+    assert_eq!(report["comparison"]["strictness"], "dbt", "{report}");
+    assert_eq!(report["comparison"]["compare_logs"], false, "{report}");
+    assert_eq!(
+        report["comparison"]["guest_stdout"]["matched"], true,
+        "{report}",
+    );
+    assert_eq!(
+        report["comparison"]["guest_exit_status"]["matched"], true,
+        "{report}",
+    );
+    for field in ["syscalls", "rewritten", "stdin_reads", "memory_hash"] {
+        assert_eq!(
+            report["comparison"]["detcore_summary"][field]["matched"], true,
+            "DBT report omitted or failed {field}: {report}",
+        );
+    }
+    assert_eq!(
+        report["comparison"]["guest_stderr_compared"], false,
+        "{report}",
+    );
+    assert_eq!(
+        report["comparison"]["internal_log_messages_compared"], false,
+        "{report}",
+    );
+    assert!(report["compared_log_messages"].is_null(), "{report}");
+}
+
+#[test]
 fn run_dbt_uses_the_requested_guest_environment() {
     let args = [
         "run",

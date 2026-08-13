@@ -42,6 +42,8 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "dbt")]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
@@ -57,6 +59,16 @@ use reverie_dbt::DbtRunner;
 use tracing::metadata::LevelFilter;
 
 use super::run::VerifyAllow;
+#[cfg(feature = "dbt")]
+use super::verify::ComparedDbtValue;
+#[cfg(feature = "dbt")]
+use super::verify::DbtComparison;
+#[cfg(feature = "dbt")]
+use super::verify::DbtGuestStatus;
+#[cfg(feature = "dbt")]
+use super::verify::DbtSummaryComparison;
+#[cfg(feature = "dbt")]
+use super::verify::write_dbt_verification_json;
 
 #[derive(Debug)]
 #[cfg(feature = "dbt")]
@@ -383,6 +395,7 @@ pub(super) fn run_dbt(
     args: &[String],
     verify: bool,
     verify_allow: VerifyAllow,
+    verify_json: Option<&Path>,
     summary: bool,
     log: Option<LevelFilter>,
     config: &Config,
@@ -529,6 +542,15 @@ pub(super) fn run_dbt(
     }
     let second_summary = detcore_summary(&second)?;
 
+    // Publish the verdict before returning any mismatch error. The process exit
+    // remains the historical human-facing failure channel; the JSON records
+    // independently whether the two completed DBT runs matched and exactly
+    // which inputs produced that answer.
+    let comparison = dbt_comparison(&first, &first_summary, &second, &second_summary);
+    if let Some(path) = verify_json {
+        write_dbt_verification_json(path, comparison, dbt_guest_status(second.status))?;
+    }
+
     // Determinism requires both runs to agree on their exit status, not merely
     // that each is permitted by `--verify-allow`. This guards the non-zero-exit
     // contract (e.g. a guest that must exit 23 on both runs); without it, two
@@ -586,12 +608,61 @@ pub(super) fn run_dbt(
     _args: &[String],
     _verify: bool,
     _verify_allow: VerifyAllow,
+    _verify_json: Option<&Path>,
     _summary: bool,
     _log: Option<LevelFilter>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_comparison(
+    first: &Output,
+    first_summary: &DbtSummary,
+    second: &Output,
+    second_summary: &DbtSummary,
+) -> DbtComparison {
+    DbtComparison {
+        backend: "dbt",
+        strictness: "dbt",
+        compare_logs: false,
+        guest_stdout: ComparedDbtValue {
+            left: first.stdout.len(),
+            right: second.stdout.len(),
+            // Equal byte counts alone do not prove equal output.
+            matched: first.stdout == second.stdout,
+        },
+        guest_exit_status: ComparedDbtValue::new(
+            DbtGuestStatus::from(dbt_guest_status(first.status)),
+            DbtGuestStatus::from(dbt_guest_status(second.status)),
+        ),
+        detcore_summary: DbtSummaryComparison {
+            syscalls: ComparedDbtValue::new(first_summary.syscalls, second_summary.syscalls),
+            rewritten: ComparedDbtValue::new(first_summary.rewritten, second_summary.rewritten),
+            stdin_reads: ComparedDbtValue::new(
+                first_summary.stdin_reads,
+                second_summary.stdin_reads,
+            ),
+            memory_hash: ComparedDbtValue::new(
+                first_summary.memory_hash.clone(),
+                second_summary.memory_hash.clone(),
+            ),
+            last_syscall_branch_count_compared: false,
+        },
+        guest_stderr_compared: false,
+        internal_log_messages_compared: false,
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_guest_status(status: std::process::ExitStatus) -> ExitStatus {
+    // Preserve the exact Unix wait status for the typed verdict. The historical
+    // process-status path below maps a signal to exit 1, which is sufficient for
+    // shell propagation but would conflate different terminating signals in a
+    // machine-readable comparison.
+    ExitStatus::from_raw(status.into_raw())
 }
 
 #[cfg(feature = "dbt")]
@@ -841,9 +912,6 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "dbt")]
-    use std::os::unix::process::ExitStatusExt as _;
-
     use super::*;
 
     #[cfg(feature = "dbt")]
@@ -932,6 +1000,121 @@ mod tests {
             stdout: Vec::new(),
             stderr: summary.as_bytes().to_vec(),
         }
+    }
+
+    #[cfg(feature = "dbt")]
+    fn dbt_verification_output(stdout: &[u8], exit_code: i32) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_code << 8),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_comparison_reports_match_and_same_length_divergence() {
+        let first = dbt_verification_output(b"same", 0);
+        let second = dbt_verification_output(b"same", 0);
+        let matched = dbt_comparison(&first, &dbt_summary(10), &second, &dbt_summary(99));
+        let report = super::super::verify::VerificationReport::from_dbt(
+            matched,
+            dbt_guest_status(second.status),
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["verdict"], "matched");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["bitwise_parity"], false);
+        assert_eq!(json["comparison"]["backend"], "dbt");
+        assert_eq!(json["comparison"]["guest_stdout"]["matched"], true);
+        assert_eq!(
+            json["comparison"]["detcore_summary"]["last_syscall_branch_count_compared"],
+            false,
+        );
+        assert_eq!(json["comparison"]["guest_stderr_compared"], false);
+        assert_eq!(json["comparison"]["internal_log_messages_compared"], false,);
+        assert!(json["compared_log_messages"].is_null());
+
+        // Equal lengths must not launder distinct stdout bytes into a match.
+        let second = dbt_verification_output(b"diff", 0);
+        let diverged = dbt_comparison(&first, &dbt_summary(10), &second, &dbt_summary(10));
+        let report = super::super::verify::VerificationReport::from_dbt(
+            diverged,
+            dbt_guest_status(second.status),
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["verdict"], "diverged");
+        assert_eq!(json["verified"], false);
+        assert_eq!(json["comparison"]["guest_stdout"]["left"], 4);
+        assert_eq!(json["comparison"]["guest_stdout"]["right"], 4);
+        assert_eq!(json["comparison"]["guest_stdout"]["matched"], false);
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_comparison_keeps_every_verdict_input_discriminating() {
+        let first_output = dbt_verification_output(b"same", 0);
+        let second_output = dbt_verification_output(b"same", 0);
+        let expected = dbt_summary(10);
+
+        let mut changed = dbt_summary(10);
+        changed.syscalls += 1;
+        assert!(!dbt_comparison(&first_output, &expected, &second_output, &changed).matched());
+
+        let mut changed = dbt_summary(10);
+        changed.rewritten -= 1;
+        assert!(!dbt_comparison(&first_output, &expected, &second_output, &changed).matched());
+
+        let mut changed = dbt_summary(10);
+        changed.stdin_reads += 1;
+        assert!(!dbt_comparison(&first_output, &expected, &second_output, &changed).matched());
+
+        let mut changed = dbt_summary(10);
+        changed.memory_hash = "0000000000000000".to_owned();
+        assert!(!dbt_comparison(&first_output, &expected, &second_output, &changed).matched());
+
+        let different_status = dbt_verification_output(b"same", 23);
+        assert!(
+            !dbt_comparison(
+                &first_output,
+                &expected,
+                &different_status,
+                &dbt_summary(10),
+            )
+            .matched()
+        );
+
+        let signaled_first = Output {
+            status: std::process::ExitStatus::from_raw(libc::SIGTERM),
+            stdout: b"same".to_vec(),
+            stderr: Vec::new(),
+        };
+        let signaled_second = Output {
+            status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+            stdout: b"same".to_vec(),
+            stderr: Vec::new(),
+        };
+        let signaled = dbt_comparison(
+            &signaled_first,
+            &expected,
+            &signaled_second,
+            &dbt_summary(10),
+        );
+        assert!(!signaled.matched());
+        assert_eq!(signaled.guest_exit_status.left.signal, Some(libc::SIGTERM));
+        assert_eq!(signaled.guest_exit_status.right.signal, Some(libc::SIGKILL));
+
+        // The last-syscall branch count is explicitly diagnostic and remains
+        // outside the verdict in both directions.
+        assert!(
+            dbt_comparison(
+                &first_output,
+                &dbt_summary(10),
+                &second_output,
+                &dbt_summary(11),
+            )
+            .matched()
+        );
     }
 
     #[test]
