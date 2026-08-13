@@ -76,6 +76,7 @@ function usage {
 Usage:
   ci/test_harness.sh validate
   ci/test_harness.sh plan [--lane portable|privileged] [--format text|json]
+  ci/test_harness.sh host-inapplicable-buckets [filters]
   ci/test_harness.sh build [filters]
   ci/test_harness.sh run [filters] [--results PATH] [--junit PATH]
   ci/test_harness.sh audit-gaps [--lane portable|privileged] [--format text|json]
@@ -496,6 +497,103 @@ function resolve_host_inapplicable {
         printf 'HOST-INAPPLICABLE: %s will NOT RUN wherever it is selected — this machine lacks %s (%s). This is NOT a pass and carries NO coverage for what that cell verifies.\n' \
             "$id" "$capability" "$evidence"
     done
+}
+
+# The per-bucket cell accounting the DRIVER needs before it spawns anything.
+#
+# One TSV line per manifest bucket the current filters select:
+#
+#     <lane>\t<category>\t<selected>\t<withheld>\t<capabilities>
+#
+# `<capabilities>` is the comma-joined sorted set of capabilities that withheld
+# cells in that bucket, or `-` when none did.
+#
+# READ-ONLY: it runs no cell, writes no result, no summary, no JUnit and no
+# label, in the same class as `plan`. It reports COUNTS ONLY and leaves the
+# predicate to the caller, so the two halves of the node decision stay separable
+# and each is bracketed alone: this half answers "what would this bucket run and
+# how much of it is withheld", and the caller answers "is that empty".
+#
+# `selected` is counted exactly the way `run_required` counts it — one per
+# (test, mode, backend) cell, from the SAME `emit_required_plan` — so the
+# driver's view of a bucket cannot drift from what that bucket's node would
+# actually run. That is what makes the driver's decision COMPUTED from the live
+# cell population rather than declared: a bucket that gains a runnable cell
+# reports a smaller `withheld` here on the very next run, with no code change.
+#
+# The human-readable capability verdicts go to stderr so stdout stays a record.
+function emit_host_inapplicable_buckets {
+    resolve_host_inapplicable >&2
+    local -A selected=() withheld=() caps=()
+    local lane category test_id mode backend key capability evidence list
+    while IFS=$'\t' read -r lane category test_id mode backend; do
+        [[ -n $test_id ]] || continue
+        key="$lane"$'\t'"$category"
+        selected[$key]=$((${selected[$key]:-0} + 1))
+        withheld[$key]=$((${withheld[$key]:-0} + 0))
+        if [[ -n ${HOST_INAPPLICABLE[$test_id]:-} ]]; then
+            withheld[$key]=$((${withheld[$key]} + 1))
+            IFS=$'\t' read -r capability evidence <<<"${HOST_INAPPLICABLE[$test_id]}"
+            caps[$key]="${caps[$key]:-}$capability"$'\n'
+        fi
+    done < <(emit_required_plan | jq -r '[.lane,.category,.test,.mode,(.backend // "")] | @tsv')
+    for key in "${!selected[@]}"; do
+        list='-'
+        if [[ -n ${caps[$key]:-} ]]; then
+            list=$(printf '%s' "${caps[$key]}" | LC_ALL=C sort -u | sed '/^$/d' | paste -sd, -)
+        fi
+        printf '%s\t%d\t%d\t%s\n' "$key" "${selected[$key]}" "${withheld[$key]}" "$list"
+    done | LC_ALL=C sort
+}
+
+# Every capability a manifest CELL can be withheld by must ALSO be declared by
+# some DAG node's `requires_host_capability`.
+#
+# WHY THIS IS ASSERTED RATHER THAN ASSUMED: `scripts/validate.rs` probes only
+# the capabilities its own DAG declares, and it asks this harness for the
+# per-bucket accounting only when one of those came back ABSENT. A capability
+# that appeared on a cell but on no node would therefore never be probed at plan
+# construction, so a bucket whose entire cell population is unrunnable would not
+# be recognized before spawn: the node would start, withhold every cell, and die
+# on the vacuity guard. That is fail-closed — a refusal, never a false pass —
+# but it is a confusing refusal, so the correspondence is checked here instead
+# of being left to chance.
+function audit_host_capability_declaration_correspondence {
+    local declared probed missing
+    declared=$(cargo run --quiet -p hermit-manifest-plan -- --format host-requirements |
+        cut -f1 | LC_ALL=C sort -u) ||
+        die "manifest \`requires\` declarations were refused while auditing host-capability correspondence"
+    if [[ -z $declared ]]; then
+        echo "PASS: no manifest cell declares a host capability with an absence proof"
+        return 0
+    fi
+    probed=$(jq -r '.steps[] | .requires_host_capability // empty' "$DAG_DIR"/*.json |
+        LC_ALL=C sort -u)
+    missing=$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$probed") | tr '\n' ' ')
+    [[ -z ${missing// /} ]] ||
+        die "host capability declared by a manifest cell but by no DAG node: ${missing% }; scripts/validate.rs probes only DAG-declared capabilities before spawning, so a cell-only capability would not be seen at plan construction. Declare it on the owning node in ci/dag/<lane>.json."
+    echo "PASS: every cell-declared host capability ($(tr '\n' ' ' <<<"$declared" | sed 's/ $//')) is also declared by a DAG node"
+
+    # An INDEPENDENT upper bound on the per-bucket accounting the driver uses to
+    # withhold a whole node. `emit_host_inapplicable_buckets` may never claim
+    # more withheld cells than there are selected cells whose OWN test declares a
+    # probeable `requires` token, counted here straight from the declaration
+    # list rather than from the map that accounting builds. Without this, a
+    # defect that reported every cell withheld would silently withhold every
+    # bucket node, and nothing else would notice.
+    local declared_ids selected_declarable withheld_total
+    declared_ids=$(cargo run --quiet -p hermit-manifest-plan -- --format host-requirements |
+        cut -f2 | LC_ALL=C sort -u)
+    selected_declarable=0
+    if [[ -n $declared_ids ]]; then
+        selected_declarable=$(emit_required_plan | jq -r .test |
+            grep -Fxc -f <(printf '%s\n' "$declared_ids") || true)
+    fi
+    withheld_total=$(emit_host_inapplicable_buckets 2>/dev/null |
+        awk -F'\t' '{s += $4} END {print s + 0}')
+    ((withheld_total <= selected_declarable)) ||
+        die "bucket accounting claims $withheld_total withheld cell(s) but only $selected_declarable selected cell(s) declare a probeable \`requires\` token; ci/test_harness.sh::emit_host_inapplicable_buckets is over-reporting and would withhold DAG nodes that have runnable work"
+    echo "PASS: bucket accounting reports $withheld_total withheld cell(s), within the $selected_declarable cell(s) the corpus declares withholdable"
 }
 
 function record_host_inapplicable {
@@ -3453,11 +3551,15 @@ case "$subcommand" in
         # the PLAN, which is unchanged by withholding: the denominator is the
         # cells the profile requires, not the cells this machine can run.
         resolve_host_inapplicable
+        audit_host_capability_declaration_correspondence
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         validate_dag_correspondence
         ;;
     plan)
         print_plan required
+        ;;
+    host-inapplicable-buckets)
+        emit_host_inapplicable_buckets
         ;;
     build)
         ((PREBUILT == 0)) || die "build does not accept --prebuilt"
