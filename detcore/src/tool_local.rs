@@ -433,40 +433,24 @@ impl FileMetadata {
 
     /// set default fds
     fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
-        // guest stdio can be a pipe, which make things difficult
-        // hence use a dummy stat here.
-        // SAFETY: stating stdin is likely to always be safe
-        let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
-            .unwrap()
-            .into();
-        let stdin = DetFd::new(
-            0,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdin));
-        let stdout = DetFd::new(
-            1,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStdout));
-        let stderr = DetFd::new(
-            2,
-            OFlag::empty(),
-            FdType::Regular,
-            self.allocate_open_file_id(owner, FdType::Regular),
-        )
-        .with_stat(stat)
-        .with_resource(ResourceID::Device(Device::ContainerStderr));
-
-        self.add_detfd(stdin);
-        self.add_detfd(stdout);
-        self.add_detfd(stderr);
+        for (fd, device) in [
+            (libc::STDIN_FILENO, Device::ContainerStdin),
+            (libc::STDOUT_FILENO, Device::ContainerStdout),
+            (libc::STDERR_FILENO, Device::ContainerStderr),
+        ] {
+            // SAFETY: each borrowed descriptor remains owned by the process.
+            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).unwrap();
+            let ty = fd_type_from_stat_mode(raw_stat.st_mode);
+            let detfd = DetFd::new(
+                fd,
+                OFlag::empty(),
+                ty,
+                self.allocate_open_file_id(owner, ty),
+            )
+            .with_stat(DetStat::from(raw_stat))
+            .with_resource(ResourceID::Device(device));
+            self.add_detfd(detfd);
+        }
 
         self
     }
@@ -485,14 +469,7 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
-            FdType::Pipe
-        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
-            FdType::Socket
-        } else {
-            FdType::Regular
-        };
+        let ty = fd_type_from_stat_mode(raw_stat.st_mode);
         let mut flags = OFlag::from_bits_truncate(status_flags);
         let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
         // Discovered descriptors have unknown provenance, so an observed
@@ -580,6 +557,17 @@ impl FileMetadata {
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+    }
+}
+
+fn fd_type_from_stat_mode(mode: libc::mode_t) -> FdType {
+    let file_type = stat::SFlag::from_bits_truncate(mode);
+    if file_type.contains(stat::SFlag::S_IFIFO) {
+        FdType::Pipe
+    } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+        FdType::Socket
+    } else {
+        FdType::Regular
     }
 }
 
@@ -735,6 +723,22 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn inherited_fd_type_comes_from_each_descriptor_mode() {
+        assert_eq!(
+            fd_type_from_stat_mode(libc::S_IFIFO as libc::mode_t),
+            FdType::Pipe
+        );
+        assert_eq!(
+            fd_type_from_stat_mode(libc::S_IFSOCK as libc::mode_t),
+            FdType::Socket
+        );
+        assert_eq!(
+            fd_type_from_stat_mode(libc::S_IFREG as libc::mode_t),
+            FdType::Regular
+        );
+    }
 
     #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {

@@ -439,6 +439,27 @@ static int check_fixed_pipe_capacity_policy(void) {
   if (expected_pipe_capacity <= 0) {
     return 0;
   }
+  int maximum_fd = open("/proc/sys/fs/pipe-max-size", O_RDONLY | O_CLOEXEC);
+  if (maximum_fd < 0) {
+    perror("open pipe-max-size");
+    return -1;
+  }
+  char maximum_text[64] = {0};
+  ssize_t maximum_length = read(maximum_fd, maximum_text,
+                                sizeof(maximum_text) - 1);
+  close(maximum_fd);
+  char *maximum_end = NULL;
+  errno = 0;
+  long maximum = maximum_length > 0
+                     ? strtol(maximum_text, &maximum_end, 10)
+                     : -1;
+  if (maximum_length <= 0 || errno != 0 || maximum_end == maximum_text ||
+      maximum != expected_pipe_capacity) {
+    fprintf(stderr, "pipe-max-size mismatch: %.*s expected %d\n",
+            maximum_length > 0 ? (int)maximum_length : 0, maximum_text,
+            expected_pipe_capacity);
+    return -1;
+  }
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     perror("capacity policy pipe");
@@ -538,13 +559,27 @@ int main(int argc, char **argv) {
     puts("writev-determinism-ok");
     return 0;
   }
+  if (argc > 1 && strcmp(argv[1], "inherited-pipe-get") == 0) {
+    int result = fcntl(STDIN_FILENO, F_GETPIPE_SZ);
+    fprintf(stderr, "inherited pipe F_GETPIPE_SZ unexpectedly returned %d/%d\n",
+            result, errno);
+    return 3;
+  }
+  if (argc > 1 && strcmp(argv[1], "inherited-pipe-set") == 0) {
+    int result = fcntl(STDIN_FILENO, F_SETPIPE_SZ, 0);
+    fprintf(stderr, "inherited pipe F_SETPIPE_SZ unexpectedly returned %d/%d\n",
+            result, errno);
+    return 3;
+  }
   if (argc > 1) {
     char *end = NULL;
     errno = 0;
     long parsed = strtol(argv[1], &end, 10);
     if (errno != 0 || end == argv[1] || *end != '\0' || parsed <= 0 ||
         parsed > INT_MAX) {
-      fprintf(stderr, "usage: %s [record|record-pipe|expected-capacity]\n",
+      fprintf(stderr,
+              "usage: %s [record|record-pipe|inherited-pipe-get|"
+              "inherited-pipe-set|expected-capacity]\n",
               argv[0]);
       return 2;
     }

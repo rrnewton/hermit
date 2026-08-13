@@ -65,15 +65,16 @@ const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 
 // One x86_64 page is a valid Linux pipe capacity and is always a shrink or no-op for a
 // newly created empty pipe, including when per-user pipe-page pressure is already high.
-fn deterministic_pipe_set_result(requested: i32, current: i32) -> Result<i32, Errno> {
+fn deterministic_pipe_set_result(requested: i32, capacity_limit: i32) -> Result<i32, Errno> {
     if requested < 0 {
         return Err(Errno::EINVAL);
     }
-    if requested <= current {
-        return Ok(current);
+    if requested <= capacity_limit {
+        return Ok(capacity_limit);
     }
-    // Linux permits an unprivileged process to shrink an empty pipe to one page and can
-    // refuse later growth under its configured and per-user accounting limits.
+    // Hermit's supported execution does not have CAP_SYS_RESOURCE in the initial user
+    // namespace. Linux refuses an unprivileged request above pipe-max-size with EPERM;
+    // procfs exposes this same deterministic capacity as /proc/sys/fs/pipe-max-size.
     Err(Errno::EPERM)
 }
 
@@ -2892,6 +2893,8 @@ mod test {
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use crate::fd::FdType;
+    use crate::procfs::ProcfsFile;
+    use crate::procfs::ProcfsSnapshotContext;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2920,6 +2923,24 @@ mod test {
                 Err(Errno::EPERM)
             );
         }
+    }
+
+    #[test]
+    fn pipe_capacity_growth_refusal_matches_exposed_maximum() {
+        let mut file = ProcfsFile::from_path(std::path::Path::new("/proc/sys/fs/pipe-max-size"))
+            .expect("pipe maximum must be virtualized");
+        file.initialize(b"1048576\n".to_vec(), ProcfsSnapshotContext::default());
+        let maximum = std::str::from_utf8(&file.take(128).expect("snapshot must be readable"))
+            .expect("pipe maximum must be UTF-8")
+            .trim()
+            .parse::<i32>()
+            .expect("pipe maximum must be numeric");
+
+        assert_eq!(maximum, DETERMINISTIC_PIPE_CAPACITY);
+        assert_eq!(
+            deterministic_pipe_set_result(maximum + 1, maximum),
+            Err(Errno::EPERM)
+        );
     }
 
     struct TestPipeCapacityOperations {

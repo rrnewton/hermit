@@ -10,6 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
@@ -43,6 +44,44 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&guest);
     command_output(compile, "writev guest compilation");
 
+    for (mode, diagnostic) in [
+        (
+            "inherited-pipe-get",
+            "cannot expose host-selected capacity for inherited pipe fd 0",
+        ),
+        (
+            "inherited-pipe-set",
+            "cannot resize inherited pipe fd 0 from host-selected state",
+        ),
+    ] {
+        let mut inherited = Command::new("timeout");
+        inherited
+            .args(["--kill-after", "5s", "30s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "run",
+                "--strict",
+                "--panic-on-unsupported-syscalls",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg(mode)
+            .stdin(Stdio::piped());
+        let output = inherited
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start inherited-pipe {mode}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(diagnostic),
+            "inherited-pipe {mode} was not refused by the typed capacity path\n\
+             status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
     let mut trace = Command::new("timeout");
     trace
         .args(["--kill-after", "5s", "30s"])
@@ -55,7 +94,9 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest);
+        .arg(&guest)
+        .arg("4096")
+        .stdin(Stdio::piped());
     let trace_output = command_output(trace, "strict writev trace");
     let trace_stdout = String::from_utf8_lossy(&trace_output.stdout);
     let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
@@ -73,36 +114,77 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
-    for (label, strict, extra_arg) in [
-        ("strict writev verification", true, None),
-        (
-            "passthru-opt writev verification",
-            false,
-            Some("--passthru-opt"),
-        ),
-    ] {
-        let mut verify = Command::new("timeout");
-        verify
-            .args(["--kill-after", "5s", "30s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--log=info", "run", "--verify", "--base-env=minimal"]);
-        if strict {
-            verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
-        }
-        if let Some(arg) = extra_arg {
-            verify.arg(arg);
-        }
-        verify.arg("--").arg(&guest);
-        let verify_output = command_output(verify, label);
-        let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
-        let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+    let strict_report = build_root.join("strict-verify.json");
+    let _ = fs::remove_file(&strict_report);
+    let mut strict_verify = Command::new("timeout");
+    strict_verify
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--verify-strict",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+        ])
+        .arg("--verify-json")
+        .arg(&strict_report)
+        .arg("--")
+        .arg(&guest)
+        .arg("4096");
+    command_output(strict_verify, "canonical strict writev verification");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&strict_report).expect("strict verification omitted its JSON report"),
+    )
+    .expect("strict verification report was not valid JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"));
+    assert_eq!(report["verified"], serde_json::json!(true));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(
+        report["comparison"]["strictness"],
+        serde_json::json!("canonical")
+    );
+    for side in ["left", "right"] {
         assert!(
-            verify_stdout.contains("Determinism verified")
-                || verify_stderr.contains("Determinism verified"),
-            "Hermit omitted its determinism marker for {label}\n\
-             stdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "canonical verification reported no compared {side} messages: {report}"
         );
     }
+
+    // This compatibility case intentionally exercises the Stripped comparator. It is not
+    // evidence for bitwise parity and its JSON verdict must keep saying so.
+    let passthru_report = build_root.join("passthru-verify.json");
+    let _ = fs::remove_file(&passthru_report);
+    let mut passthru_verify = Command::new("timeout");
+    passthru_verify
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--passthru-opt",
+            "--base-env=minimal",
+        ])
+        .arg("--verify-json")
+        .arg(&passthru_report)
+        .arg("--")
+        .arg(&guest);
+    command_output(passthru_verify, "Stripped passthru-opt writev verification");
+    let passthru: serde_json::Value = serde_json::from_slice(
+        &fs::read(&passthru_report).expect("passthru verification omitted its JSON report"),
+    )
+    .expect("passthru verification report was not valid JSON");
+    assert_eq!(passthru["verified"], serde_json::json!(true));
+    assert_eq!(passthru["bitwise_parity"], serde_json::json!(false));
+    assert_eq!(
+        passthru["comparison"]["strictness"],
+        serde_json::json!("stripped")
+    );
 
     // Exercise record mode on the smallest pipe-retry workload separately before the
     // full fixed-capacity workload is recorded and replayed below.

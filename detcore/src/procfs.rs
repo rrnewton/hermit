@@ -130,6 +130,7 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     Vmstat,
+    PipeMaxSize,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -469,6 +470,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-910): Review host file-table normalization.
             "/proc/sys/fs/file-nr" => ProcfsKind::FileNr,
             "/proc/sys/fs/file-max" => ProcfsKind::FileMax,
+            "/proc/sys/fs/pipe-max-size" => ProcfsKind::PipeMaxSize,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
             "/proc/zoneinfo" => ProcfsKind::Zoneinfo,
@@ -649,6 +651,7 @@ impl ProcfsFile {
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
             ProcfsKind::FileNr => sanitize_file_nr(&contents),
             ProcfsKind::FileMax => sanitize_file_max(&contents),
+            ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
             ProcfsKind::Zoneinfo => sanitize_zoneinfo(&contents),
             ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
@@ -1574,6 +1577,16 @@ fn sanitize_file_max(contents: &[u8]) -> Vec<u8> {
     } else {
         format!("{VIRTUAL_FILE_MAX}\n").into_bytes()
     }
+}
+
+fn sanitize_pipe_max_size(contents: &[u8]) -> Vec<u8> {
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    if value.trim().parse::<u64>().is_err() {
+        return Vec::new();
+    }
+    format!("{}\n", crate::DETERMINISTIC_PIPE_CAPACITY).into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3435,6 +3448,12 @@ mod tests {
             ProcfsKind::FileMax
         );
         assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/sys/fs/pipe-max-size"))
+                .unwrap()
+                .kind,
+            ProcfsKind::PipeMaxSize
+        );
+        assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/zoneinfo"))
                 .unwrap()
                 .kind,
@@ -4840,6 +4859,16 @@ total_commit_ms 0\n"
         assert_eq!(file.take(5).unwrap(), b"volun");
         assert_eq!(file.take(128).unwrap(), b"tary_ctxt_switches:\t0\n");
         assert!(file.take(1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pipe_max_size_matches_scheduler_managed_pipe_capacity() {
+        let mut file = ProcfsFile::from_path(Path::new("/proc/sys/fs/pipe-max-size")).unwrap();
+        file.initialize(b"1048576\n".to_vec(), ProcfsSnapshotContext::default());
+        assert_eq!(
+            file.take(128).unwrap(),
+            format!("{}\n", crate::DETERMINISTIC_PIPE_CAPACITY).as_bytes()
+        );
     }
 
     #[test]
