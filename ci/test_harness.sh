@@ -412,8 +412,24 @@ function load_tests {
 # faulting the guest sees the real host CPU and the cell fails with
 # `unexpected CPUID identity: max=00000010 vendor=AuthenticAMD` -- it is asking
 # for Detcore's synthetic GenuineIntel/0x0000000d identity, which only exists if
-# the kernel can trap CPUID. Withholding the whole `manifest_backend_parity_c`
-# bucket instead would destroy coverage of every other parity cell in it.
+# the kernel can trap CPUID.
+#
+# CELL GRANULARITY IS STILL THE RIGHT PLACE FOR THIS DECISION, but NOT for the
+# reason first given. hermit#2212 said withholding the whole
+# `manifest_backend_parity_c` bucket "would destroy coverage of every other
+# parity cell in it", and that is FALSE FOR THE PRIVILEGED LANE: measured with
+# `./ci/test_harness.sh plan --lane privileged --category backend-parity-c
+# --ci-only`, that lane's `ci = true` population for this bucket is exactly ONE
+# cell, this one. The other 78 parity cells are on the PORTABLE lane, under a
+# different DAG node, untouched either way.
+#
+# The real reason is that a cell is where the `requires` declaration lives, so
+# it is the only granularity at which the decision can be read off a static
+# declaration instead of guessed for a whole bucket. The node-level consequence
+# is then COMPUTED from the cell outcome rather than declared: see
+# `scripts/validate.rs::withhold_vacuous_manifest_nodes`, which withholds a node
+# only when every cell it would run is withheld, so a runnable cell added to
+# this bucket later brings the node straight back.
 #
 # WHAT STOPS THIS FROM EXCUSING A CELL THAT IS MERELY BROKEN:
 #
