@@ -124,8 +124,12 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
 
         if pid != root.pid {
             for tid in &tids {
-                if let Ok(identity) = process_identity(*tid) {
-                    snapshot.tasks.insert(*tid, identity);
+                match process_identity(*tid) {
+                    Ok(identity) => {
+                        snapshot.tasks.insert(*tid, identity);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
@@ -358,6 +362,20 @@ impl OwnedHermit {
         Ok(())
     }
 
+    fn record_adopted_children(&mut self, parent_pid: libc::pid_t) -> io::Result<usize> {
+        let mut count = 0;
+        for identity in direct_children(parent_pid)?.into_values() {
+            if identity == self.root.identity
+                || self.preexisting_children.get(&identity.pid) == Some(&identity)
+            {
+                continue;
+            }
+            count += 1;
+            self.record_direct_child(identity, parent_pid)?;
+        }
+        Ok(count)
+    }
+
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
@@ -413,28 +431,14 @@ impl OwnedHermit {
         let self_pid = unsafe { libc::getpid() };
         loop {
             let _ = self.child.try_wait();
-            let mut adopted_count = 0;
+            let mut adopted_count;
             let mut adoption_known = true;
-            match direct_children(self_pid) {
-                Ok(adopted) => {
-                    for identity in adopted.into_values() {
-                        if identity == self.root.identity
-                            || self.preexisting_children.get(&identity.pid) == Some(&identity)
-                        {
-                            continue;
-                        }
-                        adopted_count += 1;
-                        if let Err(error) = self.record_direct_child(identity, self_pid) {
-                            eprintln!(
-                                "cleanup could not bind adopted pid {} to its pidfd: {error}",
-                                identity.pid
-                            );
-                        }
-                    }
-                }
+            match self.record_adopted_children(self_pid) {
+                Ok(count) => adopted_count = count,
                 Err(error) => {
+                    adopted_count = 0;
                     adoption_known = false;
-                    eprintln!("cleanup could not enumerate adopted child roots: {error}");
+                    eprintln!("cleanup could not bind adopted child roots: {error}");
                 }
             }
 
@@ -476,7 +480,26 @@ impl OwnedHermit {
                 && adoption_known
                 && adopted_count == 0
             {
-                break;
+                match self.record_adopted_children(self_pid) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        adopted_count = count;
+                        for process in self.descendants.values() {
+                            if let Err(error) = signal_pidfd(process, libc::SIGKILL) {
+                                eprintln!(
+                                    "cleanup failed to signal newly adopted pid {} through its pidfd: {error}",
+                                    process.identity.pid
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        adoption_known = false;
+                        eprintln!(
+                            "cleanup could not bind adopted child roots after recorded pidfds became ready: {error}"
+                        );
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 eprintln!(
@@ -512,10 +535,13 @@ fn pidfd_alive(process: &OwnedProcess) -> io::Result<bool> {
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    if pollfd.revents & libc::POLLNVAL != 0 {
+    if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("pidfd for pid {} became invalid", process.identity.pid),
+            format!(
+                "pidfd poll for pid {} returned unexpected events {:#x}",
+                process.identity.pid, pollfd.revents
+            ),
         ));
     }
     Ok(result == 0)
