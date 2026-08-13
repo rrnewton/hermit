@@ -266,17 +266,18 @@ impl OwnedHermit {
         let identity = match process_identity(pid) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_direct_child(&mut child, Duration::from_secs(1), "unbound Hermit child");
                 return Err(error);
             }
         };
         let root = match OwnedProcess::open(identity, 0) {
             Ok(root) => root,
             Err(error) => {
-                // This exact, unreaped direct child cannot have a reused PID.
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_direct_child(
+                    &mut child,
+                    Duration::from_secs(1),
+                    "Hermit child without a pidfd",
+                );
                 return Err(error);
             }
         };
@@ -367,39 +368,78 @@ impl OwnedHermit {
             return;
         }
 
+        let deadline = Instant::now() + Duration::from_secs(1);
+
         if same_process(self.root.identity)
             && let Ok(snapshot) = owned_processes(self.root.identity)
         {
             let _ = self.record(&snapshot);
         }
 
-        let self_pid = unsafe { libc::getpid() };
-        if let Ok(adopted) = direct_children(self_pid) {
-            for identity in adopted.into_values() {
-                if identity != self.root.identity
-                    && self.preexisting_children.get(&identity.pid) != Some(&identity)
-                {
-                    let _ = self.record_direct_child(identity, self_pid);
-                }
-            }
-        }
-
         let mut descendants: Vec<&OwnedProcess> = self.descendants.values().collect();
         descendants.sort_by_key(|process| (std::cmp::Reverse(process.depth), process.identity.pid));
         for process in descendants {
-            signal_pidfd(process, libc::SIGKILL);
+            if let Err(error) = signal_pidfd(process, libc::SIGKILL) {
+                eprintln!(
+                    "cleanup failed to signal recorded pid {} through its pidfd: {error}",
+                    process.identity.pid
+                );
+            }
         }
-        signal_pidfd(&self.root, libc::SIGKILL);
-        let _ = self.child.wait();
+        if let Err(error) = signal_pidfd(&self.root, libc::SIGKILL) {
+            eprintln!(
+                "cleanup failed to signal Hermit pid {} through its pidfd: {error}",
+                self.root.identity.pid
+            );
+        }
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
+        let self_pid = unsafe { libc::getpid() };
+        loop {
+            let _ = self.child.try_wait();
+            let mut adopted_count = 0;
+            if let Ok(adopted) = direct_children(self_pid) {
+                for identity in adopted.into_values() {
+                    if identity == self.root.identity
+                        || self.preexisting_children.get(&identity.pid) == Some(&identity)
+                    {
+                        continue;
+                    }
+                    adopted_count += 1;
+                    if let Err(error) = self.record_direct_child(identity, self_pid) {
+                        eprintln!(
+                            "cleanup could not bind adopted pid {} to its pidfd: {error}",
+                            identity.pid
+                        );
+                    }
+                }
+            }
+
+            for process in self.descendants.values() {
+                if same_process(process.identity)
+                    && let Err(error) = signal_pidfd(process, libc::SIGKILL)
+                {
+                    eprintln!(
+                        "cleanup failed to signal recorded pid {} through its pidfd: {error}",
+                        process.identity.pid
+                    );
+                }
+            }
             self.reap_recorded_descendants();
-            if self
+            let live_descendants = self
                 .descendants
                 .values()
-                .all(|process| !same_process(process.identity))
-            {
+                .filter(|process| same_process(process.identity))
+                .count();
+            let root_alive = same_process(self.root.identity);
+            if !root_alive && live_descendants == 0 && adopted_count == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "ERROR: cleanup deadline expired with Hermit root alive={root_alive}, \
+                     {live_descendants} recorded descendant process(es) alive, and \
+                     {adopted_count} adopted child process root(s) observed"
+                );
                 break;
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -417,7 +457,7 @@ impl Drop for OwnedHermit {
     }
 }
 
-fn signal_pidfd(process: &OwnedProcess, signal: libc::c_int) {
+fn signal_pidfd(process: &OwnedProcess, signal: libc::c_int) -> io::Result<()> {
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -429,11 +469,37 @@ fn signal_pidfd(process: &OwnedProcess, signal: libc::c_int) {
     };
     if result != 0 {
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            eprintln!(
-                "failed to signal recorded pid {} through its pidfd: {error}",
-                process.identity.pid
-            );
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn terminate_direct_child(child: &mut Child, bound: Duration, description: &str) {
+    // An exact unreaped direct child cannot have a reused PID.
+    if let Err(error) = child.kill()
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        eprintln!("failed to signal {description}: {error}");
+    }
+    let deadline = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
+            Ok(None) => {
+                eprintln!(
+                    "ERROR: {description} did not exit within the {}-second cleanup bound",
+                    bound.as_secs()
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("ERROR: failed to reap {description}: {error}");
+                return;
+            }
         }
     }
 }
@@ -608,10 +674,11 @@ fn bounded_output(command: &mut Command, bound: Duration, description: &str) -> 
             break status;
         }
         if Instant::now() >= deadline {
-            // The unreaped direct child is the exact process created above; its
-            // PID cannot be reused before wait returns.
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_direct_child(
+                &mut child,
+                Duration::from_secs(1),
+                &format!("timed-out {description}"),
+            );
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -683,13 +750,18 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     let guest = build_root.join("robust_futex_test");
 
-    let compile = Command::new("cc")
+    let mut compiler = Command::new("cc");
+    compiler
         .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
         .arg(repository.join("tests/bin/robust_futex_test.c"))
         .arg("-o")
-        .arg(&guest)
-        .output()
-        .expect("failed to compile robust futex guest");
+        .arg(&guest);
+    let compile = bounded_output(
+        &mut compiler,
+        TOTAL_TIMEOUT,
+        "robust-futex guest compilation",
+    )
+    .expect("failed to compile robust futex guest");
     assert!(
         compile.status.success(),
         "robust futex guest compilation failed\nstdout:\n{}\nstderr:\n{}",
