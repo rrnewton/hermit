@@ -241,7 +241,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
-        let _pending_guard = stack.commit()?;
+        let pending_guard = stack.commit()?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
@@ -249,6 +249,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
+        drop(pending_guard);
 
         if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
