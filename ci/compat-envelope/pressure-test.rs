@@ -1086,7 +1086,7 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
                     "naked" => spec
                         .get("runs")
                         .and_then(TomlValue::as_integer)
-                        .unwrap_or(1),
+                        .unwrap_or(3),
                     "custom" => spec
                         .get("assert")
                         .and_then(TomlValue::as_table)
@@ -2665,6 +2665,22 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn self_test(root: &Path) -> Result<(), String> {
+    let manifest_budgets = load_budgets(root)?;
+    let omitted_naked_runs = manifest_budgets
+        .get(&("applications/timed-progress-bar".into(), "naked".into()))
+        .ok_or("self-test manifest lost applications/timed-progress-bar naked budget")?;
+    let explicit_naked_runs = manifest_budgets
+        .get(&(
+            "determinism-stress-c/producer-consumer".into(),
+            "naked".into(),
+        ))
+        .ok_or("self-test manifest lost determinism-stress-c/producer-consumer naked budget")?;
+    if omitted_naked_runs.attempts != 3 || explicit_naked_runs.attempts != 5 {
+        return Err(format!(
+            "pressure attempt counts diverge from the harness: omitted naked runs={} (want 3), explicit naked runs={} (want 5)",
+            omitted_naked_runs.attempts, explicit_naked_runs.attempts
+        ));
+    }
     let budget = CellBudget {
         timeout_seconds: 7,
         attempts: 3,
@@ -3374,7 +3390,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: selection, build closure, sampling, timeout/OOM classification, generated-DAG, fresh-result, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: selection, manifest attempt budgets, build closure, sampling, timeout/OOM classification, generated-DAG, fresh-result, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
