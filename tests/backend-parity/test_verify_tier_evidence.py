@@ -22,6 +22,7 @@ and each negative plants a record that MUST NOT reach `bitwise`.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -30,9 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
-    L2_RANK,
     SCORECARD_HEADER,
+    VERIFY_RANK,
     expectation,
+    hermit_command,
     verify_tier_from_json,
 )
 
@@ -84,7 +86,7 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
 
 
 # --------------------------------------------------------------------------
-print("case STRIPPED — the exact shape the scorecard producer emits today")
+print("case STRIPPED — a weaker comparison must never be promoted to bitwise")
 # Verbatim from a live probe run: rc=0, banner ":: Success: deterministic.
 # Determinism verified.", and bitwise_parity false in the same record.
 got = tier_of(record(bitwise=False, strictness="stripped"))
@@ -128,22 +130,28 @@ with tempfile.TemporaryDirectory(prefix="verify-tier-") as tmp:
 
 print("case RANK — the ladder orders the tiers and 'bitwise' is the ceiling")
 check("guest < stripped < bitwise",
-      L2_RANK["guest"] < L2_RANK["stripped"] < L2_RANK["bitwise"], repr(L2_RANK))
-check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
+      VERIFY_RANK["guest"] < VERIFY_RANK["stripped"] < VERIFY_RANK["bitwise"],
+      repr(VERIFY_RANK))
+check("'detlog' is no longer a tier name", "detlog" not in VERIFY_RANK,
+      repr(VERIFY_RANK))
 
-print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
-# Asserting bitwise before an INFO-tier comparator exists would red every
-# ptrace/DBT cell for a comparator limitation, not a guest defect.
-check("ptrace verify contract is 'stripped'",
-      expectation("ptrace", "exit_status", True)[0] == "stripped")
+print("case CONTRACT — every enabled verification contract demands typed bitwise parity")
+check("ptrace verify contract is 'bitwise'",
+      expectation("ptrace", "exit_status", True)[0] == "bitwise")
 # `exit_status` is a declared dbt L2 gap, so it would report "gap" regardless of
 # tiering; use a case dbt is actually contracted for.
-check("dbt verify contract is 'stripped'",
-      expectation("dbt", "hello_stdout", True)[0] == "stripped")
+check("dbt verify contract is 'bitwise'",
+      expectation("dbt", "hello_stdout", True)[0] == "bitwise")
 check("a declared dbt L2 gap still reports 'gap'",
       expectation("dbt", "exit_status", True)[0] == "gap")
-check("kvm verify contract stays 'guest'",
-      expectation("kvm", "exit_status", True)[0] == "guest")
+check("kvm verify contract is 'bitwise'",
+      expectation("kvm", "exit_status", True)[0] == "bitwise")
+verify_command = hermit_command(
+    Path("/tmp/hermit"), "kvm", ["/bin/true"], "exit_zero",
+    strict=True, verify=True, verify_json=Path("/tmp/verdict.json"),
+)
+check("verification command requests the strict comparator",
+      "--verify-strict" in verify_command, repr(verify_command))
 
 print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
 # DBT accepts --verify-json and writes nothing (measured: rc=0, no file). The old
@@ -157,13 +165,13 @@ from run_matrix import (  # noqa: E402
 )
 
 
-def emitted_row(evidence):
+def emitted_row(evidence, backend="dbt"):
     with _tf.TemporaryDirectory(prefix="fallback-") as tmp:
         path = Path(tmp) / "sc.csv"
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
         append_parent_scorecard(
             path,
-            [{"test_name": "t", "backend": "dbt", "expectation": "stripped",
+            [{"test_name": "t", "backend": backend, "expectation": "stripped",
               "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
             strict=True, verify=True, probe_gaps=False)
         return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
@@ -187,6 +195,44 @@ check("a typed verdict DOES still claim deterministic=1 (not inert)",
       typed["deterministic"] == "1", repr(typed["deterministic"]))
 check("typed row carries its counts into the row",
       typed["compared_log_messages"] == "348|348", repr(typed["compared_log_messages"]))
+
+kvm = emitted_row(
+    {"tier": "guest", "verify_compare": "canonical", "bitwise_parity": "0",
+     "compared_log_messages": "", "determinism_unmeasured": "1"},
+    backend="kvm",
+)
+check("KVM output/status-only row does NOT claim deterministic=1",
+      kvm["deterministic"] == "", repr(kvm["deterministic"]))
+check("KVM output/status-only row explicitly refuses L2",
+      "not L2" in kvm["reason"] and "not comparable" in kvm["reason"],
+      repr(kvm["reason"]))
+
+print("case HEADLINE — every L2 count has the same typed bitwise acceptance rule")
+headline = subprocess.run(
+    [sys.executable, str(Path(__file__).with_name("run_matrix.py")), "--check",
+     "--backend", "kvm", "--strict", "--verify", "--no-parent-scorecard"],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+check("headline check succeeds", headline.returncode == 0, headline.stderr)
+check("KVM L2 headline requires bitwise evidence",
+      "RATCHET-L2 kvm: 25/28 (89.3%) [bitwise=25]" in headline.stdout,
+      headline.stdout)
+
+print("case RETARGET — legacy KVM guest-only evidence cannot enable an L2 cell")
+from retarget_to_manifest import MatrixRow, build_plan  # noqa: E402
+
+legacy = MatrixRow(
+    "probe", "pass", "pass", "pass", "-", "-",
+    "detlog", "detlog", "guest", "-", "-", has_l2=True,
+)
+plan = build_plan(legacy, "tests/c/probe.c", None)
+check("legacy KVM guest-only row remains disabled", "kvm" not in plan.enabled,
+      repr(plan.enabled))
+check("disabled reason requires typed bitwise evidence",
+      "not L2" in plan.disabled["kvm"] and "typed bitwise_parity" in plan.disabled["kvm"],
+      repr(plan.disabled["kvm"]))
 
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:

@@ -13,10 +13,9 @@ runner prints at the end of the run.
 
 ## Current ratchet
 
-The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
-Stripped verification ratchet (`--strict --verify`, Hermit's double-run
-comparison after selected numeric, address, path, and time fields are stripped)
-are tracked separately. Stripped verification is not L2.
+The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the L2
+ratchet (`--strict --verify --verify-strict`, Hermit's canonical INFO comparison)
+are tracked separately.
 
 L1 (`hermit run --strict`):
 
@@ -24,29 +23,23 @@ L1 (`hermit run --strict`):
 | --- | ---: | ---: |
 | ptrace | 28/28 | 100% |
 | DBT | 26/28 | 93% |
-| KVM | 23/28 | 82% |
+| KVM | 27/28 | 96% |
 
-Stripped verification (`hermit run --strict --verify`):
+L2 (`hermit run --strict --verify --verify-strict`):
 
-| Backend | Verified pairs | Verification kind | Parity vs ptrace |
-| --- | ---: | --- | ---: |
-| ptrace | 28/28 | Stripped DETLOG | 100% |
-| DBT | 26/28 | Stripped DETLOG | 93% |
-| KVM | 22/28 | guest-visible only | 79% |
+| Backend | Declared passing contracts | Required evidence |
+| --- | ---: | --- |
+| ptrace | 28/28 | typed bitwise parity with nonzero INFO-message counts |
+| DBT | 25/28 | typed bitwise parity with nonzero INFO-message counts |
+| KVM | 25/28 | typed bitwise parity with nonzero INFO-message counts |
 
-The two verification kinds are not interchangeable. **Stripped DETLOG**
-(ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
-streams equal after stripping selected fields; it does not mean the full syscall
-and scheduling traces were bitwise-identical and does not establish L2.
-**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
-declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the verification
-subsection below for the contract that holds at L1 but not under `--verify`.
+These counts use the same acceptance rule and are comparable. A run that matches
+only output and status, uses the lossy Stripped comparison, or compares zero INFO
+messages does not enter the L2 count.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
-measures the backend's own Reverie suite. The 23/24 number above is deliberately
-separate: it measures the cross-backend Hermit contracts in this directory.
+measures the backend's own Reverie suite. The counts above are deliberately
+separate: they measure the cross-backend Hermit contracts in this directory.
 The current DBT path satisfies the virtual clock, virtual PID, root-thread
 random-source, process wait lifecycle, application executable-memory, and
 file-mutation contracts, plus deterministic memory-advice and
@@ -111,40 +104,40 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Cases
 
-Each cell shows the L1 status and, after `/`, the `--verify` status: `detlog`
-for Stripped DETLOG equality, `guest` for KVM guest-visible equality, and `gap`
-where verification does not succeed. Neither successful status is an L2 claim.
+Each cell shows the L1 status and, after `/`, the `--verify --verify-strict`
+status: `bitwise` requires the typed L2 verdict with nonzero compared-message
+counts, and `gap` means the comparison does not succeed.
 
 | Test | ptrace | DBT | KVM |
 | --- | --- | --- | --- |
-| `hello_stdout` | pass / detlog | pass / detlog | pass / guest |
-| `argument_forwarding` | pass / detlog | pass / detlog | pass / guest |
-| `exit_zero` | pass / detlog | pass / detlog | pass / guest |
-| `exit_status` | pass / detlog | pass / detlog | pass / guest |
-| `file_read` | pass / detlog | pass / detlog | pass / guest |
-| `file_mutation` | pass / detlog | pass / detlog | pass / guest |
-| `file_metadata` | pass / detlog | gap / gap | pass / guest |
-| `io_uring_fallback` | pass / detlog | pass / detlog | pass / guest |
-| `listmount_unavailable` | pass / detlog | pass / detlog | pass / guest |
-| `process_vm_readv_refusal` | pass / detlog | pass / detlog | pass / guest |
-| `process_vm_writev_refusal` | pass / detlog | pass / detlog | pass / guest |
-| `executable_mmap` | pass / detlog | pass / detlog | pass / guest |
-| `memory_advice` | pass / detlog | pass / detlog | pass / guest |
-| `heap_growth` | pass / detlog | pass / detlog | pass / guest |
-| `anonymous_mmap_layout` | pass / detlog | pass / detlog | pass / guest |
-| `shared_anonymous_mmap` | pass / detlog | pass / detlog | pass / guest |
-| `pthread_lifecycle` | pass / detlog | gap / gap | pass / guest |
-| `process_wait_accounting` | pass / detlog | pass / detlog | pass / **gap** |
-| `process_wait_lifecycle` | pass / detlog | pass / detlog | gap / gap |
-| `cpuid_policy` | pass / detlog | pass / detlog | pass / guest |
-| `virtual_clock` | pass / detlog | pass / detlog | pass / guest |
-| `random_sources` | pass / detlog | pass / detlog | pass / guest |
-| `virtual_pid` | pass / detlog | pass / detlog | pass / guest |
-| `scheduler_policy_queries` | pass / detlog | pass / detlog | pass / guest |
-| `signal_disposition` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigaction_state` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigprocmask_state` | pass / detlog | pass / detlog | **gap** / gap |
-| `sigaltstack_state` | pass / detlog | pass / detlog | **gap** / gap |
+| `hello_stdout` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `argument_forwarding` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `exit_zero` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `exit_status` | pass / bitwise | gap / gap | pass / bitwise |
+| `file_read` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `file_mutation` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `file_metadata` | pass / bitwise | gap / gap | pass / bitwise |
+| `io_uring_fallback` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `listmount_unavailable` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `process_vm_readv_refusal` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `process_vm_writev_refusal` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `executable_mmap` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `memory_advice` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `heap_growth` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `anonymous_mmap_layout` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `shared_anonymous_mmap` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `pthread_lifecycle` | pass / bitwise | gap / gap | pass / **gap** |
+| `process_wait_accounting` | pass / bitwise | pass / bitwise | pass / **gap** |
+| `process_wait_lifecycle` | pass / bitwise | pass / bitwise | gap / gap |
+| `cpuid_policy` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `virtual_clock` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `random_sources` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `virtual_pid` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `scheduler_policy_queries` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `signal_disposition` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `sigaction_state` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `sigprocmask_state` | pass / bitwise | pass / bitwise | pass / bitwise |
+| `sigaltstack_state` | pass / bitwise | pass / bitwise | pass / bitwise |
 
 The `scheduler_policy_queries` contract pins Detcore's inert-scheduler-policy
 model: the guest arms and re-reads an `ITIMER_REAL` one-shot against virtual
@@ -178,22 +171,24 @@ Without `--strict`, repeat-run results are compatibility evidence rather than
 an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
 three byte-identical runs. The runner disables PMU timeslicing for portability.
 
-### Stripped verification (`--verify`)
+### L2 verification (`--verify --verify-strict`)
 
 Passing `--verify` adds a two-run comparison: the runner invokes
-`hermit run --strict --verify --verify-allow both`. For ptrace and DBT, Hermit
-compares DETLOG streams after Stripped normalization; this is not bitwise parity
-and not L2. Because `--verify` diverts the guest's own stdout into per-run
+`hermit run --strict --verify --verify-strict --verify-allow both`. Hermit
+compares the canonical INFO stream for every backend. Because `--verify` diverts
+the guest's own stdout into per-run
 temporary logs, this path cannot re-check stdout the way the L1 path does;
 instead it enforces that the guest exit status matches and that Hermit's
-double-run comparison succeeded at *at least* the verification kind expected
-for the backend. The runner keys on two stderr witnesses: `Determinism verified`
-(Stripped DETLOG, ptrace and DBT) and `guest output and exit status matched`
-(KVM guest-visible). A DETLOG result satisfies a `guest` contract because it
-compares more observations; the reverse fails.
+double-run comparison produced a typed `bitwise_parity: true` verdict with
+nonzero compared-message counts. A banner or output/status-only match does not
+satisfy the contract.
 
-One contract holds at L1 but not under `--verify` and is recorded as a `gap`
-with its reason in the runner:
+Two contracts hold at L1 but do not establish repeatable L2 under `--verify`
+and are recorded as `gap` with their reasons in the runner:
+
+- **`pthread_lifecycle` on KVM.** One observed `--verify-strict` run passed, but
+  the next diverged in the internal log during thread startup. A single pass is
+  not a reliable L2 contract, so the matrix does not count this cell.
 
 - **`process_wait_accounting` on KVM.** The `--verify` concurrent double-run
   races child reaping: `waitid` on the already-reaped child returns `ECHILD`
@@ -344,9 +339,9 @@ Run KVM on a host with read-write `/dev/kvm` access:
 python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
-Enforce the Stripped verification ratchet on any backend by adding `--verify`
-(it implies `--strict`); Hermit's double-run then asserts the recorded
-verification kind per contract:
+Enforce the L2 ratchet on any backend by adding `--verify` (it implies `--strict`
+and the runner adds `--verify-strict`); Hermit's double-run then requires typed
+bitwise parity with nonzero compared-message counts:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend

@@ -2774,7 +2774,15 @@ impl RunOpts {
             );
         }
 
-        let kvm_output_only = self.selected_backend() == Backend::Kvm;
+        // KVM's existing plain --verify behavior remains output/status-only.
+        // A canonical request must not take that fallback: --verify-strict (or
+        // its historical verbose equivalent) compares the captured INFO stream
+        // through the same comparator used by the other backends.
+        let kvm_output_only = !compare_verification_logs(
+            self.selected_backend(),
+            self.verify_verbose,
+            self.verify_strict,
+        );
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -3153,6 +3161,10 @@ impl RunOpts {
     }
 }
 
+fn compare_verification_logs(backend: Backend, verify_verbose: bool, verify_strict: bool) -> bool {
+    backend != Backend::Kvm || verify_verbose || verify_strict
+}
+
 /// Represents a tmpfs location. There are different ways to construct `/tmp` for
 /// the container and this encapsulates all of them.
 enum Tmpfs<'a> {
@@ -3176,6 +3188,14 @@ impl<'a> Tmpfs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kvm_output_only_fallback_cannot_satisfy_a_canonical_request() {
+        assert!(!compare_verification_logs(Backend::Kvm, false, false));
+        assert!(compare_verification_logs(Backend::Kvm, false, true));
+        assert!(compare_verification_logs(Backend::Kvm, true, false));
+        assert!(compare_verification_logs(Backend::Ptrace, false, false));
+    }
 
     #[test]
     fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
