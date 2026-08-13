@@ -1950,13 +1950,31 @@ impl HermitData {
         replay_with_gdbserver(&data, port)
     }
 
-    /// Returns the recordings in the data directory.
+    /// Returns an iterator over the recordings.
     ///
     /// Use [`Self::recording_metadata`] to get more information about a recording.
+    pub fn recordings(&self) -> impl Iterator<Item = Id> + use<> {
+        fs::read_dir(&self.data_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+
+                if entry.file_type().ok()?.is_dir() {
+                    Some(entry.file_name().to_str()?.parse::<Id>().ok()?)
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Returns all recordings, or an error if the data directory cannot be
+    /// enumerated completely.
     ///
     /// A missing data directory has no recordings. Other filesystem errors are
     /// returned rather than being mistaken for an empty or partial inventory.
-    pub fn recordings(&self) -> Result<Vec<Id>, Error> {
+    pub fn try_recordings(&self) -> Result<Vec<Id>, Error> {
         let entries = match fs::read_dir(&self.data_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2116,7 +2134,7 @@ mod tests {
         let missing = parent.path().join("missing");
         assert!(
             HermitData::with_dir(&missing)
-                .recordings()
+                .try_recordings()
                 .expect("a missing data directory should be empty")
                 .is_empty()
         );
@@ -2138,8 +2156,14 @@ mod tests {
 
         assert_eq!(
             HermitData::with_dir(&inventory)
-                .recordings()
+                .try_recordings()
                 .expect("recording inventory should be readable"),
+            vec![recording]
+        );
+        assert_eq!(
+            HermitData::with_dir(&inventory)
+                .recordings()
+                .collect::<Vec<_>>(),
             vec![recording]
         );
     }
