@@ -30,7 +30,7 @@ use toml::Value as TomlValue;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
-const SCHEMA: u64 = 1;
+const SCHEMA: u64 = 2;
 /// The shipped portable DAG gives a whole manifest bucket 600 seconds. A red
 /// cell gets that complete existing allowance to itself; cells whose repeated
 /// mode could theoretically consume longer remain red when this pressure
@@ -44,10 +44,11 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const USAGE: &str = r#"Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
-  plan --results DIR [--output FILE]
+  plan --results DIR [--output FILE] [--mode MODE]
       Generate a safe-ci DAG that attempts every currently red cell. The
-      default output is DIR/dag.json.
-  run [--results DIR]
+      default output is DIR/dag.json. MODE selects verify, replay, chaos,
+      custom, or naked.
+  run [--results DIR] [--mode MODE]
       Require a clean committed checkout, generate the DAG, and execute it.
       The default result directory is ignored/compat-envelope/pressure-<SHA>-<time>.
   summarize --results DIR
@@ -80,11 +81,17 @@ struct TrackedCells {
     cells: Vec<TrackedCell>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
+    enabled: bool,
     status: String,
+}
+
+struct PressureCells {
+    red: Vec<TrackedCell>,
+    preparation_by_test: BTreeMap<String, CellId>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +111,10 @@ struct ResultRow {
     mode: String,
     backend: Option<String>,
     outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    error_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -113,6 +124,8 @@ struct RunMetadata {
     detcore_tree: String,
     source_tree_dirty: bool,
     run_timeout_seconds: i64,
+    #[serde(default)]
+    mode: Option<String>,
     cells: Vec<CellId>,
 }
 
@@ -139,9 +152,9 @@ fn run() -> Result<(), String> {
     let root = repo_root()?;
     match command.as_str() {
         "plan" => {
-            let (results, output) = result_options(&root, &mut args, false)?;
+            let (results, output, mode) = result_options(&root, &mut args, false, true)?;
             let output = output.unwrap_or_else(|| results.join("dag.json"));
-            let metadata = write_plan(&root, &results, &output)?;
+            let metadata = write_plan(&root, &results, &output, mode.as_deref())?;
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!("Cells: {}", metadata.cells.len());
@@ -153,12 +166,12 @@ fn run() -> Result<(), String> {
             );
         }
         "run" => {
-            let (results, output) = result_options(&root, &mut args, true)?;
+            let (results, output, mode) = result_options(&root, &mut args, true, true)?;
             if worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
             let output = output.unwrap_or_else(|| results.join("dag.json"));
-            let metadata = write_plan(&root, &results, &output)?;
+            let metadata = write_plan(&root, &results, &output, mode.as_deref())?;
             let status = Command::new(root.join("ci/run-dag.sh"))
                 .args([
                     "portable",
@@ -181,7 +194,7 @@ fn run() -> Result<(), String> {
             summarize(&root, &results)?;
         }
         "summarize" => {
-            let (results, output) = result_options(&root, &mut args, false)?;
+            let (results, output, _) = result_options(&root, &mut args, false, false)?;
             if output.is_some() {
                 return Err("summarize does not accept --output".into());
             }
@@ -202,9 +215,11 @@ fn result_options(
     root: &Path,
     args: &mut impl Iterator<Item = String>,
     default_results: bool,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+    allow_mode: bool,
+) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
     let mut results = None;
     let mut output = None;
+    let mut mode = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--results" => {
@@ -217,6 +232,20 @@ fn result_options(
                     args.next().ok_or("--output requires a file")?,
                 ));
             }
+            "--mode" if allow_mode => {
+                let value = args.next().ok_or("--mode requires a value")?;
+                if !matches!(
+                    value.as_str(),
+                    "verify" | "replay" | "chaos" | "custom" | "naked"
+                ) {
+                    return Err(format!(
+                        "unknown mode `{value}`; expected verify, replay, chaos, custom, or naked"
+                    ));
+                }
+                if mode.replace(value).is_some() {
+                    return Err("--mode may be specified only once".into());
+                }
+            }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
@@ -226,7 +255,7 @@ fn result_options(
         (None, false) => return Err("command requires --results DIR".into()),
     };
     let output = output.map(|path| absolute_from(root, path));
-    Ok((results, output))
+    Ok((results, output, mode))
 }
 
 fn absolute_from(root: &Path, path: PathBuf) -> PathBuf {
@@ -300,7 +329,7 @@ fn check_scorecard(root: &Path) -> Result<(), String> {
     }
 }
 
-fn red_cells(root: &Path) -> Result<Vec<CellId>, String> {
+fn pressure_cells(root: &Path, mode: Option<&str>) -> Result<PressureCells, String> {
     let path = root.join(TRACKED_CELLS);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -314,21 +343,46 @@ fn red_cells(root: &Path) -> Result<Vec<CellId>, String> {
     }
     let mut seen = BTreeSet::new();
     let mut red = Vec::new();
+    let mut enabled_by_test = BTreeMap::new();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
         }
+        if cell.enabled {
+            enabled_by_test
+                .entry(cell.id.test.clone())
+                .or_insert_with(|| cell.id.clone());
+        }
         match cell.status.as_str() {
-            "red" => red.push(cell.id),
+            "red" if mode.map_or(true, |selected| cell.id.mode == selected) => red.push(cell),
+            "red" => {}
             "green" => {}
             other => return Err(format!("unknown cell status `{other}`")),
         }
     }
-    red.sort();
+    red.sort_by(|left, right| left.id.cmp(&right.id));
     if red.is_empty() {
-        return Err("tracked scorecard has no red cells".into());
+        return Err(match mode {
+            Some(mode) => format!("tracked scorecard has no red cells for mode `{mode}`"),
+            None => "tracked scorecard has no red cells".into(),
+        });
     }
-    Ok(red)
+    let mut preparation_by_test = BTreeMap::new();
+    for cell in &red {
+        let prepared_with = enabled_by_test.get(&cell.id.test).ok_or_else(|| {
+            format!(
+                "{} has no manifest-enabled mode available to build its fixture",
+                cell.id.test
+            )
+        })?;
+        preparation_by_test
+            .entry(cell.id.test.clone())
+            .or_insert_with(|| prepared_with.clone());
+    }
+    Ok(PressureCells {
+        red,
+        preparation_by_test,
+    })
 }
 
 fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, String> {
@@ -419,9 +473,17 @@ fn pressure_node_timeout(budget: &CellBudget) -> i64 {
     pressure_timeout(budget) + 20
 }
 
-fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata, String> {
+fn write_plan(
+    root: &Path,
+    results: &Path,
+    output: &Path,
+    mode: Option<&str>,
+) -> Result<RunMetadata, String> {
     check_scorecard(root)?;
-    let cells = red_cells(root)?;
+    let PressureCells {
+        red: cells,
+        preparation_by_test,
+    } = pressure_cells(root, mode)?;
     let budgets = load_budgets(root)?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
@@ -478,13 +540,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
     let detcore_tree = git_output(root, &["rev-parse", "HEAD:detcore"])?;
     let build_root = results.join("build").join(&sha);
     let mut preparation_tags = BTreeMap::new();
-    let mut first_by_test = BTreeMap::<String, CellId>::new();
-    for cell in &cells {
-        first_by_test
-            .entry(cell.test.clone())
-            .or_insert_with(|| cell.clone());
-    }
-    for (test, cell) in first_by_test {
+    for (test, cell) in preparation_by_test {
         let budget = budgets
             .get(&(test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {test}/{}", cell.mode))?;
@@ -532,7 +588,8 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
     }
 
     let mut cell_tags = Vec::new();
-    for cell in &cells {
+    for tracked in &cells {
+        let cell = &tracked.id;
         let budget = budgets
             .get(&(cell.test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
@@ -545,10 +602,18 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
         let result_file = cell_dir.join("results.jsonl");
         let junit = cell_dir.join("junit.xml");
         let status_file = cell_dir.join("harness-status");
-        let backend = if cell.backend == "native" {
-            String::new()
+        let (selector, backend) = if tracked.enabled {
+            let backend = if cell.backend == "native" {
+                String::new()
+            } else {
+                format!(" --backend {}", shell_quote(&cell.backend))
+            };
+            ("--include-manual", backend)
         } else {
-            format!(" --backend {}", shell_quote(&cell.backend))
+            (
+                "--probe-disabled",
+                format!(" --backend {}", shell_quote(&cell.backend)),
+            )
         };
         let pressure_seconds = pressure_timeout(budget);
         let cmd = format!(
@@ -556,7 +621,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
              ./ci/run-with-hermit-e2e-artifact.sh --require-install \
-             ./ci/test_harness.sh run --include-manual --include-occasional --prebuilt \
+             ./ci/test_harness.sh run {selector} --include-occasional --prebuilt \
              --test {test} --mode {mode}{backend} --results {result_file} --junit {junit} \
              || status=$?; printf '%s\\n' \"$status\" > {status_file}; exit 0",
             cell_dir = shell_quote(&cell_dir.to_string_lossy()),
@@ -565,6 +630,7 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
             run_id = shell_quote(&slug),
             test = shell_quote(&cell.test),
             mode = shell_quote(&cell.mode),
+            selector = selector,
             backend = backend,
             result_file = shell_quote(&result_file.to_string_lossy()),
             junit = shell_quote(&junit.to_string_lossy()),
@@ -648,7 +714,8 @@ fn write_plan(root: &Path, results: &Path, output: &Path) -> Result<RunMetadata,
         detcore_tree,
         source_tree_dirty: worktree_dirty(root)?,
         run_timeout_seconds,
-        cells,
+        mode: mode.map(str::to_string),
+        cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -695,8 +762,10 @@ fn audit_dag(dag: &JsonValue, expected_cells: usize, run_timeout: i64) -> Result
         if group == "cell" {
             cells += 1;
             let cmd = step["cmd"].as_str().unwrap_or("");
+            let enabled_selector = cmd.contains("--include-manual");
+            let disabled_selector = cmd.contains("--probe-disabled");
             if !cmd.contains("timeout --kill-after=10s")
-                || !cmd.contains("--include-manual")
+                || enabled_selector == disabled_selector
                 || !cmd.contains("--prebuilt")
                 || !cmd.contains("--test")
                 || !cmd.contains("--mode")
@@ -767,7 +836,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
             )
         })?;
         let result_file = cell_dir.join("results.jsonl");
-        let (outcome, row_valid) = if result_file.is_file() {
+        let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
             let text = fs::read_to_string(&result_file)
                 .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
             let lines: Vec<_> = text
@@ -775,7 +844,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
                 .filter(|line| !line.trim().is_empty())
                 .collect();
             if lines.len() != 1 {
-                ("NO_RESULT".to_string(), false)
+                ("NO_RESULT".to_string(), false, None, None)
             } else {
                 let row: ResultRow = serde_json::from_str(lines[0])
                     .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
@@ -800,13 +869,13 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
                     _ => false,
                 };
                 if id_matches && exit_matches {
-                    (row.outcome, true)
+                    (row.outcome, true, row.reason, row.error_kind)
                 } else {
-                    ("NO_RESULT".to_string(), false)
+                    ("NO_RESULT".to_string(), false, row.reason, row.error_kind)
                 }
             }
         } else {
-            ("NO_RESULT".to_string(), false)
+            ("NO_RESULT".to_string(), false, None, None)
         };
         *by_backend
             .entry(cell.backend.clone())
@@ -820,6 +889,8 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
             "cell": cell,
             "harness_exit": harness_status,
             "outcome": outcome,
+            "reason": reason,
+            "error_kind": error_kind,
             "result_row_valid": row_valid,
         }));
     }
@@ -867,6 +938,7 @@ fn summarize(root: &Path, results: &Path) -> Result<(), String> {
         "schema": SCHEMA,
         "hermit_sha": metadata.hermit_sha,
         "detcore_tree": metadata.detcore_tree,
+        "mode": metadata.mode,
         "attempted": metadata.cells.len(),
         "pass_candidates": passing,
         "rows": rows,
@@ -959,6 +1031,14 @@ fn self_test() -> Result<(), String> {
     });
     audit_dag(&fixture, 1, 100)
         .map_err(|e| format!("positive generated-DAG bracket failed: {e}"))?;
+    let mut disabled_fixture = fixture.clone();
+    disabled_fixture["steps"][0]["cmd"] = json!(
+        exact_cell_command
+            .replace("--include-manual", "--probe-disabled")
+            .replace("--test fixture", "--test fixture --backend kvm")
+    );
+    audit_dag(&disabled_fixture, 1, 100)
+        .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
     let mut missing_exact_selector = fixture;
     missing_exact_selector["steps"][0]["cmd"] =
         json!(exact_cell_command.replace("--mode verify", ""));
