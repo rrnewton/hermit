@@ -267,6 +267,24 @@ mod tests {
         assert_eq!(sink.iter().filter(|b| **b == b'q').count(), 10);
     }
 
+    /// The writer's marker and the comparator's marker must be the same text.
+    ///
+    /// `detcore::logdiff` refuses to return a comparison verdict for a log
+    /// containing [`detcore::logdiff::TRUNCATION_MARKER`]. If the text written
+    /// here ever drifts from the text matched there, that refusal stops firing
+    /// and a truncated pair silently returns to comparing only its prefix --
+    /// with nothing failing to say so. This test is the binding between them.
+    #[test]
+    fn the_written_marker_is_the_text_the_comparator_matches() {
+        let written = String::from_utf8(TRUNCATION_MARKER.to_vec()).unwrap();
+        assert!(
+            written.contains(detcore::logdiff::TRUNCATION_MARKER),
+            "the bounded writer emits {written:?}, which does not contain the marker the \
+             comparator matches ({:?}); detcore::logdiff would no longer detect truncation",
+            detcore::logdiff::TRUNCATION_MARKER
+        );
+    }
+
     /// The non-obvious correctness point: `tracing_appender` treats a short
     /// write as an I/O error, so a discarding writer must still report the
     /// caller's whole buffer as consumed.
