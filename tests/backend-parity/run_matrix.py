@@ -453,14 +453,9 @@ L1_GAPS = {
 }
 L2_GAPS = {
     ("dbt", "file_metadata"): (
-        "Inherited from the L1 DBT file_metadata gap: the fchown EPERM aborts "
-        "the guest before any --verify double-run, so no L2 determinism witness "
-        "can be produced"
-    ),
-    ("dbt", "exit_status"): (
-        "hermit --verify runs the DBT guest only once when the first run exits "
-        "non-zero (--verify-allow both), so the double-run DETLOG comparison "
-        "never executes for this non-zero-exit contract"
+        "Inherited from the L1 DBT file_metadata gap: DBT deterministically "
+        "reproduces the guest's fchown EPERM, but that is still the wrong Linux "
+        "result for this successful-operation contract"
     ),
     ("dbt", "pthread_lifecycle"): ("DynamoRIO startup stall prevents an L2 verify run"),
     ("kvm", "process_wait_accounting"): (
