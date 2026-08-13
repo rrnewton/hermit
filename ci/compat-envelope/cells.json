@@ -1176,7 +1176,34 @@
       "category": "bin-c",
       "test": "bin-c/robust-futex-test",
       "mode": "verify",
+      "backend": "dbt",
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "bin-c",
+      "test": "bin-c/robust-futex-test",
+      "mode": "verify",
+      "backend": "kvm",
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "bin-c",
+      "test": "bin-c/robust-futex-test",
+      "mode": "verify",
       "backend": "ptrace",
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "bin-c",
+      "test": "bin-c/robust-futex-test",
+      "mode": "verify",
+      "backend": "sabre",
       "status": "red",
       "observations": []
     },
