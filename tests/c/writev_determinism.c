@@ -504,6 +504,47 @@ static int check_fixed_pipe_capacity_policy(void) {
   return 0;
 }
 
+static int report_pipe_capacity_policy(void) {
+  int maximum_fd = open("/proc/sys/fs/pipe-max-size", O_RDONLY | O_CLOEXEC);
+  if (maximum_fd < 0) {
+    perror("open pipe-max-size");
+    return -1;
+  }
+  char maximum_text[64] = {0};
+  ssize_t maximum_length = read(maximum_fd, maximum_text,
+                                sizeof(maximum_text) - 1);
+  close(maximum_fd);
+  if (maximum_length <= 0) {
+    perror("read pipe-max-size");
+    return -1;
+  }
+
+  char *maximum_end = NULL;
+  errno = 0;
+  long maximum = strtol(maximum_text, &maximum_end, 10);
+  if (errno != 0 || maximum_end == maximum_text || maximum <= 0 ||
+      maximum >= INT_MAX) {
+    fprintf(stderr, "invalid pipe-max-size: %.*s\n", (int)maximum_length,
+            maximum_text);
+    return -1;
+  }
+
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("capacity report pipe");
+    return -1;
+  }
+  errno = 0;
+  int set_capacity =
+      fcntl(pipe_fds[1], F_SETPIPE_SZ, (int)maximum + 1);
+  int set_errno = errno;
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+  printf("pipe-max-size=%ld set-above-max=%d/%d\n", maximum, set_capacity,
+         set_errno);
+  return 0;
+}
+
 static int check_failed_write_preserves_metadata(void) {
   char path[] = "/tmp/hermit-writev-XXXXXX";
   int fd = mkstemp(path);
@@ -571,6 +612,9 @@ int main(int argc, char **argv) {
             result, errno);
     return 3;
   }
+  if (argc > 1 && strcmp(argv[1], "pipe-capacity") == 0) {
+    return report_pipe_capacity_policy() == 0 ? 0 : 1;
+  }
   if (argc > 1) {
     char *end = NULL;
     errno = 0;
@@ -579,7 +623,7 @@ int main(int argc, char **argv) {
         parsed > INT_MAX) {
       fprintf(stderr,
               "usage: %s [record|record-pipe|inherited-pipe-get|"
-              "inherited-pipe-set|expected-capacity]\n",
+              "inherited-pipe-set|pipe-capacity|expected-capacity]\n",
               argv[0]);
       return 2;
     }

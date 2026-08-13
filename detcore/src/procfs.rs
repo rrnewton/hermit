@@ -548,6 +548,11 @@ impl ProcfsFile {
         })
     }
 
+    /// Returns whether this file describes the maximum capacity used for pipes.
+    pub(crate) fn is_pipe_max_size(&self) -> bool {
+        self.kind == ProcfsKind::PipeMaxSize
+    }
+
     /// Returns true until the underlying procfs content has been captured.
     pub(crate) fn needs_snapshot(&self) -> bool {
         self.contents.is_none()

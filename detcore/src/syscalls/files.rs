@@ -326,6 +326,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved))
                 });
+                // Pipe capacity is host-backed when threads are not sequentialized, so its
+                // procfs limit must remain host-backed in that mode as well.
+                if !self.cfg.sequentialize_threads
+                    && procfs.as_ref().is_some_and(ProcfsFile::is_pipe_max_size)
+                {
+                    procfs = None;
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)

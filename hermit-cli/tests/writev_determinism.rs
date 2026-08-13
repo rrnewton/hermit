@@ -44,6 +44,45 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&guest);
     command_output(compile, "writev guest compilation");
 
+    let mut native_capacity = Command::new(&guest);
+    native_capacity.arg("pipe-capacity");
+    let native_capacity_output = command_output(native_capacity, "native pipe capacity report");
+    let native_capacity_stdout = String::from_utf8_lossy(&native_capacity_output.stdout);
+    assert!(
+        native_capacity_stdout.contains("pipe-max-size=")
+            && native_capacity_stdout.contains(&format!("set-above-max=-1/{}", libc::EPERM)),
+        "native pipe capacity report did not refuse a request above the host maximum:\n\
+         {native_capacity_stdout}",
+    );
+
+    let mut host_backed_capacity = Command::new("timeout");
+    host_backed_capacity
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--no-sequentialize-threads",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("pipe-capacity");
+    let host_backed_capacity_output = command_output(
+        host_backed_capacity,
+        "non-sequentialized pipe capacity report",
+    );
+    assert_eq!(
+        host_backed_capacity_output.stdout,
+        native_capacity_output.stdout,
+        "non-sequentialized Hermit did not preserve the host pipe limit and F_SETPIPE_SZ behavior\n\
+         native stdout:\n{}\nHermit stdout:\n{}\nHermit stderr:\n{}",
+        native_capacity_stdout,
+        String::from_utf8_lossy(&host_backed_capacity_output.stdout),
+        String::from_utf8_lossy(&host_backed_capacity_output.stderr),
+    );
+
     for (mode, diagnostic) in [
         (
             "inherited-pipe-get",
