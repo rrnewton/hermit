@@ -19,7 +19,6 @@ use core::arch::global_asm;
 mod analyze;
 mod backends;
 mod bisect;
-mod bnz;
 mod clean;
 mod container;
 mod global_opts;
