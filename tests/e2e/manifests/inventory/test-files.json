@@ -1903,6 +1903,12 @@
       "why": "tests/compat/complex_shell_workload.sh is owned by scripts/validate.rs compatibility partitions: The `complex_shell_workload` compatibility driver prepares or executes a heterogeneous command workload used by strict, DBT, SaBRe, LiteInst, or record/replay ratchets. scripts/validate.rs owns tool discovery and per-command expectations, so this is orchestration rather than one guest program."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/compat/lsof_mount_redirect.c",
+      "runner": "tests/compat/prepare_real_compat_fixtures.sh",
+      "why": "tests/compat/lsof_mount_redirect.c is owned by tests/compat/prepare_real_compat_fixtures.sh: The fixture builder compiles this preload library for the lsof compatibility workload, which serves mount-table reads from an inherited descriptor for its fixed fixture and verifies that the descriptor was used. It is support code for that driver rather than a standalone guest program."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/compat/prepare_real_compat_fixtures.sh",
       "runner": "scripts/validate.rs compatibility partitions",
