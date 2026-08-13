@@ -470,7 +470,7 @@ CARGO_SHIM
     grep -Fq 'target/ci \' "$portable_workflow" ||
         die "the hosted release artifact does not transport target/ci"
 
-    # ---- the harness's WHOLE executable Cargo surface is pinned -------------
+    # ---- every non-comment line containing a Cargo token is pinned -----------
     # `validate` DOES invoke Cargo, and deliberately so: audit_test_footprints
     # runs a DIFFERENT binary (generate-test-footprints) to regenerate a
     # different artifact, and the identity check above uses Cargo precisely
@@ -481,29 +481,59 @@ CARGO_SHIM
     #
     # That leaves one way for the invariant to rot without the dynamic shapes
     # noticing: somebody adds a new Cargo execution to a path they did not
-    # realize was a consumer. So pin the surface. Any new executable `cargo`
-    # line in this file fails here until it is listed and justified, which is
-    # strictly stronger than re-asserting today's resolver path.
+    # realize was a consumer. So pin every non-comment line containing the
+    # literal shell token `cargo`, including command substitutions such as
+    # `document=$(cargo ...)`, rather than only lines whose first command is
+    # Cargo. The exact list includes non-executing jq/string inspections too;
+    # that conservative over-match ensures a newly introduced literal Cargo
+    # execution cannot hide in an already broad exemption.
     # This function names both the resolver and Cargo, so any count over the
     # whole file matches its own text. Delete this function's body first.
     local body
     body=$(sed '/^function audit_manifest_plan_cargo_independence {$/,/^}$/d' "$ROOT_DIR/ci/test_harness.sh")
-    local -a expected_cargo_surface=(
+    local -a expected_cargo_lines=(
         # The resolver's own stale/absent rebuild. The point of this whole
         # mechanism is that a verified document skips it.
         "cargo run -p hermit-manifest-plan -- --format harness-json"
         # audit_test_footprints, a different binary producing ci/test-footprints.json.
         "cargo run --quiet -p hermit-manifest-plan"
+        # Non-executing inspections of DAG command strings. They are pinned
+        # exactly so none can become an executable Cargo call on the same line
+        # without changing this listing.
+        'and (.cmd | contains("./ci/run-with-reverie-dbt-budget.sh cargo build"))'
+        'and .cmd == "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run"'
+        'elif ((.cmd // "") | contains("cargo nextest run")) then'
+        'elif ((.cmd // "") | contains("cargo test")) then'
+        '| select(.cmd | contains("cargo "))'
     )
-    local actual_cargo_surface expected_cargo_listing
-    actual_cargo_surface=$(grep -E '^[[:space:]]*cargo ' <<<"$body" |
-        sed -E 's/^[[:space:]]+//; s/[[:space:]]+/ /g; s/ \\$//' | LC_ALL=C sort)
-    expected_cargo_listing=$(printf '%s\n' "${expected_cargo_surface[@]}" | LC_ALL=C sort)
-    [[ $actual_cargo_surface == "$expected_cargo_listing" ]] ||
-        die "the harness's executable Cargo surface changed; a new Cargo call can serialize a metadata consumer behind the build lock. Expected:
+    local actual_cargo_lines expected_cargo_listing planted_cargo_lines
+    local cargo_token_pattern='(^|[^[:alnum:]_])cargo([[:space:]]|$)'
+    function extract_cargo_lines {
+        awk -v pattern="$cargo_token_pattern" '
+            $0 !~ /^[[:space:]]*#/ && $0 ~ pattern {
+                sub(/^[[:space:]]+/, "")
+                gsub(/[[:space:]]+/, " ")
+                sub(/ \\$/, "")
+                print
+            }
+        '
+    }
+    # PLANTED NEGATIVE: the former line-anchored matcher missed this exact
+    # command-substitution shape, allowing a metadata consumer to reacquire
+    # Cargo's build-directory lock without changing the pinned count.
+    planted_cargo_lines=$(printf '%s\n' \
+        '# hidden=$(cargo metadata --no-deps)' \
+        'hidden=$(cargo metadata --no-deps)' |
+        extract_cargo_lines)
+    [[ $planted_cargo_lines == 'hidden=$(cargo metadata --no-deps)' ]] ||
+        die "the Cargo-line check does not distinguish an executable command substitution from a comment: $planted_cargo_lines"
+    actual_cargo_lines=$(extract_cargo_lines <<<"$body" | LC_ALL=C sort)
+    expected_cargo_listing=$(printf '%s\n' "${expected_cargo_lines[@]}" | LC_ALL=C sort)
+    [[ $actual_cargo_lines == "$expected_cargo_listing" ]] ||
+        die "the harness's non-comment lines containing the Cargo token changed; a new Cargo call can serialize a metadata consumer behind the build lock. Expected:
 $expected_cargo_listing
 Found:
-$actual_cargo_surface"
+$actual_cargo_lines"
 
     # ---- coverage: `validate` shares the one resolver, so it cannot diverge --
     # `validate` is this function's own caller and cannot be re-entered without
@@ -706,7 +736,7 @@ $actual_cargo_surface"
     ((status == 2)) && [[ $symlink_output == *"input directory resolves outside the checkout"* ]] ||
         die "a symlinked manifest-plan input root was not refused (rc=$status): $symlink_output"
 
-    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (the harness's whole executable Cargo surface is pinned to ${#expected_cargo_surface[@]} named non-metadata site(s), so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; both hosted artifact producers explicitly select/transport publication; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant and manifest-declared program input the producer reads; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0; missing program plus final, ancestor, and input-root symlinks refused rc=2"
+    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (${#expected_cargo_lines[@]} non-comment lines containing the Cargo token are pinned, including 2 executable calls, so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; both hosted artifact producers explicitly select/transport publication; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant and manifest-declared program input the producer reads; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0; missing program plus final, ancestor, and input-root symlinks refused rc=2"
     rm -rf "$scratch"
 }
 
