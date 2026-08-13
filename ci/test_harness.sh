@@ -507,7 +507,11 @@ CARGO_SHIM
         '| select(.cmd | contains("cargo "))'
     )
     local actual_cargo_lines expected_cargo_listing planted_cargo_lines
-    local cargo_token_pattern='(^|[^[:alnum:]_])cargo([[:space:]]|$)'
+    # Treat shell separators, redirections, grouping, double quotes, and path
+    # separators as command-token boundaries. Hyphens are deliberately not a
+    # boundary: names such as `fake-cargo` and recorded `*-cargo-build-jobs`
+    # values are not Cargo commands.
+    local cargo_token_pattern='(^|[[:space:]();|&<>"/])cargo([[:space:]<>|;&()"/]|$)'
     function extract_cargo_lines {
         awk -v pattern="$cargo_token_pattern" '
             $0 !~ /^[[:space:]]*#/ && $0 ~ pattern {
@@ -520,12 +524,14 @@ CARGO_SHIM
     }
     # PLANTED NEGATIVE: the former line-anchored matcher missed this exact
     # command-substitution shape, allowing a metadata consumer to reacquire
-    # Cargo's build-directory lock without changing the pinned count.
+    # Cargo's build-directory lock without changing the pinned count. Put a
+    # redirection immediately after the command name so this also proves the
+    # token boundary is shell syntax, not merely whitespace.
     planted_cargo_lines=$(printf '%s\n' \
-        '# hidden=$(cargo metadata --no-deps)' \
-        'hidden=$(cargo metadata --no-deps)' |
+        '# hidden=$(cargo</dev/null metadata --no-deps)' \
+        'hidden=$(cargo</dev/null metadata --no-deps)' |
         extract_cargo_lines)
-    [[ $planted_cargo_lines == 'hidden=$(cargo metadata --no-deps)' ]] ||
+    [[ $planted_cargo_lines == 'hidden=$(cargo</dev/null metadata --no-deps)' ]] ||
         die "the Cargo-line check does not distinguish an executable command substitution from a comment: $planted_cargo_lines"
     actual_cargo_lines=$(extract_cargo_lines <<<"$body" | LC_ALL=C sort)
     expected_cargo_listing=$(printf '%s\n' "${expected_cargo_lines[@]}" | LC_ALL=C sort)
@@ -736,7 +742,7 @@ $actual_cargo_lines"
     ((status == 2)) && [[ $symlink_output == *"input directory resolves outside the checkout"* ]] ||
         die "a symlinked manifest-plan input root was not refused (rc=$status): $symlink_output"
 
-    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (${#expected_cargo_lines[@]} non-comment lines containing the Cargo token are pinned, including 2 executable calls, so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; both hosted artifact producers explicitly select/transport publication; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant and manifest-declared program input the producer reads; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0; missing program plus final, ancestor, and input-root symlinks refused rc=2"
+    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (${#expected_cargo_lines[@]} non-comment lines outside this audit function containing the Cargo token are pinned, including 2 executable calls, so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; both hosted artifact producers explicitly select/transport publication; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant and manifest-declared program input the producer reads; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0; missing program plus final, ancestor, and input-root symlinks refused rc=2"
     rm -rf "$scratch"
 }
 
