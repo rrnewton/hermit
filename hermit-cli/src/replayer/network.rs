@@ -8,7 +8,6 @@
 
 use reverie::Errno;
 use reverie::Guest;
-use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
@@ -31,25 +30,6 @@ fn write_bytes<M: MemoryAccess>(
     }
     let address = AddrMut::<u8>::from_raw(pointer as usize).ok_or(Errno::EFAULT)?;
     memory.write_exact(address.cast(), bytes)
-}
-
-fn read_iovecs<M: MemoryAccess>(
-    memory: &M,
-    message: &libc::msghdr,
-) -> Result<Vec<libc::iovec>, Errno> {
-    if message.msg_iovlen == 0 {
-        return Ok(Vec::new());
-    }
-    let address = Addr::from_raw(message.msg_iov as usize).ok_or(Errno::EFAULT)?;
-    let mut iovecs = vec![
-        libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        message.msg_iovlen
-    ];
-    memory.read_values(address, &mut iovecs)?;
-    Ok(iovecs)
 }
 
 fn cmsg_align(length: usize) -> Option<usize> {
@@ -219,7 +199,7 @@ impl Replayer {
 
         let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
         let mut message: libc::msghdr = guest.memory().read_value(message_address)?;
-        let iovecs = read_iovecs(&guest.memory(), &message)?;
+        let iovecs = crate::read_iovecs(&guest.memory(), &message)?;
         assert_eq!(iovecs.len(), event.iovs.len());
 
         for (iovec, bytes) in iovecs.into_iter().zip(&event.iovs) {
