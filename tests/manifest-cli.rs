@@ -117,6 +117,20 @@ fn integer_array(value: Option<&Value>, context: &str) -> Vec<i64> {
         .collect()
 }
 
+fn first_chaos_seed(spec: &Value, id: &str) -> Result<i64, String> {
+    integer_array(
+        spec.get("seeds"),
+        &format!("{id}.modes.chaos.seeds"),
+    )
+    .first()
+    .copied()
+    .ok_or_else(|| {
+        format!(
+            "{id}: chaos mode is unavailable because its manifest declares no seeds; no guest command can be printed or run"
+        )
+    })
+}
+
 fn test_id(test: &Value, bucket: &str) -> String {
     test.get("id")
         .and_then(Value::as_str)
@@ -280,10 +294,14 @@ fn hermit_command(
         "replay" => format!(
             "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
         ),
-        "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={}{run_extra_joined} -- {guest}",
-            seed.unwrap_or(0)
-        ),
+        "chaos" => {
+            let seed = seed.unwrap_or_else(|| {
+                fail("internal error: chaos command construction requires a declared seed")
+            });
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+            )
+        }
         "custom" => {
             let mut args = mode_args.to_vec();
             args.extend(extra.iter().cloned());
@@ -645,11 +663,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     };
     let seed = if mode == "chaos" {
         let modes = modes_table(test, id);
-        let seeds = integer_array(
-            modes[&mode].get("seeds"),
-            &format!("{id}.modes.chaos.seeds"),
-        );
-        Some(seeds.first().copied().unwrap_or(0))
+        Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
     } else {
         None
     };
@@ -703,6 +717,14 @@ fn self_test() -> ExitCode {
     );
     assert!(chaos.contains("run --base-env=minimal"));
     assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+    let seeded_chaos: Value = "seeds = [7, 9]".parse().unwrap();
+    let no_seed_chaos = Value::Table(Default::default());
+    assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
+    assert!(
+        first_chaos_seed(&no_seed_chaos, "fixture")
+            .unwrap_err()
+            .contains("declares no seeds")
+    );
 
     let custom = hermit_command(
         "custom",
@@ -839,6 +861,7 @@ get/run:
   --log      override the --log= level (info|debug|trace|off); default info (off for chaos)
   --all-modes (get only) print every enabled (mode,backend) command
   -- <flags> (run only) extra hermit flags injected before the `-- <guest>` separator
+  A chaos mode without declared seeds is unavailable; get/run refuse rather than invent seed 0.
 
 ENV:
   HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)"

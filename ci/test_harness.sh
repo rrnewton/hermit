@@ -2395,6 +2395,52 @@ function launch_refusal_reason {
     printf 'guest launch refused before execution: %s' "$first_line"
 }
 
+# A chaos command exists only when the manifest supplies at least one seed.
+# Disabled chaos modes may omit the recipe entirely.  That cell remains red in
+# the scorecard, but running zero guests is not a failed attempt and must not
+# produce a result row.
+function chaos_seed_count {
+    local metadata=$1
+    jq -er '.modes.chaos.seeds | select(type == "array" and length > 0) | length' \
+        <<<"$metadata"
+}
+
+function audit_chaos_seed_contract {
+    local seeded='{"modes":{"chaos":{"seeds":[0,9]}}}'
+    local unavailable='{"modes":{"chaos":{"backends_enabled":[]}}}'
+    [[ $(chaos_seed_count "$seeded") == 2 ]] ||
+        die "a declared chaos seed recipe must remain executable"
+    if chaos_seed_count "$unavailable" >/dev/null 2>&1; then
+        die "a chaos mode without seeds must remain unavailable"
+    fi
+
+    local scratch metadata output status
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-chaos-seeds.XXXXXX")
+    metadata='{"id":"fixture/no-seeds","category":"fixture","lane":"portable","modes":{"chaos":{"backends_enabled":[]}}}'
+    if output=$( {
+        function prepare_cell_dirs { : >"$scratch/prepared"; }
+        function prepare_test { : >"$scratch/prepare-called"; }
+        function execute_attempt { : >"$scratch/attempted"; }
+        function append_result { : >"$scratch/result-written"; }
+        function die { printf 'test_harness.sh: %s\n' "$*" >&2; exit 2; }
+        run_cell /dev/null "$metadata" chaos ptrace
+    } 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    if ((status != 2)) || [[ $output != *"declares no seeds; no guest was attempted"* ]]; then
+        rm -r -- "$scratch"
+        die "a no-seed chaos cell must refuse with an actionable explanation"
+    fi
+    if [[ -e $scratch/prepared || -e $scratch/prepare-called ||
+          -e $scratch/attempted || -e $scratch/result-written ]]; then
+        rm -r -- "$scratch"
+        die "a no-seed chaos cell must not prepare, execute, or write a result"
+    fi
+    rm -r -- "$scratch"
+}
+
 function audit_guest_launch_classification_contract {
     local fixture_dir refusal_stderr guest_failure_stderr
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-launch-classification.XXXXXX")
@@ -2946,6 +2992,9 @@ function run_cell {
     id=$(jq -r .id <<<"$metadata")
     category=$(jq -r .category <<<"$metadata")
     lane=$(jq -r .lane <<<"$metadata")
+    if [[ $mode == chaos ]] && ! chaos_seed_count "$metadata" >/dev/null; then
+        die "$id: chaos mode is unavailable because its manifest declares no seeds; no guest was attempted"
+    fi
     slug=${id//\//-}-$mode-${backend:-none}
     cell_dir="$RESULT_ROOT/runs/$RUN_ID/$slug"
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
@@ -3387,6 +3436,7 @@ case "$subcommand" in
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract
+        audit_chaos_seed_contract
         audit_sabre_path_evidence_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
