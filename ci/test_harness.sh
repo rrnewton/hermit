@@ -3472,28 +3472,66 @@ function drive_parity_verdict_cells {
     ) || status=$?
     ((status == 0)) ||
         die "run_cell parity bracket failed (exit $status): $report"
+    # A child case that is DELETED rather than broken exits 0 and says so only
+    # in its own tally, which nothing was reading. Pin the tally here, in the
+    # caller, against a literal: removing any one of the six cases now has to
+    # be done in two functions instead of silently in one.
+    local expected_report
+    expected_report="run_cell parity gate bracket: refusals=4/4 (replay-diverged,verify-diverged,stripped-match,unverified-parity) acceptances=2/2 (parity-reached,not-asserted)"
+    [[ $report == "$expected_report" ]] ||
+        die "run_cell parity bracket did not run all six cases; got: $report"
     printf '%s\n' "$report"
 }
 
 # The child half of the bracket above: assert what run_cell DECIDES, not what
 # execute_attempt assembles.
 #
-# Four cases, because a one-sided bracket is worthless here. Restricting the
+# Six cases, because a one-sided bracket is worthless here. Restricting the
 # gate back to verify only, deleting it, or widening it to refuse every replay
 # cell each leave at least one of these red:
 #
-#   replay + asserted + non-parity verdict -> FAIL   (the gate refuses)
-#   replay + asserted + parity verdict     -> PASS   (it does not over-refuse)
-#   replay + not asserted + non-parity     -> PASS   (it is keyed on the assert)
-#   verify + asserted + non-parity verdict -> FAIL   (verify keeps its behaviour)
+#   replay + asserted + diverged verdict     -> FAIL (the gate refuses)
+#   replay + asserted + parity verdict       -> PASS (it does not over-refuse)
+#   replay + not asserted + diverged verdict -> PASS (it is keyed on the assert)
+#   verify + asserted + diverged verdict     -> FAIL (verify keeps its behaviour)
+#   replay + asserted + verified-not-parity  -> FAIL (pins the parity conjunct)
+#   replay + asserted + parity-not-verified  -> FAIL (pins the verified conjunct)
+#
+# The last two exist because cases 1-4 vary BOTH booleans the reader consults at
+# once: they only ever pair verified=true/parity=true against
+# verified=false/parity=false. Measured on 2026-08-13 at 413d3c56b, with only
+# cases 1-4 present, all three of `and`->`or`, dropping `.verified`, and
+# dropping `.bitwise_parity` in assert_bitwise_parity_verdict left BOTH
+# `audit-comparison-contract` and full `validate` green -- and `and`->`or`
+# turned a `verified=true bitwise_parity=false strictness=stripped` cell into a
+# PASS whose recorded reason still printed `bitwise_parity=false`. Cases 5 and 6
+# each hold one boolean at the accepting value and flip the other, so no single
+# conjunct can be dropped or the connective weakened without a red.
 #
 # Every expected outcome, exit status and message below is a literal. None is
 # read back from the code under test.
 function audit_parity_verdict_cells {
     [[ ${E2E_PARITY_VERDICT_BRACKET:-} == 1 ]] ||
         die "audit-parity-verdict-cells is the child half of audit-comparison-contract's run_cell bracket and is not run directly"
+    # run_cell writes its cell directory under the harness-global RESULT_ROOT,
+    # which is readonly by the time any function runs and DEFAULTS to
+    # $ROOT_DIR/ignored/e2e -- a real results tree. This child deletes its run
+    # directory between cases, so the boolean above is not a sufficient guard:
+    # setting only that boolean and invoking the child directly deleted a real
+    # ignored/e2e/runs/ (measured 2026-08-13). Require a caller-supplied results
+    # root outside the source tree, and prove no runs/ tree is already there.
+    [[ -n ${E2E_RESULT_ROOT:-} ]] ||
+        die "audit-parity-verdict-cells deletes its results tree between cases and refuses to run without an explicit scratch E2E_RESULT_ROOT"
+    [[ $RESULT_ROOT != "$ROOT_DIR" && $RESULT_ROOT != "$ROOT_DIR"/* ]] ||
+        die "audit-parity-verdict-cells refuses a results root inside the source tree: $RESULT_ROOT"
+    [[ ! -e $RESULT_ROOT/runs ]] ||
+        die "audit-parity-verdict-cells refuses to delete a runs tree it did not create: $RESULT_ROOT/runs"
     local scratch metadata parity_replay parity_verify parity_verdict diverged_verdict
+    local stripped_verdict unverified_parity_verdict
     local outcome reason status refusals=0 acceptances=0
+    # Scoped to this run id, so even a future weakening of the guards above
+    # cannot widen the blast radius past the directory run_cell writes here.
+    local probe_runs="$RESULT_ROOT/runs/$RUN_ID"
     scratch=$(mktemp -d)
     RESULTS="$scratch/results.jsonl"
     metadata=$(jq -cn '{
@@ -3509,11 +3547,32 @@ function audit_parity_verdict_cells {
       }}')
     parity_replay=$(jq -c '.modes.replay.assert.bitwise_parity = true' <<<"$metadata")
     parity_verify=$(jq -c '.modes.verify.assert.bitwise_parity = true' <<<"$metadata")
-    # A full-parity verdict and a divergence differ in exactly the two fields
-    # the reader consults, so the accept and refuse legs differ only in the
-    # thing under test.
+    # parity_verdict is the ONLY fixture the reader may accept. The three refuse
+    # fixtures below are stated relative to it, and what each one pins is stated
+    # exactly -- do not claim the legs "differ only in the thing under test",
+    # because parity_verdict vs diverged_verdict differs in BOTH booleans and
+    # therefore pins neither of them individually.
     parity_verdict='{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":7,"right":7}}'
+    # Both booleans false: pins that the reader refuses an outright divergence,
+    # and nothing finer.
     diverged_verdict='{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":7,"right":6}}'
+    # verified=true, bitwise_parity=false: pins the `.bitwise_parity` conjunct
+    # and the `and`. This is a REAL producer shape -- the exact bytes a plain
+    # `--strict --verify` writes when the lossy Stripped comparator finds no
+    # difference (see the `matched` fixture in audit_comparison_contract) -- and
+    # it is precisely the state this feature exists to refuse: a cell justified
+    # by a parity measurement it never performed.
+    stripped_verdict='{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":7,"right":7}}'
+    # verified=false, bitwise_parity=true: pins the `.verified` conjunct. Unlike
+    # the fixture above this shape is NOT producible today -- VerificationReport
+    # computes `bitwise_parity` as a conjunction that already includes
+    # `verified` (hermit-cli/src/bin/hermit/verify.rs), so parity implies
+    # verified at the source. It is kept deliberately: it is a refuse leg, where
+    # an unproducible fixture can only hold the reader stricter than the
+    # producer, never admit something the producer emits. Without it the reader
+    # silently depends on a producer invariant it does not itself state, and
+    # dropping `.verified` from the condition is undetectable.
+    unverified_parity_verdict='{"verified":false,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":7,"right":7}}'
     export FAKE_HERMIT_ARGS="$scratch/args"
     # Register the probe cell the way load_tests registers a program-less
     # manifest entry, so run_cell's own prepare_test lookup resolves it and the
@@ -3527,7 +3586,7 @@ function audit_parity_verdict_cells {
     export FAKE_HERMIT_VERDICT="$diverged_verdict"
     METADATA_BY_ID["audit/comparison"]=$parity_replay
     : >"$RESULTS"
-    rm -rf "$RESULT_ROOT/runs"
+    rm -rf "$probe_runs"
     status=0
     run_cell direct:audit/comparison "$parity_replay" replay ptrace >/dev/null || status=$?
     outcome=$(jq -r .outcome "$RESULTS")
@@ -3545,7 +3604,7 @@ function audit_parity_verdict_cells {
     #    assertion meaningless.
     export FAKE_HERMIT_VERDICT="$parity_verdict"
     : >"$RESULTS"
-    rm -rf "$RESULT_ROOT/runs"
+    rm -rf "$probe_runs"
     status=0
     run_cell direct:audit/comparison "$parity_replay" replay ptrace >/dev/null || status=$?
     outcome=$(jq -r .outcome "$RESULTS")
@@ -3564,7 +3623,7 @@ function audit_parity_verdict_cells {
     export FAKE_HERMIT_VERDICT="$diverged_verdict"
     METADATA_BY_ID["audit/comparison"]=$metadata
     : >"$RESULTS"
-    rm -rf "$RESULT_ROOT/runs"
+    rm -rf "$probe_runs"
     status=0
     run_cell direct:audit/comparison "$metadata" replay ptrace >/dev/null || status=$?
     outcome=$(jq -r .outcome "$RESULTS")
@@ -3579,7 +3638,7 @@ function audit_parity_verdict_cells {
     #    behaviour while the gate is widened.
     METADATA_BY_ID["audit/comparison"]=$parity_verify
     : >"$RESULTS"
-    rm -rf "$RESULT_ROOT/runs"
+    rm -rf "$probe_runs"
     status=0
     run_cell direct:audit/comparison "$parity_verify" verify ptrace >/dev/null || status=$?
     outcome=$(jq -r .outcome "$RESULTS")
@@ -3592,9 +3651,50 @@ function audit_parity_verdict_cells {
         die "the verify refusal did not name verify and the parity shortfall: $reason"
     refusals=$((refusals + 1))
 
+    # 5. replay, bitwise_parity asserted, the run publishes the LOSSY-COMPARATOR
+    #    match: verified=true, bitwise_parity=false, strictness=stripped. Holds
+    #    the `.bitwise_parity` conjunct on its own, so neither dropping it nor
+    #    weakening the `and` to an `or` can survive: both turn this exact cell
+    #    into a PASS whose recorded reason still reads bitwise_parity=false.
+    export FAKE_HERMIT_VERDICT="$stripped_verdict"
+    METADATA_BY_ID["audit/comparison"]=$parity_replay
+    : >"$RESULTS"
+    rm -rf "$probe_runs"
+    status=0
+    run_cell direct:audit/comparison "$parity_replay" replay ptrace >/dev/null || status=$?
+    outcome=$(jq -r .outcome "$RESULTS")
+    reason=$(jq -r '.reason // ""' "$RESULTS")
+    ((status == 1)) ||
+        die "run_cell exited $status for a replay cell whose verdict matched only under the stripped comparator; expected 1"
+    [[ $outcome == FAIL ]] ||
+        die "a stripped-comparator replay match was recorded as $outcome; expected FAIL"
+    [[ $reason == "replay did not reach strict bitwise parity: "* ]] ||
+        die "the stripped-comparator refusal did not name replay and the parity shortfall: $reason"
+    refusals=$((refusals + 1))
+
+    # 6. replay, bitwise_parity asserted, the mirror image: verified=false with
+    #    bitwise_parity=true. Holds the `.verified` conjunct on its own. See the
+    #    fixture comment: this shape is not producible today, and the case is
+    #    here so the reader states its own requirement instead of inheriting it
+    #    from a producer invariant that no test in this file checks.
+    export FAKE_HERMIT_VERDICT="$unverified_parity_verdict"
+    : >"$RESULTS"
+    rm -rf "$probe_runs"
+    status=0
+    run_cell direct:audit/comparison "$parity_replay" replay ptrace >/dev/null || status=$?
+    outcome=$(jq -r .outcome "$RESULTS")
+    reason=$(jq -r '.reason // ""' "$RESULTS")
+    ((status == 1)) ||
+        die "run_cell exited $status for a replay cell claiming bitwise parity without a verified match; expected 1"
+    [[ $outcome == FAIL ]] ||
+        die "an unverified parity claim was recorded as $outcome; expected FAIL"
+    [[ $reason == "replay did not reach strict bitwise parity: "* ]] ||
+        die "the unverified-parity refusal did not name replay and the parity shortfall: $reason"
+    refusals=$((refusals + 1))
+
     unset FAKE_HERMIT_ARGS FAKE_HERMIT_VERDICT
     rm -rf "$scratch"
-    echo "run_cell parity gate bracket: refusals=$refusals/2 (replay,verify) acceptances=$acceptances/2 (parity-reached,not-asserted)"
+    echo "run_cell parity gate bracket: refusals=$refusals/4 (replay-diverged,verify-diverged,stripped-match,unverified-parity) acceptances=$acceptances/2 (parity-reached,not-asserted)"
 }
 
 function write_junit {
