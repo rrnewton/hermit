@@ -410,11 +410,17 @@ jobs:
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          # setup.manifest_plan publishes content-addressed manifest metadata;
+          # carry it so e2e cells read the verified document instead of running
+          # Cargo again in jobs whose build cache may be cold.
+          test -s target/ci/manifest-plan.path
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/manifest-plan \
+            target/ci/manifest-plan.path \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
@@ -456,12 +462,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang cmake file g++ gcc git jq libelf-dev libunwind-dev liblzma-dev make pkg-config python3-full zlib1g-dev zstd
-      # Reproduce EXACTLY the release build nodes from portable.json (no drift):
-      # build.dbt_release, build.sabre_release, build.liteinst_runtime_release.
+      # Reproduce the release build nodes from portable.json and publish the
+      # manifest document transported in target/ci. run-node drops dependencies
+      # outside --only, so setup.manifest_plan must be selected explicitly.
       - name: Run release build nodes (dbt + sabre + liteinst)
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '(.build_dbt_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-node.sh portable "$(jq -r '(["setup.manifest_plan"] + .build_dbt_nodes + .build_aux_nodes)|join(",")' ci/portable-shards.json)"
       - name: Upload release-build node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -473,6 +480,7 @@ jobs:
       - name: Pack full release prebuilt tree (dbt + sabre + liteinst)
         run: |
           set -euo pipefail
+          test -s target/ci/manifest-plan.path
           tar --zstd -cf "$RELEASE_TARBALL" \
             --exclude='target/release/deps' \
             --exclude='target/release/build' \
