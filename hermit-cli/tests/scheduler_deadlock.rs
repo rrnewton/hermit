@@ -17,6 +17,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Child;
 use std::process::ChildStdout;
@@ -75,8 +76,12 @@ fn process_identity(pid: libc::pid_t) -> io::Result<ProcessIdentity> {
     })
 }
 
-fn same_process(identity: ProcessIdentity) -> bool {
-    matches!(proc_stat_starttime(identity.pid), Ok(starttime) if starttime == identity.starttime)
+fn same_process(identity: ProcessIdentity) -> io::Result<bool> {
+    match proc_stat_starttime(identity.pid) {
+        Ok(starttime) => Ok(starttime == identity.starttime),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn numeric_directory_entries(path: &Path) -> io::Result<Vec<libc::pid_t>> {
@@ -98,7 +103,7 @@ fn task_ids(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
 }
 
 fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
-    if !same_process(root) {
+    if !same_process(root)? {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "recorded Hermit root no longer exists",
@@ -132,7 +137,7 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
             let (parent, starttime) = match proc_stat_parent_and_starttime(child) {
                 Ok(values) => values,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => continue,
+                Err(error) => return Err(error),
             };
             if parent != pid {
                 continue;
@@ -144,9 +149,9 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
             let after = match proc_stat_parent_and_starttime(child) {
                 Ok(values) => values,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => continue,
+                Err(error) => return Err(error),
             };
-            if after != (pid, starttime) || !same_process(visited[&pid]) {
+            if after != (pid, starttime) || !same_process(visited[&pid])? {
                 continue;
             }
             visited.insert(child, identity);
@@ -161,16 +166,19 @@ fn owned_processes(root: ProcessIdentity) -> io::Result<DescendantSnapshot> {
 fn direct_children(pid: libc::pid_t) -> io::Result<BTreeMap<libc::pid_t, ProcessIdentity>> {
     let mut children = BTreeMap::new();
     for child in numeric_directory_entries(Path::new("/proc"))? {
-        if let Ok((parent, starttime)) = proc_stat_parent_and_starttime(child)
-            && parent == pid
-        {
-            children.insert(
-                child,
-                ProcessIdentity {
-                    pid: child,
-                    starttime,
-                },
-            );
+        match proc_stat_parent_and_starttime(child) {
+            Ok((parent, starttime)) if parent == pid => {
+                children.insert(
+                    child,
+                    ProcessIdentity {
+                        pid: child,
+                        starttime,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(children)
@@ -232,7 +240,7 @@ impl OwnedProcess {
             return Err(io::Error::last_os_error());
         }
         let pidfd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-        if !same_process(identity) {
+        if !same_process(identity)? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
@@ -370,10 +378,19 @@ impl OwnedHermit {
 
         let deadline = Instant::now() + Duration::from_secs(1);
 
-        if same_process(self.root.identity)
-            && let Ok(snapshot) = owned_processes(self.root.identity)
-        {
-            let _ = self.record(&snapshot);
+        match pidfd_alive(&self.root) {
+            Ok(true) => match owned_processes(self.root.identity) {
+                Ok(snapshot) => {
+                    if let Err(error) = self.record(&snapshot) {
+                        eprintln!("cleanup could not bind the observed tracee subtree: {error}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("cleanup could not enumerate the observed tracee subtree: {error}");
+                }
+            },
+            Ok(false) => {}
+            Err(error) => eprintln!("cleanup could not read Hermit pidfd readiness: {error}"),
         }
 
         let mut descendants: Vec<&OwnedProcess> = self.descendants.values().collect();
@@ -397,27 +414,32 @@ impl OwnedHermit {
         loop {
             let _ = self.child.try_wait();
             let mut adopted_count = 0;
-            if let Ok(adopted) = direct_children(self_pid) {
-                for identity in adopted.into_values() {
-                    if identity == self.root.identity
-                        || self.preexisting_children.get(&identity.pid) == Some(&identity)
-                    {
-                        continue;
+            let mut adoption_known = true;
+            match direct_children(self_pid) {
+                Ok(adopted) => {
+                    for identity in adopted.into_values() {
+                        if identity == self.root.identity
+                            || self.preexisting_children.get(&identity.pid) == Some(&identity)
+                        {
+                            continue;
+                        }
+                        adopted_count += 1;
+                        if let Err(error) = self.record_direct_child(identity, self_pid) {
+                            eprintln!(
+                                "cleanup could not bind adopted pid {} to its pidfd: {error}",
+                                identity.pid
+                            );
+                        }
                     }
-                    adopted_count += 1;
-                    if let Err(error) = self.record_direct_child(identity, self_pid) {
-                        eprintln!(
-                            "cleanup could not bind adopted pid {} to its pidfd: {error}",
-                            identity.pid
-                        );
-                    }
+                }
+                Err(error) => {
+                    adoption_known = false;
+                    eprintln!("cleanup could not enumerate adopted child roots: {error}");
                 }
             }
 
             for process in self.descendants.values() {
-                if same_process(process.identity)
-                    && let Err(error) = signal_pidfd(process, libc::SIGKILL)
-                {
+                if let Err(error) = signal_pidfd(process, libc::SIGKILL) {
                     eprintln!(
                         "cleanup failed to signal recorded pid {} through its pidfd: {error}",
                         process.identity.pid
@@ -425,20 +447,43 @@ impl OwnedHermit {
                 }
             }
             self.reap_recorded_descendants();
-            let live_descendants = self
-                .descendants
-                .values()
-                .filter(|process| same_process(process.identity))
-                .count();
-            let root_alive = same_process(self.root.identity);
-            if !root_alive && live_descendants == 0 && adopted_count == 0 {
+            let mut liveness_known = true;
+            let mut live_descendants = 0;
+            for process in self.descendants.values() {
+                match pidfd_alive(process) {
+                    Ok(true) => live_descendants += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        liveness_known = false;
+                        eprintln!(
+                            "cleanup could not read pidfd readiness for pid {}: {error}",
+                            process.identity.pid
+                        );
+                    }
+                }
+            }
+            let root_alive = match pidfd_alive(&self.root) {
+                Ok(alive) => alive,
+                Err(error) => {
+                    liveness_known = false;
+                    eprintln!("cleanup could not read Hermit pidfd readiness: {error}");
+                    true
+                }
+            };
+            if !root_alive
+                && live_descendants == 0
+                && liveness_known
+                && adoption_known
+                && adopted_count == 0
+            {
                 break;
             }
             if Instant::now() >= deadline {
                 eprintln!(
                     "ERROR: cleanup deadline expired with Hermit root alive={root_alive}, \
                      {live_descendants} recorded descendant process(es) alive, and \
-                     {adopted_count} adopted child process root(s) observed"
+                     {adopted_count} adopted child process root(s) observed; adopted-child \
+                     enumeration known={adoption_known}, pidfd liveness known={liveness_known}"
                 );
                 break;
             }
@@ -455,6 +500,25 @@ impl Drop for OwnedHermit {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+fn pidfd_alive(process: &OwnedProcess) -> io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd: process.pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pollfd.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pidfd for pid {} became invalid", process.identity.pid),
+        ));
+    }
+    Ok(result == 0)
 }
 
 fn signal_pidfd(process: &OwnedProcess, signal: libc::c_int) -> io::Result<()> {
@@ -502,6 +566,24 @@ fn terminate_direct_child(child: &mut Child, bound: Duration, description: &str)
             }
         }
     }
+}
+
+fn terminate_process_group(
+    child: &mut Child,
+    process_group: libc::pid_t,
+    bound: Duration,
+    description: &str,
+) {
+    // The group leader is still an unreaped direct child, so this recorded
+    // process-group ID cannot have been reused by an unrelated process group.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            eprintln!("failed to signal {description} process group {process_group}: {error}");
+        }
+    }
+    terminate_direct_child(child, bound, description);
 }
 
 fn read_ready_line(
@@ -626,13 +708,23 @@ fn wait_for_teardown(
         owned.reap_recorded_descendants();
         let live_processes = snapshot
             .processes
-            .values()
-            .filter(|(identity, _)| same_process(*identity))
+            .keys()
+            .filter(|pid| {
+                pidfd_alive(
+                    owned
+                        .descendants
+                        .get(pid)
+                        .expect("recorded tracee process is missing its pidfd"),
+                )
+                .expect("failed to read recorded tracee pidfd readiness")
+            })
             .count();
         let live_tasks = snapshot
             .tasks
             .values()
-            .filter(|identity| same_process(**identity))
+            .filter(|identity| {
+                same_process(**identity).expect("failed to establish recorded tracee task liveness")
+            })
             .count();
         let adopted: BTreeMap<_, _> = direct_children(self_pid)
             .expect("failed to enumerate children adopted by the test subreaper");
@@ -665,17 +757,20 @@ fn bounded_output(command: &mut Command, bound: Duration, description: &str) -> 
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     command
+        .process_group(0)
         .stdout(Stdio::from(stdout.try_clone()?))
         .stderr(Stdio::from(stderr.try_clone()?));
     let mut child = command.spawn()?;
+    let process_group = child.id() as libc::pid_t;
     let deadline = Instant::now() + bound;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if Instant::now() >= deadline {
-            terminate_direct_child(
+            terminate_process_group(
                 &mut child,
+                process_group,
                 Duration::from_secs(1),
                 &format!("timed-out {description}"),
             );
