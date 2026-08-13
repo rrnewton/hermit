@@ -309,11 +309,21 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
         if refuse:
             assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            assert not list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            ), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
-            shards = list(canonical_root.glob("ledger/hermit/*/*.jsonl"))
-            assert len(shards) == 1, (shards, output)
-            events = [json.loads(line) for line in shards[0].read_text().splitlines()]
+            # The canonical writer now appends to the live spool first. The
+            # publisher later copies that exact event into the tracked shard;
+            # the returned published_shard is a destination, not an assertion
+            # that publication already happened.
+            spools = list(
+                canonical_root.glob("ignored/ci-hub/validate-ledger-spool/*.jsonl")
+            )
+            assert len(spools) == 1, (spools, output)
+            assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
+            events = [json.loads(line) for line in spools[0].read_text().splitlines()]
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
             assert_schema5_contract(events[0]["legacy_row"])
