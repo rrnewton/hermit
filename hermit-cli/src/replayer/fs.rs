@@ -54,17 +54,12 @@ struct UserSignalInfoHead {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-696): Review lossless replay-output backpressure handling.
-async fn wait_for_replay_output(output_fd: RawFd) -> bool {
+async fn wait_for_replay_output(output_fd: RawFd) -> std::io::Result<bool> {
     // F_DUPFD_CLOEXEC keeps the endpoint alive while the bounded blocking task
     // polls it, without changing the shared open-file-description flags.
     let duplicate = unsafe { libc::fcntl(output_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate == -1 {
-        tracing::debug!(
-            error = %std::io::Error::last_os_error(),
-            output_fd,
-            "could not duplicate replay output for readiness polling"
-        );
-        return false;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this task.
     let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
@@ -93,15 +88,10 @@ async fn wait_for_replay_output(output_fd: RawFd) -> bool {
     })
     .await;
     match readiness {
-        Ok(Ok(ready)) => ready,
-        Ok(Err(error)) => {
-            tracing::debug!(%error, output_fd, "could not wait for replay output capacity");
-            false
-        }
-        Err(error) => {
-            tracing::debug!(%error, output_fd, "could not monitor replay output capacity");
-            false
-        }
+        Ok(result) => result,
+        Err(error) => Err(std::io::Error::other(format!(
+            "replay output readiness task failed: {error}"
+        ))),
     }
 }
 
@@ -256,17 +246,24 @@ fn write_replay_output_once(
         Ok(written as usize)
     };
 
-    if changed_flags {
+    let restore_error = if changed_flags {
         // SAFETY: restore the shared description before any async wait.
         if unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags) } == -1 {
-            tracing::debug!(
-                error = %std::io::Error::last_os_error(),
-                output_fd,
-                "could not restore replay output flags"
-            );
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    match (result, restore_error) {
+        (result, None) => result,
+        (Ok(_), Some(error)) => Err(error),
+        (Err(write_error), Some(restore_error)) => Err(std::io::Error::new(
+            write_error.kind(),
+            format!("{write_error}; also failed to restore replay output flags: {restore_error}"),
+        )),
     }
-    result
 }
 
 async fn emit_replay_output(
@@ -320,16 +317,29 @@ async fn emit_replay_output(
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && wait_for_replay_output(output_fd).await
-                {
-                    continue;
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    match wait_for_replay_output(output_fd).await {
+                        Ok(true) => continue,
+                        Ok(false) => panic!(
+                            "failed to emit replay output on fd {output_fd} after {offset}/{} bytes: output became unavailable",
+                            bytes.len()
+                        ),
+                        Err(wait_error) => panic!(
+                            "failed to emit replay output on fd {output_fd} after {offset}/{} bytes: {error}; readiness check failed: {wait_error}",
+                            bytes.len()
+                        ),
+                    }
                 }
-                tracing::debug!(%error, output_fd, "could not emit all replay output");
+                panic!(
+                    "failed to emit replay output on fd {output_fd} after {offset}/{} bytes: {error}",
+                    bytes.len()
+                );
             }
-            Ok(_) => {}
+            Ok(_) => panic!(
+                "failed to emit replay output on fd {output_fd} after {offset}/{} bytes: write returned zero",
+                bytes.len()
+            ),
         }
-        break;
     }
 
     if advances_output_offset {
@@ -1125,6 +1135,22 @@ mod tests {
         let mut received = [0; 10];
         peer.read_exact(&mut received).unwrap();
         assert_eq!(&received, b"SOCKET_OUT");
+    }
+
+    #[tokio::test]
+    async fn replay_output_rejects_a_closed_socket() {
+        let (output, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+
+        let replay = tokio::spawn(async move {
+            emit_replay_output(output.as_raw_fd(), b"LOST", None, false).await;
+        })
+        .await
+        .expect_err("replay output emission failure must fail the replay operation");
+        assert!(
+            replay.is_panic(),
+            "unexpected replay task failure: {replay}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
