@@ -1283,7 +1283,10 @@
    "label": "findmnt",
    "argv": [
     "/usr/bin/findmnt",
-    "--kernel",
+    "--fstab",
+    "--tab-file",
+    "{{ROOT_DIR}}/ci/compat/findmnt.fixture",
+    "--nocanonicalize",
     "--list",
     "--output",
     "TARGET,SOURCE,FSTYPE,OPTIONS"

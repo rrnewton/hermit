@@ -113,6 +113,10 @@ For a reproducible bounded sample across verify, replay, and chaos, run:
 Add `--mode verify` to sample only the first improvement target. Custom commands
 and native naked controls are not part of an unqualified random sample. The
 seed and every selected identity are retained in `run.json`.
+Chaos cells whose manifests declare no seeds remain red but are not executable.
+An exact request refuses before creating a plan; a batch reports and omits
+those cells instead of inventing a default seed or recording a zero-execution
+failure. The scorecard denominator is unchanged.
 
 Generate the same graph without executing it by replacing `run` with `plan`
 and supplying `--results DIR`. A request for every red cell is accepted only

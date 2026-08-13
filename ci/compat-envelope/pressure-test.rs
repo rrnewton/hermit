@@ -88,7 +88,9 @@ Commands:
       occupancy cannot fit the whole-run wall bound. Use --sample for a bounded
       random batch, --mode to narrow its population, or give --test, --mode,
       and --backend together for exactly one cell. The default result directory
-      is ignored/compat-envelope/pressure-<SHA>-<time>.
+      is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
+      manifest declares no seeds remains red but is unavailable: exact requests
+      refuse it, while batches report and omit it rather than inventing a run.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
@@ -110,7 +112,8 @@ Exact-cell options (run and plan):
 Bounded-batch options (run and plan):
   --sample COUNT           Seeded random sample of red cells. Without --mode,
                            samples verify, replay, and chaos; custom and naked
-                           are omitted.
+                           are omitted. Sampling draws only from cells whose
+                           manifests provide executable commands.
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
@@ -170,6 +173,7 @@ struct TrackedCell {
 
 struct PressureCells {
     red: Vec<TrackedCell>,
+    unavailable: Vec<TrackedCell>,
     preparation_by_test: BTreeMap<String, CellId>,
 }
 
@@ -382,7 +386,7 @@ impl FreshCheckout {
 #[derive(Clone, Debug)]
 struct CellBudget {
     timeout_seconds: i64,
-    attempts: i64,
+    attempts: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +442,8 @@ struct RunMetadata {
     sample: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    unavailable_cells: usize,
     cells: Vec<CellId>,
 }
 
@@ -496,6 +502,7 @@ fn run() -> Result<(), String> {
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!("Cells: {}", metadata.cells.len());
+            print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
             if selection.is_exact() {
@@ -539,6 +546,7 @@ fn run() -> Result<(), String> {
             let output = results.join("dag.json");
             let run_result = (|| {
                 let metadata = write_plan(execution_root, &results, &output, &selection)?;
+                print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
                     print_exact_manifest_command(execution_root, &metadata.cells[0], &selection)?;
@@ -640,6 +648,15 @@ fn print_sample(metadata: &RunMetadata) {
     );
     for cell in &metadata.cells {
         println!("  {}", display_id(cell));
+    }
+}
+
+fn print_unavailable(metadata: &RunMetadata) {
+    if metadata.unavailable_cells > 0 {
+        println!(
+            "Unavailable red chaos cells omitted: {} (their manifests declare no seeds, so no guest command exists)",
+            metadata.unavailable_cells
+        );
     }
 }
 
@@ -806,7 +823,7 @@ fn print_exact_manifest_command(
         .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
     println!(
         "Boxed cell wall cap: {}s (the manifest's per-attempt timeout remains nested and cannot extend this cap)",
-        pressure_timeout(budget, selection.cell_timeout_seconds)
+        pressure_timeout(budget, selection.cell_timeout_seconds)?
     );
     println!("Manifest command inside that boxed cell:");
     let output = Command::new(root.join("tests/manifest-cli.rs"))
@@ -927,6 +944,7 @@ fn check_scorecard(root: &Path) -> Result<(), String> {
 }
 
 fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCells, String> {
+    let budgets = load_budgets(root)?;
     let path = root.join(TRACKED_CELLS);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -940,6 +958,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let mut seen = BTreeSet::new();
     let mut red = Vec::new();
+    let mut unavailable = Vec::new();
     let mut enabled_by_test = BTreeMap::new();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
@@ -966,7 +985,26 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected => red.push(cell),
+            "red" if selected => {
+                let budget = budgets
+                    .get(&(cell.id.test.clone(), cell.id.mode.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "no manifest execution budget for {}/{}",
+                            cell.id.test, cell.id.mode
+                        )
+                    })?;
+                if budget.attempts.is_some() {
+                    red.push(cell);
+                } else if selection.is_exact() {
+                    return Err(format!(
+                        "{}/{}/{} is red but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
+                        cell.id.test, cell.id.mode, cell.id.backend
+                    ));
+                } else {
+                    unavailable.push(cell);
+                }
+            }
             "red" => {}
             "green" => {}
             other => return Err(format!("unknown cell status `{other}`")),
@@ -974,6 +1012,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     red.sort_by(|left, right| left.id.cmp(&right.id));
     if red.is_empty() {
+        if !unavailable.is_empty() {
+            return Err(format!(
+                "the selected red population has no executable commands; {} chaos cell(s) are unavailable because their manifests declare no seeds",
+                unavailable.len()
+            ));
+        }
         return Err(
             if let (Some(test), Some(mode), Some(backend)) = (
                 selection.test.as_deref(),
@@ -993,8 +1037,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     if let Some(count) = selection.sample {
         if count > red.len() {
             return Err(format!(
-                "--sample {count} exceeds the {} red cells in the selected population",
-                red.len()
+                "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
+                red.len(),
+                unavailable.len()
             ));
         }
         let seed = selection.seed.expect("sample always has a seed");
@@ -1020,6 +1065,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     Ok(PressureCells {
         red,
+        unavailable,
         preparation_by_test,
     })
 }
@@ -1082,22 +1128,19 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
                 .ok_or_else(|| format!("{id} has no modes table"))?;
             for (mode, spec) in modes {
                 let attempts = match mode.as_str() {
-                    "verify" | "replay" => 1,
-                    "naked" => spec
-                        .get("runs")
-                        .and_then(TomlValue::as_integer)
-                        .unwrap_or(3),
+                    "verify" | "replay" => Some(1),
+                    "naked" => spec.get("runs").and_then(TomlValue::as_integer).or(Some(3)),
                     "custom" => spec
                         .get("assert")
                         .and_then(TomlValue::as_table)
                         .and_then(|assert| assert.get("runs"))
                         .and_then(TomlValue::as_integer)
-                        .unwrap_or(1),
+                        .or(Some(1)),
                     "chaos" => spec
                         .get("seeds")
                         .and_then(TomlValue::as_array)
-                        .map(|seeds| seeds.len() as i64 * 2)
-                        .unwrap_or(1),
+                        .filter(|seeds| !seeds.is_empty())
+                        .map(|seeds| seeds.len() as i64 * 2),
                     other => return Err(format!("{id} has unknown mode `{other}`")),
                 };
                 out.insert(
@@ -1117,21 +1160,24 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
 /// timeout per attempt. Every timeout has a documented 10-second TERM/KILL
 /// grace. The final 30 seconds is the existing nextest/reporting grace used by
 /// this repository, not a backend multiplier or a guessed speed ratio.
-fn outer_timeout(budget: &CellBudget) -> i64 {
-    let phases = budget.attempts + 1;
-    phases * (budget.timeout_seconds + 10) + 30
+fn outer_timeout(budget: &CellBudget) -> Result<i64, String> {
+    let attempts = budget.attempts.ok_or(
+        "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
+    )?;
+    let phases = attempts + 1;
+    Ok(phases * (budget.timeout_seconds + 10) + 30)
 }
 
-fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> i64 {
-    outer_timeout(budget).min(
+fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
+    Ok(outer_timeout(budget)?.min(
         selected_cap
             .unwrap_or(PRESSURE_CELL_TIMEOUT_SECONDS)
             .min(PRESSURE_CELL_TIMEOUT_SECONDS),
-    )
+    ))
 }
 
-fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> i64 {
-    pressure_timeout(budget, selected_cap) + 20
+fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
+    Ok(pressure_timeout(budget, selected_cap)? + 20)
 }
 
 fn require_cell_occupancy_fits(
@@ -1151,7 +1197,7 @@ fn require_cell_occupancy_fits(
                     tracked.id.test, tracked.id.mode
                 )
             })?;
-        let seconds = pressure_timeout(budget, selected_cap);
+        let seconds = pressure_timeout(budget, selected_cap)?;
         all_seconds = all_seconds.saturating_add(seconds);
         if tracked.id.backend == "kvm" {
             kvm_seconds = kvm_seconds.saturating_add(seconds);
@@ -1285,6 +1331,7 @@ fn write_plan(
     check_scorecard(root)?;
     let PressureCells {
         red: cells,
+        unavailable,
         preparation_by_test: all_preparations,
     } = pressure_cells(root, selection)?;
     let preparation_by_test = if selection.is_exact() {
@@ -1385,7 +1432,7 @@ fn write_plan(
         } else {
             format!(" --backend {}", shell_quote(&cell.backend))
         };
-        let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds);
+        let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds)?;
         let cmd = format!(
             "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
@@ -1403,7 +1450,7 @@ fn write_plan(
             status = shell_quote(&status_path.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
-        let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds);
+        let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds)?;
         steps.push(Step {
             group: "prepare".into(),
             job,
@@ -1518,7 +1565,7 @@ fn write_plan(
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
             preparation_guard = preparation_guard,
         );
-        let wall = pressure_timeout(budget, selection.cell_timeout_seconds);
+        let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
         cell_timeouts.insert(tag.clone(), wall);
         // KVM's canonical privileged nodes are boxed at 16 GiB even when the
         // manifest cell itself is in the portable lane. Preserve that safety
@@ -1630,6 +1677,7 @@ fn write_plan(
         cell_timeout_seconds: selection.cell_timeout_seconds,
         sample: selection.sample,
         seed: selection.seed,
+        unavailable_cells: unavailable.len(),
         cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -1796,7 +1844,15 @@ fn validate_run_contract(
         seed: metadata.seed,
         run_timeout_seconds: Some(metadata.run_timeout_seconds),
     };
-    let expected_cells = pressure_cells(root, &selection)?.red;
+    let pressure_cells = pressure_cells(root, &selection)?;
+    if metadata.unavailable_cells != pressure_cells.unavailable.len() {
+        return Err(format!(
+            "run metadata records {} unavailable red cell(s), current manifest selection has {}",
+            metadata.unavailable_cells,
+            pressure_cells.unavailable.len()
+        ));
+    }
+    let expected_cells = pressure_cells.red;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
         if expected.insert(tracked.id, tracked.enabled).is_some() {
@@ -1846,7 +1902,10 @@ fn validate_run_contract(
                 cell.lane, cell.category, cell.test, cell.mode, cell.backend
             ))
         );
-        expected_cell_timeouts.insert(tag, pressure_timeout(budget, metadata.cell_timeout_seconds));
+        expected_cell_timeouts.insert(
+            tag,
+            pressure_timeout(budget, metadata.cell_timeout_seconds)?,
+        );
     }
     audit_dag(
         &dag,
@@ -2621,6 +2680,7 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         "cell_timeout_seconds": metadata.cell_timeout_seconds,
         "sample": metadata.sample,
         "seed": metadata.seed,
+        "unavailable_cells": metadata.unavailable_cells,
         "attempted": metadata.cells.len(),
         "pass_candidates": passing,
         "rows": rows,
@@ -2675,39 +2735,51 @@ fn self_test(root: &Path) -> Result<(), String> {
             "naked".into(),
         ))
         .ok_or("self-test manifest lost determinism-stress-c/producer-consumer naked budget")?;
-    if omitted_naked_runs.attempts != 3 || explicit_naked_runs.attempts != 5 {
+    if omitted_naked_runs.attempts != Some(3) || explicit_naked_runs.attempts != Some(5) {
         return Err(format!(
-            "pressure attempt counts diverge from the harness: omitted naked runs={} (want 3), explicit naked runs={} (want 5)",
+            "pressure attempt counts diverge from the harness: omitted naked runs={:?} (want 3), explicit naked runs={:?} (want 5)",
             omitted_naked_runs.attempts, explicit_naked_runs.attempts
+        ));
+    }
+    let seeded_chaos = manifest_budgets
+        .get(&("determinism-stress/order-violation".into(), "chaos".into()))
+        .ok_or("self-test manifest lost determinism-stress/order-violation chaos budget")?;
+    let unavailable_chaos = manifest_budgets
+        .get(&("applications/timed-progress-bar".into(), "chaos".into()))
+        .ok_or("self-test manifest lost applications/timed-progress-bar chaos budget")?;
+    if seeded_chaos.attempts != Some(64) || unavailable_chaos.attempts.is_some() {
+        return Err(format!(
+            "chaos attemptability diverges from the manifest: seeded={:?} (want 64), no-seed={:?} (want unavailable)",
+            seeded_chaos.attempts, unavailable_chaos.attempts
         ));
     }
     let budget = CellBudget {
         timeout_seconds: 7,
-        attempts: 3,
+        attempts: Some(3),
     };
-    if outer_timeout(&budget) != 98 {
+    if outer_timeout(&budget)? != 98 {
         return Err(format!(
             "timeout derivation changed: expected 98, got {}",
-            outer_timeout(&budget)
+            outer_timeout(&budget)?
         ));
     }
     if pressure_timeout(
         &CellBudget {
             timeout_seconds: 1800,
-            attempts: 64,
+            attempts: Some(64),
         },
         None,
-    ) != PRESSURE_CELL_TIMEOUT_SECONDS
+    )? != PRESSURE_CELL_TIMEOUT_SECONDS
     {
         return Err("pressure timeout did not cap a long repeated red cell".into());
     }
     if pressure_timeout(
         &CellBudget {
             timeout_seconds: 1800,
-            attempts: 64,
+            attempts: Some(64),
         },
         Some(37),
-    ) != 37
+    )? != 37
     {
         return Err("exact-cell pressure timeout did not apply the requested tighter cap".into());
     }
@@ -2906,6 +2978,37 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot remove self-test stale row: {e}"))?;
 
     let unfiltered = pressure_cells(root, &CellSelection::default())?;
+    let unavailable_id = unfiltered
+        .unavailable
+        .first()
+        .ok_or("self-test needs at least one red chaos cell without seeds")?
+        .id
+        .clone();
+    if unavailable_id.mode != "chaos"
+        || unfiltered
+            .red
+            .iter()
+            .any(|tracked| tracked.id == unavailable_id)
+    {
+        return Err(
+            "a red chaos cell without seeds entered the executable pressure population".into(),
+        );
+    }
+    let unavailable_selection = CellSelection {
+        test: Some(unavailable_id.test.clone()),
+        mode: Some(unavailable_id.mode.clone()),
+        backend: Some(unavailable_id.backend.clone()),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let unavailable_error = pressure_cells(root, &unavailable_selection)
+        .err()
+        .ok_or("an exact no-seed chaos cell was accepted for execution")?;
+    if !unavailable_error.contains("no chaos seeds") {
+        return Err(format!(
+            "exact no-seed chaos refusal lost its actionable explanation: {unavailable_error}"
+        ));
+    }
     let exact_id = unfiltered
         .red
         .iter()
@@ -3267,6 +3370,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         cell_timeout_seconds: Some(20),
         sample: None,
         seed: None,
+        unavailable_cells: 0,
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
