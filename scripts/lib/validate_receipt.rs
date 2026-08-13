@@ -280,9 +280,10 @@ pub fn self_test() -> Result<String, String> {
     }
     // Positive: exactly one qualifying combination must be ACCEPTED, so the
     // predicate is not vacuously restrictive.
+    let mut accepted = 0usize;
     eligible(0, 0, true, true, false, "full")
         .map_err(|e| format!("receipt: the one qualifying case must be eligible, got: {e}"))?;
-    let mut accepted = 1usize;
+    accepted += 1;
     // Negative: each condition, spoiled alone, must be REFUSED.
     let negatives: Vec<(&str, Result<(), String>)> = vec![
         ("nonzero exit", eligible(1, 0, true, true, false, "full")),
@@ -319,6 +320,9 @@ pub fn self_test() -> Result<String, String> {
     // or touch any PR.
     use std::cell::Cell;
     let observed = Cell::new(0usize);
+    let mut applied = 0usize;
+    let mut not_applied = 0usize;
+    let mut unavailable = 0usize;
     let publication = publication_after_reconcile(
         "123",
         || Ok(true),
@@ -333,6 +337,7 @@ pub fn self_test() -> Result<String, String> {
     {
         return Err("receipt: an observed label must report Applied after one read-back".into());
     }
+    applied += usize::from(matches!(publication, Publication::Applied { .. }));
 
     observed.set(0);
     let publication = publication_after_reconcile(
@@ -351,6 +356,7 @@ pub fn self_test() -> Result<String, String> {
             "receipt: rc=0 with an absent label must not report publication success".into(),
         );
     }
+    not_applied += usize::from(matches!(publication, Publication::NotApplied { .. }));
 
     observed.set(0);
     let publication = publication_after_reconcile(
@@ -367,6 +373,7 @@ pub fn self_test() -> Result<String, String> {
     {
         return Err("receipt: a failed reconciler must not report or read back success".into());
     }
+    not_applied += usize::from(matches!(publication, Publication::NotApplied { .. }));
 
     observed.set(0);
     let publication = publication_after_reconcile(
@@ -385,13 +392,16 @@ pub fn self_test() -> Result<String, String> {
             "receipt: an unreadable label state must not report publication success".into(),
         );
     }
+    unavailable += usize::from(matches!(publication, Publication::Unavailable(_)));
 
     // Pin the `gh pr view --json labels` response shape consumed by the live
     // read-back. Unknown or malformed shapes must never default to present.
     let present = br#"{"labels":[{"name":"locally-validated"}]}"#;
     let absent = br#"{"labels":[{"name":"documentation"}]}"#;
+    let taxonomy = br#"{"labels":[{"name":"mechanism:locally-validated"}]}"#;
     if label_is_present_in_api_response(present) != Ok(true)
         || label_is_present_in_api_response(absent) != Ok(false)
+        || label_is_present_in_api_response(taxonomy) != Ok(false)
         || label_is_present_in_api_response(br#"{"labels":[]}"#) != Ok(false)
         || label_is_present_in_api_response(br#"{"unexpected":[]}"#).is_ok()
         || label_is_present_in_api_response(b"not json").is_ok()
@@ -399,9 +409,9 @@ pub fn self_test() -> Result<String, String> {
         return Err("receipt: GitHub label read-back parser does not fail closed".into());
     }
 
-    accepted += 0;
     Ok(format!(
         "receipt: eligibility bracketed {accepted} accept / {refused} refuse; publication \
-         bracketed 1 applied / 3 not applied (no label was touched; the brackets are inert)"
+         bracketed {applied} applied / {not_applied} not applied / {unavailable} unavailable \
+         (no label was touched; the brackets are inert)"
     ))
 }
