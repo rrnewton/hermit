@@ -14,9 +14,11 @@
 # Parse Rust code to work out the precise set of source files for each crate.
 precise_srcs = true
 
-# Include a public top-level target which depends on all other targets.
-include_top_level = true
-include_workspace_members = true
+# hermit's root Cargo.toml is a virtual manifest -- a workspace with no package
+# of its own -- so there is no top-level target to include. Its members carry
+# hand-written BUCK files in this tree, so they are not generated either.
+include_top_level = false
+include_workspace_members = false
 
 [cargo]
 # Support Cargo's unstable "artifact dependencies" functionality, RFC 3028.

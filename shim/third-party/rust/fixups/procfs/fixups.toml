@@ -7,3 +7,6 @@
 # above-listed licenses.
 
 buildscript.run = true
+
+# Its build script reads CARGO_PKG_* to stamp version information.
+cargo_env = true
