@@ -809,8 +809,37 @@ fn self_test() -> Result<(), String> {
             validate_corpus::E9PATCH_COMPAT_TOTAL
         ));
     }
+    // Comparator cutover bracket.  Positive: every compatibility mode selects
+    // the canonical comparator.  Negative: deleting the flag from an otherwise
+    // real argv must be detected, so this cannot pass merely because the check
+    // accepts every command shape.
+    let uses_canonical_comparator = |args: &[String]| {
+        args.windows(2).any(|pair| pair == ["--verify", "--verify-strict"])
+    };
+    let modes = [
+        validate_plan::CompatMode::Strict,
+        validate_plan::CompatMode::PortableStrict,
+        validate_plan::CompatMode::Sabre,
+        validate_plan::CompatMode::E9patch,
+        validate_plan::CompatMode::Rr,
+    ];
+    for mode in modes {
+        let args = mode.run_args("echo", "/nonexistent/nsswitch.conf");
+        if !uses_canonical_comparator(&args) {
+            return Err(format!(
+                "compat comparator bracket: {mode:?} omitted adjacent --verify --verify-strict: {args:?}"
+            ));
+        }
+        let planted_omission: Vec<String> =
+            args.into_iter().filter(|arg| arg != "--verify-strict").collect();
+        if uses_canonical_comparator(&planted_omission) {
+            return Err(format!(
+                "compat comparator bracket: {mode:?} accepted a planted --verify-strict omission"
+            ));
+        }
+    }
     println!(
-        "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}",
+        "  corpora: strict={strict} sabre={sabre} rr={} (filtered to {}) e9patch={e9}; canonical comparator 5/5, planted omissions refused 5/5",
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
