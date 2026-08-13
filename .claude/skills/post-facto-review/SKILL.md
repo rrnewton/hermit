@@ -5,10 +5,17 @@ description: "Current Hermit post-facto human-review protocol: exact trigger set
 
 # Post-facto human review
 
-Write the five-field disclosure required by the parent `AGENTS.md` in a
-bot-authored PR description. Do not write that prefix in a GitHub comment or
-review body. From the `dev-hermit` parent, send the unprefixed body through its
-registered boundary:
+Before writing a bot-authored PR description, run this command from the
+`dev-hermit` parent and paste its exact output at the start:
+
+```bash
+./ci-hub/bin/who-am-i --tag --role ROLE
+```
+
+Do not type, reconstruct, or normalize the output. The command resolves the
+caller and refuses unresolved identity. Do not write a prefix in a GitHub
+comment or review body. From the `dev-hermit` parent, send the unprefixed body
+through its registered boundary:
 
 ```bash
 with-proxy ./ci-hub/bin/gh --who AGENT --team TEAM --role ROLE \
