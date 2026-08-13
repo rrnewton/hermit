@@ -56,7 +56,7 @@ def _replay_has_serve_only_mode() -> bool:
 class LldbReplayGdbserver(DebuggerTestBase):
     require_lldb = True
 
-    def test_lldb_attaches_to_replay(self):
+    def test_lldb_attaches_to_replay(self) -> None:
         if not _replay_has_serve_only_mode():
             self.skipTest(
                 "no serve-only replay mode: `hermit replay` spawns its own gdb "

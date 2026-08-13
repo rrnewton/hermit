@@ -25,12 +25,14 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
     L2_RANK,
+    ResultRow,
     SCORECARD_HEADER,
     expectation,
     verify_tier_from_json,
@@ -47,7 +49,7 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         print(f"  \033[31mFAIL\033[0m  {label}" + (f" -- {detail}" if detail else ""))
 
 
-def tier_of(record) -> dict[str, str] | None:
+def tier_of(record: object) -> dict[str, str] | None:
     with tempfile.TemporaryDirectory(prefix="verify-tier-") as tmp:
         path = Path(tmp) / "verdict.json"
         if record is not None:
@@ -56,8 +58,10 @@ def tier_of(record) -> dict[str, str] | None:
         return verify_tier_from_json(path)
 
 
-def spec(strictness, compare_logs=True, **over):
-    base = {
+def spec(
+    strictness: str, compare_logs: bool = True, **over: object
+) -> dict[str, object]:
+    base: dict[str, object] = {
         "strictness": strictness,
         "compare_logs": compare_logs,
         "strip_lines": strictness == "stripped",
@@ -69,8 +73,15 @@ def spec(strictness, compare_logs=True, **over):
     return base
 
 
-def record(verified=True, bitwise=False, left=239, right=239, strictness="stripped",
-           verdict="matched", compare_logs=True):
+def record(
+    verified: bool = True,
+    bitwise: bool = False,
+    left: int | None = 239,
+    right: int | None = 239,
+    strictness: str = "stripped",
+    verdict: str = "matched",
+    compare_logs: bool = True,
+) -> dict[str, object]:
     counts = None if left is None else {"left": left, "right": right}
     return {
         "verified": verified,
@@ -88,16 +99,16 @@ print("case STRIPPED — the exact shape the scorecard producer emits today")
 # Verbatim from a live probe run: rc=0, banner ":: Success: deterministic.
 # Determinism verified.", and bitwise_parity false in the same record.
 got = tier_of(record(bitwise=False, strictness="stripped"))
-check("tier is 'stripped', NOT 'bitwise'", got and got["tier"] == "stripped", repr(got))
-check("bitwise_parity records 0", got and got["bitwise_parity"] == "0", repr(got))
-check("strictness is carried", got and got["verify_compare"] == "stripped", repr(got))
+check("tier is 'stripped', NOT 'bitwise'", got is not None and got["tier"] == "stripped", repr(got))
+check("bitwise_parity records 0", got is not None and got["bitwise_parity"] == "0", repr(got))
+check("strictness is carried", got is not None and got["verify_compare"] == "stripped", repr(got))
 check("counts travel with the verdict (#319)",
-      got and got["compared_log_messages"] == "239|239", repr(got))
+      got is not None and got["compared_log_messages"] == "239|239", repr(got))
 
 print("case BITWISE — a genuine canonical match may claim the top tier")
 got = tier_of(record(bitwise=True, strictness="canonical", left=348, right=348))
-check("tier is 'bitwise'", got and got["tier"] == "bitwise", repr(got))
-check("bitwise_parity records 1", got and got["bitwise_parity"] == "1", repr(got))
+check("tier is 'bitwise'", got is not None and got["tier"] == "bitwise", repr(got))
+check("bitwise_parity records 1", got is not None and got["bitwise_parity"] == "1", repr(got))
 
 print("case VACUOUS — bitwise_parity with a ZERO compared count is NOT bitwise")
 # Two empty selections 'match' under the strictest possible spec.  Without the
@@ -105,17 +116,17 @@ print("case VACUOUS — bitwise_parity with a ZERO compared count is NOT bitwise
 for left, right, why in ((0, 0, "0|0"), (0, 239, "left 0"), (239, 0, "right 0")):
     got = tier_of(record(bitwise=True, strictness="canonical", left=left, right=right))
     check(f"zero-count record ({why}) is refused the bitwise tier",
-          got and got["tier"] != "bitwise", repr(got))
+          got is not None and got["tier"] != "bitwise", repr(got))
     check(f"zero-count record ({why}) reports bitwise_parity 0",
-          got and got["bitwise_parity"] == "0", repr(got))
+          got is not None and got["bitwise_parity"] == "0", repr(got))
 
 print("case GUEST — verified without comparing the log stream is guest-visible")
 got = tier_of(record(bitwise=False, compare_logs=False, left=None))
-check("tier is 'guest'", got and got["tier"] == "guest", repr(got))
+check("tier is 'guest'", got is not None and got["tier"] == "guest", repr(got))
 
 print("case DIVERGED — an unverified record never claims a positive tier")
 got = tier_of(record(verified=False, verdict="diverged"))
-check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
+check("tier is 'gap'", got is not None and got["tier"] == "gap", repr(got))
 
 print("case NO-RECORD — absent / no_result / malformed fall back, never upward")
 check("absent file yields None", tier_of(None) is None)
@@ -157,16 +168,24 @@ from run_matrix import (  # noqa: E402
 )
 
 
-def emitted_row(evidence):
+def emitted_row(evidence: dict[str, str]) -> dict[str, str]:
     with _tf.TemporaryDirectory(prefix="fallback-") as tmp:
         path = Path(tmp) / "sc.csv"
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
+        row: ResultRow = {
+            "test_name": "t",
+            "backend": "dbt",
+            "expectation": "stripped",
+            "result": "PASS",
+            "seconds": "1.0",
+            "detail": "d",
+            "evidence": evidence,
+        }
         append_parent_scorecard(
             path,
-            [{"test_name": "t", "backend": "dbt", "expectation": "stripped",
-              "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
+            [row],
             strict=True, verify=True, probe_gaps=False)
-        return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
+        return cast(dict[str, str], list(_csv.DictReader(path.open(encoding="utf-8")))[-1])
 
 
 fallback = emitted_row({"tier": "stripped", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,

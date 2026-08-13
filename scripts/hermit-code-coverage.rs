@@ -12,6 +12,7 @@
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! ```
+#![deny(warnings)]
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)

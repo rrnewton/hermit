@@ -90,7 +90,9 @@ def wait_for_text(log: Path, text: str, process: subprocess.Popen[bytes]) -> Non
     raise AssertionError(f"validate stop-test hook did not emit {text!r}")
 
 
-def assert_schema5_contract(row: dict, *, admitted: bool = False) -> None:
+def assert_schema5_contract(
+    row: dict[str, object], *, admitted: bool = False
+) -> None:
     """A current writer never escapes strict evidence by downgrading schema."""
     assert row["schema_version"] == 5, row
     assert row["repo"] == "hermit", row

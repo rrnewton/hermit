@@ -71,6 +71,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict, cast
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
@@ -100,6 +101,17 @@ L2_PASS = {"detlog", "guest"}  # a real --verify witness; "gap" means no witness
 
 class ConvertError(Exception):
     """A source row/fixture that cannot be auto-converted; reported, not fatal."""
+
+
+class InventoryEntry(TypedDict):
+    path: str
+    disposition: str
+    runner: str
+    why: str
+
+
+class Inventory(TypedDict):
+    files: list[InventoryEntry]
 
 
 @dataclass
@@ -175,8 +187,8 @@ class Plan:
     slug: str
     program: str  # repo-relative fixture path
     lane: str
-    enabled: list  # verify-mode enabled backends (always includes ptrace)
-    disabled: dict = field(default_factory=dict)  # verify-mode backend -> reason
+    enabled: list[str]  # verify-mode enabled backends (always includes ptrace)
+    disabled: dict[str, str] = field(default_factory=dict)
     fixture_content: str | None = None  # written when the fixture is not in-tree
     note: str = ""  # non-fatal reviewer flag (e.g. name-mismatch pairing)
 
@@ -186,9 +198,11 @@ def build_plan(
 ) -> Plan:
     slug = row.name.replace("_", "-")
     enabled = ["ptrace"]
-    disabled: dict = {}
+    disabled: dict[str, str] = {}
 
-    def classify(backend: str, l1: str, l1_reason: str, l2: str, l2_reason: str):
+    def classify(
+        backend: str, l1: str, l1_reason: str, l2: str, l2_reason: str
+    ) -> None:
         if row.has_l2:
             if l2 in L2_PASS:
                 enabled.append(backend)
@@ -311,7 +325,7 @@ def manifest_has_id(manifest_text: str, plan: Plan) -> bool:
     return f'id = "{BUCKET}/{plan.slug}"' in manifest_text
 
 
-def inventory_entry(program: str) -> dict:
+def inventory_entry(program: str) -> InventoryEntry:
     return {
         "path": program,
         "disposition": "manifest-test",
@@ -329,7 +343,7 @@ def inventory_entry(program: str) -> dict:
     }
 
 
-def apply_inventory(inv: dict, program: str) -> bool:
+def apply_inventory(inv: Inventory, program: str) -> bool:
     """Return True if the inventory changed (add or reclassify)."""
     for entry in inv["files"]:
         if entry.get("path") == program:
@@ -346,7 +360,7 @@ def apply_inventory(inv: dict, program: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Source acquisition
 # --------------------------------------------------------------------------- #
-def _gh(args: list) -> str:
+def _gh(args: list[str]) -> str:
     proc = subprocess.run(
         ["with-proxy", "gh", *args],
         capture_output=True,
@@ -357,8 +371,9 @@ def _gh(args: list) -> str:
     return proc.stdout
 
 
-def pr_added_matrix_rows(diff: str) -> list:
-    rows, in_matrix = [], False
+def pr_added_matrix_rows(diff: str) -> list[str]:
+    rows: list[str] = []
+    in_matrix = False
     for line in diff.splitlines():
         if line.startswith("diff --git"):
             in_matrix = "matrix.tsv" in line
@@ -370,8 +385,8 @@ def pr_added_matrix_rows(diff: str) -> list:
     return rows
 
 
-def pr_added_fixtures(diff: str) -> list:
-    fixtures = []
+def pr_added_fixtures(diff: str) -> list[str]:
+    fixtures: list[str] = []
     for line in diff.splitlines():
         if line.startswith("+++ b/") and line.endswith(".c"):
             path = line[len("+++ b/"):]
@@ -394,7 +409,7 @@ def pr_file_content(pr_head: str, path: str) -> str:
     return base64.b64decode(raw).decode("utf-8", "replace")
 
 
-def plans_from_pr(pr: int) -> tuple:
+def plans_from_pr(pr: int) -> tuple[list[Plan], list[str]]:
     """Return (plans, skips) for a PR number."""
     diff = _gh(["pr", "diff", str(pr), "-R", REPO])
     head = _gh(
@@ -403,8 +418,9 @@ def plans_from_pr(pr: int) -> tuple:
     rows = pr_added_matrix_rows(diff)
     added_fixtures = pr_added_fixtures(diff)
     fixtures = {Path(p).stem: p for p in added_fixtures}
-    consumed = set()
-    plans, skips = [], []
+    consumed: set[str] = set()
+    plans: list[Plan] = []
+    skips: list[str] = []
     for raw in rows:
         try:
             row = parse_matrix_row(raw)
@@ -445,7 +461,7 @@ def plans_from_pr(pr: int) -> tuple:
     return plans, skips
 
 
-def plans_from_local(row_str: str, fixture: str) -> tuple:
+def plans_from_local(row_str: str, fixture: str) -> tuple[list[Plan], list[str]]:
     row = parse_matrix_row(row_str)
     program = fixture
     content = None
@@ -457,12 +473,13 @@ def plans_from_local(row_str: str, fixture: str) -> tuple:
 # --------------------------------------------------------------------------- #
 # Emit
 # --------------------------------------------------------------------------- #
-def run(plans: list, apply: bool) -> int:
+def run(plans: list[Plan], apply: bool) -> int:
     manifest_text = MANIFEST.read_text()
-    inv = json.loads(INVENTORY.read_text())
+    inv = cast(Inventory, json.loads(INVENTORY.read_text()))
     new_manifest = manifest_text
-    changed_fixtures = []
-    converted, skipped_existing = [], []
+    changed_fixtures: list[str] = []
+    converted: list[Plan] = []
+    skipped_existing: list[str] = []
 
     for plan in plans:
         if manifest_has_id(new_manifest, plan):
@@ -471,7 +488,7 @@ def run(plans: list, apply: bool) -> int:
         new_manifest = new_manifest.rstrip("\n") + "\n" + render_test_block(plan)
         converted.append(plan)
 
-    inv_after = json.loads(json.dumps(inv))
+    inv_after = cast(Inventory, json.loads(json.dumps(inv)))
     inv_changed = False
     for plan in plans:
         if apply_inventory(inv_after, plan.program):
@@ -533,13 +550,14 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
     args = parser.parse_args()
 
-    plans, skips = [], []
+    plans: list[Plan] = []
+    skips: list[str] = []
     if args.pr:
         for pr in args.pr:
             try:
-                p, s = plans_from_pr(pr)
-                plans += p
-                skips += s
+                pr_plans, pr_skips = plans_from_pr(pr)
+                plans += pr_plans
+                skips += pr_skips
             except ConvertError as err:
                 skips.append(f"#{pr}: {err}")
     elif args.row and args.fixture:
@@ -553,8 +571,8 @@ def main() -> int:
     rc = run(plans, args.apply) if plans else 0
     if skips:
         print("\n== CANNOT AUTO-CONVERT ==")
-        for s in skips:
-            print(f"  {s}")
+        for skip in skips:
+            print(f"  {skip}")
     return rc
 
 

@@ -14,6 +14,8 @@ outside Hermit -- which is the whole point of record/replay debugging.
 
 import re
 import unittest
+from pathlib import Path
+from typing import ClassVar
 
 from harness import (
     DebuggerTestBase,
@@ -34,14 +36,16 @@ def _pid_from(out: str) -> int | None:
 
 class GdbReplayGdbserver(DebuggerTestBase):
     require_gdb = True
+    data_dir: ClassVar[Path]
+    recording: ClassVar[str]
 
     @classmethod
-    def setUpClass(cls):
+    def setUpClass(cls) -> None:
         super().setUpClass()
         cls.data_dir = cls.guest.parent / "replay-data"
         cls.recording = record(cls.hermit, cls.guest, cls.data_dir)
 
-    def _replay(self, gdbex):
+    def _replay(self, gdbex: list[str]) -> str:
         return replay_under_gdb(
             self.hermit,
             self.data_dir,
@@ -50,7 +54,7 @@ class GdbReplayGdbserver(DebuggerTestBase):
             pick_free_port(),
         )
 
-    def test_replay_breakpoint_and_values(self):
+    def test_replay_breakpoint_and_values(self) -> None:
         out = self._replay(
             ["break compute", "continue", "info args", "print a + b", "continue"]
         )
@@ -59,7 +63,7 @@ class GdbReplayGdbserver(DebuggerTestBase):
         self.assertRegex(out, r"result=%d" % EXPECT_RESULT)
         self.assertIn("exited normally", out)
 
-    def test_replay_is_deterministic_across_runs(self):
+    def test_replay_is_deterministic_across_runs(self) -> None:
         # The pid is virtualized by Hermit: it is fixed across replays even
         # though getpid() is nondeterministic on a bare host. Replay twice and
         # require the debugger to observe an identical pid both times.
@@ -79,7 +83,7 @@ class GdbReplayGdbserver(DebuggerTestBase):
         self.assertEqual(_pid_from(out1), _pid_from(out2))
 
 
-def _printed_value(out: str):
+def _printed_value(out: str) -> int | None:
     m = re.search(r"\$\d+ = (-?\d+)", out)
     return int(m.group(1)) if m else None
 

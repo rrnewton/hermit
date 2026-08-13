@@ -46,6 +46,7 @@
 //! [dependencies]
 //! serde_json = "1.0"
 //! ```
+#![deny(warnings)]
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
