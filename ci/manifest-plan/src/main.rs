@@ -35,6 +35,127 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 /// This is a ratchet: add a bucket once its cells all carry reasons. Cells
 /// outside these buckets may still carry `ci_disabled_reason` voluntarily.
 const CI_REASON_REQUIRED_BUCKETS: [&str; 1] = ["backend-parity-c"];
+
+// ------------------------------------------------------- `requires` vocabulary
+//
+// Every manifest cell already declares `requires`, and until now this validator
+// parsed it into `_requires` and threw it away: it was documentation, not a
+// gate. `backend-parity-c/cpuid-probe` has declared `"cpuid"` since it was
+// written, and on a machine without CPUID faulting it still ran, still saw the
+// real host CPU, and still failed — "this machine cannot run this" and "this ran
+// and it is broken" were the same record, which is the same defect hermit#2135,
+// hermit#2148 and hermit#2205 named at NODE granularity and hermit#2212 fixed
+// there.
+//
+// This table gives the declaration teeth at CELL granularity. It is the CLOSED
+// vocabulary of `requires` tokens, and the ONLY place a token can acquire the
+// power to withhold a cell. Two properties matter more than anything else here:
+//
+//  1. A token absent from this table REFUSES THE WHOLE RUN. Editing a manifest
+//     therefore cannot invent a new reason for a cell not to run; adding a
+//     reason is a reviewed source change in this file.
+//  2. A token whose second element is `None` can NEVER withhold anything. That
+//     is every token but one. `None` does not mean "assume the machine has it
+//     and skip the cell if it does not" — it means there is no absence proof, so
+//     the cell RUNS exactly as it does today and any failure is a real failure.
+//     Adding a `Some(...)` here is what would need review, and it is precisely
+//     the edit that could lower the bar.
+//
+// Deliberately NOT probed, though trivially probeable: `cc`, `python3`, `bash`,
+// `git`, and the rest of the tool tokens. A `command -v` miss from a broken PATH
+// would silently withhold 286 cells and hand back a green run, which is exactly
+// the bar-lowering this mechanism must not enable. They stay `None` until an
+// owner asks otherwise.
+const REQUIRES_VOCABULARY: &[(&str, Option<&str>)] = &[
+    ("ar", None),
+    ("bash", None),
+    ("cc", None),
+    // The one token with an absence proof. Resolved by
+    // `scripts/lib/validate_plan.rs::probe_host_capability`, the SAME probe
+    // hermit#2212 uses for the node, reached through
+    // `scripts/validate.rs --probe-host-capability`. There is one probe, not two.
+    ("cpuid", Some("cpuid-faulting")),
+    ("cxx", None),
+    ("date", None),
+    ("du", None),
+    ("find", None),
+    ("gawk", None),
+    ("git", None),
+    ("hexdump", None),
+    ("jq", None),
+    ("kvm", None),
+    ("linux", None),
+    ("lua5.4", None),
+    ("m4", None),
+    ("node", None),
+    ("openssl", None),
+    ("perl", None),
+    ("ptrace", None),
+    ("python3", None),
+    ("ruby", None),
+    ("rustc", None),
+    ("sqlite3", None),
+    ("tclsh", None),
+    ("userns", None),
+    ("x86_64", None),
+    ("zstd", None),
+];
+
+/// Every (capability, test-id) pair the corpus declares, for the tokens that
+/// HAVE an absence proof.
+///
+/// PURE: it reads parsed manifests and nothing else — no probe, no machine, no
+/// cell output — so the two halves of the withholding decision stay separable
+/// and each is bracketed on its own. A test whose `requires` names only
+/// unprobeable tokens contributes nothing, which is what stops a cell that is
+/// merely broken from ever appearing here.
+fn host_requirement_pairs(documents: &[Value]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for document in documents {
+        let Some(tests) = document.get("test").and_then(Value::as_array) else {
+            continue;
+        };
+        for test in tests {
+            let Some(id) = test.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(tokens) = test.get("requires").and_then(Value::as_array) else {
+                continue;
+            };
+            for token in tokens {
+                let Some(token) = token.as_str() else {
+                    return Err(format!("{id}.requires: array values must be strings"));
+                };
+                if let Some(capability) = requires_capability(token)? {
+                    out.push((capability.to_string(), id.to_string()));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// The host capability a `requires` token is probed as, or `None` when no
+/// absence proof exists for it.
+///
+/// `Err` means the token is outside the closed vocabulary, which is a refusal
+/// rather than a skip: a declaration nobody can evaluate must never be treated
+/// as a reason to omit work.
+fn requires_capability(token: &str) -> Result<Option<&'static str>, String> {
+    REQUIRES_VOCABULARY
+        .iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, capability)| *capability)
+        .ok_or_else(|| {
+            format!(
+                "unknown `requires` token `{token}`; the vocabulary is closed \
+                 (ci/manifest-plan/src/main.rs::REQUIRES_VOCABULARY) and an unrecognized name is \
+                 refused rather than treated as a reason to omit a cell"
+            )
+        })
+}
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
@@ -53,6 +174,14 @@ enum Format {
     Text,
     Json,
     HarnessJson,
+    /// Which cells declare a `requires` token that HAS an absence proof.
+    ///
+    /// One line per cell: `<capability-name>\t<test-id>`. Empty output means no
+    /// cell in the corpus can be withheld by any probe, whatever the machine
+    /// looks like. This emits the DECLARATIONS only and never probes; the
+    /// machine question is asked separately, so the two halves of the decision
+    /// cannot be conflated.
+    HostRequirements,
 }
 
 #[cfg(not(test))]
@@ -82,6 +211,7 @@ fn parse_format() -> Format {
             "text" => Format::Text,
             "json" => Format::Json,
             "harness-json" => Format::HarnessJson,
+            "host-requirements" => Format::HostRequirements,
             _ => die(format!("unknown format: {value}")),
         };
     }
@@ -164,6 +294,13 @@ fn main() {
     });
 
     match format {
+        Format::HostRequirements => {
+            let pairs = host_requirement_pairs(&documents)
+                .unwrap_or_else(|error| die(format!("cannot resolve `requires`: {error}")));
+            for (capability, id) in pairs {
+                println!("{capability}\t{id}");
+            }
+        }
         Format::HarnessJson => {
             println!(
                 "{}",
@@ -500,7 +637,14 @@ fn validate_and_expand(
     if test.get("occasional").and_then(Value::as_bool).is_none() {
         die(format!("{id}: occasional must be a boolean"));
     }
-    let _requires = string_array(test.get("requires"), &format!("{id}.requires"));
+    // `requires` is a GATE, not documentation. Every token must be in the closed
+    // vocabulary; an unrecognized one refuses the whole run here, before any
+    // plan is emitted and long before any cell could be withheld.
+    for token in string_array(test.get("requires"), &format!("{id}.requires")) {
+        if let Err(why) = requires_capability(&token) {
+            die(format!("{id}.requires: {why}"));
+        }
+    }
 
     let program = test.get("program").and_then(Value::as_str);
     let direct = test.get("direct");
@@ -936,6 +1080,118 @@ mod tests {
 
     fn parse_mode(text: &str) -> Value {
         text.parse::<Value>().expect("test mode must be valid TOML")
+    }
+
+    // ------------------------------------------- `requires` vocabulary brackets
+    //
+    // Both directions, on planted manifests, so neither depends on the machine
+    // running the test. The load-bearing one is
+    // `a_cell_without_a_probeable_token_is_never_selected`: without it the
+    // mechanism could be a blanket omission rather than a predicate, and could
+    // be used to excuse a cell that is merely broken.
+
+    #[test]
+    fn the_one_probeable_token_maps_to_the_shared_capability_name() {
+        // The name must be exactly what
+        // `scripts/lib/validate_plan.rs::HostCapability::value` emits and what
+        // `scripts/validate.rs --probe-host-capability` accepts. A typo here
+        // would make the probe silently unreachable, so the cell would run and
+        // fail — safe, but the mechanism would be inert, which this catches.
+        assert_eq!(
+            requires_capability("cpuid").unwrap(),
+            Some("cpuid-faulting")
+        );
+    }
+
+    #[test]
+    fn every_other_shipped_token_has_no_absence_proof() {
+        // Exactly ONE token may withhold anything. If a future edit gives a
+        // second token an absence proof, this fails and forces the reviewer to
+        // look at it, which is the point.
+        let probeable: Vec<&str> = REQUIRES_VOCABULARY
+            .iter()
+            .filter(|(_, capability)| capability.is_some())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(probeable, vec!["cpuid"]);
+    }
+
+    #[test]
+    fn an_unknown_token_is_refused_not_ignored() {
+        let error = requires_capability("cpuid-faulting-please").unwrap_err();
+        assert!(error.contains("vocabulary is closed"), "{error}");
+    }
+
+    #[test]
+    fn a_cell_declaring_a_probeable_token_is_selected() {
+        let document = parse_mode(
+            "[[test]]\nid = \"b/needs-cpuid\"\nrequires = [\"linux\", \"cpuid\", \"cc\"]\n",
+        );
+        assert_eq!(
+            host_requirement_pairs(&[document]).unwrap(),
+            vec![("cpuid-faulting".to_string(), "b/needs-cpuid".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_cell_without_a_probeable_token_is_never_selected() {
+        // THE ONE THAT MATTERS. A cell that declares nothing probeable can never
+        // be withheld, whatever the machine lacks — so a broken cell still runs,
+        // still fails, and is still refused.
+        let document = parse_mode(
+            "[[test]]\nid = \"b/ordinary\"\nrequires = [\"linux\", \"x86_64\", \"ptrace\", \"cc\"]\n",
+        );
+        assert!(host_requirement_pairs(&[document]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_requires_list_selects_nothing() {
+        let document = parse_mode("[[test]]\nid = \"b/bare\"\nrequires = []\n");
+        assert!(host_requirement_pairs(&[document]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_token_refuses_the_whole_extraction() {
+        let document =
+            parse_mode("[[test]]\nid = \"b/exotic\"\nrequires = [\"linux\", \"quantum\"]\n");
+        let error = host_requirement_pairs(&[document]).unwrap_err();
+        assert!(
+            error.contains("unknown `requires` token `quantum`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_corpus_declares_exactly_one_withholdable_cell() {
+        // NON-VACUITY. A bracket that passed against an empty corpus would prove
+        // nothing, and this also pins the blast radius: if a future manifest edit
+        // makes a second cell withholdable, a reviewer has to see it.
+        let manifests = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
+        let mut documents = Vec::new();
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&manifests)
+            .expect("shipped manifests must be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "toml")
+            })
+            .collect();
+        paths.sort();
+        assert!(
+            !paths.is_empty(),
+            "shipped manifest corpus must not be empty"
+        );
+        for path in paths {
+            let text = std::fs::read_to_string(&path).expect("manifest must be readable");
+            documents.push(text.parse::<Value>().expect("manifest must be valid TOML"));
+        }
+        assert_eq!(
+            host_requirement_pairs(&documents).unwrap(),
+            vec![(
+                "cpuid-faulting".to_string(),
+                "backend-parity-c/cpuid-probe".to_string()
+            )]
+        );
     }
 
     #[test]

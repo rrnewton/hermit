@@ -324,7 +324,12 @@ fn usage() -> &'static str {
      machine HAS a declared host capability, so its nodes run without probing.\n\
      It is deliberately one-directional: it can only cause MORE nodes to run.\n\
      Nothing can force a capability ABSENT, because that would be a way to make\n\
-     a node stop running without anyone measuring the machine."
+     a node stop running without anyone measuring the machine.\n\
+     \n\
+     --probe-host-capability <name> reports this machine's verdict for one\n\
+     capability as PRESENT|ABSENT plus the observation behind it, and exits.\n\
+     It runs no gate. ci/test_harness.sh calls it so a withheld manifest CELL\n\
+     and a withheld DAG node are decided by the same probe."
 }
 
 fn env_flag(name: &str, want: &str) -> bool {
@@ -4724,8 +4729,63 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     );
 }
 
+/// `--probe-host-capability <name>`: report THIS machine's verdict for one
+/// capability and exit, printing `PRESENT\t<evidence>` or `ABSENT\t<evidence>`.
+///
+/// A read-only query seam, in the same class as `--show-plan`: it runs no gate,
+/// writes no ledger, and applies no label. It exists so a consumer that is not
+/// this driver can reuse the SAME probe. Today that consumer is
+/// `ci/test_harness.sh`, which withholds a manifest CELL the machine cannot run
+/// the way the driver withholds a NODE. Exposing the existing probe was the
+/// alternative to writing a second one, and two probes for one question would
+/// eventually disagree.
+///
+/// An unrecognized name exits 2 rather than answering: the vocabulary is closed
+/// in [`validate_plan::HostCapability`], and inventing an answer for a name
+/// nobody defined is exactly how a bogus reason to skip work would appear.
+///
+/// Returns `None` when the flag is absent, so ordinary parsing proceeds.
+fn probe_host_capability_query() -> Option<u8> {
+    let mut argv = std::env::args().skip(1);
+    let name = loop {
+        let arg = argv.next()?;
+        if let Some(value) = arg.strip_prefix("--probe-host-capability=") {
+            break value.to_string();
+        }
+        if arg == "--probe-host-capability" {
+            match argv.next() {
+                Some(value) => break value,
+                None => {
+                    eprintln!("validate: --probe-host-capability needs a capability name");
+                    return Some(2);
+                }
+            }
+        }
+    };
+    let Some(capability) = validate_plan::HostCapability::from_value(&name) else {
+        eprintln!(
+            "validate: unknown host capability '{name}'; the vocabulary is closed \
+             (scripts/lib/validate_plan.rs::HostCapability) and an unrecognized name is refused \
+             rather than answered"
+        );
+        return Some(2);
+    };
+    let verdict = validate_plan::probe_host_capability(capability);
+    println!(
+        "{}\t{}",
+        if verdict.present { "PRESENT" } else { "ABSENT" },
+        verdict.evidence
+    );
+    Some(0)
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
+    // Answered before anything else because it is a question ABOUT THE MACHINE,
+    // not a validation run: no handlers, no log, no plan, no gate.
+    if let Some(code) = probe_host_capability_query() {
+        return ExitCode::from(code);
+    }
     install_stop_handlers();
     let started = std::time::Instant::now();
 

@@ -397,6 +397,123 @@ function load_tests {
     ((${#TESTS[@]} > 0)) || die "no tests discovered below $MANIFEST_ROOT"
 }
 
+# ------------------------------------------------- host-inapplicable cells
+#
+# A manifest cell can need a facility the MACHINE either has or does not have.
+# Until now it had exactly two outcomes -- it passed, or it failed -- so "this
+# machine cannot run this" and "this ran and it is broken" were the same record.
+# hermit#2212 gave a DAG *node* a third outcome, host-inapplicable, decided
+# out-of-band before the node is spawned. This is the same outcome at CELL
+# granularity, reusing that mechanism rather than repeating it.
+#
+# `backend-parity-c/cpuid-probe` has declared `requires = [... "cpuid" ...]`
+# since it was written, and nothing ever read it. On a machine without CPUID
+# faulting the guest sees the real host CPU and the cell fails with
+# `unexpected CPUID identity: max=00000010 vendor=AuthenticAMD` -- it is asking
+# for Detcore's synthetic GenuineIntel/0x0000000d identity, which only exists if
+# the kernel can trap CPUID. Withholding the whole `manifest_backend_parity_c`
+# bucket instead would destroy coverage of every other parity cell in it.
+#
+# WHAT STOPS THIS FROM EXCUSING A CELL THAT IS MERELY BROKEN:
+#
+#  1. The judgement NEVER READS THE CELL. Its two inputs are the cell's own
+#     static `requires` declaration and an out-of-band probe of the machine.
+#     No exit code, stderr, timeout or panic can reach it. A broken cell
+#     declares nothing relevant, so it runs, fails, and is refused.
+#  2. The vocabulary is CLOSED on BOTH sides. `requires` tokens are closed in
+#     `ci/manifest-plan/src/main.rs::REQUIRES_VOCABULARY`, and an unrecognized
+#     token makes the manifest gate exit non-zero, refusing the whole run.
+#     Capability names are closed in `scripts/lib/validate_plan.rs`, and a name
+#     the driver refuses (rc 2) also refuses the whole run here. Editing a
+#     manifest cannot invent a reason for a cell not to run.
+#  3. Exactly ONE of the 28 shipped tokens has an absence proof at all. The
+#     other 27 can never withhold anything; `cc` or `python3` going missing
+#     from a broken PATH must not silently withhold 286 cells.
+#  4. The probe FAILS CLOSED TOWARD RUNNING. Absence needs two independent
+#     sources to agree (`arch_prctl(ARCH_SET_CPUID, 0) == ENODEV` AND
+#     `/proc/cpuinfo` lacking `cpuid_fault`); disagreement, an unexpected errno,
+#     an unreadable source, or a probe that cannot be executed at all all
+#     resolve to PRESENT and the cell runs.
+#  5. There is NO override that manufactures absence. The driver's one override
+#     can only force a capability PRESENT, i.e. can only cause MORE to run.
+#  6. The DENOMINATOR GOES UP. A withheld cell stays in the selected count, is
+#     named in the plan header, in the run's own output, in the verdict line and
+#     in the durable per-cell record with the verbatim probe observation, and is
+#     never a PASS. Withholding every selected cell is a REFUSAL, not a green.
+declare -A HOST_INAPPLICABLE=()
+HOST_INAPPLICABLE_RESOLVED=0
+
+function resolve_host_inapplicable {
+    ((HOST_INAPPLICABLE_RESOLVED == 0)) || return 0
+    HOST_INAPPLICABLE_RESOLVED=1
+
+    local declarations capability test_id verdict present evidence probe_status
+    # THE DECLARATIONS, and the closed-vocabulary gate. This prints one
+    # `<capability>\t<test-id>` line per cell that declares a token with an
+    # absence proof, and exits non-zero on any token outside the vocabulary.
+    declarations=$(cargo run --quiet -p hermit-manifest-plan -- --format host-requirements) ||
+        die "manifest \`requires\` declarations were refused (unknown token in the closed vocabulary ci/manifest-plan/src/main.rs::REQUIRES_VOCABULARY); no cell was withheld and nothing was skipped"
+    [[ -n $declarations ]] || return 0
+
+    local -A absent_evidence=()
+    local -A probed=()
+    while IFS=$'\t' read -r capability test_id; do
+        [[ -n $capability && -n $test_id ]] || continue
+        if [[ -z ${probed[$capability]+x} ]]; then
+            probed[$capability]=1
+            # THE MACHINE QUESTION, asked once per capability, out of band,
+            # through the SAME probe hermit#2212 uses for a DAG node. There is
+            # one probe for this question, not two.
+            probe_status=0
+            verdict=$("$ROOT_DIR/scripts/validate.rs" \
+                --probe-host-capability "$capability" 2>/dev/null) || probe_status=$?
+            if ((probe_status == 2)); then
+                # The driver REFUSED the name. The two closed vocabularies
+                # disagree, which is a source defect; refusing the run is the
+                # only safe answer to a declaration nobody can evaluate.
+                die "host capability '$capability' is declared in the manifests but refused by scripts/validate.rs --probe-host-capability; the closed vocabularies in ci/manifest-plan/src/main.rs and scripts/lib/validate_plan.rs disagree"
+            elif ((probe_status != 0)); then
+                # Could not ask. Doubt runs the cell.
+                printf 'Host capability %s: PRESENT — the probe could not be run (exit %s); treated as PRESENT so the cell RUNS\n' \
+                    "$capability" "$probe_status"
+                continue
+            fi
+            IFS=$'\t' read -r present evidence <<<"$verdict"
+            printf 'Host capability %s: %s — %s\n' "$capability" "$present" "$evidence"
+            [[ $present == ABSENT ]] || continue
+            absent_evidence[$capability]=$evidence
+        fi
+        [[ -n ${absent_evidence[$capability]:-} ]] || continue
+        HOST_INAPPLICABLE[$test_id]="$capability"$'\t'"${absent_evidence[$capability]}"
+    done <<<"$declarations"
+
+    # The plan header: name every cell this machine cannot run, whether or not
+    # the current filters select it. Naming them here is what stops a reader from
+    # taking a later green as full coverage.
+    local id
+    for id in "${!HOST_INAPPLICABLE[@]}"; do
+        IFS=$'\t' read -r capability evidence <<<"${HOST_INAPPLICABLE[$id]}"
+        printf 'HOST-INAPPLICABLE: %s will NOT RUN wherever it is selected — this machine lacks %s (%s). This is NOT a pass and carries NO coverage for what that cell verifies.\n' \
+            "$id" "$capability" "$evidence"
+    done
+}
+
+function record_host_inapplicable {
+    local test_id=$1 metadata=$2 mode=$3 backend=$4
+    local category lane capability evidence
+    category=$(jq -r .category <<<"$metadata")
+    lane=$(jq -r .lane <<<"$metadata")
+    IFS=$'\t' read -r capability evidence <<<"${HOST_INAPPLICABLE[$test_id]}"
+    # A distinct outcome, deliberately not PASS/FAIL/ERROR: the cell did not run,
+    # so it belongs in none of those states. The verbatim probe observation is
+    # carried in `reason` so no reader has to take "inapplicable" on trust.
+    append_result "$test_id" "$category" "$lane" "$mode" "$backend" HOST-INAPPLICABLE 0 \
+        "NOT RUN, NOT a pass, no coverage: this machine lacks $capability ($evidence)" \
+        null host-inapplicable null
+    printf '%-16s %-10s %-11s %-9s %s - NOT RUN, NOT a pass: this machine lacks %s (%s)\n' \
+        HOST-INAPPLICABLE "$lane" "$mode" "${backend:--}" "$test_id" "$capability" "$evidence"
+}
+
 function audit_inventory {
     [[ -f $INVENTORY ]] || die "missing test inventory: ${INVENTORY#"$ROOT_DIR/"}"
     jq -e '
@@ -3150,14 +3267,19 @@ function run_cell {
 }
 
 function write_junit {
-    local tests failures errors
+    local tests failures errors skipped
     tests=$(wc -l <"$RESULTS")
     failures=$(jq -s '[.[] | select(.outcome == "FAIL")] | length' "$RESULTS")
     errors=$(jq -s '[.[] | select(.outcome == "ERROR")] | length' "$RESULTS")
+    # A host-inapplicable cell is reported as JUnit `skipped`: the one state in
+    # this schema that is neither a pass nor a failure, which is exactly what it
+    # is. It stays inside `tests` (the denominator) and out of `failures`, and it
+    # emits an element, so no consumer can read it as a silent pass.
+    skipped=$(jq -s '[.[] | select(.outcome == "HOST-INAPPLICABLE")] | length' "$RESULTS")
     mkdir -p "$(dirname "$JUNIT")"
     {
         printf '<?xml version="1.0" encoding="UTF-8"?>\n'
-        printf '<testsuite name="hermit-e2e" tests="%s" failures="%s" errors="%s">\n' "$tests" "$failures" "$errors"
+        printf '<testsuite name="hermit-e2e" tests="%s" failures="%s" errors="%s" skipped="%s">\n' "$tests" "$failures" "$errors" "$skipped"
         jq -r '
             def esc: @html;
             "  <testcase classname=\"" + (.category|esc) + "\" name=\"" + ((.test + "/" + .mode + "/" + (.backend // "none"))|esc) + "\" time=\"" + ((.duration_ms / 1000)|tostring) + "\">" +
@@ -3165,6 +3287,8 @@ function write_junit {
              elif .outcome == "ERROR" then
                ("<error" + (if .error_kind then (" type=\"" + (.error_kind|esc) + "\"") else "" end)
                 + ">" + ((.reason // "error")|esc) + "</error>")
+             elif .outcome == "HOST-INAPPLICABLE" then
+               ("<skipped message=\"" + ((.reason // "host-inapplicable")|esc) + "\"/>")
              else "" end) + "</testcase>"
         ' "$RESULTS"
         printf '</testsuite>\n'
@@ -3202,30 +3326,53 @@ function run_required {
     mkdir -p "$(dirname "$RESULTS")"
     : >"$RESULTS"
 
-    local planned test_id mode backend test metadata failures=0 selected=0
+    local planned test_id mode backend test metadata failures=0 selected=0 withheld=0 executed=0
     if ((PROBE_DISABLED)); then
         planned=$(emit_gap_plan)
     else
         planned=$(emit_required_plan)
     fi
+    resolve_host_inapplicable
     while IFS=$'\t' read -r test_id mode backend; do
         [[ -n $test_id ]] || continue
+        # DENOMINATOR FIRST. A withheld cell is counted as selected exactly like
+        # one that runs, so withholding can never shrink the contract this run is
+        # measured against.
         selected=$((selected + 1))
         test=${TEST_BY_ID[$test_id]}
         metadata=$(metadata_json "$test")
+        if [[ -n ${HOST_INAPPLICABLE[$test_id]:-} ]]; then
+            withheld=$((withheld + 1))
+            record_host_inapplicable "$test_id" "$metadata" "$mode" "$backend"
+            continue
+        fi
+        executed=$((executed + 1))
         run_cell "$test" "$metadata" "$mode" "$backend" || failures=$((failures + 1))
     done < <(jq -r '[.test,.mode,(.backend // "")] | @tsv' <<<"$planned")
 
     ((selected > 0)) || ((ALLOW_EMPTY == 1)) || die "filters selected no required test cells"
+    # A run that WITHHELD everything and executed nothing must never report
+    # success. `--allow-empty` covers a bucket with no cells at all; it does not
+    # cover a bucket whose every cell was withheld, which is uncovered surface
+    # rather than absent surface.
+    ((withheld == 0)) || ((executed > 0)) ||
+        die "every one of the $withheld selected cell(s) was withheld as host-inapplicable and NOTHING ran; a run that executed no cell is not a pass"
     write_junit
     jq -s '{schema:1,tests:(map(.test)|unique|length),cells:length,
         passed:(map(select(.outcome=="PASS"))|length),
         failed:(map(select(.outcome=="FAIL"))|length),
         errors:(map(select(.outcome=="ERROR"))|length),
+        host_inapplicable:(map(select(.outcome=="HOST-INAPPLICABLE"))|length),
+        host_inapplicable_cells:(map(select(.outcome=="HOST-INAPPLICABLE")
+            |{test,mode,backend,reason})),
         by_mode:(group_by(.mode)|map({key:.[0].mode,value:{cells:length,passed:(map(select(.outcome=="PASS"))|length)}})|from_entries)}' \
         "$RESULTS" >"$(dirname "$RESULTS")/summary.json"
     echo "Results: $RESULTS"
     echo "JUnit:  $JUNIT"
+    if ((withheld > 0)); then
+        printf 'cells: %d selected = %d executed + %d host-inapplicable (NOT RUN, NOT passed, no coverage)\n' \
+            "$selected" "$executed" "$withheld"
+    fi
     ((failures == 0))
 }
 
@@ -3300,6 +3447,12 @@ case "$subcommand" in
         "$ROOT_DIR/ci/compat-envelope/scorecard.rs" check
         "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
+        # Resolve `requires` HERE too, so the closed vocabulary is enforced by the
+        # metadata gate and the machine's verdict is stated in the plan header —
+        # before any run node could withhold anything. Note the counts below are
+        # the PLAN, which is unchanged by withholding: the denominator is the
+        # cells the profile requires, not the cells this machine can run.
+        resolve_host_inapplicable
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
         validate_dag_correspondence
         ;;
