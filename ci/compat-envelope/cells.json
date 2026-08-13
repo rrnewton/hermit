@@ -5142,6 +5142,15 @@
     },
     {
       "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "ptrace",
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
       "category": "system-utils",
       "test": "system-utils/clock-determinism",
       "mode": "custom",
