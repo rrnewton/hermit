@@ -239,10 +239,11 @@ def rust_library(
     mapped_srcs = {},
     cpp_deps = None,
     cxx_bridge = None,
+    test_rustc_flags = None,
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (test_deps, test_env, named_deps, autocargo, unittests, visibility, cpp_deps, cxx_bridge)  # @unused
+    _unused = (test_deps, test_env, named_deps, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
 

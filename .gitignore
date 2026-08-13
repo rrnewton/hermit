@@ -44,3 +44,4 @@ ci/validate-ledger/
 
 # buck2 build output
 buck-out/
+shim/third-party/rust/vendor/

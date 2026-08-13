@@ -50,6 +50,7 @@ def _if_inner(cond, a, b):
 
 selects = struct(
     and_ = _and,
+    apply = _prelude_selects.apply,
     cond = _cond,
     or_ = _or,
     if_ = _if,
