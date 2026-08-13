@@ -347,6 +347,318 @@ pub fn lane_nodes(
     Ok(out)
 }
 
+// ------------------------------------------------- host-capability requirements
+//
+// A node can require a facility the MACHINE either has or does not have. Before
+// this section such a node had exactly two outcomes — it passed, or it failed —
+// so "this host cannot run it" and "this ran and it is broken" were the same
+// record. On a host without CPUID faulting `privileged-cpuid.faulting` failed in
+// 0.11 s with exit 101 and an empty detail block, which reads like a broken
+// build, and its eager-exit cost the other twelve in-flight nodes
+// (hermit#2135, hermit#2148, hermit#2205).
+//
+// The fix is a THIRD recorded outcome, host-inapplicable, decided BEFORE the
+// node is spawned. Five properties keep it from becoming a way to excuse a node
+// that is merely broken:
+//
+//  1. The decision never reads the node. It is made from an out-of-band probe of
+//     the machine during plan construction; a node's exit code, stderr, or panic
+//     message cannot produce it. A broken node still runs, still fails, and is
+//     still refused.
+//  2. The capability vocabulary is CLOSED and lives in this file
+//     ([`HostCapability`]). A DAG naming an unknown capability is a
+//     plan-construction refusal, not a skip.
+//  3. The probe fails closed TOWARD RUNNING. Absence requires two independent
+//     sources to agree; a probe error, an unexpected errno, an unreadable
+//     `/proc/cpuinfo`, or disagreement between the sources all resolve to
+//     PRESENT, so the node runs and any failure is real.
+//  4. There is no override that manufactures absence.
+//     `HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT` can only force a capability
+//     PRESENT, i.e. can only cause MORE to run.
+//  5. Recording it honestly is what costs the receipt. The node is written to
+//     the ledger as a typed intentional skip whose reason is `host-inapplicable`,
+//     and the parent's separately-reviewed consumer allowlist
+//     (`ci-hub/validate/gate_completeness.py::ALLOWED_INTENTIONAL_SKIP_REASONS`,
+//     `ci-hub/lib/qualifying_receipt.rs::intentional_skip_count`) admits only
+//     `empty-manifest-bucket`. A run carrying a host-inapplicable node therefore
+//     does NOT qualify as landing authority until the owner opts that reason in.
+//     The mechanism cannot buy a green; it can only stop one node's absence from
+//     destroying the other forty.
+
+/// A machine facility a node needs before it can run at all.
+///
+/// CLOSED VOCABULARY. `ci/dag/<lane>.json` may name one of these on a step
+/// through `requires_host_capability`, but only a name listed here parses;
+/// anything else is a refusal. Adding a member is a reviewed source change in
+/// this file, so editing a DAG alone can never invent a new reason for a node
+/// not to run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub enum HostCapability {
+    /// CPUID faulting: `arch_prctl(ARCH_SET_CPUID, 0)` succeeds, so the kernel
+    /// can trap the guest's `CPUID` and Detcore can mask host feature bits.
+    /// Advertised by the kernel as the `cpuid_fault` flag in `/proc/cpuinfo`.
+    CpuidFaulting,
+}
+
+impl HostCapability {
+    /// The stable serialized name used in `ci/dag/<lane>.json` and the ledger.
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::CpuidFaulting => "cpuid-faulting",
+        }
+    }
+
+    /// Parse one stable serialized name; `None` for anything unrecognized.
+    pub fn from_value(text: &str) -> Option<Self> {
+        match text {
+            "cpuid-faulting" => Some(Self::CpuidFaulting),
+            _ => None,
+        }
+    }
+}
+
+/// The stable ledger reason for a node the machine provably cannot run.
+///
+/// The word is the owner's, from hermit#2205: "The missing concept is a third,
+/// recorded outcome: **host-inapplicable**, distinct from both pass and fail."
+pub const HOST_INAPPLICABLE_REASON: &str = "host-inapplicable";
+
+/// The one environment override, deliberately one-directional: it can only add
+/// capabilities to the PRESENT set. Nothing can force a capability ABSENT.
+pub const ASSUME_PRESENT_ENV: &str = "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT";
+
+/// One capability verdict for THIS machine, with the observation behind it.
+#[derive(Clone, Debug)]
+pub struct CapabilityVerdict {
+    pub capability: HostCapability,
+    /// `true` unless absence was positively established. Doubt means present.
+    pub present: bool,
+    /// What was actually observed, recorded verbatim so a reader never has to
+    /// take "inapplicable" on trust.
+    pub evidence: String,
+}
+
+/// One node the machine provably cannot run, and why.
+#[derive(Clone, Debug)]
+pub struct HostInapplicableNode {
+    pub tag: String,
+    pub capability: HostCapability,
+    pub evidence: String,
+}
+
+/// The `requires_host_capability` declarations in one lane, keyed by runner tag.
+///
+/// Reads the same file `lane_nodes` reads, through the same single path helper.
+/// `prefix` matches the retagging `lane_nodes` applies when lanes are fused.
+/// An unparseable capability name is an ERROR: refusing the whole run is the
+/// only safe response to a declaration nobody can evaluate.
+pub fn lane_host_capability_requirements(
+    root: &Path,
+    lane: &str,
+    prefix: &str,
+) -> Result<BTreeMap<String, HostCapability>, String> {
+    let path = lane_dag_path(root, lane);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let raw: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
+    let steps = raw
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("invalid DAG {}: 'steps' must be a list", path.display()))?;
+    let mut out = BTreeMap::new();
+    for step in steps {
+        let Some(declared) = step.get("requires_host_capability") else {
+            continue;
+        };
+        let name = declared.as_str().ok_or_else(|| {
+            format!(
+                "{}: requires_host_capability must be a string",
+                path.display()
+            )
+        })?;
+        let capability = HostCapability::from_value(name).ok_or_else(|| {
+            format!(
+                "{}: unknown requires_host_capability '{name}'; the capability vocabulary is \
+                 closed (scripts/lib/validate_plan.rs::HostCapability) and an unrecognized name \
+                 is refused rather than treated as a reason to omit a node",
+                path.display()
+            )
+        })?;
+        let group = step.get("group").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let job = step.get("job").and_then(serde_json::Value::as_str).unwrap_or_default();
+        if group.is_empty() || job.is_empty() {
+            return Err(format!(
+                "{}: a step declaring requires_host_capability has no group.job identity",
+                path.display()
+            ));
+        }
+        out.insert(format!("{prefix}{group}.{job}"), capability);
+    }
+    Ok(out)
+}
+
+/// Every `requires_host_capability` declaration in every shipped lane, under
+/// both the bare and the fused-lane tag spelling, so the caller can look a plan's
+/// tags up directly however the plan was assembled.
+pub fn host_capability_requirements(
+    root: &Path,
+) -> Result<BTreeMap<String, HostCapability>, String> {
+    let mut out = BTreeMap::new();
+    for lane in ["portable", "privileged"] {
+        for prefix in ["".to_string(), format!("{lane}-")] {
+            out.extend(lane_host_capability_requirements(root, lane, &prefix)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Ask the MACHINE whether it has one capability.
+///
+/// This is PLAN CONSTRUCTION, in the same class as `ask_selector`: it
+/// produces no verdict about the tree and runs no gate. Every failure mode
+/// resolves to PRESENT, so the driver can only ever err toward running MORE.
+pub fn probe_host_capability(capability: HostCapability) -> CapabilityVerdict {
+    let forced = std::env::var(ASSUME_PRESENT_ENV).unwrap_or_default();
+    if forced.split(',').map(str::trim).any(|c| c == capability.value()) {
+        return CapabilityVerdict {
+            capability,
+            present: true,
+            evidence: format!("{ASSUME_PRESENT_ENV} names {}; assumed PRESENT without probing (this override can only ADD capabilities)", capability.value()),
+        };
+    }
+    match capability {
+        HostCapability::CpuidFaulting => probe_cpuid_faulting(),
+    }
+}
+
+/// `arch_prctl(ARCH_SET_CPUID, 0)` in a forked child, exactly as
+/// `detcore/tests/misc/mod.rs::cpuid_faulting_supported` probes it.
+///
+/// Returns `Ok(())` when the kernel accepted it, or `Err(errno)`. `Err(0)` means
+/// the child died without reporting an errno, which is doubt, not absence.
+fn arch_prctl_set_cpuid_off() -> Result<(), i32> {
+    const ARCH_SET_CPUID: libc::c_int = 0x1012;
+    // SAFETY: the child performs one syscall and `_exit`s; it never returns into
+    // Rust, allocates, or touches inherited locks.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(0);
+    }
+    if child == 0 {
+        let result = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) };
+        let code = if result == 0 {
+            0
+        } else {
+            let errno = unsafe { *libc::__errno_location() };
+            errno.clamp(1, 255)
+        };
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(child, &mut status, 0) } != child || !libc::WIFEXITED(status) {
+        return Err(0);
+    }
+    match libc::WEXITSTATUS(status) {
+        0 => Ok(()),
+        errno => Err(errno),
+    }
+}
+
+/// Does `/proc/cpuinfo` advertise the kernel's `cpuid_fault` flag?
+///
+/// `None` when `/proc/cpuinfo` could not be read — unknown, never "absent".
+fn cpuinfo_advertises_cpuid_fault() -> Option<bool> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    Some(text.split_whitespace().any(|word| word == "cpuid_fault"))
+}
+
+/// TWO INDEPENDENT SOURCES must agree before this capability is called absent:
+/// the kernel must refuse `arch_prctl(ARCH_SET_CPUID, 0)` with `ENODEV` AND
+/// `/proc/cpuinfo` must not advertise `cpuid_fault`. Any other combination —
+/// success, a different errno, a fork failure, an unreadable `/proc/cpuinfo`, or
+/// the two sources disagreeing — is PRESENT, so the node runs and a real
+/// regression still turns the run red.
+///
+/// PURE, so `--self-test` can bracket the conjunction with planted observations
+/// on a machine of either kind. `ENODEV` specifically, not "any failure":
+/// `EPERM` from a restricted sandbox or `EINVAL` from an unexpected kernel is
+/// doubt about the PROBE, and doubt runs the node.
+pub fn cpuid_faulting_absent(syscall: Result<(), i32>, advertised: Option<bool>) -> bool {
+    syscall == Err(libc::ENODEV) && advertised == Some(false)
+}
+
+fn probe_cpuid_faulting() -> CapabilityVerdict {
+    let syscall = arch_prctl_set_cpuid_off();
+    let advertised = cpuinfo_advertises_cpuid_fault();
+    let syscall_text = match syscall {
+        Ok(()) => "arch_prctl(ARCH_SET_CPUID, 0) = 0".to_string(),
+        Err(0) => "arch_prctl(ARCH_SET_CPUID, 0) probe could not be completed".to_string(),
+        Err(errno) => format!("arch_prctl(ARCH_SET_CPUID, 0) = -1 errno={errno}"),
+    };
+    let cpuinfo_text = match advertised {
+        Some(true) => "/proc/cpuinfo advertises cpuid_fault",
+        Some(false) => "/proc/cpuinfo does not advertise cpuid_fault",
+        None => "/proc/cpuinfo could not be read",
+    };
+    CapabilityVerdict {
+        capability: HostCapability::CpuidFaulting,
+        present: !cpuid_faulting_absent(syscall, advertised),
+        evidence: format!("{syscall_text}; {cpuinfo_text}"),
+    }
+}
+
+/// Split a step list into what will run and what the machine cannot run.
+///
+/// PURE: it consumes an already-resolved absence map, so `--self-test` brackets
+/// both directions without touching the machine.
+///
+/// A step is withheld ONLY when it declares a capability that is in `absent`.
+/// A step with no declaration is never withheld, whatever is absent — that is
+/// what stops this from excusing a node that is merely broken.
+///
+/// Withholding a node that another RETAINED node depends on would silently
+/// orphan work, so it is a refusal rather than a cascade.
+pub fn partition_host_inapplicable(
+    steps: Vec<Step>,
+    requirements: &BTreeMap<String, HostCapability>,
+    absent: &BTreeMap<HostCapability, String>,
+) -> Result<(Vec<Step>, Vec<HostInapplicableNode>), String> {
+    let mut keep = Vec::with_capacity(steps.len());
+    let mut withheld = Vec::new();
+    for step in steps {
+        let tag = step.tag();
+        match requirements.get(&tag) {
+            Some(capability) if absent.contains_key(capability) => withheld.push(
+                HostInapplicableNode {
+                    tag,
+                    capability: *capability,
+                    evidence: absent[capability].clone(),
+                },
+            ),
+            _ => keep.push(step),
+        }
+    }
+    let gone: std::collections::BTreeSet<&str> =
+        withheld.iter().map(|n| n.tag.as_str()).collect();
+    let mut orphaned = Vec::new();
+    for step in &keep {
+        for dep in &step.deps {
+            if gone.contains(dep.as_str()) {
+                orphaned.push(format!("{} depends on {dep}", step.tag()));
+            }
+        }
+    }
+    if !orphaned.is_empty() {
+        return Err(format!(
+            "refusing to withhold a host-inapplicable node that other nodes depend on: {}; \
+             a missing capability must not silently cascade into unrun work",
+            orphaned.join(", ")
+        ));
+    }
+    Ok((keep, withheld))
+}
+
 /// Build the compatibility-corpus nodes for one mode.
 ///
 /// One DAG node PER PROBE. That is a deliberate change from the bash, which ran
