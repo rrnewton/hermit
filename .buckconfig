@@ -5,6 +5,7 @@
 
 [cells]
 hermit = .
+reverie = reverie
 gh_facebook_buck2_shims_meta = shim
 prelude = prelude
 none = none
@@ -33,6 +34,7 @@ target_platform_detector_spec = target:root//...->prelude//platforms:default tar
 [oss]
 internal_cell = fbcode
 stripped_root_dirs = hermetic_infra/hermit
+prefix_mappings = fbcode//hermetic_infra/reverie->reverie// fbcode//common/rust/build_info->gh_facebook_buck2_shims_meta//common/rust/build_info
 
 [rust]
 default_edition = 2021

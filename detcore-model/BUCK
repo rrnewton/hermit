@@ -10,6 +10,8 @@ rust_library(
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:bitvec",
         "fbsource//third-party/rust:bytesize",
         "fbsource//third-party/rust:chrono",

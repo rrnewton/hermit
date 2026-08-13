@@ -6,5 +6,5 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-['cfg(version = ">=5")']
-extra_srcs = ["src/version"]
+# The extra_srcs glob inherited from the buck2 repository matched no files in
+# the 5.x release reverie pins, so reindeer refused it. Nothing to add here.

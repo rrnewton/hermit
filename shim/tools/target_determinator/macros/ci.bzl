@@ -12,16 +12,18 @@ def _lbl(*_args):
     return ""
 
 def _package(
-    _values,
+    *_values,
     # starlark-lint-disable unused-argument
-    overwrite = False,
-):  # @unused
+    overwrite = False):  # @unused
     pass
 
 def _labels(*args):
     return []
 
 def _replace(_values):
+    return ""
+
+def _remove(*_args):
     return ""
 
 def _continuous_only(*_args):
@@ -42,4 +44,5 @@ ci = struct(
     replace = _replace,
     continuous_only = _continuous_only,
     selective_coverage = _lbl,
+    remove = _remove,
 )
