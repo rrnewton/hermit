@@ -29,14 +29,14 @@
 //! change on its own. The guest's robust list stays registered with the host
 //! kernel, so when the dying thread's `exit` finally reaches Linux, Linux runs
 //! its own `exit_robust_list()` and writes `FUTEX_OWNER_DIED` into the word
-//! too. A build in which Detcore only issued the wake, and left the word to the
-//! kernel, still prints that line — measured, not assumed.
+//! too. Detcore deliberately leaves that atomic transition to Linux on the
+//! ptrace backend, so the line proves the transition but not the modeled wake.
 //!
-//! The assertions below therefore also require Detcore's own log records: that
-//! Detcore performed the word transition to
-//! `FUTEX_WAITERS | FUTEX_OWNER_DIED` itself, and that its wake reached exactly
-//! one modeled waiter. Those are the two things the host kernel cannot supply
-//! on Detcore's behalf, and they are what fails when the walk regresses.
+//! The assertions below therefore also require Detcore's own log records that
+//! its wake reached exactly one modeled waiter, the ptrace path deferred the
+//! transition, and it did not execute the production store. The unit tests
+//! separately prove that the fake exposes the same non-atomic window as the
+//! remaining DBT, SaBRe, and KVM path.
 
 use std::fs;
 use std::fs::File;
@@ -95,6 +95,34 @@ fn run_captured(
         );
     }
     captured
+}
+
+fn assert_nonempty_canonical_l2(report_path: &Path, stdout: &str, stderr: &str) {
+    let report_bytes = fs::read(report_path).unwrap_or_else(|error| {
+        panic!(
+            "missing verification report {}: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            report_path.display()
+        )
+    });
+    let report: serde_json::Value =
+        serde_json::from_slice(&report_bytes).expect("Hermit verification report is valid JSON");
+    assert!(
+        report["verdict"] == "matched"
+            && report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info"
+            && report["comparison"]["full_trace"] == true
+            && report["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && report["compared_log_messages"]["right"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            && report["guest_exit_code"] == 0,
+        "verification report was not nonempty canonical bitwise parity: {report}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
 }
 
 fn build_guest(build_root: &Path) -> PathBuf {
@@ -180,28 +208,13 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
     );
 
     // `--verify` alone prints an identical success line for the lossy stripped
-    // comparison, so the JSON record is the only thing that distinguishes L2.
-    let report = fs::read_to_string(&verify_json).unwrap_or_else(|error| {
-        panic!(
-            "missing verification report {}: {error}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            verify_json.display()
-        )
-    });
-    for expected in [
-        r#""verified":true"#,
-        r#""bitwise_parity":true"#,
-        r#""strictness":"canonical""#,
-        r#""guest_exit_code":0"#,
-    ] {
-        assert!(
-            report.contains(expected),
-            "verification report lacks {expected}\nreport:\n{report}\nstderr:\n{stderr}"
-        );
-    }
+    // comparison, so the structured, nonempty canonical record is the only
+    // thing that distinguishes L2.
+    assert_nonempty_canonical_l2(&verify_json, &stdout, &stderr);
 }
 
-/// Detcore must be the thing that performs the owner-death protocol, not a
-/// passenger on the host kernel's own `exit_robust_list()`.
+/// Detcore must wake the waiter parked in its precise futex model, while Linux
+/// supplies the atomic owner-word transition on ptrace.
 ///
 /// `--verify` sends each of its two runs' logs to its own temporary file and
 /// prints only the comparison to stderr, so this evidence needs its own plain
@@ -210,7 +223,7 @@ fn robust_futex_owner_death_wakes_the_waiter_at_l2() {
 /// run raises the log level rather than the record's level. It is also the L1
 /// leg of the same behavior; the L2 leg is asserted above.
 #[test]
-fn detcore_itself_marks_the_word_and_wakes_the_modeled_waiter() {
+fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-detcore-evidence");
     let guest = build_guest(&build_root);
 
@@ -241,27 +254,19 @@ fn detcore_itself_marks_the_word_and_wakes_the_modeled_waiter() {
         "the waiter did not observe EOWNERDEAD under Hermit\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
-    // Detcore applied the transition itself. `-> 0xc0000000` is
-    // `FUTEX_WAITERS | FUTEX_OWNER_DIED`: the waiter bit has to survive the
-    // store, because dropping it is how a parked waiter gets stranded. This is
-    // the assertion the guest's own `EOWNERDEAD` line cannot make, since the
-    // host kernel writes that bit as well when the `exit` finally lands.
-    let marked = stderr
-        .lines()
-        .find(|line| line.contains("robust-list owner death: futex word"))
-        .unwrap_or_else(|| {
-            panic!("Detcore did not record applying the owner-death transition\nstderr:\n{stderr}")
-        });
-    assert!(
-        marked.trim_end().ends_with("-> 0xc0000000"),
-        "the futex word must become FUTEX_WAITERS|FUTEX_OWNER_DIED, got: {marked}"
-    );
-
-    // And Detcore's wake reached the modeled waiter. A count of 0 is the
+    // Detcore's wake reached the modeled waiter. A count of 0 is the
     // pre-fix state exactly: a wake is issued, but not into the pool where the
     // precise futex model actually parked the waiter.
     assert!(
         stderr.contains("robust-list owner death woke 1 waiter(s)"),
         "Detcore's owner-death wake did not reach exactly one modeled waiter\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("leaving futex word") && stderr.contains("for backend exit cleanup"),
+        "ptrace did not exercise the production deferred-write branch\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("robust-list owner death: futex word"),
+        "ptrace performed the prohibited separate owner-word write\nstderr:\n{stderr}"
     );
 }

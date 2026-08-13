@@ -116,6 +116,13 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_tracks_process_children: bool,
 
+    /// The execution backend completes Linux's robust-list cleanup before its task-exit callback
+    /// lets another modeled thread run. Detcore still wakes waiters parked in its precise futex
+    /// model, but it leaves the owner-word transition to Linux so it remains atomic.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_runs_exit_robust_list: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
@@ -1296,6 +1303,7 @@ mod tests {
         assert!(!config.backend_serializes_fork_children);
         assert!(config.backend_dispatches_thread_tools);
         assert!(config.backend_tracks_process_children);
+        assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
