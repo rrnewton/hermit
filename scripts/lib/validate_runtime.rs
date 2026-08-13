@@ -134,10 +134,16 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         return Some("bpfjailer-banner");
     }
     // Form 4 (checked before the per-line scan because it is a whole-region
-    // signature): the vendored third-party build script.
-    if (lower.contains("failed to run custom build command for") && lower.contains("reverie-dbi"))
-        || (lower.contains("panicked at") && lower.contains("reverie-dbi/build.rs"))
-    {
+    // signature): the vendored third-party build script. Keep recognizing the
+    // pre-rename crate spelling because old validation logs remain valid input.
+    let reverie_dbt_build = [
+        ("reverie-dbt", "reverie-dbt/build.rs"),
+        ("reverie-dbi", "reverie-dbi/build.rs"),
+    ];
+    if reverie_dbt_build.iter().any(|(package, build_script)| {
+        (lower.contains("failed to run custom build command for") && lower.contains(package))
+            || (lower.contains("panicked at") && lower.contains(build_script))
+    }) {
         return Some("third-party-build");
     }
     let mut vcs_hit = false;
@@ -878,6 +884,10 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             "third-party-build",
+            "error: failed to run custom build command for `reverie-dbt v0.1.0`",
+        ),
+        (
+            "third-party-build",
             "error: failed to run custom build command for `reverie-dbi v0.1.0`",
         ),
         // NEW class 1: the proxy/DNS failure measured in
@@ -1110,7 +1120,8 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
+         (incl. current reverie-dbt + legacy reverie-dbi builds and the 2 newer classes), \
+         node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
          registry census 1 live / 1 stale-reaped / 1 cpu-active"

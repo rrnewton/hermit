@@ -2080,11 +2080,16 @@ fn verification_report_path(results: &Path, cell: &CellId) -> PathBuf {
         cell.mode,
         cell.backend
     );
+    // The harness names a comparison verdict after the mode that produced it
+    // (`comparison_verdict_path` in ci/test_harness.sh), so a replay cell
+    // publishes `replay-1.json`, not `verify-1.json`. Hardcoding the verify
+    // spelling here would report every replay cell as a missing verification
+    // report while the harness had in fact written one.
     results
         .join("runs")
         .join(run_id)
         .join(harness_cell)
-        .join("verify-1.json")
+        .join(format!("{}-1.json", cell.mode))
 }
 
 fn retained_verification_logs(results: &Path, cell: &CellId) -> Result<Vec<String>, String> {
@@ -3179,6 +3184,29 @@ fn self_test() -> Result<(), String> {
     if !retained_verification_logs(&scratch, &sample_a)?.is_empty() {
         return Err("missing verify-log directory produced retained logs".into());
     }
+    // The verdict file is named after the mode that produced it, mirroring
+    // `comparison_verdict_path` in ci/test_harness.sh. Bracket BOTH spellings:
+    // hardcoding the verify name here reports every one of the corpus's replay
+    // cells as a missing verification report even though the harness wrote one,
+    // and only the replay half of this check can catch that.
+    let sample_replay = CellId {
+        mode: "replay".into(),
+        ..sample_a.clone()
+    };
+    for (cell, expected) in [
+        (&sample_a, "verify-1.json"),
+        (&sample_replay, "replay-1.json"),
+    ] {
+        let named = verification_report_path(&scratch, cell);
+        if named.file_name().and_then(|n| n.to_str()) != Some(expected) {
+            return Err(format!(
+                "{} cell must read its verdict from {expected}, not {}",
+                cell.mode,
+                named.display()
+            ));
+        }
+    }
+
     let verification_path = verification_report_path(&scratch, &sample_a);
     let verification_directory = verification_path
         .parent()

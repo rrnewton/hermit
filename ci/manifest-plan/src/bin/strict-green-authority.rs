@@ -788,7 +788,7 @@ mod tests {
                 test: "backend-parity/example".into(),
                 mode: "verify".into(),
                 reference_backend: "ptrace".into(),
-                observed_backend: "dbi".into(),
+                observed_backend: "dbt".into(),
             },
             tier: Tier::Short,
             memory_cadence: 1,

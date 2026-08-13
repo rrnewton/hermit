@@ -1026,7 +1026,7 @@ backends_enabled = ["native"]
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbt = "DBI rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification"
+dbt = "DBT rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst patches the code stream, so JIT-generated code needs separate qualification"
@@ -1036,7 +1036,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "The focused C sentinel owns the blocking replay contract"
-dbt = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -1046,7 +1046,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "V8's background compiler and GC threads are not guest-visible concurrency the chaos scheduler can steer"
-dbt = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
