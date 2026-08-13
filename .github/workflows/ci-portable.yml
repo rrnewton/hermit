@@ -410,11 +410,17 @@ jobs:
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          # setup.manifest_plan publishes content-addressed manifest metadata;
+          # carry it so e2e cells read the verified document instead of running
+          # Cargo again in jobs whose build cache may be cold.
+          test -s target/ci/manifest-plan.path
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/manifest-plan \
+            target/ci/manifest-plan.path \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
       - name: Upload debug prebuilt tree
