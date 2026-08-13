@@ -19,7 +19,6 @@ rust_binary(
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
         "//common/rust/shed/fbinit:fbinit",
-        "//hermetic_infra/hermit/common:edit-distance",
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
     ],

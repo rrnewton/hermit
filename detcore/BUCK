@@ -67,7 +67,6 @@ rust_library(
         # detcore should be backend agnostic. However, it's okay to depend on
         # reverie-ptrace in tests.
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/hermit/common:digest",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
     ],
 )
