@@ -3025,6 +3025,12 @@
       "why": "tests/shared-futex-verify/qemu_net_init.c is owned by ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/shared-futex-verify/qemu_pipe_init.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false)",
+      "why": "tests/shared-futex-verify/qemu_pipe_init.c is owned by ci/test_harness.sh via tests/e2e/manifests/shared-futex-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/shell/date.sh",
       "runner": "hermit-cli shell integration targets",

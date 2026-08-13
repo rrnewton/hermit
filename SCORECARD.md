@@ -8,12 +8,12 @@ These are the current pre-basic-sanity contracts. In particular, bare `--verify`
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 149 | 188 | 337 |
+| `ptrace` | 149 | 189 | 338 |
 | `dbt` | 9 | 53 | 62 |
 | `kvm` | 0 | 23 | 23 |
 | `sabre` | 9 | 132 | 141 |
 | `liteinst` | 3 | 28 | 31 |
 | `native` | 0 | 33 | 33 |
-| **Total** | **170** | **457** | **627** |
+| **Total** | **170** | **458** | **628** |
 
 Ordinary full validation executes 172 selected regression cells: the 170 green compatibility cells above plus 2 chaos-mode race-exposure checks. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
