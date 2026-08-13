@@ -32,7 +32,7 @@ target_platform_detector_spec = target:root//...->prelude//platforms:default tar
 
 [oss]
 internal_cell = fbcode
-project_dirs = hermetic_infra/hermit
+stripped_root_dirs = hermetic_infra/hermit
 
 [rust]
 default_edition = 2021
