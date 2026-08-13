@@ -507,11 +507,12 @@ CARGO_SHIM
         '| select(.cmd | contains("cargo "))'
     )
     local actual_cargo_lines expected_cargo_listing planted_cargo_lines
-    # Treat shell separators, redirections, grouping, double quotes, and path
-    # separators as command-token boundaries. Hyphens are deliberately not a
-    # boundary: names such as `fake-cargo` and recorded `*-cargo-build-jobs`
-    # values are not Cargo commands.
-    local cargo_token_pattern='(^|[[:space:]();|&<>"/])cargo([[:space:]<>|;&()"/]|$)'
+    # Every character except a letter, digit, underscore, or hyphen is a shell
+    # command-token boundary here. Keeping underscore and hyphen out excludes
+    # names such as `cargo_build`, `fake-cargo`, and recorded
+    # `*-cargo-build-jobs` values while recognizing quoting, escaping,
+    # substitutions, separators, redirections, grouping, and paths.
+    local cargo_token_pattern='(^|[^[:alnum:]_-])cargo([^[:alnum:]_-]|$)'
     function extract_cargo_lines {
         awk -v pattern="$cargo_token_pattern" '
             $0 !~ /^[[:space:]]*#/ && $0 ~ pattern {
@@ -522,17 +523,31 @@ CARGO_SHIM
             }
         '
     }
-    # PLANTED NEGATIVE: the former line-anchored matcher missed this exact
-    # command-substitution shape, allowing a metadata consumer to reacquire
-    # Cargo's build-directory lock without changing the pinned count. Put a
-    # redirection immediately after the command name so this also proves the
-    # token boundary is shell syntax, not merely whitespace.
+    # PLANTED NEGATIVES: the former line-anchored matcher missed command
+    # substitutions, and the first boundary fix still missed single quotes,
+    # backslash escaping, and backticks. Each executable line must be found;
+    # each identical full-line comment must remain excluded.
     planted_cargo_lines=$(printf '%s\n' \
         '# hidden=$(cargo</dev/null metadata --no-deps)' \
-        'hidden=$(cargo</dev/null metadata --no-deps)' |
+        'hidden=$(cargo</dev/null metadata --no-deps)' \
+        "# 'cargo' metadata --no-deps" \
+        "'cargo' metadata --no-deps" \
+        '# \cargo metadata --no-deps' \
+        '\cargo metadata --no-deps' \
+        '# hidden=`cargo metadata --no-deps`' \
+        'hidden=`cargo metadata --no-deps`' |
         extract_cargo_lines)
-    [[ $planted_cargo_lines == 'hidden=$(cargo</dev/null metadata --no-deps)' ]] ||
-        die "the Cargo-line check does not distinguish an executable command substitution from a comment: $planted_cargo_lines"
+    local expected_planted_cargo_lines
+    expected_planted_cargo_lines=$(printf '%s\n' \
+        'hidden=$(cargo</dev/null metadata --no-deps)' \
+        "'cargo' metadata --no-deps" \
+        '\cargo metadata --no-deps' \
+        'hidden=`cargo metadata --no-deps`')
+    [[ $planted_cargo_lines == "$expected_planted_cargo_lines" ]] ||
+        die "the Cargo-line check does not distinguish executable quoting/substitution forms from comments. Expected:
+$expected_planted_cargo_lines
+Found:
+$planted_cargo_lines"
     actual_cargo_lines=$(extract_cargo_lines <<<"$body" | LC_ALL=C sort)
     expected_cargo_listing=$(printf '%s\n' "${expected_cargo_lines[@]}" | LC_ALL=C sort)
     [[ $actual_cargo_lines == "$expected_cargo_listing" ]] ||
