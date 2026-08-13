@@ -354,14 +354,18 @@ Typical flow for a change:
 - Push the branch and open a pull request against fork `main`. Keep fork `main`
   green; repair a regression before landing more work.
 - The PR author owns the branch through landing: resolve review findings,
-  rebase when needed, rerun validation at the new exact head, and verify the
-  landed commit on freshly fetched `main`.
+  rebase when needed, establish the resulting head's landability under the
+  applicable validation policy, and verify the landed commit on freshly
+  fetched `main`.
 
 When this repository is coordinated through the `dev-hermit` parent, landing
-authorization is the parent's exact-head local receipt queried through
-`ci-hub validate-status`. A label or copied status is only a cache, and delayed
-GitHub workflows are useful supplemental evidence rather than the admission
-gate. Never reuse a receipt from an earlier SHA.
+validation evidence establishes validation landability; it does not authorize
+a merge. Review, task authorization, conflict-resolution judgment,
+one-at-a-time publication through the repository's landing tool, and proof that
+the landed commit reached `main` remain separate decisions. Follow the parent's
+canonical `hermit-validation-authority` skill as the sole source for evidence
+qualification, hard- and soft-green rebase inheritance, and local-versus-GitHub
+selection. A label or copied status is only a cache.
 
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
@@ -431,10 +435,12 @@ are mandatory for every implementation and review agent.
    name alone is not evidence.
 3. **Adversarial review confirms the work exists in the PR.** Before a task's
    `implemented` tag is trusted, a reviewer independently verifies that the claimed
-   change is actually present in the pull request diff, that the cited tests
-   exist and were run at the PR head SHA, and that the reported assurance level
-   (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check must lose the `implemented` tag.
+   change is actually present in the pull request diff, that the cited
+   validation evidence truthfully names the SHA that was tested and any
+   recorded rebase through which the current head inherits landability under
+   the canonical `hermit-validation-authority` skill, and that the reported
+   assurance level (L0–L4), backend, and relaxations match reality. A claim that
+   does not survive this check must lose the `implemented` tag.
 4. **The task stays `in_progress` + `implemented` until the PR lands on
    `main`.** Open, in-review, validation-red, awaiting-merge, and
    blocked-on-a-dependency PRs are never `closed`. If the published artifact
@@ -461,9 +467,11 @@ the lower status and say why in a task note.
 
 **`in_progress` + `implemented` (agent's terminal state — do NOT close):**
 
-- Branch pushed, PR open, exact-head validation green, awaiting merge.
-- PR open but validation red, or an exact-head receipt missing/stale — still
-  `in_progress` + `implemented`; report the exact failure, do not close.
+- Branch pushed, PR open, and the current head is landable under the canonical
+  `hermit-validation-authority` skill, awaiting merge.
+- PR open but the current head is not landable under the canonical
+  `hermit-validation-authority` skill — still `in_progress` + `implemented`;
+  report the exact failure, do not close.
 - Work committed and pushed but blocked on another PR or a reverie pin bump —
   `in_progress` + `implemented` with the blocker and dependency SHAs named.
 
