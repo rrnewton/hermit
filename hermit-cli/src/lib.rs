@@ -100,6 +100,26 @@ pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
 
+fn read_iovecs<M: reverie::syscalls::MemoryAccess>(
+    memory: &M,
+    message: &libc::msghdr,
+) -> Result<Vec<libc::iovec>, reverie::Errno> {
+    if message.msg_iovlen == 0 {
+        return Ok(Vec::new());
+    }
+    let address = reverie::syscalls::Addr::from_raw(message.msg_iov as usize)
+        .ok_or(reverie::Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        message.msg_iovlen
+    ];
+    memory.read_values(address, &mut iovecs)?;
+    Ok(iovecs)
+}
+
 enum KvmStdinReservation {
     Open(fs::File),
     Closed,
