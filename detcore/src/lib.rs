@@ -123,6 +123,7 @@ use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
 use tool_global::report_unsupported_syscall;
+use tool_global::robust_list_wakes_after_exit;
 
 fn select_thread_exit_detpid(
     thread_detpid: Option<DetPid>,
@@ -1274,6 +1275,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Permission::RW,
             );
             resource_request(guest, request).await;
+            // A delivered signal may be caught, ignored, or terminate the
+            // thread group. Reading the lists is harmless; the collected
+            // wakes remain inert unless the ptrace exit callback later reports
+            // that this exact signal caused physical exit.
+            self.stage_thread_group_robust_list_wakes(
+                guest,
+                tool_local::RobustListExit::Signal(signal as i32),
+            )
+            .await;
             info!(
                 "[dtid {}] finish delivering signal (#{}) {}",
                 dettid, mycount, signal
@@ -1429,6 +1439,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // new task, thread or process alike. The child re-registers
                     // its own head before it can own a robust futex.
                     robust_list_head: None,
+                    robust_list_process: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.robust_list_process)
+                    } else {
+                        Arc::new(Mutex::new(tool_local::RobustListProcessState::default()))
+                    },
                 }
             }
         }
@@ -2526,6 +2541,32 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
         }
         let mm_id = thread_state.mm_id;
+        if let Some(pending) = thread_state.take_robust_list_wakes() {
+            let should_wake = match (pending.reason, &exit_status) {
+                (tool_local::RobustListExit::ExitGroup, _) => true,
+                (tool_local::RobustListExit::Signal(expected), ExitStatus::Signaled(actual, _)) => {
+                    expected == *actual as i32
+                }
+                (tool_local::RobustListExit::Signal(_), ExitStatus::Exited(_)) => false,
+            };
+            if should_wake {
+                let futexes: Vec<_> = pending.wakes.iter().map(|wake| wake.futex).collect();
+                let counts = robust_list_wakes_after_exit(
+                    thread_state.thread_logical_time.clone(),
+                    global_state,
+                    mm_id,
+                    dettid,
+                    pending.wakes,
+                )
+                .await;
+                for (futex, count) in futexes.into_iter().zip(counts) {
+                    info!(
+                        "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",
+                        dettid, count, futex,
+                    );
+                }
+            }
+        }
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
         deregister_thread(
             thread_state.thread_logical_time.clone(),
