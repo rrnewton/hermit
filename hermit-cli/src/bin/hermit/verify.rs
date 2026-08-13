@@ -494,11 +494,13 @@ impl VerificationOutcome {
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => Err(Error::msg("Mismatch between run 1 and run 2 outputs.")),
-            // Unreachable in practice: `compare_two_runs` only ever yields
-            // Matched/Diverged, and the no-result state is published directly to
-            // the JSON artifact rather than carried in an outcome. Fail closed
-            // rather than mapping "no verdict" onto a guest exit status.
+            Verdict::Diverged => Err(Error::msg(
+                "Mismatch between run 1 and run 2 outputs (logs retained).",
+            )),
+            // Reached when the comparator refused (a truncated log) and nothing
+            // else was observed to differ. Still an error, so the historical
+            // nonzero process exit is unchanged -- but it must not be reported
+            // as a mismatch, because no comparison established one.
             Verdict::NoResult => Err(Error::msg(
                 "Verification did not reach a verdict (no comparison was performed).",
             )),
@@ -817,6 +819,12 @@ fn compare_two_runs_with_unsupported_scan(
         log: log2,
     } = second;
     let mut failed = false;
+    // A difference that was actually OBSERVED, as opposed to a comparison that
+    // was refused. Only an observed difference can justify a `Diverged`
+    // verdict; see the verdict selection at the end of this function.
+    let mut observed_divergence = false;
+    // The log comparator declined to produce a verdict (a truncated input).
+    let mut comparison_refused = false;
     // None until the log comparison actually runs; stays None on the
     // output-only (KVM concurrent) fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
@@ -839,6 +847,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stdout != out2.stdout {
         failed = true;
+        observed_divergence = true;
         eprintln!("Mismatch in stdout between run 1 and run 2:");
         let str1 = String::from_utf8_lossy(&out1.stdout);
         let str2 = String::from_utf8_lossy(&out2.stdout);
@@ -851,6 +860,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stderr != out2.stderr {
         failed = true;
+        observed_divergence = true;
         eprintln!("Mismatch in stderr between run 1 and run 2:");
         let str1 = String::from_utf8_lossy(&out1.stderr);
         let str2 = String::from_utf8_lossy(&out2.stderr);
@@ -908,6 +918,11 @@ fn compare_two_runs_with_unsupported_scan(
             });
             if summary.diff_found {
                 failed = true;
+                if summary.refused {
+                    comparison_refused = true;
+                } else {
+                    observed_divergence = true;
+                }
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
                 // Set inside this `diff_found` arm, matching its two siblings
@@ -928,7 +943,9 @@ fn compare_two_runs_with_unsupported_scan(
                 // on a match.
                 first_divergent_record = summary.first_divergent_record;
                 first_divergent_syscall = summary.first_divergent_syscall;
-                eprintln!(":: {}", "Log differences found between runs.".red().bold());
+                if !summary.refused {
+                    eprintln!(":: {}", "Log differences found between runs.".red().bold());
+                }
             }
         } else {
             eprintln!(
@@ -938,6 +955,7 @@ fn compare_two_runs_with_unsupported_scan(
 
         if out1.status != out2.status {
             failed = true;
+            observed_divergence = true;
             eprintln!(
                 "Mismatch in exit status between run 1 and run 2: {}",
                 Comparison::new(&out1.status, &out2.status)
@@ -969,12 +987,29 @@ fn compare_two_runs_with_unsupported_scan(
     }
 
     if failed {
+        // A refused comparison is a NO-RESULT, not a divergence. A real
+        // stdout/stderr/exit-status mismatch still outranks the refusal.
+        let verdict = if comparison_refused && !observed_divergence {
+            Verdict::NoResult
+        } else {
+            Verdict::Diverged
+        };
+        if verdict == Verdict::NoResult {
+            eprintln!(
+                ":: {}",
+                "No result: the comparison was refused, so this is neither a match nor a difference."
+                    .red()
+                    .bold()
+            );
+        } else {
+            eprintln!(":: {}", options.failure_message.red().bold());
+        }
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
         // `VerificationOutcome::into_exit_status`.
         Ok(VerificationOutcome {
-            verdict: Verdict::Diverged,
+            verdict,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1227,6 +1262,97 @@ mod tests {
             unsupported_syscalls_from_log(file.path()).unwrap(),
             BTreeSet::from(["getppid".to_owned(), "vmsplice".to_owned()])
         );
+    }
+
+    /// Two logs carrying identical comparable content that were both cut at the
+    /// bounded writer's size bound, i.e. each ends with the truncation marker
+    /// on a line of its own.
+    fn logs_truncated_at_the_bound() -> (TempPath, TempPath) {
+        let (left, right) = temp_log_files("verify_left", "verify_right").unwrap();
+        let left_path = left.into_temp_path();
+        let right_path = right.into_temp_path();
+        let body = format!(
+            "{}{}{}\n",
+            detlog_with_value(1),
+            detlog_with_value(2),
+            detcore::logdiff::TRUNCATION_MARKER
+        );
+        fs::write(&left_path, body.as_bytes()).unwrap();
+        fs::write(&right_path, body.as_bytes()).unwrap();
+        (left_path, right_path)
+    }
+
+    /// A refused comparison must publish `NoResult`, not `Diverged`.
+    ///
+    /// The banner already said "This is a NO-RESULT, not a difference and not a
+    /// match" while the typed field in the same invocation said `diverged`.
+    /// Those are contradictory claims about the same run, and the typed one is
+    /// what a machine reads. `Diverged` asserts the two executions were
+    /// observed to differ; nothing here observed anything.
+    #[test]
+    fn a_refused_comparison_is_a_no_result_not_a_divergence() {
+        let left = output(0, b"hello\n", b"");
+        let right = left.clone();
+        let (log1, log2) = logs_truncated_at_the_bound();
+
+        let outcome = compare(&left, log1, &right, log2).unwrap();
+        assert_eq!(
+            outcome.verdict,
+            Verdict::NoResult,
+            "a refused comparison must not be reported as a divergence"
+        );
+        assert!(!outcome.verified(), "a no-result is never verified");
+        // The failure direction is unchanged: still not a match, still nonzero
+        // compared counts of zero, still a nonzero process exit.
+        assert_eq!(
+            outcome.compared_log_messages,
+            Some(ComparedLogCounts { left: 0, right: 0 })
+        );
+        let report = VerificationReport::from(&outcome);
+        assert!(!report.verified);
+        assert!(!report.bitwise_parity);
+        assert!(
+            outcome.into_exit_status().is_err(),
+            "a no-result must still exit nonzero; it is not a pass"
+        );
+    }
+
+    /// The direction that matters most: truncation must never DOWNGRADE a real
+    /// divergence into "we didn't look".
+    ///
+    /// `NoResult` is a weaker claim than `Diverged`, so emitting it when the
+    /// runs actually differed would lose a finding. Each case below pairs the
+    /// same refused log comparison with a genuine observed difference, and each
+    /// must still report `Diverged`.
+    #[test]
+    fn an_observed_difference_outranks_a_refused_comparison() {
+        for (label, left, right) in [
+            (
+                "stdout",
+                output(0, b"hello\n", b""),
+                output(0, b"goodbye\n", b""),
+            ),
+            (
+                "stderr",
+                output(0, b"hello\n", b""),
+                output(0, b"hello\n", b"oops\n"),
+            ),
+            (
+                "exit status",
+                output(0, b"hello\n", b""),
+                output(3, b"hello\n", b""),
+            ),
+        ] {
+            let (log1, log2) = logs_truncated_at_the_bound();
+            let outcome = compare(&left, log1, &right, log2).unwrap();
+            assert_eq!(
+                outcome.verdict,
+                Verdict::Diverged,
+                "{label} differed, so the verdict must be Diverged even though the log \
+                 comparison was refused"
+            );
+            assert!(!outcome.verified());
+        }
     }
 
     #[test]

@@ -3573,7 +3573,8 @@ impl RunOpts {
         // was measured on exactly these `--verify` comparison logs would not
         // apply to the path that produces them: a livelocked run here could
         // still fill the disk.
-        let _guard = init_file_tracing(Some(level), BoundedWriter::new(log_file, log_max_bytes()));
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        let _guard = init_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
 
         let command = self.guest_command()?;
 

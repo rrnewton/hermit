@@ -123,7 +123,11 @@ impl GlobalOpts {
             // Bounded so a run that makes no progress cannot fill the disk: a
             // livelocked guest logged 928.8 GiB over 11.7 hours before this.
             // The bound is on the LOG only; the run is unaffected.
-            let file_writer = BoundedWriter::new(file_writer, log_max_bytes());
+            // A malformed bound is fatal rather than silently defaulted, so a
+            // typo in the value meant to DISABLE the bound cannot quietly
+            // re-enable it.
+            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let file_writer = BoundedWriter::new(file_writer, limit);
             Some(init_file_tracing(self.log, file_writer))
         } else {
             init_stderr_tracing(self.log);
