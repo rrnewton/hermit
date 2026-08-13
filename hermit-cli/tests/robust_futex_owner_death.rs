@@ -144,6 +144,25 @@ fn build_guest(build_root: &Path) -> PathBuf {
     guest
 }
 
+fn build_lifecycle_guest(build_root: &Path) -> PathBuf {
+    fs::create_dir_all(build_root).expect("failed to create lifecycle guest build directory");
+    let guest = build_root.join("robust_futex_owner_lifecycle");
+    let mut compile = Command::new("cc");
+    compile
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository().join("tests/c/robust_futex_owner_lifecycle.c"))
+        .args(["-pthread", "-o"])
+        .arg(&guest);
+    run_captured(
+        compile,
+        "robust-futex lifecycle guest compilation",
+        &build_root.join("compile-lifecycle.out"),
+        &build_root.join("compile-lifecycle.err"),
+        true,
+    );
+    guest
+}
+
 /// The native control must pass, otherwise the guest itself is broken and any
 /// Hermit result would be meaningless.
 #[test]
@@ -269,4 +288,81 @@ fn detcore_wakes_the_modeled_waiter_before_linux_finishes_exit() {
         !stderr.contains("robust-list owner death: futex word"),
         "ptrace performed the prohibited separate owner-word write\nstderr:\n{stderr}"
     );
+}
+
+#[test]
+fn linux_wakes_process_shared_waiters_for_all_three_owner_death_paths() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-native");
+    let guest = build_lifecycle_guest(&build_root);
+
+    for mode in ["signal", "exit-group", "de-thread"] {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            native,
+            &format!("native robust-futex {mode} control"),
+            &build_root.join(format!("native-{mode}.out")),
+            &build_root.join(format!("native-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "native {mode} control did not wake its process-shared waiter\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+    }
+}
+
+#[test]
+fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace");
+    let guest = build_lifecycle_guest(&build_root);
+
+    for mode in ["signal", "exit-group"] {
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "120s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=debug",
+                "run",
+                "--backend=ptrace",
+                "--strict",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            run,
+            &format!("ptrace robust-futex {mode} run"),
+            &build_root.join(format!("ptrace-{mode}.out")),
+            &build_root.join(format!("ptrace-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+        assert!(
+            captured
+                .stderr
+                .contains("staged robust-list owner-death wake until physical exit"),
+            "ptrace {mode} did not exercise the pre-exit collection path\nstderr:\n{}",
+            captured.stderr,
+        );
+        assert!(
+            captured.stderr.lines().any(|line| {
+                line.contains("robust-list owner death woke 1 waiter(s) on futex")
+                    && line.contains("after physical exit")
+            }),
+            "ptrace {mode} did not wake exactly one modeled waiter after physical cleanup\nstderr:\n{}",
+            captured.stderr,
+        );
+    }
 }
