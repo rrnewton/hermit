@@ -447,6 +447,29 @@ CARGO_SHIM
     [[ -z $missing_inputs ]] ||
         die "the producer reads file(s) the published content address does not hash, so a drift in them would be served as fresh:$missing_inputs"
 
+    local program missing_program_inputs=""
+    while IFS= read -r program; do
+        [[ -n $program ]] || continue
+        grep -qE "^[0-9a-f]{64}  ${program//./\\.}$" "$bundle/inputs.sha256" ||
+            missing_program_inputs+=" $program"
+    done < <(jq -r '.[] | .test[] | .program // empty' "$bundle/harness.json" | LC_ALL=C sort -u)
+    [[ -z $missing_program_inputs ]] ||
+        die "manifest-declared program input(s) are absent from the published content address:$missing_program_inputs"
+
+    # Hosted run-node drops dependencies outside --only. Both artifact-producing
+    # build jobs must therefore select the publisher explicitly and transport
+    # its pointer/bundle rather than relying on the DAG edge that run-node omits.
+    local portable_workflow="$ROOT_DIR/.github/workflows/ci-portable.yml"
+    grep -Fq '(["setup.manifest_plan"] + .build_dbt_nodes + .build_aux_nodes)|join(",")' \
+        "$portable_workflow" ||
+        die "the hosted release build does not explicitly select setup.manifest_plan"
+    (($(grep -Fc 'test -s target/ci/manifest-plan.path' "$portable_workflow") >= 2)) ||
+        die "both hosted artifact producers must verify the manifest-plan pointer before packing"
+    grep -Fq 'target/ci/manifest-plan \' "$portable_workflow" ||
+        die "the hosted debug artifact does not transport the manifest-plan bundle"
+    grep -Fq 'target/ci \' "$portable_workflow" ||
+        die "the hosted release artifact does not transport target/ci"
+
     # ---- the harness's WHOLE executable Cargo surface is pinned -------------
     # `validate` DOES invoke Cargo, and deliberately so: audit_test_footprints
     # runs a DIFFERENT binary (generate-test-footprints) to regenerate a
@@ -623,7 +646,45 @@ $actual_cargo_surface"
     [[ ! -e $marker ]] ||
         die "tampered document fell back to a rebuild instead of failing closed"
 
-    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (the harness's whole executable Cargo surface is pinned to ${#expected_cargo_surface[@]} named non-metadata site(s), so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant the producer declares; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0"
+    # ---- NEGATIVE (dynamic program inputs and symlink traversal) ------------
+    # Exercise the verifier in a copied minimal tree so the real checkout never
+    # becomes dirty. Removing one manifest-declared program must make input
+    # enumeration fail, and a symlink inside a hashed input directory must be
+    # refused rather than followed outside the checkout.
+    local input_fixture="$scratch/input-fixture" missing_program symlink_output
+    local -a program_inputs=()
+    mkdir -p "$input_fixture/ci" "$input_fixture/tests/e2e"
+    cp -a "$ROOT_DIR/ci/manifest-plan" "$input_fixture/ci/"
+    cp -a "$ROOT_DIR/tests/e2e/manifests" "$input_fixture/tests/e2e/"
+    cp -a "$ROOT_DIR/Cargo.lock" "$ROOT_DIR/rust-toolchain.toml" "$input_fixture/"
+    cp -a "$ROOT_DIR/ci/matrix-symmetry-baseline.json" "$input_fixture/ci/"
+    cp -a "$ROOT_DIR/ci/verify-manifest-plan.sh" "$input_fixture/ci/"
+    mapfile -t program_inputs < <(
+        jq -r '.[] | .test[] | .program // empty' "$bundle/harness.json" | LC_ALL=C sort -u
+    )
+    ((${#program_inputs[@]} > 0)) || die "published document declares no program inputs"
+    (
+        cd "$ROOT_DIR"
+        cp -P --parents "${program_inputs[@]}" "$input_fixture"
+    )
+    missing_program=${program_inputs[0]}
+    rm -f "$input_fixture/$missing_program"
+    set +e
+    output=$("$input_fixture/ci/verify-manifest-plan.sh" --emit-input-manifest 2>&1)
+    status=$?
+    set -e
+    ((status == 2)) && [[ $output == *"input is missing or is not a file/symlink: $missing_program"* ]] ||
+        die "a missing manifest-declared program was not refused precisely (rc=$status): $output"
+    cp -P "$ROOT_DIR/$missing_program" "$input_fixture/$missing_program"
+    ln -s /etc/passwd "$input_fixture/tests/e2e/manifests/planted-escape"
+    set +e
+    symlink_output=$("$input_fixture/ci/verify-manifest-plan.sh" --emit-input-manifest 2>&1)
+    status=$?
+    set -e
+    ((status == 2)) && [[ $symlink_output == *"input directory contains a symlink"* ]] ||
+        die "an escaping symlink in the hashed manifest tree was not refused (rc=$status): $symlink_output"
+
+    echo "manifest-plan lock independence: the METADATA LOAD is Cargo-free for every subcommand (the harness's whole executable Cargo surface is pinned to ${#expected_cargo_surface[@]} named non-metadata site(s), so \`validate\` invoking Cargo for other reasons is bounded, not hidden); $dag_consumers DAG + $workflow_consumers workflow metadata consumer(s); shapes${covered} exercised at cargo_invocations=0 against a published document; every DAG consumer transitively depends on the publishing setup.manifest_plan; both hosted artifact producers explicitly select/transport publication; one resolver call site reached unconditionally pre-dispatch; published document byte-identical to the Cargo producer over $(wc -l <"$bundle/inputs.sha256") hashed inputs covering every path constant and manifest-declared program input the producer reads; absent document rebuilds (cargo_invocations=1, shim live) and does NOT refuse a real consumer; drifted inputs rebuild rather than serve; tampered document fails closed rc=2 with cargo_invocations=0; missing program and input-tree symlink refused rc=2"
     rm -rf "$scratch"
 }
 
