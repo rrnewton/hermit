@@ -31,6 +31,7 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::Shebang;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
@@ -1466,6 +1467,14 @@ fn image_script_validation_resolves_interpreter_inside_rootfs() {
     std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     validate_executable(&script, Path::new("/bin/image-script"), Some(rootfs)).unwrap();
+
+    std::fs::write(&script, b"#!/missing-image-interpreter\nexit 0\n").unwrap();
+    let error = validate_executable(&script, Path::new("/bin/image-script"), Some(rootfs))
+        .expect_err("a missing guest interpreter must be rejected");
+    assert!(
+        error.to_string().contains("/missing-image-interpreter"),
+        "unexpected error: {error:#}"
+    );
 }
 
 #[test]
@@ -1548,20 +1557,7 @@ fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     let mut file = File::open(path).ok()?;
     let mut bytes = [0_u8; 256];
     let count = file.read(&mut bytes).ok()?;
-    let bytes = &bytes[..count];
-    if !bytes.starts_with(b"#!") {
-        return None;
-    }
-
-    let start = bytes[2..]
-        .iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t'))?
-        + 2;
-    let end = bytes[start..]
-        .iter()
-        .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-        .map_or(bytes.len(), |offset| start + offset);
-    Some(PathBuf::from(OsStr::from_bytes(&bytes[start..end])))
+    Shebang::interpreter_from_buf(&bytes[..count])
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
