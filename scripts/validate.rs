@@ -3502,7 +3502,13 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
     if let Some(second) = plan.second.as_mut() {
         apply(second)?;
     }
-    for node in &withheld {
+    plan.host_inapplicable = withheld;
+    // A node can also lose its whole reason to exist WITHOUT declaring anything,
+    // when every manifest cell it would run is withheld. That case is computed
+    // from the live cell population, never declared; see
+    // [`withhold_vacuous_manifest_nodes`].
+    withhold_vacuous_manifest_nodes(root, plan, &absent)?;
+    for node in &plan.host_inapplicable {
         println!(
             "HOST-INAPPLICABLE: {} will NOT RUN — this machine lacks {} ({}). This is NOT a pass \
              and carries NO coverage for what that node verifies; it is recorded in the ledger as \
@@ -3513,8 +3519,368 @@ fn withhold_host_inapplicable(root: &Path, plan: &mut Plan) -> Result<(), String
             validate_plan::HOST_INAPPLICABLE_REASON
         );
     }
-    plan.host_inapplicable = withheld;
     Ok(())
+}
+
+// ------------------------------------------- a node whose whole bucket is gone
+//
+// hermit#2212 withholds a node that DECLARES a capability this machine lacks.
+// hermit#2214 withholds a manifest CELL whose own `requires` declaration names
+// one. Between them sits the case neither covers: a DAG node that declares
+// nothing itself, but whose entire cell population is withheld at cell level, so
+// it would spawn and have nothing at all to run. `ci/test_harness.sh` refuses
+// that with its vacuity guard — correctly, because `0/0` is not a passing
+// population — which leaves the run incomplete rather than recorded.
+//
+// This is the third case, and it is deliberately the NARROWEST of the three.
+//
+// WHY IT CANNOT GENERALIZE INTO "SKIP ANYTHING INCONVENIENT":
+//
+//  1. It is COMPUTED, NEVER DECLARED. There is no list of withholdable nodes
+//     anywhere; a node is withheld only when the live cell population it would
+//     run is non-empty and every one of those cells is withheld. Adding ONE
+//     runnable cell to the bucket un-withholds the node on the next run with no
+//     code change, which is exactly the silent-swallow failure a hard-coded node
+//     list would rot into.
+//  2. IT ADDS NO NEW REASON TO WITHHOLD ANYTHING. Every input is already
+//     established: the cell-level withholding of hermit#2214 (closed `requires`
+//     vocabulary, one probeable token) and the probe of hermit#2212 (two
+//     corroborating sources, absence only). This layer computes a conjunction
+//     over decisions already made; it cannot withhold a cell that would
+//     otherwise have run, so it cannot enlarge what is omitted by even one cell.
+//  3. IT STILL NEVER READS THE NODE. Its inputs are the node's own command line,
+//     the manifests, and that probe. No exit code, stderr, timeout or panic can
+//     reach it, and the decision is taken before anything spawns.
+//  4. AN EMPTY BUCKET IS NOT THIS CASE. `selected == 0` is the pre-existing
+//     `empty-manifest-bucket` condition and is explicitly excluded, so this
+//     mechanism can never absorb a bucket that simply has no cells.
+//  5. IT FAILS CLOSED TOWARD RUNNING at every step. A command it cannot fully
+//     model, a bucket it cannot find, an accounting query that fails or times
+//     out, or a capability the two probes disagree about all leave the node
+//     RUNNING — where the harness's own vacuity guard still refuses a vacuous
+//     pass.
+//  6. THE DENOMINATOR STILL GOES UP. A node withheld here goes into
+//     `plan.host_inapplicable` exactly like a declared one: added back into
+//     `gates_expected`, named in the plan header, the cost table, the verdict
+//     detail and the ledger row, and never written into `gates[]`.
+
+/// One manifest bucket's cell accounting, exactly as `ci/test_harness.sh`
+/// counts it for the run that bucket's node would perform.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BucketCells {
+    lane: String,
+    category: String,
+    /// Cells the bucket's node would select: one per (test, mode, backend).
+    selected: usize,
+    /// How many of those the harness would withhold as host-inapplicable.
+    withheld: usize,
+    /// Which capabilities did the withholding, sorted and deduplicated.
+    capabilities: Vec<String>,
+}
+
+/// Would this bucket's node have NOTHING to run?
+///
+/// PURE, and the whole decision. `selected > 0` is load-bearing twice over: a
+/// bucket with no cells at all is the pre-existing `empty-manifest-bucket`
+/// condition and must not be absorbed here, and `0 == 0` would otherwise make
+/// every empty bucket read as host-inapplicable — the exact vacuous accounting
+/// this line of work exists to refuse.
+///
+/// `withheld == selected` rather than `withheld > 0`: one withheld cell in a
+/// bucket that still has runnable cells leaves the node running, with the
+/// withheld cell recorded by the harness. That is what makes adding a runnable
+/// cell back un-withhold the node automatically.
+fn bucket_runs_nothing(bucket: &BucketCells) -> bool {
+    bucket.selected > 0 && bucket.withheld == bucket.selected
+}
+
+/// The `(lane, category)` a manifest bucket node runs, read off the node's OWN
+/// command — the thing that actually selects the cells.
+///
+/// `None` when the command is not a manifest bucket run, or when it carries any
+/// token this function does not model. THE WHITELIST IS THE POINT: an unmodelled
+/// `--mode`, `--backend`, `--test`, `--include-occasional`, `--results` or
+/// anything else means the cell set cannot be proven equal to the bucket
+/// accounting, so the node is not a candidate and simply runs.
+///
+/// `--ci-only` is REQUIRED because the accounting is queried with `--ci-only`;
+/// a node selecting a wider population must not be matched against a narrower
+/// count.
+fn manifest_bucket_of(cmd: &str) -> Option<(String, String)> {
+    let tail = cmd.split_once("./ci/test_harness.sh run ")?.1;
+    let tokens: Vec<&str> = tail.split_whitespace().collect();
+    let mut lane: Option<String> = None;
+    let mut category: Option<String> = None;
+    let mut ci_only = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--lane" => {
+                if lane.is_some() {
+                    return None;
+                }
+                lane = Some((*tokens.get(i + 1)?).to_string());
+                i += 2;
+            }
+            "--category" => {
+                if category.is_some() {
+                    return None;
+                }
+                category = Some((*tokens.get(i + 1)?).to_string());
+                i += 2;
+            }
+            "--ci-only" => {
+                ci_only = true;
+                i += 1;
+            }
+            // Tokens that change nothing about WHICH cells are selected.
+            "--allow-empty" | "--prebuilt" => i += 1,
+            // Anything else: unmodelled, so unproven, so not a candidate.
+            _ => return None,
+        }
+    }
+    if !ci_only {
+        return None;
+    }
+    Some((lane?, category?))
+}
+
+/// Parse `ci/test_harness.sh host-inapplicable-buckets` output.
+///
+/// Strict: a malformed line is an error rather than a silently dropped bucket,
+/// and the caller turns any error into "withhold nothing".
+fn parse_bucket_cells(text: &str) -> Result<Vec<BucketCells>, String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 5 {
+            return Err(format!("expected 5 tab-separated fields, got {line:?}"));
+        }
+        let selected: usize = fields[2]
+            .parse()
+            .map_err(|_| format!("unparseable selected count in {line:?}"))?;
+        let withheld: usize = fields[3]
+            .parse()
+            .map_err(|_| format!("unparseable withheld count in {line:?}"))?;
+        if withheld > selected {
+            return Err(format!("withheld exceeds selected in {line:?}"));
+        }
+        let capabilities: Vec<String> = if fields[4] == "-" {
+            Vec::new()
+        } else {
+            fields[4].split(',').map(str::to_string).collect()
+        };
+        out.push(BucketCells {
+            lane: fields[0].to_string(),
+            category: fields[1].to_string(),
+            selected,
+            withheld,
+            capabilities,
+        });
+    }
+    Ok(out)
+}
+
+/// Ask the harness for the per-bucket cell accounting, bounded in time.
+///
+/// The harness is the ONLY source used, because it is the same code that will
+/// select and withhold the cells when the bucket's node runs. Re-deriving the
+/// selection here would create a second implementation that could drift from
+/// the one that actually runs.
+fn read_bucket_cells(root: &Path) -> Result<Vec<BucketCells>, String> {
+    let mut c = Command::new("timeout");
+    c.arg("600")
+        .arg(root.join("ci").join("test_harness.sh"))
+        .arg("host-inapplicable-buckets")
+        .arg("--ci-only")
+        .current_dir(root);
+    let out = c
+        .output()
+        .map_err(|e| format!("could not run ci/test_harness.sh host-inapplicable-buckets: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ci/test_harness.sh host-inapplicable-buckets exited {}: {}",
+            out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default()
+        ));
+    }
+    parse_bucket_cells(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Withhold every planned manifest bucket node whose entire cell population is
+/// withheld, and say so.
+///
+/// See the section comment above for why this cannot generalize. Called only
+/// when at least one capability is ABSENT, so a machine that has everything
+/// pays nothing and emits byte-identical output.
+fn withhold_vacuous_manifest_nodes(
+    root: &Path,
+    plan: &mut Plan,
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+) -> Result<(), String> {
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    for cfg in std::iter::once(&plan.cfg).chain(plan.second.iter()) {
+        for step in &cfg.steps {
+            if let Some((lane, category)) = manifest_bucket_of(&step.cmd) {
+                candidates.push((step.tag(), lane, category));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let buckets = match read_bucket_cells(root) {
+        Ok(buckets) => buckets,
+        Err(why) => {
+            // FAIL CLOSED TOWARD RUNNING. Without the accounting there is no
+            // proof that a bucket is empty of runnable cells, and an unproven
+            // omission is worse than a node that runs and refuses itself.
+            println!(
+                "Host-inapplicable bucket accounting UNAVAILABLE ({why}); NO node was withheld \
+                 and every planned manifest bucket node will run."
+            );
+            return Ok(());
+        }
+    };
+    let by_bucket: BTreeMap<(&str, &str), &BucketCells> = buckets
+        .iter()
+        .map(|b| ((b.lane.as_str(), b.category.as_str()), b))
+        .collect();
+
+    let mut withheld: Vec<validate_plan::HostInapplicableNode> = Vec::new();
+    for (tag, lane, category) in &candidates {
+        // A bucket with no row selected NO cells at all. That is
+        // `empty-manifest-bucket`, not host-inapplicable, and is left alone.
+        let Some(bucket) = by_bucket.get(&(lane.as_str(), category.as_str())) else {
+            continue;
+        };
+        if !bucket_runs_nothing(bucket) {
+            continue;
+        }
+        // One typed record needs one capability. More than one means a second
+        // probeable token was added without extending this record, so REFUSE
+        // rather than pick: refusing is never the bar-lowering direction, and
+        // this is unreachable while exactly one token has an absence proof.
+        if bucket.capabilities.len() != 1 {
+            return Err(format!(
+                "manifest bucket {lane}/{category} has every cell withheld by {} capabilities \
+                 ({}), and one host-inapplicable record names exactly one; extend the record \
+                 before adding a second probeable `requires` token",
+                bucket.capabilities.len(),
+                bucket.capabilities.join(", ")
+            ));
+        }
+        let name = &bucket.capabilities[0];
+        let Some(capability) = validate_plan::HostCapability::from_value(name) else {
+            return Err(format!(
+                "manifest bucket {lane}/{category} was withheld by capability '{name}', which \
+                 the driver's closed vocabulary does not know; the two vocabularies disagree"
+            ));
+        };
+        // The driver probed this capability itself. If ITS probe said PRESENT
+        // while the harness's said ABSENT, the sources disagree, and
+        // disagreement runs the work.
+        let Some(evidence) = absent.get(&capability) else {
+            println!(
+                "Host capability {name}: the driver's probe says PRESENT while \
+                 ci/test_harness.sh withheld cells for it; the sources disagree, so \
+                 {tag} RUNS."
+            );
+            continue;
+        };
+        withheld.push(validate_plan::HostInapplicableNode {
+            tag: tag.clone(),
+            capability,
+            evidence: format!(
+                "all {} selected cell(s) of manifest bucket {lane}/{category} are \
+                 host-inapplicable: {evidence}",
+                bucket.selected
+            ),
+        });
+    }
+    if withheld.is_empty() {
+        return Ok(());
+    }
+    let gone: BTreeSet<String> = withheld.iter().map(|n| n.tag.clone()).collect();
+    let retained: Vec<(String, String, Vec<String>)> = std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter(|s| !gone.contains(&s.tag()))
+        .map(|s| (s.tag(), s.cmd.clone(), s.deps.clone()))
+        .collect();
+    let (droppable, refusals) = classify_withheld_dependents(&retained, &gone);
+    if !refusals.is_empty() {
+        return Err(format!(
+            "refusing to withhold a manifest bucket node that a NON-RESULT-CONSUMING node \
+             depends on: {}; a machine incapability must not silently cascade into unrun work",
+            refusals.join(", ")
+        ));
+    }
+    let drop_edge: BTreeSet<(String, String)> = droppable.iter().cloned().collect();
+    let mut apply = |cfg: &mut DagConfig| {
+        cfg.steps.retain(|s| !gone.contains(&s.tag()));
+        for step in cfg.steps.iter_mut() {
+            let tag = step.tag();
+            step.deps
+                .retain(|d| !drop_edge.contains(&(tag.clone(), d.clone())));
+        }
+    };
+    apply(&mut plan.cfg);
+    if let Some(second) = plan.second.as_mut() {
+        apply(second);
+    }
+    for (tag, dep) in &droppable {
+        println!(
+            "HOST-INAPPLICABLE: dropped result-consumer dependency edge {tag} -> {dep} — the \
+             consumer still RUNS and judges the incomplete result set itself; it is not skipped."
+        );
+    }
+    plan.host_inapplicable.extend(withheld);
+    Ok(())
+}
+
+/// What to do about a RETAINED node that depends on a withheld manifest bucket
+/// node. PURE, so both directions are bracketed with planted nodes.
+///
+/// A withheld bucket node produces per-cell results and nothing else, so a
+/// dependent is a RESULT CONSUMER. Leaving the edge in place would strand that
+/// consumer unrun — the cascade hermit#2212 refuses — so the edge is dropped and
+/// the consumer RUNS and judges the incomplete result set for itself. That
+/// measures MORE, not less: if it genuinely needed those results it fails and
+/// the run is refused, which is the opposite of an excuse.
+///
+/// Only a result consumer qualifies. Any other dependent would be treating the
+/// withheld node as a prerequisite whose removal cannot be justified from here,
+/// so it is a REFUSAL, exactly like hermit#2212's declared-node case.
+///
+/// Returns the `(dependent, dependency)` edges that may be dropped, and the
+/// refusals that must abort the run.
+fn classify_withheld_dependents(
+    retained: &[(String, String, Vec<String>)],
+    gone: &BTreeSet<String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut droppable = Vec::new();
+    let mut refusals = Vec::new();
+    for (tag, cmd, deps) in retained {
+        // The withheld node's ONLY product is per-cell results under
+        // `$E2E_RESULT_ROOT`; naming that root is what makes a dependent a
+        // consumer of it rather than a consumer of some prerequisite effect.
+        let consumes_results = cmd.contains("$E2E_RESULT_ROOT");
+        for dep in deps {
+            if !gone.contains(dep) {
+                continue;
+            }
+            if consumes_results {
+                droppable.push((tag.clone(), dep.clone()));
+            } else {
+                refusals.push(format!("{tag} depends on {dep}"));
+            }
+        }
+    }
+    (droppable, refusals)
 }
 
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
@@ -5063,6 +5429,7 @@ fn verdict_refusals(
     out
 }
 
+<<<<<<< HEAD
 /// Execution completeness applies after profile-specific failure policy. A
 /// profile may allow a fully measured failing row, but no profile may turn a
 /// partial run into exit zero.
@@ -5087,6 +5454,220 @@ fn possible_missing_artifact_nodes<'a>(
         })
         .map(|outcome| outcome.tag.as_str())
         .collect()
+=======
+/// Two-sided bracket for withholding a manifest bucket NODE whose entire cell
+/// population is withheld.
+///
+/// Inert: planted counts and planted command strings; it reads no manifest,
+/// runs no probe, and does not depend on which machine runs it. The
+/// load-bearing case is UN-WITHHOLDING: give the same bucket one runnable cell
+/// back and the node must run again, with no code change anywhere. That is the
+/// difference between a computed decision and a hard-coded list of nodes that
+/// would silently swallow a cell added later.
+fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
+    let bucket = |selected: usize, withheld: usize| BucketCells {
+        lane: "privileged".into(),
+        category: "backend-parity-c".into(),
+        selected,
+        withheld,
+        capabilities: if withheld > 0 {
+            vec!["cpuid-faulting".into()]
+        } else {
+            Vec::new()
+        },
+    };
+
+    // POSITIVE — the bucket's only cell is withheld, so its node has nothing at
+    // all left to run.
+    if !bucket_runs_nothing(&bucket(1, 1)) {
+        return Err("node vacuity: a bucket whose every selected cell is withheld must \
+                    withhold its node"
+            .into());
+    }
+    // ...and the same at a larger size, so the rule is not "exactly one cell".
+    if !bucket_runs_nothing(&bucket(78, 78)) {
+        return Err("node vacuity: an all-withheld bucket of 78 cells must withhold its node".into());
+    }
+
+    // THE UN-WITHHOLDING PROOF. One runnable cell in the bucket and the node
+    // runs, however many of its siblings are withheld. Nothing is edited to make
+    // this happen: the same predicate over a changed cell population produces
+    // the opposite answer.
+    for (selected, withheld) in [(2usize, 1usize), (79, 78), (100, 99)] {
+        if bucket_runs_nothing(&bucket(selected, withheld)) {
+            return Err(format!(
+                "node vacuity: a bucket with {} runnable cell(s) left ({selected} selected, \
+                 {withheld} withheld) must still RUN its node; withholding it would silently \
+                 swallow the runnable cells",
+                selected - withheld
+            ));
+        }
+    }
+
+    // NEGATIVE — nothing withheld at all.
+    for selected in [1usize, 5, 78] {
+        if bucket_runs_nothing(&bucket(selected, 0)) {
+            return Err("node vacuity: a bucket with nothing withheld must run its node".into());
+        }
+    }
+
+    // NEGATIVE, AND SEPARATELY LOAD-BEARING — an EMPTY bucket is the
+    // pre-existing `empty-manifest-bucket` condition, not this one. Without the
+    // `selected > 0` guard, `0 == 0` would make every empty bucket read as
+    // host-inapplicable and quietly inflate the omission count.
+    if bucket_runs_nothing(&bucket(0, 0)) {
+        return Err("node vacuity: a bucket that selected NO cells is empty-manifest-bucket, \
+                    never host-inapplicable"
+            .into());
+    }
+
+    // THE NODE-TO-BUCKET BINDING, from the node's own command. A command with
+    // any selection token this function does not model must NOT be matched
+    // against the bucket accounting.
+    let shipped = "./ci/run-with-hermit-e2e-artifact.sh ./ci/test_harness.sh run \
+                   --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt";
+    if manifest_bucket_of(shipped)
+        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+    {
+        return Err(format!(
+            "node vacuity: the shipped bucket command must bind to its bucket; got {:?}",
+            manifest_bucket_of(shipped)
+        ));
+    }
+    let unmodelled = [
+        // A narrower selection than the accounting was taken with.
+        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --mode verify",
+        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --backend ptrace",
+        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --test backend-parity-c/cpuid-probe",
+        // A WIDER selection than the accounting was taken with.
+        "./ci/test_harness.sh run --lane privileged --category backend-parity-c --ci-only --include-occasional",
+        "./ci/test_harness.sh run --lane privileged --category backend-parity-c",
+        // Not a bucket run at all.
+        "./ci/test_harness.sh validate",
+        "./ci/test_harness.sh build --lane privileged --ci-only --allow-empty",
+        "cargo test -p hermit-detcore",
+    ];
+    for cmd in unmodelled {
+        if manifest_bucket_of(cmd).is_some() {
+            return Err(format!(
+                "node vacuity: {cmd:?} selects a cell population this function cannot prove \
+                 equal to the bucket accounting and must NOT be a withholding candidate"
+            ));
+        }
+    }
+
+    // THE ACCOUNTING PARSER — a malformed record must be an error, so the caller
+    // withholds nothing, rather than a silently dropped or mis-read bucket.
+    let good = "privileged\tbackend-parity-c\t1\t1\tcpuid-faulting\nportable\tapplications\t3\t0\t-\n";
+    let parsed = parse_bucket_cells(good)?;
+    if parsed.len() != 2 || !bucket_runs_nothing(&parsed[0]) || bucket_runs_nothing(&parsed[1]) {
+        return Err(format!("node vacuity: accounting parse is wrong: {parsed:?}"));
+    }
+    if parsed[0].capabilities != vec!["cpuid-faulting".to_string()]
+        || !parsed[1].capabilities.is_empty()
+    {
+        return Err("node vacuity: the accounting must carry which capability withheld".into());
+    }
+    for bad in [
+        "privileged\tbackend-parity-c\t1\t1\n",
+        "privileged\tbackend-parity-c\tmany\t1\tcpuid-faulting\n",
+        // withheld > selected cannot happen and must not be silently accepted.
+        "privileged\tbackend-parity-c\t1\t2\tcpuid-faulting\n",
+    ] {
+        if parse_bucket_cells(bad).is_ok() {
+            return Err(format!("node vacuity: malformed accounting {bad:?} must be refused"));
+        }
+    }
+
+    // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
+    // dropped; ANY other dependent refuses the whole run rather than having a
+    // prerequisite quietly removed from under it.
+    let gone: BTreeSet<String> = ["privileged-e2e.manifest_backend_parity_c".to_string()]
+        .into_iter()
+        .collect();
+    let consumer = (
+        "scorecard.compatibility".to_string(),
+        "./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" \
+         --lanes portable,privileged"
+            .to_string(),
+        vec![
+            "privileged-e2e.manifest_backend_parity_c".to_string(),
+            "e2e.manifest_util_c".to_string(),
+        ],
+    );
+    let prerequisite = (
+        "test.something".to_string(),
+        "cargo nextest run -p hermit-detcore".to_string(),
+        vec!["privileged-e2e.manifest_backend_parity_c".to_string()],
+    );
+    let unrelated = (
+        "lint.rustfmt".to_string(),
+        "cargo fmt --all -- --check".to_string(),
+        vec!["quick.build".to_string()],
+    );
+    let (droppable, refusals) =
+        classify_withheld_dependents(&[consumer.clone(), unrelated.clone()], &gone);
+    if droppable
+        != vec![(
+            "scorecard.compatibility".to_string(),
+            "privileged-e2e.manifest_backend_parity_c".to_string(),
+        )]
+        || !refusals.is_empty()
+    {
+        return Err(format!(
+            "node vacuity: exactly the result consumer's edge to the withheld node may be \
+             dropped; got droppable={droppable:?} refusals={refusals:?}"
+        ));
+    }
+    let (droppable, refusals) =
+        classify_withheld_dependents(&[prerequisite.clone(), unrelated.clone()], &gone);
+    if !droppable.is_empty() || refusals.len() != 1 {
+        return Err(format!(
+            "node vacuity: a NON-result-consuming dependent must REFUSE the run, never have its \
+             prerequisite silently removed; got droppable={droppable:?} refusals={refusals:?}"
+        ));
+    }
+    // Nothing withheld: no edge is touched and nothing refuses.
+    let (droppable, refusals) =
+        classify_withheld_dependents(&[consumer, prerequisite, unrelated], &BTreeSet::new());
+    if !droppable.is_empty() || !refusals.is_empty() {
+        return Err("node vacuity: with nothing withheld, no dependency edge may change".into());
+    }
+
+    // NON-VACUITY — the shipped privileged DAG really does contain a manifest
+    // bucket node this mechanism can bind, so the brackets above are about
+    // something that exists.
+    let path = root.join("ci").join("dag").join("privileged.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("node vacuity: cannot read {}: {e}", path.display()))?;
+    let raw: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("node vacuity: invalid DAG: {e}"))?;
+    let bound: Vec<String> = raw
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(|s| s.get("cmd").and_then(serde_json::Value::as_str))
+                .filter_map(manifest_bucket_of)
+                .map(|(lane, category)| format!("{lane}/{category}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !bound.contains(&"privileged/backend-parity-c".to_string()) {
+        return Err(format!(
+            "node vacuity: ci/dag/privileged.json must contain a bindable manifest bucket node \
+             for privileged/backend-parity-c; bound {bound:?}"
+        ));
+    }
+    println!(
+        "  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, \
+         1 empty-bucket), 1 command bound / 8 refused, accounting parser 1 good / 3 malformed, \
+         dependents 1 edge-dropped / 1 refusal / 1 inert, shipped DAG binds {}",
+        bound.join(", ")
+    );
+    Ok(())
+>>>>>>> 2d547bc5ec ([disclosure: automated agent commit; ./ci-hub/bin/who-am-i --tag --role impl REFUSED (owner unresolved: identity resolver returned UNRESOLVED; no DG_AGENT_NAME, no identity-bearing process ancestor, no active TaskGraph owner). Written by a Claude Code agent named claude-hostcap by its coordinator claude-coord-fable, working in registered slot claude-cellcap. Role: impl. DG_AGENT_NAME was deliberately NOT set by hand, because that is the one input the disclosure design keeps launch-injected.] Withhold a DAG node when every manifest cell it would run is withheld)
 }
 
 /// Two-sided bracket for the host-capability withholding decision.
@@ -5223,6 +5804,8 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
             ));
         }
     }
+
+    node_vacuity_bracket(root)?;
 
     // The one override can only force PRESENT; nothing forces ABSENT.
     let verdict = validate_plan::probe_host_capability(HostCapability::CpuidFaulting);
