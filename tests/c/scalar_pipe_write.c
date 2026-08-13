@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -99,24 +100,28 @@ static int wait_until_started(struct writer_args *args) {
   while (!atomic_load_explicit(&args->started, memory_order_acquire)) {
     sched_yield();
   }
-  for (int index = 0; index < 100; index++) {
-    sched_yield();
-  }
   return 0;
 }
 
-static int fill_pipe(int fd) {
-  static unsigned char fill[PIPE_CAPACITY];
-  memset(fill, 'F', sizeof(fill));
-  return write(fd, fill, sizeof(fill)) == (ssize_t)sizeof(fill) ? 0 : -1;
+static int wait_for_pipe_bytes(int fd, int expected) {
+  for (int attempt = 0; attempt < 10000; attempt++) {
+    int available = -1;
+    if (ioctl(fd, FIONREAD, &available) != 0) {
+      return -1;
+    }
+    if (available == expected) {
+      return 0;
+    }
+    sched_yield();
+  }
+  return -1;
 }
 
 static int check_close_reuse(const unsigned char *payload) {
   int original[2];
   int replacement[2];
   if (pipe(original) != 0 || pipe(replacement) != 0 ||
-      fcntl(original[1], F_SETPIPE_SZ, PIPE_CAPACITY) != PIPE_CAPACITY ||
-      fill_pipe(original[1]) != 0) {
+      fcntl(original[1], F_SETPIPE_SZ, PIPE_CAPACITY) != PIPE_CAPACITY) {
     return -1;
   }
 
@@ -133,14 +138,18 @@ static int check_close_reuse(const unsigned char *payload) {
     return -1;
   }
   wait_until_started(&args);
+  // Seeing one full page proves the writer completed its first positive-short
+  // attempt and is now in the retry path. A pre-call flag or fixed yield count
+  // cannot establish that boundary.
+  if (wait_for_pipe_bytes(original[0], PIPE_CAPACITY) != 0) {
+    return -1;
+  }
   if (dup2(replacement[1], original[1]) != original[1]) {
     return -1;
   }
 
-  unsigned char fill[PIPE_CAPACITY];
   unsigned char received[PAYLOAD_SIZE];
-  if (read_exact(original[0], fill, sizeof(fill)) != 0 ||
-      read_exact(original[0], received, sizeof(received)) != 0 ||
+  if (read_exact(original[0], received, sizeof(received)) != 0 ||
       pthread_join(writer, NULL) != 0 || args.result != PAYLOAD_SIZE ||
       memcmp(received, payload, sizeof(received)) != 0) {
     return -1;
@@ -158,8 +167,7 @@ static int check_close_reuse(const unsigned char *payload) {
 static int check_sigpipe(const unsigned char *payload) {
   int fds[2];
   if (pipe(fds) != 0 ||
-      fcntl(fds[1], F_SETPIPE_SZ, PIPE_CAPACITY) != PIPE_CAPACITY ||
-      fill_pipe(fds[1]) != 0) {
+      fcntl(fds[1], F_SETPIPE_SZ, PIPE_CAPACITY) != PIPE_CAPACITY) {
     return -1;
   }
   struct writer_args args = {
@@ -176,9 +184,14 @@ static int check_sigpipe(const unsigned char *payload) {
     return -1;
   }
   wait_until_started(&args);
+  if (wait_for_pipe_bytes(fds[0], PIPE_CAPACITY) != 0) {
+    return -1;
+  }
   close(fds[0]);
-  if (pthread_join(writer, NULL) != 0 || args.result != -1 ||
-      args.error != EPIPE || sigpipe_count != 1) {
+  // Linux returns progress already made by the logical write, while still
+  // delivering SIGPIPE when the reader disappears before its remainder.
+  if (pthread_join(writer, NULL) != 0 || args.result != PIPE_CAPACITY ||
+      sigpipe_count != 1) {
     return -1;
   }
   return 0;
