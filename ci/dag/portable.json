@@ -55,9 +55,18 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "test_availability_guards",
+      "desc": "Refuse a #[test] that silently returns early when a dependency is missing",
+      "description": "libtest scores an early return from a #[test] as `ok`, so a runtime guard of the form `if !Path::new(\"/dev/kvm\").exists() { return; }` announces a pass having executed nothing. Twenty-three tests under hermit-cli/tests/ did exactly that before this PR moved the decision to build time with #[cfg_attr(not(...), ignore = \"SKIPPED: ...\")]. Measured at deb32a48b: reverting one test to the early-return form left the suite green and dropped the ignored count 20 -> 19 with nothing failing, so the fix shipped with no committed guard. This is that guard. It brackets its own scanner on fixtures in both directions before scanning the tree, so it cannot silently become inert or over-broad.",
+      "cmd": "./ci/check-test-availability-guards.sh",
+      "timeout": 60,
+      "hint": {"est_duration_s": 2, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "setup", "job": "nextest",
       "desc": "cargo-nextest available",
-      "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy cargo install cargo-nextest --locked --version 0.9.100; else cargo install cargo-nextest --locked --version 0.9.100; fi",
+      "cmd": "cargo nextest show-config version >/dev/null 2>&1 || if command -v with-proxy >/dev/null 2>&1; then with-proxy ./ci/install-cargo-tool.sh cargo-nextest --locked --version 0.9.100; else ./ci/install-cargo-tool.sh cargo-nextest --locked --version 0.9.100; fi",
       "timeout": 600,
       "hint": {"est_duration_s": 30, "rss_baseline_bytes": 536870912,
                "hard_mem_max_bytes": 2147483648, "classification": "light"}

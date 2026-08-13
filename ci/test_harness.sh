@@ -324,6 +324,62 @@ function contains {
     return 1
 }
 
+function assert_cargo_tool_install_isolation {
+    local installer="$ROOT_DIR/ci/install-cargo-tool.sh"
+    [[ -x $installer ]] || die "Cargo tool installer must be executable"
+
+    # Plant every class of repository build override that can redirect or alter
+    # a source-built tool. A fake cargo observes the helper's actual child
+    # environment, while Cargo home/network inputs prove the scrub is narrow.
+    (
+        local scratch capture args name
+        scratch=$(mktemp -d)
+        capture="$scratch/env"
+        args="$scratch/args"
+        trap 'rm -rf -- "$scratch"' EXIT
+        cat >"$scratch/cargo" <<'FAKE_CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+env | LC_ALL=C sort >"$CAPTURE"
+printf '%s\n' "$@" >"$ARGS"
+FAKE_CARGO
+        chmod +x "$scratch/cargo"
+
+        PATH="$scratch:/usr/bin:/bin" CAPTURE="$capture" ARGS="$args" \
+            RUSTFLAGS='-C link-arg=-lhost-only' RUSTDOCFLAGS='-D warnings' \
+            CARGO_ENCODED_RUSTFLAGS='-Cunit-separatorlink-arg=-lhost-only' \
+            RUSTC_WRAPPER=/host/wrapper RUSTC_WORKSPACE_WRAPPER=/host/workspace-wrapper \
+            CARGO_BUILD_JOBS=99 CARGO_BUILD_TARGET=host-only \
+            CARGO_TARGET_DIR=/host/target \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/host/linker \
+            CARGO_PROFILE_RELEASE_LTO=true CC=/host/cc CFLAGS=-march=host \
+            LDFLAGS=-lhost-only CARGO_HOME=/preserved/cargo \
+            CARGO_HTTP_TIMEOUT=123 "$installer" fixture-tool --locked
+
+        for name in RUSTFLAGS RUSTDOCFLAGS CARGO_ENCODED_RUSTFLAGS \
+            RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_JOBS \
+            CARGO_BUILD_TARGET CARGO_TARGET_DIR \
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER \
+            CARGO_PROFILE_RELEASE_LTO CC CFLAGS LDFLAGS; do
+            ! grep -q "^${name}=" "$capture" ||
+                die "Cargo tool installer leaked project build variable $name"
+        done
+        grep -Fxq 'CARGO_HOME=/preserved/cargo' "$capture" ||
+            die "Cargo tool installer scrubbed CARGO_HOME"
+        grep -Fxq 'CARGO_HTTP_TIMEOUT=123' "$capture" ||
+            die "Cargo tool installer scrubbed Cargo network configuration"
+        [[ $(<"$args") == $'install\nfixture-tool\n--locked' ]] ||
+            die "Cargo tool installer changed cargo install arguments"
+    )
+
+    jq -e '
+        [.steps[] | select(.group == "setup" and .job == "nextest")][0].cmd as $cmd
+        | ($cmd | contains("./ci/install-cargo-tool.sh cargo-nextest"))
+          and ($cmd | contains("cargo install cargo-nextest") | not)
+    ' "$DAG_ROOT/portable.json" >/dev/null ||
+        die "portable cargo-nextest fallback must use the isolated Cargo tool installer"
+}
+
 function normalize_metadata {
     jq -c '
         . + {
@@ -1743,6 +1799,7 @@ EOF
     done
 
     assert_reverie_pin_enforcement
+    assert_cargo_tool_install_isolation
 
     # Portable CI fans the audited DAG out across jobs; privileged CI still runs
     # its small hardware DAG within one job.

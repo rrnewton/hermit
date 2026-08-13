@@ -15,6 +15,7 @@
     "check.backend_parity_mutation",
     "check.portability_paths",
     "check.script_sigpipe",
+    "check.test_availability_guards",
     "lint.rustfmt"
   ],
   "build_debug_nodes": [

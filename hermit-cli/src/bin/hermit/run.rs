@@ -51,7 +51,9 @@ use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::with_container;
 use super::global_opts::GlobalOpts;
+use super::tracing::BoundedWriter;
 use super::tracing::init_file_tracing;
+use super::tracing::log_max_bytes;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
@@ -3136,7 +3138,14 @@ impl RunOpts {
         };
         let level = verification_log_level(global.log, strictness, self.verify_verbose);
 
-        let _guard = init_file_tracing(Some(level), log_file);
+        // Bound this log too. `hermit run --verify` opens its own file and
+        // calls `init_file_tracing` directly instead of going through
+        // `GlobalOpts::init_tracing`, so without this wrapper the bound that
+        // was measured on exactly these `--verify` comparison logs would not
+        // apply to the path that produces them: a livelocked run here could
+        // still fill the disk.
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        let _guard = init_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
 
         let command = self.guest_command()?;
 

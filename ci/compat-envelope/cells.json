@@ -64473,6 +64473,216 @@
     },
     {
       "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "chaos",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "chaos",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "chaos",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "chaos",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "chaos",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "custom",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "custom",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "custom",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "custom",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "custom",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "naked",
+      "backend": "native",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "replay",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "replay",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "replay",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "replay",
+      "backend": "ptrace",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "replay",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "liteinst",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "shared-futex-c",
+      "test": "shared-futex-c/qemu-pipe-init",
+      "mode": "verify",
+      "backend": "sabre",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
       "category": "system-utils",
       "test": "system-utils/clock-determinism",
       "mode": "chaos",

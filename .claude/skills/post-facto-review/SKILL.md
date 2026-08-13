@@ -5,9 +5,26 @@ description: "Current Hermit post-facto human-review protocol: exact trigger set
 
 # Post-facto human review
 
-Every bot-authored PR description or comment starts with the applicable
-`[impl agent, MODEL]`, `[adversarial-reviewer agent, MODEL]`, or
-`[coordinator, MODEL]` tag. Human comments use `[Human]`.
+Before writing a bot-authored PR description, run this command from the
+`dev-hermit` parent and paste its exact output at the start:
+
+```bash
+./ci-hub/bin/who-am-i --tag --role ROLE
+```
+
+Do not type, reconstruct, or normalize the output. The command resolves the
+caller and refuses unresolved identity. Do not write a prefix in a GitHub
+comment or review body. From the `dev-hermit` parent, send the unprefixed body
+through its registered boundary:
+
+```bash
+with-proxy ./ci-hub/bin/gh --who AGENT --team TEAM --role ROLE \
+  pr comment PR --repo OWNER/REPO --body-file BODY
+```
+
+The three boundary flags must precede `pr comment`. The boundary validates the
+caller, resolves the model, and prepends the disclosure. Do not pass `--model`
+and do not substitute bare or official `gh` for `ci-hub/bin/gh`.
 
 Immediately after that disclosure, every PR description starts with `## Plain
 Language Summary and Project Impact`. It states the substantive outcome, its

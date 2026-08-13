@@ -24,6 +24,62 @@ use clap::Parser;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
+/// The in-band line a bounded log writer emits when a run's log file reaches
+/// its configured size bound.
+///
+/// This lives beside the comparator, not only beside the writer that emits it,
+/// because the comparator is the consumer that must not ignore it. The
+/// comparison below walks the two message lists in lockstep, so it can only
+/// ever speak for the retained prefix; a pair of logs that were both cut at the
+/// bound would agree on that prefix while the discarded tails were never looked
+/// at. Recognizing the marker is what keeps that from being reported as a
+/// match. `hermit-cli`'s writer emits this exact line and a unit test there
+/// binds the two by running the real writer's output through
+/// [`log_was_truncated`].
+///
+/// This is the COMPLETE sentence, not a prefix of it. An earlier version
+/// matched only the leading `=== HERMIT LOG TRUNCATED:` fragment anywhere in
+/// the text, which made the refusal fire on guest-controlled content: DETLOG
+/// records syscall path arguments verbatim, so a guest that merely touched a
+/// path containing that fragment poisoned its own `--verify` -- including with
+/// the bound already disabled, so the refusal's own remedy was unavailable.
+pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the configured size bound \
+     (HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run itself continued and \
+     was NOT affected. ===";
+
+/// Whether `log_text` is the output of a writer that hit its size bound.
+///
+/// The question this answers is "was THIS LOG truncated", which is not the same
+/// question as "does this text mention the marker". The distinction is the
+/// whole point: log text contains guest-controlled bytes, so a predicate that
+/// merely searches for the marker is a predicate a guest can satisfy.
+///
+/// Two anchors make it discriminate, and both are properties of how the marker
+/// is produced rather than of what it says:
+///
+/// 1. **End of file.** `BoundedWriter::announce_truncation` writes the marker
+///    at the moment the bound is crossed and every later write is discarded, so
+///    on a truncated log the marker is the final bytes. Trailing newlines are
+///    ignored; nothing else may follow.
+/// 2. **A whole line.** The marker is emitted preceded by its own newline, so
+///    it occupies a line by itself. A DETLOG line always carries a
+///    `<timestamp> LEVEL target:` prefix and therefore can never equal it. Nor
+///    can a guest forge the line break: DETLOG renders path arguments with
+///    `Debug`, which escapes a newline to a literal backslash-`n`, so guest
+///    bytes cannot start a line at all.
+///
+/// A genuinely truncated log still satisfies both, so this narrows the
+/// predicate to the real condition without weakening it.
+pub fn log_was_truncated(log_text: &str) -> bool {
+    let trimmed = log_text.trim_end_matches(['\n', '\r']);
+    if !trimmed.ends_with(TRUNCATION_MARKER) {
+        return false;
+    }
+    // `ends_with` matched, so this offset is on a character boundary.
+    let marker_start = trimmed.len() - TRUNCATION_MARKER.len();
+    marker_start == 0 || trimmed.as_bytes()[marker_start - 1] == b'\n'
+}
+
 /// Selects the set of log messages compared for determinism.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LogComparisonMode {
@@ -715,6 +771,20 @@ pub struct LogDiffSummary {
     pub compared_left: usize,
     /// Number of messages actually selected for comparison from the second run.
     pub compared_right: usize,
+    /// True when the comparison was REFUSED rather than performed, so there is
+    /// no verdict about whether the runs agree.
+    ///
+    /// [`Self::diff_found`] is also set, because a refusal must never read as a
+    /// match on any existing predicate. But the two are not the same fact: a
+    /// difference is something observed, whereas a refusal is the absence of an
+    /// observation. A caller that reports the outcome must be able to tell them
+    /// apart -- otherwise a run that compared nothing is announced as a run
+    /// that found the two executions differing, which is a claim nothing
+    /// supports.
+    ///
+    /// Set today by exactly one condition: an input log that ends at the
+    /// bounded writer's truncation marker.
+    pub refused: bool,
 }
 
 impl LogDiffSummary {
@@ -777,6 +847,40 @@ fn log_diff_summary_from_strs(
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<LogDiffSummary> {
+    // A log that reached its size bound stops early and says so in-band. The
+    // comparison below walks the two selected lists in lockstep, so it speaks
+    // only for the retained prefix: two runs both cut at the bound with equal
+    // retained message counts would agree on that prefix while the discarded
+    // tails were never compared, and reporting that as "no differences found"
+    // would assert determinism over a region nothing looked at. Refuse the
+    // verdict instead, in both directions of the green predicate --
+    // `diff_found` is set AND the compared counts stay zero, so neither
+    // `log_diff() == false` nor `matched_with_evidence()` can read as a match.
+    let truncated_a = log_was_truncated(file_a_str.as_ref());
+    let truncated_b = log_was_truncated(file_b_str.as_ref());
+    if truncated_a || truncated_b {
+        let which_side = match (truncated_a, truncated_b) {
+            (true, true) => "both logs were",
+            (true, false) => "the first log was",
+            (false, true) => "the second log was",
+            (false, false) => unreachable!("guarded by the condition above"),
+        };
+        writeln!(
+            w,
+            "REFUSING to compare: {which_side} truncated at the configured size bound \
+             (the log ends with the bounded writer's truncation marker). The discarded tail was \
+             never written, so no comparison of these files can establish that the runs agree \
+             past that point. This is a NO-RESULT, not a difference and not a match. Re-run with \
+             a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+        )?;
+        return Ok(LogDiffSummary {
+            diff_found: true,
+            compared_left: 0,
+            compared_right: 0,
+            refused: true,
+        });
+    }
+
     let all_a = filter_ignored(
         extract_log_messages(file_a_str.as_ref()),
         &opts.ignore_lines,
@@ -864,6 +968,8 @@ fn log_diff_summary_from_strs(
         diff_found,
         compared_left: compared_a.len(),
         compared_right: compared_b.len(),
+        // This path compared the logs; only the refusal above declines to.
+        refused: false,
     };
 
     if diff_found {
@@ -944,6 +1050,159 @@ mod test {
                 "",
             ]
         );
+    }
+
+    /// The two directions of the truncation refusal, on the SAME pair of logs.
+    ///
+    /// Both cases feed identical, matching DETLOG content; the only difference
+    /// is whether a side carries the bounded writer's marker. So a pass here
+    /// cannot come from the comparison being broken in general, and the refusal
+    /// cannot come from the content differing.
+    #[test]
+    fn truncated_logs_are_refused_and_untruncated_logs_still_match() -> std::io::Result<()> {
+        let body = "2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)\n2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)";
+        let marked = format!("{body}\n{}\n", super::TRUNCATION_MARKER);
+        let options = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+
+        // Direction 1: no marker on either side -> a real comparison happens,
+        // finds no difference, and carries nonzero evidence.
+        let clean = super::log_diff_summary_from_strs(body, body, &options, &mut Vec::new())?;
+        assert!(!clean.diff_found, "identical untruncated logs must match");
+        assert!(
+            clean.matched_with_evidence(),
+            "the untruncated match must carry nonzero compared counts, got {clean:?}"
+        );
+
+        // Direction 2: the marker on the left, the right, or both -> refused,
+        // even though the retained content is byte-identical to direction 1.
+        for (label, left, right) in [
+            ("left", marked.as_str(), body),
+            ("right", body, marked.as_str()),
+            ("both", marked.as_str(), marked.as_str()),
+        ] {
+            let mut out = Vec::new();
+            let summary = super::log_diff_summary_from_strs(left, right, &options, &mut out)?;
+            assert!(
+                summary.diff_found,
+                "{label}: a truncated log must not be reported as a match"
+            );
+            assert_eq!(
+                (summary.compared_left, summary.compared_right),
+                (0, 0),
+                "{label}: nothing was compared, so the counts must not claim otherwise"
+            );
+            assert!(
+                !summary.matched_with_evidence(),
+                "{label}: the evidence predicate must also refuse"
+            );
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("REFUSING to compare"),
+                "{label}: the refusal must be stated, got: {text}"
+            );
+            assert!(
+                !text.contains("no substantive differences found"),
+                "{label}: a refusal must never print the match line, got: {text}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The refusal must fire on "this log was truncated", never on "this log
+    /// mentions the marker".
+    ///
+    /// DETLOG records guest syscall path arguments verbatim, so the log text is
+    /// partly guest-controlled. The first version of this refusal searched the
+    /// whole text for a marker PREFIX, which let a guest that merely touched a
+    /// path containing that prefix refuse its own `--verify` -- and, because
+    /// the poisoning came from content rather than from the bound, disabling
+    /// the bound did not help. Each case below is a way the marker text can
+    /// appear in a log that was NOT truncated.
+    #[test]
+    fn marker_text_in_guest_content_is_not_truncation() -> std::io::Result<()> {
+        let options = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+        let marker = super::TRUNCATION_MARKER;
+        // The exact shape the live reproducer produced: a `statx` path argument
+        // carrying the marker prefix, mid-line, in a log that ran to completion.
+        let guest_path_line = format!(
+            "2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] inbound syscall: \
+             statx(-100, 0x7fff -> \"/tmp/{marker} probe\", AtFlags(AT_NO_AUTOMOUNT), 2, 0x7fff) \
+             = ?"
+        );
+        let tail_line = "2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: \
+             write(1, 0x2000, 1) = Ok(1)";
+
+        for (label, text) in [
+            // The whole marker sentence, inside a DETLOG line, at end of file.
+            (
+                "marker inside the final DETLOG line",
+                guest_path_line.clone(),
+            ),
+            // The marker on its own line, but the log continues afterwards --
+            // so the writer cannot have produced it: it discards everything
+            // after announcing.
+            (
+                "marker on its own line, followed by more log",
+                format!("{guest_path_line}\n{marker}\n{tail_line}"),
+            ),
+            // Ends with the marker text, but not at a line boundary.
+            (
+                "marker at end of file but mid-line",
+                format!("{tail_line}\nsomething {marker}"),
+            ),
+        ] {
+            assert!(
+                !super::log_was_truncated(&text),
+                "{label}: an untruncated log must not be classified as truncated"
+            );
+            let mut out = Vec::new();
+            let summary = super::log_diff_summary_from_strs(&text, &text, &options, &mut out)?;
+            let printed = String::from_utf8(out).unwrap();
+            assert!(
+                !printed.contains("REFUSING to compare"),
+                "{label}: must be compared, not refused, got: {printed}"
+            );
+            assert!(
+                !summary.diff_found,
+                "{label}: identical logs must compare equal, got {summary:?}"
+            );
+            assert!(
+                summary.matched_with_evidence(),
+                "{label}: the match must carry nonzero compared counts, got {summary:?}"
+            );
+        }
+
+        // ...and the narrowing did not go so far that real truncation escapes:
+        // the same guest content, actually cut at the bound, is still refused.
+        let really_truncated = format!("{guest_path_line}\n{marker}\n");
+        assert!(
+            super::log_was_truncated(&really_truncated),
+            "a log ending in the marker line IS truncated and must still be caught"
+        );
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            &really_truncated,
+            &really_truncated,
+            &options,
+            &mut out,
+        )?;
+        assert!(summary.diff_found, "real truncation must still be refused");
+        assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("REFUSING to compare"),
+            "real truncation must still print the refusal"
+        );
+
+        Ok(())
     }
 
     #[test]

@@ -5,24 +5,34 @@ description: "Apply a disciplined read, plan, execute, and adversarially verify 
 
 # Fabler
 
-## PR Comment Convention
+## PR description and GitHub comment disclosure
 
-Every PR description and comment created under this workflow MUST start with
-the applicable role tag:
+Before writing a bot-authored PR description, run this command from the
+`dev-hermit` parent and paste its exact output at the start:
 
-- `[impl agent, MODEL]` for implementation agents
-- `[adversarial-reviewer agent, MODEL]` for review agents
-- `[coordinator, MODEL]` for coordinator agents
-- `[Human]` for the human owner
+```bash
+./ci-hub/bin/who-am-i --tag --role ROLE
+```
 
-Immediately after the role tag, a PR description MUST start with `## Plain
+Do not type, reconstruct, or normalize the output. The command resolves the
+caller and refuses unresolved identity. Do not write a prefix in a GitHub
+comment or review body. From the `dev-hermit` parent, send the unprefixed body
+through its registered boundary:
+
+```bash
+with-proxy ./ci-hub/bin/gh --who AGENT --team TEAM --role ROLE \
+  pr comment PR --repo OWNER/REPO --body-file BODY
+```
+
+The three boundary flags must precede `pr comment`. The boundary validates the
+caller, resolves the model, and prepends the disclosure. Do not pass `--model`
+and do not substitute bare or official `gh` for `ci-hub/bin/gh`.
+
+Immediately after the disclosure, a PR description MUST start with `## Plain
 Language Summary and Project Impact`, explaining the substantive project
 outcome, how it advances the product vision or owner request, and the meaningful
 before/after difference. This requirement does not apply to ordinary PR
 comments.
-
-Examples: `[impl agent, gpt-5.6-sol]`,
-`[adversarial-reviewer agent, opus-4.8]`.
 
 *Distilled from retrospectives on a set of unusually effective planning, build, and audit sessions (the "Fable" threads). These are working habits, not domain knowledge: they apply equally to research, architecture, coding, audit, and multi-agent work. The aim is to make careful sequencing automatic, so raw capability is never squandered on avoidable errors: confident wrong conclusions, unverified claims, scope drift.*
 
