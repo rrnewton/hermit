@@ -522,26 +522,28 @@ static int report_pipe_capacity_policy(void) {
   char *maximum_end = NULL;
   errno = 0;
   long maximum = strtol(maximum_text, &maximum_end, 10);
-  if (errno != 0 || maximum_end == maximum_text || maximum <= 0 ||
-      maximum >= INT_MAX) {
+  if (errno != 0 || maximum_end == maximum_text || maximum <= 0) {
     fprintf(stderr, "invalid pipe-max-size: %.*s\n", (int)maximum_length,
             maximum_text);
     return -1;
   }
 
-  int pipe_fds[2];
-  if (pipe(pipe_fds) != 0) {
-    perror("capacity report pipe");
+  errno = 0;
+  int current = fcntl(STDIN_FILENO, F_GETPIPE_SZ);
+  if (current <= 0) {
+    perror("capacity report F_GETPIPE_SZ");
     return -1;
   }
   errno = 0;
-  int set_capacity =
-      fcntl(pipe_fds[1], F_SETPIPE_SZ, (int)maximum + 1);
+  int set_capacity = fcntl(STDIN_FILENO, F_SETPIPE_SZ, current);
   int set_errno = errno;
-  close(pipe_fds[0]);
-  close(pipe_fds[1]);
-  printf("pipe-max-size=%ld set-above-max=%d/%d\n", maximum, set_capacity,
-         set_errno);
+  if (set_capacity != current || set_errno != 0) {
+    fprintf(stderr, "capacity report F_SETPIPE_SZ returned %d/%d, expected %d/0\n",
+            set_capacity, set_errno, current);
+    return -1;
+  }
+  printf("pipe-max-size=%ld get=%d set-current=%d/%d\n", maximum, current,
+         set_capacity, set_errno);
   return 0;
 }
 

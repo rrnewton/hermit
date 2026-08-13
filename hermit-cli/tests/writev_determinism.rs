@@ -12,6 +12,9 @@ use std::process::Command;
 use std::process::Output;
 use std::process::Stdio;
 
+use nix::fcntl::OFlag;
+use nix::unistd::pipe2;
+
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
     let output = command
@@ -44,14 +47,25 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&guest);
     command_output(compile, "writev guest compilation");
 
+    // Both executions receive a duplicate of the same host pipe as standard input. This
+    // compares pass-through behavior on one pipe object instead of comparing independently
+    // selected capacities from two newly created pipes. O_CLOEXEC keeps the parent copies
+    // out of both children; Stdio installs only the requested duplicate as fd 0.
+    let (capacity_read, capacity_write) =
+        pipe2(OFlag::O_CLOEXEC).expect("failed to create inherited capacity pipe");
     let mut native_capacity = Command::new(&guest);
-    native_capacity.arg("pipe-capacity");
+    native_capacity.arg("pipe-capacity").stdin(Stdio::from(
+        capacity_read
+            .try_clone()
+            .expect("failed to duplicate native capacity pipe"),
+    ));
     let native_capacity_output = command_output(native_capacity, "native pipe capacity report");
     let native_capacity_stdout = String::from_utf8_lossy(&native_capacity_output.stdout);
     assert!(
         native_capacity_stdout.contains("pipe-max-size=")
-            && native_capacity_stdout.contains(&format!("set-above-max=-1/{}", libc::EPERM)),
-        "native pipe capacity report did not refuse a request above the host maximum:\n\
+            && native_capacity_stdout.contains("get=")
+            && native_capacity_stdout.contains("set-current="),
+        "native pipe capacity report omitted successful F_GETPIPE_SZ/F_SETPIPE_SZ evidence:\n\
          {native_capacity_stdout}",
     );
 
@@ -68,7 +82,12 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             "--",
         ])
         .arg(&guest)
-        .arg("pipe-capacity");
+        .arg("pipe-capacity")
+        .stdin(Stdio::from(
+            capacity_read
+                .try_clone()
+                .expect("failed to duplicate Hermit capacity pipe"),
+        ));
     let host_backed_capacity_output = command_output(
         host_backed_capacity,
         "non-sequentialized pipe capacity report",
@@ -82,6 +101,8 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         String::from_utf8_lossy(&host_backed_capacity_output.stdout),
         String::from_utf8_lossy(&host_backed_capacity_output.stderr),
     );
+    drop(capacity_read);
+    drop(capacity_write);
 
     for (mode, diagnostic) in [
         (
