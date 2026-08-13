@@ -542,11 +542,56 @@ EOF
         ;;
     lsof)
         printf 'lsof-fixture\n' >"$WORK_DIR/input.txt"
+        printf 'lsof-wrong-fd\n' >"$WORK_DIR/wrong-fd.txt"
+        exec 8<"$WORK_DIR/wrong-fd.txt"
         exec 9<"$WORK_DIR/input.txt"
-        output=$(/usr/bin/lsof -O -w -p $$ -a -d 9 -Ffn)
-        [[ $output == *f9* ]]
-        [[ $output == *"$WORK_DIR/input.txt"* ]]
-        printf 'lsof:fd9-ok\n'
+
+        # The preload library must refuse an inherited descriptor for the live
+        # procfs table.  The selection below is otherwise the same qualifying
+        # case as the final invocation, and no success marker may be emitted.
+        live_proc_status=0
+        HERMIT_LSOF_MOUNTS_FD=0 \
+            HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/live-proc.redirected" \
+            LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \
+            /usr/bin/lsof -O -w -p $$ -a -d 9 -a -Ffn \
+                -- "$WORK_DIR/input.txt" \
+                </proc/mounts >"$WORK_DIR/live-proc.out" \
+                2>"$WORK_DIR/live-proc.err" || live_proc_status=$?
+        test "$live_proc_status" -eq 1
+        test ! -s "$WORK_DIR/live-proc.out"
+        [[ $(cat "$WORK_DIR/live-proc.err") == \
+            'lsof: can'\''t fopen(/proc/mounts, "r"): Operation not permitted' ]]
+        test ! -e "$WORK_DIR/live-proc.redirected"
+
+        # Bracket the real selection in both directions.  The first invocation
+        # must refuse a path that fd 9 does not hold; the second must report the
+        # fixture descriptor.  Both must prove that lsof's unconditional
+        # /proc/mounts read was served from the inherited fixed descriptor.
+        refusal_status=0
+        refusal_output=$(HERMIT_LSOF_MOUNTS_FD=0 \
+            HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/refusal.redirected" \
+            LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \
+            /usr/bin/lsof -O -w -p $$ -a -d 9 -a -Ffn \
+                -- "$WORK_DIR/wrong-fd.txt" \
+                <"$FIXTURE_ROOT/lsof/mounts" \
+                2>"$WORK_DIR/refusal.err") || refusal_status=$?
+        test "$refusal_status" -eq 0
+        test -z "$refusal_output"
+        test ! -s "$WORK_DIR/refusal.err"
+        [[ $(cat "$WORK_DIR/refusal.redirected") == fixed-mount-fd ]]
+
+        output=$(HERMIT_LSOF_MOUNTS_FD=0 \
+            HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/accept.redirected" \
+            LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \
+            /usr/bin/lsof -O -w -p $$ -a -d 9 -a -Ffn \
+                -- "$WORK_DIR/input.txt" \
+                <"$FIXTURE_ROOT/lsof/mounts" \
+                2>"$WORK_DIR/accept.err")
+        [[ $(cat "$WORK_DIR/accept.redirected") == fixed-mount-fd ]]
+        test ! -s "$WORK_DIR/accept.err"
+        expected=$(printf 'p%s\nf9\nn%s' "$$" "$WORK_DIR/input.txt")
+        [[ $output == "$expected" ]]
+        printf 'lsof:fixed-mount-fd=2/2:live-proc-fd-refused=1/1:wrong-path-refused=1/1:fd9-ok\n'
         ;;
     ar)
         archive=$(gcc -print-file-name=libgcc.a)
