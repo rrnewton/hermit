@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -23,6 +24,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+static int expected_pipe_capacity = -1;
 
 static int write_vector(int fd, const char *first, const char *second,
                         const char *third) {
@@ -160,6 +163,11 @@ static int check_atomic_full_pipe(void) {
   int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
   if (capacity <= 0) {
     perror("atomic pipe F_GETPIPE_SZ");
+    return -1;
+  }
+  if (expected_pipe_capacity > 0 && capacity != expected_pipe_capacity) {
+    fprintf(stderr, "expected pipe capacity %d, got %d\n",
+            expected_pipe_capacity, capacity);
     return -1;
   }
   char *fill = malloc((size_t)capacity);
@@ -371,6 +379,110 @@ static int check_large_blocking_pipe(void) {
   return 0;
 }
 
+static int check_large_blocking_scalar_pipe(void) {
+  enum { EXPECTED = 8190 };
+  static char payload[EXPECTED];
+  memset(payload, 'S', sizeof(payload));
+
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("large scalar pipe");
+    return -1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("large scalar fork");
+    return -1;
+  }
+  if (child == 0) {
+    close(pipe_fds[1]);
+    size_t received = 0;
+    char buffer[4096];
+    while (received < sizeof(payload)) {
+      ssize_t count = read(pipe_fds[0], buffer, sizeof(buffer));
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      if (count <= 0) {
+        _exit(2);
+      }
+      for (ssize_t index = 0; index < count; index++) {
+        if (buffer[index] != 'S') {
+          _exit(3);
+        }
+      }
+      received += (size_t)count;
+    }
+    close(pipe_fds[0]);
+    _exit(received == sizeof(payload) ? 0 : 4);
+  }
+
+  close(pipe_fds[0]);
+  ssize_t written = write(pipe_fds[1], payload, sizeof(payload));
+  close(pipe_fds[1]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("large scalar waitpid");
+    return -1;
+  }
+  if (written != (ssize_t)sizeof(payload) || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fprintf(stderr,
+            "large blocking pipe write returned %zd/%zu, child status %#x\n",
+            written, sizeof(payload), status);
+    return -1;
+  }
+  return 0;
+}
+
+static int check_fixed_pipe_capacity_policy(void) {
+  if (expected_pipe_capacity <= 0) {
+    return 0;
+  }
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("capacity policy pipe");
+    return -1;
+  }
+  int capacity = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  errno = 0;
+  int negative = fcntl(pipe_fds[1], F_SETPIPE_SZ, -1);
+  int negative_errno = errno;
+  errno = 0;
+  int minimum = fcntl(pipe_fds[1], F_SETPIPE_SZ, 0);
+  int minimum_errno = errno;
+  errno = 0;
+  int growth = fcntl(pipe_fds[1], F_SETPIPE_SZ, expected_pipe_capacity + 1);
+  int growth_errno = errno;
+  int after = fcntl(pipe_fds[1], F_GETPIPE_SZ);
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
+
+  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  if (null_fd < 0) {
+    perror("open /dev/null");
+    return -1;
+  }
+  errno = 0;
+  int nonpipe = fcntl(null_fd, F_SETPIPE_SZ, 0);
+  int nonpipe_errno = errno;
+  close(null_fd);
+
+  if (capacity != expected_pipe_capacity || negative != -1 ||
+      negative_errno != EINVAL || minimum != expected_pipe_capacity ||
+      minimum_errno != 0 || growth != -1 || growth_errno != EPERM ||
+      after != expected_pipe_capacity || nonpipe != -1 ||
+      nonpipe_errno != EBADF) {
+    fprintf(stderr,
+            "pipe capacity policy mismatch: get=%d negative=%d/%d "
+            "minimum=%d/%d growth=%d/%d after=%d nonpipe=%d/%d\n",
+            capacity, negative, negative_errno, minimum, minimum_errno, growth,
+            growth_errno, after, nonpipe, nonpipe_errno);
+    return -1;
+  }
+  return 0;
+}
+
 static int check_failed_write_preserves_metadata(void) {
   char path[] = "/tmp/hermit-writev-XXXXXX";
   int fd = mkstemp(path);
@@ -426,6 +538,18 @@ int main(int argc, char **argv) {
     puts("writev-determinism-ok");
     return 0;
   }
+  if (argc > 1) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0' || parsed <= 0 ||
+        parsed > INT_MAX) {
+      fprintf(stderr, "usage: %s [record|record-pipe|expected-capacity]\n",
+              argv[0]);
+      return 2;
+    }
+    expected_pipe_capacity = (int)parsed;
+  }
 
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
@@ -453,6 +577,8 @@ int main(int argc, char **argv) {
 
   if (check_atomic_full_pipe() != 0 || check_readonly_iovec() != 0 ||
       check_large_iovec_snapshot() != 0 || check_large_blocking_pipe() != 0 ||
+      check_large_blocking_scalar_pipe() != 0 ||
+      check_fixed_pipe_capacity_policy() != 0 ||
       check_failed_write_preserves_metadata() != 0) {
     return 1;
   }

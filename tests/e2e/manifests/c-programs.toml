@@ -8694,13 +8694,15 @@ program = "tests/c/writev_determinism.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
+guest_args = { ptrace = ["4096"] }
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
 sabre = "The first verify run exits with waitpid error 512 after one raw libc syscall site; neither functional L2 nor a pure SaBRe path is established"
-liteinst = "Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"
+liteinst = "Measured at Hermit 1f4e430c with its pinned LiteInst runtime: the full writev guest stops with ENOTSUPP before F_GETPIPE_SZ, so neither functional execution nor canonical parity is established; a separate minimal pipe probe reaches F_GETPIPE_SZ but does not qualify this workload"
 
 [test.modes.naked]
 ci = false

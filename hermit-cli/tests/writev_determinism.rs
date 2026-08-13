@@ -104,8 +104,8 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         );
     }
 
-    // Exercise record mode on pipe retries separately. Replaying dynamically allocated
-    // pipe fds is currently blocked by the recorder's independent fd-numbering gap.
+    // Exercise record mode on the smallest pipe-retry workload separately before the
+    // full fixed-capacity workload is recorded and replayed below.
     let pipe_recording = build_root.join("pipe-recording");
     let _ = fs::remove_dir_all(&pipe_recording);
     let mut pipe_record = Command::new("timeout");
@@ -145,7 +145,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&recording)
         .arg("--")
         .arg(&guest)
-        .arg("record");
+        .arg("4096");
     let record_output = command_output(record, "writev record/replay verification");
     let record_stdout = String::from_utf8_lossy(&record_output.stdout);
     let record_stderr = String::from_utf8_lossy(&record_output.stderr);

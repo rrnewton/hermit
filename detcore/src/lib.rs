@@ -81,6 +81,8 @@ pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_wire_fingerprint;
+/// Physical and guest-visible capacity of scheduler-managed pipes.
+pub const DETERMINISTIC_PIPE_CAPACITY: i32 = 4 * 1024;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
