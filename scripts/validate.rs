@@ -4060,8 +4060,18 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     if completed_exit_code(1, 1, false, false) != 1
         || ledger_run_results(1, 1, 1, false) != ("fail", "fail")
         || ledger_run_results(1, 0, 1, false) != ("fail", "fail")
+        || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 1, 1, false) != ("fail", "fail")
     {
         return Err("no-result propagation: a sibling exit 75 hid a genuine failure".into());
+    }
+
+    if completed_exit_code(0, 1, true, false) != 1 {
+        return Err("no-result propagation: a run timeout was weakened to NO_RESULT".into());
+    }
+    if completed_exit_code(0, 1, false, true) != 1 {
+        return Err(
+            "no-result propagation: an unexplained runner failure was weakened to NO_RESULT".into(),
+        );
     }
 
     let aborted = outcome("aborted", NO_RESULT_EXIT_CODE, true);
