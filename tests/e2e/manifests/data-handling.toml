@@ -249,7 +249,7 @@ native = "zstd fixes job boundaries by input offset, not by which worker claims 
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbt = "DBI coverage is owned by its backend parity partition"
+dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe strict verification intermittently diverges on multi-thread DETLOG ordering"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
@@ -259,7 +259,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "The focused C sentinel owns the blocking replay contract"
-dbt = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -269,7 +269,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "Enabling chaos here is a genuine follow-up: the worker pool is real guest concurrency, but the frame digest must first be shown stable under chaos scheduling before it can gate CI"
-dbt = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"

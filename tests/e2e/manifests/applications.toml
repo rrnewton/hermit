@@ -257,7 +257,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Strict verification owns this toolchain transaction's blocking determinism contract"
-dbt = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -267,7 +267,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The build graph is intentionally serial"
-dbt = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -312,7 +312,7 @@ ci = false
 backends_enabled = []
 [test.modes.replay.backends_disabled]
 ptrace = "Strict verification owns this repository transaction's blocking determinism contract"
-dbt = "Record/replay is unsupported by DBI"
+dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
@@ -322,7 +322,7 @@ ci = false
 backends_enabled = []
 [test.modes.chaos.backends_disabled]
 ptrace = "The repository transaction is intentionally serial"
-dbt = "Chaos scheduling is unsupported by DBI"
+dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"
 liteinst = "Chaos scheduling is unsupported by LiteInst"
@@ -332,7 +332,7 @@ ci = false
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "Strict verification owns the Git transaction; no custom Hermit arguments are required"
-dbt = "The Git transaction is not qualified on DBI"
+dbt = "The Git transaction is not qualified on DBT"
 kvm = "The Git transaction is not qualified on KVM"
 sabre = "The Git transaction is not qualified on SaBRe"
 liteinst = "The Git transaction is not qualified on LiteInst"

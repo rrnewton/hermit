@@ -206,6 +206,8 @@ pub fn node(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
@@ -563,6 +565,15 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     }
     if base.default_step_cpu_count != derived.default_step_cpu_count {
         bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
+    }
+    if base.cpu_timeout_multiplier != derived.cpu_timeout_multiplier {
+        bad.push(format!("cpu_timeout_multiplier {} != {}", base.cpu_timeout_multiplier, derived.cpu_timeout_multiplier));
+    }
+    if base.cpu_timeout_platform != derived.cpu_timeout_platform {
+        bad.push(format!("cpu_timeout_platform {:?} != {:?}", base.cpu_timeout_platform, derived.cpu_timeout_platform));
+    }
+    if base.write_domain_policy != derived.write_domain_policy {
+        bad.push(format!("write_domain_policy {:?} != {:?}", base.write_domain_policy, derived.write_domain_policy));
     }
     if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
 }
