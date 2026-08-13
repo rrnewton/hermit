@@ -241,7 +241,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
-        stack.commit()?;
+        let _pending_guard = stack.commit()?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
