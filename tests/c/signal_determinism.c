@@ -494,6 +494,23 @@ static int test_blocking_sigsuspend(void) {
   return 0;
 }
 
+static int test_blocking_sigsuspend_without_signal(void) {
+  sigset_t wait_mask;
+  sigfillset(&wait_mask);
+
+  static const char ready[] = "sigsuspend waiting without a signal\n";
+  write_message(ready, sizeof(ready) - 1);
+
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  fprintf(
+      stderr,
+      "unexpected sigsuspend return result=%d errno=%d\n",
+      suspend_result,
+      errno);
+  return 2;
+}
+
 static void* check_clone_mask(void* argument) {
   (void)argument;
   const int blocked = signal_is_blocked(SIGUSR1);
@@ -789,6 +806,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "blocking-sigsuspend") == 0) {
     return test_blocking_sigsuspend();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend-no-signal") == 0) {
+    return test_blocking_sigsuspend_without_signal();
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();

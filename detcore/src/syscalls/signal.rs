@@ -41,6 +41,7 @@ use crate::types::LogicalTime;
 // use libc's sigaction here unfortunately. See:
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
 const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
+const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
@@ -225,7 +226,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigsuspend,
     ) -> Result<i64, Error> {
-        self.record_or_replay_blocking(guest, call.into()).await
+        // Invalid arguments return immediately from the kernel and therefore are
+        // not signal-only waits.
+        let Some(mask_addr) = call.mask() else {
+            return self.record_or_replay_blocking(guest, call.into()).await;
+        };
+        if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+            return self.record_or_replay_blocking(guest, call.into()).await;
+        }
+
+        let temporary_mask: u64 = match guest.memory().read_value(mask_addr.cast()) {
+            Ok(mask) => mask,
+            Err(_) => return self.record_or_replay_blocking(guest, call.into()).await,
+        };
+        let mut stack = guest.stack().await;
+        let pending_addr = stack.push(0_u64);
+        stack.commit()?;
+        let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
+            .expect("stack address must be non-null");
+        let pending_call = syscalls::RtSigpending::new()
+            .with_set(Some(pending_out))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+        guest.inject_with_retry(pending_call).await?;
+        let pending: u64 = guest.memory().read_value(pending_addr)?;
+
+        if pending & !temporary_mask != 0 {
+            // The kernel will consume an already-pending signal as soon as it
+            // atomically installs the temporary mask. Keep this immediate case
+            // out of the terminal-wait classification; the real syscall still
+            // performs delivery and restores the old mask.
+            self.record_or_replay_blocking(guest, call.into()).await
+        } else {
+            self.record_or_replay_rt_sigsuspend(guest, call).await
+        }
     }
 
     /// rt_sigaction
