@@ -2043,6 +2043,38 @@ fn record_list_json_reports_an_empty_inventory() {
 }
 
 #[test]
+fn record_list_rejects_a_non_directory_inventory() {
+    let parent = tempfile::tempdir().expect("failed to create recording data parent");
+    let data_file = parent.path().join("not-a-directory");
+    fs::write(&data_file, b"not a recording inventory")
+        .expect("failed to create non-directory data path");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "list", "--json", "--data-dir"])
+        .arg(&data_file)
+        .output()
+        .expect("failed to run hermit record list");
+    assert_failure_contains(
+        &output,
+        &["Failed to read recording inventory", "not-a-directory"],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "clean", "--data-dir"])
+        .arg(&data_file)
+        .output()
+        .expect("failed to run hermit record clean");
+    assert_failure_contains(
+        &output,
+        &["Failed to read recording inventory", "not-a-directory"],
+    );
+    assert_eq!(
+        fs::read(&data_file).expect("record clean removed the data path"),
+        b"not a recording inventory"
+    );
+}
+
+#[test]
 fn run_rejects_invalid_programs_with_actionable_errors() {
     let output = hermit(&["run", "--", "/definitely/missing/hermit-program"]);
     assert_failure_contains(

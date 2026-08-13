@@ -1831,6 +1831,39 @@ pub struct HermitData {
     data_dir: PathBuf,
 }
 
+fn collect_recording_ids(
+    entries: impl IntoIterator<Item = io::Result<fs::DirEntry>>,
+    data_dir: &Path,
+    mut file_type: impl FnMut(&fs::DirEntry) -> io::Result<fs::FileType>,
+) -> Result<Vec<Id>, Error> {
+    let mut recordings = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to read an entry in recording inventory {}",
+                data_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if file_type(&entry)
+            .with_context(|| {
+                format!(
+                    "Failed to inspect recording inventory entry {}",
+                    path.display()
+                )
+            })?
+            .is_dir()
+            && let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<Id>().ok())
+        {
+            recordings.push(id);
+        }
+    }
+    Ok(recordings)
+}
+
 impl Default for HermitData {
     fn default() -> Self {
         Self::new()
@@ -1917,23 +1950,27 @@ impl HermitData {
         replay_with_gdbserver(&data, port)
     }
 
-    /// Returns an iterator over the recordings.
+    /// Returns the recordings in the data directory.
     ///
     /// Use [`Self::recording_metadata`] to get more information about a recording.
-    pub fn recordings(&self) -> impl Iterator<Item = Id> + use<> {
-        fs::read_dir(&self.data_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
+    ///
+    /// A missing data directory has no recordings. Other filesystem errors are
+    /// returned rather than being mistaken for an empty or partial inventory.
+    pub fn recordings(&self) -> Result<Vec<Id>, Error> {
+        let entries = match fs::read_dir(&self.data_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to read recording inventory in {}",
+                        self.data_dir.display()
+                    )
+                });
+            }
+        };
 
-                if entry.file_type().ok()?.is_dir() {
-                    Some(entry.file_name().to_str()?.parse::<Id>().ok()?)
-                } else {
-                    None
-                }
-            })
+        collect_recording_ids(entries, &self.data_dir, fs::DirEntry::file_type)
     }
 
     /// Returns the metadata of a recording.
@@ -2044,7 +2081,10 @@ mod tests {
 
     use super::Backend;
     use super::ExitStatus;
+    use super::HermitData;
+    use super::Id;
     use super::SABRE_RPC_SOCKET_ENV;
+    use super::collect_recording_ids;
     #[cfg(feature = "dbt")]
     use super::dbt_runtime_unavailable_reason;
     #[cfg(feature = "dbt")]
@@ -2069,6 +2109,91 @@ mod tests {
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
     use super::wait_for_sabre_rpc_disconnects;
+
+    #[test]
+    fn recording_inventory_preserves_missing_and_non_recording_cases() {
+        let parent = tempfile::tempdir().expect("failed to create recording inventory parent");
+        let missing = parent.path().join("missing");
+        assert!(
+            HermitData::with_dir(&missing)
+                .recordings()
+                .expect("a missing data directory should be empty")
+                .is_empty()
+        );
+
+        let inventory = parent.path().join("inventory");
+        fs::create_dir(&inventory).expect("failed to create recording inventory");
+        let recording: Id = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid recording ID");
+        fs::create_dir(inventory.join(recording.to_string()))
+            .expect("failed to create recording directory");
+        fs::create_dir(inventory.join("not-a-recording"))
+            .expect("failed to create invalid-name directory");
+        fs::write(
+            inventory.join("fedcba9876543210fedcba9876543210"),
+            b"not a directory",
+        )
+        .expect("failed to create valid-looking non-directory");
+
+        assert_eq!(
+            HermitData::with_dir(&inventory)
+                .recordings()
+                .expect("recording inventory should be readable"),
+            vec![recording]
+        );
+    }
+
+    #[test]
+    fn recording_inventory_rejects_an_error_after_a_valid_entry() {
+        let inventory = tempfile::tempdir().expect("failed to create recording inventory");
+        let recording: Id = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("valid recording ID");
+        fs::create_dir(inventory.path().join(recording.to_string()))
+            .expect("failed to create recording directory");
+        let valid_entry = fs::read_dir(inventory.path())
+            .expect("failed to open recording inventory")
+            .next()
+            .expect("missing recording entry")
+            .expect("failed to read recording entry");
+
+        let entries = vec![
+            Ok(valid_entry),
+            Err(std::io::Error::other("injected entry failure")),
+        ];
+        let error = collect_recording_ids(entries, inventory.path(), fs::DirEntry::file_type)
+            .expect_err("a partial inventory must not be returned");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to read an entry in recording inventory"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn recording_inventory_rejects_an_entry_inspection_error() {
+        let inventory = tempfile::tempdir().expect("failed to create recording inventory");
+        let recording = inventory.path().join("0123456789abcdef0123456789abcdef");
+        fs::create_dir(&recording).expect("failed to create recording directory");
+        let entry = fs::read_dir(inventory.path())
+            .expect("failed to open recording inventory")
+            .next()
+            .expect("missing recording entry")
+            .expect("failed to read recording entry");
+
+        let error = collect_recording_ids([Ok(entry)], inventory.path(), |_| {
+            Err(std::io::Error::other("injected inspection failure"))
+        })
+        .expect_err("an uninspectable entry must fail the inventory");
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to inspect recording inventory entry"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     /// Regression test for the `hermit run --verify` empty-stdin bug: a pipe
     /// (non-seekable) fed to hermit must be buffered and replayed *identically*

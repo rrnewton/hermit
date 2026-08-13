@@ -43,7 +43,8 @@ impl ListOpts {
         let hermit = HermitData::from(self.data_dir.as_ref());
 
         let mut recordings = hermit
-            .recordings()
+            .recordings()?
+            .into_iter()
             .map(|id| {
                 let metadata = hermit.recording_metadata(id)?;
                 Ok(RecordingInfo {
