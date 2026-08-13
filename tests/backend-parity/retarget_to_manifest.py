@@ -19,15 +19,14 @@ its catalog back into ``run_matrix.py``. Dozens of open PRs still add a
 
 This tool mechanizes the coverage migration for those PRs. For each source PR it:
 
-  1. reads the added ``matrix.tsv`` row(s) (6-col L1 schema or 11-col L1+L2
+  1. reads the added ``matrix.tsv`` row(s) (6-col L1 schema or historical 11-col
      schema) and the added fixture ``.c`` file(s);
   2. writes the fixture into the working tree (so the manifest ``program`` path
      exists for the lint) if it is not already present;
   3. appends a symmetric ``[[test]]`` block to
      ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
-     every backend x mode cell declared, DBT/KVM enabled only where the source
-     row's ``--verify`` (L2) witness actually passed, everything else disabled
-     with a concrete reason carried over from the matrix row;
+     every backend x mode cell declared, DBT/KVM disabled unless evidence at the
+     required level exists, with the source row's reason carried over;
   4. reclassifies the fixture in
      ``tests/e2e/manifests/inventory/test-files.json`` from the private
      ``guest-fixture`` disposition to ``manifest-test`` so it leaves the
@@ -95,7 +94,7 @@ REPO = "rrnewton/hermit"
 # / /dev/kvm). Everything else is a portable syscall probe.
 PRIVILEGED_HINTS = ("cpuid", "rdtsc", "rdseed", "rdrand")
 
-L2_PASS = {"detlog", "guest"}  # a real --verify witness; "gap" means no witness
+LEGACY_VERIFY_MATCH = {"detlog", "guest"}
 
 
 class ConvertError(Exception):
@@ -111,7 +110,8 @@ class MatrixRow:
     kvm: str
     dbt_reason: str
     kvm_reason: str
-    # L2 detlog/guest/gap (empty when the source row is the 6-col schema)
+    # Historical detlog/guest/gap fields (empty in the 6-column schema). Neither
+    # successful spelling carries a typed bitwise verdict or message counts.
     ptrace_l2: str = ""
     dbt_l2: str = ""
     kvm_l2: str = ""
@@ -190,8 +190,12 @@ def build_plan(
 
     def classify(backend: str, l1: str, l1_reason: str, l2: str, l2_reason: str):
         if row.has_l2:
-            if l2 in L2_PASS:
-                enabled.append(backend)
+            if l2 in LEGACY_VERIFY_MATCH:
+                disabled[backend] = (
+                    f"source matrix records {l2} --verify equality without a "
+                    "typed bitwise_parity verdict and nonzero compared-message "
+                    f"counts; that is not L2, so qualify {backend.upper()} separately"
+                )
             elif l2 == "gap":
                 disabled[backend] = (
                     l2_reason
@@ -204,8 +208,8 @@ def build_plan(
             # 6-col source: only L1 evidence, no --verify witness -> stay ptrace-first.
             if l1 == "pass":
                 disabled[backend] = (
-                    f"L1 parity established in the source matrix row; the L2 --verify "
-                    f"witness was not recorded, so qualify {backend.upper()} separately"
+                    f"L1 parity established in the source matrix row; typed bitwise "
+                    f"parity was not recorded, so qualify {backend.upper()} separately"
                 )
             else:
                 disabled[backend] = (

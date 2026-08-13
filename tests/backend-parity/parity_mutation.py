@@ -143,10 +143,10 @@ FIXTURES: dict[str, FixtureSpec] = {
 # is not a substitute for --verify-strict and does not reimplement it -- it
 # applies the same idea across backends.
 #
-# TIER-2 corresponds to what KVM's --verify can currently assert (exit status,
-# stdout, stderr) and TIER-3 to the full-INFO envelope, which is why the repo
-# says KVM "cannot claim full L2 INFO parity until internal log comparison
-# exists".
+# TIER-2 is exit status, stdout, and stderr; TIER-3 is the full-INFO envelope.
+# Hermit's own KVM `--verify --verify-strict` path now compares that INFO envelope
+# and is authoritative for L2. This cross-backend mutation harness remains a
+# separate comparison and does not substitute for the typed Hermit verdict.
 #
 # KNOWN GAP, and it is deliberate rather than overlooked: BitwiseInfoV1 both
 # removes the wall-clock prefix AND ordinalizes host addresses marked with the
