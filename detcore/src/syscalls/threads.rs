@@ -1010,7 +1010,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = self
             .record_or_replay(guest, Syscall::SetRobustList(call))
             .await?;
-        // TODO-HUMAN-REVIEW(PR-2078): Review robust-list
+        // TODO-HUMAN-REVIEW(PR-2223): Review robust-list
         // head tracking used to drive owner-death wakeups.
         let recorded = match head {
             // `set_robust_list(NULL, ...)` unregisters the list.
@@ -1047,7 +1047,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// and without thread sequentialization Detcore does not model futexes at
     /// all.
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-2078): Review owner-death wakeup
+    // TODO-HUMAN-REVIEW(PR-2223): Review owner-death wakeup
     // emulation, which changes how a dying thread's peers are scheduled.
     async fn run_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
         if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
