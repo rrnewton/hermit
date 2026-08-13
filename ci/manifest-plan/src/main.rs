@@ -53,6 +53,7 @@ enum Format {
     Text,
     Json,
     HarnessJson,
+    VerifyFlags,
 }
 
 #[cfg(not(test))]
@@ -82,6 +83,7 @@ fn parse_format() -> Format {
             "text" => Format::Text,
             "json" => Format::Json,
             "harness-json" => Format::HarnessJson,
+            "verify-flags" => Format::VerifyFlags,
             _ => die(format!("unknown format: {value}")),
         };
     }
@@ -164,7 +166,13 @@ fn main() {
     });
 
     match format {
+        Format::VerifyFlags => {
+            for line in verify_flags_tsv(&documents) {
+                println!("{line}");
+            }
+        }
         Format::HarnessJson => {
+            attach_verify_flags(&mut documents);
             println!(
                 "{}",
                 serde_json::to_string(&documents)
@@ -645,6 +653,115 @@ fn validate_ci_disabled_reason(
     }
 }
 
+/// Does this verify cell require canonical parity on one backend?
+///
+/// A CI promotion is the load-bearing case, so it defaults to L2. Existing
+/// gates that intentionally retain the weaker Stripped comparator must say so
+/// with a backend-keyed false entry; exact key coverage makes a newly enabled
+/// backend fail validation until its bitwise parity setting is chosen. Manual cells keep the
+/// historical Stripped default unless they explicitly opt into parity.
+fn verify_asserts_bitwise_parity(spec: &Value, backend: &str) -> bool {
+    let declared = spec
+        .get("assert")
+        .and_then(Value::as_table)
+        .and_then(|assert| assert.get("bitwise_parity"));
+    match declared {
+        Some(Value::Boolean(value)) => *value,
+        Some(Value::Table(by_backend)) => by_backend
+            .get(backend)
+            .and_then(Value::as_bool)
+            .expect("backend-keyed parity assertion validated before emission"),
+        Some(_) => unreachable!("parity assertion type validated before emission"),
+        None => spec.get("ci").and_then(Value::as_bool) == Some(true),
+    }
+}
+
+/// Inject the single derived flag set into every verify mode before emitting
+/// harness JSON. The harness consumes this field for execution, receipts, and
+/// verdict enforcement, so those three views cannot disagree about L2 versus
+/// Stripped verification.
+fn attach_verify_flags(documents: &mut [Value]) {
+    for document in documents {
+        let Some(tests) = document.get_mut("test").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for test in tests {
+            let Some(verify) = test
+                .get_mut("modes")
+                .and_then(Value::as_table_mut)
+                .and_then(|modes| modes.get_mut("verify"))
+            else {
+                continue;
+            };
+            let backends = verify
+                .get("backends_enabled")
+                .and_then(Value::as_array)
+                .expect("verify backends validated before emission");
+            let flags = backends
+                .iter()
+                .map(|backend| {
+                    let backend = backend.as_str().expect("backend validated as a string");
+                    let values = if verify_asserts_bitwise_parity(verify, backend) {
+                        vec![
+                            Value::String("--verify-strict".to_owned()),
+                            Value::String("--verify-json".to_owned()),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    (backend.to_owned(), Value::Array(values))
+                })
+                .collect();
+            verify
+                .as_table_mut()
+                .expect("verify mode validated as a table")
+                .insert("verify_flags".to_owned(), Value::Table(flags));
+        }
+    }
+}
+
+/// Emit one line for every verify cell:
+/// `<test-id>\t<backend>\t<space-joined flags>`.
+///
+/// Keeping even the empty sets is fail-closed for other consumers: an absent
+/// test id means their view of the manifests is stale, not "use bare verify".
+fn verify_flags_tsv(documents: &[Value]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for document in documents {
+        let Some(tests) = document.get("test").and_then(Value::as_array) else {
+            continue;
+        };
+        for test in tests {
+            let id = test
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let Some(verify) = test
+                .get("modes")
+                .and_then(Value::as_table)
+                .and_then(|modes| modes.get("verify"))
+            else {
+                continue;
+            };
+            let backends = verify
+                .get("backends_enabled")
+                .and_then(Value::as_array)
+                .expect("verify backends validated before emission");
+            for backend in backends {
+                let backend = backend.as_str().expect("backend validated as a string");
+                let flags = if verify_asserts_bitwise_parity(verify, backend) {
+                    "--verify-strict --verify-json"
+                } else {
+                    ""
+                };
+                lines.push(format!("{id}\t{backend}\t{flags}"));
+            }
+        }
+    }
+    lines.sort();
+    lines
+}
+
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -668,12 +785,10 @@ fn validate_mode(
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
         "custom" => allowed.extend(["args", "assert"]),
-        // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
-        // cell from the lossy default comparator to the L2 parity comparator and
-        // requires the run's own verdict JSON to report parity. Without it a
-        // `verify` cell runs `--strict --verify` only, which per
-        // AGENTS.md "cannot establish L2" -- so a cell justified by a
-        // hand-measured `bitwise_parity: true` does not actually ratchet it.
+        // `verify` accepts one assertion: `bitwise_parity`. CI cells default to
+        // true, which selects canonical parity and requires the run's own
+        // verdict JSON to report it. Existing weaker gates must explicitly set
+        // false; manual cells retain the historical Stripped default.
         "verify" => allowed.push("assert"),
         _ => {}
     }
@@ -685,13 +800,6 @@ fn validate_mode(
                 &["bitwise_parity"],
                 &format!("{id}.modes.verify.assert"),
             );
-            if let Some(value) = assert.get("bitwise_parity") {
-                if value.as_bool().is_none() {
-                    die(format!(
-                        "{id}: modes.verify.assert.bitwise_parity must be a boolean"
-                    ));
-                }
-            }
         }
     }
     let ci = spec
@@ -738,6 +846,40 @@ fn validate_mode(
             "{id}: modes.{mode} must partition {:?}; enabled={enabled_set:?}, disabled={disabled_set:?}",
             expected
         ));
+    }
+    if mode == "verify" {
+        if let Some(value) = spec
+            .get("assert")
+            .and_then(Value::as_table)
+            .and_then(|assert| assert.get("bitwise_parity"))
+        {
+            match value {
+                Value::Boolean(true) => {}
+                Value::Boolean(false) => die(format!(
+                    "{id}: modes.verify.assert.bitwise_parity=false must be keyed by enabled \
+                     backend so a newly promoted backend cannot inherit Stripped"
+                )),
+                Value::Table(by_backend) => {
+                    let actual: BTreeSet<&str> = by_backend.keys().map(String::as_str).collect();
+                    if actual != enabled_set {
+                        die(format!(
+                            "{id}: modes.verify.assert.bitwise_parity backend keys must exactly \
+                             match enabled backends; assertion={actual:?}, enabled={enabled_set:?}"
+                        ));
+                    }
+                    for (backend, assertion) in by_backend {
+                        if assertion.as_bool().is_none() {
+                            die(format!(
+                                "{id}: modes.verify.assert.bitwise_parity.{backend} must be a boolean"
+                            ));
+                        }
+                    }
+                }
+                _ => die(format!(
+                    "{id}: modes.verify.assert.bitwise_parity must be true or a backend-keyed table"
+                )),
+            }
+        }
     }
     if let Some(guest_args) = spec.get("guest_args") {
         let guest_args = guest_args
@@ -1034,6 +1176,208 @@ liteinst = "unsupported"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].backend, "ptrace");
         assert!(rows[0].ci);
+    }
+
+    #[test]
+    fn ci_verify_defaults_to_bitwise_parity() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        assert!(verify_asserts_bitwise_parity(&spec, "ptrace"));
+    }
+
+    #[test]
+    fn explicit_false_preserves_a_stripped_gate() {
+        let spec = parse_mode(
+            r#"
+ci = true
+assert = { bitwise_parity = { ptrace = false } }
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        assert!(!verify_asserts_bitwise_parity(&spec, "ptrace"));
+    }
+
+    #[test]
+    fn manual_verify_keeps_stripped_default_and_can_request_parity() {
+        let default = parse_mode("ci = false\n");
+        let parity = parse_mode("ci = false\nassert = { bitwise_parity = true }\n");
+        assert!(!verify_asserts_bitwise_parity(&default, "ptrace"));
+        assert!(verify_asserts_bitwise_parity(&parity, "ptrace"));
+    }
+
+    #[test]
+    fn harness_flags_bracket_ci_default_and_explicit_opt_out() {
+        let mut documents = vec![parse_mode(
+            r#"
+[[test]]
+id = "bucket/default-l2"
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+
+[[test]]
+id = "bucket/explicit-stripped"
+[test.modes.verify]
+ci = true
+assert = { bitwise_parity = { ptrace = false } }
+backends_enabled = ["ptrace"]
+
+[[test]]
+id = "bucket/explicit-l2"
+[test.modes.verify]
+ci = false
+assert = { bitwise_parity = true }
+backends_enabled = ["ptrace"]
+
+[[test]]
+id = "bucket/manual-default"
+[test.modes.verify]
+ci = false
+backends_enabled = ["ptrace"]
+"#,
+        )];
+        attach_verify_flags(&mut documents);
+        let tests = documents[0].get("test").unwrap().as_array().unwrap();
+        let flags = |index: usize| {
+            tests[index]
+                .get("modes")
+                .unwrap()
+                .get("verify")
+                .unwrap()
+                .get("verify_flags")
+                .unwrap()
+                .get("ptrace")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|flag| flag.as_str().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flags(0), vec!["--verify-strict", "--verify-json"]);
+        assert!(flags(1).is_empty());
+        assert_eq!(flags(2), vec!["--verify-strict", "--verify-json"]);
+        assert!(flags(3).is_empty());
+    }
+
+    #[test]
+    fn verify_flag_transport_includes_strict_and_empty_rows() {
+        let documents = vec![parse_mode(
+            r#"
+[[test]]
+id = "bucket/l2"
+[test.modes.verify]
+ci = true
+backends_enabled = ["ptrace"]
+
+[[test]]
+id = "bucket/stripped"
+[test.modes.verify]
+ci = true
+assert = { bitwise_parity = { ptrace = false } }
+backends_enabled = ["ptrace"]
+"#,
+        )];
+        assert_eq!(
+            verify_flags_tsv(&documents),
+            vec![
+                "bucket/l2\tptrace\t--verify-strict --verify-json",
+                "bucket/stripped\tptrace\t",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "backend keys must exactly match enabled backends")]
+    fn rejects_new_backend_without_a_bitwise_parity_setting() {
+        let spec = parse_mode(
+            r#"
+ci = true
+assert = { bitwise_parity = { ptrace = false } }
+backends_enabled = ["ptrace", "dbt"]
+
+[backends_disabled]
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "backend keys must exactly match enabled backends")]
+    fn rejects_an_extra_backend_bitwise_parity_setting() {
+        let spec = parse_mode(
+            r#"
+ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false } }
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "false must be keyed by enabled backend")]
+    fn rejects_scalar_false_so_a_new_backend_cannot_inherit_stripped() {
+        let spec = parse_mode(
+            r#"
+ci = true
+assert = { bitwise_parity = false }
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     const REASON_BUCKET: &str = CI_REASON_REQUIRED_BUCKETS[0];

@@ -29,6 +29,7 @@ native = "The date-nanoseconds entry owns the native clock nondeterminism contro
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, liteinst = false } }
 backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "Enable after the ptrace baseline for direct C guests is trusted"
@@ -83,6 +84,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -243,6 +245,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -298,6 +301,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -353,6 +357,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -408,6 +413,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -463,6 +469,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -519,6 +526,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -574,6 +582,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -630,6 +639,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -686,6 +696,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -743,6 +754,7 @@ native = "The test asserts Hermit's virtualized process identity"
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, liteinst = false, sabre = false } }
 backends_enabled = ["ptrace", "liteinst", "sabre"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -796,6 +808,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -851,6 +864,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -906,6 +920,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -961,6 +976,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -1017,6 +1033,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -1072,6 +1089,7 @@ native = "The checkout byte count is deterministic by construction; this row est
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Qualify recursive du independently against the new ptrace golden baseline"
@@ -1127,6 +1145,7 @@ native = "The checkout path/size inventory is deterministic by construction; thi
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Qualify recursive find independently against the new ptrace golden baseline"
@@ -1179,6 +1198,7 @@ cflags = ["-O0", "-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Enable once measured on this backend; ptrace is the proven baseline"
@@ -1237,6 +1257,7 @@ cflags = ["-O0", "-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away"
@@ -1295,6 +1316,7 @@ cflags = ["-O0", "-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away"
@@ -1359,6 +1381,7 @@ native = "The guard asserts Hermit's virtual clock; the host clock is not the co
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Enable once the DBI post-exec clock path is qualified against the ptrace baseline"

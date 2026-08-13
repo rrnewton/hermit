@@ -27,9 +27,11 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitCode;
 
 use toml::Value;
@@ -237,6 +239,58 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
     format!("{guest} {rendered}")
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct VerifyFlags {
+    flags: Vec<String>,
+}
+
+fn parse_verify_flags(tsv: &str) -> BTreeMap<String, BTreeMap<String, VerifyFlags>> {
+    let mut flags: BTreeMap<String, BTreeMap<String, VerifyFlags>> = BTreeMap::new();
+    for line in tsv.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let id = fields.next().unwrap_or_default();
+        let backend = fields
+            .next()
+            .unwrap_or_else(|| fail(format!("verify-flags row has no backend: {line:?}")));
+        let words = fields
+            .next()
+            .unwrap_or_else(|| fail(format!("verify-flags row has no flag field: {line:?}")));
+        let previous = flags.entry(id.to_owned()).or_default().insert(
+            backend.to_owned(),
+            VerifyFlags {
+                flags: words.split_whitespace().map(str::to_owned).collect(),
+            },
+        );
+        if previous.is_some() {
+            fail(format!("duplicate verify-flags row for {id}/{backend}"));
+        }
+    }
+    flags
+}
+
+fn load_verify_flags(root: &Path) -> BTreeMap<String, BTreeMap<String, VerifyFlags>> {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "hermit-manifest-plan",
+            "--",
+            "--format",
+            "verify-flags",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|error| fail(format!("cannot run hermit-manifest-plan: {error}")));
+    if !output.status.success() {
+        fail(format!(
+            "hermit-manifest-plan --format verify-flags failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_verify_flags(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -245,6 +299,7 @@ fn hermit_command(
     seed: Option<i64>,
     extra: &[String],
     guest: &str,
+    verify: &VerifyFlags,
 ) -> String {
     let portable = lane == "portable";
     let profile = if portable {
@@ -252,9 +307,17 @@ fn hermit_command(
     } else {
         ""
     };
+    let mut verify_args = String::new();
+    for flag in &verify.flags {
+        verify_args.push(' ');
+        verify_args.push_str(&shell_quote(flag));
+        if flag == "--verify-json" {
+            verify_args.push_str(" \"$cell/verify.json\"");
+        }
+    }
     let command = match mode {
         "verify" => format!(
-            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{profile} -- {guest}",
+            "{RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{verify_args}{profile} -- {guest}",
             shell_quote(backend)
         ),
         "replay" => format!(
@@ -280,7 +343,16 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    format!("timeout --kill-after=10s {timeout}s {command}")
+    let command = format!("timeout --kill-after=10s {timeout}s {command}");
+    if mode == "verify" && verify.flags.iter().any(|flag| flag == "--verify-strict") {
+        format!(
+            "rm -f \"$cell/verify.json\" && {command} && \
+             jq -e '(.verified == true) and (.bitwise_parity == true)' \
+             \"$cell/verify.json\" >/dev/null"
+        )
+    } else {
+        command
+    }
 }
 
 fn repeat(command: &str, count: i64) -> String {
@@ -294,7 +366,12 @@ fn repeat(command: &str, count: i64) -> String {
     format!("for _run in {iterations}; do {command} || exit; done")
 }
 
-fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
+fn commands_for_test(
+    test: &Value,
+    bucket: &str,
+    verify_flags: &BTreeMap<String, BTreeMap<String, VerifyFlags>>,
+    mode_filter: Option<&str>,
+) -> Vec<String> {
     let id = test_id(test, bucket);
     let lane = test
         .get("lane")
@@ -312,8 +389,12 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
     let mut mode_names = modes.keys().map(String::as_str).collect::<Vec<_>>();
     mode_names.sort_unstable();
     let mut lines = Vec::new();
+    let empty_verify = VerifyFlags::default();
 
     for mode in mode_names {
+        if mode_filter.is_some_and(|filter| mode != filter) {
+            continue;
+        }
         let spec = &modes[mode];
         if mode == "naked" {
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
@@ -346,13 +427,25 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
         } else {
             vec![0]
         };
-
         for backend in backends {
+            let verify = if mode == "verify" {
+                verify_flags
+                    .get(&id)
+                    .and_then(|by_backend| by_backend.get(&backend))
+                    .unwrap_or_else(|| {
+                        fail(format!(
+                            "hermit-manifest-plan emitted no verify-flags row for {id}/{backend}"
+                        ))
+                    })
+            } else {
+                &empty_verify
+            };
             let guest_args = mode_guest_args(spec, mode, &backend, &id);
             let guest = guest_with_args(&guest, &guest_args);
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
-                let command = hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest);
+                let command =
+                    hermit_command(mode, &backend, lane, timeout, seed, &extra, &guest, verify);
                 let runs = match mode {
                     "chaos" => 2,
                     "custom" => custom_runs,
@@ -390,10 +483,9 @@ fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
         for mode in mode_names {
             let spec = &modes[mode];
             let backends = match spec.get("backends_enabled") {
-                Some(value) => string_array(
-                    Some(value),
-                    &format!("{id}.modes.{mode}.backends_enabled"),
-                ),
+                Some(value) => {
+                    string_array(Some(value), &format!("{id}.modes.{mode}.backends_enabled"))
+                }
                 None => continue,
             };
             for backend in backends {
@@ -411,14 +503,16 @@ fn guest_args_tsv(tests: &[(String, Value)]) -> Vec<String> {
 
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
 const USAGE: &str = "\
-Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
+Usage: manifest-to-commands.rs [-h|--help] [--guest-args] [--verify-test ID]
 
 Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
 TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
   --guest-args  Write nothing; print the declared per-backend guest arguments as
-                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
+                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.
+  --verify-test ID
+                Write nothing; print this test's verify commands on stdout.";
 
 /// Parse every manifest under `manifests`, validating schema and bucket naming,
 /// and return `(bucket, test)` pairs in file order.
@@ -477,15 +571,41 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
 
 fn main() -> ExitCode {
     rust_script_prelude::init();
-    if std::env::args().skip(1).any(|a| a == "-h" || a == "--help") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
-    if std::env::args().skip(1).any(|a| a == "--guest-args") {
+    if args.iter().any(|a| a == "--guest-args") {
         for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
             println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let selected_test = args
+        .iter()
+        .position(|arg| arg == "--verify-test")
+        .map(|index| {
+            args.get(index + 1)
+                .cloned()
+                .unwrap_or_else(|| fail("--verify-test requires an ID"))
+        });
+    if let Some(id) = selected_test {
+        let verify_flags = load_verify_flags(&root);
+        let mut found = false;
+        for (bucket, test) in load_manifest_tests(&manifests) {
+            if test_id(&test, &bucket) != id {
+                continue;
+            }
+            found = true;
+            for line in commands_for_test(&test, &bucket, &verify_flags, Some("verify")) {
+                println!("{line}");
+            }
+        }
+        if !found {
+            fail(format!("no manifest test with id {id}"));
         }
         return ExitCode::SUCCESS;
     }
@@ -503,9 +623,10 @@ fn main() -> ExitCode {
         }
     }
 
+    let verify_flags = load_verify_flags(&root);
     let mut by_bucket: Vec<(String, Vec<String>)> = Vec::new();
     for (bucket, test) in load_manifest_tests(&manifests) {
-        let lines = commands_for_test(&test, &bucket);
+        let lines = commands_for_test(&test, &bucket, &verify_flags, None);
         match by_bucket.iter_mut().find(|(name, _)| name == &bucket) {
             Some((_, existing)) => existing.extend(lines),
             None => by_bucket.push((bucket, lines)),
@@ -629,6 +750,44 @@ guest_args = { ptrace = ["multi"] }
         );
         let spec = &tests[0].1["modes"]["verify"];
         assert!(mode_guest_args(spec, "verify", "kvm", "c-programs/partial").is_empty());
+    }
+
+    #[test]
+    fn canonical_flags_and_typed_verdict_reach_generated_command() {
+        let flags = parse_verify_flags(
+            "c-programs/l2\tptrace\t--verify-strict --verify-json\n\
+             c-programs/stripped\tptrace\t\n",
+        );
+        let command = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "\"$cell/guest\"",
+            &flags["c-programs/l2"]["ptrace"],
+        );
+        assert!(command.contains(
+            "--verify --verify-strict --verify-json \"$cell/verify.json\" \
+             --no-virtualize-cpuid"
+        ));
+        assert!(command.contains("rm -f \"$cell/verify.json\" && timeout"));
+        assert!(command.contains("(.bitwise_parity == true)"));
+
+        let stripped = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "\"$cell/guest\"",
+            &flags["c-programs/stripped"]["ptrace"],
+        );
+        assert!(!stripped.contains("--verify-strict"));
+        assert!(!stripped.contains("verify.json"));
+        assert!(!stripped.contains("bitwise_parity"));
     }
 
     /// The TSV dump is the out-of-tree harness's only source for these

@@ -82,17 +82,27 @@ The mode contracts are:
 
 | Mode | Contract |
 | --- | --- |
-| `verify` | Run each enabled backend with `hermit run --strict --verify` |
+| `verify` | Run each enabled backend with canonical parity in CI; manual cells default to Stripped |
 | `chaos` | Search declared seeds and require cross-seed diversity plus exact within-seed reproduction |
 | `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
-An enabled `verify` cell records backend-local Stripped equality under the
-manifest's declared status/stdout/stderr/artifact observation. It is not L2 and
-is not, by itself, a full cross-backend parity claim. Full parity additionally
-requires matching the complete INFO trace, `--detlog-stack`, and
-`--detlog-heap` between backends.
+A CI-enabled `verify` cell defaults to canonical parity: the harness adds
+`--verify-strict --verify-json` and requires the run's own verdict to report
+`bitwise_parity: true`. A backend may retain the weaker Stripped comparator only
+with an explicit setting such as
+`assert = { bitwise_parity = { ptrace = false } }`. The table keys must exactly
+match `backends_enabled`, so adding a backend without choosing its setting is
+refused instead of silently inheriting Stripped. Existing Stripped gates carry
+those settings so their coverage is preserved and remains visibly weaker;
+changing one to true is a real promotion that must pass canonical parity.
+Manual `ci = false` cells keep the Stripped default unless they explicitly set
+`bitwise_parity = true`.
+
+This is backend-local evidence and is not, by itself, a full cross-backend
+parity claim. Full parity additionally requires matching the complete INFO
+trace, `--detlog-stack`, and `--detlog-heap` between backends.
 
 An enabled SaBRe cell has an additional execution-path contract. Every E2E
 Hermit execution writes structured evidence into the cell capture: the

@@ -384,6 +384,8 @@ function load_tests {
         [[ -z ${TEST_BY_ID[$id]+x} ]] || die "duplicate test id: $id"
         [[ -z ${ID_BY_TEST[$test]+x} ]] || die "program appears in multiple tests: $relative"
         metadata=$(normalize_metadata <<<"$raw")
+        verify_flags_metadata_valid "$metadata" ||
+            die "$id: generated verify flags do not exactly cover enabled backends"
         kind=$(jq -r .program_kind <<<"$metadata")
         if [[ $kind == shell ]]; then
             [[ -x $test ]] || die "program is not executable: $relative"
@@ -2592,10 +2594,36 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the L2 parity assertion?
-function verify_asserts_bitwise_parity {
+# The extra Hermit flags derived by hermit-manifest-plan for this verify cell.
+function verify_flags {
+    local metadata=$1 backend=$2
+    jq -r --arg backend "$backend" '.modes.verify.verify_flags[$backend][]?' <<<"$metadata"
+}
+
+# Refuse a planner/consumer mismatch before any command construction. Exact
+# backend keys matter: treating a missing key as an empty array would silently
+# turn a promoted backend into Stripped verification.
+function verify_flags_metadata_valid {
     local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+    jq -e '
+        (.modes.verify.backends | sort) as $enabled
+        | (.modes.verify.verify_flags // null) as $flags
+        | ($flags | type) == "object"
+          and (($flags | keys | sort) == $enabled)
+          and all($flags[];
+              type == "array"
+              and (. == [] or . == ["--verify-strict", "--verify-json"]))
+    ' <<<"$metadata" >/dev/null
+}
+
+# Does this test's verify mode execute the L2 parity assertion? Key off the
+# derived flags that execution and receipts consume, not a second reading of
+# the raw manifest declaration.
+function verify_asserts_bitwise_parity {
+    local metadata=$1 backend=$2
+    jq -r --arg backend "$backend" \
+        '[.modes.verify.verify_flags[$backend][]?] | index("--verify-strict") != null' \
+        <<<"$metadata"
 }
 
 # Where a verify attempt writes its machine-readable verdict.
@@ -2628,6 +2656,82 @@ function assert_bitwise_parity_verdict {
     fi
     printf 'L2 parity: %s\n' "$summary"
     return 0
+}
+
+# Bracket the consumer side of the derived verify flags without running a
+# guest. The strict flag must activate typed-verdict enforcement, the explicit
+# Stripped opt-out must not claim L2, and a Stripped verdict must be refused by
+# the parity reader while a genuine canonical verdict is accepted.
+function verify_parity_selftest {
+    local scratch strict_metadata stripped_metadata missing_backend_metadata
+    scratch=$(mktemp -d)
+    strict_metadata='{"id":"strict","modes":{"verify":{"backends":["ptrace"],"verify_flags":{"ptrace":["--verify-strict","--verify-json"]}}}}'
+    stripped_metadata='{"id":"stripped","modes":{"verify":{"backends":["ptrace"],"verify_flags":{"ptrace":[]}}}}'
+    missing_backend_metadata='{"id":"missing","modes":{"verify":{"backends":["ptrace"],"verify_flags":{}}}}'
+
+    verify_flags_metadata_valid "$strict_metadata" ||
+        die "verify parity self-test rejected canonical planner output"
+    verify_flags_metadata_valid "$stripped_metadata" ||
+        die "verify parity self-test rejected an explicit Stripped setting"
+    if verify_flags_metadata_valid "$missing_backend_metadata"; then
+        die "verify parity self-test accepted a missing backend flag entry as Stripped"
+    fi
+
+    [[ $(verify_asserts_bitwise_parity "$strict_metadata" ptrace) == true ]] || {
+        rm -rf "$scratch"
+        die "verify parity self-test lost the canonical flag"
+    }
+    [[ $(verify_asserts_bitwise_parity "$stripped_metadata" ptrace) == false ]] || {
+        rm -rf "$scratch"
+        die "verify parity self-test promoted the Stripped opt-out"
+    }
+
+    printf '%s\n' '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":12,"right":12}}' >"$scratch/canonical.json"
+    printf '%s\n' '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":12,"right":12}}' >"$scratch/stripped.json"
+    assert_bitwise_parity_verdict "$scratch/canonical.json" >/dev/null || {
+        rm -rf "$scratch"
+        die "verify parity self-test rejected canonical parity"
+    }
+    if assert_bitwise_parity_verdict "$scratch/stripped.json" >/dev/null; then
+        rm -rf "$scratch"
+        die "verify parity self-test accepted a Stripped verdict as L2"
+    fi
+    rm -rf "$scratch"
+    echo "PASS: verify parity bracket (canonical accepted 1/1; Stripped refused 1/1; missing backend refused 1/1)"
+}
+
+# Exercise both documented command consumers against the live manifest-plan
+# derivation. This is deliberately deletion-sensitive: if either consumer
+# stops loading the derived flags, its real output loses the strict flags or
+# typed-verdict check and this gate fails.
+function audit_verify_flag_consumers {
+    local l2_id=c-programs/pause-alarm-interrupt
+    local stripped_id=c-programs/add-key-enosys
+    local cli_l2 cli_stripped flat_l2 flat_stripped output
+    cli_l2=$("$ROOT_DIR/tests/manifest-cli.rs" get "$l2_id" --mode verify --backend ptrace)
+    cli_stripped=$("$ROOT_DIR/tests/manifest-cli.rs" get "$stripped_id" --mode verify --backend ptrace)
+    flat_l2=$("$ROOT_DIR/scripts/manifest-to-commands.rs" --verify-test "$l2_id")
+    flat_stripped=$("$ROOT_DIR/scripts/manifest-to-commands.rs" --verify-test "$stripped_id")
+
+    for output in "$cli_l2" "$flat_l2"; do
+        [[ $(grep -Foc -- '--verify-strict' <<<"$output") == 1 ]] ||
+            die "L2 command consumer lost --verify-strict"
+        [[ $(grep -Foc -- '--verify-json' <<<"$output") == 1 ]] ||
+            die "L2 command consumer lost --verify-json"
+        [[ $(grep -Foc -- 'rm -f "$cell/verify.json"' <<<"$output") == 1 ]] ||
+            die "L2 command consumer can reuse a stale parity verdict"
+        [[ $(grep -Foc -- '(.bitwise_parity == true)' <<<"$output") == 1 ]] ||
+            die "L2 command consumer lost the typed-verdict check"
+    done
+    for output in "$cli_stripped" "$flat_stripped"; do
+        [[ $(grep -Foc -- '--verify-strict' <<<"$output" || true) == 0 ]] ||
+            die "Stripped command consumer silently claimed canonical parity"
+        [[ $(grep -Foc -- '--verify-json' <<<"$output" || true) == 0 ]] ||
+            die "Stripped command consumer emitted an unearned parity verdict"
+        [[ $(grep -Foc -- '(.bitwise_parity == true)' <<<"$output" || true) == 0 ]] ||
+            die "Stripped command consumer applied the L2 verdict reader"
+    done
+    echo "PASS: manifest command consumers preserve L2 2/2 and Stripped 2/2"
 }
 
 function execute_attempt {
@@ -2706,16 +2810,20 @@ function execute_attempt {
         verify)
             # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
             # which normalizes numbers/addresses/paths away wholesale and so
-            # "cannot establish L2" (AGENTS.md). A cell that opts into
-            # `assert = { bitwise_parity = true }` is upgraded to the canonical
-            # parity comparator and made to emit a machine-readable verdict, which
-            # run_cell then checks -- otherwise the cell would be justified by a
-            # parity measurement it never actually performs.
-            local verify_strict_flags=()
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict --verify-json
-                    "$(verify_verdict_path "$cell_dir" "$attempt")")
-            fi
+            # "cannot establish L2" (AGENTS.md). hermit-manifest-plan derives
+            # the canonical flags for CI by default; only an explicit false
+            # opt-out leaves this array empty. run_cell checks the resulting
+            # machine-readable verdict whenever the strict flags are present.
+            local -a verify_strict_flags=()
+            local flag verify_lines
+            verify_lines=$(verify_flags "$metadata" "$backend") ||
+                die "$id/$backend: cannot read generated verify flags"
+            while IFS= read -r flag; do
+                [[ -n $flag ]] || continue
+                verify_strict_flags+=("$flag")
+                [[ $flag == --verify-json ]] &&
+                    verify_strict_flags+=("$(verify_verdict_path "$cell_dir" "$attempt")")
+            done <<<"$verify_lines"
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
                 "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
@@ -2790,9 +2898,10 @@ function append_result {
             # bare `--strict --verify` for a cell that ran the parity comparator
             # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
+                --argjson extra "$(jq -c --arg backend "$backend" \
+                    '[.modes.verify.verify_flags[$backend][]]' \
+                    <<<"${METADATA_BY_ID[$test_id]}")" \
+                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"] + $extra')
             log_level=info
             ;;
         replay)
@@ -3107,7 +3216,7 @@ function run_cell {
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
-        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata" "$backend") == true ]]; then
             # A zero exit only means the comparator this run used was satisfied.
             # For an L2 cell, read the verdict the run itself published and
             # require full parity; anything else is a FAIL, not a PASS.
@@ -3288,6 +3397,8 @@ case "$subcommand" in
         (($# == 0)) || true
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
+        verify_parity_selftest
+        audit_verify_flag_consumers
         audit_immutable_hermit_binary
         audit_test_binary_registration
         audit_guest_launch_classification_contract

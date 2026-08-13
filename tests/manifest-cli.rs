@@ -39,6 +39,7 @@
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -121,6 +122,58 @@ fn test_id(test: &Value, bucket: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| fail(format!("{bucket}: [[test]] is missing `id`")))
         .to_owned()
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct VerifyFlags {
+    flags: Vec<String>,
+}
+
+fn parse_verify_flags(tsv: &str) -> BTreeMap<String, BTreeMap<String, VerifyFlags>> {
+    let mut flags: BTreeMap<String, BTreeMap<String, VerifyFlags>> = BTreeMap::new();
+    for line in tsv.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let id = fields.next().unwrap_or_default();
+        let backend = fields
+            .next()
+            .unwrap_or_else(|| fail(format!("verify-flags row has no backend: {line:?}")));
+        let words = fields
+            .next()
+            .unwrap_or_else(|| fail(format!("verify-flags row has no flag field: {line:?}")));
+        let previous = flags.entry(id.to_owned()).or_default().insert(
+            backend.to_owned(),
+            VerifyFlags {
+                flags: words.split_whitespace().map(str::to_owned).collect(),
+            },
+        );
+        if previous.is_some() {
+            fail(format!("duplicate verify-flags row for {id}/{backend}"));
+        }
+    }
+    flags
+}
+
+fn load_verify_flags(root: &Path) -> BTreeMap<String, BTreeMap<String, VerifyFlags>> {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "hermit-manifest-plan",
+            "--",
+            "--format",
+            "verify-flags",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|error| fail(format!("cannot run hermit-manifest-plan: {error}")));
+    if !output.status.success() {
+        fail(format!(
+            "hermit-manifest-plan --format verify-flags failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_verify_flags(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Build the shell setup prefix (compile/prepare the guest) and return the
@@ -231,6 +284,7 @@ fn hermit_command(
     log: &str,
     extra: &[String],
     guest: &str,
+    verify: &VerifyFlags,
 ) -> String {
     let portable = lane == "portable";
     let profile: Vec<String> = if portable {
@@ -243,7 +297,14 @@ fn hermit_command(
     };
     let be = shell_quote(backend);
     let extra_joined = {
-        let mut all: Vec<String> = profile;
+        let mut all = Vec::new();
+        for flag in &verify.flags {
+            all.push(shell_quote(flag));
+            if flag == "--verify-json" {
+                all.push("\"$cell/verify.json\"".to_owned());
+            }
+        }
+        all.extend(profile);
         all.extend(extra.iter().map(|x| shell_quote(x)));
         let joined = all.join(" ");
         if joined.is_empty() {
@@ -276,7 +337,16 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    format!("timeout --kill-after=10s {timeout}s {command}")
+    let command = format!("timeout --kill-after=10s {timeout}s {command}");
+    if mode == "verify" && verify.flags.iter().any(|flag| flag == "--verify-strict") {
+        format!(
+            "rm -f \"$cell/verify.json\" && {command} && \
+             jq -e '(.verified == true) and (.bitwise_parity == true)' \
+             \"$cell/verify.json\" >/dev/null"
+        )
+    } else {
+        command
+    }
 }
 
 /// Default `--log` level per mode, matching the CI expansion (`off` for chaos,
@@ -288,6 +358,7 @@ fn default_log(mode: &str) -> &'static str {
 struct Manifests {
     /// (bucket, test-value) for every [[test]] across all manifests, sorted.
     tests: Vec<(String, Value)>,
+    verify_flags: BTreeMap<String, BTreeMap<String, VerifyFlags>>,
 }
 
 fn load_manifests(root: &Path) -> Manifests {
@@ -337,7 +408,10 @@ fn load_manifests(root: &Path) -> Manifests {
             tests.push((bucket.clone(), test.clone()));
         }
     }
-    Manifests { tests }
+    Manifests {
+        tests,
+        verify_flags: load_verify_flags(root),
+    }
 }
 
 fn modes_table<'a>(test: &'a Value, id: &str) -> &'a toml::map::Map<String, Value> {
@@ -597,7 +671,12 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
     (mode, backend, lane, timeout)
 }
 
-fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
+fn build_full_command(
+    manifests: &Manifests,
+    test: &Value,
+    id: &str,
+    args: &Args,
+) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
     let (setup, guest) = setup_prefix(test, id);
     let log = args
@@ -620,6 +699,20 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     } else {
         None
     };
+    let empty_verify = VerifyFlags::default();
+    let verify = if mode == "verify" {
+        manifests
+            .verify_flags
+            .get(id)
+            .and_then(|by_backend| by_backend.get(&backend))
+            .unwrap_or_else(|| {
+                fail(format!(
+                    "hermit-manifest-plan emitted no verify-flags row for {id}/{backend}"
+                ))
+            })
+    } else {
+        &empty_verify
+    };
     let run = if mode == "naked" {
         format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}")
     } else {
@@ -633,6 +726,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             &log,
             &args.passthrough,
             &guest,
+            verify,
         )
     };
     let full = format!("{setup} && {run}");
@@ -661,14 +755,14 @@ fn cmd_get(manifests: &Manifests, args: &Args) -> ExitCode {
                     sub.flags.push(("lane".to_owned(), Some(l.to_owned())));
                 }
                 sub.positional.push(id.clone());
-                let (full, mode, backend) = build_full_command(test, id, &sub);
+                let (full, mode, backend) = build_full_command(manifests, test, id, &sub);
                 println!("# {id} mode={mode} backend={backend}");
                 println!("{full}\n");
             }
         }
         return ExitCode::SUCCESS;
     }
-    let (full, mode, backend) = build_full_command(test, id, args);
+    let (full, mode, backend) = build_full_command(manifests, test, id, args);
     println!("# {id} mode={mode} backend={backend}");
     println!("{full}");
     ExitCode::SUCCESS
@@ -680,7 +774,7 @@ fn cmd_run(manifests: &Manifests, args: &Args, root: &Path) -> ExitCode {
         .first()
         .unwrap_or_else(|| fail("run: missing <test-id>"));
     let test = find_test(manifests, id);
-    let (full, mode, backend) = build_full_command(test, id, args);
+    let (full, mode, backend) = build_full_command(manifests, test, id, args);
     eprintln!("manifest-cli: running {id} mode={mode} backend={backend}");
     eprintln!("manifest-cli: $ {full}");
     let status = Command::new("sh")
@@ -756,5 +850,52 @@ fn main() -> ExitCode {
             eprintln!("manifest-cli: unknown subcommand `{other}`\n");
             usage();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_flags_and_typed_verdict_reach_front_door_command() {
+        let flags = parse_verify_flags(
+            "c-programs/l2\tptrace\t--verify-strict --verify-json\n\
+             c-programs/stripped\tptrace\t\n",
+        );
+        let command = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "info",
+            &[],
+            "\"$cell/guest\"",
+            &flags["c-programs/l2"]["ptrace"],
+        );
+        assert!(command.contains(
+            "--verify --verify-strict --verify-json \"$cell/verify.json\" \
+             --no-virtualize-cpuid"
+        ));
+        assert!(command.contains("rm -f \"$cell/verify.json\" && timeout"));
+        assert!(command.contains("(.bitwise_parity == true)"));
+
+        let stripped = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            "info",
+            &[],
+            "\"$cell/guest\"",
+            &flags["c-programs/stripped"]["ptrace"],
+        );
+        assert!(!stripped.contains("--verify-strict"));
+        assert!(!stripped.contains("verify.json"));
+        assert!(!stripped.contains("bitwise_parity"));
     }
 }

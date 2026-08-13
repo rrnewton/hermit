@@ -74,6 +74,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -288,6 +289,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1167,6 +1169,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1327,6 +1330,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -1885,6 +1889,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2111,6 +2116,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2164,6 +2170,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -2271,6 +2278,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false, dbt = false, sabre = false } }
 backends_enabled = ["ptrace", "dbt", "sabre"]
 [test.modes.verify.backends_disabled]
 kvm = "Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"
@@ -5368,6 +5376,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"
