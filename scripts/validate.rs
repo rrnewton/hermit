@@ -3875,6 +3875,8 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         cpu_timeout: 10,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     };
     let requirements: BTreeMap<String, HostCapability> =
         [("cpuid.faulting".to_string(), HostCapability::CpuidFaulting)].into_iter().collect();
