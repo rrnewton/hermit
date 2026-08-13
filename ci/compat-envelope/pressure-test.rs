@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Safely retry compatibility cells outside Hermit's committed green envelope.
 //!
 //! ```cargo

@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Keep Hermit's compatibility scorecard derived from the E2E manifest and
 //! verify that a validate run produced a fresh passing row for every selected
 //! regression cell.

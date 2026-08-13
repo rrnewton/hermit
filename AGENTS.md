@@ -116,7 +116,10 @@ and the reason is documented.
 ## Script Convention
 
 - Project scripts use rust-script as `.rs` files with the shebang
-  `#!/usr/bin/env rust-script`.
+  `#!/usr/bin/env -S rust-script --force`. The `--force` flag delegates included-module
+  and local-path dependency freshness to Cargo instead of rust-script's main-file-only
+  executable cache. This convention requires an `env` implementation with `-S` support
+  (GNU coreutils 8.30 or newer on supported Linux hosts).
 - Prefer rust-script over Python for all new scripts.
 - `scripts/` is reserved for repository-wide utilities. Co-locate actions over
   a directory's data with that directory; see `docs/DIRECTORY_ACTIONS.md`.

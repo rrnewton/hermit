@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Copyright (c) Meta Platforms, Inc. and affiliates.
 //! All rights reserved.
 //!
@@ -25,7 +25,7 @@
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude;
 
 use std::fs;
 use std::path::Path;

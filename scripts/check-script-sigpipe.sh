@@ -10,9 +10,11 @@
 # Every standalone Hermit rust-script calls `rust_script_prelude::init` so that
 # a downstream reader closing the pipe early (`prog | head`) terminates the
 # producer cleanly instead of panicking or exiting 141 (which would fail any
-# `set -o pipefail` pipeline). This guard compiles a tiny fixture that uses the
-# real prelude with a plain `rustc` (no rust-script dependency in CI) and
-# asserts the pipeline is clean.
+# `set -o pipefail` pipeline). This guard compiles a tiny fixture with plain
+# `rustc`, asserts the pipeline is clean, and requires every tracked rust-script
+# entrypoint to use `rust-script --force`. The forced Cargo check is cheap on a
+# warm build and makes Cargo, rather than a separate cache-key protocol, track
+# included modules and local path dependencies.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +23,7 @@ cd "$ROOT_DIR"
 fixture="scripts/lib/tests/sigpipe_smoke.rs"
 [[ -f $fixture ]] || { echo "check-script-sigpipe.sh: missing $fixture" >&2; exit 2; }
 command -v rustc >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: rustc is required" >&2; exit 2; }
+command -v realpath >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: realpath is required" >&2; exit 2; }
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -54,8 +57,48 @@ fi
 
 echo "check-script-sigpipe.sh: OK — SIGPIPE from an early consumer exits cleanly (0)"
 
-# rust-script's freshness check ignores #[path]-included modules, so a prelude
-# edit does not bust consumer caches unless each consumer's bytes also change.
-# The cache-key stamp enforces that; verify it is current here so a forgotten
-# restamp fails the same guard that protects the prelude's SIGPIPE contract.
-"$ROOT_DIR/scripts/lib/prelude-cache-key.sh" --check
+tracked="$(git ls-files -- '*.rs')" || {
+    echo "check-script-sigpipe.sh: cannot enumerate tracked Rust sources" >&2
+    exit 2
+}
+consumers=0
+while IFS= read -r source; do
+    [[ -n $source ]] || continue
+    IFS= read -r first <"$source" || {
+        echo "check-script-sigpipe.sh: cannot read $source" >&2
+        exit 2
+    }
+    case "$first" in
+        '#!/usr/bin/env -S rust-script --force')
+            [[ $(grep -Ec '^[[:space:]]*mod[[:space:]]+rust_script_prelude[[:space:]]*;' "$source") == 1 &&
+               $(awk '
+                   $0 ~ /^[[:space:]]*fn[[:space:]]+main\(\)([[:space:]]*->[[:space:]]*[^{}]+)?[[:space:]]*\{[[:space:]]*$/ { mains++ }
+                   previous ~ /^[[:space:]]*fn[[:space:]]+main\(\)([[:space:]]*->[[:space:]]*[^{}]+)?[[:space:]]*\{[[:space:]]*$/ &&
+                       $0 ~ /^[[:space:]]*rust_script_prelude::init\(\);[[:space:]]*$/ { count++ }
+                   { previous = $0 }
+                   END { print (mains + 0) ":" (count + 0) }
+               ' "$source") == "1:1" ]] || {
+                echo "check-script-sigpipe.sh: $source must have one main and initialize rust_script_prelude as its first statement" >&2
+                exit 1
+            }
+            path_line="$(grep -B1 -m1 -E '^[[:space:]]*mod[[:space:]]+rust_script_prelude[[:space:]]*;' "$source" | head -n1)"
+            prelude_relative="$(printf '%s\n' "$path_line" | sed -n 's/^[[:space:]]*#\[path = "\([^"]*\)"\][[:space:]]*$/\1/p')"
+            if [[ -z $prelude_relative ||
+                  $(realpath -- "$(dirname -- "$source")/$prelude_relative") != "$ROOT_DIR/scripts/lib/rust_script_prelude.rs" ]]; then
+                echo "check-script-sigpipe.sh: $source must bind rust_script_prelude to scripts/lib/rust_script_prelude.rs" >&2
+                exit 1
+            fi
+            consumers=$((consumers + 1))
+            ;;
+        *rust-script*)
+            echo "check-script-sigpipe.sh: $source can reuse stale code: $first" >&2
+            echo "  Use: #!/usr/bin/env -S rust-script --force" >&2
+            exit 1
+            ;;
+    esac
+done <<<"$tracked"
+((consumers > 0)) || {
+    echo "check-script-sigpipe.sh: no tracked rust-script entrypoints found" >&2
+    exit 2
+}
+echo "check-script-sigpipe.sh: OK — $consumers tracked rust-script entrypoint(s) force Cargo freshness"
