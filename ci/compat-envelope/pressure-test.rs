@@ -7,7 +7,6 @@
 //! safe-ci-dag-runner = { path = "../../agent-utils/rs/safe-ci-dag-runner" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! toml = "0.8"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -37,7 +36,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use toml::Value as TomlValue;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
@@ -383,10 +381,18 @@ impl FreshCheckout {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CellBudget {
     timeout_seconds: i64,
     attempts: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestBudgetRow {
+    test: String,
+    mode: String,
+    timeout_seconds: i64,
+    attempts: JsonValue,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1089,68 +1095,80 @@ fn sample_score(cell: &CellId, seed: u64) -> u64 {
 }
 
 fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, String> {
-    let manifest_dir = root.join("tests/e2e/manifests");
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&manifest_dir)
-        .map_err(|e| format!("cannot list {}: {e}", manifest_dir.display()))?
-    {
-        let path = entry
-            .map_err(|e| format!("cannot read manifest entry: {e}"))?
-            .path();
-        if path.extension().and_then(|value| value.to_str()) == Some("toml") {
-            paths.push(path);
-        }
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "hermit-manifest-plan",
+            "--",
+            "--format",
+            "matrix-json",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot run hermit-manifest-plan: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hermit-manifest-plan failed while loading execution budgets:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    paths.sort();
-    let mut out = BTreeMap::new();
-    for path in paths {
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let document: TomlValue = text
-            .parse()
-            .map_err(|e| format!("invalid TOML in {}: {e}", path.display()))?;
-        let tests = document
-            .get("test")
-            .and_then(TomlValue::as_array)
-            .ok_or_else(|| format!("{} has no [[test]] array", path.display()))?;
-        for test in tests {
-            let id = test
-                .get("id")
-                .and_then(TomlValue::as_str)
-                .ok_or_else(|| format!("{} has a test without id", path.display()))?;
-            let timeout_seconds = test
-                .get("timeout_seconds")
-                .and_then(TomlValue::as_integer)
-                .ok_or_else(|| format!("{id} has no timeout_seconds"))?;
-            let modes = test
-                .get("modes")
-                .and_then(TomlValue::as_table)
-                .ok_or_else(|| format!("{id} has no modes table"))?;
-            for (mode, spec) in modes {
-                let attempts = match mode.as_str() {
-                    "verify" | "replay" => Some(1),
-                    "naked" => spec.get("runs").and_then(TomlValue::as_integer).or(Some(3)),
-                    "custom" => spec
-                        .get("assert")
-                        .and_then(TomlValue::as_table)
-                        .and_then(|assert| assert.get("runs"))
-                        .and_then(TomlValue::as_integer)
-                        .or(Some(1)),
-                    "chaos" => spec
-                        .get("seeds")
-                        .and_then(TomlValue::as_array)
-                        .filter(|seeds| !seeds.is_empty())
-                        .map(|seeds| seeds.len() as i64 * 2),
-                    other => return Err(format!("{id} has unknown mode `{other}`")),
-                };
-                out.insert(
-                    (id.to_string(), mode.to_string()),
-                    CellBudget {
-                        timeout_seconds,
-                        attempts,
-                    },
-                );
+    decode_budgets(&output.stdout)
+}
+
+fn decode_budgets(
+    matrix_json: &[u8],
+) -> Result<BTreeMap<(String, String), CellBudget>, String> {
+    let rows: Vec<ManifestBudgetRow> = serde_json::from_slice(matrix_json)
+        .map_err(|e| format!("manifest-plan emitted invalid matrix JSON: {e}"))?;
+    if rows.is_empty() {
+        return Err("manifest-plan emitted an empty matrix".into());
+    }
+    let mut out: BTreeMap<(String, String), CellBudget> = BTreeMap::new();
+    for row in rows {
+        if !(1..=1800).contains(&row.timeout_seconds) {
+            return Err(format!(
+                "manifest-plan emitted timeout {} outside 1..=1800 for {}/{}",
+                row.timeout_seconds, row.test, row.mode
+            ));
+        }
+        let attempts = if row.attempts.is_null() {
+            None
+        } else {
+            Some(row.attempts.as_i64().ok_or_else(|| {
+                format!(
+                    "manifest-plan emitted a non-integer attempt count for {}/{}",
+                    row.test, row.mode
+                )
+            })?)
+        };
+        if attempts.is_none() && row.mode != "chaos" {
+            return Err(format!(
+                "manifest-plan emitted no attempt count for non-chaos mode {}/{}",
+                row.test, row.mode
+            ));
+        }
+        if attempts.is_some_and(|attempts| attempts <= 0) {
+            return Err(format!(
+                "manifest-plan emitted a nonpositive attempt count for {}/{}",
+                row.test, row.mode
+            ));
+        }
+        let key = (row.test, row.mode);
+        let budget = CellBudget {
+            timeout_seconds: row.timeout_seconds,
+            attempts,
+        };
+        if let Some(existing) = out.get(&key) {
+            if existing != &budget {
+                return Err(format!(
+                    "manifest-plan emitted conflicting execution budgets for {}/{}",
+                    key.0, key.1
+                ));
             }
+        } else {
+            out.insert(key, budget);
         }
     }
     Ok(out)
@@ -2725,6 +2743,41 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn self_test(root: &Path) -> Result<(), String> {
+    let explicit_null = decode_budgets(
+        br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90,"attempts":null}]"#,
+    )?;
+    if explicit_null
+        .get(&("fixture/test".into(), "chaos".into()))
+        .is_none_or(|budget| budget.attempts.is_some())
+    {
+        return Err("explicit null chaos attempts must remain unavailable".into());
+    }
+    for (matrix, expected) in [
+        (
+            br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90}]"#.as_slice(),
+            "missing field `attempts`",
+        ),
+        (
+            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":90,"attempts":null}]"#.as_slice(),
+            "no attempt count for non-chaos mode",
+        ),
+        (
+            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":1801,"attempts":1}]"#.as_slice(),
+            "outside 1..=1800",
+        ),
+        (
+            br#"[{"test":"fixture/test","mode":"verify","timeout_seconds":90,"attempts":1},{"test":"fixture/test","mode":"verify","timeout_seconds":91,"attempts":1}]"#.as_slice(),
+            "conflicting execution budgets",
+        ),
+    ] {
+        let error = decode_budgets(matrix).expect_err("invalid matrix budget must refuse");
+        if !error.contains(expected) {
+            return Err(format!(
+                "invalid matrix budget refused for the wrong reason: {error:?}; expected {expected:?}"
+            ));
+        }
+    }
+
     let manifest_budgets = load_budgets(root)?;
     let omitted_naked_runs = manifest_budgets
         .get(&("applications/timed-progress-bar".into(), "naked".into()))

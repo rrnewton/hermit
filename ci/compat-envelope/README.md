@@ -25,9 +25,13 @@ the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format
 matrix-json` emits both sides of each manifest's required enabled/disabled
-partition. A disabled combination is red; a cell that cannot run is not green.
-The existing `--format json` and text views remain enabled-only because they
-are execution plans rather than scorecards.
+partition. It also emits the validated per-test timeout and the number of
+`execute_attempt` calls the existing harness makes for each mode. A seedless
+chaos mode has `attempts: null`: it remains red but has no command to run. The
+pressure-test entry point consumes this output instead of parsing the manifest
+a second way. A disabled combination is red; a cell that cannot run is not
+green. The existing `--format json` and text views remain enabled-only because
+they are execution plans rather than scorecards.
 
 ## Ordinary validation
 

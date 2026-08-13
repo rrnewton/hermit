@@ -36,6 +36,8 @@ struct PlanRow {
     backend: String,
     ci: bool,
     enabled: bool,
+    timeout_seconds: i64,
+    attempts: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +198,8 @@ fn main() {
                         "backend": row.backend,
                         "ci": row.ci,
                         "enabled": row.enabled,
+                        "timeout_seconds": row.timeout_seconds,
+                        "attempts": row.attempts,
                     })
                 })
                 .collect();
@@ -505,12 +509,12 @@ fn validate_and_expand(
             "{id}: lane must be portable|privileged, got `{lane}`"
         ));
     }
-    match test.get("timeout_seconds").and_then(Value::as_integer) {
-        Some(timeout) if (1..=1800).contains(&timeout) => {}
+    let timeout_seconds = match test.get("timeout_seconds").and_then(Value::as_integer) {
+        Some(timeout) if (1..=1800).contains(&timeout) => timeout,
         other => die(format!(
             "{id}: timeout_seconds must be 1..=1800, got {other:?}"
         )),
-    }
+    };
     if test.get("occasional").and_then(Value::as_bool).is_none() {
         die(format!("{id}: occasional must be a boolean"));
     }
@@ -586,7 +590,15 @@ fn validate_and_expand(
 
     let row_start = rows.len();
     for mode in MODES {
-        validate_mode(&id, bucket, lane, mode, modes.get(mode).unwrap(), rows);
+        validate_mode(
+            &id,
+            bucket,
+            lane,
+            mode,
+            timeout_seconds,
+            modes.get(mode).unwrap(),
+            rows,
+        );
     }
     if rows[row_start..].iter().any(|row| row.enabled && row.ci)
         && program_path.as_ref().is_some_and(|path| !path.is_file())
@@ -630,6 +642,7 @@ fn validate_mode(
     bucket: &str,
     lane: &str,
     mode: &str,
+    timeout_seconds: i64,
     spec: &Value,
     rows: &mut Vec<PlanRow>,
 ) {
@@ -897,6 +910,7 @@ fn validate_mode(
         }
     }
 
+    let attempts = mode_attempts(id, mode, spec_value);
     for backend in enabled {
         rows.push(PlanRow {
             bucket: bucket.to_string(),
@@ -906,6 +920,8 @@ fn validate_mode(
             backend,
             ci,
             enabled: true,
+            timeout_seconds,
+            attempts,
         });
     }
     for backend in disabled.keys() {
@@ -917,7 +933,94 @@ fn validate_mode(
             backend: backend.to_string(),
             ci,
             enabled: false,
+            timeout_seconds,
+            attempts,
         });
+    }
+}
+
+fn optional_positive_integer(
+    table: &toml::map::Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Option<i64> {
+    let value = table.get(key)?;
+    match value.as_integer() {
+        Some(value) if value > 0 => Some(value),
+        other => die(format!(
+            "{context}.{key} must be a positive integer, got {other:?}"
+        )),
+    }
+}
+
+/// Number of `execute_attempt` calls made by the existing harness for one mode.
+/// A verify call still performs Hermit's internal two-run comparison, and a
+/// replay call still performs record and replay. `None` means the manifest does
+/// not declare an executable chaos recipe.
+fn mode_attempts(id: &str, mode: &str, spec_value: &Value) -> Option<i64> {
+    let spec = spec_value
+        .as_table()
+        .unwrap_or_else(|| die(format!("{id}: modes.{mode} must be a table")));
+    match mode {
+        "verify" | "replay" => Some(1),
+        "naked" => match optional_positive_integer(spec, "runs", &format!("{id}.modes.naked")) {
+            Some(runs @ 3..=5) => Some(runs),
+            Some(runs) => die(format!("{id}: naked.runs must be 3..=5, got {runs}")),
+            None => Some(3),
+        },
+        "custom" => {
+            let Some(assert_value) = spec.get("assert") else {
+                return Some(1);
+            };
+            let assertions = assert_value
+                .as_table()
+                .unwrap_or_else(|| die(format!("{id}: modes.custom.assert must be a table")));
+            match optional_positive_integer(
+                assertions,
+                "runs",
+                &format!("{id}.modes.custom.assert"),
+            ) {
+                Some(runs @ 3..=5) => Some(runs),
+                Some(runs) => die(format!(
+                    "{id}: custom.assert.runs must be 3..=5, got {runs}"
+                )),
+                None => Some(1),
+            }
+        }
+        "chaos" => {
+            let Some(seed_value) = spec.get("seeds") else {
+                return None;
+            };
+            let seeds = seed_value
+                .as_array()
+                .unwrap_or_else(|| die(format!("{id}: modes.chaos.seeds must be an array")));
+            if seeds.is_empty() {
+                return None;
+            }
+            let seeds: Vec<_> = seeds
+                .iter()
+                .map(|seed| {
+                    seed.as_integer().unwrap_or_else(|| {
+                        die(format!("{id}: modes.chaos.seeds entries must be integers"))
+                    })
+                })
+                .collect();
+            if seeds.iter().any(|seed| *seed < 0) {
+                die(format!("{id}: chaos seeds must be nonnegative integers"));
+            }
+            let unique: BTreeSet<_> = seeds.iter().copied().collect();
+            if seeds.len() < 2 || unique.len() != seeds.len() {
+                die(format!(
+                    "{id}: chaos seeds must contain at least two unique integers"
+                ));
+            }
+            let seeds = i64::try_from(seeds.len())
+                .ok()
+                .and_then(|count| count.checked_mul(2))
+                .unwrap_or_else(|| die(format!("{id}: chaos seed count is too large")));
+            Some(seeds)
+        }
+        other => die(format!("{id}: unknown mode `{other}`")),
     }
 }
 
@@ -968,6 +1071,7 @@ sabre = "unsupported"
             "bucket",
             "portable",
             "verify",
+            90,
             &spec,
             &mut Vec::new(),
         );
@@ -993,6 +1097,7 @@ min_distinct = 2
             "bucket",
             "portable",
             "naked",
+            90,
             &spec,
             &mut Vec::new(),
         );
@@ -1019,6 +1124,7 @@ liteinst = "unsupported"
             "bucket",
             "portable",
             "verify",
+            90,
             &spec,
             &mut rows,
         );
@@ -1027,7 +1133,53 @@ liteinst = "unsupported"
         assert_eq!(enabled.len(), 1);
         assert_eq!(enabled[0].backend, "ptrace");
         assert!(enabled[0].ci);
+        assert_eq!(enabled[0].timeout_seconds, 90);
+        assert_eq!(enabled[0].attempts, Some(1));
+        assert!(
+            rows.iter()
+                .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
+        );
         assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
+    }
+
+    #[test]
+    fn derives_existing_harness_attempt_counts() {
+        let absent = parse_mode("");
+        assert_eq!(mode_attempts("bucket/test", "verify", &absent), Some(1));
+        assert_eq!(mode_attempts("bucket/test", "replay", &absent), Some(1));
+        assert_eq!(mode_attempts("bucket/test", "naked", &absent), Some(3));
+        assert_eq!(mode_attempts("bucket/test", "custom", &absent), Some(1));
+        assert_eq!(mode_attempts("bucket/test", "chaos", &absent), None);
+
+        let naked = parse_mode("runs = 5\n");
+        assert_eq!(mode_attempts("bucket/test", "naked", &naked), Some(5));
+        let custom = parse_mode("[assert]\nruns = 4\n");
+        assert_eq!(mode_attempts("bucket/test", "custom", &custom), Some(4));
+        let chaos = parse_mode("seeds = [0, 3, 9]\n");
+        assert_eq!(mode_attempts("bucket/test", "chaos", &chaos), Some(6));
+        let empty_chaos = parse_mode("seeds = []\n");
+        assert_eq!(mode_attempts("bucket/test", "chaos", &empty_chaos), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "naked.runs must be 3..=5")]
+    fn rejects_invalid_explicit_naked_attempt_count_when_disabled() {
+        let spec = parse_mode("runs = 2\n");
+        mode_attempts("bucket/test", "naked", &spec);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least two unique integers")]
+    fn rejects_duplicate_chaos_recipe_when_disabled() {
+        let spec = parse_mode("seeds = [7, 7]\n");
+        mode_attempts("bucket/test", "chaos", &spec);
+    }
+
+    #[test]
+    #[should_panic(expected = "chaos seeds must be nonnegative integers")]
+    fn rejects_negative_chaos_seed() {
+        let spec = parse_mode("seeds = [-1, 7]\n");
+        mode_attempts("bucket/test", "chaos", &spec);
     }
 
     #[test]
@@ -1151,6 +1303,7 @@ liteinst = "unsupported"
             "bucket",
             "portable",
             "verify",
+            90,
             &spec,
             &mut Vec::new(),
         );
@@ -1197,7 +1350,7 @@ liteinst = "unsupported"
     }
 
     fn validate_chaos(spec: &Value, rows: &mut Vec<PlanRow>) {
-        validate_mode("bucket/test", "bucket", "portable", "chaos", spec, rows);
+        validate_mode("bucket/test", "bucket", "portable", "chaos", 90, spec, rows);
     }
 
     // POSITIVE side of the bracket: the qualifying spec is accepted and produces
