@@ -24,6 +24,19 @@ use clap::Parser;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
+/// The in-band text a bounded log writer emits when a run's log file reaches
+/// its configured size bound.
+///
+/// This lives beside the comparator, not only beside the writer that emits it,
+/// because the comparator is the consumer that must not ignore it. The
+/// comparison below walks the two message lists in lockstep, so it can only
+/// ever speak for the retained prefix; a pair of logs that were both cut at the
+/// bound would agree on that prefix while the discarded tails were never looked
+/// at. Recognizing the marker is what keeps that from being reported as a
+/// match. `hermit-cli`'s writer emits this exact text and a unit test there
+/// binds the two.
+pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED:";
+
 /// Selects the set of log messages compared for determinism.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LogComparisonMode {
@@ -1346,6 +1359,42 @@ pub fn log_diff_summary_from_strs_with_filter(
     w: &mut impl std::io::Write,
     keep_record: impl Fn(&str) -> bool,
 ) -> std::io::Result<LogDiffSummary> {
+    // A log that reached its size bound stops early and says so in-band. The
+    // comparison below walks the two selected lists in lockstep, so it speaks
+    // only for the retained prefix: two runs both cut at the bound with equal
+    // retained message counts would agree on that prefix while the discarded
+    // tails were never compared, and reporting that as "no differences found"
+    // would assert determinism over a region nothing looked at. Refuse the
+    // verdict instead, in both directions of the green predicate --
+    // `diff_found` is set AND the compared counts stay zero, so neither
+    // `log_diff() == false` nor `matched_with_evidence()` can read as a match.
+    let truncated_a = file_a_str.as_ref().contains(TRUNCATION_MARKER);
+    let truncated_b = file_b_str.as_ref().contains(TRUNCATION_MARKER);
+    if truncated_a || truncated_b {
+        let which_side = match (truncated_a, truncated_b) {
+            (true, true) => "both logs were",
+            (true, false) => "the first log was",
+            (false, true) => "the second log was",
+            (false, false) => unreachable!("guarded by the condition above"),
+        };
+        writeln!(
+            w,
+            "REFUSING to compare: {which_side} truncated at the configured size bound \
+             (\"{TRUNCATION_MARKER}\" is present). The discarded tail was never written, so no \
+             comparison of these files can establish that the runs agree past that point. This \
+             is a NO-RESULT, not a difference and not a match. Re-run with a larger \
+             HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+        )?;
+        return Ok(LogDiffSummary {
+            diff_found: true,
+            compared_left: 0,
+            compared_right: 0,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+        });
+    }
+
     let all_a = filter_ignored(
         extract_log_messages(file_a_str.as_ref())?
             .into_iter()
@@ -1878,6 +1927,66 @@ mod test {
                 "",
             ]
         );
+    }
+
+    /// The two directions of the truncation refusal, on the SAME pair of logs.
+    ///
+    /// Both cases feed identical, matching DETLOG content; the only difference
+    /// is whether a side carries the bounded writer's marker. So a pass here
+    /// cannot come from the comparison being broken in general, and the refusal
+    /// cannot come from the content differing.
+    #[test]
+    fn truncated_logs_are_refused_and_untruncated_logs_still_match() -> std::io::Result<()> {
+        let body = "2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)\n2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)";
+        let marked = format!("{body}\n{}\n", super::TRUNCATION_MARKER);
+        let options = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+
+        // Direction 1: no marker on either side -> a real comparison happens,
+        // finds no difference, and carries nonzero evidence.
+        let clean = super::log_diff_summary_from_strs(body, body, &options, &mut Vec::new())?;
+        assert!(!clean.diff_found, "identical untruncated logs must match");
+        assert!(
+            clean.matched_with_evidence(),
+            "the untruncated match must carry nonzero compared counts, got {clean:?}"
+        );
+
+        // Direction 2: the marker on the left, the right, or both -> refused,
+        // even though the retained content is byte-identical to direction 1.
+        for (label, left, right) in [
+            ("left", marked.as_str(), body),
+            ("right", body, marked.as_str()),
+            ("both", marked.as_str(), marked.as_str()),
+        ] {
+            let mut out = Vec::new();
+            let summary = super::log_diff_summary_from_strs(left, right, &options, &mut out)?;
+            assert!(
+                summary.diff_found,
+                "{label}: a truncated log must not be reported as a match"
+            );
+            assert_eq!(
+                (summary.compared_left, summary.compared_right),
+                (0, 0),
+                "{label}: nothing was compared, so the counts must not claim otherwise"
+            );
+            assert!(
+                !summary.matched_with_evidence(),
+                "{label}: the evidence predicate must also refuse"
+            );
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("REFUSING to compare"),
+                "{label}: the refusal must be stated, got: {text}"
+            );
+            assert!(
+                !text.contains("no substantive differences found"),
+                "{label}: a refusal must never print the match line, got: {text}"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
