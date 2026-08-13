@@ -868,6 +868,36 @@ fn run_dbt_forwards_detcore_info_logs() {
     );
 }
 
+#[test]
+fn run_dbt_uses_the_normalized_backend_config() {
+    let args = [
+        "--log",
+        "DEBUG",
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("detcore-dbt: using CLI-provided Detcore Config"),
+        "DBT did not consume the CLI-provided config:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("backend_requires_thread_directed_process_signals: true"),
+        "DBT did not receive its required process-signal translation capability:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("backend_requires_thread_directed_process_signals: false"),
+        "DBT received an unnormalized process-signal capability:\n{stderr}",
+    );
+}
+
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
 #[test]
 fn run_dbt_verifies_queued_self_signals() {
