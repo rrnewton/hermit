@@ -2337,6 +2337,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.backend_serializes_fork_children = false;
     config.backend_dispatches_thread_tools = true;
     config.backend_tracks_process_children = backend != Backend::Dbt;
+    // Ptrace reports the task exit after Linux has atomically updated every
+    // robust owner word. DBT and SaBRe report tool exit before executing the
+    // native exit syscall, while KVM does not execute a native task exit, so
+    // none of those backends can safely defer Detcore's modeled transition.
+    config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
@@ -3973,6 +3978,7 @@ mod tests {
         assert!(!sabre.backend_serializes_fork_children);
         assert!(sabre.backend_dispatches_thread_tools);
         assert!(sabre.backend_tracks_process_children);
+        assert!(!sabre.backend_runs_exit_robust_list);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
         assert!(!sabre.backend_defers_vfork_child_registration);
@@ -3986,6 +3992,7 @@ mod tests {
         assert!(!ptrace.backend_serializes_fork_children);
         assert!(ptrace.backend_dispatches_thread_tools);
         assert!(ptrace.backend_tracks_process_children);
+        assert!(ptrace.backend_runs_exit_robust_list);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
         assert!(!ptrace.backend_defers_vfork_child_registration);
@@ -3998,6 +4005,7 @@ mod tests {
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
         assert!(kvm.backend_tracks_process_children);
+        assert!(!kvm.backend_runs_exit_robust_list);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
         assert!(kvm.backend_defers_vfork_child_registration);
@@ -4008,6 +4016,7 @@ mod tests {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
         assert!(config.cancel_killed_thread_rpcs);
         assert!(!config.backend_tracks_process_children);
+        assert!(!config.backend_runs_exit_robust_list);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
     }
