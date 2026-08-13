@@ -1582,6 +1582,38 @@ pub(crate) struct GuestClock {
     now: LogicalTime,
 }
 
+/// One modeled robust-futex wake that must wait until Linux has completed the
+/// corresponding task-exit cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RobustListWake {
+    pub(crate) futex: FutexID,
+}
+
+/// The physical-exit condition under which staged robust-futex wakes become
+/// safe to deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RobustListExit {
+    ExitGroup,
+    Signal(i32),
+}
+
+/// Wakes collected while guest memory is still readable, keyed by the owner
+/// whose physical exit makes them safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingRobustListWakes {
+    pub(crate) reason: RobustListExit,
+    pub(crate) wakes: Vec<RobustListWake>,
+}
+
+/// Robust-list registrations and staged wakes shared by one Linux thread
+/// group. A forked process starts with an empty instance; `CLONE_THREAD`
+/// members share it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct RobustListProcessState {
+    heads: BTreeMap<DetTid, usize>,
+    pending: BTreeMap<DetTid, PendingRobustListWakes>,
+}
+
 impl GuestClock {
     fn observe(&mut self, raw: LogicalTime) -> LogicalTime {
         self.now = self.now.max(raw);
@@ -1789,6 +1821,11 @@ pub struct ThreadState<T> {
     /// `crate::syscalls::robust_list`.
     #[serde(default)]
     pub(crate) robust_list_head: Option<usize>,
+
+    /// Per-thread registrations are mirrored here while their shared address
+    /// space is readable, so a group exit can walk every dying sibling's list.
+    #[serde(default)]
+    pub(crate) robust_list_process: Arc<Mutex<RobustListProcessState>>,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -2087,7 +2124,53 @@ impl<T> ThreadState<T> {
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
             robust_list_head: None,
+            robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
         }
+    }
+
+    pub(crate) fn record_robust_list_head(&mut self, head: Option<usize>) {
+        self.robust_list_head = head;
+        let mut process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        if let Some(head) = head {
+            process.heads.insert(self.dettid, head);
+        } else {
+            process.heads.remove(&self.dettid);
+        }
+    }
+
+    pub(crate) fn robust_list_heads(&self) -> Vec<(DetTid, usize)> {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .heads
+            .iter()
+            .map(|(&tid, &head)| (tid, head))
+            .collect()
+    }
+
+    pub(crate) fn stage_robust_list_wakes(
+        &self,
+        owner: DetTid,
+        reason: RobustListExit,
+        wakes: Vec<RobustListWake>,
+    ) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .pending
+            .insert(owner, PendingRobustListWakes { reason, wakes });
+    }
+
+    pub(crate) fn take_robust_list_wakes(&self) -> Option<PendingRobustListWakes> {
+        let mut process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        process.heads.remove(&self.dettid);
+        process.pending.remove(&self.dettid)
     }
 
     /// Clear the robust-list head for a candidate `execve` image, returning the
@@ -2099,13 +2182,19 @@ impl<T> ThreadState<T> {
     /// thread exit would walk unrelated guest memory and write
     /// `FUTEX_OWNER_DIED` into whatever happened to look like a futex word.
     pub(crate) fn take_robust_list_for_exec(&mut self) -> Option<usize> {
-        self.robust_list_head.take()
+        let previous = self.robust_list_head.take();
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .heads
+            .remove(&self.dettid);
+        previous
     }
 
     /// Restore the head after an `execve` that failed and left the old address
     /// space intact.
     pub(crate) fn restore_robust_list_after_failed_exec(&mut self, previous: Option<usize>) {
-        self.robust_list_head = previous;
+        self.record_robust_list_head(previous);
     }
 
     /// Resolve a futex key from its opcode mode and virtual address.
@@ -2681,7 +2770,7 @@ mod timeslice_tests {
         let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
         assert_eq!(state.robust_list_head, None, "a fresh thread has no list");
 
-        state.robust_list_head = Some(0x7ffff7bff920);
+        state.record_robust_list_head(Some(0x7ffff7bff920));
         assert_eq!(
             state.take_robust_list_for_exec(),
             Some(0x7ffff7bff920),
@@ -2691,6 +2780,10 @@ mod timeslice_tests {
             state.robust_list_head, None,
             "the candidate exec image starts with no robust list, as after copy_process"
         );
+        assert!(
+            state.robust_list_heads().is_empty(),
+            "the old address-space registration must also leave the shared index"
+        );
     }
 
     /// `execve` returns only on failure, and then the old address space -- and
@@ -2698,12 +2791,41 @@ mod timeslice_tests {
     #[test]
     fn a_failed_exec_restores_the_robust_list_head() {
         let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
-        state.robust_list_head = Some(0x404100);
+        state.record_robust_list_head(Some(0x404100));
 
         let saved = state.take_robust_list_for_exec();
         state.restore_robust_list_after_failed_exec(saved);
 
         assert_eq!(state.robust_list_head, Some(0x404100));
+        assert_eq!(
+            state.robust_list_heads(),
+            vec![(DetTid::from_raw(3), 0x404100)],
+            "a failed exec keeps the old address-space registration indexed"
+        );
+    }
+
+    #[test]
+    fn physical_exit_takes_only_its_own_staged_robust_list_wakes() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        state.record_robust_list_head(Some(0x404100));
+        let wake = RobustListWake {
+            futex: FutexID::private(MmId::initial(DetTid::from_raw(3)), 0x4040),
+        };
+        state.stage_robust_list_wakes(
+            DetTid::from_raw(3),
+            RobustListExit::Signal(libc::SIGTERM),
+            vec![wake],
+        );
+
+        assert_eq!(
+            state.take_robust_list_wakes(),
+            Some(PendingRobustListWakes {
+                reason: RobustListExit::Signal(libc::SIGTERM),
+                wakes: vec![wake],
+            })
+        );
+        assert!(state.robust_list_heads().is_empty());
+        assert_eq!(state.take_robust_list_wakes(), None);
     }
 
     #[test]

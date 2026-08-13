@@ -86,6 +86,7 @@ use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
 use crate::tool_local::Detcore;
 use crate::tool_local::ExecFdBlockingOverrides;
+use crate::tool_local::RobustListWake;
 use crate::types::*;
 
 pub(crate) async fn yield_once() {
@@ -1108,6 +1109,9 @@ impl GlobalTool for GlobalState {
                 )
                 .await,
             ),
+            GlobalRequest::RobustListWakes(owner, wakes) => {
+                R::RobustListWakes(self.recv_robust_list_wakes(owner, wakes))
+            }
             GlobalRequest::DeterminizeInode(ino) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino).await)
             }
@@ -1898,6 +1902,14 @@ impl GlobalState {
         }
     }
 
+    fn recv_robust_list_wakes(&self, owner: DetTid, wakes: Vec<FutexID>) -> Vec<u64> {
+        let mut sched = self.sched.lock().unwrap();
+        wakes
+            .into_iter()
+            .map(|futex| sched.wake_futex_waiters(owner, futex, 1, u32::MAX))
+            .collect()
+    }
+
     async fn recv_determinize_inode(&self, from: Tid, ino: RawInode) -> (DetInode, LogicalTime) {
         // Here we establish a policy that when we first see a file its mtime is epoch.
         let nanos = self
@@ -2381,6 +2393,10 @@ pub enum GlobalRequest {
 
     // Release the port when the last alias of its open file description closes.
     ReleasePort(OpenFileId),
+
+    /// Deliver robust-futex wakes collected before exit after the backend has
+    /// confirmed that Linux's physical task cleanup completed.
+    RobustListWakes(DetTid, Vec<FutexID>),
 }
 
 /// Responses from the global object
@@ -2442,6 +2458,7 @@ pub enum GlobalResponse {
     AddUsedPort,
     ReleasePort(Option<u16>),
     PortFull,
+    RobustListWakes(Vec<u64>),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2810,6 +2827,38 @@ pub(crate) async fn deregister_thread<R>(
             GlobalResponse::DeregisterThread(x) => x,
             _ => unreachable!(),
         }
+    }
+}
+
+/// Deliver owner-death wakes from an exit callback that no longer has guest
+/// memory access. The callback runs only after ptrace has observed physical
+/// exit, so Linux's atomic robust-list word update is already complete.
+pub(crate) async fn robust_list_wakes_after_exit<R>(
+    threads_time: DetTime,
+    reverie: &R,
+    mm: MmId,
+    owner: DetTid,
+    wakes: Vec<RobustListWake>,
+) -> Vec<u64>
+where
+    R: GlobalRPC<GlobalState>,
+{
+    if wakes.is_empty() {
+        return Vec::new();
+    }
+    let response = reverie
+        .send_rpc((
+            threads_time,
+            mm,
+            GlobalRequest::RobustListWakes(
+                owner,
+                wakes.into_iter().map(|wake| wake.futex).collect(),
+            ),
+        ))
+        .await;
+    match response.1 {
+        GlobalResponse::RobustListWakes(counts) => counts,
+        _ => unreachable!(),
     }
 }
 
