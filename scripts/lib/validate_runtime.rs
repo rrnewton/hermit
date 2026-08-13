@@ -168,6 +168,8 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         // compiler / build-system / linker phrasing.
         if (line.contains("fatal error: ") && line.matches(':').count() >= 2)
             || line.contains("cmake error")
+            || (line.contains("test_harness.sh:")
+                && line.contains("cannot create temp file for here-document"))
             || has_any(
                 line,
                 &[
@@ -877,6 +879,10 @@ pub fn self_test() -> Result<String, String> {
             "cc: fatal error: cannot execute 'as': execvp: Operation not permitted",
         ),
         (
+            "toolchain-eperm",
+            "./ci/test_harness.sh: line 368: cannot create temp file for here-document: Operation not permitted",
+        ),
+        (
             "third-party-build",
             "error: failed to run custom build command for `reverie-dbt v0.1.0`",
         ),
@@ -936,6 +942,7 @@ pub fn self_test() -> Result<String, String> {
         // A test that merely PRINTS the words must not be excused.
         "test permission_denied_is_reported ... ok",
         "guest wrote: permission denied",
+        "guest wrote: cannot create temp file for here-document: Operation not permitted",
         "",
     ];
     let mut refused = 0usize;

@@ -51,13 +51,16 @@ pub(crate) struct ComparisonOptions<'a> {
     /// mode; an ordinary `--verify-strict` verdict must not depend on diagnostic
     /// events merely because the caller requested that they be captured.
     pub diagnostic_full_trace: bool,
+    /// Keep both captured logs at their selected paths after comparison,
+    /// whether the runs match or diverge.
+    pub keep_logs: bool,
 }
 
 /// How strictly two runs' internal logs are compared — the condition a
 /// [`Verdict`] rests on.
 ///
 /// A bare "matched" verdict is meaningless without this. The two modes sit at
-/// opposite ends of a three-tier treatment of log data:
+/// opposite ends of the available log comparisons:
 ///
 /// - [`Self::Stripped`] normalizes away numeric values, addresses, tmp paths,
 ///   and — most importantly — the virtual-time timestamps and syscall
@@ -65,12 +68,12 @@ pub(crate) struct ComparisonOptions<'a> {
 ///   under `Stripped` asserts only "matched after normalizing known-
 ///   nondeterministic data", NOT parity. STRIPPING DESTROYS THE ABILITY TO
 ///   DETECT A DIFFERENCE.
-/// - [`Self::Canonical`] is the parity mode. It applies exactly three tiers:
-///   (1) STRIP the real wall-clock timestamp PREFIX only (genuinely
-///   irreproducible; done by `extract_log_messages`); (2) CANONICALIZE host
+/// - [`Self::Canonical`] is the parity mode. It strips the real wall-clock
+///   timestamp prefix only (genuinely irreproducible; done by
+///   `extract_log_messages`), canonicalizes host
 ///   memory addresses to an ordinal by first appearance (1, 2, 3…), preserving
-///   identity, ordering, and aliasing while discarding only the host-specific
-///   raw pointer; (3) COMPARE EXACTLY everything else — virtual-time timestamps,
+///   identity, ordering, and aliasing while discarding only the host-specific raw
+///   pointer, and compares exactly everything else — virtual-time timestamps,
 ///   syscall inputs/results, counts, sizes, flags. CANONICALIZING PRESERVES the
 ///   ability to detect a difference (allocation-order and aliasing changes still
 ///   diverge), which is the whole point.
@@ -167,7 +170,7 @@ pub struct ComparisonSpec {
     /// [`Stripped`]: LogCompareStrictness::Stripped
     pub strip_lines: bool,
     /// Concrete: were host memory addresses canonicalized to first-appearance
-    /// ordinals (the tier-2 step of the parity policy) before diffing? Unlike
+    /// ordinals before diffing? Unlike
     /// [`Self::strip_lines`] this is lossless for parity: it discards only the
     /// raw pointer value, keeping identity, order, and aliasing.
     pub canonicalize_addresses: bool,
@@ -391,6 +394,11 @@ pub struct VerificationOutcome {
     /// the log comparison was not run at all (output-only fallback). `None` and
     /// `Some(0/0)` are both "no log evidence" and neither can support parity.
     pub compared_log_messages: Option<ComparedLogCounts>,
+    /// Scheduler turn at the first log divergence, when a preceding COMMIT
+    /// identified the turn.
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
 impl VerificationOutcome {
@@ -407,9 +415,7 @@ impl VerificationOutcome {
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => Err(Error::msg(
-                "Mismatch between run 1 and run 2 outputs (logs retained).",
-            )),
+            Verdict::Diverged => Err(Error::msg("Mismatch between run 1 and run 2 outputs.")),
             // Unreachable in practice: `compare_two_runs` only ever yields
             // Matched/Diverged, and the no-result state is published directly to
             // the JSON artifact rather than carried in an outcome. Fail closed
@@ -458,6 +464,11 @@ pub struct VerificationReport {
     pub guest_exit_code: Option<i32>,
     /// The guest's terminating signal number, if it was killed by a signal.
     pub guest_signal: Option<i32>,
+    /// Scheduler turn at the first log divergence, or `null` when the logs
+    /// matched or no preceding COMMIT metadata was available.
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// Virtual nanoseconds at that same point, with the same nullability rules.
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
 impl VerificationReport {
@@ -472,6 +483,8 @@ impl VerificationReport {
             compared_log_messages: None,
             guest_exit_code: None,
             guest_signal: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
         }
     }
 }
@@ -500,6 +513,8 @@ impl From<&VerificationOutcome> for VerificationReport {
             compared_log_messages: outcome.compared_log_messages,
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
+            first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
+            first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
         }
     }
 }
@@ -605,14 +620,25 @@ pub(crate) fn verification_log_level(
 }
 
 pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, NamedTempFile)> {
-    let file1 = tempfile::Builder::new()
-        .prefix(&format!("{}_log_", name1))
-        .rand_bytes(5)
-        .tempfile()?;
-    let file2 = tempfile::Builder::new()
-        .prefix(&format!("{}_log_", name2))
-        .rand_bytes(5)
-        .tempfile()?;
+    temp_log_files_in(name1, name2, None)
+}
+
+pub fn temp_log_files_in(
+    name1: &str,
+    name2: &str,
+    directory: Option<&Path>,
+) -> io::Result<(NamedTempFile, NamedTempFile)> {
+    let create = |name: &str| {
+        let prefix = format!("{}_log_", name);
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix).rand_bytes(5);
+        match directory {
+            Some(directory) => builder.tempfile_in(directory),
+            None => builder.tempfile(),
+        }
+    };
+    let file1 = create(name1)?;
+    let file2 = create(name2)?;
 
     Ok((file1, file2))
 }
@@ -663,10 +689,32 @@ fn unsupported_syscalls_from_log(path: &Path) -> io::Result<BTreeSet<String>> {
     Ok(syscalls)
 }
 
+pub(crate) fn retain_verification_logs<const N: usize>(
+    logs: [(&str, TempPath); N],
+) -> Result<Vec<PathBuf>, Error> {
+    let mut retained = Vec::with_capacity(N);
+    eprintln!(":: Verification logs retained:");
+    for (label, log) in logs {
+        let path = log.keep()?;
+        eprintln!("::   {label}: {}", path.display());
+        retained.push(path);
+    }
+    Ok(retained)
+}
+
 pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
     options: ComparisonOptions<'_>,
+) -> Result<VerificationOutcome, Error> {
+    compare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
+}
+
+fn compare_two_runs_with_unsupported_scan(
+    first: ComparedRun<'_>,
+    second: ComparedRun<'_>,
+    options: ComparisonOptions<'_>,
+    scan_unsupported_syscalls: impl Fn(&Path) -> io::Result<BTreeSet<String>>,
 ) -> Result<VerificationOutcome, Error> {
     let ComparedRun {
         output: out1,
@@ -681,6 +729,8 @@ pub fn compare_two_runs(
     // output-only (KVM concurrent) fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
+    let mut first_divergent_scheduler_turn = None;
+    let mut first_divergent_virtual_nanoseconds = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -715,78 +765,95 @@ pub fn compare_two_runs(
         }
     }
 
-    if options.compare_logs {
-        eprintln!(
-            ":: {} {} and {}",
-            "Comparing logs...".yellow().bold(),
-            log1.display(),
-            log2.display()
-        );
-        // The comparison semantics come from `spec` (strip_lines + mode); only
-        // the printed syscall-history depth still tracks `verbose`. Historically
-        // both were flipped together, so the sole bitwise comparison was also the
-        // loudest — decoupling them lets a quiet run be bitwise-strict.
-        let diff_options = logdiff::LogDiffOpts {
-            strip_lines: spec.strip_lines,
-            // Thread the tier-2 canonicalization from the spec so the parity
-            // (`Canonical`) policy actually rewrites host addresses to ordinals
-            // in the engine; without this the verdict would REPORT
-            // `canonicalize_addresses = true` while the diff ran with the raw
-            // addresses — the exact proxy/binding drift the spec exists to close.
-            canonicalize_addresses: spec.canonicalize_addresses,
-            comparison: spec.log_comparison_mode(),
-            syscall_history: if options.verbose { 10 } else { 5 },
-            // Thread the filter facts from the spec so what the verdict *reports*
-            // (`spec.skip_commit`/`spec.skip_detlog`) is exactly what the diff
-            // engine *does*; the remaining filters stay at their no-op defaults.
-            skip_commit: spec.skip_commit,
-            skip_detlog: spec.skip_detlog,
-            ..Default::default()
-        };
-        // Bind the spec's recorded filter-absence to the engine's real defaults:
-        // if `LogDiffOpts::default()` ever grew a filtering default, the spec
-        // would silently misreport "no filters", so refuse to run in that case.
-        debug_assert!(
-            diff_options.ignore_lines.is_empty() != spec.ignore_lines,
-            "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
-        );
-
-        let summary = logdiff::log_diff_detailed(log1.as_ref(), log2.as_ref(), &diff_options);
-        compared_log_messages = Some(ComparedLogCounts {
-            left: summary.compared_left,
-            right: summary.compared_right,
-        });
-        if summary.diff_found {
-            failed = true;
-            eprintln!(":: {}", "Log differences found between runs.".red().bold());
+    let log_processing_result = (|| -> Result<(), Error> {
+        if options.compare_logs {
             eprintln!(
-                ":: {}: {} {}",
-                "Respective Logs retained for further inspection".red(),
-                log1.display(),
-                log2.display()
+                ":: {}",
+                "Comparing captured verification logs...".yellow().bold()
+            );
+            // The comparison semantics come from `spec` (strip_lines + mode); only
+            // the printed syscall-history depth still tracks `verbose`. Historically
+            // both were flipped together, so the sole bitwise comparison was also the
+            // loudest — decoupling them lets a quiet run be bitwise-strict.
+            let diff_options = logdiff::LogDiffOpts {
+                strip_lines: spec.strip_lines,
+                // Thread canonical address normalization from the spec so the parity
+                // (`Canonical`) policy actually rewrites host addresses to ordinals
+                // in the engine; without this the verdict would REPORT
+                // `canonicalize_addresses = true` while the diff ran with the raw
+                // addresses — the exact proxy/binding drift the spec exists to close.
+                canonicalize_addresses: spec.canonicalize_addresses,
+                comparison: spec.log_comparison_mode(),
+                syscall_history: if options.verbose { 10 } else { 5 },
+                // Thread the filter facts from the spec so what the verdict *reports*
+                // (`spec.skip_commit`/`spec.skip_detlog`) is exactly what the diff
+                // engine *does*; the remaining filters stay at their no-op defaults.
+                skip_commit: spec.skip_commit,
+                skip_detlog: spec.skip_detlog,
+                ..Default::default()
+            };
+            // Bind the spec's recorded filter-absence to the engine's real defaults:
+            // if `LogDiffOpts::default()` ever grew a filtering default, the spec
+            // would silently misreport "no filters", so refuse to run in that case.
+            debug_assert!(
+                diff_options.ignore_lines.is_empty() != spec.ignore_lines,
+                "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
+            );
+
+            let summary =
+                logdiff::try_log_diff_detailed(log1.as_ref(), log2.as_ref(), &diff_options)?;
+            compared_log_messages = Some(ComparedLogCounts {
+                left: summary.compared_left,
+                right: summary.compared_right,
+            });
+            if summary.diff_found {
+                failed = true;
+                first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
+                first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
+                eprintln!(":: {}", "Log differences found between runs.".red().bold());
+            }
+        } else {
+            eprintln!(
+                ":: KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic"
             );
         }
-    } else {
-        eprintln!(
-            ":: KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic"
-        );
+
+        if out1.status != out2.status {
+            failed = true;
+            eprintln!(
+                "Mismatch in exit status between run 1 and run 2: {}",
+                Comparison::new(&out1.status, &out2.status)
+            );
+        }
+
+        if !failed {
+            let mut unsupported = scan_unsupported_syscalls(log1.as_ref())?;
+            unsupported.extend(scan_unsupported_syscalls(log2.as_ref())?);
+            if let Some(message) = detcore::format_unsupported_syscall_warning(&unsupported) {
+                eprintln!("WARNING: {message}");
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = log_processing_result {
+        if options.keep_logs || failed {
+            retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+        }
+        return Err(error);
     }
 
-    if out1.status != out2.status {
-        failed = true;
-        eprintln!(
-            "Mismatch in exit status between run 1 and run 2: {}",
-            Comparison::new(&out1.status, &out2.status)
-        );
+    // Divergence historically retained both diagnostics. `--keep-logs` extends
+    // that behavior to successful comparisons instead of changing the failure
+    // path.
+    if options.keep_logs || failed {
+        retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
     }
 
     if failed {
         eprintln!(":: {}", options.failure_message.red().bold());
-        let _ = log1.keep()?;
-        let _ = log2.keep()?;
         // Divergence is a verification *verdict*, not an I/O error: return it as
-        // a value carrying the guest exit status. `Err` stays reserved for
-        // genuine failures (e.g. the `.keep()?` above). Callers that want the
+        // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
         // `VerificationOutcome::into_exit_status`.
         Ok(VerificationOutcome {
@@ -794,20 +861,18 @@ pub fn compare_two_runs(
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            first_divergent_scheduler_turn,
+            first_divergent_virtual_nanoseconds,
         })
     } else {
-        // Allow the NamedTempFiles to be deleted in this case:
-        let mut unsupported = unsupported_syscalls_from_log(log1.as_ref())?;
-        unsupported.extend(unsupported_syscalls_from_log(log2.as_ref())?);
-        if let Some(message) = detcore::format_unsupported_syscall_warning(&unsupported) {
-            eprintln!("WARNING: {message}");
-        }
         eprintln!(":: {}", options.success_message.green().bold());
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
+            first_divergent_scheduler_turn,
+            first_divergent_virtual_nanoseconds,
         })
     }
 }
@@ -962,6 +1027,7 @@ mod tests {
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                keep_logs: false,
             },
         )
     }
@@ -1080,6 +1146,7 @@ mod tests {
                 strictness: LogCompareStrictness::Stripped,
                 compare_logs: false,
                 diagnostic_full_trace: false,
+                keep_logs: false,
             },
         )
         .unwrap();
@@ -1212,6 +1279,7 @@ mod tests {
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
                 diagnostic_full_trace: true,
+                keep_logs: false,
             },
         )
         .unwrap();
@@ -1270,9 +1338,238 @@ mod tests {
         assert!(!report.verified);
         assert!(!report.comparison.unwrap().strip_lines);
 
-        // Diverged canonical runs retain their logs (`.keep()`); clean them up.
-        let _ = fs::remove_file(path1);
-        let _ = fs::remove_file(path2);
+        assert!(path1.exists(), "divergent run-1 log must be retained");
+        assert!(path2.exists(), "divergent run-2 log must be retained");
+        fs::remove_file(path1).unwrap();
+        fs::remove_file(path2).unwrap();
+    }
+
+    #[test]
+    fn verification_log_retention_matches_the_cli_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = output(0, b"hello\n", b"");
+
+        for (left_value, right_value, keep_logs, expected, retained) in [
+            (7, 7, false, Verdict::Matched, false),
+            (7, 8, false, Verdict::Diverged, true),
+            (7, 7, true, Verdict::Matched, true),
+            (7, 8, true, Verdict::Diverged, true),
+        ] {
+            let (left, right) = temp_log_files_in("left", "right", Some(directory.path())).unwrap();
+            fs::write(left.path(), detlog_with_value(left_value)).unwrap();
+            fs::write(right.path(), detlog_with_value(right_value)).unwrap();
+            let left_path = left.path().to_path_buf();
+            let right_path = right.path().to_path_buf();
+            let outcome = compare_two_runs(
+                ComparedRun {
+                    output: &output,
+                    log: left.into_temp_path(),
+                },
+                ComparedRun {
+                    output: &output,
+                    log: right.into_temp_path(),
+                },
+                ComparisonOptions {
+                    success_message: "verified",
+                    failure_message: "failed",
+                    verbose: false,
+                    strictness: LogCompareStrictness::Canonical,
+                    compare_logs: true,
+                    diagnostic_full_trace: false,
+                    keep_logs,
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome.verdict, expected);
+            assert_eq!(left_path.exists(), retained, "run-1 retention mismatch");
+            assert_eq!(right_path.exists(), retained, "run-2 retention mismatch");
+            if retained {
+                fs::remove_file(left_path).unwrap();
+                fs::remove_file(right_path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn requested_logs_survive_unsupported_syscall_scan_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = temp_log_files_in("left", "right", Some(directory.path())).unwrap();
+        fs::write(left.path(), detlog_with_value(7)).unwrap();
+        fs::write(right.path(), detlog_with_value(7)).unwrap();
+        let left_path = left.path().to_path_buf();
+        let right_path = right.path().to_path_buf();
+
+        let error = compare_two_runs_with_unsupported_scan(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                keep_logs: true,
+            },
+            |_| Err(io::Error::other("injected unsupported-syscall scan error")),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected unsupported-syscall scan error")
+        );
+        assert!(left_path.exists(), "run-1 log must survive the scan error");
+        assert!(right_path.exists(), "run-2 log must survive the scan error");
+        assert_eq!(
+            fs::read_to_string(&left_path).unwrap(),
+            detlog_with_value(7)
+        );
+        assert_eq!(
+            fs::read_to_string(&right_path).unwrap(),
+            detlog_with_value(7)
+        );
+        fs::remove_file(left_path).unwrap();
+        fs::remove_file(right_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_logs_survive_log_comparison_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = temp_log_files_in("left", "right", Some(directory.path())).unwrap();
+        fs::write(left.path(), detlog_with_value(7)).unwrap();
+        fs::write(right.path(), detlog_with_value(7)).unwrap();
+        let left_path = left.path().to_path_buf();
+        let right_path = right.path().to_path_buf();
+        fs::set_permissions(&left_path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            fs::read(&left_path).is_err(),
+            "the test must make the run-1 log unreadable"
+        );
+
+        let result = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                keep_logs: true,
+            },
+        );
+
+        assert!(result.is_err(), "unreadable input must fail comparison");
+        assert!(
+            left_path.exists(),
+            "run-1 log must survive the comparison error"
+        );
+        assert!(
+            right_path.exists(),
+            "run-2 log must survive the comparison error"
+        );
+        fs::set_permissions(&left_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(left_path).unwrap();
+        fs::remove_file(right_path).unwrap();
+    }
+
+    #[test]
+    fn verification_report_carries_first_log_divergence_position() {
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = empty_logs();
+        let left_path = left.to_path_buf();
+        let right_path = right.to_path_buf();
+        fs::write(
+            &left_path,
+            "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s\n\
+             2026-08-13T01:02:03.000001Z INFO detcore: DETLOG value=1\n",
+        )
+        .unwrap();
+        fs::write(
+            &right_path,
+            "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 23, dettid 2, on previously committed 4.567_890_123s\n\
+             2026-08-13T01:02:04.000001Z INFO detcore: DETLOG value=2\n",
+        )
+        .unwrap();
+
+        let outcome = compare_with(
+            &output,
+            left,
+            &output,
+            right,
+            LogCompareStrictness::Canonical,
+        )
+        .unwrap();
+        let report = VerificationReport::from(&outcome);
+        assert_eq!(report.verdict, Verdict::Diverged);
+        assert_eq!(report.first_divergent_scheduler_turn, Some(23));
+        assert_eq!(
+            report.first_divergent_virtual_nanoseconds,
+            Some(4_567_890_123)
+        );
+
+        let _ = fs::remove_file(left_path);
+        let _ = fs::remove_file(right_path);
+    }
+
+    #[test]
+    fn output_divergence_does_not_discard_the_log_divergence_position() {
+        let left_output = output(0, b"left\n", b"");
+        let right_output = output(0, b"right\n", b"");
+        let (left, right) = empty_logs();
+        let left_path = left.to_path_buf();
+        let right_path = right.to_path_buf();
+        fs::write(
+            &left_path,
+            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+             INFO detcore: DETLOG value=1\n",
+        )
+        .unwrap();
+        fs::write(
+            &right_path,
+            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+             INFO detcore: DETLOG value=2\n",
+        )
+        .unwrap();
+
+        let outcome = compare_with(
+            &left_output,
+            left,
+            &right_output,
+            right,
+            LogCompareStrictness::Canonical,
+        )
+        .unwrap();
+        let report = VerificationReport::from(&outcome);
+        assert_eq!(report.verdict, Verdict::Diverged);
+        assert_eq!(report.first_divergent_scheduler_turn, Some(23));
+        assert_eq!(
+            report.first_divergent_virtual_nanoseconds,
+            Some(4_567_890_123)
+        );
+
+        let _ = fs::remove_file(left_path);
+        let _ = fs::remove_file(right_path);
     }
 
     // The `--verify-json` payload names the comparison in the JSON itself, so a
@@ -1475,6 +1772,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["verified"], serde_json::json!(true));
         assert_eq!(parsed["verdict"], serde_json::json!("matched"));
+        assert_eq!(
+            parsed["first_divergent_scheduler_turn"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            parsed["first_divergent_virtual_nanoseconds"],
+            serde_json::Value::Null
+        );
         // The executed-work evidence travels with the verdict.
         assert!(parsed["compared_log_messages"]["left"].as_u64().unwrap() > 0);
         assert!(parsed["compared_log_messages"]["right"].as_u64().unwrap() > 0);
@@ -1581,6 +1886,8 @@ mod tests {
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }

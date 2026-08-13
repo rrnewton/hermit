@@ -28,7 +28,7 @@ use serde::Serialize;
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 2;
+const SCHEMA: u64 = 3;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
@@ -40,6 +40,9 @@ Commands:
   update [--allow-green-removal] [--allow-cell-removal]
       Rewrite the two tracked files. Green regressions and cell deletion are
       refused unless the matching explicit flag is present.
+  update-observations --summary FILE
+      Merge one completed clean pressure-test summary into the red cells'
+      checked-in observations. This never changes which cells are green.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -93,7 +96,7 @@ struct TrackedCell {
     status: CellStatus,
     /// Filled only by the periodic all-red pressure test. Ordinary validate
     /// never changes this array.
-    observations: Vec<serde_json::Value>,
+    observations: Vec<Observation>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -101,6 +104,96 @@ struct TrackedCell {
 enum CellStatus {
     Green,
     Red,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct Observation {
+    detcore_tree: String,
+    hermit_shas: BTreeSet<String>,
+    results: BTreeSet<ObservedResult>,
+    first_divergent_scheduler_turn: Option<ObservedRange>,
+    first_divergent_virtual_nanoseconds: Option<ObservedRange>,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "kebab-case")]
+enum ObservedResult {
+    Pass,
+    DeterminismFailure,
+    ParityFailure,
+    ReplayFailure,
+    CrashError,
+    Timeout,
+    Oom,
+}
+
+impl ObservedResult {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "pass" => Ok(Self::Pass),
+            "determinism-failure" => Ok(Self::DeterminismFailure),
+            "parity-failure" => Ok(Self::ParityFailure),
+            "replay-failure" => Ok(Self::ReplayFailure),
+            "crash-error" => Ok(Self::CrashError),
+            "timeout" => Ok(Self::Timeout),
+            "oom" => Ok(Self::Oom),
+            "infrastructure-error" => Err(
+                "pressure summary contains an infrastructure error; refusing to store it as product behavior"
+                    .into(),
+            ),
+            other => Err(format!("unknown pressure result `{other}`")),
+        }
+    }
+
+    fn carries_divergence_position(self) -> bool {
+        matches!(
+            self,
+            Self::DeterminismFailure | Self::ParityFailure | Self::ReplayFailure
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ObservedRange {
+    earliest: u64,
+    latest: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PressureSummary {
+    schema: u64,
+    hermit_sha: String,
+    detcore_tree: String,
+    source_tree_dirty: bool,
+    rows: Vec<PressureSummaryRow>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PressureSummaryRow {
+    cell: CellId,
+    result: String,
+    #[serde(default)]
+    verification: Option<PressureVerification>,
+    #[serde(default)]
+    evidence_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PressureVerification {
+    #[serde(default)]
+    first_divergent_scheduler_turn: Option<u64>,
+    #[serde(default)]
+    first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -194,6 +287,27 @@ fn run() -> Result<(), String> {
             }
             update_tracked(&root, allow_green_removal, allow_cell_removal)?;
         }
+        "update-observations" => {
+            let mut summary = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--summary" => {
+                        summary = Some(PathBuf::from(
+                            args.next().ok_or("--summary requires a file")?,
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown update-observations option `{arg}`\n\n{USAGE}"
+                        ));
+                    }
+                }
+            }
+            update_observations(
+                &root,
+                &summary.ok_or("update-observations requires --summary FILE")?,
+            )?;
+        }
         "verify-results" => {
             let mut result_root = None;
             let mut lanes = BTreeSet::from(["portable".to_string(), "privileged".to_string()]);
@@ -282,10 +396,12 @@ fn derive(root: &Path) -> Result<Derived, String> {
         .map_err(|e| format!("manifest-plan emitted invalid JSON: {e}"))?;
     let expected: ExpectedPlan = read_json(&root.join(EXPECTED_PLAN))?;
 
+    let mut manifest_cells = BTreeSet::new();
     let mut population = BTreeSet::new();
     let mut enabled = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
     for row in rows {
+        let comparable = row.mode != "custom";
         let id = CellId {
             lane: row.lane,
             category: row.bucket,
@@ -293,14 +409,23 @@ fn derive(root: &Path) -> Result<Derived, String> {
             mode: row.mode,
             backend: row.backend,
         };
-        if !population.insert(id.clone()) {
+        if !manifest_cells.insert(id.clone()) {
             return Err(format!(
                 "manifest-plan emitted duplicate cell {}",
                 display_id(&id)
             ));
         }
+        // `custom` is an explicit per-test command, not a mode which applies
+        // uniformly to every test/backend pair. Keep selected custom commands
+        // in ordinary validation, but do not manufacture 1,680 scorecard cells
+        // from combinations that have no product meaning.
+        if comparable {
+            population.insert(id.clone());
+        }
         if row.enabled {
-            enabled.insert(id.clone());
+            if comparable {
+                enabled.insert(id.clone());
+            }
             if row.ci {
                 ci_enabled.insert(id);
             }
@@ -311,7 +436,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         return Err("expected E2E plan is empty".into());
     }
     for id in &selected {
-        if !population.contains(id) {
+        if !manifest_cells.contains(id) {
             return Err(format!(
                 "expected plan names absent cell {}",
                 display_id(id)
@@ -326,7 +451,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     }
     let green = selected
         .iter()
-        .filter(|id| id.mode != "chaos")
+        .filter(|id| id.mode != "chaos" && population.contains(*id))
         .cloned()
         .collect();
     Ok(Derived {
@@ -408,7 +533,7 @@ not exist for that backend.\n\n| Mode",
         out.push_str(" | ---:");
     }
     out.push_str(" | ---: | ---: | ---: |\n");
-    for mode in ["verify", "replay", "chaos", "custom", "naked"] {
+    for mode in ["verify", "replay", "chaos", "naked"] {
         let mode_total = derived
             .population
             .iter()
@@ -442,16 +567,60 @@ not exist for that backend.\n\n| Mode",
         "| **Total** | | | | | | | **{green_total}** | **{}** | **{total}** |\n\n",
         total - green_total
     ));
+    out.push_str(
+        "## Ptrace by manifest category\n\n\
+This view uses the same pre-basic-sanity contracts as the tables above, but makes the ptrace \
+workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
+denominator.\n\n\
+| Manifest category | Verify | Replay | Chaos | Green | Total |\n\
+| --- | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    let categories: BTreeSet<&str> = derived
+        .population
+        .iter()
+        .filter(|id| id.backend == "ptrace")
+        .map(|id| id.category.as_str())
+        .collect();
+    for category in categories {
+        let category_cells: Vec<_> = derived
+            .population
+            .iter()
+            .filter(|id| id.backend == "ptrace" && id.category == category)
+            .collect();
+        let category_green = category_cells
+            .iter()
+            .filter(|id| derived.green.contains(**id))
+            .count();
+        out.push_str(&format!("| `{category}`"));
+        for mode in ["verify", "replay", "chaos"] {
+            let mode_total = category_cells.iter().filter(|id| id.mode == mode).count();
+            let mode_green = category_cells
+                .iter()
+                .filter(|id| id.mode == mode && derived.green.contains(**id))
+                .count();
+            out.push_str(&format!(" | {mode_green} / {mode_total}"));
+        }
+        out.push_str(&format!(
+            " | {category_green} | {} |\n",
+            category_cells.len()
+        ));
+    }
+    out.push('\n');
     let chaos = derived
         .selected
         .iter()
         .filter(|id| id.mode == "chaos")
         .count();
+    let custom = derived
+        .selected
+        .iter()
+        .filter(|id| id.mode == "custom")
+        .count();
     out.push_str(&format!(
         "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above plus {chaos} chaos-mode race-exposure checks. A passing validate must \
-produce a fresh result for all of them; a failing green cell is a regression, not permission to \
-move it to red.\n",
+compatibility cells above, {chaos} chaos-mode race-exposure checks, and {custom} explicit custom \
+commands outside the comparable denominator. A passing validate must produce a fresh result for \
+all of them; a failing green cell is a regression, not permission to move it to red.\n",
         derived.selected.len()
     ));
     out
@@ -465,7 +634,7 @@ fn tracked_from(
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
     if let Some(existing) = existing {
-        if existing.schema != 1 && existing.schema != SCHEMA {
+        if !(1..=SCHEMA).contains(&existing.schema) {
             return Err(format!(
                 "unsupported tracked cell schema {}",
                 existing.schema
@@ -493,7 +662,11 @@ fn tracked_from(
     }
     let regressed: Vec<_> = previous
         .values()
-        .filter(|cell| cell.status == CellStatus::Green && !derived.green.contains(&cell.id))
+        .filter(|cell| {
+            cell.status == CellStatus::Green
+                && derived.population.contains(&cell.id)
+                && !derived.green.contains(&cell.id)
+        })
         .map(|cell| cell.id.clone())
         .collect();
     if !regressed.is_empty() && !allow_green_removal {
@@ -599,6 +772,167 @@ fn update_tracked(
     Ok(())
 }
 
+fn merge_range(range: &mut Option<ObservedRange>, value: Option<u64>) {
+    let Some(value) = value else {
+        return;
+    };
+    match range {
+        Some(range) => {
+            range.earliest = range.earliest.min(value);
+            range.latest = range.latest.max(value);
+        }
+        None => {
+            *range = Some(ObservedRange {
+                earliest: value,
+                latest: value,
+            });
+        }
+    }
+}
+
+fn apply_pressure_summary(
+    tracked: &mut TrackedCells,
+    summary: &PressureSummary,
+    head: &str,
+    detcore_tree: &str,
+) -> Result<usize, String> {
+    if summary.schema != 3 {
+        return Err(format!(
+            "unsupported pressure summary schema {}",
+            summary.schema
+        ));
+    }
+    if summary.source_tree_dirty {
+        return Err("dirty pressure results cannot update checked-in observations".into());
+    }
+    if summary.hermit_sha != head {
+        return Err(format!(
+            "pressure summary belongs to {}, but HEAD is {head}",
+            summary.hermit_sha
+        ));
+    }
+    if summary.detcore_tree != detcore_tree {
+        return Err(format!(
+            "pressure summary names detcore tree {}, but HEAD contains {detcore_tree}",
+            summary.detcore_tree
+        ));
+    }
+
+    let positions: BTreeMap<_, _> = tracked
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.id.clone(), index))
+        .collect();
+    if positions.len() != tracked.cells.len() {
+        return Err("tracked cell file contains a duplicate identity".into());
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::new();
+    for row in &summary.rows {
+        if !seen.insert(row.cell.clone()) {
+            return Err(format!(
+                "pressure summary contains duplicate cell {}",
+                display_id(&row.cell)
+            ));
+        }
+        if !row.evidence_errors.is_empty() {
+            return Err(format!(
+                "pressure summary contains untrustworthy evidence for {}: {}",
+                display_id(&row.cell),
+                row.evidence_errors.join("; ")
+            ));
+        }
+        let Some(index) = positions.get(&row.cell).copied() else {
+            return Err(format!(
+                "pressure summary contains unknown cell {}",
+                display_id(&row.cell)
+            ));
+        };
+        if tracked.cells[index].status != CellStatus::Red {
+            return Err(format!(
+                "pressure summary contains green regression cell {}; ordinary validate owns green evidence",
+                display_id(&row.cell)
+            ));
+        }
+        let result = ObservedResult::parse(&row.result)?;
+        let turn = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_scheduler_turn);
+        let virtual_nanoseconds = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_virtual_nanoseconds);
+        if !result.carries_divergence_position()
+            && (turn.is_some() || virtual_nanoseconds.is_some())
+        {
+            return Err(format!(
+                "non-divergence result for {} carries a divergence position",
+                display_id(&row.cell)
+            ));
+        }
+        prepared.push((index, result, turn, virtual_nanoseconds));
+    }
+
+    for (index, result, turn, virtual_nanoseconds) in prepared {
+        let observations = &mut tracked.cells[index].observations;
+        let position = observations
+            .iter()
+            .position(|observation| observation.detcore_tree == summary.detcore_tree);
+        let observation = match position {
+            Some(position) => &mut observations[position],
+            None => {
+                observations.push(Observation {
+                    detcore_tree: summary.detcore_tree.clone(),
+                    hermit_shas: BTreeSet::new(),
+                    results: BTreeSet::new(),
+                    first_divergent_scheduler_turn: None,
+                    first_divergent_virtual_nanoseconds: None,
+                });
+                observations.last_mut().expect("observation was appended")
+            }
+        };
+        observation.hermit_shas.insert(summary.hermit_sha.clone());
+        observation.results.insert(result);
+        merge_range(&mut observation.first_divergent_scheduler_turn, turn);
+        merge_range(
+            &mut observation.first_divergent_virtual_nanoseconds,
+            virtual_nanoseconds,
+        );
+        observations.sort_by(|left, right| left.detcore_tree.cmp(&right.detcore_tree));
+    }
+    Ok(seen.len())
+}
+
+fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
+    check_tracked(root)?;
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot inspect working tree: {e}"))?;
+    if !status.status.success() {
+        return Err("git status failed while checking the working tree".into());
+    }
+    if !status.stdout.is_empty() {
+        return Err("update-observations requires a clean tracked working tree".into());
+    }
+
+    let summary: PressureSummary = read_json(summary_path)?;
+    let head = git_head(root)?;
+    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let updated = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree)?;
+    fs::write(root.join(CELLS), encoded_cells(&tracked)?)
+        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    println!(
+        "compatibility scorecard: merged pressure observations for {updated} red cell(s) at {head}"
+    );
+    Ok(())
+}
+
 fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> Result<(), String> {
     let derived = derive(root)?;
     let head = git_head(root)?;
@@ -620,27 +954,33 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
         .filter(|id| derived.green.contains(*id))
         .count();
     let chaos_checked = expected.iter().filter(|id| id.mode == "chaos").count();
+    let custom_checked = expected.iter().filter(|id| id.mode == "custom").count();
     println!();
     println!(
-        "Fresh result check: {}/{} selected cells passed at {} ({} compatibility green, {} chaos).",
+        "Fresh result check: {}/{} selected cells passed at {} ({} compatibility green, {} chaos, {} custom).",
         expected.len(),
         expected.len(),
         head,
         green_checked,
-        chaos_checked
+        chaos_checked,
+        custom_checked
     );
     println!("Result directory: {}", result_root.display());
     Ok(())
 }
 
 fn git_head(root: &Path) -> Result<String, String> {
+    git_rev_parse(root, "HEAD")
+}
+
+fn git_rev_parse(root: &Path, revision: &str) -> Result<String, String> {
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", revision])
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot read HEAD: {e}"))?;
     if !output.status.success() {
-        return Err("git rev-parse HEAD failed".into());
+        return Err(format!("git rev-parse {revision} failed"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -843,7 +1183,7 @@ fn self_test() -> Result<(), String> {
     let intentional = TrackedCells {
         schema: SCHEMA,
         cells: vec![TrackedCell {
-            id,
+            id: id.clone(),
             enabled: true,
             status: CellStatus::Green,
             observations: Vec::new(),
@@ -851,6 +1191,127 @@ fn self_test() -> Result<(), String> {
     };
     tracked_from(&regressed, Some(intentional), true, false)
         .map_err(|e| format!("explicit compatibility-transition bracket failed: {e}"))?;
+
+    let mut observed = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![TrackedCell {
+            id: id.clone(),
+            enabled: false,
+            status: CellStatus::Red,
+            observations: Vec::new(),
+        }],
+    };
+    let pressure_row = |result: &str, turn, virtual_nanoseconds| PressureSummaryRow {
+        cell: id.clone(),
+        result: result.into(),
+        verification: Some(PressureVerification {
+            first_divergent_scheduler_turn: turn,
+            first_divergent_virtual_nanoseconds: virtual_nanoseconds,
+        }),
+        evidence_errors: Vec::new(),
+    };
+    let pressure_summary = |sha: &str, tree: &str, rows| PressureSummary {
+        schema: 3,
+        hermit_sha: sha.into(),
+        detcore_tree: tree.into(),
+        source_tree_dirty: false,
+        rows,
+    };
+    let first = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("determinism-failure", Some(20), Some(500))],
+    );
+    apply_pressure_summary(&mut observed, &first, "sha-1", "tree-1")
+        .map_err(|e| format!("positive pressure-observation bracket failed: {e}"))?;
+    let later = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("determinism-failure", Some(10), Some(900))],
+    );
+    apply_pressure_summary(&mut observed, &later, "sha-1", "tree-1")
+        .map_err(|e| format!("pressure-observation range bracket failed: {e}"))?;
+    let timeout = pressure_summary("sha-1", "tree-1", vec![pressure_row("timeout", None, None)]);
+    apply_pressure_summary(&mut observed, &timeout, "sha-1", "tree-1")
+        .map_err(|e| format!("pressure-observation result-set bracket failed: {e}"))?;
+    let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
+    apply_pressure_summary(&mut observed, &same_engine, "sha-doc", "tree-1")
+        .map_err(|e| format!("same-Detcore-tree pressure-observation bracket failed: {e}"))?;
+    let replay = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("replay-failure", Some(30), Some(1000))],
+    );
+    apply_pressure_summary(&mut observed, &replay, "sha-1", "tree-1")
+        .map_err(|e| format!("replay divergence-position bracket failed: {e}"))?;
+    let observation = &observed.cells[0].observations[0];
+    if observation.first_divergent_scheduler_turn
+        != Some(ObservedRange {
+            earliest: 10,
+            latest: 30,
+        })
+        || observation.first_divergent_virtual_nanoseconds
+            != Some(ObservedRange {
+                earliest: 500,
+                latest: 1000,
+            })
+        || observation.results
+            != BTreeSet::from([
+                ObservedResult::Pass,
+                ObservedResult::DeterminismFailure,
+                ObservedResult::ReplayFailure,
+                ObservedResult::Timeout,
+            ])
+        || observation.hermit_shas != BTreeSet::from(["sha-1".into(), "sha-doc".into()])
+    {
+        return Err(
+            "pressure observations did not preserve min/max ranges and all outcomes".into(),
+        );
+    }
+    let next_source = pressure_summary(
+        "sha-2",
+        "tree-2",
+        vec![pressure_row("crash-error", None, None)],
+    );
+    apply_pressure_summary(&mut observed, &next_source, "sha-2", "tree-2")
+        .map_err(|e| format!("new-source pressure-observation bracket failed: {e}"))?;
+    if observed.cells[0].observations.len() != 2 {
+        return Err("a new Detcore tree was blended into an old observation".into());
+    }
+    let preserved = tracked_from(&regressed, Some(observed.clone()), true, false)?;
+    if preserved.cells[0].observations != observed.cells[0].observations {
+        return Err("ordinary scorecard derivation changed pressure observations".into());
+    }
+
+    let mut dirty = first.clone();
+    dirty.source_tree_dirty = true;
+    let mut refusal_target = observed.clone();
+    if apply_pressure_summary(&mut refusal_target, &dirty, "sha-1", "tree-1").is_ok() {
+        return Err("dirty pressure observations were accepted".into());
+    }
+    if apply_pressure_summary(&mut refusal_target, &first, "wrong-sha", "tree-1").is_ok()
+        || apply_pressure_summary(&mut refusal_target, &first, "sha-1", "wrong-tree").is_ok()
+    {
+        return Err("pressure observations with wrong source identity were accepted".into());
+    }
+    let infrastructure = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![PressureSummaryRow {
+            cell: id.clone(),
+            result: "infrastructure-error".into(),
+            verification: None,
+            evidence_errors: vec!["fixture missing".into()],
+        }],
+    );
+    if apply_pressure_summary(&mut refusal_target, &infrastructure, "sha-1", "tree-1").is_ok() {
+        return Err("infrastructure failure was stored as product behavior".into());
+    }
+    let mut green_target = observed.clone();
+    green_target.cells[0].status = CellStatus::Green;
+    if apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1").is_ok() {
+        return Err("periodic pressure evidence was allowed to rewrite a green cell".into());
+    }
 
     let native = ResultRow {
         schema: 3,
@@ -872,6 +1333,8 @@ fn self_test() -> Result<(), String> {
     if malformed.id().is_some() {
         return Err("non-native result without a backend was accepted".into());
     }
-    println!("compatibility scorecard self-test: 3 accepted cases, 4 refused cases");
+    println!(
+        "compatibility scorecard self-test: result, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+    );
     Ok(())
 }

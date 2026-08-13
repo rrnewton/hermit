@@ -269,16 +269,16 @@ fn hermit_command(
     let command = match mode {
         "verify" => {
             let strict = if verify_bitwise_parity {
-                " --verify-strict --verify-json \"$cell/captures/verify.json\""
+                " --verify-strict"
             } else {
                 ""
             };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict}{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict} --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
         ),
         "chaos" => format!(
             "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={}{run_extra_joined} -- {guest}",
@@ -733,6 +733,20 @@ fn self_test() -> ExitCode {
         "guest",
     );
     assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+    let weak_verify = hermit_command(
+        "verify",
+        "ptrace",
+        "portable",
+        60,
+        None,
+        &[],
+        false,
+        "info",
+        &[],
+        "guest",
+    );
+    assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
+    assert!(!weak_verify.contains("--verify-strict"));
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }
