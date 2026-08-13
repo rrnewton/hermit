@@ -78,6 +78,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
@@ -187,6 +188,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
@@ -245,6 +247,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it"
@@ -353,6 +356,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
@@ -408,6 +412,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"
@@ -466,6 +471,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately"

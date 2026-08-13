@@ -26,6 +26,7 @@ native = "Native ordering can vary but is not guaranteed to diverge in a bounded
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -134,6 +135,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -188,6 +190,7 @@ native = "The programs self-check invariants rather than requiring native output
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -245,6 +248,7 @@ native = "Native scheduling does not guarantee both outcomes within a fixed budg
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"

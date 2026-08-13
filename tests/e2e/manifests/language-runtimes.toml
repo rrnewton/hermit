@@ -26,6 +26,7 @@ native = "This regression establishes Hermit verification, not native nondetermi
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Bash qualification is tracked by backend compatibility"
@@ -82,6 +83,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Bash qualification is tracked by backend compatibility"
@@ -138,6 +140,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT C++ qualification is tracked by backend compatibility"
@@ -245,6 +248,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT awk support is tracked by backend compatibility"
@@ -300,6 +304,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT m4 qualification is tracked by backend compatibility"
@@ -354,6 +359,7 @@ native = "This regression establishes Hermit verification, not native nondetermi
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Perl qualification is tracked by backend compatibility"
@@ -410,6 +416,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Perl support is tracked by backend compatibility"
@@ -465,6 +472,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python support is tracked by backend compatibility"
@@ -520,6 +528,7 @@ native = "This regression establishes Hermit verification, not native nondetermi
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python qualification is tracked by backend compatibility"
@@ -576,6 +585,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python support is tracked by backend compatibility"
@@ -632,6 +642,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Rust qualification is tracked by backend compatibility"
@@ -688,6 +699,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Ruby support is tracked by backend compatibility"
@@ -744,6 +756,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT perl support is tracked by backend compatibility"
@@ -800,6 +813,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Lua qualification is tracked by backend compatibility"
@@ -856,6 +870,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python support is tracked by backend compatibility"
@@ -913,6 +928,7 @@ native = "Native hash-seed variation is host/PYTHONHASHSEED sensitive; this regr
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python qualification is tracked by backend compatibility"
@@ -968,6 +984,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT Tcl qualification is tracked by backend compatibility"
@@ -1024,6 +1041,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBI rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification"

@@ -26,6 +26,7 @@ native = "Elapsed time drives progress but final output is intentionally stable"
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT application coverage is owned by backend parity"
@@ -134,6 +135,7 @@ native = "The portable Python-random test owns the native nondeterminism control
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { kvm = false } }
 backends_enabled = ["kvm"]
 [test.modes.verify.backends_disabled]
 ptrace = "This test specifically asserts the KVM execution path"
@@ -190,6 +192,7 @@ native = "This is a privileged KVM backend integration test"
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { kvm = false } }
 backends_enabled = ["kvm"]
 [test.modes.verify.backends_disabled]
 ptrace = "This test specifically asserts the KVM execution path"
@@ -245,6 +248,7 @@ native = "The fixed sources, compiler flags, and input make the toolchain transa
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Establish the shared C toolchain transaction on the ptrace reference path before backend ratchets"
@@ -300,6 +304,7 @@ native = "Fixed content, identities, timestamps, and configuration make the repo
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Establish the shared Git transaction on the ptrace reference path before backend ratchets"

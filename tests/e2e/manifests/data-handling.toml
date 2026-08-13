@@ -26,6 +26,7 @@ native = "Normalized archive metadata is deterministic by construction"
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -81,6 +82,7 @@ native = "The LC_ALL=C pipeline output is deterministic by construction"
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -137,6 +139,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
@@ -192,6 +195,7 @@ backends_enabled = ["native"]
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBT SQLite qualification is tracked by backend compatibility"
@@ -247,6 +251,7 @@ native = "zstd fixes job boundaries by input offset, not by which worker claims 
 
 [test.modes.verify]
 ci = true
+assert = { bitwise_parity = { ptrace = false } }
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "DBI coverage is owned by its backend parity partition"
