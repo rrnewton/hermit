@@ -40,16 +40,19 @@ use std::process::Command;
 /// Repository the label is applied to. Hard-coded in the bash and kept hard-coded
 /// here: this driver must not be usable to label an arbitrary repository.
 pub const LABEL_REPO: &str = "rrnewton/hermit";
+const LOCALLY_VALIDATED_LABEL: &str = "locally-validated";
 
 /// Why publication did not happen, or that it did. Returned (rather than only
 /// printed) so `--self-test` can bracket the decision without any network call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Publication {
-    /// Eligible, but a prerequisite was missing (no ci-hub, no PR).
+    /// Eligible, but a prerequisite or the API read-back was unavailable.
     /// Eligibility itself is the caller's check, via [`eligible`].
     Unavailable(String),
-    /// `ci-hub apply-local-label` was invoked for this PR.
-    Attempted { pr: String },
+    /// The GitHub API read-back observed the derived label on this PR.
+    Applied { pr: String },
+    /// Reconciliation completed without the GitHub API observing the label.
+    NotApplied { pr: String, reason: String },
 }
 
 /// The five conditions `validate.sh:1735` requires before publishing.
@@ -133,6 +136,81 @@ fn apply_local_label_args(pr: &str) -> [&str; 5] {
     ["apply-local-label", "--pr", pr, "--repo", LABEL_REPO]
 }
 
+fn label_is_present_in_api_response(response: &[u8]) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_slice(response)
+        .map_err(|error| format!("PR label read-back was not valid JSON: {error}"))?;
+    let labels = value
+        .get("labels")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "PR label read-back has no labels array".to_string())?;
+    Ok(labels.iter().any(|label| {
+        label.get("name").and_then(serde_json::Value::as_str) == Some(LOCALLY_VALIDATED_LABEL)
+    }))
+}
+
+/// Read the label state back from GitHub rather than treating the reconciler's
+/// exit status as proof that its action was `bound` rather than `skip`.
+fn local_label_is_present(pr: &str) -> Result<bool, String> {
+    if !has_cmd("gh") {
+        return Err("gh is unavailable for label read-back".into());
+    }
+    let (prog, pre): (&str, &[&str]) = if has_cmd("with-proxy") {
+        ("with-proxy", &["gh"])
+    } else {
+        ("gh", &[])
+    };
+    let output = Command::new(prog)
+        .args(pre)
+        .args(["pr", "view", pr, "--repo", LABEL_REPO, "--json", "labels"])
+        .output()
+        .map_err(|error| format!("could not read PR labels: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "PR label read-back failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    label_is_present_in_api_response(&output.stdout)
+}
+
+/// Reconcile, then classify publication from the independent label read-back.
+///
+/// A successful reconciler exit only says that reconciliation completed. It
+/// may have selected `skip`, so it cannot produce [`Publication::Applied`]
+/// without the observation step.
+fn publication_after_reconcile<A, O>(pr: &str, apply: A, observe: O) -> Publication
+where
+    A: FnOnce() -> Result<bool, String>,
+    O: FnOnce() -> Result<bool, String>,
+{
+    match apply() {
+        Err(reason) => Publication::Unavailable(reason),
+        Ok(false) => Publication::NotApplied {
+            pr: pr.into(),
+            reason: "apply-local-label exited unsuccessfully".into(),
+        },
+        Ok(true) => match observe() {
+            Ok(true) => Publication::Applied { pr: pr.into() },
+            Ok(false) => Publication::NotApplied {
+                pr: pr.into(),
+                reason: format!(
+                    "API read-back shows {LOCALLY_VALIDATED_LABEL} is absent after reconciliation"
+                ),
+            },
+            Err(reason) => Publication::Unavailable(reason),
+        },
+    }
+}
+
+fn applied_message(publication: &Publication) -> Option<String> {
+    match publication {
+        Publication::Applied { pr } => Some(format!(
+            "📎 receipt published; {LOCALLY_VALIDATED_LABEL} applied to {LABEL_REPO}#{pr} from the canonical ledger"
+        )),
+        Publication::Unavailable(_) | Publication::NotApplied { .. } => None,
+    }
+}
+
 /// Publish the receipt and apply `locally-validated`, FROM the ledger record.
 ///
 /// Always returns; never fails the run.
@@ -157,26 +235,37 @@ pub fn publish() -> Publication {
         eprintln!("⚠️  counted validation recorded, but no PR was found; not applying locally-validated");
         return Publication::Unavailable("no PR was found".into());
     };
-    let status = Command::new(&ci_hub).args(apply_local_label_args(&pr)).status();
-    match status {
-        Ok(s) if s.success() => {
-            println!(
-                "📎 receipt published; locally-validated applied to {LABEL_REPO}#{pr} from the canonical ledger"
-            );
-        }
-        _ => {
-            eprintln!(
-                "⚠️  receipt publication failed for PR #{pr}; locally-validated was not authorized"
-            );
+    let publication = publication_after_reconcile(
+        &pr,
+        || {
+            Command::new(&ci_hub)
+                .args(apply_local_label_args(&pr))
+                .status()
+                .map(|status| status.success())
+                .map_err(|error| format!("could not run apply-local-label: {error}"))
+        },
+        || local_label_is_present(&pr),
+    );
+    if let Some(message) = applied_message(&publication) {
+        println!("{message}");
+    } else {
+        match &publication {
+            Publication::NotApplied { reason, .. } | Publication::Unavailable(reason) => {
+                eprintln!(
+                    "⚠️  receipt publication did not apply {LOCALLY_VALIDATED_LABEL} for PR #{pr}: {reason}"
+                );
+            }
+            Publication::Applied { .. } => unreachable!("applied publication has a message"),
         }
     }
-    Publication::Attempted { pr }
+    publication
 }
 
 /// Inert brackets for the eligibility predicate.
 ///
-/// **Nothing here can publish.** It exercises only the pure predicate — no
-/// `ci-hub` invocation, no `gh` call, no label mutation — because a bracket that
+/// **Nothing here can publish.** It exercises the pure eligibility predicate,
+/// injected reconciliation/read-back outcomes, and inert API-response bytes —
+/// no `ci-hub` invocation, no `gh` call, and no label mutation. A bracket that
 /// planted a real `locally-validated` label would itself be the authorization it
 /// claims to test.
 pub fn self_test() -> Result<String, String> {
@@ -223,9 +312,96 @@ pub fn self_test() -> Result<String, String> {
             return Err(format!("receipt: super must be refused BY THE PROFILE gate, got: {e}"));
         }
     }
+
+    // The command's rc=0 is not an applied-label result: `apply-local-label`
+    // also returns success for a correct `skip`. Only the API read-back may
+    // select Applied. These closures are inert; they do not invoke ci-hub, gh,
+    // or touch any PR.
+    use std::cell::Cell;
+    let observed = Cell::new(0usize);
+    let publication = publication_after_reconcile(
+        "123",
+        || Ok(true),
+        || {
+            observed.set(observed.get() + 1);
+            Ok(true)
+        },
+    );
+    if !matches!(publication, Publication::Applied { .. })
+        || applied_message(&publication).is_none()
+        || observed.get() != 1
+    {
+        return Err("receipt: an observed label must report Applied after one read-back".into());
+    }
+
+    observed.set(0);
+    let publication = publication_after_reconcile(
+        "123",
+        || Ok(true),
+        || {
+            observed.set(observed.get() + 1);
+            Ok(false)
+        },
+    );
+    if !matches!(publication, Publication::NotApplied { .. })
+        || applied_message(&publication).is_some()
+        || observed.get() != 1
+    {
+        return Err(
+            "receipt: rc=0 with an absent label must not report publication success".into(),
+        );
+    }
+
+    observed.set(0);
+    let publication = publication_after_reconcile(
+        "123",
+        || Ok(false),
+        || {
+            observed.set(observed.get() + 1);
+            Ok(true)
+        },
+    );
+    if !matches!(publication, Publication::NotApplied { .. })
+        || applied_message(&publication).is_some()
+        || observed.get() != 0
+    {
+        return Err("receipt: a failed reconciler must not report or read back success".into());
+    }
+
+    observed.set(0);
+    let publication = publication_after_reconcile(
+        "123",
+        || Ok(true),
+        || {
+            observed.set(observed.get() + 1);
+            Err("API unavailable".into())
+        },
+    );
+    if !matches!(publication, Publication::Unavailable(_))
+        || applied_message(&publication).is_some()
+        || observed.get() != 1
+    {
+        return Err(
+            "receipt: an unreadable label state must not report publication success".into(),
+        );
+    }
+
+    // Pin the `gh pr view --json labels` response shape consumed by the live
+    // read-back. Unknown or malformed shapes must never default to present.
+    let present = br#"{"labels":[{"name":"locally-validated"}]}"#;
+    let absent = br#"{"labels":[{"name":"documentation"}]}"#;
+    if label_is_present_in_api_response(present) != Ok(true)
+        || label_is_present_in_api_response(absent) != Ok(false)
+        || label_is_present_in_api_response(br#"{"labels":[]}"#) != Ok(false)
+        || label_is_present_in_api_response(br#"{"unexpected":[]}"#).is_ok()
+        || label_is_present_in_api_response(b"not json").is_ok()
+    {
+        return Err("receipt: GitHub label read-back parser does not fail closed".into());
+    }
+
     accepted += 0;
     Ok(format!(
-        "receipt: eligibility bracketed {accepted} accept / {refused} refuse (no label was \
-         touched; the predicate is pure)"
+        "receipt: eligibility bracketed {accepted} accept / {refused} refuse; publication \
+         bracketed 1 applied / 3 not applied (no label was touched; the brackets are inert)"
     ))
 }
