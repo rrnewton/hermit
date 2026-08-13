@@ -22,27 +22,28 @@
 //! kernel algorithm inside Detcore so the wake is issued against the modeled
 //! waiter pool, deterministically and identically on every backend.
 //!
-//! The word transition is performed by Detcore as well, not left to the host
-//! kernel. That is deliberate:
+//! Detcore always performs the modeled wake. On ptrace, it leaves the
+//! owner-word transition to the real Linux task-exit path:
 //!
-//! * it removes an ordering race — Detcore issues the wake before the guest's
-//!   `exit` reaches the kernel, so a waiter that is woken and re-reads the word
-//!   must already see `FUTEX_OWNER_DIED`;
-//! * it makes the behavior backend-independent — on the KVM backend nothing
-//!   performs this transition at all. Measured on the `robust_futex_test` guest,
-//!   the futex word after owner death reads `0x40000000` natively and on base
-//!   ptrace (the host kernel wrote it) but `0x00000004` on base KVM;
-//! * it is idempotent with respect to the host kernel. After Detcore clears the
-//!   owner TID field, the kernel's later `handle_futex_death()` sees
-//!   `(uval & FUTEX_TID_MASK) != task_pid_vnr(curr)` and does nothing.
+//! * Linux performs the required compare/exchange atomically, so a process
+//!   outside Hermit's scheduler cannot have its newly acquired process-shared
+//!   mutex overwritten by a separate Detcore read and write;
+//! * waking a modeled waiter does not immediately run it. Ptrace keeps the
+//!   dying thread's handler pending through its tail-injected exit, so Linux
+//!   changes the word before the exit callback releases another scheduler turn.
+//!
+//! DBT and SaBRe invoke their task-exit callback before executing the native
+//! exit, and KVM has no Linux task-exit path. Detcore therefore retains the
+//! separate read and write on those backends. The fake below models that window
+//! so the remaining process-shared race is visible rather than hidden by an
+//! atomic test double.
 //!
 //! # Scope: voluntary thread exit only
 //!
-//! Detcore replays this walk from the `exit`/`exit_group` syscall handlers,
-//! which is strictly narrower than Linux, and narrower in a way that matters for
-//! process-shared robust mutexes. See `handle_exit_group` in
-//! [`crate::syscalls::threads`] for the exact constraint and why no other hook
-//! can carry it.
+//! Detcore replays this walk from the `exit`/`exit_group` syscall handlers, but
+//! an `exit_group` caller still walks only its own registration. Sibling
+//! cleanup, successful exec's `de_thread` cleanup, and fatal signals need
+//! lifecycle handling that is not available on every backend.
 //!
 //! # Structure
 //!
@@ -161,6 +162,9 @@ enum DeathStep {
 pub(crate) enum FutexCasOutcome {
     /// The word still held the expected value and now holds the new one.
     Stored,
+    /// The backend will perform the atomic replacement before the modeled wake
+    /// can let another thread run.
+    Deferred,
     /// The word held this other value instead, so nothing was written. The
     /// kernel's `goto retry`.
     Changed(u32),
@@ -182,12 +186,15 @@ pub(crate) trait RobustDeathEffects {
     /// Read the 32-bit futex word. `None` models `get_user()` faulting.
     fn read_u32(&mut self, address: usize) -> Option<u32>;
 
-    /// Replace the futex word, but only while it still holds `expected`.
+    /// Arrange to replace the futex word, but only while it still holds `expected`.
     ///
     /// This is `futex_cmpxchg_value_locked(&nval, uaddr, uval, mval)` plus the
     /// `if (nval != uval) goto retry;` immediately after it: the kernel never
     /// stores `desired` over a word whose value moved since it was read,
-    /// because that word may have been re-acquired by a live thread.
+    /// because that word may have been re-acquired by a live thread. A backend
+    /// whose Linux task-exit cleanup completes before another modeled thread
+    /// can run may return [`FutexCasOutcome::Deferred`] and leave the atomic
+    /// replacement to it.
     fn compare_and_swap(&mut self, address: usize, expected: u32, desired: u32) -> FutexCasOutcome;
 
     /// Wake exactly one waiter on the futex word, as the kernel's
@@ -371,7 +378,7 @@ async fn handle_futex_death<E: RobustDeathEffects>(
         };
 
         match effects.compare_and_swap(word, uval, transition.new_value) {
-            FutexCasOutcome::Stored => {
+            FutexCasOutcome::Stored | FutexCasOutcome::Deferred => {
                 if transition.wake_one {
                     effects.wake_one(word, transition.new_value).await;
                 }
@@ -419,6 +426,13 @@ mod tests {
         /// to reach the compare-and-swap retry path from a test, because the
         /// walk itself is single-threaded.
         races: BTreeMap<usize, VecDeque<u32>>,
+        /// Values stored after `compare_and_swap` has re-read and accepted the
+        /// expected word, but before its separate write. This reproduces the
+        /// production read/write window rather than granting the fake an
+        /// atomic operation production does not have.
+        races_before_write: BTreeMap<usize, VecDeque<u32>>,
+        /// Leave the owner-word transition to the backend's task-exit cleanup.
+        defer_owner_death_to_backend: bool,
         /// `(word, before, after)` for each applied transition, in order.
         marks: Vec<(usize, u32, u32)>,
         /// `(word, observed)` for each wake, in order.
@@ -430,6 +444,13 @@ mod tests {
         /// it, as another thread's store would.
         fn race_after_read(&mut self, address: usize, value: u32) {
             self.races.entry(address).or_default().push_back(value);
+        }
+
+        fn race_before_write(&mut self, address: usize, value: u32) {
+            self.races_before_write
+                .entry(address)
+                .or_default()
+                .push_back(value);
         }
 
         fn put_u64(&mut self, address: usize, value: u64) {
@@ -513,6 +534,16 @@ mod tests {
             };
             if observed != expected {
                 return FutexCasOutcome::Changed(observed);
+            }
+            if let Some(raced) = self
+                .races_before_write
+                .get_mut(&address)
+                .and_then(VecDeque::pop_front)
+            {
+                self.put_u32(address, raced);
+            }
+            if self.defer_owner_death_to_backend {
+                return FutexCasOutcome::Deferred;
             }
             self.put_u32(address, desired);
             self.marks.push((address, expected, desired));
@@ -827,6 +858,58 @@ mod tests {
         assert!(guest.wakes.is_empty());
         assert_eq!(outcome.entries_visited, 1);
         assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn backend_exit_cleanup_does_not_overwrite_a_store_after_the_final_read() {
+        let mut guest = FakeGuest {
+            defer_owner_death_to_backend: true,
+            ..FakeGuest::default()
+        };
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        // Thread 7 acquires the process-shared mutex after Detcore's final
+        // read. The old production implementation then performed a separate
+        // write and overwrote this live owner. Linux's exit cleanup repeats
+        // the comparison atomically and therefore leaves thread 7 untouched.
+        guest.race_before_write(0x2000, FUTEX_WAITERS | 7);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert_eq!(outcome.cas_retries, 0);
+        assert_eq!(guest.get_u32(0x2000), Some(FUTEX_WAITERS | 7));
+        assert!(guest.marks.is_empty());
+        // A stale modeled wake is harmless: the waiter rechecks the live owner
+        // after it resumes. The prohibited behavior is overwriting that owner.
+        assert_eq!(guest.wakes.len(), 1);
+    }
+
+    #[test]
+    fn fake_guest_exposes_the_separate_read_write_window() {
+        let mut guest = FakeGuest::default();
+        guest.put_u32(0x2000, FUTEX_WAITERS | OWNER);
+        guest.race_before_write(0x2000, FUTEX_WAITERS | 7);
+
+        let outcome = guest.compare_and_swap(
+            0x2000,
+            FUTEX_WAITERS | OWNER,
+            FUTEX_WAITERS | FUTEX_OWNER_DIED,
+        );
+
+        assert_eq!(outcome, FutexCasOutcome::Stored);
+        assert_eq!(
+            guest.get_u32(0x2000),
+            Some(FUTEX_WAITERS | FUTEX_OWNER_DIED),
+            "the fake must expose that a separate write overwrites the intervening store"
+        );
+        assert_eq!(
+            guest.marks,
+            vec![(
+                0x2000,
+                FUTEX_WAITERS | OWNER,
+                FUTEX_WAITERS | FUTEX_OWNER_DIED
+            )]
+        );
     }
 
     #[test]

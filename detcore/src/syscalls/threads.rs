@@ -451,9 +451,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Replay Linux's `exit_robust_list()` for the calling thread.
     ///
     /// Linux runs this from `mm_release()` while a task dies. Detcore performs
-    /// the same walk, applies the same word transition, and issues the wake
-    /// against its own modeled waiter pool, which is where precise-mode futex
-    /// waiters actually live. The algorithm is in
+    /// the same walk and issues the wake against its own modeled waiter pool,
+    /// which is where precise-mode futex waiters actually live. It either
+    /// applies the word transition or, on ptrace, leaves the atomic operation
+    /// to Linux. The algorithm is in
     /// [`crate::syscalls::robust_list`]; this function only supplies guest
     /// memory and the scheduler wake.
     ///
@@ -489,6 +490,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut effects = GuestRobustEffects::<'_, G, T> {
             guest,
             dettid,
+            defer_owner_death_to_backend: self.cfg.backend_runs_exit_robust_list,
             tool: PhantomData,
         };
         let outcome = robust_list::exit_robust_list(&mut effects, head, owner_tid).await;
@@ -1332,6 +1334,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 struct GuestRobustEffects<'a, G, T> {
     guest: &'a mut G,
     dettid: DetTid,
+    defer_owner_death_to_backend: bool,
     tool: PhantomData<T>,
 }
 
@@ -1368,21 +1371,30 @@ where
         // cross-address-space cmpxchg, so this re-reads the word immediately
         // before storing and refuses to store when the value has moved.
         //
-        // Within Detcore's model that is exact rather than approximate: the
-        // dying thread holds the scheduler turn for the whole walk, and the
-        // walk performs no `await` between this read and the write below, so
-        // no modeled thread can run in between. What the comparison adds is
-        // refusal against a writer OUTSIDE the model — a process-shared robust
-        // mutex (`FutexID::Shared`) touched by a task Detcore does not
-        // sequentialize — where a blind write would stamp
-        // `FUTEX_OWNER_DIED` onto a lock that is currently held by someone
-        // alive. Linux compares for the same reason.
+        // The dying task keeps the scheduler turn for the whole walk, so no
+        // modeled thread can run between this read and the write. That does not
+        // make the operations atomic against a process outside the model. Only
+        // ptrace can safely take the deferred branch below; DBT and SaBRe run
+        // their tool-exit callbacks before native cleanup, and KVM has none.
         let observed = match self.guest.memory().read_value::<_, u32>(read_at) {
             Ok(value) => value,
             Err(_) => return FutexCasOutcome::Faulted,
         };
         if observed != expected {
             return FutexCasOutcome::Changed(observed);
+        }
+        if self.defer_owner_death_to_backend {
+            // Ptrace keeps this syscall handler pending through the native
+            // exit and does not release another scheduler turn until Linux has
+            // repeated the owner check and changed the word atomically. Do not
+            // perform a separate write here: a process outside Hermit's
+            // scheduler can share the mapping and acquire the mutex between
+            // this read and that write.
+            debug!(
+                "[detcore, dtid {}] robust-list owner death: leaving futex word {:#x} for backend exit cleanup",
+                self.dettid, address,
+            );
+            return FutexCasOutcome::Deferred;
         }
         // `MemoryAccess::write_value` writes through to the guest immediately
         // (`write_exact`); it is not the scratch-stack path, which buffers
@@ -1392,9 +1404,8 @@ where
         }
         // Deliberately DEBUG, not INFO: this line carries a raw guest address,
         // and INFO is the surface `--verify-strict` compares. The
-        // `detcore_itself_marks_the_word_and_wakes_the_modeled_waiter`
-        // regression test reads it from a `--log=debug` run, which is why the
-        // exact wording is load-bearing.
+        // KVM diagnostics read this from `--log=debug`; keep it below INFO
+        // because the address is not a deterministic observation.
         debug!(
             "[detcore, dtid {}] robust-list owner death: futex word {:#x} {:#x} -> {:#x}",
             self.dettid, address, expected, desired,
