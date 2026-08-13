@@ -271,7 +271,7 @@ fn usage() -> &'static str {
      \x20 quick            Core ptrace run/verify/record smoke tests; no alternate backends.\n\
      \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
      \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
-     \x20 full             quick plus the complete suite and DBI/KVM gates (default).\n\
+     \x20 full             quick plus the complete suite and DBT/KVM gates (default).\n\
      \x20 super            Repeat stress probes under moderate oversubscription.\n\
      \x20 --quick          Alias for the quick level.\n\
      \x20 --portable       Alias for the portable-only level.\n\
@@ -1333,6 +1333,8 @@ fn super_plan_bracket() -> Result<(), String> {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -2066,7 +2068,7 @@ struct Plan {
     /// and emitted afterwards, and an optional baseline is enforced.
     envelope: Option<EnvelopePlan>,
     /// Tags whose failure must NOT turn the run red. This is how a MEASUREMENT
-    /// (envelope probes) and a NEVER-BEFORE-MEASURED row (KVM/DBI stress) are
+    /// (envelope probes) and a NEVER-BEFORE-MEASURED row (KVM/DBT stress) are
     /// kept out of the blocking verdict without hiding them from the report.
     /// Every member is named in the summary with the reason it is nonblocking.
     nonblocking: BTreeSet<String>,
@@ -3477,6 +3479,8 @@ fn step_with_caps(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
@@ -6303,7 +6307,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // passed", and each states which rows it excluded and why:
     //   * compat — known fail-closed rows and bounded portable diagnostics are
     //     nonblocking by policy;
-    //   * super — the KVM/DBI stress rows were unreachable in validate.sh, so
+    //   * super — the KVM/DBT stress rows were unreachable in validate.sh, so
     //     their first measurement is reported rather than ratcheted;
     //   * envelope — it is a measurement, so probe failures lower a count and
     //     only the build/preflight spine can fail it.

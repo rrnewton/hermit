@@ -85,6 +85,7 @@ Usage:
   ci/test_harness.sh audit-test-binary-registration
   ci/test_harness.sh audit-ci
   ci/test_harness.sh audit-compile [--lane LANE] [--category CATEGORY] [--test ID]
+  ci/test_harness.sh audit-comparison-contract
 
 Filters:
   --lane LANE             portable or privileged
@@ -342,12 +343,23 @@ function normalize_metadata {
           compile_args: (.build.cflags // .build.rustflags // []),
           run_args: (if ((.program // "") | endswith(".sh")) then ["--run"] else [] end),
           modes: (.modes | with_entries(
-            .value |= (. + {
+            . as $mode
+            | .value |= (. + {
               backends: (.backends_enabled // []),
               disabled: (.backends_disabled // {}),
               args: (.args // []),
               guest_args: (.guest_args // {}),
-              assert: (.assert // {})
+              assert: (.assert // {}),
+              comparison:
+                (if ($mode.key == "verify" or $mode.key == "replay") then
+                   {expected:true, reason:null}
+                 elif $mode.key == "naked" then
+                   {expected:false, reason:"naked mode is a native control and does not compare Hermit executions"}
+                 elif $mode.key == "chaos" then
+                   {expected:false, reason:"chaos mode measures schedule diversity and does not compare two executions"}
+                 else
+                   {expected:false, reason:"custom mode has no comparison contract"}
+                 end)
             } | del(.backends_enabled, .backends_disabled))))
         }
         | del(.program, .direct, .build)
@@ -2823,16 +2835,18 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the L2 parity assertion?
-function verify_asserts_bitwise_parity {
-    local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+# Does this exact mode opt into the canonical L2 comparator? Keeping this
+# decision mode-local prevents adding --verify-strict merely to make structured
+# reporting available.
+function comparison_asserts_bitwise_parity {
+    local metadata=$1 mode=$2
+    jq -r --arg mode "$mode" '.modes[$mode].assert.bitwise_parity // false' <<<"$metadata"
 }
 
-# Where a verify attempt writes its machine-readable verdict.
-function verify_verdict_path {
-    local cell_dir=$1 attempt=$2
-    printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
+# Where a comparison-producing attempt writes its machine-readable verdict.
+function comparison_verdict_path {
+    local cell_dir=$1 mode=$2 attempt=$3
+    printf '%s/%s-%s.json\n' "$cell_dir" "$mode" "$attempt"
 }
 
 # Fail closed on anything short of a full parity verdict: a missing, unparsable,
@@ -2869,6 +2883,7 @@ function execute_attempt {
     local cell_dir=$5
     local attempt=$6
     local seed=${7:-}
+    local hermit_bin=${8:-$HERMIT_BIN}
     local timeout_seconds stdout_file stderr_file path_evidence_file guest_tmpdir kind guest_backend
     timeout_seconds=$(jq -r .timeout_seconds <<<"$metadata")
     stdout_file="$cell_dir/captures/${mode}-${attempt}.stdout"
@@ -2942,28 +2957,34 @@ function execute_attempt {
             # parity comparator and made to emit a machine-readable verdict, which
             # run_cell then checks -- otherwise the cell would be justified by a
             # parity measurement it never actually performs.
-            local verify_strict_flags=()
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict --verify-json
-                    "$(verify_verdict_path "$cell_dir" "$attempt")")
+            local verify_flags=(--verify-json
+                "$(comparison_verdict_path "$cell_dir" "$mode" "$attempt")")
+            if [[ $(comparison_asserts_bitwise_parity "$metadata" "$mode") == true ]]; then
+                verify_flags=(--verify-strict "${verify_flags[@]}")
             fi
-            command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_strict_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
+            command=("$hermit_bin" --log=info run --backend "$backend" --strict --verify
+                "${verify_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
-            command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
-                --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
+            local replay_flags=(--verify-json
+                "$(comparison_verdict_path "$cell_dir" "$mode" "$attempt")")
+            if [[ $(comparison_asserts_bitwise_parity "$metadata" "$mode") == true ]]; then
+                replay_flags=(--verify-strict "${replay_flags[@]}")
+            fi
+            command=("$hermit_bin" --log=info --backend "$backend" record start --strict --verify
+                "${replay_flags[@]}" --data-dir "$cell_dir/recording"
+                --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
             # Chaos seeds are witnesses for a guest schedule, so the guest's initial
             # stack must not inherit run-specific host variables such as RESULT_ROOT.
             # Keep the witness independent of the harness run id and checkout path.
-            command=("$HERMIT_BIN" --log=off run --base-env=minimal --backend "$backend" --strict --chaos
+            command=("$hermit_bin" --log=off run --base-env=minimal --backend "$backend" --strict --chaos
                 --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         custom)
             mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
-            command=("$HERMIT_BIN" --log=info run --backend "$backend"
+            command=("$hermit_bin" --log=info run --backend "$backend"
                 "${custom_args[@]}" -- "${guest_command[@]}")
             ;;
         *) die "internal error: unsupported mode $mode" ;;
@@ -2983,11 +3004,78 @@ function execute_attempt {
         "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
 }
 
+# Read the machine-readable parity verdict a verify attempt left in the cell
+# directory and reduce it to the three fields a consumer needs to tell a
+# comparator result from a run that never compared.
+#
+# WHY THIS EXISTS. Until now a results.jsonl row carried neither the verdict nor
+# the compared-message counts, so a green asserted only that the command exited
+# 0 -- not that the comparator ran and matched. Measured over 2788 retained rows
+# at the time of writing: 2409 of 2415 passing cells recorded no parity evidence
+# anywhere, in a column or in prose.
+#
+# ALL THREE FIELDS ARE REQUIRED AND bitwise_parity ALONE IS NOT ENOUGH. Across 60
+# retained verdicts the observed shapes were `matched` with parity true and
+# counts present, and `no_result` with parity FALSE and counts null. A genuine
+# divergence is also parity false, so parity cannot separate a refusal from a
+# divergence; `verdict` names the state directly and `compared_log_messages`
+# records whether any comparison happened at all.
+#
+# Emits one object for every mode. Comparison-producing modes carry the report
+# or a nonblank reason that the report is unavailable. Other modes carry their
+# declared reason for not comparing, so null verdict fields never have two
+# indistinguishable meanings.
+function comparison_result_fields {
+    local metadata=$1 mode=$2 cell_dir=$3 attempt=$4
+    local expected declared_reason verdict
+    expected=$(jq -r --arg mode "$mode" '.modes[$mode].comparison.expected' <<<"$metadata")
+    declared_reason=$(jq -r --arg mode "$mode" '.modes[$mode].comparison.reason // ""' <<<"$metadata")
+    if [[ $expected != true ]]; then
+        [[ -n $declared_reason ]] || die "$mode must state why it does not produce a comparison"
+        jq -cn --arg reason "$declared_reason" \
+            '{expected:false,unavailable_reason:$reason,verdict:null,bitwise_parity:null,compared_log_messages:null}'
+        return 0
+    fi
+
+    verdict=$(comparison_verdict_path "$cell_dir" "$mode" "$attempt")
+    if [[ ! -f $verdict ]]; then
+        jq -cn '{expected:true,unavailable_reason:"comparison verdict file is missing",verdict:null,bitwise_parity:null,compared_log_messages:null}'
+        return 0
+    fi
+    # `comparison` is null exactly when no verdict was reached: the producer's
+    # VerificationReport::no_result() hardcodes it, and that record is stamped
+    # before every --verify-json run, so it survives any early exit. Demanding
+    # the comparison object unconditionally would route that honest state into
+    # the malformed branch below and republish it as a corrupt artifact, which
+    # is the same collapse the emitter comment further down refuses. The sibling
+    # reader assert_bitwise_parity_verdict already tolerates the null shape.
+    if ! jq -e '
+        (.verdict | type == "string")
+        and (.bitwise_parity | type == "boolean")
+        and (if .verdict == "no_result" and .comparison == null then true
+             else (.comparison.strictness | type == "string")
+                  and (.comparison.compare_logs | type == "boolean") end)
+        and ((.compared_log_messages | type) == "object" or (.compared_log_messages == null))
+    ' "$verdict" >/dev/null 2>&1; then
+        jq -cn '{expected:true,unavailable_reason:"comparison verdict file is not readable structured evidence",verdict:null,bitwise_parity:null,compared_log_messages:null}'
+        return 0
+    fi
+    jq -c '{
+        expected: true,
+        unavailable_reason:
+          (if .verdict == "no_result" then "comparison reported no_result" else null end),
+        verdict: .verdict,
+        bitwise_parity: .bitwise_parity,
+        compared_log_messages: .compared_log_messages
+    }' "$verdict"
+}
+
 function append_result {
     local test_id=$1 category=$2 lane=$3 mode=$4 backend=$5 outcome=$6 duration_ms=$7 reason=$8
     local path_evidence=$9
     local error_kind=${10}
     local diversity=${11:-null}
+    local comparison=${12:-null}
     local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
@@ -3021,14 +3109,16 @@ function append_result {
             # bare `--strict --verify` for a cell that ran the parity comparator
             # (or vice versa) is how an L1 cell gets mistaken for an L2 one.
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
+                --argjson strict "$(comparison_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}" verify)" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict","--verify-json"] else [] end)')
+                 + (if $strict then ["--verify-strict"] else [] end) + ["--verify-json"]')
             log_level=info
             ;;
         replay)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify"]')
+                --argjson strict "$(comparison_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}" replay)" \
+                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify"]
+                 + (if $strict then ["--verify-strict"] else [] end) + ["--verify-json"]')
             log_level=info
             ;;
         chaos)
@@ -3045,6 +3135,11 @@ function append_result {
     if [[ $lane == portable && $mode != naked ]]; then
         relaxations='["no-virtualize-cpuid","max-timeslice=disabled"]'
     fi
+    # The three parity fields below use an explicit null-check, NOT jq alternative
+    # operator //. That operator treats false as empty, so bitwise_parity=false --
+    # a real refusal or a real divergence -- would emit as null and become
+    # indistinguishable from "no verdict exists". That confusion is the precise
+    # defect these fields are being added to end, and // would reintroduce it.
     jq -cn \
         --arg run_id "$RUN_ID" \
         --arg hermit_sha "$SOURCE_TREE_SHA" \
@@ -3067,6 +3162,7 @@ function append_result {
         --argjson relaxations "$relaxations" \
         --argjson path_evidence "$path_evidence" \
         --argjson diversity "$diversity" \
+        --argjson comparison "$comparison" \
         '{schema:3,run_id:$run_id,hermit_sha:$hermit_sha,source_tree_dirty:$source_tree_dirty,
           binary_sha256:(if $binary_sha256 == "" then null else $binary_sha256 end),
           test_sha256:$test_sha256,test:$test,category:$category,lane:$lane,mode:$mode,
@@ -3078,6 +3174,11 @@ function append_result {
           effective_args:$effective_args,guest_args:$guest_args,
           relaxations:$relaxations,preprocessor:null,execution_path:$path_evidence,
           diversity:$diversity,
+          comparison_expected:(if $comparison == null then null else $comparison.expected end),
+          comparison_unavailable_reason:(if $comparison == null then null else $comparison.unavailable_reason end),
+          verdict:(if $comparison == null then null else $comparison.verdict end),
+          bitwise_parity:(if $comparison == null then null else $comparison.bitwise_parity end),
+          compared_log_messages:(if $comparison == null then null else $comparison.compared_log_messages end),
           reason:(if $reason == "" then null else $reason end)}' >>"$RESULTS"
 }
 
@@ -3325,9 +3426,10 @@ function run_cell {
             fi
         fi
     else
-        local row status _hash stdout_file stderr_file attempt_execution
+        local row status _hash stdout_file stderr_file attempt_execution comparison
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
         IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution <<<"$row"
+        comparison=$(comparison_result_fields "$metadata" "$mode" "$cell_dir" 1)
         if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
             outcome=ERROR
             error_kind=guest-launch-refused
@@ -3338,13 +3440,13 @@ function run_cell {
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
-        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+        elif [[ $(comparison_asserts_bitwise_parity "$metadata" "$mode") == true ]]; then
             # A zero exit only means the comparator this run used was satisfied.
             # For an L2 cell, read the verdict the run itself published and
             # require full parity; anything else is a FAIL, not a PASS.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
-                "$(verify_verdict_path "$cell_dir" 1)"); then
+                "$(comparison_verdict_path "$cell_dir" "$mode" 1)"); then
                 reason=$parity_reason
             else
                 outcome=FAIL
@@ -3374,10 +3476,142 @@ function run_cell {
 
     end_ms=$(date +%s%3N)
     duration_ms=$((end_ms - start_ms))
-    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity"
+    local comparison
+    comparison=$(comparison_result_fields "$metadata" "$mode" "$cell_dir" 1)
+    append_result "$id" "$category" "$lane" "$mode" "$backend" "$outcome" "$duration_ms" "$reason" "$path_evidence" "$error_kind" "$diversity" "$comparison"
     printf '%-5s %-10s %-11s %-9s %s%s\n' "$outcome" "$lane" "$mode" "${backend:--}" "$id" \
         "${reason:+ - $reason}"
     [[ $outcome == PASS ]]
+}
+
+# Exercise the actual command constructor, verdict reader, and results.jsonl
+# emitter together. A source-only assertion would miss the original defect:
+# syntactically present fields whose producer never wrote a verdict.
+function audit_comparison_result_contract {
+    local scratch fake args metadata strict_metadata row status comparison
+    local results matched no_result diverged missing malformed noncomparison
+    scratch=$(mktemp -d)
+    fake="$scratch/hermit"
+    args="$scratch/args"
+    cat >"$fake" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$FAKE_HERMIT_ARGS"
+verdict=
+while (($#)); do
+    if [[ $1 == --verify-json ]]; then
+        verdict=$2
+        shift 2
+    else
+        shift
+    fi
+done
+[[ -n $verdict ]] || exit 90
+mkdir -p "$(dirname "$verdict")"
+printf '%s\n' "$FAKE_HERMIT_VERDICT" >"$verdict"
+EOF
+    chmod +x "$fake"
+    metadata=$(jq -cn '{
+      id:"audit/comparison",category:"audit",lane:"privileged",program_kind:"direct-argv",
+      direct_argv:["/bin/true"],run_args:[],timeout_seconds:5,
+      observation:{artifacts:[]},
+      modes:{
+        verify:{guest_args:{ptrace:[]},assert:{},comparison:{expected:true,reason:null}},
+        replay:{guest_args:{ptrace:[]},assert:{},comparison:{expected:true,reason:null}},
+        naked:{guest_args:{native:[]},assert:{},comparison:{expected:false,reason:"naked mode is a native control and does not compare Hermit executions"}},
+        chaos:{guest_args:{ptrace:[]},assert:{},comparison:{expected:false,reason:"chaos mode measures schedule diversity and does not compare two executions"}},
+        custom:{guest_args:{ptrace:[]},assert:{},comparison:{expected:false,reason:"custom mode has no comparison contract"}}
+      }}')
+    matched='{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":7,"right":7}}'
+    # The exact bytes VerificationReport::no_result() writes: comparison is
+    # null, not an object. An invented object here would let the audit pass
+    # while the only shape the producer can emit still failed the reader.
+    no_result='{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}'
+    diverged='{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":7,"right":6}}'
+    export FAKE_HERMIT_ARGS="$args" FAKE_HERMIT_VERDICT="$matched"
+    prepare_cell_dirs "$scratch/verify"
+    row=$(execute_attempt direct:audit "$metadata" verify ptrace "$scratch/verify" 1 '' "$fake")
+    IFS=$'\t' read -r status _ _ _ _ <<<"$row"
+    [[ $status == 0 && -f $scratch/verify/verify-1.json ]] ||
+        die "ordinary verify did not publish its structured comparison verdict"
+    grep -Fq -- '--verify-json' "$args" || die "ordinary verify omitted --verify-json"
+    ! grep -Fq -- '--verify-strict' "$args" ||
+        die "structured reporting silently upgraded the ordinary verify comparator"
+
+    : >"$args"
+    strict_metadata=$(jq -c '.modes.verify.assert.bitwise_parity = true' <<<"$metadata")
+    prepare_cell_dirs "$scratch/strict"
+    execute_attempt direct:audit "$strict_metadata" verify ptrace "$scratch/strict" 1 '' "$fake" >/dev/null
+    grep -Fq -- '--verify-json' "$args" || die "strict verify omitted --verify-json"
+    grep -Fq -- '--verify-strict' "$args" || die "strict verify lost its comparator"
+
+    : >"$args"
+    prepare_cell_dirs "$scratch/replay"
+    execute_attempt direct:audit "$metadata" replay ptrace "$scratch/replay" 1 '' "$fake" >/dev/null
+    [[ -f $scratch/replay/replay-1.json ]] || die "replay did not publish its comparison verdict"
+    grep -Fq -- '--verify-json' "$args" || die "replay omitted --verify-json"
+    ! grep -Fq -- '--verify-strict' "$args" ||
+        die "structured reporting silently upgraded the replay comparator"
+
+    comparison=$(comparison_result_fields "$metadata" verify "$scratch/verify" 1)
+    jq -e '.expected == true and .unavailable_reason == null and .verdict == "matched" and .bitwise_parity == false and .compared_log_messages.left == 7' <<<"$comparison" >/dev/null ||
+        die "matched comparison fields were not preserved"
+    printf '%s\n' "$no_result" >"$scratch/verify/verify-1.json"
+    no_result=$(comparison_result_fields "$metadata" verify "$scratch/verify" 1)
+    jq -e '.verdict == "no_result" and .bitwise_parity == false and (.unavailable_reason | length > 0)' <<<"$no_result" >/dev/null ||
+        die "no_result comparison was not explicitly unavailable"
+    printf '%s\n' "$diverged" >"$scratch/verify/verify-1.json"
+    diverged=$(comparison_result_fields "$metadata" verify "$scratch/verify" 1)
+    jq -e '.verdict == "diverged" and .bitwise_parity == false and .unavailable_reason == null' <<<"$diverged" >/dev/null ||
+        die "diverged comparison was collapsed into absence"
+    rm "$scratch/verify/verify-1.json"
+    missing=$(comparison_result_fields "$metadata" verify "$scratch/verify" 1)
+    jq -e '.verdict == null and (.unavailable_reason | length > 0)' <<<"$missing" >/dev/null ||
+        die "missing comparison lacked an unavailable reason"
+    printf '{truncated' >"$scratch/verify/verify-1.json"
+    malformed=$(comparison_result_fields "$metadata" verify "$scratch/verify" 1)
+    jq -e '.verdict == null and (.unavailable_reason | length > 0)' <<<"$malformed" >/dev/null ||
+        die "malformed comparison lacked an unavailable reason"
+    noncomparison=$(comparison_result_fields "$metadata" chaos "$scratch/verify" 1)
+    jq -e '.expected == false and (.unavailable_reason | length > 0) and .verdict == null' <<<"$noncomparison" >/dev/null ||
+        die "a mode that does not compare lacked its declared reason"
+
+    results="$scratch/results.jsonl"
+    (
+        RESULTS=$results
+        TEST_BY_ID["audit/comparison"]=/bin/true
+        METADATA_BY_ID["audit/comparison"]=$metadata
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$comparison"
+        # Execution outcome and comparison availability are orthogonal. A DBT
+        # invocation can complete successfully while its backend provides no
+        # comparison channel; the row must say both facts rather than turning
+        # unavailable evidence into either a match or a functional failure.
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$no_result"
+        append_result "audit/comparison" audit privileged verify ptrace FAIL 1 "diverged" null "" null "$diverged"
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$missing"
+        append_result "audit/comparison" audit privileged verify ptrace PASS 1 "" null "" null "$malformed"
+        append_result "audit/comparison" audit privileged chaos ptrace PASS 1 "" null "" null "$noncomparison"
+    )
+    jq -se '
+      length == 6
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == "matched"
+             and .bitwise_parity == false and .compared_log_messages.left == 7)] | length == 1)
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == "no_result"
+             and .bitwise_parity == false and (.comparison_unavailable_reason | length > 0))] | length == 1)
+      and ([.[] | select(.outcome == "FAIL" and .comparison_expected == true and .verdict == "diverged"
+             and .bitwise_parity == false and .compared_log_messages.right == 6)] | length == 1)
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == null
+             and .comparison_unavailable_reason == "comparison verdict file is missing")] | length == 1)
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == true and .verdict == null
+             and .comparison_unavailable_reason == "comparison verdict file is not readable structured evidence")] | length == 1)
+      and ([.[] | select(.outcome == "PASS" and .comparison_expected == false and .verdict == null
+             and (.comparison_unavailable_reason | length > 0))] | length == 1)
+    ' "$results" >/dev/null ||
+        die "results.jsonl emitter did not preserve all comparison states"
+
+    unset FAKE_HERMIT_ARGS FAKE_HERMIT_VERDICT
+    rm -rf "$scratch"
+    echo "comparison verdict bracket: verify-report=1 strict-preserved=1 replay-report=1 matched/no_result/diverged/missing/malformed=5/5 noncomparison-reason=1 emitter-states=6/6 availability-outcome-independent=3/3 false-preserved=3/3"
 }
 
 function write_junit {
@@ -3553,6 +3787,7 @@ case "$subcommand" in
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_sabre_path_evidence_contract
+        audit_comparison_result_contract
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory
@@ -3599,6 +3834,9 @@ case "$subcommand" in
         ;;
     audit-ci)
         audit_ci_correspondence
+        ;;
+    audit-comparison-contract)
+        audit_comparison_result_contract
         ;;
     audit-compile)
         audit_compile
