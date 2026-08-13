@@ -41,3 +41,6 @@ envelope.json
 # records absolute cwd/log_file paths -- so a tracked shard can never satisfy
 # scripts/check-portable-paths.sh. Kept in-tree for locality, never committed.
 ci/validate-ledger/
+
+# buck2 build output
+buck-out/
