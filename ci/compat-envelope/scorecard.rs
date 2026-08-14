@@ -42,7 +42,8 @@ Commands:
       refused unless the matching explicit flag is present.
   update-observations --summary FILE
       Merge one completed clean pressure-test summary into the red cells'
-      checked-in observations. This never changes which cells are green.
+      checked-in observations. This never changes which cells are green and
+      refuses repeated green-cell summaries.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -175,6 +176,8 @@ struct PressureSummary {
     hermit_sha: String,
     detcore_tree: String,
     source_tree_dirty: bool,
+    #[serde(default)]
+    repetitions: Option<usize>,
     rows: Vec<PressureSummaryRow>,
 }
 
@@ -810,6 +813,12 @@ fn apply_pressure_summary(
             summary.schema
         ));
     }
+    if summary.repetitions.is_some() {
+        return Err(
+            "repeated green-cell results cannot update scorecard observations; ordinary validate owns green evidence"
+                .into(),
+        );
+    }
     if summary.source_tree_dirty {
         return Err("dirty pressure results cannot update checked-in observations".into());
     }
@@ -1223,6 +1232,7 @@ fn self_test() -> Result<(), String> {
         hermit_sha: sha.into(),
         detcore_tree: tree.into(),
         source_tree_dirty: false,
+        repetitions: None,
         rows,
     };
     let first = pressure_summary(
@@ -1232,6 +1242,16 @@ fn self_test() -> Result<(), String> {
     );
     apply_pressure_summary(&mut observed, &first, "sha-1", "tree-1")
         .map_err(|e| format!("positive pressure-observation bracket failed: {e}"))?;
+    let mut repeated = first.clone();
+    repeated.repetitions = Some(2);
+    let mut repeated_target = observed.clone();
+    let before_repeated_refusal = encoded_cells(&repeated_target)?;
+    if apply_pressure_summary(&mut repeated_target, &repeated, "sha-1", "tree-1").is_ok() {
+        return Err("repeated green-cell evidence was accepted as a scorecard observation".into());
+    }
+    if encoded_cells(&repeated_target)? != before_repeated_refusal {
+        return Err("refused repeated green-cell evidence changed the scorecard".into());
+    }
     let later = pressure_summary(
         "sha-1",
         "tree-1",
@@ -1342,7 +1362,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: result, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: result, ratchet, repeated-summary refusal, observation-range, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
