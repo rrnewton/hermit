@@ -48,9 +48,7 @@ const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
 const TRACKED_CELLS_SCHEMA: u64 = 3;
 const RUN_SCHEMA: u64 = 3;
-const REQUIRED_BUILD_TAGS: [&str; 6] = [
-    "setup.manifest_plan",
-    "e2e.metadata",
+const REQUIRED_BUILD_TAGS: [&str; 4] = [
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -207,11 +205,13 @@ Other options:
   --help                    Show this text
 
 How it runs:
-  The in-memory graph reuses the canonical Hermit/resource build commands from
-  ci/dag/portable.json. Fixture preparation is serialized. Every selected red
-  cell, or every selected green-cell repetition, then runs in its own safe-ci
-  cgroup. Existing resource caps admit four manifest guests at once and one KVM
-  guest. A failure, timeout, OOM, or missing result does not
+  Plan generation first checks the tracked scorecard and reads selection and
+  budgets from the typed manifest tool. The in-memory graph then reuses the
+  canonical Hermit/resource build commands from ci/dag/portable.json without
+  recursively running the full validation metadata audit. Fixture preparation
+  is serialized. Every selected red cell, or every selected green-cell
+  repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
+  four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
   including signal-caused crashes when the shell reports a nonzero status; the
@@ -1748,11 +1748,13 @@ fn required_build_tags(
     exact_cell: Option<(&str, &str)>,
     includes_liteinst: bool,
 ) -> BTreeSet<&'static str> {
-    // Batch cells consume the canonical prebuilt artifact, so retain its full
-    // dependency closure. LiteInst's separate runtime build is part of that
-    // closure only when at least one selected cell uses LiteInst. Exact
-    // ptrace/KVM cells use a lean Hermit build, DBT/SaBRe retain the canonical
-    // third-party runtime build, LiteInst retains its full chain, and a naked
+    // Batch cells consume the canonical prebuilt artifact, so retain the build
+    // nodes that produce it. The complete metadata audit is not a product-build
+    // prerequisite: write_plan already refuses a stale scorecard and derives
+    // selection and budgets through the typed manifest tool. LiteInst's separate
+    // runtime build is retained only when a selected cell uses it. Exact
+    // ptrace/KVM cells use a direct Hermit build, DBT/SaBRe retain the canonical
+    // third-party runtime build, LiteInst retains its build chain, and a naked
     // native command needs no Hermit build.
     if let Some((mode, backend)) = exact_cell {
         if mode == "naked" && backend == "native" {
@@ -1769,8 +1771,7 @@ fn required_build_tags(
 }
 
 fn required_builds_complete(results: &Path, metadata: &RunMetadata) -> bool {
-    let lean_exact_cell = (metadata.repetitions.is_none()
-        && metadata.test.is_some()
+    let exact_cell = (metadata.test.is_some()
         && metadata.mode.is_some()
         && metadata.backend.is_some()
         && metadata.cells.len() == 1)
@@ -1781,26 +1782,35 @@ fn required_builds_complete(results: &Path, metadata: &RunMetadata) -> bool {
             )
         });
     let includes_liteinst = metadata.cells.iter().any(|cell| cell.backend == "liteinst");
-    required_build_tags(lean_exact_cell, includes_liteinst)
+    required_build_tags(exact_cell, includes_liteinst)
         .iter()
         .all(|tag| build_marker(results, tag).is_file())
 }
 
 fn selected_cell_dependencies(
     exact_cell: bool,
+    shared_preparation: bool,
     mode: &str,
     backend: &str,
     preparation_tag: Option<&str>,
 ) -> Vec<String> {
     if exact_cell {
-        if mode == "naked" && backend == "native" {
-            return Vec::new();
+        let mut deps = Vec::new();
+        if shared_preparation {
+            deps.push(
+                preparation_tag
+                    .expect("shared exact cell has a preparation tag")
+                    .into(),
+            );
         }
-        return vec![if backend == "liteinst" {
-            "build.liteinst_runtime_release".into()
-        } else {
-            "build.runtime_release".into()
-        }];
+        if !(mode == "naked" && backend == "native") {
+            deps.push(if backend == "liteinst" {
+                "build.liteinst_runtime_release".into()
+            } else {
+                "build.runtime_release".into()
+            });
+        }
+        return deps;
     }
     let mut deps = vec![
         preparation_tag
@@ -1812,6 +1822,34 @@ fn selected_cell_dependencies(
         deps.push("build.liteinst_runtime_release".into());
     }
     deps
+}
+
+fn retain_required_build_dependencies(
+    step: &mut Step,
+    required_builds: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let tag = step.tag();
+    let mut retained = Vec::new();
+    for dependency in &step.deps {
+        if required_builds.contains(dependency.as_str()) {
+            retained.push(dependency.clone());
+            continue;
+        }
+        // These two current edges order product builds after the complete
+        // metadata audit. That audit produces no binary or prebuilt artifact;
+        // pressure plan generation performs its scorecard and typed-manifest
+        // checks before execution instead.
+        if dependency == "e2e.metadata"
+            && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
+        {
+            continue;
+        }
+        return Err(format!(
+            "canonical build node {tag} has unexpected prerequisite {dependency}; refusing to omit a prerequisite whose effect on the consumed build artifacts is unknown"
+        ));
+    }
+    step.deps = retained;
+    Ok(())
 }
 
 fn base_cell_slug(cell: &CellId) -> String {
@@ -1874,7 +1912,7 @@ fn write_plan(
     let canonical =
         dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
     let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
-    let lean_exact_cell = (selection.is_exact() && !selection.repeats_green_cell()).then(|| {
+    let exact_cell = selection.is_exact().then(|| {
         (
             selection.mode.as_deref().expect("exact selection has mode"),
             selection
@@ -1883,13 +1921,13 @@ fn write_plan(
                 .expect("exact selection has backend"),
         )
     });
-    let required_builds = required_build_tags(lean_exact_cell, includes_liteinst);
+    let required_builds = required_build_tags(exact_cell, includes_liteinst);
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build = lean_exact_cell.is_some()
+            let direct_backend_build = exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
@@ -1901,9 +1939,11 @@ fn write_plan(
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
                 marker = shell_quote(&marker.to_string_lossy()),
             );
-            if lean_exact_cell.is_some() && selection.backend.as_deref() != Some("liteinst") {
-                step.deps.clear();
-            }
+            // Preserve every dependency between selected build nodes. Only the
+            // two explicitly checked metadata-audit edges may be omitted; an
+            // unknown future prerequisite refuses instead of silently shrinking
+            // the build closure.
+            retain_required_build_dependencies(&mut step, &required_builds)?;
             if direct_backend_build {
                 step.timeout = 600;
                 step.cpu_timeout = 1200;
@@ -1965,13 +2005,18 @@ fn write_plan(
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
         let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds)?;
+        let preparation_deps = if selection.is_exact() {
+            selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
+        } else {
+            vec!["build.e2e_artifact".into()]
+        };
         steps.push(Step {
             group: "prepare".into(),
             job,
             desc: format!("Prepare selected-cell fixture {test}"),
             description: String::new(),
             cmd,
-            deps: vec!["build.e2e_artifact".into()],
+            deps: preparation_deps,
             env: BTreeMap::new(),
             hint: ResourceHint {
                 resources: BTreeMap::from([("cargo_writer".into(), 1)]),
@@ -2033,10 +2078,16 @@ fn write_plan(
             } else {
                 String::new()
             };
-            let harness = if selection.allows_dirty_source() {
+            let harness = if selection.is_exact() {
+                let prebuilt = if selection.uses_shared_preparation() {
+                    " --prebuilt"
+                } else {
+                    ""
+                };
                 format!(
-                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
+                    prebuilt = prebuilt,
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
                     backend = backend,
@@ -2093,7 +2144,8 @@ fn write_plan(
                 resources.insert("kvm".into(), 1);
             }
             let deps = selected_cell_dependencies(
-                !selection.uses_shared_preparation(),
+                selection.is_exact(),
+                selection.uses_shared_preparation(),
                 &cell.mode,
                 &cell.backend,
                 preparation_tags.get(&cell.test).map(String::as_str),
@@ -3815,20 +3867,78 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let non_liteinst_batch =
-        selected_cell_dependencies(false, "verify", "ptrace", Some("prepare.fixture"));
+        selected_cell_dependencies(false, true, "verify", "ptrace", Some("prepare.fixture"));
     let liteinst_batch =
-        selected_cell_dependencies(false, "verify", "liteinst", Some("prepare.fixture"));
+        selected_cell_dependencies(false, true, "verify", "liteinst", Some("prepare.fixture"));
+    let exact_repeated =
+        selected_cell_dependencies(true, true, "verify", "ptrace", Some("prepare.fixture"));
     if non_liteinst_batch.contains(&"build.liteinst_runtime_release".to_string())
         || !liteinst_batch.contains(&"build.liteinst_runtime_release".to_string())
-        || !selected_cell_dependencies(true, "naked", "native", None).is_empty()
-        || selected_cell_dependencies(true, "verify", "ptrace", None)
+        || exact_repeated
+            != [
+                "prepare.fixture".to_string(),
+                "build.runtime_release".to_string(),
+            ]
+        || !selected_cell_dependencies(true, false, "naked", "native", None).is_empty()
+        || selected_cell_dependencies(true, false, "verify", "ptrace", None)
             != ["build.runtime_release".to_string()]
-        || selected_cell_dependencies(true, "verify", "liteinst", None)
+        || selected_cell_dependencies(true, false, "verify", "liteinst", None)
             != ["build.liteinst_runtime_release".to_string()]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
         );
+    }
+    let canonical_build_text = fs::read_to_string(root.join(PORTABLE_DAG))
+        .map_err(|e| format!("cannot read canonical build-dependency fixture: {e}"))?;
+    let canonical_build_dag = dag_from_json(&canonical_build_text)
+        .map_err(|e| format!("cannot parse canonical build-dependency fixture: {e}"))?;
+    let all_required_builds = required_build_tags(None, true);
+    let mut checked_current_builds = 0usize;
+    for canonical_step in canonical_build_dag
+        .steps
+        .iter()
+        .filter(|step| all_required_builds.contains(step.tag().as_str()))
+    {
+        let mut selected_step = canonical_step.clone();
+        retain_required_build_dependencies(&mut selected_step, &all_required_builds)
+            .map_err(|e| format!("current canonical build graph was refused: {e}"))?;
+        if selected_step
+            .deps
+            .iter()
+            .any(|dependency| !all_required_builds.contains(dependency.as_str()))
+        {
+            return Err(format!(
+                "{} retained a dependency outside the selected current build graph",
+                selected_step.tag()
+            ));
+        }
+        checked_current_builds += 1;
+    }
+    if checked_current_builds != all_required_builds.len() {
+        return Err(format!(
+            "current canonical build graph exposed {checked_current_builds}/{} required nodes",
+            all_required_builds.len()
+        ));
+    }
+    let mut unexpected_dependency = canonical_build_dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.workspace")
+        .ok_or("canonical build graph lost build.workspace")?
+        .clone();
+    unexpected_dependency
+        .deps
+        .push("build.unexpected_prerequisite".into());
+    let unexpected_error =
+        retain_required_build_dependencies(&mut unexpected_dependency, &all_required_builds)
+            .expect_err("an unexpected canonical build prerequisite was silently omitted");
+    if !unexpected_error.contains("build.workspace")
+        || !unexpected_error.contains("build.unexpected_prerequisite")
+    {
+        return Err(format!(
+            "unexpected canonical prerequisite refusal did not name both sides: {unexpected_error}"
+        ));
     }
     let probe = "space ' quote";
     let quoted = shell_quote(probe);
@@ -3980,6 +4090,32 @@ fn self_test(root: &Path) -> Result<(), String> {
     })?;
     let scratch_cleanup = SelfTestDirectory::new(scratch.clone());
     require_empty_result_dir(&scratch)?;
+
+    // Plan-time scorecard validation remains mandatory even though pressure
+    // execution no longer recursively runs the full metadata audit. Exercise
+    // the actual command boundary with an inert stale-scorecard refusal.
+    let stale_scorecard_root = scratch.join("stale-scorecard");
+    let stale_scorecard_command = stale_scorecard_root.join("ci/compat-envelope/scorecard.rs");
+    fs::create_dir_all(
+        stale_scorecard_command
+            .parent()
+            .expect("scorecard fixture has parent"),
+    )
+    .map_err(|e| format!("cannot create stale-scorecard fixture: {e}"))?;
+    fs::write(&stale_scorecard_command, "#!/bin/sh\nexit 1\n")
+        .map_err(|e| format!("cannot write stale-scorecard fixture: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&stale_scorecard_command)
+            .map_err(|e| format!("cannot inspect stale-scorecard fixture: {e}"))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&stale_scorecard_command, permissions)
+            .map_err(|e| format!("cannot make stale-scorecard fixture executable: {e}"))?;
+    }
+    if check_scorecard(&stale_scorecard_root).is_ok() {
+        return Err("plan-time scorecard check accepted a stale scorecard".into());
+    }
 
     // The real runner clones a clean commit into /tmp when its checkout has no
     // dev-hermit parent. A local clone must copy objects rather than hard-link
@@ -4301,6 +4437,17 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.group == "prepare")
         .collect();
+    let runtime_build_steps: Vec<_> = repeated_dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "build.runtime_release")
+        .collect();
+    let recursive_metadata_tags = [
+        "setup.manifest_plan",
+        "e2e.metadata",
+        "build.workspace",
+        "build.e2e_artifact",
+    ];
     let repeated_jobs: BTreeSet<_> = repeated_cell_steps
         .iter()
         .map(|step| step.job.clone())
@@ -4311,20 +4458,37 @@ fn self_test(root: &Path) -> Result<(), String> {
     if repeated_cell_steps.len() != 3
         || repeated_jobs != expected_repeated_jobs
         || preparation_steps.len() != 1
+        || runtime_build_steps.len() != 1
+        || repeated_dag
+            .steps
+            .iter()
+            .any(|step| recursive_metadata_tags.contains(&step.tag().as_str()))
+        || !runtime_build_steps[0].deps.is_empty()
+        || !runtime_build_steps[0]
+            .cmd
+            .contains("cargo build --release --locked -p hermit --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
         || repeated_dag.resource_caps.get("kvm") != Some(&1)
     {
         return Err(
-            "repeated plan lost its three unique cells, one preparation, or resource caps".into(),
+            "repeated exact plan lost its shared direct build, preparation, cells, or resource caps, or reintroduced the recursive metadata audit"
+                .into(),
         );
     }
     let preparation_tag = preparation_steps[0].tag();
+    if preparation_steps[0].deps != ["build.runtime_release".to_string()] {
+        return Err("repeated exact preparation does not depend on its direct Hermit build".into());
+    }
     let repeated_tags: BTreeSet<_> = repeated_cell_steps.iter().map(|step| step.tag()).collect();
     for step in &repeated_cell_steps {
         if !step.deps.contains(&preparation_tag)
-            || !step.deps.contains(&"build.e2e_artifact".to_string())
+            || !step.deps.contains(&"build.runtime_release".to_string())
             || step.deps.iter().any(|dep| repeated_tags.contains(dep))
             || !step.cmd.contains("--prebuilt")
+            || !step
+                .cmd
+                .contains("HERMIT_BIN=\"$PWD/target/release/hermit\"")
+            || step.cmd.contains("run-with-hermit-e2e-artifact.sh")
             || !step.cmd.contains(&format!("E2E_RUN_ID='{}'", step.job))
             || !step.cmd.contains(&format!("/cells/{}/", step.job))
         {
@@ -4366,6 +4530,20 @@ fn self_test(root: &Path) -> Result<(), String> {
     .is_ok()
     {
         return Err("repeated-plan audit accepted a missing cell job".into());
+    }
+    let mut missing_direct_build = repeated_dag.clone();
+    missing_direct_build
+        .steps
+        .retain(|step| step.tag() != "build.runtime_release");
+    if audit_dag(
+        &missing_direct_build,
+        3,
+        repeated_metadata.run_timeout_seconds,
+        &repeated_timeouts,
+    )
+    .is_ok()
+    {
+        return Err("repeated-plan audit accepted a missing required Hermit build".into());
     }
     let mut duplicate_repetition = repeated_dag.clone();
     let cell_indexes: Vec<_> = duplicate_repetition
@@ -4415,20 +4593,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     let runtime_marker = build_marker(&repeated_build_results, "build.runtime_release");
     fs::create_dir_all(runtime_marker.parent().expect("build marker has parent"))
         .map_err(|e| format!("cannot create repeated build-marker fixture: {e}"))?;
+    if required_builds_complete(&repeated_build_results, &repeated_metadata) {
+        return Err("repeated exact ptrace setup accepted a missing Hermit build".into());
+    }
     fs::write(&runtime_marker, "ok\n")
         .map_err(|e| format!("cannot write repeated runtime marker: {e}"))?;
-    if required_builds_complete(&repeated_build_results, &repeated_metadata) {
-        return Err("repeated ptrace setup accepted the lean exact-build marker".into());
-    }
-    for tag in required_build_tags(None, false) {
-        let marker = build_marker(&repeated_build_results, tag);
-        fs::create_dir_all(marker.parent().expect("build marker has parent"))
-            .map_err(|e| format!("cannot create full build-marker fixture: {e}"))?;
-        fs::write(marker, "ok\n")
-            .map_err(|e| format!("cannot write full build-marker fixture: {e}"))?;
-    }
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
-        return Err("repeated ptrace setup refused the complete shared build closure".into());
+        return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
 
     let green_batch_selection = CellSelection {
@@ -4534,6 +4705,57 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read green-batch DAG: {e}"))?;
     let green_batch_dag = dag_from_json(&green_batch_dag_text)
         .map_err(|e| format!("cannot parse green-batch DAG: {e}"))?;
+    let green_batch_includes_liteinst = expected_green_ids
+        .iter()
+        .any(|cell| cell.backend == "liteinst");
+    let expected_green_build_tags: BTreeSet<String> =
+        required_build_tags(None, green_batch_includes_liteinst)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    let actual_green_build_tags: BTreeSet<String> = green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "build")
+        .map(|step| step.tag())
+        .collect();
+    if actual_green_build_tags != expected_green_build_tags
+        || green_batch_dag
+            .steps
+            .iter()
+            .any(|step| matches!(step.tag().as_str(), "setup.manifest_plan" | "e2e.metadata"))
+    {
+        return Err(format!(
+            "green batch build set changed or reintroduced the recursive metadata audit: expected={expected_green_build_tags:?} actual={actual_green_build_tags:?}"
+        ));
+    }
+    for step in green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "build")
+    {
+        let deps: BTreeSet<&str> = step.deps.iter().map(String::as_str).collect();
+        let tag = step.tag();
+        let expected: BTreeSet<&str> = match tag.as_str() {
+            "build.workspace" | "build.runtime_release" => BTreeSet::new(),
+            "build.e2e_artifact" => {
+                BTreeSet::from(["build.workspace", "build.runtime_release"])
+            }
+            "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
+            other => return Err(format!("unexpected green-batch build node {other}")),
+        };
+        if deps != expected {
+            return Err(format!(
+                "{} lost its internal build dependencies: expected={expected:?} actual={deps:?}",
+                tag
+            ));
+        }
+        if tag == "build.e2e_artifact"
+            && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
+        {
+            return Err("green batch replaced the canonical prebuilt artifact publisher".into());
+        }
+    }
     let green_batch_cell_count = green_batch_dag
         .steps
         .iter()
@@ -4551,11 +4773,46 @@ fn self_test(root: &Path) -> Result<(), String> {
         .len();
     if green_batch_cell_count != expected_green_ids.len()
         || green_batch_preparation_count != green_test_count
+        || green_batch_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "prepare")
+            .any(|step| step.deps != ["build.e2e_artifact".to_string()])
+        || green_batch_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .any(|step| {
+                !step.deps.contains(&"build.e2e_artifact".to_string())
+                    || !step.cmd.contains(
+                        "./ci/run-with-hermit-e2e-artifact.sh --require-install",
+                    )
+            })
     {
         return Err(
-            "green batch did not place every selected cell and shared per-test preparation in one DAG"
+            "green batch did not retain every selected cell, shared preparation, and canonical prebuilt artifact in one DAG"
                 .into(),
         );
+    }
+    let mut missing_green_artifact = green_batch_dag.clone();
+    missing_green_artifact
+        .steps
+        .retain(|step| step.tag() != "build.e2e_artifact");
+    let green_batch_timeouts: BTreeMap<_, _> = green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .map(|step| (step.tag(), step.timeout))
+        .collect();
+    if audit_dag(
+        &missing_green_artifact,
+        expected_green_ids.len(),
+        green_batch_metadata.run_timeout_seconds,
+        &green_batch_timeouts,
+    )
+    .is_ok()
+    {
+        return Err("green-batch plan audit accepted a missing prebuilt artifact".into());
     }
     green_batch_metadata.source_tree_dirty = false;
     validate_run_contract(root, &green_batch_results, &green_batch_metadata, false)
@@ -5163,7 +5420,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, manifest attempt budgets, shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
