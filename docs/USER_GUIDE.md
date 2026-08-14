@@ -131,6 +131,7 @@ default stricter.
 - serializes guest threads and schedules them deterministically;
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
+- rejects syscalls classified Unsupported instead of forwarding them silently;
 - gives the guest an isolated PID namespace and `/tmp`;
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
@@ -409,7 +410,8 @@ reproducible target condition.
 | Option | Effect |
 | --- | --- |
 | `--strict` | Compatibility spelling for the current deterministic defaults. |
-| `--passthru-opt` | Use the reduced syscall subscription set for performance. Unlisted syscalls bypass Detcore, weakening deterministic accounting. |
+| `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
+| `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
