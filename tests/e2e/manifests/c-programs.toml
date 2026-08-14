@@ -1083,10 +1083,26 @@ sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
-ci = false
-backends_enabled = []
+ci = true
+# The chaos argument preserves the default full floating-point result used by
+# strict verification, but prints only its low three bits here. That gives an
+# exact eight-class ceiling: the output can express at most 0..7, and seeds
+# 0..31 observed all eight values.
+#
+# Direct ptrace measurements at 077760ccb6ea (2026-08-14), using INFO,
+# --verify-strict, --detlog-stack, and --detlog-heap:
+#   seeds 0..31: 8/8 classes, normalized entropy 0.9220, 32/32 exit 0
+#   seeds 32..63: 7/8 classes, normalized entropy 0.8757, 32/32 exit 0
+# A retained-work change from 256 sched_yield points to four kept the OpenMP
+# reduction and output calculation but narrowed seeds 0..31 to 6/8 classes.
+# min_distinct=7 accepts both measured healthy windows and refuses that partial
+# narrowing. All selected outcomes are required to exit successfully.
+seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+outcome_classes = 8
+assert = { min_distinct = 7, min_passes = 32, min_failures = 0 }
+backends_enabled = ["ptrace"]
+guest_args = { ptrace = ["chaos"] }
 [test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
 dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"

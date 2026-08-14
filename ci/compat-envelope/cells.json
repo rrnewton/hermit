@@ -19077,8 +19077,8 @@
       "test": "c-programs/fp-reduction-nondeterminism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
