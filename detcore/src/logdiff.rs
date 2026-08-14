@@ -420,6 +420,39 @@ fn is_detlog(line: &str) -> bool {
 /// "advance global time for scheduler turn" DETLOG line for these turns at the source (see
 /// `Scheduler::bump_global_time`), so the two mechanisms together make the deterministic
 /// comparison insensitive to host-timing-dependent polling-loop counts.
+/// SCOPE LIMIT, MEASURED. This exclusion and [`is_scheduler_committed_time`]
+/// below apply to the DETERMINISTIC comparison only. `--verify-strict` selects
+/// `LogCompareStrictness::Canonical` / `ComparedLogScope::Info`, documented as
+/// "Every INFO message, exactly", which re-includes these polling-retry COMMIT
+/// lines -- the very lines the paragraph above explains are host-timing
+/// dependent and therefore not reproducible.
+///
+/// The `logger` row of `ci/compat/corpus-rr.json` shows it, same guest, one flag
+/// apart:
+///
+///     record start --verify                  -> matched,  exit 0 (stripped)
+///     record start --verify --verify-strict  -> diverged, exit 1 (canonical)
+///
+/// and the divergence is exactly one of these turns, differing only in the
+/// echoed clock:
+///
+///     COMMIT turn 76, dettid 3 using resources {InternalIOPolling: W},
+///       on previously committed 1_767_225_600.059_585_320s   (record)
+///       on previously committed 1_767_225_600.059_585_330s   (replay)
+///
+/// 10 ns, one retry's worth of global-clock advance, with all 831 preceding INFO
+/// messages identical.
+///
+/// TWO READINGS, AND CHOOSING BETWEEN THEM IS NOT A COMPARATOR DECISION:
+///   1. The retries are legitimately host-timing dependent, so the strict
+///      envelope should exclude them as this mode already does; or
+///   2. the global logical clock should not advance on a host-timing-dependent
+///      retry at all, in which case the scheduler is what needs fixing and the
+///      exclusion here is compensating for it.
+///
+/// Do NOT widen the canonical comparator to make this pass. Under reading 2 that
+/// would hide a real dependency of virtual time on host timing, and the strict
+/// mode exists precisely to surface that class.
 fn is_internal_io_poll_commit(line: &str) -> bool {
     is_commit(line)
         && (line.contains("{InternalIOPolling: ")
