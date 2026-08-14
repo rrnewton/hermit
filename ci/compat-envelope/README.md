@@ -180,9 +180,24 @@ attempts also retain both raw INFO logs named by Hermit. A ptrace verify attempt
 runs the same Hermit binary's one-input `log-diff` command and retains the
 normalized first-run INFO stream for later cross-backend parity work. Retaining
 that input is preparation, not a parity result.
-Replay-mode raw-log retention is not implemented yet. A one-time PASS is
-printed as a candidate for repeated confirmation; it never edits the tracked
-green set automatically.
+Replay-mode raw-log retention is not implemented, and it is not a harness TODO:
+the harness cannot ask for it. Retention works by passing Hermit `--keep-logs`
+and `--verify-log-dir`, and `hermit record start` accepts neither
+(`unexpected argument '--keep-logs'`). It accepts seven flags in total —
+`--data-dir`, `--record-timeout`, `--strict`, `--verify`, `--verify-json`,
+`--verify-strict`, `--verify-with-gdbex` — against 82 on `hermit run`, and
+`--strict` among them is `_strict: bool`, parsed and discarded. Everything else
+about a record/replay run is fixed in
+`hermit_cli::metadata::record_or_replay_config`.
+
+The practical cost is that a failing replay cell cannot be diagnosed from
+retained artifacts the way a failing verify cell can; it has to be reproduced by
+hand outside the harness, which is unreliable because the harness's cell
+workdir, build flags, and portable relaxations are not reproduced by a bare
+`hermit` invocation.
+
+A one-time PASS is printed as a candidate for repeated confirmation; it never
+edits the tracked green set automatically.
 See the complete command contract with:
 
 ```console
