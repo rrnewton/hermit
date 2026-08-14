@@ -83,7 +83,7 @@ fn scheduler_daemon_startup_line_is_not_in_the_compared_info_envelope() {
     );
 }
 
-/// The exact Detcore INFO messages that precede guest registration, in order.
+/// The exact INFO messages that precede guest registration, in order.
 ///
 /// Each is emitted on the sequenced setup path -- `RunQueue::new` for the
 /// runqueue seed and `ThreadState::new` for the two root-thread seeds -- so
@@ -104,6 +104,32 @@ const EXPECTED_PRE_REGISTRATION_INFO: &[&str] = &[
     "DETLOG CHAOSRAND: seeding chaos scheduler",
 ];
 
+/// Select exactly the lines the parity comparator selects.
+///
+/// `detcore/src/logdiff.rs` `is_info` is `line.starts_with("INFO ")` after the
+/// wall-clock prefix is stripped -- it keys on the LEVEL TAG ALONE and does not
+/// care which crate emitted the line. This helper reproduces that: drop the
+/// leading timestamp token, then require the `INFO ` level tag.
+///
+/// An earlier version of this test filtered on `" INFO detcore"` instead, and an
+/// adversarial review proved that restriction admits the very bug this file
+/// exists to prevent. Injecting one racing pre-registration line under a
+/// non-Detcore target --
+/// `tracing::info!(target: "reverie_ptrace::task", "...")` before the
+/// `iv.get().await` -- left all three tests GREEN while driving strict
+/// record/replay parity from 0% to 14.5% failures (171/200 under 8 concurrent
+/// streams, versus 200/200 unmodified). The comparator saw the line; the test
+/// did not. Do not narrow this selection again.
+///
+/// The original justification for the crate filter -- keeping the test portable
+/// across hosts -- was unsound as well: the host-dependent CPUID notice on hosts
+/// without CPUID faulting is logged at ERROR, not INFO, so an INFO-level
+/// selection already excludes it.
+fn info_payload(line: &str) -> Option<&str> {
+    let after_timestamp = line.split_once(char::is_whitespace)?.1.trim_start();
+    after_timestamp.strip_prefix("INFO ")
+}
+
 #[test]
 fn pre_registration_info_prefix_is_exactly_the_sequenced_setup_messages() {
     let stderr = hermit_stderr("info");
@@ -115,23 +141,22 @@ fn pre_registration_info_prefix_is_exactly_the_sequenced_setup_messages() {
             panic!("scheduler never reported guest registration at INFO\nstderr:\n{stderr}")
         });
 
-    // Restrict to Detcore INFO lines: host-dependent warnings (for example the
-    // ARCH_SET_CPUID notice on hosts without CPUID faulting) are logged at other
-    // levels by other crates and must not make this test host-specific.
     let prefix: Vec<&str> = stderr
         .lines()
         .take(milestone_index)
-        .filter(|line| line.contains(" INFO detcore"))
+        .filter(|line| info_payload(line).is_some())
         .collect();
 
     assert_eq!(
         prefix.len(),
         EXPECTED_PRE_REGISTRATION_INFO.len(),
-        "the set of Detcore INFO messages emitted before guest registration changed. Every such \
-         message is compared exactly by --verify-strict, so a message emitted from a concurrent \
-         task here reintroduces record/replay parity flakiness. Classify the new message: if it \
-         is emitted on the sequenced setup path, add it to EXPECTED_PRE_REGISTRATION_INFO; if it \
-         comes from the spawned scheduler daemon, emit it at DEBUG instead.\nobserved:\n{prefix:#?}",
+        "the set of INFO messages emitted before guest registration changed. Every INFO message \
+         is compared exactly by --verify-strict -- from ANY crate, not just Detcore -- so a \
+         message emitted from a concurrent task here reintroduces record/replay parity \
+         flakiness. Classify the new message: if it is emitted on the sequenced setup path, add \
+         it to EXPECTED_PRE_REGISTRATION_INFO; if it comes from the spawned scheduler daemon or \
+         any other task running concurrently with root-thread setup, emit it at DEBUG \
+         instead.\nobserved:\n{prefix:#?}",
     );
 
     for (observed, expected) in prefix.iter().zip(EXPECTED_PRE_REGISTRATION_INFO) {
