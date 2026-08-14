@@ -1011,10 +1011,57 @@ fn run_dbt_preserves_the_guest_hermit_log_environment() {
         .expect("DBT log-env verification verdict should be JSON");
         assert_eq!(verdict["verified"], true);
         assert_eq!(verdict["bitwise_parity"], true);
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "empty {side} INFO population: {verdict}"
+            );
+        }
+    }
+}
+
+#[test]
+fn run_dbt_preserves_the_guest_hermit_log_environment_without_verification() {
+    for (guest_value, expected) in [
+        (None, "hermit_log=<unset>\n"),
+        (Some("guest-sentinel"), "hermit_log=guest-sentinel\n"),
+    ] {
+        let args = [
+            "--log",
+            "INFO",
+            "run",
+            "--backend",
+            "dbt",
+            "--tmp=/tmp",
+            "--strict",
+            "--detlog-stack",
+            "--detlog-heap",
+            "--",
+        ];
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(args)
+            .arg(dbt_log_env_guest())
+            .arg("exec")
+            .env_remove("HERMIT_LOG");
+        if let Some(value) = guest_value {
+            command.env("HERMIT_LOG", value);
+        }
+        let output = command
+            .output()
+            .expect("failed to run non-verifying DBT log-env case");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "unexpected guest environment");
+        let stderr = stderr(&output);
         assert!(
-            verdict["compared_log_messages"]["left"]
-                .as_u64()
-                .is_some_and(|count| count > 0)
+            stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
+            "DBT did not forward controller INFO without verification:\n{stderr}",
+        );
+        assert!(
+            stderr.matches("DETLOG [post_exec").count() >= 2,
+            "DBT did not preserve controller INFO across guest exec:\n{stderr}",
         );
     }
 }
