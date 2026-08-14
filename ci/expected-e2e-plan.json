@@ -680,6 +680,13 @@
       "test": "c-programs/ioctl-fioclex"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/ipc-determinism"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",

@@ -21797,7 +21797,7 @@
       "test": "c-programs/ipc-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
