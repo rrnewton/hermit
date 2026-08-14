@@ -964,6 +964,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::fadvise64,
                 Sysno::mmap,
                 Sysno::madvise,
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                // TODO-HUMAN-REVIEW(#2260)
+                Sysno::membarrier,
                 Sysno::munmap,
                 Sysno::mremap,
                 Sysno::fcntl,
@@ -2659,6 +2662,18 @@ mod subscription_tests {
             subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::pidfd_open)
+        );
+    }
+
+    #[test]
+    fn passthru_opt_intercepts_membarrier() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+
+        assert!(
+            subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::membarrier),
+            "membarrier must reach its deterministic Detcore handler under passthru_opt"
         );
     }
 }

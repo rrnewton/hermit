@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,8 +155,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
-        // Record/replay keeps partial Detcore subscription; madvise policy semantics
-        // begin in v0x102.
+        // Record/replay keeps partial Detcore subscription. Membarrier policy semantics
+        // begin in v0x10a; older recordings may contain a host-dependent query result.
         passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
@@ -254,5 +254,11 @@ mod tests {
     fn record_version_rejects_pre_madvise_policy_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
+    }
+
+    #[test]
+    fn record_version_rejects_pre_membarrier_policy_streams() {
+        assert_eq!(RECORD_VERSION, RecordVersion(0x10a));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
     }
 }
