@@ -173,8 +173,32 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
-    /// for command-line compatibility with `hermit run --strict`.
+    /// ACCEPTED AND IGNORED, for command-line compatibility with `hermit run
+    /// --strict`. It does NOT make recording equivalent to `run --strict`.
+    ///
+    /// Recording uses the fixed configuration in
+    /// `hermit_cli::metadata::record_or_replay_config`, which is deliberately a
+    /// PARTIAL Detcore subscription ("Record/replay keeps partial Detcore
+    /// subscription", same file) and is materially weaker than `run --strict`:
+    ///
+    /// {n}    field                          run --strict   record/replay
+    /// {n}    panic_on_unsupported_syscalls   true           false
+    /// {n}    passthru_opt                    false          true
+    /// {n}    deterministic_io                true           false
+    /// {n}    virtualize_time                 on             false
+    /// {n}    virtualize_metadata             on             false
+    /// {n}
+    ///
+    /// Measured consequence, on the `backend-parity-c/child-subreaper-refusal`
+    /// guest: `run --strict` refuses `prctl(PR_SET_CHILD_SUBREAPER)` with
+    /// `Err(Errno(ENOSYS))` and the guest exits 0; under `record start` the same
+    /// prctl reaches the host, returns rc=0, and the guest's own assertion fails
+    /// with `PR_SET_CHILD_SUBREAPER rc=0 errno=0 (want -1/ENOSYS)`. Replay then
+    /// reproduces that recording faithfully, so `--verify-strict` reports
+    /// `bitwise_parity: true` for a run that was never strictly determinized.
+    ///
+    /// Read a passing record/replay comparison as RECORD/REPLAY SELF-CONSISTENCY
+    /// under the config above, not as equivalence to `run --strict`.
     #[clap(long = "strict")]
     _strict: bool,
 
