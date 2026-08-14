@@ -1,16 +1,20 @@
 //! Establish and verify the outer safe-ci scope used by in-process DAG clients.
 
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use safe_ci_dag_runner::cgroup::CgroupManager;
 use safe_ci_dag_runner::cgroup::Cgroups;
+use safe_ci_dag_runner::cgroup::ContainmentProof;
 use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
-use safe_ci_dag_runner::cgroup::enable_outer_oom_group;
 use safe_ci_dag_runner::cgroup::expected_outer_memory_max_bytes;
 use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
 use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::verify_scope_limits;
 use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 
@@ -101,6 +105,95 @@ pub fn propagate_result(result: Result<BoxedCgroups, u8>) -> Result<BoxedCgroups
     result
 }
 
+/// Find the exact promised scope in the ancestry of the cgroup observed for
+/// this live process. A scheduler child normally lives in `step-*`, one level
+/// below that scope; treating only the current cgroup as the scope makes a
+/// correctly nested validate falsely fail its outer-limit audit.
+fn promised_scope_ancestor(proof: &ContainmentProof) -> Option<PathBuf> {
+    let promised = proof.unit.as_deref()?;
+    proof.cgroup.ancestors().find_map(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| *name == promised)
+            .map(|_| ancestor.to_path_buf())
+    })
+}
+
+/// Whether this invocation owns teardown of the promised outer scope.
+///
+/// The owner is observed at the exact scope root before `Cgroups::new()` moves
+/// it. Any descendant—including a direct or nested `supervisor`—is inherited;
+/// installing the outer SIGINT/SIGTERM handler there would let one node stop
+/// the entire run and every sibling.
+fn invocation_owns_promised_scope(proof: &ContainmentProof) -> bool {
+    let Some(scope) = promised_scope_ancestor(proof) else {
+        return false;
+    };
+    proof.cgroup == scope
+}
+
+fn read_trim(group: &Path, name: &str) -> Option<String> {
+    fs::read_to_string(group.join(name))
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+/// Write and read back the OOM-group bit, then verify every outer memory
+/// control against the exact scope named by the live containment proof.
+fn verify_outer_scope_limits_at(scope: &Path, expected_memory_max: i64) -> bool {
+    let oom_control = scope.join("memory.oom.group");
+    if let Err(error) = fs::write(&oom_control, "1") {
+        eprintln!(
+            "[safe-ci] ERROR: outer memory.oom.group=1 write failed at {} ({error})",
+            oom_control.display()
+        );
+        return false;
+    }
+
+    outer_scope_limit_readback_matches(scope, expected_memory_max)
+}
+
+fn outer_scope_limit_readback_matches(scope: &Path, expected_memory_max: i64) -> bool {
+    let memory_max = read_trim(scope, "memory.max");
+    let memory_swap_max = read_trim(scope, "memory.swap.max");
+    let memory_oom_group = read_trim(scope, "memory.oom.group");
+    let memory_ok = memory_max
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|actual| actual <= expected_memory_max && expected_memory_max - actual < 4096);
+    let swap_ok = memory_swap_max.as_deref() == Some("0");
+    let oom_group_ok = memory_oom_group.as_deref() == Some("1");
+    eprintln!(
+        "[safe-ci] outer cgroup audit at {}: memory.max={} ({}), memory.swap.max={} ({}), \
+         memory.oom.group={} ({})",
+        scope.display(),
+        memory_max.as_deref().unwrap_or("UNREADABLE"),
+        if memory_ok { "bound" } else { "MISMATCH" },
+        memory_swap_max.as_deref().unwrap_or("UNREADABLE"),
+        if swap_ok { "disabled" } else { "MISMATCH" },
+        memory_oom_group.as_deref().unwrap_or("UNREADABLE"),
+        if oom_group_ok { "enabled" } else { "MISMATCH" },
+    );
+    memory_ok && swap_ok && oom_group_ok
+}
+
+fn outer_scope_limits_observed(proof: Option<&ContainmentProof>, expected_memory_max: i64) -> bool {
+    let Some(proof) = proof else {
+        eprintln!("[safe-ci] ERROR: outer cgroup limit audit has no live containment proof");
+        return false;
+    };
+    let Some(scope) = promised_scope_ancestor(proof) else {
+        eprintln!(
+            "[safe-ci] ERROR: observed cgroup {} has no ancestor matching promised unit {}",
+            proof.cgroup.display(),
+            proof.unit.as_deref().unwrap_or("<missing>")
+        );
+        return false;
+    };
+    verify_outer_scope_limits_at(&scope, expected_memory_max)
+}
+
 /// Establish two-level cgroup-v2 boxing for a direct Rust scheduler client.
 ///
 /// A successful initial call re-executes the current CLI inside a transient
@@ -141,7 +234,11 @@ pub fn resolve_cgroups(
             "the outer scope did not carry its requested MemoryMax",
         );
     };
-    let outer_limits_observed = enable_outer_oom_group() && verify_scope_limits(memory_max);
+    let outer_limits_observed = outer_scope_limits_observed(attempt.proof(), memory_max);
+    // Capture ownership BEFORE Cgroups::new() moves this process into a local
+    // `supervisor` child. After that move, path shape alone cannot distinguish
+    // a scope-level owner from a scheduler payload's nested supervisor.
+    let owns_outer_scope = attempt.proof().is_some_and(invocation_owns_promised_scope);
     let runtime_observed =
         !verify_runtime || expected_scope_runtime_max_s().is_some_and(verify_scope_runtime_max);
     let manager = Cgroups::new();
@@ -159,7 +256,14 @@ pub fn resolve_cgroups(
         };
         return unavailable(label, allow_failure, &detail);
     }
-    install_scope_teardown();
+    if owns_outer_scope {
+        install_scope_teardown();
+    } else {
+        eprintln!(
+            "{label}: inherited outer scope; this nested invocation will not install the outer \
+             SIGINT/SIGTERM teardown handler."
+        );
+    }
     eprintln!(
         "{label}: cgroup boxing ACTIVE; containment and outer limits OBSERVED: {}.",
         attempt.describe()
@@ -179,7 +283,10 @@ pub fn self_test() -> Result<String, String> {
     for (requirement, observations) in [
         (
             ScopeRequirement::LiveContainment,
-            ScopeObservations { live_containment: false, ..all },
+            ScopeObservations {
+                live_containment: false,
+                ..all
+            },
         ),
         (
             ScopeRequirement::OuterMemorySwapAndOomGroup,
@@ -190,11 +297,17 @@ pub fn self_test() -> Result<String, String> {
         ),
         (
             ScopeRequirement::RuntimeMax,
-            ScopeObservations { runtime_max: false, ..all },
+            ScopeObservations {
+                runtime_max: false,
+                ..all
+            },
         ),
         (
             ScopeRequirement::PerStepCgroups,
-            ScopeObservations { per_step_cgroups: false, ..all },
+            ScopeObservations {
+                per_step_cgroups: false,
+                ..all
+            },
         ),
     ] {
         let refused = require_scope_observations(observations, true)
@@ -232,8 +345,129 @@ pub fn self_test() -> Result<String, String> {
                 .into(),
         );
     }
+
+    // Explicit-path bracket for the topology that failed in production. The
+    // fake `step-child` is below the promised scope, just like nested validate.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "safe-ci-scope-self-test-{}-{nonce}",
+        std::process::id()
+    ));
+    let fixture_result = (|| -> Result<(), String> {
+        let scope = tmp.join("fixture.scope");
+        let child = scope.join("step-child");
+        fs::create_dir_all(&child)
+            .map_err(|error| format!("cannot create scope fixture: {error}"))?;
+        fs::write(scope.join("memory.max"), "104857600\n")
+            .map_err(|error| format!("cannot write memory.max fixture: {error}"))?;
+        fs::write(scope.join("memory.swap.max"), "0\n")
+            .map_err(|error| format!("cannot write memory.swap.max fixture: {error}"))?;
+        fs::write(scope.join("memory.oom.group"), "0\n")
+            .map_err(|error| format!("cannot write memory.oom.group fixture: {error}"))?;
+        let proof = ContainmentProof {
+            cgroup: child,
+            pid: std::process::id(),
+            unit: Some("fixture.scope".into()),
+        };
+        if promised_scope_ancestor(&proof).as_deref() != Some(scope.as_path()) {
+            return Err("a step child did not resolve its exact promised scope ancestor".into());
+        }
+        let exact_owner = ContainmentProof {
+            cgroup: scope.clone(),
+            ..proof.clone()
+        };
+        let scope_supervisor = ContainmentProof {
+            cgroup: scope.join("supervisor"),
+            ..proof.clone()
+        };
+        let nested_supervisor = ContainmentProof {
+            cgroup: proof.cgroup.join("supervisor"),
+            ..proof.clone()
+        };
+        let mut no_promise = exact_owner.clone();
+        no_promise.unit = None;
+        if !invocation_owns_promised_scope(&exact_owner) {
+            return Err("the exact promised scope did not retain outer teardown ownership".into());
+        }
+        if invocation_owns_promised_scope(&proof)
+            || invocation_owns_promised_scope(&scope_supervisor)
+            || invocation_owns_promised_scope(&nested_supervisor)
+            || invocation_owns_promised_scope(&no_promise)
+        {
+            return Err(
+                "an inherited or unpromised topology claimed outer-scope teardown ownership".into(),
+            );
+        }
+        if !outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("matching ancestor limits were refused".into());
+        }
+
+        let mut missing = proof.clone();
+        missing.unit = Some("missing.scope".into());
+        if outer_scope_limits_observed(Some(&missing), 104857600) {
+            return Err("a missing promised scope ancestor was accepted".into());
+        }
+        let mut partial = proof.clone();
+        partial.unit = Some("fixture".into());
+        if outer_scope_limits_observed(Some(&partial), 104857600) {
+            return Err("a partial promised scope name was accepted".into());
+        }
+        fs::write(scope.join("memory.max"), "104849408\n")
+            .map_err(|error| format!("cannot mutate memory.max fixture: {error}"))?;
+        if outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("a memory.max mismatch was accepted".into());
+        }
+        fs::remove_file(scope.join("memory.max"))
+            .map_err(|error| format!("cannot remove memory.max fixture: {error}"))?;
+        fs::create_dir(scope.join("memory.max"))
+            .map_err(|error| format!("cannot make memory.max unreadable: {error}"))?;
+        if outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("an unreadable memory.max was accepted".into());
+        }
+        fs::remove_dir(scope.join("memory.max"))
+            .map_err(|error| format!("cannot remove unreadable memory.max fixture: {error}"))?;
+        fs::write(scope.join("memory.max"), "104857600\n")
+            .map_err(|error| format!("cannot restore memory.max fixture: {error}"))?;
+        fs::write(scope.join("memory.swap.max"), "1\n")
+            .map_err(|error| format!("cannot mutate memory.swap.max fixture: {error}"))?;
+        if outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("a nonzero outer swap limit was accepted".into());
+        }
+        fs::remove_file(scope.join("memory.swap.max"))
+            .map_err(|error| format!("cannot remove memory.swap.max fixture: {error}"))?;
+        fs::create_dir(scope.join("memory.swap.max"))
+            .map_err(|error| format!("cannot make memory.swap.max unreadable: {error}"))?;
+        if outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("an unreadable memory.swap.max was accepted".into());
+        }
+        fs::remove_dir(scope.join("memory.swap.max")).map_err(|error| {
+            format!("cannot remove unreadable memory.swap.max fixture: {error}")
+        })?;
+        fs::write(scope.join("memory.swap.max"), "0\n")
+            .map_err(|error| format!("cannot restore memory.swap.max fixture: {error}"))?;
+        fs::write(scope.join("memory.oom.group"), "0\n")
+            .map_err(|error| format!("cannot mutate memory.oom.group fixture: {error}"))?;
+        if outer_scope_limit_readback_matches(&scope, 104857600) {
+            return Err("a zero outer OOM-group readback was accepted".into());
+        }
+        fs::remove_file(scope.join("memory.oom.group"))
+            .map_err(|error| format!("cannot remove OOM-group fixture: {error}"))?;
+        fs::create_dir(scope.join("memory.oom.group"))
+            .map_err(|error| format!("cannot plant unwritable OOM-group fixture: {error}"))?;
+        if outer_scope_limits_observed(Some(&proof), 104857600) {
+            return Err("an unwritable outer OOM-group control was accepted".into());
+        }
+        Ok(())
+    })();
+    let cleanup_result = fs::remove_dir_all(&tmp)
+        .map_err(|error| format!("cannot clean scope fixture {}: {error}", tmp.display()));
+    fixture_result?;
+    cleanup_result?;
     Ok(
-        "safe-ci scope: containment, outer memory/swap/OOM-group, optional RuntimeMax, and per-step cgroups bracketed"
+        "safe-ci scope: containment, promised-scope ancestor, outer memory/swap/OOM-group, optional RuntimeMax, and per-step cgroups bracketed"
             .into(),
     )
 }

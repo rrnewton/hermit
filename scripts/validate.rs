@@ -119,6 +119,20 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
+const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+const NESTED_SCOPE_OUTER: &str = "outer";
+const NESTED_SCOPE_INNER: &str = "inner";
+const NESTED_SCOPE_SIGNAL: &str = "signal";
+const NESTED_INNER_STEP_S: i64 = 2;
+const NESTED_INNER_RUN_S: i64 = 5;
+const NESTED_OUTER_CHILD_STEP_S: i64 = 10;
+const NESTED_OUTER_CHILD_RUN_S: i64 = 12;
+const NESTED_SIGNAL_STEP_S: i64 = 5;
+const NESTED_SIGNAL_RUN_S: i64 = 7;
+const NESTED_SURVIVOR_STEP_S: i64 = 2;
+const NESTED_SURVIVOR_RUN_S: i64 = 4;
+const NESTED_SCOPE_RUNTIME_S: i64 = 30;
+const NESTED_WRAPPER_TIMEOUT_S: i64 = 45;
 
 /// Standalone-only in-repo ledger directory.
 ///
@@ -307,7 +321,8 @@ fn usage() -> &'static str {
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
      \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
-     \x20 --self-test      Run the driver's inert policy/quoting brackets and exit.\n\
+     \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
+     \x20                  nested-cgroup check, then exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
@@ -571,6 +586,218 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
     !force_full || (level == Level::Full && focused.is_none())
 }
 
+/// The environment marker only routes an invocation that already parsed the
+/// explicit `--self-test` flag. An inherited or operator-supplied marker must
+/// never turn an ordinary validation into a small passing probe.
+fn nested_scope_probe_selected(self_test: bool, marker_present: bool) -> bool {
+    self_test && marker_present
+}
+
+fn nested_scope_probe_requested() -> bool {
+    std::env::var_os(NESTED_SCOPE_SELF_TEST_ENV).is_some()
+}
+
+/// Every local rung is strict, and the three sequential outer runs sum to
+/// 12 + 7 + 4 = 23s, below the disposable scope's 30s and wrapper's 45s.
+fn nested_scope_budgets_are_ordered() -> bool {
+    NESTED_INNER_STEP_S < NESTED_INNER_RUN_S
+        && NESTED_INNER_RUN_S < NESTED_OUTER_CHILD_STEP_S
+        && NESTED_OUTER_CHILD_STEP_S < NESTED_OUTER_CHILD_RUN_S
+        && NESTED_SIGNAL_STEP_S < NESTED_SIGNAL_RUN_S
+        && NESTED_SURVIVOR_STEP_S < NESTED_SURVIVOR_RUN_S
+        && NESTED_OUTER_CHILD_RUN_S + NESTED_SIGNAL_RUN_S + NESTED_SURVIVOR_RUN_S
+            < NESTED_SCOPE_RUNTIME_S
+        && NESTED_SCOPE_RUNTIME_S < NESTED_WRAPPER_TIMEOUT_S
+}
+
+fn nested_scope_probe_step(
+    job: &str,
+    cmd: String,
+    mode: Option<&str>,
+    timeout_s: i64,
+) -> safe_ci_dag_runner::model::Step {
+    let mut step = step_with_caps(
+        "safe_ci_scope_self_test", job, "Exercise nested per-step cgroup containment",
+        cmd, Vec::new(), timeout_s, timeout_s, 512 * 1024 * 1024,
+    );
+    if let Some(mode) = mode {
+        step.env.insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
+    }
+    step.env.insert("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS".into(), "1".into());
+    step.hint.preferred_inner_jobs = Some(1);
+    step.jobs_flag = Some(String::new());
+    step
+}
+
+fn run_one_nested_scope_probe_step(
+    cgroups: BoxedCgroups,
+    step: safe_ci_dag_runner::model::Step,
+    run_timeout_s: i64,
+) -> Result<(), String> {
+    let mut cfg = DagConfig::default();
+    cfg.description = "real nested safe-ci scope self-test".into();
+    cfg.steps.push(step);
+    let result = run_dag_boxed_deadline(
+        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+    );
+    if !result.ok || result.run_timed_out || !result.skipped.is_empty()
+        || result.outcomes.len() != 1 || !result.outcomes[0].ok
+    {
+        return Err(format!(
+            "nested cgroup step did not pass exactly once: ok={} timed_out={} outcomes={:?} skipped={:?}",
+            result.ok, result.run_timed_out, result.outcomes, result.skipped
+        ));
+    }
+    Ok(())
+}
+
+fn run_one_nested_scope_signal_step(
+    cgroups: BoxedCgroups,
+    step: safe_ci_dag_runner::model::Step,
+    run_timeout_s: i64,
+) -> Result<(), String> {
+    let mut cfg = DagConfig::default();
+    cfg.description = "real inherited-scope signal self-test".into();
+    cfg.steps.push(step);
+    let result = run_dag_boxed_deadline(
+        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+    );
+    if result.ok || result.run_timed_out || !result.skipped.is_empty()
+        || result.outcomes.len() != 1
+        || result.outcomes[0].ok
+        || result.outcomes[0].returncode != Some(-libc::SIGTERM as i64)
+    {
+        return Err(format!(
+            "nested signal step did not fail only by SIGTERM: ok={} timed_out={} \
+             outcomes={:?} skipped={:?}",
+            result.ok, result.run_timed_out, result.outcomes, result.skipped
+        ));
+    }
+    Ok(())
+}
+
+/// Exercise outer-scope verification from a real scheduler `step-*` child,
+/// then require that child to dispatch one further per-step cgroup.
+fn run_nested_scope_probe() -> Result<String, String> {
+    match std::env::var(NESTED_SCOPE_SELF_TEST_ENV).as_deref() {
+        Ok(NESTED_SCOPE_OUTER) => {
+            let cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
+            ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
+            let exe = std::env::current_exe()
+                .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+            let exe = exe.to_str()
+                .ok_or_else(|| "self-test executable path is not UTF-8".to_string())?;
+            let command = format!("{} --self-test", validate_plan::shell_quote(exe));
+            run_one_nested_scope_probe_step(
+                cgroups.clone(),
+                nested_scope_probe_step(
+                    "outer_child", command.clone(), Some(NESTED_SCOPE_INNER),
+                    NESTED_OUTER_CHILD_STEP_S,
+                ),
+                NESTED_OUTER_CHILD_RUN_S,
+            )?;
+            run_one_nested_scope_signal_step(
+                cgroups.clone(),
+                nested_scope_probe_step(
+                    "signal_child", command, Some(NESTED_SCOPE_SIGNAL), NESTED_SIGNAL_STEP_S,
+                ),
+                NESTED_SIGNAL_RUN_S,
+            )?;
+            run_one_nested_scope_probe_step(
+                cgroups,
+                nested_scope_probe_step(
+                    "surviving_sibling", "true".into(), None, NESTED_SURVIVOR_STEP_S,
+                ),
+                NESTED_SURVIVOR_RUN_S,
+            )?;
+            Ok(
+                "outer scope observed the nested SIGTERM failure and then ran a boxed sibling"
+                    .into(),
+            )
+        }
+        Ok(NESTED_SCOPE_INNER) => {
+            // This process inherited the outer scope's RuntimeMax; it did not
+            // request a second systemd unit. Every other limit stays mandatory.
+            let cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested self-test inner", false, None, false,
+            ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
+            run_one_nested_scope_probe_step(
+                cgroups,
+                nested_scope_probe_step(
+                    "inner_child", "true".into(), None, NESTED_INNER_STEP_S,
+                ),
+                NESTED_INNER_RUN_S,
+            )?;
+            Ok("nested child verified the outer scope and dispatched its own boxed step".into())
+        }
+        Ok(NESTED_SCOPE_SIGNAL) => {
+            // Remove validate's ordinary signal observer BEFORE resolve_cgroups.
+            // The fixed inherited path installs no replacement, so SIGTERM
+            // terminates only this child. The buggy path installs the outer-
+            // scope teardown handler, which instead kills the disposable scope
+            // and makes the bounded parent wrapper fail.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            }
+            let _cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested signal self-test", false, None, false,
+            ).map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
+            eprintln!("nested signal child resolved inherited cgroups; delivering SIGTERM");
+            let raised = unsafe { libc::raise(libc::SIGTERM) };
+            Err(format!("nested signal child survived SIGTERM (libc::raise rc={raised})"))
+        }
+        Ok(other) => Err(format!("unknown nested scope self-test mode {other:?}")),
+        Err(error) => Err(format!("nested scope self-test mode is unavailable: {error}")),
+    }
+}
+
+/// Launch the real nested topology in a bounded child. Clearing inherited
+/// scope sentinels forces that child to establish and observe a fresh scope.
+fn nested_scope_self_test() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+    let output = Command::new("timeout")
+        .arg("--kill-after=5s")
+        .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
+        .arg(exe).arg("--self-test")
+        .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
+        .env("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")
+        .env("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", "1")
+        .env_remove("SAFE_CI_IN_SCOPE")
+        .env_remove("SAFE_CI_SCOPE_UNIT")
+        .env_remove("SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("SAFE_CI_EXPECTED_RUNTIME_MAX_SEC")
+        .output()
+        .map_err(|error| format!("cannot launch bounded nested scope self-test: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "real nested scope self-test failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        "nested child verified the outer scope and dispatched its own boxed step",
+        "safe-ci nested self-test inner: cgroup boxing ACTIVE",
+        "outer cgroup audit at ",
+        "safe_ci_scope_self_test.inner_child] ✓ PASS",
+        "safe_ci_scope_self_test.signal_child] ✗ FAIL",
+        "safe_ci_scope_self_test.surviving_sibling] ✓ PASS",
+        "outer scope observed the nested SIGTERM failure and then ran a boxed sibling",
+    ] {
+        if !stdout.contains(required) && !stderr.contains(required) {
+            return Err(format!(
+                "real nested scope self-test exited successfully without required evidence \
+                 {required:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -579,6 +806,26 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    if !nested_scope_probe_selected(true, true)
+        || nested_scope_probe_selected(false, true)
+        || nested_scope_probe_selected(true, false)
+        || nested_scope_probe_selected(false, false)
+    {
+        return Err(
+            "nested scope probe dispatch did not require both --self-test and its internal marker"
+                .into(),
+        );
+    }
+    if !nested_scope_budgets_are_ordered() {
+        return Err(format!(
+            "nested scope self-test budgets are inverted: inner={NESTED_INNER_STEP_S}/\
+             {NESTED_INNER_RUN_S}s outer-child={NESTED_OUTER_CHILD_STEP_S}/\
+             {NESTED_OUTER_CHILD_RUN_S}s signal={NESTED_SIGNAL_STEP_S}/\
+             {NESTED_SIGNAL_RUN_S}s survivor={NESTED_SURVIVOR_STEP_S}/\
+             {NESTED_SURVIVOR_RUN_S}s scope={NESTED_SCOPE_RUNTIME_S}s \
+             wrapper={NESTED_WRAPPER_TIMEOUT_S}s"
+        ));
+    }
     // CLI bracket: a real positive budget reaches the typed field, while zero,
     // negative, malformed, and missing values are all refused.
     let parsed = parse_argv(&["--run-timeout".into(), "600".into(), "--self-test".into()])
@@ -825,11 +1072,13 @@ fn self_test() -> Result<(), String> {
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
-    // Every ported subsystem brings its own two-sided brackets. They are inert:
-    // none of them runs a gate, publishes a label, writes the real ledger, or
-    // touches a PR — see each module's `self_test` doc for why that matters.
+    // Policy/data brackets are inert: none runs a gate, publishes a label,
+    // writes the real ledger, or touches a PR. The one deliberate exception is
+    // nested_scope_self_test: it uses a fresh disposable scope with strict
+    // inner/run/scope/wrapper bounds, then proves a nested signal cannot stop it.
     for line in [
         safe_ci_scope::self_test()?,
+        nested_scope_self_test()?,
         scheduler_accounting_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
@@ -5156,6 +5405,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
+    if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
+        return match run_nested_scope_probe() {
+            Ok(detail) => RunSummary::new(
+                Verdict::SelfTest, 0, "nested safe-ci scope self-test", vec![detail],
+            ),
+            Err(error) => {
+                eprintln!("validate: NESTED SCOPE SELF-TEST FAILED: {error}");
+                RunSummary::new(
+                    Verdict::Fail, 2, "nested safe-ci scope self-test",
+                    vec![format!("nested scope self-test failed: {error}")],
+                )
+            }
+        };
+    }
+
     if args.self_test {
         return match self_test() {
             Ok(()) => RunSummary::new(
@@ -5167,8 +5431,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                      envelope scoring/comparison, ledger cache, receipt eligibility, and the \
                      selective subset builder all passed"
                         .into(),
-                    "every bracket is inert: none runs a gate, publishes a label, or writes the \
-                     real ledger"
+                    "policy/data brackets are inert; the cgroup bracket runs only inside a bounded \
+                     disposable scope and neither publishes nor writes the real ledger"
                         .into(),
                 ],
             ),
