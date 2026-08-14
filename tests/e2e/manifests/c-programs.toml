@@ -1089,13 +1089,12 @@ ci = true
 # exact eight-class ceiling: the output can express at most 0..7, and seeds
 # 0..31 observed all eight values.
 #
-# Direct ptrace measurements at 077760ccb6ea (2026-08-14), using INFO,
+# Direct ptrace measurements at dd72f57de01d (2026-08-14), using INFO,
 # --verify-strict, --detlog-stack, and --detlog-heap:
 #   seeds 0..31: 8/8 classes, normalized entropy 0.9220, 32/32 exit 0
-#   seeds 32..63: 7/8 classes, normalized entropy 0.8757, 32/32 exit 0
 # A retained-work change from 256 sched_yield points to four kept the OpenMP
 # reduction and output calculation but narrowed seeds 0..31 to 6/8 classes.
-# min_distinct=7 accepts both measured healthy windows and refuses that partial
+# min_distinct=7 accepts the measured healthy window and refuses that partial
 # narrowing. All selected outcomes are required to exit successfully.
 seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
 outcome_classes = 8
