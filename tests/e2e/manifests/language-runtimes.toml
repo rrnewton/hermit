@@ -197,10 +197,10 @@ backends_enabled = ["ptrace", "dbt", "kvm", "sabre", "liteinst"]
 [test.modes.verify.backends_disabled]
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Strict verification owns the examples-directory parity contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

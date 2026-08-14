@@ -372,10 +372,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Chaos witness reproduction is the required relation for this deliberately racy guest"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

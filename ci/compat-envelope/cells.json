@@ -257,8 +257,8 @@
       "test": "applications/example-timed-progress-bar",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -1857,8 +1857,8 @@
       "test": "backend-parity-c/cpu-virtualization",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2177,8 +2177,8 @@
       "test": "backend-parity-c/dup-shared-offset",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -3937,8 +3937,8 @@
       "test": "backend-parity-c/fd-duplication",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -5057,8 +5057,8 @@
       "test": "backend-parity-c/getcpu-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -5537,8 +5537,8 @@
       "test": "backend-parity-c/hardware-trap-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6497,8 +6497,8 @@
       "test": "backend-parity-c/lseek-positioning",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9377,8 +9377,8 @@
       "test": "backend-parity-c/pid-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9537,8 +9537,8 @@
       "test": "backend-parity-c/pidfd-open-self",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10337,8 +10337,8 @@
       "test": "backend-parity-c/prctl-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10817,8 +10817,8 @@
       "test": "backend-parity-c/pthread-lifecycle",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11937,8 +11937,8 @@
       "test": "backend-parity-c/sched-getaffinity-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -16097,8 +16097,8 @@
       "test": "c-programs/acct-refusal-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -16417,8 +16417,8 @@
       "test": "c-programs/adjtimex-deterministic",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -16737,8 +16737,8 @@
       "test": "c-programs/bpf-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17057,8 +17057,8 @@
       "test": "c-programs/clock-adjtime-deterministic",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17217,8 +17217,8 @@
       "test": "c-programs/clone",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17377,8 +17377,8 @@
       "test": "c-programs/copy-file-range-refusal-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17537,8 +17537,8 @@
       "test": "c-programs/dbt-copied-tiocgpgrp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17697,8 +17697,8 @@
       "test": "c-programs/dbt-exec-failure",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -17857,8 +17857,8 @@
       "test": "c-programs/dbt-execveat-unsupported",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -18017,8 +18017,8 @@
       "test": "c-programs/dbt-mmap-exec",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -18337,8 +18337,8 @@
       "test": "c-programs/dbt-prlimit-self",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -18497,8 +18497,8 @@
       "test": "c-programs/dbt-self-sigqueue",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -18657,8 +18657,8 @@
       "test": "c-programs/dbt-unsupported-syscall",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -18817,8 +18817,8 @@
       "test": "c-programs/dbt-wait-lifecycle",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19137,8 +19137,8 @@
       "test": "c-programs/fp-reduction-nondeterminism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19297,8 +19297,8 @@
       "test": "c-programs/futex-requeue-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19617,8 +19617,8 @@
       "test": "c-programs/futex-wake-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19777,8 +19777,8 @@
       "test": "c-programs/get-robust-list-child",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20097,8 +20097,8 @@
       "test": "c-programs/get-robust-list-thread",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20257,8 +20257,8 @@
       "test": "c-programs/getcpu",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20417,8 +20417,8 @@
       "test": "c-programs/getitimer-determinism-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20577,8 +20577,8 @@
       "test": "c-programs/getsockopt-null",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20737,8 +20737,8 @@
       "test": "c-programs/hello-alarm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -20897,8 +20897,8 @@
       "test": "c-programs/hello-nostdlib",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -21057,8 +21057,8 @@
       "test": "c-programs/hello-signals",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -21217,8 +21217,8 @@
       "test": "c-programs/io-uring-fallback",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -21377,8 +21377,8 @@
       "test": "c-programs/io-uring-ring-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -21697,8 +21697,8 @@
       "test": "c-programs/ioctl-siocethtool",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22017,8 +22017,8 @@
       "test": "c-programs/just-spin",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22497,8 +22497,8 @@
       "test": "c-programs/keyctl-passthrough",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22977,8 +22977,8 @@
       "test": "c-programs/lsm-get-self-attr-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -23137,8 +23137,8 @@
       "test": "c-programs/lsm-list-modules-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -23297,8 +23297,8 @@
       "test": "c-programs/lsm-set-self-attr-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -23617,8 +23617,8 @@
       "test": "c-programs/map-shadow-stack-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -23777,8 +23777,8 @@
       "test": "c-programs/memfd-secret-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -24417,8 +24417,8 @@
       "test": "c-programs/memorypress",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -24737,8 +24737,8 @@
       "test": "c-programs/mmap-stress-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -24897,8 +24897,8 @@
       "test": "c-programs/name-to-handle-at-eopnotsupp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -25057,8 +25057,8 @@
       "test": "c-programs/name-to-handle-directory-eopnotsupp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -25217,8 +25217,8 @@
       "test": "c-programs/name-to-handle-empty-path-eopnotsupp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -25377,8 +25377,8 @@
       "test": "c-programs/name-to-handle-regular-eopnotsupp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -25537,8 +25537,8 @@
       "test": "c-programs/nanosleep-par",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -25697,8 +25697,8 @@
       "test": "c-programs/nanosleep-threads-nocrash",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26177,8 +26177,8 @@
       "test": "c-programs/netlink-autobind-route",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26337,8 +26337,8 @@
       "test": "c-programs/netlink-autobind-usersock",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26497,8 +26497,8 @@
       "test": "c-programs/netns-cookie-tcp4",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26657,8 +26657,8 @@
       "test": "c-programs/netns-cookie-tcp6",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26817,8 +26817,8 @@
       "test": "c-programs/netns-cookie-udp4",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -27137,8 +27137,8 @@
       "test": "c-programs/perf-event-hardware-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -27297,8 +27297,8 @@
       "test": "c-programs/perf-event-open-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -27457,8 +27457,8 @@
       "test": "c-programs/perf-event-software-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -27617,8 +27617,8 @@
       "test": "c-programs/perf-event-watchpoint-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -27937,8 +27937,8 @@
       "test": "c-programs/pidfd-open-self",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -28097,8 +28097,8 @@
       "test": "c-programs/pidfd-poll-self",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -28257,8 +28257,8 @@
       "test": "c-programs/pidfd-waitid-child",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -28417,8 +28417,8 @@
       "test": "c-programs/ppoll-readv",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -28737,8 +28737,8 @@
       "test": "c-programs/prctl-dumpable",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -28897,8 +28897,8 @@
       "test": "c-programs/pread64-nostdlib",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -29057,8 +29057,8 @@
       "test": "c-programs/print-memaddrs",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -29217,8 +29217,8 @@
       "test": "c-programs/printf-with-threads",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -29537,8 +29537,8 @@
       "test": "c-programs/proc-fdinfo",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -29857,8 +29857,8 @@
       "test": "c-programs/process-mrelease-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -30017,8 +30017,8 @@
       "test": "c-programs/process-vm-readv-refusal-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -30177,8 +30177,8 @@
       "test": "c-programs/process-vm-writev-refusal-probe",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -30497,8 +30497,8 @@
       "test": "c-programs/prodcons-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -30817,8 +30817,8 @@
       "test": "c-programs/ptrace-attach-eperm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -30977,8 +30977,8 @@
       "test": "c-programs/ptrace-eperm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31137,8 +31137,8 @@
       "test": "c-programs/ptrace-seize-eperm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31297,8 +31297,8 @@
       "test": "c-programs/ptrace-traceme-eperm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31457,8 +31457,8 @@
       "test": "c-programs/pty-nr-count",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31617,8 +31617,8 @@
       "test": "c-programs/racewrite-nostdlib",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31937,8 +31937,8 @@
       "test": "c-programs/rcx-canonicalization",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -32097,8 +32097,8 @@
       "test": "c-programs/record-replay-fd-close",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -32577,8 +32577,8 @@
       "test": "c-programs/record-replay-setsockopt",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -32737,8 +32737,8 @@
       "test": "c-programs/recvmsg-scm-rights-mmap",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -32897,8 +32897,8 @@
       "test": "c-programs/remap-file-pages-anonymous-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -33057,8 +33057,8 @@
       "test": "c-programs/remap-file-pages-memfd-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -33217,8 +33217,8 @@
       "test": "c-programs/remap-file-pages-tmpfile-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -33537,8 +33537,8 @@
       "test": "c-programs/resource-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -33697,8 +33697,8 @@
       "test": "c-programs/sched-setattr-batch",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -33857,8 +33857,8 @@
       "test": "c-programs/sched-setattr-idle",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -34017,8 +34017,8 @@
       "test": "c-programs/sched-setattr-other",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -34177,8 +34177,8 @@
       "test": "c-programs/sched-yield-progress",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -34497,8 +34497,8 @@
       "test": "c-programs/setitimer-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -34657,8 +34657,8 @@
       "test": "c-programs/sigmask-preemption",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -34977,8 +34977,8 @@
       "test": "c-programs/sigpipe-siginfo",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -35137,8 +35137,8 @@
       "test": "c-programs/sigtimedwait-no-timeout",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -35297,8 +35297,8 @@
       "test": "c-programs/sigtimedwait-timeout-0s",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -35457,8 +35457,8 @@
       "test": "c-programs/sigtimedwait-timeout-1s",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -36097,8 +36097,8 @@
       "test": "c-programs/socket-cookie-tcp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -36257,8 +36257,8 @@
       "test": "c-programs/socket-cookie-udp",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -36417,8 +36417,8 @@
       "test": "c-programs/socket-cookie-unix",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -36897,8 +36897,8 @@
       "test": "c-programs/socket-timestamp-timespec",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -37377,8 +37377,8 @@
       "test": "c-programs/statmount-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -37537,8 +37537,8 @@
       "test": "c-programs/syscall-file-io",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -38017,8 +38017,8 @@
       "test": "c-programs/sysfs-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -38177,8 +38177,8 @@
       "test": "c-programs/sysinfo",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -38337,8 +38337,8 @@
       "test": "c-programs/sysinfo-uptime",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -38657,8 +38657,8 @@
       "test": "c-programs/sysv-sem-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -38817,8 +38817,8 @@
       "test": "c-programs/sysv-shm-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -39617,8 +39617,8 @@
       "test": "c-programs/thread-self-procfs-handoff",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -39937,8 +39937,8 @@
       "test": "c-programs/threadexhaustion",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -40097,8 +40097,8 @@
       "test": "c-programs/timer-create-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -40257,8 +40257,8 @@
       "test": "c-programs/uname",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -40417,8 +40417,8 @@
       "test": "c-programs/unix-autobind-dgram",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -40737,8 +40737,8 @@
       "test": "c-programs/unix-autobind-stream",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -40897,8 +40897,8 @@
       "test": "c-programs/ustat-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -41057,8 +41057,8 @@
       "test": "c-programs/vforkexec",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -41377,8 +41377,8 @@
       "test": "c-programs/wait-on-child",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -41537,8 +41537,8 @@
       "test": "c-programs/writev-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -41697,8 +41697,8 @@
       "test": "chaos-c/lock-granularity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -42657,8 +42657,8 @@
       "test": "debugger-c/debuggee",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43457,8 +43457,8 @@
       "test": "determinism-stress/thread-interleaving",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43777,8 +43777,8 @@
       "test": "determinism-stress-c/fork-tree",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44097,8 +44097,8 @@
       "test": "determinism-stress-c/mmap-fork-shared",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44577,8 +44577,8 @@
       "test": "determinism-stress-c/pipe-chain",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -45377,8 +45377,8 @@
       "test": "determinism-stress-c/thread-stress",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -46017,8 +46017,8 @@
       "test": "language-runtimes/example-python-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
