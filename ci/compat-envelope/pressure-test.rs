@@ -179,6 +179,76 @@ How it runs:
   pressure runner does not currently distinguish the originating signal.
 "#;
 
+const RUN_HELP: &str = r#"Usage: ci/compat-envelope/pressure-test.rs run [OPTIONS]
+
+Run one exact compatibility cell or one resource-capped batch and retain the
+plan, raw rows, runner evidence, and summary under --results. Exact red-cell
+iteration may use a dirty checkout and is labelled exploratory. Every batch
+and every repeated green-cell run requires a clean commit and executes from an
+isolated checkout. Any nonpass, timeout, OOM, crash/error, missing result, or
+infrastructure error makes the command exit nonzero.
+
+Selection forms:
+  --test ID --mode MODE --backend BACKEND
+      Run one exact red cell once. Add --repetitions N to repeat one exact
+      enabled green cell N times.
+  [--mode MODE] [--sample N --seed SEED]
+      Probe currently red cells. With no filters, select every executable red
+      verify/replay/chaos cell.
+  --green --repetitions N [--mode MODE] [--sample N --seed SEED]
+      Repeat enabled green cells. Only the unfiltered form covers the complete
+      current green population; mode-filtered and sampled runs are partial.
+
+Options:
+  --results DIR          Retained result directory (default is under ignored/)
+  --test ID              Exact manifest test ID
+  --mode MODE            verify, replay, chaos, or naked
+  --backend BACKEND      ptrace, dbt, kvm, sabre, liteinst, or native
+  --repetitions N        Positive repetition count for green cells
+  --green                Select enabled green cells instead of red cells
+  --sample N             Select a retained seeded subset
+  --seed SEED            Reproduce a sample; generated when omitted
+  --cell-timeout SEC     Tighter per-cell wall cap
+  --run-timeout SEC      Whole-run wall bound (default 7200 seconds)
+  -h, --help             Show this help
+"#;
+
+const PLAN_HELP: &str = r#"Usage: ci/compat-envelope/pressure-test.rs plan --results DIR [OPTIONS]
+
+Generate and retain the exact safe-ci DAG used by `run` without executing it.
+The result is always DIR/dag.json. The planner validates the current scorecard,
+selected population, resource caps, per-cell limits, and whole-run wall bound.
+It prints the declared cell-occupancy floor and the smallest accepted bound for
+that occupancy alone; build and preparation work require additional time.
+
+Selection forms and options are the same as `run`, except --results is required.
+Only one exact red cell may be planned from a dirty checkout. Batches and all
+repeated green-cell plans require a clean commit.
+
+  --results DIR          Required fresh result directory
+  --test ID              Exact manifest test ID
+  --mode MODE            verify, replay, chaos, or naked
+  --backend BACKEND      ptrace, dbt, kvm, sabre, liteinst, or native
+  --repetitions N        Positive repetition count for green cells
+  --green                Select enabled green cells instead of red cells
+  --sample N             Select a retained seeded subset
+  --seed SEED            Reproduce a sample; generated when omitted
+  --cell-timeout SEC     Tighter per-cell wall cap
+  --run-timeout SEC      Whole-run wall bound (default 7200 seconds)
+  -h, --help             Show this help
+"#;
+
+const SUMMARIZE_HELP: &str = r#"Usage: ci/compat-envelope/pressure-test.rs summarize --results DIR
+
+Re-read one retained pressure run, verify its source/plan/result identity, print
+the per-backend outcome table, and rewrite DIR/summary.json. This command never
+edits or promotes the checked-in scorecard. Missing, nonpass, or infrastructure
+results make the command exit nonzero.
+
+  --results DIR          Completed retained result directory
+  -h, --help             Show this help
+"#;
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct CellId {
     lane: String,
@@ -330,6 +400,27 @@ impl Drop for SelfTestDirectory {
 }
 
 impl FreshCheckout {
+    fn marker_path(&self) -> PathBuf {
+        self.path
+            .join(".git")
+            .join("pressure-test-generated-checkout")
+    }
+
+    fn expected_marker(&self) -> String {
+        format!("source={}\nsha={}\n", self.source.display(), self.sha)
+    }
+
+    fn marker_matches(&self) -> Result<bool, String> {
+        match fs::read_to_string(self.marker_path()) {
+            Ok(observed) => Ok(observed == self.expected_marker()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "cannot read generated-checkout marker {}: {error}",
+                self.marker_path().display()
+            )),
+        }
+    }
+
     fn prepare(source: &Path, sha: &str) -> Result<Self, String> {
         let parent = source
             .parent()
@@ -367,12 +458,9 @@ impl FreshCheckout {
                     .arg(&checkout.path),
                 "materialize fresh pressure-test checkout",
             )?;
-            let marker = checkout.path.join(".pressure-test-generated-checkout");
-            fs::write(
-                &marker,
-                format!("source={}\nsha={}\n", source.display(), sha),
-            )
-            .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
+            let marker = checkout.marker_path();
+            fs::write(&marker, checkout.expected_marker())
+                .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
             command_ok(
                 Command::new("git")
                     .args([
@@ -441,8 +529,8 @@ impl FreshCheckout {
                 self.path.display()
             ));
         }
-        let marker = self.path.join(".pressure-test-generated-checkout");
-        let expected_marker = format!("source={}\nsha={}\n", self.source.display(), self.sha);
+        let marker = self.marker_path();
+        let expected_marker = self.expected_marker();
         match fs::read_to_string(&marker) {
             Ok(observed_marker) if observed_marker == expected_marker => {}
             Ok(_) => {
@@ -582,7 +670,8 @@ fn run() -> Result<(), String> {
         if args.next().is_some() {
             return Err("help accepts no additional options".into());
         }
-        print!("{USAGE}");
+        let root = repo_root()?;
+        print!("{}", subcommand_help(&root, &command)?);
         return Ok(());
     }
     let root = repo_root()?;
@@ -615,6 +704,7 @@ fn run() -> Result<(), String> {
             );
             print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
+            print_cell_occupancy(&root, &metadata, &selection)?;
             print_sample(&metadata);
             if selection.is_exact() {
                 print_exact_manifest_command(&root, &metadata.cells[0], &selection)?;
@@ -711,9 +801,9 @@ fn run() -> Result<(), String> {
                             "compatibility pressure test: a repeated green-cell check stopped this DAG pass; resuming the remaining checks ({progress} progress markers)"
                         );
                     } else {
-                    eprintln!(
-                        "compatibility pressure test: a bounded red-cell attempt stopped this DAG pass; resuming the remaining cells ({progress} progress markers)"
-                    );
+                        eprintln!(
+                            "compatibility pressure test: a bounded red-cell attempt stopped this DAG pass; resuming the remaining cells ({progress} progress markers)"
+                        );
                     }
                     prior_progress = progress;
                 }
@@ -760,10 +850,10 @@ fn print_sample(metadata: &RunMetadata) {
         return;
     };
     if metadata.eligible_cells == 0 {
-    println!(
+        println!(
             "Sample: selected {count} cell(s), eligible count not retained by this older run, seed {}",
-        metadata.seed.unwrap_or(0)
-    );
+            metadata.seed.unwrap_or(0)
+        );
     } else {
         println!(
             "Sample: selected {count} of {} eligible cell(s), seed {}",
@@ -783,6 +873,75 @@ fn print_unavailable(metadata: &RunMetadata) {
             metadata.unavailable_cells
         );
     }
+}
+
+fn print_cell_occupancy(
+    root: &Path,
+    metadata: &RunMetadata,
+    selection: &CellSelection,
+) -> Result<(), String> {
+    let budgets = load_budgets(root)?;
+    let (occupancy_floor, _) = cell_occupancy_floor(
+        metadata.cells.iter(),
+        &budgets,
+        selection.cell_timeout_seconds,
+        selection.run_count(),
+    )?;
+    let smallest_accepted = refusal_safe_run_timeout(occupancy_floor)?;
+    println!("Declared cell-occupancy floor: {occupancy_floor}s at manifest_guest=4/kvm=1");
+    println!(
+        "Smallest accepted whole-run bound for cell occupancy alone: {smallest_accepted}s (build and preparation work need additional time)"
+    );
+    Ok(())
+}
+
+fn current_basic_sanity_help(root: &Path, command: &str) -> Result<String, String> {
+    const REPETITIONS: usize = 20;
+    const CELL_TIMEOUT_SECONDS: i64 = 60;
+
+    let selection = CellSelection {
+        green: true,
+        repetitions: Some(REPETITIONS),
+        cell_timeout_seconds: Some(CELL_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let selected = pressure_cells(root, &selection)?.selected;
+    let budgets = load_budgets(root)?;
+    let (occupancy_floor, cell_count) = cell_occupancy_floor(
+        selected.iter().map(|tracked| &tracked.id),
+        &budgets,
+        selection.cell_timeout_seconds,
+        REPETITIONS,
+    )?;
+    let cell_jobs = cell_count
+        .checked_mul(REPETITIONS)
+        .ok_or("current green-cell job count exceeds the supported integer range")?;
+    let smallest_accepted = refusal_safe_run_timeout(occupancy_floor)?;
+    let results = if command == "plan" {
+        " --results ignored/compat-envelope/basic-sanity-plan"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "\nCurrent full basic-sanity selection at this checkout:\n  {cell_count} enabled green cells × {REPETITIONS} = {cell_jobs} cell jobs\n  ./ci/compat-envelope/pressure-test.rs {command}{results} --green --repetitions {REPETITIONS} --cell-timeout {CELL_TIMEOUT_SECONDS} --run-timeout {smallest_accepted}\n  {smallest_accepted}s is the smallest planner-accepted bound for declared cell occupancy only; it is not a completion estimate because builds and preparation add work.\n"
+    ))
+}
+
+fn subcommand_help(root: &Path, command: &str) -> Result<String, String> {
+    let mut help = match command {
+        "run" => RUN_HELP.to_string(),
+        "plan" => PLAN_HELP.to_string(),
+        "summarize" => return Ok(SUMMARIZE_HELP.to_string()),
+        "self-test" => {
+            return Ok(
+                "Usage: ci/compat-envelope/pressure-test.rs self-test\n\nRun isolated selection, plan, timeout, and retained-evidence brackets without running a guest.\n"
+                    .into(),
+            );
+        }
+        _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
+    };
+    help.push_str(&current_basic_sanity_help(root, command)?);
+    Ok(help)
 }
 
 fn result_options(
@@ -917,9 +1076,11 @@ fn result_options(
         );
     }
     if selection.cell_timeout_seconds.is_some()
-        && !(selection.is_exact() || selection.sample.is_some())
+        && !(selection.is_exact() || selection.sample.is_some() || selection.green)
     {
-        return Err("--cell-timeout requires an exact cell or --sample".into());
+        return Err(
+            "--cell-timeout requires an exact cell, --sample, or a repeated --green batch".into(),
+        );
     }
     if selection.sample.is_some() && selection.is_exact() {
         return Err(
@@ -1048,11 +1209,7 @@ fn worktree_dirty(root: &Path) -> Result<bool, String> {
     if !output.status.success() {
         return Err("git status failed".into());
     }
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .any(|entry| entry != b"?? .pressure-test-generated-checkout"))
+    Ok(!output.stdout.is_empty())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -1198,15 +1355,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                         "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
                     )
                 } else {
-                format!(
-                    "{test}/{mode}/{backend} is not a currently red tracked cell; use the scorecard or manifest CLI to inspect it"
-                )
+                    format!(
+                        "{test}/{mode}/{backend} is not a currently red tracked cell; use the scorecard or manifest CLI to inspect it"
+                    )
                 }
             } else if let Some(mode) = selection.mode.as_deref() {
                 if selection.repeats_green_cell() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
                 } else {
-                format!("tracked scorecard has no red cells for mode `{mode}`")
+                    format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
             } else if selection.repeats_green_cell() {
                 "tracked scorecard has no enabled green cells".into()
@@ -1225,9 +1382,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 )
             } else {
                 format!(
-                "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
+                    "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
                     selected_cells.len(),
-                unavailable.len()
+                    unavailable.len()
                 )
             });
         }
@@ -1382,28 +1539,26 @@ fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> R
     Ok(pressure_timeout(budget, selected_cap)? + 20)
 }
 
-fn require_cell_occupancy_fits(
-    cells: &[TrackedCell],
+fn cell_occupancy_floor<'a>(
+    cells: impl IntoIterator<Item = &'a CellId>,
     budgets: &BTreeMap<(String, String), CellBudget>,
     selected_cap: Option<i64>,
-    run_timeout_seconds: i64,
     repetitions: usize,
-) -> Result<(), String> {
+) -> Result<(i64, usize), String> {
     let repetitions = i64::try_from(repetitions).map_err(|_| {
         "--repetitions is too large to represent in the pressure-test occupancy calculation"
             .to_string()
     })?;
     let mut all_seconds = 0_i64;
     let mut kvm_seconds = 0_i64;
-    for tracked in cells {
+    let mut cell_count = 0_usize;
+    for cell in cells {
+        cell_count = cell_count
+            .checked_add(1)
+            .ok_or("selected cell count exceeds the supported integer range")?;
         let budget = budgets
-            .get(&(tracked.id.test.clone(), tracked.id.mode.clone()))
-            .ok_or_else(|| {
-                format!(
-                    "no manifest budget for {}/{}",
-                    tracked.id.test, tracked.id.mode
-                )
-            })?;
+            .get(&(cell.test.clone(), cell.mode.clone()))
+            .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
         let seconds = pressure_timeout(budget, selected_cap)?;
         let seconds = seconds.checked_mul(repetitions).ok_or_else(|| {
             "--repetitions makes the declared pressure-test occupancy exceed the supported integer range"
@@ -1413,7 +1568,7 @@ fn require_cell_occupancy_fits(
             "the selected cells make the declared pressure-test occupancy exceed the supported integer range"
                 .to_string()
         })?;
-        if tracked.id.backend == "kvm" {
+        if cell.backend == "kvm" {
             kvm_seconds = kvm_seconds.checked_add(seconds).ok_or_else(|| {
                 "the selected KVM cells make the declared pressure-test occupancy exceed the supported integer range"
                     .to_string()
@@ -1426,16 +1581,32 @@ fn require_cell_occupancy_fits(
     // preparation work. Refuse an impossible public bound instead of printing a
     // command which cannot satisfy its own contract.
     let guest_floor = all_seconds / 4 + i64::from(all_seconds % 4 != 0);
-    let occupancy_floor = guest_floor.max(kvm_seconds);
+    Ok((guest_floor.max(kvm_seconds), cell_count))
+}
+
+fn refusal_safe_run_timeout(occupancy_floor: i64) -> Result<i64, String> {
+    occupancy_floor
+        .checked_add(1)
+        .ok_or("declared cell occupancy leaves no representable whole-run bound".into())
+}
+
+fn require_cell_occupancy_fits<'a>(
+    cells: impl IntoIterator<Item = &'a CellId>,
+    budgets: &BTreeMap<(String, String), CellBudget>,
+    selected_cap: Option<i64>,
+    run_timeout_seconds: i64,
+    repetitions: usize,
+) -> Result<i64, String> {
+    let (occupancy_floor, cell_count) =
+        cell_occupancy_floor(cells, budgets, selected_cap, repetitions)?;
     if occupancy_floor >= run_timeout_seconds {
+        let smallest_accepted = refusal_safe_run_timeout(occupancy_floor)?;
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at manifest_guest=4/kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
-            i64::try_from(cells.len())
-                .unwrap_or(i64::MAX)
-                .saturating_mul(repetitions)
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at manifest_guest=4/kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; the smallest accepted bound for cell occupancy alone is --run-timeout {smallest_accepted}, while builds and preparation add more work; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            cell_count.saturating_mul(repetitions)
         ));
     }
-    Ok(())
+    Ok(occupancy_floor)
 }
 
 fn build_marker(results: &Path, tag: &str) -> PathBuf {
@@ -1589,7 +1760,7 @@ fn write_plan(
         .run_timeout_seconds
         .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
     require_cell_occupancy_fits(
-        &cells,
+        cells.iter().map(|tracked| &tracked.id),
         &budgets,
         selection.cell_timeout_seconds,
         run_timeout_seconds,
@@ -1731,63 +1902,63 @@ fn write_plan(
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
         for repetition in repetition_numbers(selection.repetitions) {
             let slug = cell_run_slug(cell, repetition);
-        let tag = format!("cell.{slug}");
-        let cell_dir = results.join("cells").join(&slug);
-        let result_file = cell_dir.join("results.jsonl");
-        let result_in_progress = cell_dir.join("results.in-progress.jsonl");
-        let junit = cell_dir.join("junit.xml");
-        let junit_in_progress = cell_dir.join("junit.in-progress.xml");
-        let status_file = cell_dir.join("harness-status");
-        let (selector, backend) = if tracked.enabled {
-            let backend = if cell.backend == "native" {
-                String::new()
+            let tag = format!("cell.{slug}");
+            let cell_dir = results.join("cells").join(&slug);
+            let result_file = cell_dir.join("results.jsonl");
+            let result_in_progress = cell_dir.join("results.in-progress.jsonl");
+            let junit = cell_dir.join("junit.xml");
+            let junit_in_progress = cell_dir.join("junit.in-progress.xml");
+            let status_file = cell_dir.join("harness-status");
+            let (selector, backend) = if tracked.enabled {
+                let backend = if cell.backend == "native" {
+                    String::new()
+                } else {
+                    format!(" --backend {}", shell_quote(&cell.backend))
+                };
+                ("--include-manual", backend)
             } else {
-                format!(" --backend {}", shell_quote(&cell.backend))
+                (
+                    "--probe-disabled",
+                    format!(" --backend {}", shell_quote(&cell.backend)),
+                )
             };
-            ("--include-manual", backend)
-        } else {
-            (
-                "--probe-disabled",
-                format!(" --backend {}", shell_quote(&cell.backend)),
-            )
-        };
             let preparation_guard = if selection.uses_shared_preparation() {
-            let preparation_status = results
-                .join("prepare")
-                .join(sanitize(&cell.test))
-                .join("status");
-            format!(
-                "if ! test \"$(cat {preparation_status} 2>/dev/null)\" = 0; then printf '{failed}\\n' > {status_file}; exit 0; fi; ",
-                preparation_status = shell_quote(&preparation_status.to_string_lossy()),
-                failed = PREPARATION_FAILED_STATUS,
-                status_file = shell_quote(&status_file.to_string_lossy()),
-            )
+                let preparation_status = results
+                    .join("prepare")
+                    .join(sanitize(&cell.test))
+                    .join("status");
+                format!(
+                    "if ! test \"$(cat {preparation_status} 2>/dev/null)\" = 0; then printf '{failed}\\n' > {status_file}; exit 0; fi; ",
+                    preparation_status = shell_quote(&preparation_status.to_string_lossy()),
+                    failed = PREPARATION_FAILED_STATUS,
+                    status_file = shell_quote(&status_file.to_string_lossy()),
+                )
             } else {
                 String::new()
-        };
+            };
             let harness = if selection.allows_dirty_source() {
-            format!(
-                "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
-                selector = selector,
-                test = shell_quote(&cell.test),
-                mode = shell_quote(&cell.mode),
-                backend = backend,
-                result_file = shell_quote(&result_in_progress.to_string_lossy()),
-                junit = shell_quote(&junit_in_progress.to_string_lossy()),
-            )
-        } else {
-            format!(
-                "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
-                selector = selector,
-                test = shell_quote(&cell.test),
-                mode = shell_quote(&cell.mode),
-                backend = backend,
-                result_file = shell_quote(&result_in_progress.to_string_lossy()),
-                junit = shell_quote(&junit_in_progress.to_string_lossy()),
-            )
-        };
-        let cmd = format!(
-            "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
+                format!(
+                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    selector = selector,
+                    test = shell_quote(&cell.test),
+                    mode = shell_quote(&cell.mode),
+                    backend = backend,
+                    result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                    junit = shell_quote(&junit_in_progress.to_string_lossy()),
+                )
+            } else {
+                format!(
+                    "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    selector = selector,
+                    test = shell_quote(&cell.test),
+                    mode = shell_quote(&cell.mode),
+                    backend = backend,
+                    result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                    junit = shell_quote(&junit_in_progress.to_string_lossy()),
+                )
+            };
+            let cmd = format!(
+                "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
              E2E_KEEP_VERIFY_LOGS=1 \
@@ -1796,43 +1967,43 @@ fn write_plan(
              if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
              if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit} || status=$?; fi; \
              printf '%s\\n' \"$status\" > {status_file}; exit \"$status\"",
-            cell_dir = shell_quote(&cell_dir.to_string_lossy()),
-            results = shell_quote(&results.to_string_lossy()),
-            build_root = shell_quote(&build_root.to_string_lossy()),
-            run_id = shell_quote(&slug),
-            harness = harness,
-            result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
-            result_file = shell_quote(&result_file.to_string_lossy()),
-            junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
-            junit = shell_quote(&junit.to_string_lossy()),
-            status_file = shell_quote(&status_file.to_string_lossy()),
-            incomplete = INCOMPLETE_ATTEMPT_STATUS,
-            preparation_guard = preparation_guard,
-        );
-        let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
-        cell_timeouts.insert(tag.clone(), wall);
-        // KVM's canonical privileged nodes are boxed at 16 GiB even when the
-        // manifest cell itself is in the portable lane. Preserve that safety
-        // boundary here; a 3 GiB generic portable cap kills the VM before its
-        // compatibility result exists.
-        let memory = if cell.lane == "privileged" || cell.backend == "kvm" {
-            16_i64 * 1024 * 1024 * 1024
-        } else {
-            3_i64 * 1024 * 1024 * 1024
-        };
-        let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
-        if cell.backend == "kvm" {
-            resources.insert("kvm".into(), 1);
-        }
-        let deps = selected_cell_dependencies(
+                cell_dir = shell_quote(&cell_dir.to_string_lossy()),
+                results = shell_quote(&results.to_string_lossy()),
+                build_root = shell_quote(&build_root.to_string_lossy()),
+                run_id = shell_quote(&slug),
+                harness = harness,
+                result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
+                result_file = shell_quote(&result_file.to_string_lossy()),
+                junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
+                junit = shell_quote(&junit.to_string_lossy()),
+                status_file = shell_quote(&status_file.to_string_lossy()),
+                incomplete = INCOMPLETE_ATTEMPT_STATUS,
+                preparation_guard = preparation_guard,
+            );
+            let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+            cell_timeouts.insert(tag.clone(), wall);
+            // KVM's canonical privileged nodes are boxed at 16 GiB even when the
+            // manifest cell itself is in the portable lane. Preserve that safety
+            // boundary here; a 3 GiB generic portable cap kills the VM before its
+            // compatibility result exists.
+            let memory = if cell.lane == "privileged" || cell.backend == "kvm" {
+                16_i64 * 1024 * 1024 * 1024
+            } else {
+                3_i64 * 1024 * 1024 * 1024
+            };
+            let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
+            if cell.backend == "kvm" {
+                resources.insert("kvm".into(), 1);
+            }
+            let deps = selected_cell_dependencies(
                 !selection.uses_shared_preparation(),
-            &cell.mode,
-            &cell.backend,
-            preparation_tags.get(&cell.test).map(String::as_str),
-        );
-        steps.push(Step {
-            group: "cell".into(),
-            job: slug,
+                &cell.mode,
+                &cell.backend,
+                preparation_tags.get(&cell.test).map(String::as_str),
+            );
+            steps.push(Step {
+                group: "cell".into(),
+                job: slug,
                 desc: if let Some(number) = repetition {
                     format!(
                         "Repeat green cell {}/{}/{}@{} ({number}/{})",
@@ -1844,30 +2015,30 @@ fn write_plan(
                     )
                 } else {
                     format!(
-                "Attempt red cell {}/{}/{}@{}",
-                cell.test, cell.mode, cell.backend, cell.lane
+                        "Attempt red cell {}/{}/{}@{}",
+                        cell.test, cell.mode, cell.backend, cell.lane
                     )
                 },
-            description: String::new(),
-            cmd,
-            deps,
-            env: BTreeMap::new(),
-            hint: ResourceHint {
-                resources,
-                rss_baseline_bytes: Some(memory / 3),
-                hard_mem_max_bytes: Some(memory),
-                classification: StepClass::LatencyBound,
-                ..ResourceHint::default()
-            },
-            networkonly: false,
-            engine_only: false,
-            timeout: wall,
-            cpu_timeout: wall * 2,
-            jobs_flag: None,
-            skip_reason: None,
-        });
-        cell_tags.push(tag);
-    }
+                description: String::new(),
+                cmd,
+                deps,
+                env: BTreeMap::new(),
+                hint: ResourceHint {
+                    resources,
+                    rss_baseline_bytes: Some(memory / 3),
+                    hard_mem_max_bytes: Some(memory),
+                    classification: StepClass::LatencyBound,
+                    ..ResourceHint::default()
+                },
+                networkonly: false,
+                engine_only: false,
+                timeout: wall,
+                cpu_timeout: wall * 2,
+                jobs_flag: None,
+                skip_reason: None,
+            });
+            cell_tags.push(tag);
+        }
     }
 
     steps.push(Step {
@@ -2208,11 +2379,11 @@ fn validate_run_contract(
             .get(&(cell.test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
         for repetition in repetition_numbers(metadata.repetitions) {
-        expected_cell_timeouts.insert(
+            expected_cell_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, repetition)),
-            pressure_timeout(budget, metadata.cell_timeout_seconds)?,
-        );
-    }
+                pressure_timeout(budget, metadata.cell_timeout_seconds)?,
+            );
+        }
     }
     audit_dag(
         &dag,
@@ -2759,212 +2930,212 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
     for cell in &metadata.cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
-        let cell_dir = results.join("cells").join(&slug);
-        let step_tag = format!("cell.{slug}");
-        let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
-        let mut evidence_errors = Vec::new();
-        let status_file = cell_dir.join("harness-status");
-        let harness_status = if status_file.is_file() {
-            match fs::read_to_string(&status_file) {
-                Ok(text) => {
-                    let text = text.trim();
-                    match text.parse::<i32>() {
-                        Ok(status) => Some(status),
-                        Err(_) => {
-                            evidence_errors.push(format!(
-                                "{} contains nonnumeric harness exit `{text}`",
-                                status_file.display()
-                            ));
-                            None
+            let cell_dir = results.join("cells").join(&slug);
+            let step_tag = format!("cell.{slug}");
+            let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
+            let mut evidence_errors = Vec::new();
+            let status_file = cell_dir.join("harness-status");
+            let harness_status = if status_file.is_file() {
+                match fs::read_to_string(&status_file) {
+                    Ok(text) => {
+                        let text = text.trim();
+                        match text.parse::<i32>() {
+                            Ok(status) => Some(status),
+                            Err(_) => {
+                                evidence_errors.push(format!(
+                                    "{} contains nonnumeric harness exit `{text}`",
+                                    status_file.display()
+                                ));
+                                None
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    evidence_errors.push(format!(
-                        "cannot read harness exit {}: {error}",
-                        status_file.display()
-                    ));
-                    None
-                }
-            }
-        } else {
-            evidence_errors.push(format!(
-                    "selected cell node wrote no attempt marker at {}",
-                status_file.display()
-            ));
-            None
-        };
-        let proven_oom = is_proven_oom_attempt(runner, harness_status);
-        let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
-        let result_file = cell_dir.join("results.jsonl");
-        let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
-            match fs::read_to_string(&result_file) {
-                Ok(text) => {
-                    let lines: Vec<_> = text
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .collect();
-                    if lines.len() != 1 {
+                    Err(error) => {
                         evidence_errors.push(format!(
-                            "{} contains {} nonempty rows; expected exactly one",
-                            result_file.display(),
-                            lines.len()
+                            "cannot read harness exit {}: {error}",
+                            status_file.display()
                         ));
-                        ("NO_RESULT".to_string(), false, None, None)
-                    } else {
-                        match serde_json::from_str::<ResultRow>(lines[0]) {
-                            Ok(row) => {
-                                let row_matches = result_row_matches_cell(
-                                    &row,
-                                    &slug,
-                                    &metadata,
-                                    cell,
-                                    expected.get(cell).copied().unwrap_or(false),
-                                    harness_status,
-                                );
-                                let runner_completed =
-                                    runner_observed_terminal_attempt(runner, harness_status);
-                                if row_matches && (proven_oom || runner_completed) {
-                                    (row.outcome, true, row.reason, row.error_kind)
-                                } else {
-                                    evidence_errors.push(format!(
+                        None
+                    }
+                }
+            } else {
+                evidence_errors.push(format!(
+                    "selected cell node wrote no attempt marker at {}",
+                    status_file.display()
+                ));
+                None
+            };
+            let proven_oom = is_proven_oom_attempt(runner, harness_status);
+            let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
+            let result_file = cell_dir.join("results.jsonl");
+            let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
+                match fs::read_to_string(&result_file) {
+                    Ok(text) => {
+                        let lines: Vec<_> = text
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .collect();
+                        if lines.len() != 1 {
+                            evidence_errors.push(format!(
+                                "{} contains {} nonempty rows; expected exactly one",
+                                result_file.display(),
+                                lines.len()
+                            ));
+                            ("NO_RESULT".to_string(), false, None, None)
+                        } else {
+                            match serde_json::from_str::<ResultRow>(lines[0]) {
+                                Ok(row) => {
+                                    let row_matches = result_row_matches_cell(
+                                        &row,
+                                        &slug,
+                                        &metadata,
+                                        cell,
+                                        expected.get(cell).copied().unwrap_or(false),
+                                        harness_status,
+                                    );
+                                    let runner_completed =
+                                        runner_observed_terminal_attempt(runner, harness_status);
+                                    if row_matches && (proven_oom || runner_completed) {
+                                        (row.outcome, true, row.reason, row.error_kind)
+                                    } else {
+                                        evidence_errors.push(format!(
                                         "{} does not match the selected cell, harness exit, or retained runner result",
+                                        result_file.display()
+                                    ));
+                                        ("NO_RESULT".to_string(), false, None, None)
+                                    }
+                                }
+                                Err(error) => {
+                                    evidence_errors.push(format!(
+                                        "invalid result row {}: {error}",
                                         result_file.display()
                                     ));
                                     ("NO_RESULT".to_string(), false, None, None)
                                 }
                             }
-                            Err(error) => {
-                                evidence_errors.push(format!(
-                                    "invalid result row {}: {error}",
-                                    result_file.display()
-                                ));
-                                ("NO_RESULT".to_string(), false, None, None)
-                            }
                         }
                     }
+                    Err(error) => {
+                        evidence_errors.push(format!(
+                            "cannot read result row {}: {error}",
+                            result_file.display()
+                        ));
+                        ("NO_RESULT".to_string(), false, None, None)
+                    }
                 }
-                Err(error) => {
-                    evidence_errors.push(format!(
-                        "cannot read result row {}: {error}",
-                        result_file.display()
-                    ));
-                    ("NO_RESULT".to_string(), false, None, None)
-                }
-            }
-        } else if !proven_oom && !proven_timeout {
-            evidence_errors.push(format!("missing result row {}", result_file.display()));
-            ("NO_RESULT".to_string(), false, None, None)
-        } else {
-            ("NO_RESULT".to_string(), false, None, None)
-        };
+            } else if !proven_oom && !proven_timeout {
+                evidence_errors.push(format!("missing result row {}", result_file.display()));
+                ("NO_RESULT".to_string(), false, None, None)
+            } else {
+                ("NO_RESULT".to_string(), false, None, None)
+            };
             let verification = match read_verification_report(results, cell, &slug) {
-            Ok(Some(report)) => Some(report),
-            Ok(None)
-                if matches!(cell.mode.as_str(), "verify" | "replay")
-                    && !proven_oom
-                    && !proven_timeout =>
-            {
-                evidence_errors.push(format!(
-                    "missing verification report {}",
+                Ok(Some(report)) => Some(report),
+                Ok(None)
+                    if matches!(cell.mode.as_str(), "verify" | "replay")
+                        && !proven_oom
+                        && !proven_timeout =>
+                {
+                    evidence_errors.push(format!(
+                        "missing verification report {}",
                         verification_report_path(results, cell, &slug).display()
-                ));
-                None
-            }
-            Ok(None) => None,
-            Err(error) => {
-                evidence_errors.push(error);
-                None
-            }
-        };
-        let verification_verdict = verification
-            .as_ref()
-            .and_then(|report| report.get("verdict"))
-            .and_then(JsonValue::as_str);
+                    ));
+                    None
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    None
+                }
+            };
+            let verification_verdict = verification
+                .as_ref()
+                .and_then(|report| report.get("verdict"))
+                .and_then(JsonValue::as_str);
             let verification_logs = match retained_verification_logs(results, cell, &slug) {
-            Ok(logs) => logs,
-            Err(error) => {
-                evidence_errors.push(error);
-                Vec::new()
-            }
-        };
+                Ok(logs) => logs,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    Vec::new()
+                }
+            };
             let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell, &slug) {
-            Ok(path) => path,
-            Err(error) => {
-                evidence_errors.push(error);
-                None
-            }
-        };
-        if cell.mode == "verify"
-            && matches!(verification_verdict, Some("matched" | "diverged"))
-            && verification_logs.len() != 2
-        {
-            evidence_errors.push(
+                Ok(path) => path,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    None
+                }
+            };
+            if cell.mode == "verify"
+                && matches!(verification_verdict, Some("matched" | "diverged"))
+                && verification_logs.len() != 2
+            {
+                evidence_errors.push(
                 "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
                     .into(),
             );
-        }
-        if cell.mode == "verify"
-            && cell.backend == "ptrace"
-            && matches!(verification_verdict, Some("matched" | "diverged"))
-            && normalized_ptrace_golden.is_none()
-            && !evidence_errors
-                .iter()
-                .any(|error| error.contains("golden-log normalization"))
-        {
-            evidence_errors
-                .push("terminal ptrace verify result has no normalized golden INFO log".into());
-        }
-        let result = classify_result(
-            runner,
-            harness_status,
-            &outcome,
-            row_valid,
-            reason.as_deref(),
-            &cell.mode,
-            verification_verdict,
-            verification_logs.len() == 2,
-            evidence_errors.is_empty(),
-        );
-        *by_backend
-            .entry(cell.backend.clone())
-            .or_default()
-            .entry(result.to_string())
-            .or_default() += 1;
+            }
+            if cell.mode == "verify"
+                && cell.backend == "ptrace"
+                && matches!(verification_verdict, Some("matched" | "diverged"))
+                && normalized_ptrace_golden.is_none()
+                && !evidence_errors
+                    .iter()
+                    .any(|error| error.contains("golden-log normalization"))
+            {
+                evidence_errors
+                    .push("terminal ptrace verify result has no normalized golden INFO log".into());
+            }
+            let result = classify_result(
+                runner,
+                harness_status,
+                &outcome,
+                row_valid,
+                reason.as_deref(),
+                &cell.mode,
+                verification_verdict,
+                verification_logs.len() == 2,
+                evidence_errors.is_empty(),
+            );
+            *by_backend
+                .entry(cell.backend.clone())
+                .or_default()
+                .entry(result.to_string())
+                .or_default() += 1;
             *by_cell
                 .entry(cell.clone())
                 .or_default()
                 .entry(result.to_string())
                 .or_default() += 1;
             if result == "pass" && metadata.repetitions.is_none() {
-            passing.push(display_id(cell));
+                passing.push(display_id(cell));
+            }
+            rows.push(json!({
+                "cell": cell,
+                    "repetition": repetition,
+                "harness_exit": harness_status,
+                "outcome": outcome,
+                "reason": reason,
+                "error_kind": error_kind,
+                "result_row_valid": row_valid,
+                "result": result,
+                "verification": verification,
+                "verification_logs": verification_logs,
+                "normalized_ptrace_golden": normalized_ptrace_golden,
+                "evidence_errors": evidence_errors,
+                "runner_seen": runner.seen,
+                "runner_ok": runner.ok,
+                "runner_timed_out": runner.timed_out,
+                "runner_oom": runner.oom,
+                "oom_proven_by_runner_and_attempt_marker": proven_oom,
+                "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
+            }));
         }
-        rows.push(json!({
-            "cell": cell,
-                "repetition": repetition,
-            "harness_exit": harness_status,
-            "outcome": outcome,
-            "reason": reason,
-            "error_kind": error_kind,
-            "result_row_valid": row_valid,
-            "result": result,
-            "verification": verification,
-            "verification_logs": verification_logs,
-            "normalized_ptrace_golden": normalized_ptrace_golden,
-            "evidence_errors": evidence_errors,
-            "runner_seen": runner.seen,
-            "runner_ok": runner.ok,
-            "runner_timed_out": runner.timed_out,
-            "runner_oom": runner.oom,
-            "oom_proven_by_runner_and_attempt_marker": proven_oom,
-            "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
-        }));
-    }
     }
     if metadata.repetitions.is_some() {
         println!("# Repeated green-cell results");
     } else {
-    println!("# Red-cell pressure-test results");
+        println!("# Red-cell pressure-test results");
     }
     println!();
     println!(
@@ -3078,13 +3249,13 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         );
         Some(result)
     } else {
-    println!(
-        "{} red cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
-        passing.len()
-    );
-    for id in passing.iter().take(20) {
-        println!("  PASS {id}");
-    }
+        println!(
+            "{} red cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
+            passing.len()
+        );
+        for id in passing.iter().take(20) {
+            println!("  PASS {id}");
+        }
         None
     };
 
@@ -3486,6 +3657,23 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::remove_file(scratch.join("old-row"))
         .map_err(|e| format!("cannot remove self-test stale row: {e}"))?;
+    let mut full_green_args = vec![
+        "--results".to_string(),
+        scratch.join("full-green-options").display().to_string(),
+        "--green".to_string(),
+        "--repetitions".to_string(),
+        "20".to_string(),
+        "--cell-timeout".to_string(),
+        "60".to_string(),
+    ]
+    .into_iter();
+    let (_, _, parsed_full_green) = result_options(root, &mut full_green_args, false, true)?;
+    if !parsed_full_green.green
+        || parsed_full_green.repetitions != Some(20)
+        || parsed_full_green.cell_timeout_seconds != Some(60)
+    {
+        return Err("full-green repetition options did not survive command parsing".into());
+    }
 
     let dirty_fixture = scratch.join("dirty-source");
     fs::create_dir(&dirty_fixture)
@@ -3521,14 +3709,32 @@ fn self_test(root: &Path) -> Result<(), String> {
     if worktree_dirty(&dirty_fixture)? {
         return Err("clean source was reported dirty".into());
     }
+    let fixture_sha = git_output(&dirty_fixture, &["rev-parse", "HEAD"])?;
+    let generated_fixture = FreshCheckout {
+        source: dirty_fixture.clone(),
+        path: dirty_fixture.clone(),
+        sha: fixture_sha,
+    };
     fs::write(
-        dirty_fixture.join(".pressure-test-generated-checkout"),
-        "owned marker\n",
+        generated_fixture.marker_path(),
+        generated_fixture.expected_marker(),
     )
     .map_err(|e| format!("cannot write generated-checkout marker fixture: {e}"))?;
-    if worktree_dirty(&dirty_fixture)? {
-        return Err("the tool-owned generated-checkout marker made clean source dirty".into());
+    if !generated_fixture.marker_matches()? || worktree_dirty(&dirty_fixture)? {
+        return Err(
+            "a verified generated-checkout marker under .git was not treated as metadata".into(),
+        );
     }
+    fs::write(
+        dirty_fixture.join(".pressure-test-generated-checkout"),
+        "arbitrary source marker\n",
+    )
+    .map_err(|e| format!("cannot write arbitrary source-marker fixture: {e}"))?;
+    if !worktree_dirty(&dirty_fixture)? {
+        return Err("an untracked source-tree marker was treated as tool-owned metadata".into());
+    }
+    fs::remove_file(dirty_fixture.join(".pressure-test-generated-checkout"))
+        .map_err(|e| format!("cannot remove arbitrary source-marker fixture: {e}"))?;
     fs::write(dirty_fixture.join("arbitrary-source"), "untracked\n")
         .map_err(|e| format!("cannot write arbitrary untracked-source fixture: {e}"))?;
     if !worktree_dirty(&dirty_fixture)? {
@@ -3835,6 +4041,70 @@ fn self_test(root: &Path) -> Result<(), String> {
     if selected_green_ids != expected_green_ids || !selected_green_batch.unavailable.is_empty() {
         return Err("--green did not select the complete enabled green population".into());
     }
+    let basic_sanity_selection = CellSelection {
+        green: true,
+        repetitions: Some(20),
+        cell_timeout_seconds: Some(60),
+        ..CellSelection::default()
+    };
+    let budgets = load_budgets(root)?;
+    let (basic_sanity_floor, basic_sanity_cells) = cell_occupancy_floor(
+        selected_green_batch
+            .selected
+            .iter()
+            .map(|tracked| &tracked.id),
+        &budgets,
+        basic_sanity_selection.cell_timeout_seconds,
+        basic_sanity_selection.run_count(),
+    )?;
+    let basic_sanity_bound = refusal_safe_run_timeout(basic_sanity_floor)?;
+    if require_cell_occupancy_fits(
+        selected_green_batch
+            .selected
+            .iter()
+            .map(|tracked| &tracked.id),
+        &budgets,
+        basic_sanity_selection.cell_timeout_seconds,
+        PRESSURE_RUN_TIMEOUT_SECONDS,
+        basic_sanity_selection.run_count(),
+    )
+    .is_ok()
+        || require_cell_occupancy_fits(
+            selected_green_batch
+                .selected
+                .iter()
+                .map(|tracked| &tracked.id),
+            &budgets,
+            basic_sanity_selection.cell_timeout_seconds,
+            basic_sanity_bound,
+            basic_sanity_selection.run_count(),
+        )? != basic_sanity_floor
+    {
+        return Err(
+            "derived full-green cell-occupancy bound did not bracket refusal and acceptance".into(),
+        );
+    }
+    let run_help = subcommand_help(root, "run")?;
+    let plan_help = subcommand_help(root, "plan")?;
+    let summarize_help = subcommand_help(root, "summarize")?;
+    let current_jobs = basic_sanity_cells
+        .checked_mul(20)
+        .ok_or("basic-sanity self-test job count overflow")?;
+    let current_population =
+        format!("{basic_sanity_cells} enabled green cells × 20 = {current_jobs} cell jobs");
+    let current_bound = format!("--run-timeout {basic_sanity_bound}");
+    if !run_help.starts_with("Usage: ci/compat-envelope/pressure-test.rs run")
+        || !plan_help.starts_with("Usage: ci/compat-envelope/pressure-test.rs plan")
+        || !summarize_help.starts_with("Usage: ci/compat-envelope/pressure-test.rs summarize")
+        || !run_help.contains(&current_population)
+        || !plan_help.contains(&current_population)
+        || !run_help.contains(&current_bound)
+        || !plan_help.contains(&current_bound)
+    {
+        return Err(
+            "subcommand help lost its command-specific or current-population guidance".into(),
+        );
+    }
     let green_sample_selection = CellSelection {
         green: true,
         repetitions: Some(1),
@@ -3849,50 +4119,17 @@ fn self_test(root: &Path) -> Result<(), String> {
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
         );
     }
-    let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
-    let one_cell_mode_selection = CellSelection {
-        green: true,
-        mode: Some("replay".into()),
-        repetitions: Some(2),
-        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
-        ..CellSelection::default()
-    };
-    let one_cell_mode_metadata = write_plan(
-        root,
-        &one_cell_mode_results,
-        &one_cell_mode_results.join("dag.json"),
-        &one_cell_mode_selection,
-    )?;
-    if !one_cell_mode_metadata.green
-        || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
+    let mut one_cell_green_batch_metadata = repeated_metadata.clone();
+    one_cell_green_batch_metadata.green = true;
+    one_cell_green_batch_metadata.test = None;
+    one_cell_green_batch_metadata.backend = None;
+    if top_level_repeated_result_description(&repeated_metadata, 1, 0, 2) != "flaky"
+        || top_level_repeated_result_description(&one_cell_green_batch_metadata, 1, 0, 2)
             != "one or more repeated checks failed"
     {
         return Err(
-            "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
+            "green-batch result wording was inferred from cell count instead of selection".into(),
         );
-    }
-    let one_cell_sample_results = scratch.join("one-cell-sample-green-plan");
-    let one_cell_sample_selection = CellSelection {
-        green: true,
-        repetitions: Some(2),
-        sample: Some(1),
-        seed: Some(7),
-        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
-        ..CellSelection::default()
-    };
-    let one_cell_sample_metadata = write_plan(
-        root,
-        &one_cell_sample_results,
-        &one_cell_sample_results.join("dag.json"),
-        &one_cell_sample_selection,
-    )?;
-    if !one_cell_sample_metadata.green
-        || one_cell_sample_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 0, 2)
-            != "one or more repeated checks failed"
-    {
-        return Err("a one-cell sampled green batch was described as an exact flaky cell".into());
     }
     let green_batch_results = scratch.join("green-batch-plan");
     let mut green_batch_metadata = write_plan(
@@ -3970,13 +4207,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         format!("{}\n", dag_to_json(&forged_zero_dag)),
     )
     .map_err(|e| format!("cannot write forged-zero DAG: {e}"))?;
-    for tag in required_build_tags(None, false) {
-        let marker = build_marker(&forged_zero_results, tag);
-        fs::create_dir_all(marker.parent().expect("build marker has parent"))
-            .map_err(|e| format!("cannot create forged-zero build marker: {e}"))?;
-        fs::write(marker, "ok\n")
-            .map_err(|e| format!("cannot write forged-zero build marker: {e}"))?;
-    }
     let mut forged_zero_metadata = green_batch_metadata.clone();
     forged_zero_metadata.sample = Some(0);
     forged_zero_metadata.seed = Some(7);
