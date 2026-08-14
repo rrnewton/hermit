@@ -737,8 +737,8 @@
       "test": "backend-parity-c/aio-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -747,16 +747,6 @@
       "test": "backend-parity-c/aio-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/aio-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -766,6 +756,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/aio-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/aio-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -897,8 +897,8 @@
       "test": "backend-parity-c/append-pwrite",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -907,16 +907,6 @@
       "test": "backend-parity-c/append-pwrite",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/append-pwrite",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -926,6 +916,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/append-pwrite",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/append-pwrite",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -1217,8 +1217,8 @@
       "test": "backend-parity-c/cachestat-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -1227,16 +1227,6 @@
       "test": "backend-parity-c/cachestat-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/cachestat-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -1246,6 +1236,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/cachestat-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/cachestat-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -1537,8 +1537,8 @@
       "test": "backend-parity-c/close-range-fds",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -1547,16 +1547,6 @@
       "test": "backend-parity-c/close-range-fds",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/close-range-fds",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -1566,6 +1556,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/close-range-fds",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/close-range-fds",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -1697,8 +1697,8 @@
       "test": "backend-parity-c/copy-file-range-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -1707,16 +1707,6 @@
       "test": "backend-parity-c/copy-file-range-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/copy-file-range-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -1726,6 +1716,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/copy-file-range-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/copy-file-range-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2017,8 +2017,8 @@
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2027,16 +2027,6 @@
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/cwd-roundtrip",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -2046,6 +2036,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/cwd-roundtrip",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2337,8 +2337,8 @@
       "test": "backend-parity-c/epoll-pwait2",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2347,16 +2347,6 @@
       "test": "backend-parity-c/epoll-pwait2",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/epoll-pwait2",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -2366,6 +2356,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/epoll-pwait2",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/epoll-pwait2",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2497,8 +2497,8 @@
       "test": "backend-parity-c/epoll-readiness",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2507,16 +2507,6 @@
       "test": "backend-parity-c/epoll-readiness",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/epoll-readiness",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -2526,6 +2516,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/epoll-readiness",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/epoll-readiness",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2657,8 +2657,8 @@
       "test": "backend-parity-c/event-delivery-ordering",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2667,16 +2667,6 @@
       "test": "backend-parity-c/event-delivery-ordering",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/event-delivery-ordering",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -2686,6 +2676,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/event-delivery-ordering",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/event-delivery-ordering",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2817,8 +2817,8 @@
       "test": "backend-parity-c/eventfd-semantics",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2827,16 +2827,6 @@
       "test": "backend-parity-c/eventfd-semantics",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/eventfd-semantics",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -2846,6 +2836,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/eventfd-semantics",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/eventfd-semantics",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -2977,8 +2977,8 @@
       "test": "backend-parity-c/faccessat2-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -2987,16 +2987,6 @@
       "test": "backend-parity-c/faccessat2-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/faccessat2-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -3006,6 +2996,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/faccessat2-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/faccessat2-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -3137,8 +3137,8 @@
       "test": "backend-parity-c/fadvise-hints",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -3147,16 +3147,6 @@
       "test": "backend-parity-c/fadvise-hints",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fadvise-hints",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -3166,6 +3156,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fadvise-hints",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fadvise-hints",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -3297,8 +3297,8 @@
       "test": "backend-parity-c/fallocate-extents",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -3307,16 +3307,6 @@
       "test": "backend-parity-c/fallocate-extents",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fallocate-extents",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -3326,6 +3316,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fallocate-extents",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fallocate-extents",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -3457,8 +3457,8 @@
       "test": "backend-parity-c/fchmod-bits",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -3467,16 +3467,6 @@
       "test": "backend-parity-c/fchmod-bits",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fchmod-bits",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -3486,6 +3476,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fchmod-bits",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fchmod-bits",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -3617,8 +3617,8 @@
       "test": "backend-parity-c/fchmodat2-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -3627,16 +3627,6 @@
       "test": "backend-parity-c/fchmodat2-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fchmodat2-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -3646,6 +3636,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fchmodat2-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fchmodat2-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4097,8 +4097,8 @@
       "test": "backend-parity-c/file-backed-mmap",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4107,16 +4107,6 @@
       "test": "backend-parity-c/file-backed-mmap",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/file-backed-mmap",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4126,6 +4116,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/file-backed-mmap",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/file-backed-mmap",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4417,8 +4417,8 @@
       "test": "backend-parity-c/flock-lifecycle",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4427,16 +4427,6 @@
       "test": "backend-parity-c/flock-lifecycle",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/flock-lifecycle",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4446,6 +4436,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/flock-lifecycle",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/flock-lifecycle",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4577,8 +4577,8 @@
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4587,16 +4587,6 @@
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fork-exec-pipeline",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4606,6 +4596,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fork-exec-pipeline",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4737,8 +4737,8 @@
       "test": "backend-parity-c/fsync-durability",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4747,16 +4747,6 @@
       "test": "backend-parity-c/fsync-durability",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fsync-durability",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4766,6 +4756,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fsync-durability",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fsync-durability",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4897,8 +4897,8 @@
       "test": "backend-parity-c/ftruncate-sparse",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4907,16 +4907,6 @@
       "test": "backend-parity-c/ftruncate-sparse",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/ftruncate-sparse",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4926,6 +4916,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/ftruncate-sparse",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/ftruncate-sparse",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -5857,8 +5857,8 @@
       "test": "backend-parity-c/inotify-watch",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -5867,16 +5867,6 @@
       "test": "backend-parity-c/inotify-watch",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/inotify-watch",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -5886,6 +5876,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/inotify-watch",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/inotify-watch",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -6017,8 +6017,8 @@
       "test": "backend-parity-c/ioctl-fionread",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6027,16 +6027,6 @@
       "test": "backend-parity-c/ioctl-fionread",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/ioctl-fionread",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -6046,6 +6036,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/ioctl-fionread",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/ioctl-fionread",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -6177,8 +6177,8 @@
       "test": "backend-parity-c/kcmp-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6187,16 +6187,6 @@
       "test": "backend-parity-c/kcmp-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/kcmp-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -6206,6 +6196,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/kcmp-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/kcmp-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -6337,8 +6337,8 @@
       "test": "backend-parity-c/linkat-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6347,16 +6347,6 @@
       "test": "backend-parity-c/linkat-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/linkat-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -6366,6 +6356,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/linkat-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/linkat-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -6977,8 +6977,8 @@
       "test": "backend-parity-c/memfd-create",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6987,16 +6987,6 @@
       "test": "backend-parity-c/memfd-create",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/memfd-create",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7006,6 +6996,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/memfd-create",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/memfd-create",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -7137,8 +7137,8 @@
       "test": "backend-parity-c/mempolicy-default",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -7147,16 +7147,6 @@
       "test": "backend-parity-c/mempolicy-default",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/mempolicy-default",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7166,6 +7156,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/mempolicy-default",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/mempolicy-default",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -7297,8 +7297,8 @@
       "test": "backend-parity-c/mincore-residency",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -7307,16 +7307,6 @@
       "test": "backend-parity-c/mincore-residency",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/mincore-residency",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7326,6 +7316,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/mincore-residency",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/mincore-residency",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -7457,8 +7457,8 @@
       "test": "backend-parity-c/mkdir-rmdir",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -7467,16 +7467,6 @@
       "test": "backend-parity-c/mkdir-rmdir",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/mkdir-rmdir",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7486,6 +7476,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/mkdir-rmdir",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/mkdir-rmdir",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -7617,8 +7617,8 @@
       "test": "backend-parity-c/mknod-special",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -7627,16 +7627,6 @@
       "test": "backend-parity-c/mknod-special",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/mknod-special",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7646,6 +7636,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/mknod-special",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/mknod-special",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -7937,8 +7937,8 @@
       "test": "backend-parity-c/msync-writeback",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -7947,16 +7947,6 @@
       "test": "backend-parity-c/msync-writeback",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/msync-writeback",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -7966,6 +7956,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/msync-writeback",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/msync-writeback",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -8097,8 +8097,8 @@
       "test": "backend-parity-c/name-to-handle-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8107,16 +8107,6 @@
       "test": "backend-parity-c/name-to-handle-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/name-to-handle-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -8126,6 +8116,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/name-to-handle-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/name-to-handle-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -8257,8 +8257,8 @@
       "test": "backend-parity-c/no-new-privs-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8267,16 +8267,6 @@
       "test": "backend-parity-c/no-new-privs-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/no-new-privs-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -8286,6 +8276,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/no-new-privs-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/no-new-privs-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -8577,8 +8577,8 @@
       "test": "backend-parity-c/o-tmpfile-anon",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8587,16 +8587,6 @@
       "test": "backend-parity-c/o-tmpfile-anon",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/o-tmpfile-anon",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -8606,6 +8596,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/o-tmpfile-anon",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/o-tmpfile-anon",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -8737,8 +8737,8 @@
       "test": "backend-parity-c/openat-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8747,16 +8747,6 @@
       "test": "backend-parity-c/openat-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/openat-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -8766,6 +8756,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/openat-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/openat-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -8897,8 +8897,8 @@
       "test": "backend-parity-c/openat2-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8907,16 +8907,6 @@
       "test": "backend-parity-c/openat2-refusal",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/openat2-refusal",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -8926,6 +8916,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/openat2-refusal",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/openat2-refusal",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -9057,8 +9057,8 @@
       "test": "backend-parity-c/path-file-ops",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9067,16 +9067,6 @@
       "test": "backend-parity-c/path-file-ops",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/path-file-ops",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -9086,6 +9076,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/path-file-ops",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/path-file-ops",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -9217,8 +9217,8 @@
       "test": "backend-parity-c/personality-domain",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9227,16 +9227,6 @@
       "test": "backend-parity-c/personality-domain",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/personality-domain",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -9246,6 +9236,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/personality-domain",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/personality-domain",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -9697,8 +9697,8 @@
       "test": "backend-parity-c/pipe-capacity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9707,16 +9707,6 @@
       "test": "backend-parity-c/pipe-capacity",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/pipe-capacity",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -9726,6 +9716,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/pipe-capacity",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-capacity",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -9857,8 +9857,8 @@
       "test": "backend-parity-c/pipe-ipc",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9867,16 +9867,6 @@
       "test": "backend-parity-c/pipe-ipc",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/pipe-ipc",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -9886,6 +9876,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/pipe-ipc",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe-ipc",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -10017,8 +10017,8 @@
       "test": "backend-parity-c/pipe2-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10027,16 +10027,6 @@
       "test": "backend-parity-c/pipe2-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/pipe2-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -10046,6 +10036,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/pipe2-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/pipe2-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -10497,8 +10497,8 @@
       "test": "backend-parity-c/prctl-pdeathsig",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10507,16 +10507,6 @@
       "test": "backend-parity-c/prctl-pdeathsig",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/prctl-pdeathsig",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -10526,6 +10516,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/prctl-pdeathsig",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/prctl-pdeathsig",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -10657,8 +10657,8 @@
       "test": "backend-parity-c/preadv2-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10667,16 +10667,6 @@
       "test": "backend-parity-c/preadv2-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/preadv2-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -10686,6 +10676,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/preadv2-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/preadv2-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -10977,8 +10977,8 @@
       "test": "backend-parity-c/readdir-entries",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10987,16 +10987,6 @@
       "test": "backend-parity-c/readdir-entries",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/readdir-entries",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -11006,6 +10996,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/readdir-entries",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/readdir-entries",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -11297,8 +11297,8 @@
       "test": "backend-parity-c/rename-ops",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11307,16 +11307,6 @@
       "test": "backend-parity-c/rename-ops",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/rename-ops",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -11326,6 +11316,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/rename-ops",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/rename-ops",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -11457,8 +11457,8 @@
       "test": "backend-parity-c/renameat2-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11467,16 +11467,6 @@
       "test": "backend-parity-c/renameat2-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/renameat2-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -11486,6 +11476,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/renameat2-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/renameat2-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -11777,8 +11777,8 @@
       "test": "backend-parity-c/robust-list",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11787,16 +11787,6 @@
       "test": "backend-parity-c/robust-list",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/robust-list",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -11806,6 +11796,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/robust-list",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/robust-list",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -12257,8 +12257,8 @@
       "test": "backend-parity-c/sendfile-copy",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12267,16 +12267,6 @@
       "test": "backend-parity-c/sendfile-copy",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/sendfile-copy",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -12286,6 +12276,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/sendfile-copy",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/sendfile-copy",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -12417,8 +12417,8 @@
       "test": "backend-parity-c/set-tid-address",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12427,16 +12427,6 @@
       "test": "backend-parity-c/set-tid-address",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/set-tid-address",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -12446,6 +12436,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/set-tid-address",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/set-tid-address",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -12577,8 +12577,8 @@
       "test": "backend-parity-c/short-io-split-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12587,16 +12587,6 @@
       "test": "backend-parity-c/short-io-split-identity",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/short-io-split-identity",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -12606,6 +12596,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/short-io-split-identity",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/short-io-split-identity",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -12737,8 +12737,8 @@
       "test": "backend-parity-c/shutdown-socketpair",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12747,16 +12747,6 @@
       "test": "backend-parity-c/shutdown-socketpair",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/shutdown-socketpair",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -12766,6 +12756,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/shutdown-socketpair",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/shutdown-socketpair",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -12897,8 +12897,8 @@
       "test": "backend-parity-c/signal-delivery-sequence",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12907,16 +12907,6 @@
       "test": "backend-parity-c/signal-delivery-sequence",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/signal-delivery-sequence",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -12926,6 +12916,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/signal-delivery-sequence",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/signal-delivery-sequence",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -13217,8 +13217,8 @@
       "test": "backend-parity-c/signalfd-create",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -13227,16 +13227,6 @@
       "test": "backend-parity-c/signalfd-create",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/signalfd-create",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -13246,6 +13236,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/signalfd-create",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/signalfd-create",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -13377,8 +13377,8 @@
       "test": "backend-parity-c/socket-options",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -13387,16 +13387,6 @@
       "test": "backend-parity-c/socket-options",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/socket-options",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -13406,6 +13396,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/socket-options",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/socket-options",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -13537,8 +13537,8 @@
       "test": "backend-parity-c/socketpair-flags",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -13547,16 +13547,6 @@
       "test": "backend-parity-c/socketpair-flags",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/socketpair-flags",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -13566,6 +13556,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/socketpair-flags",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/socketpair-flags",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -13697,8 +13697,8 @@
       "test": "backend-parity-c/sockname-unnamed",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -13707,16 +13707,6 @@
       "test": "backend-parity-c/sockname-unnamed",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/sockname-unnamed",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -13726,6 +13716,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/sockname-unnamed",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/sockname-unnamed",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -14017,8 +14017,8 @@
       "test": "backend-parity-c/statfs-free-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14027,16 +14027,6 @@
       "test": "backend-parity-c/statfs-free-determinism",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/statfs-free-determinism",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -14046,6 +14036,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/statfs-free-determinism",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/statfs-free-determinism",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -14177,8 +14177,8 @@
       "test": "backend-parity-c/statx-metadata",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14187,16 +14187,6 @@
       "test": "backend-parity-c/statx-metadata",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/statx-metadata",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -14206,6 +14196,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/statx-metadata",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/statx-metadata",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -14337,8 +14337,8 @@
       "test": "backend-parity-c/symlink-ops",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14347,16 +14347,6 @@
       "test": "backend-parity-c/symlink-ops",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/symlink-ops",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -14366,6 +14356,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/symlink-ops",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/symlink-ops",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -14497,8 +14497,8 @@
       "test": "backend-parity-c/sync-file-range",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14507,16 +14507,6 @@
       "test": "backend-parity-c/sync-file-range",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/sync-file-range",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -14526,6 +14516,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/sync-file-range",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/sync-file-range",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -14657,8 +14657,8 @@
       "test": "backend-parity-c/sysv-ipc-refusal",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14817,8 +14817,8 @@
       "test": "backend-parity-c/thp-disable",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14977,8 +14977,8 @@
       "test": "backend-parity-c/umask-mode",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -15137,8 +15137,8 @@
       "test": "backend-parity-c/uname-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -15297,8 +15297,8 @@
       "test": "backend-parity-c/utimensat-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -15457,8 +15457,8 @@
       "test": "backend-parity-c/vectored-file-io",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -15617,8 +15617,8 @@
       "test": "backend-parity-c/vectored-io",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
