@@ -86,6 +86,7 @@ type Emitter = reverie_dbt::RuntimeEmitter;
 type Idler = reverie_dbt::RuntimeIdler;
 
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DBT_DIAGNOSTIC_LEVEL: AtomicI32 = AtomicI32::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DbtSubscriber {
@@ -186,11 +187,11 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
 ///
 /// These progress markers narrate DBT backend startup and are useful when
 /// debugging the runtime, but they are noise for a normal `hermit run --backend
-/// dbt`. Gate them behind `HERMIT_LOG=debug` (or `trace`) and tag them as DEBUG
-/// records so the standard log reader can parse a complete diagnostic file.
-/// Genuine warnings and unsupported-syscall diagnostics do not go through this
-/// helper and stay unconditional. The decision is read once and cached, so hot
-/// callers pay only an atomic load.
+/// dbt`. Gate them behind the controller-selected debug (or trace) level and
+/// tag them as DEBUG records so the standard log reader can parse a complete
+/// diagnostic file. Genuine warnings and unsupported-syscall diagnostics do
+/// not go through this helper and stay unconditional. The decision is read once
+/// and cached, so hot callers pay only an atomic load.
 fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if *ENABLED.get_or_init(debug_logging_enabled) {
@@ -204,36 +205,20 @@ fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
 }
 
 fn debug_logging_enabled() -> bool {
-    matches!(
-        std::env::var("HERMIT_LOG")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "debug" | "trace"
-    )
+    matches!(DBT_DIAGNOSTIC_LEVEL.load(Ordering::Acquire), 4 | 5)
 }
 
 fn info_logging_enabled() -> bool {
-    matches!(
-        std::env::var("HERMIT_LOG")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "info" | "debug" | "trace"
-    )
+    matches!(DBT_DIAGNOSTIC_LEVEL.load(Ordering::Acquire), 3..=5)
 }
 
 fn dbt_log_level() -> Option<DbtLogLevel> {
-    match std::env::var("HERMIT_LOG")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "error" => Some(DbtLogLevel::Error),
-        "warn" => Some(DbtLogLevel::Warn),
-        "info" => Some(DbtLogLevel::Info),
-        "debug" => Some(DbtLogLevel::Debug),
-        "trace" => Some(DbtLogLevel::Trace),
+    match DBT_DIAGNOSTIC_LEVEL.load(Ordering::Acquire) {
+        1 => Some(DbtLogLevel::Error),
+        2 => Some(DbtLogLevel::Warn),
+        3 => Some(DbtLogLevel::Info),
+        4 => Some(DbtLogLevel::Debug),
+        5 => Some(DbtLogLevel::Trace),
         _ => None,
     }
 }
@@ -874,6 +859,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
     let emit = callbacks.emit;
+    DBT_DIAGNOSTIC_LEVEL.store(callbacks.diagnostic_level, Ordering::Release);
     SCHEDULER_COMPLETED.store(false, Ordering::Release);
     SCHEDULER_STARTED.store(true, Ordering::Release);
     if PROCESS_EXIT_STARTED.load(Ordering::Acquire) {

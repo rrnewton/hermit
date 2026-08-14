@@ -3233,10 +3233,7 @@ impl RunOpts {
         };
         let level = verification_log_level(global.log, strictness, self.verify_verbose);
 
-        let mut command = self.guest_command()?;
-        if self.selected_backend() == Backend::Dbt {
-            command.env("HERMIT_LOG", level.to_string());
-        }
+        let command = self.guest_command()?;
 
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
@@ -3249,6 +3246,7 @@ impl RunOpts {
                 &self.summary_json,
                 self.runtime_backend(),
                 Some(log_file),
+                Some(level.to_string().to_ascii_lowercase()),
             );
         }
 

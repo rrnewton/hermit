@@ -30,6 +30,7 @@ static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -86,6 +87,31 @@ fn dbt_stderr_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBT stderr guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbt_log_env_guest() -> &'static Path {
+    DBT_LOG_ENV_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-hermit-log-env");
+        fs::create_dir_all(&build_root).expect("failed to create DBT log-env guest directory");
+        let guest = build_root.join("hermit_log_env");
+        let output = Command::new("cc")
+            .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/simple/hermit_log_env.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBT log-env guest");
+        assert!(
+            output.status.success(),
+            "DBT log-env guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -924,6 +950,73 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
             .as_u64()
             .is_some_and(|count| count > 0)
     );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-dbi-log): validate controller logging without guest env mutation.
+#[test]
+fn run_dbt_preserves_the_guest_hermit_log_environment() {
+    for (guest_value, expected) in [
+        (None, "hermit_log=<unset>\n"),
+        (Some("guest-sentinel"), "hermit_log=guest-sentinel\n"),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create DBT log-env verification directory");
+        let logs = directory.path().join("logs");
+        fs::create_dir(&logs).expect("failed to create DBT log-env verification log directory");
+        let verdict = directory.path().join("verdict.json");
+        let args = [
+            "--log",
+            "INFO",
+            "run",
+            "--backend",
+            "dbt",
+            "--tmp=/tmp",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--detlog-stack",
+            "--detlog-heap",
+            "--keep-logs",
+            "--verify-log-dir",
+        ];
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args(args)
+            .arg(&logs)
+            .arg("--verify-json")
+            .arg(&verdict)
+            .arg("--")
+            .arg(dbt_log_env_guest())
+            .env_remove("HERMIT_LOG");
+        if let Some(value) = guest_value {
+            command.env("HERMIT_LOG", value);
+        }
+        let output = command.output().expect("failed to run DBT log-env case");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "unexpected guest environment");
+
+        let retained_logs = fs::read_dir(&logs)
+            .expect("failed to read DBT log-env verification logs")
+            .map(|entry| entry.expect("failed to read retained log entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained_logs.len(), 2, "unexpected logs: {retained_logs:?}");
+        for log in retained_logs {
+            let contents = fs::read_to_string(&log).expect("failed to read retained DBT log");
+            assert!(contents.contains("INFO detcore"), "empty INFO log: {log:?}");
+        }
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict).expect("failed to read DBT log-env verification verdict"),
+        )
+        .expect("DBT log-env verification verdict should be JSON");
+        assert_eq!(verdict["verified"], true);
+        assert_eq!(verdict["bitwise_parity"], true);
+        assert!(
+            verdict["compared_log_messages"]["left"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+    }
 }
 
 #[test]

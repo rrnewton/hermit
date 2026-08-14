@@ -1481,6 +1481,7 @@ async fn run_dbt(
     print_summary: bool,
     capture_output: bool,
     diagnostic_file: Option<fs::File>,
+    diagnostic_level: Option<String>,
 ) -> Result<Output, Error> {
     if !config.sequentialize_threads {
         return Err(anyhow!(
@@ -1506,6 +1507,9 @@ async fn run_dbt(
         .isolated_process_group(panic_on_unsupported_syscalls);
     if let Some(file) = diagnostic_file {
         runner = runner.diagnostic_file(file);
+    }
+    if let Some(level) = diagnostic_level {
+        runner = runner.client_argument("-log-level").client_argument(level);
     }
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -1663,7 +1667,7 @@ async fn run_with_backend_inner(
     if backend == Backend::Dbt {
         #[cfg(feature = "dbt")]
         {
-            return Ok(run_dbt(command, config, print_summary, false, None)
+            return Ok(run_dbt(command, config, print_summary, false, None, None)
                 .await?
                 .status);
         }
@@ -1746,6 +1750,7 @@ pub fn run_with_output_backend(
         print_summary_to_json_file,
         backend,
         None,
+        None,
     )
 }
 
@@ -1758,6 +1763,7 @@ pub fn run_with_output_backend_diagnostic_file(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     diagnostic_file: Option<fs::File>,
+    diagnostic_level: Option<String>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
@@ -1770,6 +1776,7 @@ pub fn run_with_output_backend_diagnostic_file(
         print_summary_to_json_file,
         backend,
         diagnostic_file,
+        diagnostic_level,
     )
 }
 
@@ -1781,6 +1788,7 @@ async fn run_with_output_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     diagnostic_file: Option<fs::File>,
+    diagnostic_level: Option<String>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         return run_kvm(
@@ -1795,7 +1803,15 @@ async fn run_with_output_backend_inner(
     if backend == Backend::Dbt {
         #[cfg(feature = "dbt")]
         {
-            return run_dbt(command, config, print_summary, true, diagnostic_file).await;
+            return run_dbt(
+                command,
+                config,
+                print_summary,
+                true,
+                diagnostic_file,
+                diagnostic_level,
+            )
+            .await;
         }
         #[cfg(not(feature = "dbt"))]
         {
