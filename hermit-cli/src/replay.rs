@@ -111,6 +111,11 @@ impl Replay {
             );
         }
 
+        chroot
+            .create_dir_all(Path::new("/proc"))
+            .context("Failed to create proc mount target in chroot")?;
+        command.mount(Mount::proc().target(chroot.path().join("proc")));
+
         command.chroot(chroot.path());
 
         let mut builder = reverie_ptrace::TracerBuilder::<ReplayTool>::new(command).config(config);
@@ -239,7 +244,13 @@ fn populate_recorded_exec_paths(
     let mut seen = std::collections::HashSet::new();
     for line in contents.lines() {
         let path = Path::new(line);
-        if line.is_empty() || path == root_exe || !seen.insert(path.to_path_buf()) {
+        // The replay's procfs supplies paths such as /proc/self/exe. Resolving
+        // them here would copy files belonging to the outer Hermit process.
+        if line.is_empty()
+            || path == root_exe
+            || path.starts_with("/proc")
+            || !seen.insert(path.to_path_buf())
+        {
             continue;
         }
         if !path.is_file() {
@@ -262,4 +273,21 @@ fn populate_recorded_exec_paths(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recorded_proc_exec_paths_are_not_copied_from_replay_host() {
+        let recording = tempfile::tempdir().unwrap();
+        fs::write(recording.path().join(EXEC_PATHS_NAME), "/proc/self/exe\n").unwrap();
+        let chroot = TempChroot::new_in(recording.path()).unwrap();
+
+        populate_recorded_exec_paths(recording.path(), &chroot, Path::new("/recorded/root"))
+            .unwrap();
+
+        assert!(!chroot.relpath(Path::new("/proc/self/exe")).exists());
+    }
 }

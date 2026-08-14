@@ -1368,10 +1368,10 @@ sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
 liteinst = "The preload runtime does not survive the guest's own re-exec"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Clock replay divergence is tracked by the clock-determinism entry"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

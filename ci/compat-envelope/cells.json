@@ -49377,8 +49377,8 @@
       "test": "system-utils/clock-exec-continuity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
