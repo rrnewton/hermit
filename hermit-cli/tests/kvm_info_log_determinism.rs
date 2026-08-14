@@ -8,10 +8,11 @@
 
 //! The KVM backend's INFO stream must not carry host-irreproducible values.
 //!
-//! `--verify-strict` compares INFO events under the canonical policy: it removes
-//! the real wall-clock *prefix* of each line and compares the remainder exactly.
-//! Any host wall-clock value inside a message *body* therefore makes two runs of
-//! the same guest differ on that line alone, with no guest cause.
+//! `--verify-strict` compares INFO events under the production canonical policy:
+//! it removes the real wall-clock prefix and ordinalizes only explicitly marked
+//! host addresses. Every other byte remains exact. An unmarked host wall-clock
+//! value inside a message body therefore makes two runs of the same guest differ
+//! on that line alone, with no guest cause.
 //!
 //! This is currently invisible through `--verify` itself, because the KVM path
 //! takes an output-only fallback (`compare_logs: false`, reported as
@@ -19,34 +20,18 @@
 //! compares it directly so the defect cannot hide behind that fallback.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
+use tempfile::NamedTempFile;
+
 /// KVM runs are serialized for the same reason `kvm_harder.rs` serializes them.
 static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
 
-/// Strip the leading RFC3339 wall-clock timestamp that `tracing` prefixes to
-/// every line. This is exactly the `real-wall-clock-prefix/v1` removal the
-/// canonical comparison policy performs, and nothing more: the remainder of the
-/// line is compared verbatim, so a nondeterministic value in a message body is
-/// still caught.
-fn strip_wall_clock_prefix(log: &str) -> Vec<&str> {
-    log.lines()
-        .map(|line| match line.split_once(char::is_whitespace) {
-            // A timestamp token looks like `2026-08-14T03:41:30.792057Z`.
-            Some((first, rest))
-                if first.len() >= 20
-                    && first.ends_with('Z')
-                    && first.starts_with(|c: char| c.is_ascii_digit()) =>
-            {
-                rest
-            }
-            _ => line,
-        })
-        .collect()
-}
+const LIFECYCLE_TIMING_EVENT: &str = "reverie-kvm lifecycle phase timings";
 
 fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
@@ -70,11 +55,11 @@ fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
     binary
 }
 
-fn run_kvm_info(binary: &Path, extra_run_flags: &[&str]) -> String {
+fn run_kvm_log(binary: &Path, log_level: &str, extra_run_flags: &[&str]) -> String {
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "90s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "info", "--backend", "kvm"])
+        .args(["--log", log_level, "--backend", "kvm"])
         .args(["run", "--strict"])
         .args(extra_run_flags)
         .arg("--")
@@ -90,6 +75,32 @@ fn run_kvm_info(binary: &Path, extra_run_flags: &[&str]) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[derive(Debug)]
+struct CanonicalInfo {
+    message_count: usize,
+    text: String,
+}
+
+/// Run the same production canonical INFO extraction used by strict
+/// verification. Keeping this call on the production implementation prevents
+/// the test from drifting to a second approximation of the policy.
+fn canonical_info(log: &str) -> CanonicalInfo {
+    let mut input = NamedTempFile::new().expect("failed to create temporary KVM log");
+    input
+        .write_all(log.as_bytes())
+        .expect("failed to write temporary KVM log");
+    input.flush().expect("failed to flush temporary KVM log");
+
+    let mut output = Vec::new();
+    let reported = detcore::logdiff::write_canonical_info(input.path(), &mut output)
+        .expect("failed to extract the canonical KVM INFO stream");
+    let text = String::from_utf8(output).expect("canonical INFO stream was not UTF-8");
+    CanonicalInfo {
+        message_count: reported,
+        text,
+    }
+}
+
 #[test]
 fn kvm_info_stream_repeats_exactly_across_two_runs() {
     // Host limitation, not a product result: without /dev/kvm there is no KVM
@@ -103,26 +114,28 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let binary = compile_guest("guest", &[]);
-    let first = run_kvm_info(&binary, &[]);
-    let second = run_kvm_info(&binary, &[]);
+    let first_log = run_kvm_log(&binary, "info", &[]);
+    let second_log = run_kvm_log(&binary, "info", &[]);
+    let debug_log = run_kvm_log(&binary, "debug", &[]);
 
-    let first_lines = strip_wall_clock_prefix(&first);
-    let second_lines = strip_wall_clock_prefix(&second);
+    let first = canonical_info(&first_log);
+    let second = canonical_info(&second_log);
 
     // Guard the comparison itself: an empty or truncated capture would make the
     // equality below vacuously true, which is the classic false green.
     assert!(
-        first_lines.len() > 50,
-        "KVM INFO capture is implausibly short ({} lines); the comparison below \
+        first.message_count > 50,
+        "canonical KVM INFO capture is implausibly short ({} messages); the comparison below \
          would not discriminate anything",
-        first_lines.len(),
+        first.message_count,
     );
     assert_eq!(
-        first_lines.len(),
-        second_lines.len(),
-        "KVM INFO stream changed line count between two runs of the same guest",
+        first.message_count, second.message_count,
+        "KVM INFO stream changed message count between two runs of the same guest",
     );
 
+    let first_lines = first.text.lines().collect::<Vec<_>>();
+    let second_lines = second.text.lines().collect::<Vec<_>>();
     let divergences: Vec<(usize, &str, &str)> = first_lines
         .iter()
         .zip(second_lines.iter())
@@ -132,7 +145,7 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
         .collect();
 
     assert!(
-        divergences.is_empty(),
+        first.text == second.text,
         "KVM INFO stream is not reproducible across two runs of the same guest. \
          Every line below differs with no guest cause, so it carries a host value \
          that must not be in the compared stream:\n{}",
@@ -142,13 +155,72 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+
+    assert!(
+        !first.text.contains(LIFECYCLE_TIMING_EVENT),
+        "host lifecycle timings leaked into the canonical INFO stream",
+    );
+    let debug_timing_lines = debug_log
+        .lines()
+        .filter(|line| line.contains(" DEBUG ") && line.contains(LIFECYCLE_TIMING_EVENT))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        debug_timing_lines.len(),
+        1,
+        "expected exactly one DEBUG lifecycle timing event; captured: {debug_timing_lines:?}",
+    );
+    for field in [
+        "prepare_us=",
+        "setup_us=",
+        "execution_us=",
+        "cleanup_us=",
+        "teardown_us=",
+        "lifecycle_us=",
+    ] {
+        assert!(
+            debug_timing_lines[0].contains(field),
+            "DEBUG lifecycle timing event is missing {field}: {}",
+            debug_timing_lines[0],
+        );
+    }
 }
 
-/// Every `DETLOG [memory]` record, in order, with the wall-clock prefix removed.
-fn memory_records(log: &str) -> Vec<&str> {
-    strip_wall_clock_prefix(log)
-        .into_iter()
+#[derive(Debug, PartialEq, Eq)]
+struct MemoryDigest {
+    kind: &'static str,
+    digest: String,
+}
+
+fn parse_memory_record(line: &str) -> Result<MemoryDigest, String> {
+    let kind = if line.contains(" Stack ") {
+        "Stack"
+    } else if line.contains(" Heap ") {
+        "Heap"
+    } else {
+        return Err(format!(
+            "memory record names neither Stack nor Heap: {line}"
+        ));
+    };
+    let (_, digest) = line
+        .rsplit_once("->")
+        .ok_or_else(|| format!("memory record has no digest separator: {line}"))?;
+    let digest = digest.trim();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "memory record has no 64-character hexadecimal content digest: {line}"
+        ));
+    }
+    Ok(MemoryDigest {
+        kind,
+        digest: digest.to_owned(),
+    })
+}
+
+/// Every parsed `DETLOG [memory]` content digest, in order.
+fn memory_records(info: &str) -> Vec<MemoryDigest> {
+    info.lines()
         .filter(|line| line.contains("DETLOG [memory]"))
+        .map(|line| parse_memory_record(line).unwrap_or_else(|error| panic!("{error}")))
         .collect()
 }
 
@@ -184,11 +256,11 @@ fn kvm_memory_hashes_repeat_for_a_static_guest() {
 
     let binary = compile_guest("static_guest", &["-static"]);
     let flags = ["--detlog-stack", "--detlog-heap"];
-    let first = run_kvm_info(&binary, &flags);
-    let second = run_kvm_info(&binary, &flags);
+    let first = canonical_info(&run_kvm_log(&binary, "info", &flags));
+    let second = canonical_info(&run_kvm_log(&binary, "info", &flags));
 
-    let first_records = memory_records(&first);
-    let second_records = memory_records(&second);
+    let first_records = memory_records(&first.text);
+    let second_records = memory_records(&second.text);
 
     // Without this guard the equality below would pass vacuously if the flags
     // stopped emitting records at all — which is precisely how a memory
@@ -199,8 +271,8 @@ fn kvm_memory_hashes_repeat_for_a_static_guest() {
          the comparison below would not discriminate anything",
     );
     assert!(
-        first_records.iter().any(|r| r.contains("Stack"))
-            && first_records.iter().any(|r| r.contains("Heap")),
+        first_records.iter().any(|record| record.kind == "Stack")
+            && first_records.iter().any(|record| record.kind == "Heap"),
         "expected both Stack and Heap records; got {} record(s): {:?}",
         first_records.len(),
         first_records,
@@ -211,12 +283,12 @@ fn kvm_memory_hashes_repeat_for_a_static_guest() {
         "KVM emitted a different number of memory records between two runs",
     );
 
-    let divergences: Vec<(usize, &str, &str)> = first_records
+    let divergences: Vec<(usize, &MemoryDigest, &MemoryDigest)> = first_records
         .iter()
         .zip(second_records.iter())
         .enumerate()
         .filter(|(_, (a, b))| a != b)
-        .map(|(index, (a, b))| (index, *a, *b))
+        .map(|(index, (a, b))| (index, a, b))
         .collect();
 
     assert!(
@@ -227,8 +299,27 @@ fn kvm_memory_hashes_repeat_for_a_static_guest() {
         first_records.len(),
         divergences
             .iter()
-            .map(|(index, a, b)| format!("  record {index}:\n    run 1: {a}\n    run 2: {b}"))
+            .map(|(index, a, b)| {
+                format!("  record {index}:\n    run 1: {a:?}\n    run 2: {b:?}")
+            })
             .collect::<Vec<_>>()
             .join("\n"),
+    );
+}
+
+#[test]
+fn memory_record_parser_requires_a_content_digest() {
+    let without_digest = "INFO detcore: DETLOG [memory][dtid 1] Stack 0x1000-0x2000->";
+    assert!(
+        parse_memory_record(without_digest).is_err(),
+        "a labeled memory record without a digest must not count as evidence",
+    );
+    let valid = "INFO detcore: DETLOG [memory][dtid 1] Heap 0x1000-0x2000->0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_eq!(
+        parse_memory_record(valid),
+        Ok(MemoryDigest {
+            kind: "Heap",
+            digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+        }),
     );
 }
