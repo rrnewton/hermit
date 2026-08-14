@@ -1732,6 +1732,169 @@ int main(void) {
     assert_eq!(stdout(&output), "kvm-syscalls-ok\n");
 }
 
+#[test]
+fn run_kvm_random_device_lseek_matches_linux() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    let _guard = HERMIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let compiler = ["cc", "gcc", "clang"]
+        .into_iter()
+        .find(|program| {
+            Command::new(program)
+                .args(["-x", "c", "-fsyntax-only", "-"])
+                .stdin(Stdio::null())
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .expect("random-device lseek regression requires cc, gcc, or clang on PATH");
+
+    let temp = tempfile::tempdir().expect("failed to create random-device lseek guest directory");
+    let source = temp.path().join("random_device_lseek.c");
+    let binary = temp.path().join("random_device_lseek");
+    fs::write(
+        &source,
+        br#"#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static int expect_lseek(int fd, off_t offset, int whence, off_t expected,
+                        int expected_errno, const char *label) {
+    errno = 0;
+    off_t actual = syscall(SYS_lseek, fd, offset, whence);
+    int actual_errno = errno;
+    if (actual == expected && actual_errno == expected_errno) return 0;
+    fprintf(stderr,
+            "%s: expected %lld errno %d, got %lld errno %d\n",
+            label, (long long)expected, expected_errno,
+            (long long)actual, actual_errno);
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    int opath = argc == 2 && strcmp(argv[1], "--opath") == 0;
+    int fd = open("/dev/urandom", opath ? O_PATH : O_RDONLY);
+    if (fd < 0) {
+        perror("open /dev/urandom");
+        return 1;
+    }
+
+    int failed = 0;
+    if (opath) {
+        failed |= expect_lseek(fd, 0, SEEK_SET, -1, EBADF, "O_PATH SEEK_SET");
+        failed |= expect_lseek(fd, -4, SEEK_CUR, -1, EBADF, "O_PATH SEEK_CUR");
+        failed |= expect_lseek(fd, 0, SEEK_END, -1, EBADF, "O_PATH SEEK_END");
+        failed |= expect_lseek(fd, 0, SEEK_DATA, -1, EBADF, "O_PATH SEEK_DATA");
+        failed |= expect_lseek(fd, 0, SEEK_HOLE, -1, EBADF, "O_PATH SEEK_HOLE");
+        failed |= expect_lseek(fd, 0, 99, -1, EBADF, "O_PATH invalid whence");
+        if (close(fd) != 0) {
+            perror("close O_PATH /dev/urandom");
+            return 2;
+        }
+        if (failed) return 3;
+        puts("random-device-lseek-opath-ok");
+        return 0;
+    }
+
+    unsigned char bytes[8];
+    if (read(fd, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) {
+        perror("read /dev/urandom before lseek");
+        return 4;
+    }
+    failed |= expect_lseek(fd, -4, SEEK_CUR, 0, 0, "SEEK_CUR");
+    failed |= expect_lseek(fd, 123, SEEK_SET, 0, 0, "SEEK_SET");
+    failed |= expect_lseek(fd, 0, SEEK_END, 0, 0, "SEEK_END");
+    failed |= expect_lseek(fd, 0, SEEK_DATA, 0, 0, "SEEK_DATA");
+    failed |= expect_lseek(fd, 0, SEEK_HOLE, 0, 0, "SEEK_HOLE");
+    failed |= expect_lseek(fd, 0, 99, -1, EINVAL, "invalid whence");
+    if (read(fd, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) {
+        perror("read /dev/urandom after lseek");
+        return 5;
+    }
+    if (close(fd) != 0) {
+        perror("close /dev/urandom");
+        return 6;
+    }
+    if (failed) return 7;
+    puts("random-device-lseek-ok");
+    return 0;
+}
+"#,
+    )
+    .expect("failed to write random-device lseek guest");
+    let compile = Command::new(compiler)
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("failed to invoke C compiler");
+    assert!(
+        compile.status.success(),
+        "failed to compile random-device lseek guest:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let program = binary
+        .to_str()
+        .expect("random-device lseek guest path should be UTF-8");
+    let kvm_args = [
+        "--log=info",
+        "run",
+        "--backend=kvm",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--tmp=/tmp",
+        "--base-env=minimal",
+        "--",
+        program,
+    ];
+    let kvm_output = hermit(&kvm_args);
+    assert_success(&kvm_output, &kvm_args);
+    assert_eq!(stdout(&kvm_output), "random-device-lseek-ok\n");
+    assert!(
+        stderr(&kvm_output).contains("Success: KVM guest output and exit status matched."),
+        "KVM determinism confirmation missing:\n{}",
+        stderr(&kvm_output),
+    );
+
+    // Reverie KVM currently rejects O_PATH at openat. Exercise the Linux
+    // lseek error precedence through the ptrace backend until KVM accepts the
+    // descriptor itself.
+    let ptrace_args = [
+        "--log=info",
+        "run",
+        "--backend=ptrace",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--tmp=/tmp",
+        "--base-env=minimal",
+        "--",
+        program,
+        "--opath",
+    ];
+    let ptrace_output = hermit(&ptrace_args);
+    assert_success(&ptrace_output, &ptrace_args);
+    assert_eq!(stdout(&ptrace_output), "random-device-lseek-opath-ok\n");
+    assert!(
+        stderr(&ptrace_output).contains("Success: deterministic. Determinism verified."),
+        "ptrace determinism confirmation missing:\n{}",
+        stderr(&ptrace_output),
+    );
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
 #[test]
