@@ -341,12 +341,23 @@ struct FreshCheckout {
 
 struct SelfTestDirectory {
     path: PathBuf,
+    expected_parent: PathBuf,
+    expected_prefix: String,
     armed: bool,
 }
 
 impl SelfTestDirectory {
     fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+        Self::at(path, env::temp_dir(), "hermit-pressure-self-test-")
+    }
+
+    fn at(path: PathBuf, expected_parent: PathBuf, expected_prefix: &str) -> Self {
+        Self {
+            path,
+            expected_parent,
+            expected_prefix: expected_prefix.into(),
+            armed: true,
+        }
     }
 
     fn remove(mut self) -> Result<(), String> {
@@ -364,16 +375,28 @@ impl SelfTestDirectory {
 impl Drop for SelfTestDirectory {
     fn drop(&mut self) {
         if self.armed
-            && self.path.parent() == Some(env::temp_dir().as_path())
+            && self.path.parent() == Some(self.expected_parent.as_path())
             && self
                 .path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("hermit-pressure-self-test-"))
+                .is_some_and(|name| name.starts_with(&self.expected_prefix))
         {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+const LOCAL_CLONE_ARGS: [&str; 4] = ["clone", "--local", "--no-hardlinks", "--no-checkout"];
+
+fn clone_local_without_hardlinks(source: &Path, destination: &Path) -> Result<(), String> {
+    command_ok(
+        Command::new("git")
+            .args(LOCAL_CLONE_ARGS)
+            .arg(source)
+            .arg(destination),
+        "materialize fresh pressure-test checkout",
+    )
 }
 
 impl FreshCheckout {
@@ -407,13 +430,7 @@ impl FreshCheckout {
             sha: sha.to_string(),
         };
         let initialize = (|| {
-            command_ok(
-                Command::new("git")
-                    .args(["clone", "--local", "--no-checkout"])
-                    .arg(source)
-                    .arg(&checkout.path),
-                "materialize fresh pressure-test checkout",
-            )?;
+            clone_local_without_hardlinks(source, &checkout.path)?;
             let marker = checkout
                 .path
                 .join(".git")
@@ -3963,6 +3980,121 @@ fn self_test(root: &Path) -> Result<(), String> {
     })?;
     let scratch_cleanup = SelfTestDirectory::new(scratch.clone());
     require_empty_result_dir(&scratch)?;
+
+    // The real runner clones a clean commit into /tmp when its checkout has no
+    // dev-hermit parent. A local clone must copy objects rather than hard-link
+    // them: hard links fail with EXDEV when source and destination are on
+    // different filesystems. Exercise the exact Git front door with a tiny
+    // repository on the checkout filesystem, and prove the copied checkout is
+    // detached at the requested commit and usable.
+    if !LOCAL_CLONE_ARGS.contains(&"--no-hardlinks") {
+        return Err("fresh local clone does not disable object hard links".into());
+    }
+    let clone_source_parent = root.join("ignored");
+    fs::create_dir_all(&clone_source_parent).map_err(|e| {
+        format!(
+            "cannot create clone self-test parent {}: {e}",
+            clone_source_parent.display()
+        )
+    })?;
+    let clone_source = clone_source_parent.join(format!(
+        "pressure-clone-self-test-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&clone_source).map_err(|e| {
+        format!(
+            "cannot create clone self-test source {}: {e}",
+            clone_source.display()
+        )
+    })?;
+    let clone_source_cleanup = SelfTestDirectory::at(
+        clone_source.clone(),
+        clone_source_parent,
+        "pressure-clone-self-test-",
+    );
+    command_ok(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&clone_source),
+        "initialize no-hardlinks clone fixture",
+    )?;
+    fs::write(clone_source.join("tracked"), "usable\n")
+        .map_err(|e| format!("cannot write no-hardlinks clone fixture: {e}"))?;
+    command_ok(
+        Command::new("git")
+            .args(["add", "tracked"])
+            .current_dir(&clone_source),
+        "stage no-hardlinks clone fixture",
+    )?;
+    command_ok(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=pressure-test self-test",
+                "-c",
+                "user.email=pressure-test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ])
+            .current_dir(&clone_source),
+        "commit no-hardlinks clone fixture",
+    )?;
+    let clone_sha = git_output(&clone_source, &["rev-parse", "HEAD"])?;
+    let blob_sha = git_output(&clone_source, &["rev-parse", "HEAD:tracked"])?;
+    let clone_destination = scratch.join("no-hardlinks-checkout");
+    clone_local_without_hardlinks(&clone_source, &clone_destination)?;
+    command_ok(
+        Command::new("git")
+            .args([
+                "-C",
+                &clone_destination.to_string_lossy(),
+                "checkout",
+                "--detach",
+            ])
+            .arg(&clone_sha),
+        "check out no-hardlinks clone fixture",
+    )?;
+    let cloned_sha = git_output(&clone_destination, &["rev-parse", "HEAD"])?;
+    if cloned_sha != clone_sha
+        || fs::read_to_string(clone_destination.join("tracked"))
+            .ok()
+            .as_deref()
+            != Some("usable\n")
+    {
+        return Err(format!(
+            "no-hardlinks clone is not an exact usable checkout: expected {clone_sha}, observed {cloned_sha}"
+        ));
+    }
+    if blob_sha.len() < 3 {
+        return Err("clone fixture produced a malformed object ID".into());
+    }
+    let (object_dir, object_name) = blob_sha.split_at(2);
+    let source_object = clone_source.join(".git/objects").join(object_dir).join(object_name);
+    let cloned_object = clone_destination
+        .join(".git/objects")
+        .join(object_dir)
+        .join(object_name);
+    let source_object_metadata = fs::metadata(&source_object).map_err(|e| {
+        format!(
+            "cannot inspect source clone-fixture object {}: {e}",
+            source_object.display()
+        )
+    })?;
+    let cloned_object_metadata = fs::metadata(&cloned_object).map_err(|e| {
+        format!(
+            "cannot inspect copied clone-fixture object {}: {e}",
+            cloned_object.display()
+        )
+    })?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if source_object_metadata.dev() == cloned_object_metadata.dev()
+            && source_object_metadata.ino() == cloned_object_metadata.ino()
+        {
+            return Err("fresh local clone hard-linked its source object".into());
+        }
+    }
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
@@ -5028,9 +5160,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     if load_runner_evidence(&scratch, "abc").is_ok() {
         return Err("malformed retained runner evidence was accepted".into());
     }
+    clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, manifest attempt budgets, shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, manifest attempt budgets, shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
