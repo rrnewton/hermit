@@ -132,6 +132,23 @@ struct OpenFileDescription {
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// The `flock(2)` mode this open file description currently holds, as the
+    /// bare `LOCK_SH`/`LOCK_EX` constant, or `None` when it holds no lock.
+    ///
+    /// `flock` locks are a property of the open file description, not of the
+    /// descriptor slot and not of the inode, which is exactly the granularity
+    /// this struct models: `dup`/`fork` aliases share one lock, two separate
+    /// `open`s of the same file contend with each other.
+    ///
+    /// Detcore tracks this only so `handle_flock` can tell a first acquisition
+    /// (where a failed `LOCK_NB` probe changes nothing) from a *conversion* of
+    /// an already-held lock (where Linux drops the old lock before it can fail).
+    /// It is a cache of what Detcore itself granted, never an authority: it is
+    /// written only after the kernel reports success.
+    #[serde(default)]
+    flock_mode: Option<i32>,
 }
 
 impl PartialEq for DetFd {
@@ -176,6 +193,7 @@ impl DetFd {
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 loopback_peer: false,
+                flock_mode: None,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -454,6 +472,23 @@ impl DetFd {
     pub(crate) fn is_loopback_peer(&self) -> bool {
         self.description().loopback_peer
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// The `flock(2)` mode (`LOCK_SH`/`LOCK_EX`) this open file description
+    /// currently holds, or `None` when Detcore has granted it no lock.
+    pub(crate) fn flock_mode(&self) -> Option<i32> {
+        self.description().flock_mode
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// Record the `flock(2)` mode this open file description now holds. Every
+    /// `dup`/`fork` alias observes the change, matching the kernel, where one
+    /// `flock` lock belongs to the whole open file description.
+    pub(crate) fn set_flock_mode(&self, mode: Option<i32>) {
+        self.description().flock_mode = mode;
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -518,6 +553,49 @@ mod tests {
         assert!(
             !duplicate.is_loopback_peer(),
             "reconnects through one alias must clear loopback state for every alias"
+        );
+    }
+
+    /// `flock(2)` locks belong to the open file description, so every `dup`
+    /// alias must see one lock, while a separate `open` of the same file is a
+    /// distinct contender with its own state.
+    #[test]
+    fn flock_mode_is_shared_by_dup_aliases_and_private_to_separate_opens() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(
+            3,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(owner, 0),
+        );
+        let duplicate = original.clone().with_fd(4);
+        let separate_open = DetFd::new(
+            5,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(owner, 1),
+        );
+
+        assert_eq!(original.flock_mode(), None);
+        original.set_flock_mode(Some(libc::LOCK_SH));
+        assert_eq!(
+            duplicate.flock_mode(),
+            Some(libc::LOCK_SH),
+            "a dup alias shares the open file description's flock lock"
+        );
+        assert_eq!(
+            separate_open.flock_mode(),
+            None,
+            "a separate open of the same file is an independent flock contender"
+        );
+
+        duplicate.set_flock_mode(Some(libc::LOCK_EX));
+        assert_eq!(original.flock_mode(), Some(libc::LOCK_EX));
+        duplicate.set_flock_mode(None);
+        assert_eq!(
+            original.flock_mode(),
+            None,
+            "LOCK_UN through one alias releases the whole open file description"
         );
     }
 

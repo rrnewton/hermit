@@ -3425,10 +3425,10 @@ program = "tests/c/getpriority_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-backends_enabled = ["ptrace", "dbt", "kvm"]
+ci = true
+backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
+kvm = "KVM times out before guest start on the validation host, so no getpriority verdict is available; re-enable when the startup livelock is fixed"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
@@ -4352,7 +4352,7 @@ sabre = "No custom edge-case arguments have been calibrated for this C guest"
 liteinst = "No custom edge-case arguments have been calibrated for this C guest"
 [[test]]
 id = "backend-parity-c/getcpu-identity"
-description = "Strict verification for tests/c/getcpu_identity.c"
+description = "getcpu(2) host-topology determinization: raw syscall reports CPU 0 / node 0 with the observed values emitted"
 lane = "portable"
 requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
 timeout_seconds = 90
@@ -4361,10 +4361,10 @@ program = "tests/c/getcpu_identity.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (measured: ptrace passes, a non-ptrace enabled backend is red): verify PASSES on ptrace but dbi FAIL (exit 1), kvm FAIL (exit 124 = the 90s per-cell timeout, i.e. a hang, not an assertion failure). Measured 2026-08-06 at hermit 6e1b59af0b228403fb3e9bcafc63da64a531569f (debug build), twice at different concurrency with identical verdicts; host and method recorded in tests/backend-parity/measurements/README.md. The ci flag covers EVERY backend in backends_enabled, so enabling this cell would run the red backend(s) too and turn the lane red. Enable once they are qualified, or once they are deliberately demoted to backends_disabled with a reason under the task that owns those parity declarations -- do not demote them merely to buy this flip."
-backends_enabled = ["ptrace", "dbt", "kvm"]
+ci = true
+backends_enabled = ["ptrace", "dbt"]
 [test.modes.verify.backends_disabled]
+kvm = "Measured on the validation host: KVM does not start the guest, so no getcpu verdict is available. Previously listed as enabled while the whole entry was ci=false, i.e. never exercised"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
 liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
@@ -5622,6 +5622,66 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 [test.modes.custom]
 ci = false
 ci_disabled_reason = "NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest"
+backends_enabled = []
+[test.modes.custom.backends_disabled]
+ptrace = "No custom edge-case arguments have been calibrated for this C guest"
+dbt = "No custom edge-case arguments have been calibrated for this C guest"
+kvm = "No custom edge-case arguments have been calibrated for this C guest"
+sabre = "No custom edge-case arguments have been calibrated for this C guest"
+liteinst = "No custom edge-case arguments have been calibrated for this C guest"
+
+[[test]]
+id = "backend-parity-c/pipe-multiwriter-ordering"
+description = "Strict verification for tests/backend-parity/fixtures/pipe_multiwriter_ordering.c"
+lane = "portable"
+requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
+timeout_seconds = 90
+occasional = false
+program = "tests/backend-parity/fixtures/pipe_multiwriter_ordering.c"
+observation = { status = true, stdout = true, stderr = false, artifacts = [] }
+
+[test.modes.verify]
+ci = false
+ci_disabled_reason = "NOT-EXERCISED: the folded fixture has compile and inventory coverage but no qualifying ptrace --verify witness at the current head; do not infer runtime qualification from successful compilation."
+backends_enabled = ["ptrace"]
+[test.modes.verify.backends_disabled]
+dbt = "The DynamoRIO (DBT) backend is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake), so no witness could be recorded; qualify DBT separately once it builds"
+kvm = "KVM livelocks at guest startup on the current host, so no witness could be recorded; qualify KVM separately"
+sabre = "SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately"
+liteinst = "LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately"
+
+[test.modes.naked]
+ci = false
+ci_disabled_reason = "NOT-EXERCISED (by design): native variation is the premise measured by this guest, not a stable naked-mode oracle that the guest asserts."
+backends_enabled = []
+[test.modes.naked.backends_disabled]
+native = "Native run-to-run variation is the PREMISE of this guest, not an assertion it makes; it is demonstrated in the fixture comment rather than gated here"
+
+[test.modes.replay]
+ci = false
+ci_disabled_reason = "NOT-EXERCISED: record/replay qualification is separate from the initial strict-verification fixture and has not been measured for this guest."
+backends_enabled = []
+[test.modes.replay.backends_disabled]
+ptrace = "Record/replay qualification is separate from strict verification"
+dbt = "Record/replay is unsupported by the DynamoRIO (DBT) backend"
+kvm = "Record/replay is unsupported by KVM"
+sabre = "Record/replay is unsupported by SaBRe"
+liteinst = "Record/replay is unsupported by LiteInst"
+
+[test.modes.chaos]
+ci = false
+ci_disabled_reason = "NOT-EXERCISED: the guest has schedule-derived outcomes, but no per-seed chaos oracle has been calibrated, so enabling it would not provide a meaningful verdict."
+backends_enabled = []
+[test.modes.chaos.backends_disabled]
+ptrace = "Chaos would be a GOOD fit here (this guest has two schedule-derived orderings), but a chaos oracle needs per-seed expected output, which is not calibrated yet"
+dbt = "Chaos scheduling is unsupported by the DynamoRIO (DBT) backend"
+kvm = "Chaos scheduling is unsupported by KVM"
+sabre = "Chaos scheduling is unsupported by SaBRe"
+liteinst = "Chaos scheduling is unsupported by LiteInst"
+
+[test.modes.custom]
+ci = false
+ci_disabled_reason = "NOT-EXERCISED: no custom edge-case arguments or expected outcomes have been calibrated for this guest."
 backends_enabled = []
 [test.modes.custom.backends_disabled]
 ptrace = "No custom edge-case arguments have been calibrated for this C guest"
