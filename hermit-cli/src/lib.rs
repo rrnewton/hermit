@@ -1124,13 +1124,6 @@ async fn run_sabre(
     if requires_forced_shutdown {
         global.force_shutdown_with_error();
     }
-    tracing::info!(
-        target: "hermit::sabre::fallback",
-        ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
-        trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
-        guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
-        "SaBRe ptrace fallback completed",
-    );
     // Emit one unconditional, machine-readable per-run fact instead of a
     // free-form warning. SaBRe loads the guest interpreter before the Detcore
     // plugin, so pre-plugin loader syscalls are structurally absent from its
@@ -1179,6 +1172,13 @@ async fn run_sabre(
     global
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    tracing::info!(
+        target: "hermit::sabre::fallback",
+        ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
+        trusted_shared_object_sites = supervised.path_evidence.trusted_shared_object_sites,
+        guest_rpc_observed = supervised.path_evidence.guest_rpc_observed,
+        "SaBRe ptrace fallback completed",
+    );
     if detcore_never_engaged {
         return Err(anyhow!(
             "{}",
