@@ -661,27 +661,32 @@ fn validate_mode(
         "naked" => allowed.extend(["runs", "assert"]),
         "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
         "custom" => allowed.extend(["args", "assert"]),
-        // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
-        // cell from the lossy default comparator to the L2 parity comparator and
-        // requires the run's own verdict JSON to report parity. Without it a
-        // `verify` cell runs `--strict --verify` only, which per
+        // `verify` and `replay` each accept one assertion: `bitwise_parity`,
+        // which upgrades the cell from the lossy default comparator to the L2
+        // parity comparator and requires the run's own verdict JSON to report
+        // parity. Without it a `verify` cell runs `--strict --verify` only and a
+        // `replay` cell runs `record start --strict --verify` only, which per
         // AGENTS.md "cannot establish L2" -- so a cell justified by a
         // hand-measured `bitwise_parity: true` does not actually ratchet it.
-        "verify" => allowed.push("assert"),
+        //
+        // `replay` was added here after measurement: the one enabled replay cell
+        // was passing on the Stripped comparator and self-reporting
+        // `bitwise_parity: false`, while writing a verdict file nothing read.
+        "verify" | "replay" => allowed.push("assert"),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
-    if mode == "verify" {
+    if mode == "verify" || mode == "replay" {
         if let Some(assert) = spec.get("assert") {
             ensure_keys(
                 assert,
                 &["bitwise_parity"],
-                &format!("{id}.modes.verify.assert"),
+                &format!("{id}.modes.{mode}.assert"),
             );
             if let Some(value) = assert.get("bitwise_parity") {
                 if value.as_bool().is_none() {
                     die(format!(
-                        "{id}: modes.verify.assert.bitwise_parity must be a boolean"
+                        "{id}: modes.{mode}.assert.bitwise_parity must be a boolean"
                     ));
                 }
             }

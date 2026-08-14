@@ -2682,10 +2682,15 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the strict bitwise-parity assertion?
-function verify_asserts_bitwise_parity {
-    local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
+# Does this test's MODE opt into the strict bitwise-parity assertion?
+#
+# Takes the mode explicitly. It used to read `.modes.verify.` unconditionally,
+# which silently made the opt-in unreachable for `replay` even where the caller
+# had a replay cell in hand -- so replay cells ran the lossy comparator and their
+# verdict file was written and never read.
+function mode_asserts_bitwise_parity {
+    local metadata=$1 mode=$2
+    jq -r --arg mode "$mode" '.modes[$mode].assert.bitwise_parity // false' <<<"$metadata"
 }
 
 # Where a verify attempt writes its machine-readable verdict.
@@ -2809,15 +2814,28 @@ function execute_attempt {
             # parity measurement it never actually performs.
             local verify_strict_flags=(--verify-json
                 "$(verify_verdict_path "$cell_dir" "$attempt")")
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+            if [[ $(mode_asserts_bitwise_parity "$metadata" verify) == true ]]; then
                 verify_strict_flags=(--verify-strict "${verify_strict_flags[@]}")
             fi
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
                 "${verify_strict_flags[@]}" "${verify_log_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
+            # Same discipline as `verify` above, for the same reason. Plain
+            # `record start --strict --verify` compares recording against replay
+            # with the LOSSY `Stripped` comparator, so a green replay cell
+            # establishes same-run repeatability, not parity. A cell that opts
+            # into `assert = { bitwise_parity = true }` is upgraded to the
+            # canonical comparator, and run_cell then reads the verdict the run
+            # published -- otherwise the cell would be justified by a parity
+            # measurement it never performed.
+            local replay_strict_flags=(--verify-json
+                "$(verify_verdict_path "$cell_dir" "$attempt")")
+            if [[ $(mode_asserts_bitwise_parity "$metadata" replay) == true ]]; then
+                replay_strict_flags=(--verify-strict "${replay_strict_flags[@]}")
+            fi
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
-                --verify-json "$(verify_verdict_path "$cell_dir" "$attempt")"
+                "${replay_strict_flags[@]}"
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
@@ -2913,7 +2931,7 @@ function append_result {
             local keep_verify_logs=false
             [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 ]] && keep_verify_logs=true
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
+                --argjson strict "$(mode_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}" verify)" \
                 --argjson keep "$keep_verify_logs" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
                  + (if $strict then ["--verify-strict"] else [] end)
@@ -2922,10 +2940,14 @@ function append_result {
             log_level=info
             ;;
         replay)
+            # As for verify: the receipt must record the flags that actually ran,
+            # or a Stripped result reads as a strict bitwise-parity one.
             timeout_seconds=$(jq -r .timeout_seconds <<<"${METADATA_BY_ID[$test_id]}")
             effective_args=$(jq -cn --arg backend "$backend" --arg timeout "$timeout_seconds" \
-                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify",
-                  "--verify-json","<cell-verify-report>","--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
+                --argjson strict "$(mode_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}" replay)" \
+                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify"]
+                 + (if $strict then ["--verify-strict"] else [] end)
+                 + ["--verify-json","<cell-verify-report>","--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
             log_level=info
             ;;
         chaos)
@@ -3252,10 +3274,16 @@ function run_cell {
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
-        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
+        elif [[ ($mode == verify || $mode == replay) &&
+                $(mode_asserts_bitwise_parity "$metadata" "$mode") == true ]]; then
             # A zero exit only means the comparator this run used was satisfied.
             # For a strict bitwise-parity cell, read the verdict the run itself published and
             # require full parity; anything else is a FAIL, not a PASS.
+            #
+            # `replay` is here as well as `verify`: a replay cell publishes the
+            # same verdict JSON, and while this branch was gated on `verify`
+            # alone that file was written and discarded, so a replay cell's PASS
+            # rested on exit status only.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
                 "$(verify_verdict_path "$cell_dir" 1)"); then
