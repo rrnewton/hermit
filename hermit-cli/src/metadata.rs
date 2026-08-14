@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,8 +155,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
-        // Record/replay keeps partial Detcore subscription; madvise policy semantics
-        // begin in v0x102.
+        // Record/replay keeps a partial Detcore subscription. Complete coverage
+        // of the Determinized classification begins in v0x10a; madvise policy
+        // semantics begin in v0x102.
         passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
@@ -236,6 +237,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
 
 #[cfg(test)]
 mod tests {
+    use reverie::Tool;
+    use reverie::syscalls::Sysno;
+
     use super::*;
 
     #[test]
@@ -251,7 +255,40 @@ mod tests {
     }
 
     #[test]
-    fn record_version_rejects_pre_madvise_policy_streams() {
+    fn record_and_replay_subscribe_every_determinized_syscall() {
+        let config = record_or_replay_config(Path::new("replay-data"));
+        let record = <detcore::Detcore<crate::recorder::Recorder> as Tool>::subscriptions(&config);
+        let replay = <detcore::Detcore<crate::replayer::Replayer> as Tool>::subscriptions(&config);
+
+        for (phase, subscriptions) in [("record", record), ("replay", replay)] {
+            let delivered = subscriptions.iter_syscalls().collect::<Vec<_>>();
+            let missing = detcore::all_pinned_syscalls()
+                .filter(|sysno| detcore::is_determinized_syscall(*sysno))
+                .filter(|sysno| !delivered.contains(sysno))
+                .collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "{phase} lets Determinized syscalls bypass Detcore: {}",
+                missing
+                    .iter()
+                    .map(|sysno| sysno.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(
+                delivered.contains(&Sysno::syslog),
+                "{phase} must deliver syslog to its deterministic Detcore handler"
+            );
+            assert!(
+                !delivered.contains(&Sysno::chdir),
+                "{phase} must leave unlisted PassThrough chdir unsubscribed"
+            );
+        }
+    }
+
+    #[test]
+    fn record_version_rejects_pre_complete_determinized_subscription_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
     }

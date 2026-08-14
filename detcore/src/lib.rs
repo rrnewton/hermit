@@ -1049,8 +1049,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Sysno::pselect6,
-                // TODO(T137258824): add proper Select
-                // Sysno::select,
+                // `select` is included by the Determinized sweep below;
+                // T137258824 tracks improving its implementation.
             ]);
 
             if do_sched {
@@ -1107,18 +1107,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
-            // with the deterministic-refusal boundary. Even under the performance
-            // opt-in, Detcore MUST still see every syscall it deterministically
-            // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
-            // strict guests execute those syscalls natively against the host,
-            // exactly the leak the DBT copied-child path also had to close.
+            // with the complete Determinized classification. Even under the
+            // performance opt-in, Detcore must see every syscall that its audited
+            // policy says it models or deterministically refuses. Otherwise
+            // record/replay can bypass a Detcore handler and execute the syscall
+            // natively against the host.
             // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
             // stops one short of the end of the table, which silently dropped
             // `lsm_list_modules` out of this sweep.
             subscription.syscalls(
-                syscall_classification::all_pinned_syscalls().filter(|sysno| {
-                    syscall_classification::is_deterministically_refused_syscall(*sysno)
-                }),
+                crate::all_pinned_syscalls().filter(|sysno| crate::is_determinized_syscall(*sysno)),
             );
 
             // Make sure we also intercept everything that the record-or-replay tool
@@ -2567,40 +2565,48 @@ mod subscription_tests {
         );
     }
 
-    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
-    /// syscalls does each subscription path actually deliver to Detcore?
-    ///
-    /// `passthru_opt` is not a niche flag: `record_or_replay_config` turns it on
-    /// for every `hermit record` / `hermit replay`, so this census is the record
-    /// and replay coverage too.
     #[test]
-    fn census_determinized_syscalls_reaching_each_subscription_path() {
+    fn passthru_opt_subscribes_every_determinized_syscall() {
         let determinized: Vec<Sysno> = crate::all_pinned_syscalls()
             .filter(|sysno| crate::is_determinized_syscall(*sysno))
             .collect();
-        let m = determinized.len();
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+        let missing = determinized
+            .iter()
+            .filter(|sysno| !delivered.contains(sysno))
+            .copied()
+            .collect::<Vec<_>>();
 
-        for passthru_opt in [false, true] {
-            let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
-            let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
-            let (reached, missing): (Vec<Sysno>, Vec<Sysno>) = determinized
+        assert!(
+            missing.is_empty(),
+            "passthru_opt let Determinized syscalls bypass Detcore: {}",
+            missing
                 .iter()
-                .partition(|sysno| delivered.contains(sysno));
-            println!(
-                "subscriptions passthru_opt={passthru_opt}: {}/{m} Determinized syscalls \
-                 delivered to Detcore; {} bypass it",
-                reached.len(),
-                missing.len()
-            );
-            println!(
-                "  bypassing: {}",
-                missing
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
+                .map(|sysno| sysno.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            delivered.contains(&Sysno::syslog),
+            "syslog must reach its deterministic Detcore handler"
+        );
+    }
+
+    #[test]
+    fn passthru_opt_leaves_unlisted_passthrough_syscalls_unsubscribed() {
+        assert_eq!(
+            syscall_classification::classify_syscall(Sysno::chdir),
+            syscall_classification::SyscallClassification::PassThrough
+        );
+
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        assert!(
+            !subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::chdir),
+            "chdir is PassThrough and must remain outside the partial subscription"
+        );
     }
 
     #[test]
