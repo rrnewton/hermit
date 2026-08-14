@@ -329,6 +329,31 @@ impl Tool for Replayer {
             | Syscall::Utimensat(_) => self.handle_confined_path_mutation(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Other(Sysno::close_range, _) => self.handle_close_range(guest, syscall).await,
+            // FALLTHROUGH: THIS IS NOT A REPLAY. A syscall with no arm above is
+            // EXECUTED LIVE against the host during replay, and whatever the host
+            // answers at that moment becomes the guest's result -- the recording is
+            // not consulted.
+            //
+            // Measured on `backend-parity-c/poll-readiness`, which uses `pselect6`.
+            // No match arm above names it, so it lands here. Same syscall, same
+            // arguments, recording versus replay:
+            //
+            //     record: finish syscall #34: pselect6(4, 0x7fffffffc170, NULL, NULL, ...) = Ok(1)
+            //     replay: finish syscall #34: pselect6(4, 0x7fffffffc170, NULL, NULL, ...) = Ok(0)
+            //
+            // A replayed syscall returns its recorded value by definition, so a
+            // differing return proves live re-execution. The guest saw one fewer
+            // ready descriptor and printed `ok=7` where the recording printed
+            // `ok=8`. Its siblings `poll` and `ppoll` DO have arms and replay
+            // correctly, so the discriminator is membership in this table, not
+            // anything about the syscall itself.
+            //
+            // Consequence for anyone reading a green replay result: a passing
+            // record/replay comparison does not establish that every syscall was
+            // replayed. It establishes that the syscalls which ARE replayed agreed,
+            // and that any live-injected ones happened to answer the same way twice.
+            // Adding an arm above is what moves a syscall from the second class to
+            // the first.
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
