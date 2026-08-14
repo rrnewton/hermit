@@ -758,6 +758,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/thread-sync-determinism"
+    },
+    {
+      "backend": "ptrace",
       "category": "data-handling",
       "lane": "portable",
       "mode": "verify",

@@ -39717,7 +39717,7 @@
       "test": "c-programs/thread-sync-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
