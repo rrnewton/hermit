@@ -710,13 +710,31 @@ fn fcntl_advisory_set_lock_succeeds() {
 
 #[test]
 fn bound_port_survives_closing_dup_alias() {
-    det_test_fn_sequential_without_pmu(|| {
-        fn bind_loopback_ephemeral(fd: libc::c_int) -> libc::c_int {
+    const LINUX_PID_LIMIT_EXCLUSIVE: u32 = 1 << 22;
+
+    let host_pid = std::process::id();
+    assert!(
+        host_pid < LINUX_PID_LIMIT_EXCLUSIVE,
+        "host PID {host_pid} exceeds the 22-bit Linux PID limit"
+    );
+    let loopback_address = [
+        127,
+        0x80 | ((host_pid >> 16) as u8),
+        ((host_pid >> 8) & 0xff) as u8,
+        (host_pid & 0xff) as u8,
+    ];
+    // Every address in 127.0.0.0/8 is loopback on Linux. Use 127.128.0.0/10
+    // for this test, encoding every bit of Linux's 22-bit PID limit so
+    // independent host test processes do not bind the same address and port.
+    // Repetitions inside this test process retain one address and still exercise
+    // the same deterministic port sequence.
+    det_test_fn_sequential_without_pmu(move || {
+        fn bind_loopback(fd: libc::c_int, address_bytes: [u8; 4], port: u16) -> libc::c_int {
             let mut address = libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: 0,
+                sin_port: port.to_be(),
                 sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+                    s_addr: u32::from_ne_bytes(address_bytes),
                 },
                 sin_zero: [0; 8],
             };
@@ -729,31 +747,107 @@ fn bound_port_survives_closing_dup_alias() {
             }
         }
 
+        fn socket_name(fd: libc::c_int) -> ([u8; 4], u16) {
+            let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockname(
+                        fd,
+                        (&mut address as *mut libc::sockaddr_in).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert_eq!(length as usize, std::mem::size_of::<libc::sockaddr_in>());
+            assert_eq!(address.sin_family, libc::AF_INET as libc::sa_family_t);
+            (
+                address.sin_addr.s_addr.to_ne_bytes(),
+                address.sin_port.to_be(),
+            )
+        }
+
+        fn socket_option(fd: libc::c_int, option: libc::c_int) -> libc::c_int {
+            let mut value = 0;
+            let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        option,
+                        (&mut value as *mut libc::c_int).cast(),
+                        &mut length,
+                    )
+                },
+                0
+            );
+            assert_eq!(length as usize, std::mem::size_of::<libc::c_int>());
+            value
+        }
+
+        fn socket_identity(fd: libc::c_int) -> (libc::dev_t, libc::ino_t) {
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (stat.st_dev, stat.st_ino)
+        }
+
         let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(socket >= 0);
         let mut first_bound = false;
         for _ in 0..128 {
-            if bind_loopback_ephemeral(socket) == 0 {
+            if bind_loopback(socket, loopback_address, 0) == 0 {
                 first_bound = true;
                 break;
             }
             assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::EADDRINUSE);
         }
         assert!(first_bound, "no deterministic ephemeral port was available");
+        let first_name = socket_name(socket);
+        let first_identity = socket_identity(socket);
+        assert_eq!(first_name.0, loopback_address);
+        assert_ne!(first_name.1, 0);
 
         let duplicate = unsafe { libc::dup(socket) };
         assert!(duplicate >= 0);
+        assert_eq!(socket_identity(duplicate), first_identity);
         assert_eq!(unsafe { libc::close(socket) }, 0);
+
+        assert_ne!(unsafe { libc::fcntl(duplicate, libc::F_GETFD) }, -1);
+        assert_eq!(socket_identity(duplicate), first_identity);
+        assert_eq!(socket_name(duplicate), first_name);
+        assert_eq!(socket_option(duplicate, libc::SO_TYPE), libc::SOCK_STREAM);
+        assert_eq!(socket_option(duplicate, libc::SO_ERROR), 0);
 
         let second = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(second >= 0);
+        let second_bind = bind_loopback(second, loopback_address, 0);
+        let second_errno = (second_bind == -1).then(nix::errno::Errno::last);
         assert_eq!(
-            bind_loopback_ephemeral(second),
-            0,
-            "closing one dup alias must not free its bound port reservation"
+            second_bind, 0,
+            "closing one dup alias must not free its bound port reservation: {second_errno:?}"
+        );
+        let second_name = socket_name(second);
+        assert_eq!(second_name.0, loopback_address);
+        assert_ne!(second_name.1, first_name.1);
+        eprintln!(
+            "bound-port state after first alias close: first={:?}:{}, next={:?}:{}, second_bind={}, second_errno={:?}",
+            first_name.0, first_name.1, second_name.0, second_name.1, second_bind, second_errno
         );
 
         assert_eq!(unsafe { libc::close(duplicate) }, 0);
+
+        let reuse = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(reuse >= 0);
+        assert_eq!(
+            bind_loopback(reuse, loopback_address, first_name.1),
+            0,
+            "the kernel must release the bound port after the final alias closes"
+        );
+        assert_eq!(socket_name(reuse), first_name);
+
+        assert_eq!(unsafe { libc::close(reuse) }, 0);
         assert_eq!(unsafe { libc::close(second) }, 0);
     });
 }
