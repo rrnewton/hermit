@@ -45157,7 +45157,7 @@
       "test": "determinism-stress-c/thread-contention",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },

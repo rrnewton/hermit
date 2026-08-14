@@ -877,6 +877,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress-c/thread-contention"
+    },
+    {
+      "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
