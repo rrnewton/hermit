@@ -1,5 +1,5 @@
 #!/usr/bin/env -S rust-script --force
-//! Safely retry compatibility cells outside Hermit's committed green envelope.
+//! Safely retry red compatibility cells and repeat one committed green cell.
 //!
 //! ```cargo
 //! [dependencies]
@@ -89,6 +89,9 @@ Commands:
       is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
       manifest declares no seeds remains red but is unavailable: exact requests
       refuse it, while batches report and omit it rather than inventing a run.
+      Add --repetitions N to an exact currently green cell to run N independent
+      boxed checks against the same committed source. This reports flakiness;
+      it never edits or demotes the scorecard.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
@@ -106,6 +109,9 @@ Exact-cell options (run and plan):
   --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
   --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
                            an exact cell or --sample
+  --repetitions COUNT      Repeat one exact currently green cell concurrently.
+                           COUNT must be at least 2. Requires a clean commit and
+                           cannot be combined with --sample.
 
 Bounded-batch options (run and plan):
   --sample COUNT           Seeded random sample of red cells. Without --mode,
@@ -126,6 +132,11 @@ Examples:
   # Reproducibly sample ten red verify/replay/chaos cells, sixty seconds each.
   ./ci/compat-envelope/pressure-test.rs run \
     --sample 10 --seed 42 --cell-timeout 60
+
+  # Check one committed green cell 100 times under the same boxed limits.
+  ./ci/compat-envelope/pressure-test.rs run \
+    --test backend-parity-c/fork-exec-pipeline \
+    --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
 
   # Inspect the bounded plan without executing it.
   ./ci/compat-envelope/pressure-test.rs plan \
@@ -170,7 +181,7 @@ struct TrackedCell {
 }
 
 struct PressureCells {
-    red: Vec<TrackedCell>,
+    selected: Vec<TrackedCell>,
     unavailable: Vec<TrackedCell>,
     preparation_by_test: BTreeMap<String, CellId>,
 }
@@ -191,11 +202,29 @@ struct CellSelection {
     seed: Option<u64>,
     #[serde(default)]
     run_timeout_seconds: Option<i64>,
+    #[serde(default)]
+    repetitions: Option<usize>,
 }
 
 impl CellSelection {
     fn is_exact(&self) -> bool {
         self.test.is_some() && self.mode.is_some() && self.backend.is_some()
+    }
+
+    fn repeats_green_cell(&self) -> bool {
+        self.repetitions.is_some()
+    }
+
+    fn uses_shared_preparation(&self) -> bool {
+        !self.is_exact() || self.repeats_green_cell()
+    }
+
+    fn run_count(&self) -> usize {
+        self.repetitions.unwrap_or(1)
+    }
+
+    fn allows_dirty_source(&self) -> bool {
+        self.is_exact() && !self.repeats_green_cell()
     }
 }
 
@@ -450,6 +479,8 @@ struct RunMetadata {
     seed: Option<u64>,
     #[serde(default)]
     unavailable_cells: usize,
+    #[serde(default)]
+    repetitions: Option<usize>,
     cells: Vec<CellId>,
 }
 
@@ -507,7 +538,13 @@ fn run() -> Result<(), String> {
             let metadata = write_plan(&root, &results, &output, &selection)?;
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
-            println!("Cells: {}", metadata.cells.len());
+            println!(
+                "Cell runs: {}",
+                metadata
+                    .cells
+                    .len()
+                    .saturating_mul(metadata.repetitions.unwrap_or(1))
+            );
             print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
@@ -529,13 +566,13 @@ fn run() -> Result<(), String> {
                 );
             }
             let exact_cell = selection.is_exact();
-            if !exact_cell && worktree_dirty(&root)? {
+            if !selection.allows_dirty_source() && worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
             require_empty_result_dir(&results)?;
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
-            let fresh = if exact_cell {
+            let fresh = if selection.allows_dirty_source() {
                 eprintln!(
                     "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
                 );
@@ -766,6 +803,18 @@ fn result_options(
                     return Err("--run-timeout may be specified only once".into());
                 }
             }
+            "--repetitions" if allow_selection => {
+                let raw = args.next().ok_or("--repetitions requires a count")?;
+                let value = raw.parse::<usize>().map_err(|_| {
+                    format!("invalid --repetitions `{raw}`; expected an integer of at least 2")
+                })?;
+                if value < 2 {
+                    return Err("--repetitions must be at least 2".into());
+                }
+                if selection.repetitions.replace(value).is_some() {
+                    return Err("--repetitions may be specified only once".into());
+                }
+            }
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
@@ -788,6 +837,12 @@ fn result_options(
         return Err(
             "--sample and an exact --test/--mode/--backend cell are mutually exclusive".into(),
         );
+    }
+    if selection.repetitions.is_some() && !selection.is_exact() {
+        return Err("--repetitions requires an exact --test/--mode/--backend cell".into());
+    }
+    if selection.repetitions.is_some() && selection.sample.is_some() {
+        return Err("--repetitions and --sample are mutually exclusive".into());
     }
     if selection.seed.is_some() && selection.sample.is_none() {
         return Err("--seed requires --sample".into());
@@ -963,7 +1018,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         ));
     }
     let mut seen = BTreeSet::new();
-    let mut red = Vec::new();
+    let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
     let mut enabled_by_test = BTreeMap::new();
     for cell in tracked.cells {
@@ -991,7 +1046,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected => {
+            "red" if selected && !selection.repeats_green_cell() => {
                 let budget = budgets
                     .get(&(cell.id.test.clone(), cell.id.mode.clone()))
                     .ok_or_else(|| {
@@ -1001,7 +1056,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                         )
                     })?;
                 if budget.attempts.is_some() {
-                    red.push(cell);
+                    selected_cells.push(cell);
                 } else if selection.is_exact() {
                     return Err(format!(
                         "{}/{}/{} is red but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
@@ -1012,12 +1067,29 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
+            "green" if selected && selection.repeats_green_cell() && cell.enabled => {
+                let budget = budgets
+                    .get(&(cell.id.test.clone(), cell.id.mode.clone()))
+                    .ok_or_else(|| {
+                        format!(
+                            "no manifest execution budget for {}/{}",
+                            cell.id.test, cell.id.mode
+                        )
+                    })?;
+                if budget.attempts.is_none() {
+                    return Err(format!(
+                        "{}/{}/{} is green but its manifest has no executable attempt recipe",
+                        cell.id.test, cell.id.mode, cell.id.backend
+                    ));
+                }
+                selected_cells.push(cell);
+            }
             "green" => {}
             other => return Err(format!("unknown cell status `{other}`")),
         }
     }
-    red.sort_by(|left, right| left.id.cmp(&right.id));
-    if red.is_empty() {
+    selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
+    if selected_cells.is_empty() {
         if !unavailable.is_empty() {
             return Err(format!(
                 "the selected red population has no executable commands; {} chaos cell(s) are unavailable because their manifests declare no seeds",
@@ -1030,9 +1102,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selection.mode.as_deref(),
                 selection.backend.as_deref(),
             ) {
-                format!(
-                    "{test}/{mode}/{backend} is not a currently red tracked cell; use the scorecard or manifest CLI to inspect it"
-                )
+                if selection.repeats_green_cell() {
+                    format!(
+                        "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
+                    )
+                } else {
+                    format!(
+                        "{test}/{mode}/{backend} is not a currently red tracked cell; use the scorecard or manifest CLI to inspect it"
+                    )
+                }
             } else if let Some(mode) = selection.mode.as_deref() {
                 format!("tracked scorecard has no red cells for mode `{mode}`")
             } else {
@@ -1041,24 +1119,24 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         );
     }
     if let Some(count) = selection.sample {
-        if count > red.len() {
+        if count > selected_cells.len() {
             return Err(format!(
                 "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
-                red.len(),
+                selected_cells.len(),
                 unavailable.len()
             ));
         }
         let seed = selection.seed.expect("sample always has a seed");
-        red.sort_by(|left, right| {
+        selected_cells.sort_by(|left, right| {
             sample_score(&left.id, seed)
                 .cmp(&sample_score(&right.id, seed))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        red.truncate(count);
-        red.sort_by(|left, right| left.id.cmp(&right.id));
+        selected_cells.truncate(count);
+        selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
     }
     let mut preparation_by_test = BTreeMap::new();
-    for cell in &red {
+    for cell in &selected_cells {
         let prepared_with = enabled_by_test.get(&cell.id.test).ok_or_else(|| {
             format!(
                 "{} has no manifest-enabled mode available to build its fixture",
@@ -1070,7 +1148,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             .or_insert_with(|| prepared_with.clone());
     }
     Ok(PressureCells {
-        red,
+        selected: selected_cells,
         unavailable,
         preparation_by_test,
     })
@@ -1117,9 +1195,7 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
     decode_budgets(&output.stdout)
 }
 
-fn decode_budgets(
-    matrix_json: &[u8],
-) -> Result<BTreeMap<(String, String), CellBudget>, String> {
+fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellBudget>, String> {
     let rows: Vec<ManifestBudgetRow> = serde_json::from_slice(matrix_json)
         .map_err(|e| format!("manifest-plan emitted invalid matrix JSON: {e}"))?;
     if rows.is_empty() {
@@ -1203,6 +1279,7 @@ fn require_cell_occupancy_fits(
     budgets: &BTreeMap<(String, String), CellBudget>,
     selected_cap: Option<i64>,
     run_timeout_seconds: i64,
+    repetitions: usize,
 ) -> Result<(), String> {
     let mut all_seconds = 0_i64;
     let mut kvm_seconds = 0_i64;
@@ -1216,6 +1293,7 @@ fn require_cell_occupancy_fits(
                 )
             })?;
         let seconds = pressure_timeout(budget, selected_cap)?;
+        let seconds = seconds.saturating_mul(i64::try_from(repetitions).unwrap_or(i64::MAX));
         all_seconds = all_seconds.saturating_add(seconds);
         if tracked.id.backend == "kvm" {
             kvm_seconds = kvm_seconds.saturating_add(seconds);
@@ -1230,8 +1308,8 @@ fn require_cell_occupancy_fits(
     let occupancy_floor = guest_floor.max(kvm_seconds);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cells have at least {occupancy_floor}s of declared worst-case cell occupancy at manifest_guest=4/kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), or deliberately raise --run-timeout",
-            cells.len()
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at manifest_guest=4/kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            cells.len().saturating_mul(repetitions)
         ));
     }
     Ok(())
@@ -1310,26 +1388,51 @@ fn selected_cell_dependencies(
     deps
 }
 
-fn cell_status_path(results: &Path, cell: &CellId) -> PathBuf {
-    let slug = sanitize(&format!(
+fn base_cell_slug(cell: &CellId) -> String {
+    sanitize(&format!(
         "{}-{}-{}-{}-{}",
         cell.lane, cell.category, cell.test, cell.mode, cell.backend
-    ));
-    results.join("cells").join(slug).join("harness-status")
+    ))
+}
+
+fn repetition_numbers(repetitions: Option<usize>) -> Vec<Option<usize>> {
+    repetitions
+        .map(|count| (1..=count).map(Some).collect())
+        .unwrap_or_else(|| vec![None])
+}
+
+fn cell_run_slug(cell: &CellId, repetition: Option<usize>) -> String {
+    let base = base_cell_slug(cell);
+    repetition.map_or(base.clone(), |number| {
+        format!("{base}-repetition-{number:04}")
+    })
+}
+
+fn cell_status_path(results: &Path, cell: &CellId, repetition: Option<usize>) -> PathBuf {
+    results
+        .join("cells")
+        .join(cell_run_slug(cell, repetition))
+        .join("harness-status")
 }
 
 fn all_cells_attempted(results: &Path, metadata: &RunMetadata) -> bool {
-    metadata
-        .cells
-        .iter()
-        .all(|cell| cell_status_path(results, cell).is_file())
+    metadata.cells.iter().all(|cell| {
+        repetition_numbers(metadata.repetitions)
+            .into_iter()
+            .all(|repetition| cell_status_path(results, cell, repetition).is_file())
+    })
 }
 
 fn progress_marker_count(results: &Path, metadata: &RunMetadata) -> usize {
     let cell_markers = metadata
         .cells
         .iter()
-        .filter(|cell| cell_status_path(results, cell).is_file())
+        .flat_map(|cell| {
+            repetition_numbers(metadata.repetitions)
+                .into_iter()
+                .map(move |repetition| (cell, repetition))
+        })
+        .filter(|(cell, repetition)| cell_status_path(results, cell, *repetition).is_file())
         .count();
     let preparation_markers = fs::read_dir(results.join("prepare"))
         .into_iter()
@@ -1348,14 +1451,14 @@ fn write_plan(
 ) -> Result<RunMetadata, String> {
     check_scorecard(root)?;
     let PressureCells {
-        red: cells,
+        selected: cells,
         unavailable,
         preparation_by_test: all_preparations,
     } = pressure_cells(root, selection)?;
-    let preparation_by_test = if selection.is_exact() {
-        BTreeMap::new()
-    } else {
+    let preparation_by_test = if selection.uses_shared_preparation() {
         all_preparations
+    } else {
+        BTreeMap::new()
     };
     let budgets = load_budgets(root)?;
     let run_timeout_seconds = selection
@@ -1366,6 +1469,7 @@ fn write_plan(
         &budgets,
         selection.cell_timeout_seconds,
         run_timeout_seconds,
+        selection.run_count(),
     )?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
@@ -1378,7 +1482,7 @@ fn write_plan(
     let canonical =
         dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
     let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
-    let exact_cell = selection.is_exact().then(|| {
+    let lean_exact_cell = (selection.is_exact() && !selection.repeats_green_cell()).then(|| {
         (
             selection.mode.as_deref().expect("exact selection has mode"),
             selection
@@ -1387,13 +1491,13 @@ fn write_plan(
                 .expect("exact selection has backend"),
         )
     });
-    let required_builds = required_build_tags(exact_cell, includes_liteinst);
+    let required_builds = required_build_tags(lean_exact_cell, includes_liteinst);
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build = selection.is_exact()
+            let direct_backend_build = lean_exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
@@ -1405,7 +1509,7 @@ fn write_plan(
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
                 marker = shell_quote(&marker.to_string_lossy()),
             );
-            if selection.is_exact() && selection.backend.as_deref() != Some("liteinst") {
+            if lean_exact_cell.is_some() && selection.backend.as_deref() != Some("liteinst") {
                 step.deps.clear();
             }
             if direct_backend_build {
@@ -1501,67 +1605,65 @@ fn write_plan(
         let budget = budgets
             .get(&(cell.test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
-        let slug = sanitize(&format!(
-            "{}-{}-{}-{}-{}",
-            cell.lane, cell.category, cell.test, cell.mode, cell.backend
-        ));
-        let tag = format!("cell.{slug}");
-        let cell_dir = results.join("cells").join(&slug);
-        let result_file = cell_dir.join("results.jsonl");
-        let result_in_progress = cell_dir.join("results.in-progress.jsonl");
-        let junit = cell_dir.join("junit.xml");
-        let junit_in_progress = cell_dir.join("junit.in-progress.xml");
-        let status_file = cell_dir.join("harness-status");
-        let (selector, backend) = if tracked.enabled {
-            let backend = if cell.backend == "native" {
-                String::new()
+        for repetition in repetition_numbers(selection.repetitions) {
+            let slug = cell_run_slug(cell, repetition);
+            let tag = format!("cell.{slug}");
+            let cell_dir = results.join("cells").join(&slug);
+            let result_file = cell_dir.join("results.jsonl");
+            let result_in_progress = cell_dir.join("results.in-progress.jsonl");
+            let junit = cell_dir.join("junit.xml");
+            let junit_in_progress = cell_dir.join("junit.in-progress.xml");
+            let status_file = cell_dir.join("harness-status");
+            let (selector, backend) = if tracked.enabled {
+                let backend = if cell.backend == "native" {
+                    String::new()
+                } else {
+                    format!(" --backend {}", shell_quote(&cell.backend))
+                };
+                ("--include-manual", backend)
             } else {
-                format!(" --backend {}", shell_quote(&cell.backend))
+                (
+                    "--probe-disabled",
+                    format!(" --backend {}", shell_quote(&cell.backend)),
+                )
             };
-            ("--include-manual", backend)
-        } else {
-            (
-                "--probe-disabled",
-                format!(" --backend {}", shell_quote(&cell.backend)),
-            )
-        };
-        let preparation_guard = if selection.is_exact() {
-            String::new()
-        } else {
-            let preparation_status = results
-                .join("prepare")
-                .join(sanitize(&cell.test))
-                .join("status");
-            format!(
-                "if ! test \"$(cat {preparation_status} 2>/dev/null)\" = 0; then printf '{failed}\\n' > {status_file}; exit 0; fi; ",
-                preparation_status = shell_quote(&preparation_status.to_string_lossy()),
-                failed = PREPARATION_FAILED_STATUS,
-                status_file = shell_quote(&status_file.to_string_lossy()),
-            )
-        };
-        let harness = if selection.is_exact() {
-            format!(
-                "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
-                selector = selector,
-                test = shell_quote(&cell.test),
-                mode = shell_quote(&cell.mode),
-                backend = backend,
-                result_file = shell_quote(&result_in_progress.to_string_lossy()),
-                junit = shell_quote(&junit_in_progress.to_string_lossy()),
-            )
-        } else {
-            format!(
-                "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
-                selector = selector,
-                test = shell_quote(&cell.test),
-                mode = shell_quote(&cell.mode),
-                backend = backend,
-                result_file = shell_quote(&result_in_progress.to_string_lossy()),
-                junit = shell_quote(&junit_in_progress.to_string_lossy()),
-            )
-        };
-        let cmd = format!(
-            "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
+            let preparation_guard = if selection.uses_shared_preparation() {
+                let preparation_status = results
+                    .join("prepare")
+                    .join(sanitize(&cell.test))
+                    .join("status");
+                format!(
+                    "if ! test \"$(cat {preparation_status} 2>/dev/null)\" = 0; then printf '{failed}\\n' > {status_file}; exit 0; fi; ",
+                    preparation_status = shell_quote(&preparation_status.to_string_lossy()),
+                    failed = PREPARATION_FAILED_STATUS,
+                    status_file = shell_quote(&status_file.to_string_lossy()),
+                )
+            } else {
+                String::new()
+            };
+            let harness = if selection.allows_dirty_source() {
+                format!(
+                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    selector = selector,
+                    test = shell_quote(&cell.test),
+                    mode = shell_quote(&cell.mode),
+                    backend = backend,
+                    result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                    junit = shell_quote(&junit_in_progress.to_string_lossy()),
+                )
+            } else {
+                format!(
+                    "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    selector = selector,
+                    test = shell_quote(&cell.test),
+                    mode = shell_quote(&cell.mode),
+                    backend = backend,
+                    result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                    junit = shell_quote(&junit_in_progress.to_string_lossy()),
+                )
+            };
+            let cmd = format!(
+                "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
              env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
              E2E_KEEP_VERIFY_LOGS=1 \
@@ -1570,73 +1672,89 @@ fn write_plan(
              if test -e {result_in_progress}; then mv -- {result_in_progress} {result_file} || status=$?; fi; \
              if test -e {junit_in_progress}; then mv -- {junit_in_progress} {junit} || status=$?; fi; \
              printf '%s\\n' \"$status\" > {status_file}; exit \"$status\"",
-            cell_dir = shell_quote(&cell_dir.to_string_lossy()),
-            results = shell_quote(&results.to_string_lossy()),
-            build_root = shell_quote(&build_root.to_string_lossy()),
-            run_id = shell_quote(&slug),
-            harness = harness,
-            result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
-            result_file = shell_quote(&result_file.to_string_lossy()),
-            junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
-            junit = shell_quote(&junit.to_string_lossy()),
-            status_file = shell_quote(&status_file.to_string_lossy()),
-            incomplete = INCOMPLETE_ATTEMPT_STATUS,
-            preparation_guard = preparation_guard,
-        );
-        let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
-        cell_timeouts.insert(tag.clone(), wall);
-        // KVM's canonical privileged nodes are boxed at 16 GiB even when the
-        // manifest cell itself is in the portable lane. Preserve that safety
-        // boundary here; a 3 GiB generic portable cap kills the VM before its
-        // compatibility result exists.
-        let memory = if cell.lane == "privileged" || cell.backend == "kvm" {
-            16_i64 * 1024 * 1024 * 1024
-        } else {
-            3_i64 * 1024 * 1024 * 1024
-        };
-        let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
-        if cell.backend == "kvm" {
-            resources.insert("kvm".into(), 1);
+                cell_dir = shell_quote(&cell_dir.to_string_lossy()),
+                results = shell_quote(&results.to_string_lossy()),
+                build_root = shell_quote(&build_root.to_string_lossy()),
+                run_id = shell_quote(&slug),
+                harness = harness,
+                result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
+                result_file = shell_quote(&result_file.to_string_lossy()),
+                junit_in_progress = shell_quote(&junit_in_progress.to_string_lossy()),
+                junit = shell_quote(&junit.to_string_lossy()),
+                status_file = shell_quote(&status_file.to_string_lossy()),
+                incomplete = INCOMPLETE_ATTEMPT_STATUS,
+                preparation_guard = preparation_guard,
+            );
+            let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+            cell_timeouts.insert(tag.clone(), wall);
+            // KVM's canonical privileged nodes are boxed at 16 GiB even when the
+            // manifest cell itself is in the portable lane. Preserve that safety
+            // boundary here; a 3 GiB generic portable cap kills the VM before its
+            // compatibility result exists.
+            let memory = if cell.lane == "privileged" || cell.backend == "kvm" {
+                16_i64 * 1024 * 1024 * 1024
+            } else {
+                3_i64 * 1024 * 1024 * 1024
+            };
+            let mut resources = BTreeMap::from([("manifest_guest".into(), 1)]);
+            if cell.backend == "kvm" {
+                resources.insert("kvm".into(), 1);
+            }
+            let deps = selected_cell_dependencies(
+                !selection.uses_shared_preparation(),
+                &cell.mode,
+                &cell.backend,
+                preparation_tags.get(&cell.test).map(String::as_str),
+            );
+            steps.push(Step {
+                group: "cell".into(),
+                job: slug,
+                desc: if let Some(number) = repetition {
+                    format!(
+                        "Repeat green cell {}/{}/{}@{} ({number}/{})",
+                        cell.test,
+                        cell.mode,
+                        cell.backend,
+                        cell.lane,
+                        selection.run_count()
+                    )
+                } else {
+                    format!(
+                        "Attempt red cell {}/{}/{}@{}",
+                        cell.test, cell.mode, cell.backend, cell.lane
+                    )
+                },
+                description: String::new(),
+                cmd,
+                deps,
+                env: BTreeMap::new(),
+                hint: ResourceHint {
+                    resources,
+                    rss_baseline_bytes: Some(memory / 3),
+                    hard_mem_max_bytes: Some(memory),
+                    classification: StepClass::LatencyBound,
+                    ..ResourceHint::default()
+                },
+                networkonly: false,
+                engine_only: false,
+                timeout: wall,
+                cpu_timeout: wall * 2,
+                jobs_flag: None,
+                skip_reason: None,
+            });
+            cell_tags.push(tag);
         }
-        let deps = selected_cell_dependencies(
-            selection.is_exact(),
-            &cell.mode,
-            &cell.backend,
-            preparation_tags.get(&cell.test).map(String::as_str),
-        );
-        steps.push(Step {
-            group: "cell".into(),
-            job: slug,
-            desc: format!(
-                "Attempt red cell {}/{}/{}@{}",
-                cell.test, cell.mode, cell.backend, cell.lane
-            ),
-            description: String::new(),
-            cmd,
-            deps,
-            env: BTreeMap::new(),
-            hint: ResourceHint {
-                resources,
-                rss_baseline_bytes: Some(memory / 3),
-                hard_mem_max_bytes: Some(memory),
-                classification: StepClass::LatencyBound,
-                ..ResourceHint::default()
-            },
-            networkonly: false,
-            engine_only: false,
-            timeout: wall,
-            cpu_timeout: wall * 2,
-            jobs_flag: None,
-            skip_reason: None,
-        });
-        cell_tags.push(tag);
     }
 
     steps.push(Step {
         group: "pressure".into(),
         job: "summarize".into(),
-        desc: "Wait for every red-cell attempt before the outer command reads retained runner evidence"
-            .into(),
+        desc: if selection.repeats_green_cell() {
+            "Wait for every repeated green-cell check before reading retained runner evidence"
+                .into()
+        } else {
+            "Wait for every red-cell attempt before reading retained runner evidence".into()
+        },
         description: String::new(),
         cmd: "true".into(),
         deps: cell_tags,
@@ -1665,13 +1783,19 @@ fn write_plan(
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
-    audit_dag(&dag, cells.len(), run_timeout_seconds, &cell_timeouts)?;
+    let expected_runs = cells.len().saturating_mul(selection.run_count());
+    audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts)?;
     let mut dag_text = dag_to_json(&dag);
     dag_text.push('\n');
     let reparsed = dag_from_json(&dag_text)
         .map_err(|e| format!("generated pressure DAG does not parse: {e}"))?;
     assert_plan_round_trip(&dag, &reparsed)?;
-    audit_dag(&reparsed, cells.len(), run_timeout_seconds, &cell_timeouts)?;
+    audit_dag(
+        &reparsed,
+        expected_runs,
+        run_timeout_seconds,
+        &cell_timeouts,
+    )?;
     let retained_output = results.join("dag.json");
     fs::write(&retained_output, &dag_text)
         .map_err(|e| format!("cannot write {}: {e}", retained_output.display()))?;
@@ -1696,6 +1820,7 @@ fn write_plan(
         sample: selection.sample,
         seed: selection.seed,
         unavailable_cells: unavailable.len(),
+        repetitions: selection.repetitions,
         cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -1845,6 +1970,9 @@ fn validate_run_contract(
     if metadata.source_tree_dirty && !allow_dirty_exact_cell {
         return Err("pressure run metadata claims a dirty source tree".into());
     }
+    if metadata.source_tree_dirty && metadata.repetitions.is_some() {
+        return Err("repeated green-cell results require a clean committed source tree".into());
+    }
     let detcore_tree = git_output(root, &["rev-parse", "HEAD:detcore"])?;
     if detcore_tree != metadata.detcore_tree {
         return Err(format!(
@@ -1861,6 +1989,7 @@ fn validate_run_contract(
         sample: metadata.sample,
         seed: metadata.seed,
         run_timeout_seconds: Some(metadata.run_timeout_seconds),
+        repetitions: metadata.repetitions,
     };
     let pressure_cells = pressure_cells(root, &selection)?;
     if metadata.unavailable_cells != pressure_cells.unavailable.len() {
@@ -1870,7 +1999,7 @@ fn validate_run_contract(
             pressure_cells.unavailable.len()
         ));
     }
-    let expected_cells = pressure_cells.red;
+    let expected_cells = pressure_cells.selected;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
         if expected.insert(tracked.id, tracked.enabled).is_some() {
@@ -1894,7 +2023,7 @@ fn validate_run_contract(
             .map(display_id)
             .unwrap_or_else(|| "none".into());
         return Err(format!(
-            "run metadata does not match the current red population: expected={} actual={} first_missing={} first_extra={}",
+            "run metadata does not match the current selected population: expected={} actual={} first_missing={} first_extra={}",
             expected_ids.len(),
             actual.len(),
             missing,
@@ -1913,21 +2042,18 @@ fn validate_run_contract(
         let budget = budgets
             .get(&(cell.test.clone(), cell.mode.clone()))
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
-        let tag = format!(
-            "cell.{}",
-            sanitize(&format!(
-                "{}-{}-{}-{}-{}",
-                cell.lane, cell.category, cell.test, cell.mode, cell.backend
-            ))
-        );
-        expected_cell_timeouts.insert(
-            tag,
-            pressure_timeout(budget, metadata.cell_timeout_seconds)?,
-        );
+        for repetition in repetition_numbers(metadata.repetitions) {
+            expected_cell_timeouts.insert(
+                format!("cell.{}", cell_run_slug(cell, repetition)),
+                pressure_timeout(budget, metadata.cell_timeout_seconds)?,
+            );
+        }
     }
     audit_dag(
         &dag,
-        expected.len(),
+        expected
+            .len()
+            .saturating_mul(metadata.repetitions.unwrap_or(1)),
         metadata.run_timeout_seconds,
         &expected_cell_timeouts,
     )?;
@@ -1939,11 +2065,10 @@ fn validate_run_contract(
         .collect();
     let expected_jobs: BTreeSet<_> = expected
         .keys()
-        .map(|cell| {
-            sanitize(&format!(
-                "{}-{}-{}-{}-{}",
-                cell.lane, cell.category, cell.test, cell.mode, cell.backend
-            ))
+        .flat_map(|cell| {
+            repetition_numbers(metadata.repetitions)
+                .into_iter()
+                .map(move |repetition| cell_run_slug(cell, repetition))
         })
         .collect();
     if dag_cells != expected_jobs {
@@ -2190,11 +2315,7 @@ fn classify_result(
     }
 }
 
-fn verification_report_path(results: &Path, cell: &CellId) -> PathBuf {
-    let run_id = sanitize(&format!(
-        "{}-{}-{}-{}-{}",
-        cell.lane, cell.category, cell.test, cell.mode, cell.backend
-    ));
+fn verification_report_path(results: &Path, cell: &CellId, run_id: &str) -> PathBuf {
     let harness_cell = format!(
         "{}-{}-{}",
         cell.test.replace('/', "-"),
@@ -2208,11 +2329,15 @@ fn verification_report_path(results: &Path, cell: &CellId) -> PathBuf {
         .join("verify-1.json")
 }
 
-fn retained_verification_logs(results: &Path, cell: &CellId) -> Result<Vec<String>, String> {
+fn retained_verification_logs(
+    results: &Path,
+    cell: &CellId,
+    run_id: &str,
+) -> Result<Vec<String>, String> {
     if cell.mode != "verify" {
         return Ok(Vec::new());
     }
-    let directory = verification_report_path(results, cell)
+    let directory = verification_report_path(results, cell, run_id)
         .parent()
         .expect("verification report has a parent")
         .join("verify-logs")
@@ -2277,11 +2402,15 @@ fn retained_verification_logs(results: &Path, cell: &CellId) -> Result<Vec<Strin
     Ok(run1.into_iter().chain(run2).collect())
 }
 
-fn normalized_ptrace_golden(results: &Path, cell: &CellId) -> Result<Option<String>, String> {
+fn normalized_ptrace_golden(
+    results: &Path,
+    cell: &CellId,
+    run_id: &str,
+) -> Result<Option<String>, String> {
     if cell.mode != "verify" || cell.backend != "ptrace" {
         return Ok(None);
     }
-    let directory = verification_report_path(results, cell)
+    let directory = verification_report_path(results, cell, run_id)
         .parent()
         .expect("verification report has a parent")
         .join("verify-logs")
@@ -2328,11 +2457,15 @@ fn normalized_ptrace_golden(results: &Path, cell: &CellId) -> Result<Option<Stri
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-fn read_verification_report(results: &Path, cell: &CellId) -> Result<Option<JsonValue>, String> {
+fn read_verification_report(
+    results: &Path,
+    cell: &CellId,
+    run_id: &str,
+) -> Result<Option<JsonValue>, String> {
     if !matches!(cell.mode.as_str(), "verify" | "replay") {
         return Ok(None);
     }
-    let path = verification_report_path(results, cell);
+    let path = verification_report_path(results, cell, run_id);
     if !path.is_file() {
         return Ok(None);
     }
@@ -2418,206 +2551,210 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
     let mut passing = Vec::new();
     let mut rows = Vec::new();
     for cell in &metadata.cells {
-        let slug = sanitize(&format!(
-            "{}-{}-{}-{}-{}",
-            cell.lane, cell.category, cell.test, cell.mode, cell.backend
-        ));
-        let cell_dir = results.join("cells").join(&slug);
-        let step_tag = format!("cell.{slug}");
-        let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
-        let mut evidence_errors = Vec::new();
-        let status_file = cell_dir.join("harness-status");
-        let harness_status = if status_file.is_file() {
-            match fs::read_to_string(&status_file) {
-                Ok(text) => {
-                    let text = text.trim();
-                    match text.parse::<i32>() {
-                        Ok(status) => Some(status),
-                        Err(_) => {
-                            evidence_errors.push(format!(
-                                "{} contains nonnumeric harness exit `{text}`",
-                                status_file.display()
-                            ));
-                            None
+        for repetition in repetition_numbers(metadata.repetitions) {
+            let slug = cell_run_slug(cell, repetition);
+            let cell_dir = results.join("cells").join(&slug);
+            let step_tag = format!("cell.{slug}");
+            let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
+            let mut evidence_errors = Vec::new();
+            let status_file = cell_dir.join("harness-status");
+            let harness_status = if status_file.is_file() {
+                match fs::read_to_string(&status_file) {
+                    Ok(text) => {
+                        let text = text.trim();
+                        match text.parse::<i32>() {
+                            Ok(status) => Some(status),
+                            Err(_) => {
+                                evidence_errors.push(format!(
+                                    "{} contains nonnumeric harness exit `{text}`",
+                                    status_file.display()
+                                ));
+                                None
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    evidence_errors.push(format!(
-                        "cannot read harness exit {}: {error}",
-                        status_file.display()
-                    ));
-                    None
-                }
-            }
-        } else {
-            evidence_errors.push(format!(
-                "red-cell node wrote no attempt marker at {}",
-                status_file.display()
-            ));
-            None
-        };
-        let proven_oom = is_proven_oom_attempt(runner, harness_status);
-        let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
-        let result_file = cell_dir.join("results.jsonl");
-        let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
-            match fs::read_to_string(&result_file) {
-                Ok(text) => {
-                    let lines: Vec<_> = text
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .collect();
-                    if lines.len() != 1 {
+                    Err(error) => {
                         evidence_errors.push(format!(
-                            "{} contains {} nonempty rows; expected exactly one",
-                            result_file.display(),
-                            lines.len()
+                            "cannot read harness exit {}: {error}",
+                            status_file.display()
                         ));
-                        ("NO_RESULT".to_string(), false, None, None)
-                    } else {
-                        match serde_json::from_str::<ResultRow>(lines[0]) {
-                            Ok(row) => {
-                                let row_matches = result_row_matches_cell(
-                                    &row,
-                                    &slug,
-                                    &metadata,
-                                    cell,
-                                    expected.get(cell).copied().unwrap_or(false),
-                                    harness_status,
-                                );
-                                let runner_completed =
-                                    runner_observed_terminal_attempt(runner, harness_status);
-                                if row_matches && (proven_oom || runner_completed) {
-                                    (row.outcome, true, row.reason, row.error_kind)
-                                } else {
-                                    evidence_errors.push(format!(
+                        None
+                    }
+                }
+            } else {
+                evidence_errors.push(format!(
+                    "selected cell node wrote no attempt marker at {}",
+                    status_file.display()
+                ));
+                None
+            };
+            let proven_oom = is_proven_oom_attempt(runner, harness_status);
+            let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
+            let result_file = cell_dir.join("results.jsonl");
+            let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
+                match fs::read_to_string(&result_file) {
+                    Ok(text) => {
+                        let lines: Vec<_> = text
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .collect();
+                        if lines.len() != 1 {
+                            evidence_errors.push(format!(
+                                "{} contains {} nonempty rows; expected exactly one",
+                                result_file.display(),
+                                lines.len()
+                            ));
+                            ("NO_RESULT".to_string(), false, None, None)
+                        } else {
+                            match serde_json::from_str::<ResultRow>(lines[0]) {
+                                Ok(row) => {
+                                    let row_matches = result_row_matches_cell(
+                                        &row,
+                                        &slug,
+                                        &metadata,
+                                        cell,
+                                        expected.get(cell).copied().unwrap_or(false),
+                                        harness_status,
+                                    );
+                                    let runner_completed =
+                                        runner_observed_terminal_attempt(runner, harness_status);
+                                    if row_matches && (proven_oom || runner_completed) {
+                                        (row.outcome, true, row.reason, row.error_kind)
+                                    } else {
+                                        evidence_errors.push(format!(
                                         "{} does not match the selected cell, harness exit, or retained runner result",
+                                        result_file.display()
+                                    ));
+                                        ("NO_RESULT".to_string(), false, None, None)
+                                    }
+                                }
+                                Err(error) => {
+                                    evidence_errors.push(format!(
+                                        "invalid result row {}: {error}",
                                         result_file.display()
                                     ));
                                     ("NO_RESULT".to_string(), false, None, None)
                                 }
                             }
-                            Err(error) => {
-                                evidence_errors.push(format!(
-                                    "invalid result row {}: {error}",
-                                    result_file.display()
-                                ));
-                                ("NO_RESULT".to_string(), false, None, None)
-                            }
                         }
                     }
+                    Err(error) => {
+                        evidence_errors.push(format!(
+                            "cannot read result row {}: {error}",
+                            result_file.display()
+                        ));
+                        ("NO_RESULT".to_string(), false, None, None)
+                    }
                 }
-                Err(error) => {
+            } else if !proven_oom && !proven_timeout {
+                evidence_errors.push(format!("missing result row {}", result_file.display()));
+                ("NO_RESULT".to_string(), false, None, None)
+            } else {
+                ("NO_RESULT".to_string(), false, None, None)
+            };
+            let verification = match read_verification_report(results, cell, &slug) {
+                Ok(Some(report)) => Some(report),
+                Ok(None)
+                    if matches!(cell.mode.as_str(), "verify" | "replay")
+                        && !proven_oom
+                        && !proven_timeout =>
+                {
                     evidence_errors.push(format!(
-                        "cannot read result row {}: {error}",
-                        result_file.display()
+                        "missing verification report {}",
+                        verification_report_path(results, cell, &slug).display()
                     ));
-                    ("NO_RESULT".to_string(), false, None, None)
+                    None
                 }
-            }
-        } else if !proven_oom && !proven_timeout {
-            evidence_errors.push(format!("missing result row {}", result_file.display()));
-            ("NO_RESULT".to_string(), false, None, None)
-        } else {
-            ("NO_RESULT".to_string(), false, None, None)
-        };
-        let verification = match read_verification_report(results, cell) {
-            Ok(Some(report)) => Some(report),
-            Ok(None)
-                if matches!(cell.mode.as_str(), "verify" | "replay")
-                    && !proven_oom
-                    && !proven_timeout =>
+                Ok(None) => None,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    None
+                }
+            };
+            let verification_verdict = verification
+                .as_ref()
+                .and_then(|report| report.get("verdict"))
+                .and_then(JsonValue::as_str);
+            let verification_logs = match retained_verification_logs(results, cell, &slug) {
+                Ok(logs) => logs,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    Vec::new()
+                }
+            };
+            let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell, &slug) {
+                Ok(path) => path,
+                Err(error) => {
+                    evidence_errors.push(error);
+                    None
+                }
+            };
+            if cell.mode == "verify"
+                && matches!(verification_verdict, Some("matched" | "diverged"))
+                && verification_logs.len() != 2
             {
-                evidence_errors.push(format!(
-                    "missing verification report {}",
-                    verification_report_path(results, cell).display()
-                ));
-                None
-            }
-            Ok(None) => None,
-            Err(error) => {
-                evidence_errors.push(error);
-                None
-            }
-        };
-        let verification_verdict = verification
-            .as_ref()
-            .and_then(|report| report.get("verdict"))
-            .and_then(JsonValue::as_str);
-        let verification_logs = match retained_verification_logs(results, cell) {
-            Ok(logs) => logs,
-            Err(error) => {
-                evidence_errors.push(error);
-                Vec::new()
-            }
-        };
-        let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell) {
-            Ok(path) => path,
-            Err(error) => {
-                evidence_errors.push(error);
-                None
-            }
-        };
-        if cell.mode == "verify"
-            && matches!(verification_verdict, Some("matched" | "diverged"))
-            && verification_logs.len() != 2
-        {
-            evidence_errors.push(
+                evidence_errors.push(
                 "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
                     .into(),
             );
+            }
+            if cell.mode == "verify"
+                && cell.backend == "ptrace"
+                && matches!(verification_verdict, Some("matched" | "diverged"))
+                && normalized_ptrace_golden.is_none()
+                && !evidence_errors
+                    .iter()
+                    .any(|error| error.contains("golden-log normalization"))
+            {
+                evidence_errors
+                    .push("terminal ptrace verify result has no normalized golden INFO log".into());
+            }
+            let result = classify_result(
+                runner,
+                harness_status,
+                &outcome,
+                row_valid,
+                reason.as_deref(),
+                &cell.mode,
+                verification_verdict,
+                verification_logs.len() == 2,
+                evidence_errors.is_empty(),
+            );
+            *by_backend
+                .entry(cell.backend.clone())
+                .or_default()
+                .entry(result.to_string())
+                .or_default() += 1;
+            if result == "pass" {
+                passing.push(display_id(cell));
+            }
+            rows.push(json!({
+                "cell": cell,
+                "repetition": repetition,
+                "harness_exit": harness_status,
+                "outcome": outcome,
+                "reason": reason,
+                "error_kind": error_kind,
+                "result_row_valid": row_valid,
+                "result": result,
+                "verification": verification,
+                "verification_logs": verification_logs,
+                "normalized_ptrace_golden": normalized_ptrace_golden,
+                "evidence_errors": evidence_errors,
+                "runner_seen": runner.seen,
+                "runner_ok": runner.ok,
+                "runner_timed_out": runner.timed_out,
+                "runner_oom": runner.oom,
+                "oom_proven_by_runner_and_attempt_marker": proven_oom,
+                "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
+            }));
         }
-        if cell.mode == "verify"
-            && cell.backend == "ptrace"
-            && matches!(verification_verdict, Some("matched" | "diverged"))
-            && normalized_ptrace_golden.is_none()
-            && !evidence_errors
-                .iter()
-                .any(|error| error.contains("golden-log normalization"))
-        {
-            evidence_errors
-                .push("terminal ptrace verify result has no normalized golden INFO log".into());
-        }
-        let result = classify_result(
-            runner,
-            harness_status,
-            &outcome,
-            row_valid,
-            reason.as_deref(),
-            &cell.mode,
-            verification_verdict,
-            verification_logs.len() == 2,
-            evidence_errors.is_empty(),
-        );
-        *by_backend
-            .entry(cell.backend.clone())
-            .or_default()
-            .entry(result.to_string())
-            .or_default() += 1;
-        if result == "pass" {
-            passing.push(display_id(cell));
-        }
-        rows.push(json!({
-            "cell": cell,
-            "harness_exit": harness_status,
-            "outcome": outcome,
-            "reason": reason,
-            "error_kind": error_kind,
-            "result_row_valid": row_valid,
-            "result": result,
-            "verification": verification,
-            "verification_logs": verification_logs,
-            "normalized_ptrace_golden": normalized_ptrace_golden,
-            "evidence_errors": evidence_errors,
-            "runner_seen": runner.seen,
-            "runner_ok": runner.ok,
-            "runner_timed_out": runner.timed_out,
-            "runner_oom": runner.oom,
-            "oom_proven_by_runner_and_attempt_marker": proven_oom,
-            "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
-        }));
     }
-    println!("# Red-cell pressure-test results");
+    if metadata.repetitions.is_some() {
+        println!("# Repeated green-cell results");
+    } else {
+        println!("# Red-cell pressure-test results");
+    }
     println!();
     println!(
         "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
@@ -2665,7 +2802,10 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         "Crash/error combines remaining nonzero harness exits. It includes signal-caused crashes when the shell reports a nonzero status; this runner does not yet distinguish the signal."
     );
     println!();
-    if metadata.cells.len() == 1 && matches!(metadata.cells[0].mode.as_str(), "verify" | "replay") {
+    if metadata.repetitions.is_none()
+        && metadata.cells.len() == 1
+        && matches!(metadata.cells[0].mode.as_str(), "verify" | "replay")
+    {
         let verification = &rows[0]["verification"];
         if verification.is_object() {
             println!(
@@ -2679,13 +2819,29 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         }
         println!();
     }
-    println!(
-        "{} red cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
-        passing.len()
-    );
-    for id in passing.iter().take(20) {
-        println!("  PASS {id}");
-    }
+    let repeated_result = if metadata.repetitions.is_some() {
+        let result = if totals[0] == totals[7] {
+            "passed every repetition"
+        } else if totals[0] == 0 {
+            "failed every repetition"
+        } else {
+            "flaky"
+        };
+        println!(
+            "Repeated result: {}/{} passed; {result}.",
+            totals[0], totals[7]
+        );
+        Some(result)
+    } else {
+        println!(
+            "{} red cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
+            passing.len()
+        );
+        for id in passing.iter().take(20) {
+            println!("  PASS {id}");
+        }
+        None
+    };
 
     let summary = json!({
         "schema": RUN_SCHEMA,
@@ -2699,7 +2855,9 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
         "sample": metadata.sample,
         "seed": metadata.seed,
         "unavailable_cells": metadata.unavailable_cells,
-        "attempted": metadata.cells.len(),
+        "repetitions": metadata.repetitions,
+        "repeated_result": repeated_result,
+        "attempted": rows.len(),
         "pass_candidates": passing,
         "rows": rows,
     });
@@ -2711,8 +2869,14 @@ fn summarize(root: &Path, results: &Path, allow_dirty_exact_cell: bool) -> Resul
     println!("Summary: {}", results.join("summary.json").display());
     if totals[6] > 0 {
         return Err(format!(
-            "{} selected cell(s) produced no trustworthy result; these are harness/infrastructure errors, not evidence that the cells are red",
+            "{} selected cell run(s) produced no trustworthy result; these are harness/infrastructure errors, not compatibility evidence",
             totals[6]
+        ));
+    }
+    if metadata.repetitions.is_some() && totals[0] != totals[7] {
+        return Err(format!(
+            "only {}/{} repeated green-cell checks passed; the retained summary classifies every non-pass",
+            totals[0], totals[7]
         ));
     }
     Ok(())
@@ -3039,7 +3203,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .clone();
     if unavailable_id.mode != "chaos"
         || unfiltered
-            .red
+            .selected
             .iter()
             .any(|tracked| tracked.id == unavailable_id)
     {
@@ -3063,10 +3227,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         ));
     }
     let exact_id = unfiltered
-        .red
+        .selected
         .iter()
         .find(|tracked| tracked.id.backend == "ptrace" && tracked.id.mode == "verify")
-        .or_else(|| unfiltered.red.first())
+        .or_else(|| unfiltered.selected.first())
         .ok_or("self-test needs at least one red compatibility cell")?
         .id
         .clone();
@@ -3407,10 +3571,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("seeded cell sampling lost its identity or seed sensitivity".into());
     }
 
-    let sample_slug = sanitize(&format!(
-        "{}-{}-{}-{}-{}",
-        sample_a.lane, sample_a.category, sample_a.test, sample_a.mode, sample_a.backend
-    ));
+    let sample_slug = base_cell_slug(&sample_a);
     let sample_metadata = RunMetadata {
         schema: RUN_SCHEMA,
         hermit_sha: "abc".into(),
@@ -3424,6 +3585,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         sample: None,
         seed: None,
         unavailable_cells: 0,
+        repetitions: None,
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
@@ -3463,10 +3625,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("foreign retained result-row identity was accepted".into());
     }
 
-    if !retained_verification_logs(&scratch, &sample_a)?.is_empty() {
+    if !retained_verification_logs(&scratch, &sample_a, &sample_slug)?.is_empty() {
         return Err("missing verify-log directory produced retained logs".into());
     }
-    let verification_path = verification_report_path(&scratch, &sample_a);
+    let verification_path = verification_report_path(&scratch, &sample_a, &sample_slug);
     let verification_directory = verification_path
         .parent()
         .expect("verification path has parent");
@@ -3477,24 +3639,24 @@ fn self_test(root: &Path) -> Result<(), String> {
     let run2_log = verify_log_directory.join("run2_log_fixture.log");
     fs::write(&run1_log, "run one\n")
         .map_err(|e| format!("cannot write run1 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a).is_ok() {
+    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("retained verify-log evidence accepted a missing run2 capture".into());
     }
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot write run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a)?.len() != 2 {
+    if retained_verification_logs(&scratch, &sample_a, &sample_slug)?.len() != 2 {
         return Err("one nonempty run1/run2 verify-log pair was refused".into());
     }
     let duplicate_run1 = verify_log_directory.join("run1_log_duplicate.log");
     fs::write(&duplicate_run1, "duplicate\n")
         .map_err(|e| format!("cannot write duplicate run1 fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a).is_ok() {
+    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("duplicate retained run1 verify-log capture was accepted".into());
     }
     fs::remove_file(&duplicate_run1)
         .map_err(|e| format!("cannot remove duplicate run1 fixture: {e}"))?;
     fs::write(&run2_log, "").map_err(|e| format!("cannot empty run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&scratch, &sample_a).is_ok() {
+    if retained_verification_logs(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("empty retained run2 verify-log capture was accepted".into());
     }
     fs::write(&run2_log, "run two\n")
@@ -3502,35 +3664,35 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     let golden_status = verify_log_directory.join("normalized-ptrace-golden.status");
     let golden_log = verify_log_directory.join("normalized-ptrace-golden.log");
-    if normalized_ptrace_golden(&scratch, &sample_a)?.is_some() {
+    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug)?.is_some() {
         return Err("absent normalized ptrace golden produced an artifact".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot write normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a).is_ok() {
+    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("normalized ptrace golden without status was accepted".into());
     }
     fs::remove_file(&golden_log)
         .map_err(|e| format!("cannot remove normalized golden fixture: {e}"))?;
     fs::write(&golden_status, "0\n")
         .map_err(|e| format!("cannot write normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a).is_ok() {
+    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("normalized ptrace golden status without output was accepted".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot restore normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a)?.is_none() {
+    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug)?.is_none() {
         return Err("complete normalized ptrace golden output/status pair was refused".into());
     }
     fs::write(&golden_status, "not-a-status\n")
         .map_err(|e| format!("cannot mutate normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&scratch, &sample_a).is_ok() {
+    if normalized_ptrace_golden(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("nonnumeric normalized ptrace golden status was accepted".into());
     }
 
     fs::write(&verification_path, "{")
         .map_err(|e| format!("cannot write malformed verification fixture: {e}"))?;
-    if read_verification_report(&scratch, &sample_a).is_ok() {
+    if read_verification_report(&scratch, &sample_a, &sample_slug).is_ok() {
         return Err("malformed existing verification report was accepted".into());
     }
     fs::remove_file(&verification_path)
