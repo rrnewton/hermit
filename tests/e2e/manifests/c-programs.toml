@@ -3320,10 +3320,26 @@ sabre = "Record/replay is unsupported by SaBRe"
 liteinst = "Record/replay is unsupported by LiteInst"
 
 [test.modes.chaos]
-ci = false
-backends_enabled = []
+ci = true
+# The contiguous prefix 0..31 is a mechanically selected sample, not a list
+# curated around outcomes. Both threads sleep for one virtual second and then
+# store distinct values. If the worker stores first, the main thread's later
+# store leaves shared_var=2 and the guest exits 0. If the main thread stores
+# first, the worker's later store leaves shared_var=1 and the guest exits 1.
+# Those two statuses are the complete observable class set; stdout is empty.
+#
+# Direct ptrace verification on devbig030 at e2f9a36b1ad8 used --log=info,
+# --verify-strict, --detlog-stack, and --detlog-heap. Seeds 0..31 reproduced
+# 32/32 with 21 exit-0 and 11 exit-1 outcomes. The same seed-to-status map was
+# observed by earlier exact-source Hermit builds. Moving pthread_join before
+# the main thread's sleep/store retained both thread bodies and both sleeps,
+# but collapsed the population to 32 exit-0 outcomes; the assertions below
+# refuse that loss of schedule exposure.
+seeds = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]
+outcome_classes = 2
+assert = { min_distinct = 2, min_passes = 1, min_failures = 1, min_normalized_entropy = 0.75 }
+backends_enabled = ["ptrace"]
 [test.modes.chaos.backends_disabled]
-ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"
 dbt = "Chaos scheduling is unsupported by DBT"
 kvm = "Chaos scheduling is unsupported by KVM"
 sabre = "Chaos scheduling is unsupported by SaBRe"

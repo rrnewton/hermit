@@ -25637,7 +25637,7 @@
       "test": "c-programs/nanosleep-threads-nocrash",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
