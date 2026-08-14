@@ -771,6 +771,19 @@ fn validate_mode(
     if mode == "replay" && enabled.iter().any(|backend| backend != "ptrace") {
         die(format!("{id}: replay is ptrace-only, got {enabled:?}"));
     }
+    if mode == "replay"
+        && ci
+        && spec
+            .get("assert")
+            .and_then(|assert| assert.get("bitwise_parity"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        die(format!(
+            "{id}: CI-enabled replay requires modes.replay.assert.bitwise_parity=true \
+             (Bar B); Bar A stack/heap hashes remain deferred"
+        ));
+    }
 
     if mode == "naked" && !enabled.is_empty() {
         let runs = spec
@@ -1143,6 +1156,76 @@ liteinst = "unsupported"
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
         assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
+    }
+
+    fn complete_replay_spec(assertion: Option<bool>) -> Value {
+        let assertion = match assertion {
+            Some(value) => format!("\n[assert]\nbitwise_parity = {value}\n"),
+            None => String::new(),
+        };
+        parse_mode(&format!(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+{assertion}
+"#
+        ))
+    }
+
+    #[test]
+    fn accepts_ci_replay_at_bar_b() {
+        let spec = complete_replay_spec(Some(true));
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &spec,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 5);
+        let enabled: Vec<_> = rows.iter().filter(|row| row.enabled).collect();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].backend, "ptrace");
+        assert!(enabled[0].ci);
+    }
+
+    #[test]
+    #[should_panic(expected = "CI-enabled replay requires modes.replay.assert.bitwise_parity=true")]
+    fn rejects_ci_replay_without_bar_b_assertion() {
+        let spec = complete_replay_spec(None);
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "CI-enabled replay requires modes.replay.assert.bitwise_parity=true")]
+    fn rejects_ci_replay_with_false_bar_b_assertion() {
+        let spec = complete_replay_spec(Some(false));
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[test]

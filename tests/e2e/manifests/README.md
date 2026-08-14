@@ -84,7 +84,7 @@ The mode contracts are:
 | --- | --- |
 | `verify` | Run each enabled backend with `hermit run --strict --verify` |
 | `chaos` | Search declared seeds and require cross-seed diversity plus exact within-seed reproduction |
-| `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
+| `replay` | Run ptrace `record start --strict --verify`; CI cells require `assert.bitwise_parity = true`, which adds `--verify-strict` and enforces Bar B |
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
@@ -93,6 +93,15 @@ manifest's declared status/stdout/stderr/artifact observation. It is not L2 and
 is not, by itself, a full cross-backend parity claim. Full parity additionally
 requires matching the complete INFO trace, `--detlog-stack`, and
 `--detlog-heap` between backends.
+
+Every CI-enabled `replay` cell must declare
+`assert = { bitwise_parity = true }`. The harness then requires the canonical
+INFO verdict in addition to its status/stdout/stderr observation, establishing
+Bar B record/replay self-consistency under the fixed record configuration.
+`record start --strict` is the command spelling, but that flag is accepted and
+ignored; Bar B does not claim equivalence to `run --strict`. Bar A stack/heap
+hashes remain deferred because `record start` does not accept `--detlog-stack`
+or `--detlog-heap`.
 
 An enabled SaBRe cell has an additional execution-path contract. Every E2E
 Hermit execution writes structured evidence into the cell capture: the

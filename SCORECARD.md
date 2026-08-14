@@ -4,7 +4,7 @@ This table is derived from the manifest, not from a separately maintained parent
 
 **Green** means the cell is in `ci/expected-e2e-plan.json`, is not a chaos-mode race-exposure check, and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
 
-These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity.
+These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity. Every CI-green `replay` cell must declare `assert.bitwise_parity = true` and use the canonical INFO comparator. The replay row therefore counts cells required to meet Bar B record/replay self-consistency under the fixed record configuration: guest-visible exit, stdout, and INFO parity. It is plan membership, not a fresh observation by itself, and it does not establish equivalence to `run --strict`. Bar A stack/heap hashes are deferred and are not measured by these cells because `record start` does not accept `--detlog-stack` or `--detlog-heap`.
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
@@ -21,7 +21,7 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 2 / 336 | — | 167 | 1513 | 1680 |
-| `replay` | 248 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 248 | 1432 | 1680 |
+| `replay` (Bar B only; Bar A deferred) | 248 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 248 | 1432 | 1680 |
 | `chaos` | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 0 | 1680 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
 | **Total** | | | | | | | **415** | **4961** | **5376** |

@@ -240,7 +240,11 @@ pub struct StartOpts {
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
     /// comparison that strips only the real wall-clock prefix, canonicalizes host
     /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — rather than a stripped match.
+    /// exactly (see --verify-strict) — rather than a stripped match. Together
+    /// with guest-visible exit/stdout parity, that is Bar B record/replay
+    /// self-consistency under the fixed record configuration. Bar A stack/heap
+    /// hashes remain deferred: `record start` accepts neither `--detlog-stack`
+    /// nor `--detlog-heap`.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -256,7 +260,8 @@ pub struct StartOpts {
     /// timestamps before comparing, so a "verified" result asserts only stripped
     /// parity, not bitwise identity. A record/replay determinism ratchet keying on
     /// the verdict should set this so it cannot be silently weakened to a stripped
-    /// comparison.
+    /// comparison. This establishes Bar B only; Bar A stack/heap hashes are not
+    /// available through `record start` and remain deferred.
     #[clap(long, requires = "verify")]
     verify_strict: bool,
 

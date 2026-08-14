@@ -2699,8 +2699,10 @@ function verify_verdict_path {
     printf '%s/verify-%s.json\n' "$cell_dir" "$attempt"
 }
 
-# Fail closed on anything short of a full parity verdict: a missing, unparsable,
-# or non-parity verdict is NOT a pass. Echoes a reason on failure.
+# Fail closed on anything short of a Bar B verdict: deterministic execution plus
+# guest-visible exit/stdout/INFO parity under the canonical comparator. Bar A
+# additionally requires stack/heap hashes; replay does not currently support
+# those flags, so this function must never imply that Bar A was measured.
 function assert_bitwise_parity_verdict {
     local verdict=$1
     if [[ ! -f $verdict ]]; then
@@ -2718,10 +2720,10 @@ function assert_bitwise_parity_verdict {
         return 1
     fi
     if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
-        printf 'verify did not reach strict bitwise parity: %s\n' "$summary"
+        printf 'Bar B not reached (Bar A stack/heap hashes deferred): %s\n' "$summary"
         return 1
     fi
-    printf 'strict bitwise parity: %s\n' "$summary"
+    printf 'Bar B reached; Bar A stack/heap hashes deferred: %s\n' "$summary"
     return 0
 }
 

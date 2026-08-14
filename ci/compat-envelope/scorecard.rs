@@ -494,7 +494,12 @@ not omitted: a cell that cannot run is not green.\n\n\
 These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend \
 twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
 same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
-parity.\n\n\
+parity. Every CI-green `replay` cell must declare `assert.bitwise_parity = true` and use the \
+canonical INFO comparator. The replay row therefore counts cells required to meet Bar B \
+record/replay self-consistency under the fixed record configuration: guest-visible exit, stdout, \
+and INFO parity. It is plan membership, not a fresh observation by itself, and it does not \
+establish equivalence to `run --strict`. Bar A stack/heap hashes are deferred and are not measured \
+by these cells because `record start` does not accept `--detlog-stack` or `--detlog-heap`.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
     );
@@ -542,7 +547,11 @@ not exist for that backend.\n\n| Mode",
             .filter(|id| id.mode == mode)
             .count();
         let mode_green = derived.green.iter().filter(|id| id.mode == mode).count();
-        out.push_str(&format!("| `{mode}`"));
+        if mode == "replay" {
+            out.push_str("| `replay` (Bar B only; Bar A deferred)");
+        } else {
+            out.push_str(&format!("| `{mode}`"));
+        }
         for backend in &ordered {
             let cell_total = derived
                 .population

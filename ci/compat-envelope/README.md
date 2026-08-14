@@ -65,6 +65,14 @@ do not establish strict INFO-log determinism or cross-backend parity. The
 scorecard says this directly and reports no cross-backend parity count until
 the manifest has cells that really compare fresh ptrace and non-ptrace logs.
 
+Every CI-green `replay` cell is different: the manifest validator requires
+`assert.bitwise_parity = true`, and the harness requires a canonical INFO
+verdict alongside guest-visible exit/stdout parity. The replay row is therefore
+Bar B record/replay self-consistency under the fixed record configuration. It
+does not establish equivalence to `run --strict`. Bar A stack/heap hashes are
+deferred and not measured because `record start` accepts neither
+`--detlog-stack` nor `--detlog-heap`.
+
 A green cell turning red makes validate fail. The normal response is to fix the
 regression. Moving the cell out of the selected plan is not a fix, and
 `scorecard.rs update` refuses green-to-red movement unless an explicit
