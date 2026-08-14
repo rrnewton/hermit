@@ -909,7 +909,24 @@ async fn sched_loop_inner(
     blocking_backoff: bool,
     observer: Option<SchedulerObserver>,
 ) {
-    info!("[scheduler] daemon task starting up, waiting for guest thread start..");
+    // DEBUG, not INFO, and the level is load-bearing.
+    //
+    // This runs before the guest is registered, so its position in the log is
+    // decided by host async-task startup rather than by guest execution. INFO is
+    // the scope `--verify-strict` compares exactly (`ComparedLogScope::Info`:
+    // "Every INFO message, exactly; DEBUG/TRACE captures remain diagnostic"), so
+    // emitting an unordered line at INFO made record/replay parity flaky: the
+    // line raced the root thread's `ThreadState::new` seeding messages, and
+    // record and replay bias that race differently. Measured on
+    // `system-utils/record-getpid`: 17/20 `record start --verify --verify-strict`
+    // before this change, with all 3 divergences a pure permutation of this line
+    // against the two seeding lines and nothing else differing.
+    //
+    // The message carries no guest state -- it is a constant string -- so nothing
+    // observable is removed from the compared envelope; only a host-scheduling
+    // artifact is. The deterministic startup milestone stays at INFO below, after
+    // the guest is queued, and the observer callback is untouched.
+    debug!("[scheduler] daemon task starting up, waiting for guest thread start..");
     if let Some(observer) = &observer {
         observer("daemon task starting; waiting for guest thread");
     }
