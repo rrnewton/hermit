@@ -341,26 +341,36 @@ impl Tool for Replayer {
             // answers at that moment becomes the guest's result -- the recording is
             // not consulted.
             //
-            // Measured on `backend-parity-c/poll-readiness`, which uses `pselect6`.
-            // No match arm above names it, so it lands here. Same syscall, same
-            // arguments, recording versus replay:
+            // That is a direct reading of this arm, not an inference:
+            // `inject_with_retry` performs the syscall.
             //
-            //     record: finish syscall #34: pselect6(4, 0x7fffffffc170, NULL, NULL, ...) = Ok(1)
-            //     replay: finish syscall #34: pselect6(4, 0x7fffffffc170, NULL, NULL, ...) = Ok(0)
+            // CORRECTION, recorded because the first version of this comment got it
+            // wrong. It cited `backend-parity-c/poll-readiness` and its `pselect6`
+            // as a measured example of this fallthrough. The measurement was real --
+            // that call returns `Ok(1)` recording and `Ok(0)` replaying -- but the
+            // attribution was NOT: `pselect6` never arrives here. Detcore intercepts
+            // it first and injects it live itself in record/replay mode, at
+            // `detcore/src/syscalls/io.rs` `handle_pselect6`:
             //
-            // A replayed syscall returns its recorded value by definition, so a
-            // differing return proves live re-execution. The guest saw one fewer
-            // ready descriptor and printed `ok=7` where the recording printed
-            // `ok=8`. Its siblings `poll` and `ppoll` DO have arms and replay
-            // correctly, so the discriminator is membership in this table, not
-            // anything about the syscall itself.
+            //     if self.cfg.recordreplay_modes || !self.cfg.sequentialize_threads {
+            //         // Recorder/Replayer do not model pselect6 events. Preserve
+            //         // their existing live-kernel behavior ...
+            //         return Ok(guest.inject(call).await?);
+            //     }
+            //
+            // and `record_or_replay_config` sets `recordreplay_modes: true`. Adding a
+            // `Syscall::Pselect6` arm here therefore changes nothing; it was tried and
+            // the guest's output was bit-for-bit unchanged.
+            //
+            // So there are TWO places a syscall can be executed live during replay --
+            // this fallthrough, and a Detcore handler that returns early before
+            // delegating. When something replays wrong, check the Detcore handler
+            // before assuming this arm.
             //
             // Consequence for anyone reading a green replay result: a passing
             // record/replay comparison does not establish that every syscall was
             // replayed. It establishes that the syscalls which ARE replayed agreed,
             // and that any live-injected ones happened to answer the same way twice.
-            // Adding an arm above is what moves a syscall from the second class to
-            // the first.
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
