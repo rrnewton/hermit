@@ -20,8 +20,10 @@ pair: unlike the three common modes, they do not define a uniform product-wide
 denominator.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
-has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
-the live manifest and changes automatically when a manifest test is added.
+has `336 × (5 × 3 + 1) = 5,376` cells. `scorecard.rs update` derives the
+checked-in table from the live manifest; it changes only through that explicit
+reviewed update. `scorecard.rs check` refuses when a manifest change makes the
+tracked table stale.
 
 `hermit-manifest-plan --format
 matrix-json` emits both sides of each manifest's required enabled/disabled
@@ -91,7 +93,7 @@ Review the table delta and the exact cell identity. The update command does not
 run a test and cannot turn a red cell green by itself; the subsequent validate
 must execute the newly selected cell.
 
-## Red cells and the periodic full-matrix run
+## Red cells, repeated green checks, and periodic full-matrix runs
 
 Every manifest cell outside the green set is red, including cells that have not
 run and cells that cannot currently run. That conservative classification is
@@ -106,6 +108,47 @@ investigation, probe one exact red cell with a tight wall-clock cap:
   --test applications/example-timed-progress-bar \
   --mode verify --backend ptrace --cell-timeout 60
 ```
+
+To repeat one enabled green cell, add a positive repetition count to an exact
+selection. The run and plan require a clean committed checkout:
+
+```console
+./ci/compat-envelope/pressure-test.rs run \
+  --test backend-parity-c/fork-exec-pipeline \
+  --mode verify --backend ptrace --repetitions 20 --cell-timeout 120
+```
+
+To repeat the complete enabled green population with one shared build and one
+typed DAG, use `--green`. A count of one is useful as a smoke run; the evidence
+policy decides how many independent repetitions a milestone requires:
+
+```console
+./ci/compat-envelope/pressure-test.rs run \
+  --green --repetitions 1 --run-timeout 14400
+```
+
+Each repetition has a distinct boxed DAG job, run ID, result directory, runner
+row, and retained verification evidence. Fixture preparation is shared per
+test. The existing DAG limits admit at most four manifest guests at once and
+at most one KVM guest; a large count does not mean every repetition starts at
+once. `--mode` can narrow the green population and `--sample COUNT --seed SEED`
+can select a reproducible subset. The retained metadata and summary name the
+selected and eligible counts plus the seed; sampled results are not
+full-population milestone evidence.
+
+Repeated green runs report pass counts and trustworthy failure categories for
+each cell. Missing or malformed evidence makes that cell incomplete, not
+flaky. Any non-pass makes the command return nonzero after writing the complete
+summary. These runs never update the checked-in scorecard, and
+`scorecard.rs update-observations` explicitly refuses their summaries because
+ordinary validation owns green evidence.
+
+Only unqualified `--green --repetitions N` covers the complete current green
+set. An exact cell, `--mode` filter, or `--sample` is deliberately partial
+evidence and its retained metadata and summary say which population was
+selected. Repetition does not strengthen the comparator: before Milestone 2,
+bare `--verify` still uses the legacy Stripped comparison described under
+ordinary validation above.
 
 For a reproducible bounded sample across verify, replay, and chaos, run:
 
@@ -138,14 +181,17 @@ not change its denominator or green definition:
 ```
 
 The command reuses the canonical Hermit/resource build nodes, serializes
-fixture preparation, and gives every red cell its own cgroup-boxed node.
+fixture preparation, and gives every selected red cell or green-cell repetition
+its own cgroup-boxed node.
 The plan derives that build closure from the selected cells: a sample without
 LiteInst does not build the LiteInst runtime, while any sample containing a
 LiteInst cell retains the complete canonical LiteInst build chain.
-`run` first materializes the exact committed SHA in a temporary local clone,
-so ignored Cargo output in the primary checkout cannot change the experiment
-and no shared worktree registry is touched. The generated clone is removed
-afterward while the run directory remains retained.
+Red-cell batches and repeated green checks first materialize the exact committed
+SHA in a temporary local clone, so ignored Cargo output in the caller's checkout
+cannot change the experiment and no shared worktree registry is touched. The
+generated clone is removed afterward while the run directory remains retained.
+One exact red-cell iteration instead uses the current checkout for a fast
+fix/test loop and labels dirty evidence exploratory.
 Enabled red cells use the ordinary exact-cell selector; disabled red cells use
 the harness's explicit `--probe-disabled` selector. Each cell gets at most the
 shipped portable DAG's existing 600-second bucket allowance; the manifest's
@@ -181,8 +227,8 @@ runs the same Hermit binary's one-input `log-diff` command and retains the
 normalized first-run INFO stream for later cross-backend parity work. Retaining
 that input is preparation, not a parity result.
 Replay-mode raw-log retention is not implemented yet. A one-time PASS is
-printed as a candidate for repeated confirmation; it never edits the tracked
-green set automatically.
+printed for a red cell as a candidate for repeated confirmation; it never edits
+the tracked green set automatically.
 See the complete command contract with:
 
 ```console
