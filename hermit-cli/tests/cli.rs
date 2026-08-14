@@ -1059,8 +1059,9 @@ fn run_dbt_preserves_the_guest_hermit_log_environment_without_verification() {
             stderr.contains("INFO detcore") && stderr.contains("DETLOG [syscall]"),
             "DBT did not forward controller INFO without verification:\n{stderr}",
         );
-        assert!(
-            stderr.matches("DETLOG [post_exec").count() >= 2,
+        assert_eq!(
+            stderr.matches("DETLOG [post_exec").count(),
+            2,
             "DBT did not preserve controller INFO across guest exec:\n{stderr}",
         );
     }
