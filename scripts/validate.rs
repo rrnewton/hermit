@@ -79,6 +79,9 @@ mod validate_receipt;
 #[path = "lib/validate_runtime.rs"]
 mod validate_runtime;
 
+#[path = "lib/safe_ci_scope.rs"]
+mod safe_ci_scope;
+
 #[path = "lib/validate_super.rs"]
 mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic args onto nextest.
 
@@ -88,15 +91,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::Arc;
-
-use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
-use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
-use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
-use safe_ci_dag_runner::cgroup::CgroupManager;
-use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
@@ -834,6 +829,8 @@ fn self_test() -> Result<(), String> {
     // none of them runs a gate, publishes a label, writes the real ledger, or
     // touches a PR — see each module's `self_test` doc for why that matters.
     for line in [
+        safe_ci_scope::self_test()?,
+        scheduler_accounting_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
@@ -1557,72 +1554,29 @@ fn resolve_cgroups(
     run_timeout_s: Option<i64>,
     deadline_ns: Option<u64>,
 ) -> Result<BoxedCgroups, u8> {
-    if is_in_scope() {
-        // A RuntimeMaxSec request is only this invocation's backstop when the marker carries this
-        // invocation's absolute deadline. Nested validates inherit an outer scope and its env;
-        // treating that inherited request as the nested 660s rung would compare unrelated clocks.
-        if owns_scope_request(deadline_ns) {
-            let verified = expected_scope_runtime_max_s()
-                .is_some_and(verify_scope_runtime_max);
-            if !verified {
-                let msg = "this invocation's outer RuntimeMaxSec readback failed; the requested \
-                           scope backstop is not proven on the live unit";
-                if allow_failure {
-                    eprintln!(
-                        "validate: WARNING: {msg}; running UNBOXED (--allow-cgroup-failure)."
-                    );
-                    return Ok(None);
-                }
-                eprintln!("validate: ERROR: {msg}.");
-                return Err(3);
-            }
-        } else if run_timeout_s.is_some() {
-            eprintln!(
-                "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
-                 the anchored in-process deadline remains inside the enclosing DAG node limit"
-            );
-        }
-        let mgr = Cgroups::new();
-        if mgr.enabled() {
-            install_scope_teardown();
-            eprintln!(
-                "validate: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU \
-                 caps + setsid-proof teardown)."
-            );
-            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
-        }
-        if allow_failure {
-            eprintln!("validate: WARNING: per-step cgroup setup failed; running UNBOXED (--allow-cgroup-failure).");
-            return Ok(None);
-        }
+    let owns_request = owns_scope_request(deadline_ns);
+    if is_in_scope() && run_timeout_s.is_some() && !owns_request {
         eprintln!(
-            "validate: ERROR: inside a managed scope but per-step cgroups could not be set up; \
-             re-run with --allow-cgroup-failure to run UNBOXED."
+            "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+             the anchored in-process deadline remains inside the enclosing DAG node limit"
         );
-        return Err(3);
-    }
-    if allow_failure {
-        eprintln!(
-            "validate: WARNING: cgroup boxing not established (--allow-cgroup-failure); running \
-             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
-        );
-        return Ok(None);
     }
     let scope_runtime_s = run_timeout_s.and_then(|run| {
         remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
     });
-    if let Some(deadline) = deadline_ns {
-        std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
-    } else {
-        std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+    if !allow_failure {
+        if let Some(deadline) = deadline_ns {
+            std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
+        } else {
+            std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+        }
     }
-    let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
-    let detail = attempt.describe();
-    eprintln!(
-        "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
-         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
-    );
-    Err(3)
+    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(
+        "validate",
+        allow_failure,
+        scope_runtime_s,
+        owns_request,
+    ))
 }
 
 // --------------------------------------------------------------------------- durable log
@@ -3187,6 +3141,13 @@ fn verdict_refusals(
     out
 }
 
+/// Execution completeness applies after profile-specific failure policy. A
+/// profile may allow a fully measured failing row, but no profile may turn a
+/// partial run into exit zero.
+fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
+    if execution_complete { exit_code } else { exit_code.max(1) }
+}
+
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
 /// label, no PR — it exercises the decision function with planted counts only.
 fn verdict_refusal_bracket() -> Result<(), String> {
@@ -3343,6 +3304,14 @@ fn interrupted_by() -> Option<&'static str> {
 struct LaneResult {
     outcomes: Vec<StepOutcome>,
     skipped: Vec<String>,
+    /// Every non-intentional planned node completed with a non-aborted outcome,
+    /// and the whole-run clock did not cut the lane short. Dependency-skipped
+    /// and aborted nodes are known but unexecuted, so they are incomplete. This
+    /// is deliberately separate from node success: compat, super, and envelope
+    /// profiles may allow a fully measured failing row.
+    complete: bool,
+    /// Whether every reported node succeeded or was aborted after a peer failed.
+    /// This does not answer whether the planned lane was completely reported.
     ok: bool,
     /// How many retry ROUNDS this lane needed; recorded in the ledger so a green
     /// that only survived because the host was retried is never mistaken for a
@@ -3514,6 +3483,505 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
     })
 }
 
+/// Planned runnable steps absent from both scheduler result collections.
+fn unreported_non_intentional_steps(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+    skipped: &[String],
+) -> Vec<String> {
+    let skipped: BTreeSet<&str> = skipped.iter().map(String::as_str).collect();
+    cfg.steps
+        .iter()
+        .filter(|step| {
+            let tag = step.tag();
+            step.skip_reason.is_none()
+                && !by_tag.contains_key(&tag)
+                && !skipped.contains(tag.as_str())
+        })
+        .map(|step| step.tag())
+        .collect()
+}
+
+/// Keep only retry candidates whose prerequisites are either already complete
+/// and successful or will execute in the same retry. Removing one unsafe node
+/// can make its dependents unsafe too, so this must reach a fixed point before
+/// the retry DAG is built. Dependencies between retained nodes remain intact;
+/// only dependencies satisfied by a successful earlier outcome are dropped.
+fn retry_steps_with_satisfied_prerequisites(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+    mut keep: BTreeSet<String>,
+) -> Vec<safe_ci_dag_runner::model::Step> {
+    loop {
+        let remove: Vec<String> = cfg
+            .steps
+            .iter()
+            .filter(|step| keep.contains(&step.tag()))
+            .filter(|step| {
+                step.deps.iter().any(|dependency| {
+                    !keep.contains(dependency)
+                        && !by_tag
+                            .get(dependency)
+                            .is_some_and(|outcome| outcome.ok && !outcome.aborted)
+                })
+            })
+            .map(|step| step.tag())
+            .collect();
+        if remove.is_empty() {
+            break;
+        }
+        for tag in remove {
+            keep.remove(&tag);
+        }
+    }
+
+    cfg.steps
+        .iter()
+        .filter(|step| keep.contains(&step.tag()))
+        .map(|step| {
+            let mut step = step.clone();
+            step.deps.retain(|dependency| keep.contains(dependency));
+            step
+        })
+        .collect()
+}
+
+/// Fast front-door bracket for the scheduler result shape consumed below.
+fn scheduler_accounting_bracket() -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-scheduler-accounting-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|e| format!("scheduler accounting: cannot create {}: {e}", tmp.display()))?;
+
+    let result = (|| -> Result<(), String> {
+    let step = |job: &str, cmd: &str| {
+        step_with_caps(
+            "fixture",
+            job,
+            "validate scheduler accounting fixture",
+            cmd.to_string(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        )
+    };
+    let mut intentional_skip = step("intentional_skip", "exit 99");
+    intentional_skip.skip_reason = Some(
+        safe_ci_dag_runner::model::IntentionalSkipReason::EmptyManifestBucket,
+    );
+
+    // A complete runnable plan plus a typed intentional skip is complete and
+    // green. The skipped command is `exit 99`, so executing it cannot accidentally
+    // satisfy the positive case.
+    let complete_cfg = DagConfig {
+        steps: vec![step("pass", "true"), intentional_skip.clone()],
+        ..Default::default()
+    };
+    let complete = run_lane_with_env_retries(
+        &complete_cfg,
+        1,
+        true,
+        0,
+        None,
+        &tmp.join("complete.log"),
+        None,
+        1,
+        false,
+    );
+    if !complete.complete
+        || !complete.ok
+        || complete.env_retries != 0
+        || complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            != vec!["fixture.pass"]
+    {
+        return Err(format!(
+            "scheduler accounting: complete plan plus intentional skip was not accepted: complete={} ok={} retries={} outcomes={:?}",
+            complete.complete,
+            complete.ok,
+            complete.env_retries,
+            complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+        ));
+    }
+
+    // A genuine failure must not be reclassified or retried. With one worker,
+    // both independent peers remain runnable but unreported after fail-fast.
+    let failure_log = tmp.join("unclassified.log");
+    std::fs::write(
+        &failure_log,
+        "[fixture.fail] ----- detail -----\n[fixture.fail] ordinary test failure\n[fixture.fail] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", failure_log.display()))?;
+    let failed_cfg = DagConfig {
+        steps: vec![
+            step("fail", "exit 1"),
+            step("pending_a", "true"),
+            step("pending_b", "true"),
+        ],
+        ..Default::default()
+    };
+    let failed = run_lane_with_env_retries(
+        &failed_cfg,
+        1,
+        true,
+        0,
+        None,
+        &failure_log,
+        None,
+        1,
+        false,
+    );
+    if failed.complete
+        || failed.ok
+        || failed.env_retries != 0
+        || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            != vec!["fixture.fail"]
+        || exit_code_with_execution_completeness(0, failed.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: unclassified failure did not remain an incomplete red without retry: complete={} ok={} retries={} outcomes={:?}",
+            failed.complete,
+            failed.ok,
+            failed.env_retries,
+            failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+        ));
+    }
+
+    // A dependency skip is named by the scheduler but still did not execute.
+    // It cannot satisfy required-node completeness.
+    let dependency_log = tmp.join("dependency-failure.log");
+    std::fs::write(
+        &dependency_log,
+        "[fixture.dependency_failure] ----- detail -----\n[fixture.dependency_failure] ordinary test failure\n[fixture.dependency_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            dependency_log.display()
+        )
+    })?;
+    let mut dependency_skipped = step("dependency_skipped", "true");
+    dependency_skipped.deps = vec!["fixture.dependency_failure".into()];
+    let dependency_cfg = DagConfig {
+        steps: vec![
+            step("dependency_failure", "exit 1"),
+            dependency_skipped,
+        ],
+        ..Default::default()
+    };
+    let dependency_result = run_lane_with_env_retries(
+        &dependency_cfg,
+        1,
+        true,
+        0,
+        None,
+        &dependency_log,
+        None,
+        1,
+        false,
+    );
+    if dependency_result.complete
+        || dependency_result.ok
+        || dependency_result.skipped != vec!["fixture.dependency_skipped"]
+        || exit_code_with_execution_completeness(0, dependency_result.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: dependency-skipped required node did not force incomplete execution: complete={} ok={} skipped={:?}",
+            dependency_result.complete, dependency_result.ok, dependency_result.skipped
+        ));
+    }
+
+    // Eager-exit reports a running peer as aborted. That typed outcome is not a
+    // completed required node and must likewise force a nonzero final exit.
+    let aborted_log = tmp.join("aborted-peer.log");
+    std::fs::write(
+        &aborted_log,
+        "[fixture.abort_failure] ----- detail -----\n[fixture.abort_failure] ordinary test failure\n[fixture.abort_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            aborted_log.display()
+        )
+    })?;
+    let aborted_cfg = DagConfig {
+        steps: vec![
+            step("abort_failure", "sleep 0.1; exit 1"),
+            step("aborted_peer", "sleep 5"),
+        ],
+        ..Default::default()
+    };
+    let aborted_result = run_lane_with_env_retries(
+        &aborted_cfg,
+        2,
+        false,
+        0,
+        None,
+        &aborted_log,
+        None,
+        1,
+        false,
+    );
+    let aborted_peer_reported = aborted_result
+        .outcomes
+        .iter()
+        .any(|outcome| outcome.tag == "fixture.aborted_peer" && outcome.aborted);
+    if aborted_result.complete
+        || aborted_result.ok
+        || !aborted_peer_reported
+        || exit_code_with_execution_completeness(0, aborted_result.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: aborted required node did not force incomplete execution: complete={} ok={} aborted_peer_reported={aborted_peer_reported} outcomes={:?}",
+            aborted_result.complete,
+            aborted_result.ok,
+            aborted_result
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.aborted))
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    // A fully reported failing row can be allowed by a profile's existing
+    // policy. Completeness must not silently turn every raw node failure into a
+    // blocking failure.
+    let allowed_log = tmp.join("allowed-failure.log");
+    std::fs::write(
+        &allowed_log,
+        "[fixture.allowed_failure] ----- detail -----\n[fixture.allowed_failure] expected measured failure\n[fixture.allowed_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", allowed_log.display()))?;
+    let allowed_cfg = DagConfig {
+        steps: vec![step("allowed_failure", "exit 1"), intentional_skip],
+        ..Default::default()
+    };
+    let allowed = run_lane_with_env_retries(
+        &allowed_cfg,
+        1,
+        true,
+        0,
+        None,
+        &allowed_log,
+        None,
+        1,
+        false,
+    );
+    if !allowed.complete
+        || allowed.ok
+        || allowed.env_retries != 0
+        || exit_code_with_execution_completeness(0, allowed.complete) != 0
+    {
+        return Err(format!(
+            "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={} retries={}",
+            allowed.complete, allowed.ok, allowed.env_retries
+        ));
+    }
+
+    // A classified one-time host failure retries itself and every peer omitted
+    // by fail-fast. The dependent is deliberately registered before its
+    // prerequisite and fails unless the retry preserves their edge.
+    let environmental_log = tmp.join("environmental.log");
+    let first_attempt = tmp.join("environmental-first-attempt");
+    let edge_ready = tmp.join("edge-ready");
+    let environmental_cmd = format!(
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+         '[fixture.environmental] ----- detail -----' \
+         '[fixture.environmental] An action was blocked on this server based on a security policy!' \
+         '[fixture.environmental] ----- end detail -----' > {log}; exit 1; fi",
+        first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
+        log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
+    );
+    let mut dependent = step(
+        "dependent",
+        &format!(
+            "test -f {}",
+            validate_plan::shell_quote(&edge_ready.to_string_lossy())
+        ),
+    );
+    dependent.deps = vec!["fixture.prerequisite".into()];
+    let environmental_cfg = DagConfig {
+        steps: vec![
+            step("environmental", &environmental_cmd),
+            dependent,
+            step(
+                "prerequisite",
+                &format!(
+                    ": > {}",
+                    validate_plan::shell_quote(&edge_ready.to_string_lossy())
+                ),
+            ),
+        ],
+        ..Default::default()
+    };
+    let retried = run_lane_with_env_retries(
+        &environmental_cfg,
+        1,
+        true,
+        0,
+        None,
+        &environmental_log,
+        None,
+        1,
+        false,
+    );
+    let retried_tags: BTreeSet<&str> =
+        retried.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect();
+    let expected_tags: BTreeSet<&str> = [
+        "fixture.environmental",
+        "fixture.dependent",
+        "fixture.prerequisite",
+    ]
+    .into_iter()
+    .collect();
+    if !retried.complete
+        || !retried.ok
+        || retried.env_retries != 1
+        || retried_tags != expected_tags
+        || !retried.skipped.is_empty()
+        || !edge_ready.is_file()
+    {
+        return Err(format!(
+            "scheduler accounting: environmental retry did not run every peer with its edge preserved: complete={} ok={} retries={} outcomes={retried_tags:?} skipped={:?} edge_ready={}",
+            retried.complete,
+            retried.ok,
+            retried.env_retries,
+            retried.skipped,
+            edge_ready.is_file()
+        ));
+    }
+
+    // An environmental failure may be retried alongside an ordinary failure,
+    // but a dependent of the ordinary failure must not become runnable merely
+    // because its failed prerequisite is outside the retry DAG. This uses the
+    // real scheduler path with both independent failures running concurrently.
+    let mixed_log = tmp.join("ordinary-and-environmental.log");
+    let ordinary_attempts = tmp.join("ordinary-attempts");
+    let mixed_environmental_first = tmp.join("mixed-environmental-first-attempt");
+    let mixed_environmental_passed = tmp.join("mixed-environmental-passed");
+    let unsafe_dependent_ran = tmp.join("unsafe-dependent-ran");
+    let unsafe_transitive_dependent_ran = tmp.join("unsafe-transitive-dependent-ran");
+    std::fs::write(
+        &mixed_log,
+        "[fixture.ordinary_failure] ----- detail -----\n\
+[fixture.ordinary_failure] ordinary test failure\n\
+[fixture.ordinary_failure] ----- end detail -----\n\
+[fixture.environmental_mixed] ----- detail -----\n\
+[fixture.environmental_mixed] An action was blocked on this server based on a security policy!\n\
+[fixture.environmental_mixed] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            mixed_log.display()
+        )
+    })?;
+    let ordinary_cmd = format!(
+        "printf 'attempt\\n' >> {}; sleep 0.1; exit 1",
+        validate_plan::shell_quote(&ordinary_attempts.to_string_lossy())
+    );
+    let mixed_environmental_cmd = format!(
+        "if test ! -e {first}; then : > {first}; exit 1; fi; : > {passed}",
+        first = validate_plan::shell_quote(&mixed_environmental_first.to_string_lossy()),
+        passed = validate_plan::shell_quote(&mixed_environmental_passed.to_string_lossy()),
+    );
+    let mut unsafe_dependent = step(
+        "unsafe_dependent",
+        &format!(
+            ": > {}",
+            validate_plan::shell_quote(&unsafe_dependent_ran.to_string_lossy())
+        ),
+    );
+    unsafe_dependent.deps = vec!["fixture.ordinary_failure".into()];
+    let mut unsafe_transitive_dependent = step(
+        "unsafe_transitive_dependent",
+        &format!(
+            ": > {}",
+            validate_plan::shell_quote(&unsafe_transitive_dependent_ran.to_string_lossy())
+        ),
+    );
+    unsafe_transitive_dependent.deps = vec!["fixture.unsafe_dependent".into()];
+    let mixed_cfg = DagConfig {
+        steps: vec![
+            step("ordinary_failure", &ordinary_cmd),
+            step("environmental_mixed", &mixed_environmental_cmd),
+            unsafe_dependent,
+            unsafe_transitive_dependent,
+        ],
+        ..Default::default()
+    };
+    let mixed = run_lane_with_env_retries(
+        &mixed_cfg,
+        2,
+        true,
+        0,
+        None,
+        &mixed_log,
+        None,
+        1,
+        false,
+    );
+    let mixed_by_tag: BTreeMap<&str, &StepOutcome> = mixed
+        .outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect();
+    let ordinary_attempt_count = std::fs::read_to_string(&ordinary_attempts)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    if mixed.complete
+        || mixed.env_retries != 1
+        || ordinary_attempt_count != 1
+        || mixed_by_tag
+            .get("fixture.ordinary_failure")
+            .is_none_or(|outcome| outcome.ok || outcome.aborted)
+        || mixed_by_tag
+            .get("fixture.environmental_mixed")
+            .is_none_or(|outcome| !outcome.ok || outcome.aborted)
+        || !mixed_environmental_passed.is_file()
+        || unsafe_dependent_ran.exists()
+        || unsafe_transitive_dependent_ran.exists()
+        || mixed_by_tag.contains_key("fixture.unsafe_dependent")
+        || mixed_by_tag.contains_key("fixture.unsafe_transitive_dependent")
+        || exit_code_with_execution_completeness(0, mixed.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: environmental retry crossed an unsatisfied ordinary dependency: complete={} ok={} retries={} ordinary_attempts={ordinary_attempt_count} environmental_passed={} dependent_ran={} transitive_dependent_ran={} outcomes={:?}",
+            mixed.complete,
+            mixed.ok,
+            mixed.env_retries,
+            mixed_environmental_passed.is_file(),
+            unsafe_dependent_ran.exists(),
+            unsafe_transitive_dependent_ran.exists(),
+            mixed
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.aborted))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp)
+        .map_err(|e| format!("scheduler accounting: cannot remove {}: {e}", tmp.display()));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(
+            "scheduler accounting: complete and allowed-failure plans accepted; fail-fast, skipped, aborted, and environmental-retry cases bracketed"
+                .into(),
+        ),
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => Err(format!(
+            "{problem}; cleanup also failed: {cleanup_problem}"
+        )),
+    }
+}
+
 /// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
 ///
 /// This is `run_check_with_timeout`'s retry loop (validate.sh:2119) moved to DAG
@@ -3533,10 +4001,11 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 ///   attempts). A *persistent* breakage — a bad Reverie pin, a genuinely missing
 ///   header — fails every attempt and still leaves the run RED. It is never
 ///   silently greened, only relabelled from "test failure" to "environmental".
-/// * **Nodes that never ran because the blocked node failed are retried with
-///   it.** In the bash the retry happened INSIDE the gate, so downstream never
-///   got skipped; reproducing that here means the retry DAG carries the skipped
-///   and aborted nodes too, with dependencies restricted to the retry set.
+/// * **Nodes that never ran because the blocked node failed are retried only
+///   when their prerequisites remain valid.** Every prerequisite must either
+///   have completed successfully already or execute in the same retry. Internal
+///   dependency edges are preserved, and removing an unsafe prerequisite also
+///   removes its dependents before anything runs.
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -3545,8 +4014,9 @@ fn run_lane_with_env_retries(
     cgroups: BoxedCgroups,
     log_path: &Path,
     deadline: Option<u64>,
+    max: usize,
+    record_step_profiles: bool,
 ) -> LaneResult {
-    let max = validate_runtime::env_block_max_retries();
     if remaining_budget_s(deadline) == Some(0) {
         eprintln!(
             "validate: whole-run budget expired during setup; no DAG node will be started \
@@ -3555,6 +4025,7 @@ fn run_lane_with_env_retries(
         return LaneResult {
             outcomes: Vec::new(),
             skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            complete: false,
             ok: false,
             env_retries: 0,
             run_timed_out: true,
@@ -3570,7 +4041,9 @@ fn run_lane_with_env_retries(
         None,
         remaining_budget_s(deadline),
     );
-    forward_step_profiles(&first, jobs);
+    if record_step_profiles {
+        forward_step_profiles(&first, jobs);
+    }
     let mut run_timed_out = first.run_timed_out;
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
@@ -3603,33 +4076,29 @@ fn run_lane_with_env_retries(
         if blocked.is_empty() {
             break;
         }
+        // The retry set: the blocked nodes, plus everything that never ran (or was
+        // aborted) because of them. The scheduler's fail-fast result reports only
+        // dependency-skipped nodes; an independent runnable node can otherwise be
+        // absent from both outcomes and skipped.
+        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
+        keep.extend(skipped.iter().cloned());
+        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
+        keep.extend(unreported_non_intentional_steps(cfg, &by_tag, &skipped));
+        let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
+        let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
+        if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
+            eprintln!(
+                "validate: environmental failure has no safe retry because a prerequisite did \
+                 not complete successfully and is not part of the retry; NOT retrying."
+            );
+            break;
+        }
         env_retries += 1;
-        for (tag, class) in &blocked {
+        for (tag, class) in blocked.iter().filter(|(tag, _)| retry_tags.contains(tag)) {
             println!(
                 "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
                  failure — retrying (attempt {env_retries}/{max})"
             );
-        }
-        // The retry set: the blocked nodes, plus everything that never ran (or was
-        // aborted) because of them.
-        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
-        keep.extend(skipped.iter().cloned());
-        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
-        let steps: Vec<safe_ci_dag_runner::model::Step> = cfg
-            .steps
-            .iter()
-            .filter(|s| keep.contains(&s.tag()))
-            .map(|s| {
-                let mut s = s.clone();
-                // Dependencies already satisfied by the first pass are dropped;
-                // edges INSIDE the retry set are preserved so a re-run dependency
-                // still gates its dependents.
-                s.deps.retain(|d| keep.contains(d));
-                s
-            })
-            .collect();
-        if steps.is_empty() {
-            break;
         }
         let mut retry_cfg = cfg.clone();
         retry_cfg.description =
@@ -3655,7 +4124,9 @@ fn run_lane_with_env_retries(
             None,
             remaining_budget_s(deadline),
         );
-        forward_step_profiles(&again, jobs);
+        if record_step_profiles {
+            forward_step_profiles(&again, jobs);
+        }
         run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
@@ -3686,11 +4157,24 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
-    // Eager-exit aborts after a genuine peer failure are neutral, but steps cut
-    // by the whole-run clock are not a green. Without the typed run bit here an
-    // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
-    let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
+    let unreported = unreported_non_intentional_steps(cfg, &by_tag, &skipped);
+    if !unreported.is_empty() {
+        eprintln!(
+            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
+             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
+            unreported.len(),
+            unreported.join(", ")
+        );
+    }
+    // Raw failure policy may still treat an aborted peer as neutral, but execution
+    // completeness may not: dependency-skipped, aborted, timed-out, or unreported
+    // required nodes did not finish and therefore cannot support a green run.
+    let complete = !run_timed_out
+        && unreported.is_empty()
+        && skipped.is_empty()
+        && outcomes.iter().all(|outcome| !outcome.aborted);
+    let ok = outcomes.iter().all(|o| o.ok || o.aborted);
+    LaneResult { outcomes, skipped, complete, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -5281,6 +5765,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut ok = true;
+    let mut execution_complete = true;
     let mut env_retries = 0usize;
 
     // One clock for the whole invocation. Sequential lanes and retries spend
@@ -5295,6 +5780,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             cgroups.clone(),
             &log_path,
             deadline,
+            validate_runtime::env_block_max_retries(),
+            true,
         )
     };
     let mut run_timed_out = false;
@@ -5303,6 +5790,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
+    execution_complete = execution_complete && r.complete;
     env_retries += r.env_retries;
     run_timed_out = run_timed_out || r.run_timed_out;
 
@@ -5312,10 +5800,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
+            execution_complete = execution_complete && r2.complete;
             env_retries += r2.env_retries;
             run_timed_out = run_timed_out || r2.run_timed_out;
         } else {
-            eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
+            eprintln!(
+                "validate: first lane failed; the second planned lane was not run (eager exit), \
+                 so validation is incomplete."
+            );
+            execution_complete = false;
         }
     }
 
@@ -5578,6 +6071,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
+    if !execution_complete {
+        eprintln!(
+            "validate: ERROR: not every required node completed with a non-aborted outcome; \
+             dependency-skipped, aborted, timed-out, and unreported work makes validation \
+             incomplete and cannot report PASS."
+        );
+    }
+    exit_code = exit_code_with_execution_completeness(exit_code, execution_complete);
 
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
@@ -5624,7 +6125,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             wall,
             exit_code,
             &log_path.to_string_lossy(),
-            plan.suite_complete,
+            plan.suite_complete && execution_complete,
             coverage,
         );
     }
@@ -5700,6 +6201,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+    }
+    if !execution_complete {
+        detail.push(
+            "not every required node completed with a non-aborted outcome; dependency-skipped, \
+             aborted, timed-out, or unreported work made the run incomplete"
+                .into(),
+        );
     }
     for why in &refusals {
         detail.push(format!("REFUSED ON COMPLETENESS: {why}"));

@@ -767,6 +767,114 @@ function workflow_non_dag_step_budget_seconds {
     ' "$workflow"
 }
 
+function rust_code_has_line {
+    [[ $(perl -0pe \
+        's{(?(DEFINE)(?<block>/\*(?:[^*/]+|/(?!\*)|\*(?!/)|(?&block))*\*/))(?&block)|(?:br|cr|r)(?<hash>\#{0,255})".*?"\k<hash>|[bc]?"(?:\\.|[^"\\])*"|//[^\n]*}{}gsx' \
+        "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' |
+        grep -Fxc -- "$2" || true) == 1 ]]
+}
+
+function assert_safe_ci_scope_enforcement {
+    local validate="$1/scripts/validate.rs"
+    local pressure="$1/ci/compat-envelope/pressure-test.rs"
+    local helper="$1/scripts/lib/safe_ci_scope.rs"
+    [[ -f $helper ]] &&
+        rust_code_has_line "$validate" 'mod safe_ci_scope;' &&
+        rust_code_has_line "$pressure" 'mod safe_ci_scope;' &&
+        rust_code_has_line "$validate" \
+            'safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(' &&
+        rust_code_has_line "$pressure" \
+            'safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(' ||
+        die "both Rust front doors must propagate the shared safe-ci scope helper result"
+}
+
+function assert_safe_ci_scope_enforcement_brackets {
+    (
+        local tmp
+        tmp=$(mktemp -d) || die "safe-ci scope guard bracket: mktemp failed"
+        trap 'rm -rf -- "$tmp"' EXIT
+        trap 'exit 130' HUP INT TERM
+        mkdir -p "$tmp/scripts/lib" "$tmp/ci/compat-envelope"
+        cp "$ROOT_DIR/scripts/validate.rs" "$tmp/scripts/validate.rs"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$tmp/scripts/lib/safe_ci_scope.rs"
+        cp "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" \
+            "$tmp/ci/compat-envelope/pressure-test.rs"
+        assert_safe_ci_scope_enforcement "$tmp"
+
+        # Both callers must keep the typed Result load-bearing. Merely retaining
+        # the helper call while discarding its Err is the dangerous mutation.
+        sed -i \
+            's/safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(/let _ = safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(/' \
+            "$tmp/scripts/validate.rs"
+        ! ( assert_safe_ci_scope_enforcement "$tmp" ) >/dev/null 2>&1 ||
+            die "safe-ci scope guard accepted validate discarding the helper Result"
+        cp "$ROOT_DIR/scripts/validate.rs" "$tmp/scripts/validate.rs"
+
+        sed -i \
+            's/safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(/let _ = safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(/' \
+            "$tmp/ci/compat-envelope/pressure-test.rs"
+        ! ( assert_safe_ci_scope_enforcement "$tmp" ) >/dev/null 2>&1 ||
+            die "safe-ci scope guard accepted pressure-test discarding the helper Result"
+        cp "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" \
+            "$tmp/ci/compat-envelope/pressure-test.rs"
+        assert_safe_ci_scope_enforcement "$tmp"
+
+        # Compile and execute the helper's own decision path from the mutated
+        # copy. These are behavior mutations: each replaces one required false
+        # observation with true, and the probe must then fail because the
+        # two-sided self-test sees the planted refusal disappear.
+        cat >"$tmp/scope-probe.rs" <<EOF
+#!/usr/bin/env -S rust-script --force
+//! \`\`\`cargo
+//! [dependencies]
+//! safe-ci-dag-runner = { path = "$ROOT_DIR/agent-utils/rs/safe-ci-dag-runner" }
+//! \`\`\`
+#[path = "scripts/lib/safe_ci_scope.rs"]
+mod safe_ci_scope;
+
+fn main() {
+    if let Err(problem) = safe_ci_scope::self_test() {
+        eprintln!("{problem}");
+        std::process::exit(1);
+    }
+}
+EOF
+        _scope_probe() (
+            cd "$tmp"
+            XDG_CACHE_HOME="$tmp/cache" CARGO_TARGET_DIR="$tmp/target" \
+                rust-script --force "$tmp/scope-probe.rs" >/dev/null 2>&1
+        )
+        _scope_probe || die "safe-ci scope behavior probe refused the unmodified helper"
+
+        local helper="$tmp/scripts/lib/safe_ci_scope.rs"
+        perl -0pi -e \
+            's/pub fn propagate_result\(result: Result<BoxedCgroups, u8>\) -> Result<BoxedCgroups, u8> \{\n    result\n\}/pub fn propagate_result(result: Result<BoxedCgroups, u8>) -> Result<BoxedCgroups, u8> {\n    let _ = result;\n    Ok(None)\n}/' \
+            "$helper"
+        ! _scope_probe || die "safe-ci scope behavior probe accepted a discarded helper Result"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
+
+        sed -i '0,/        observations.live_containment,/s//        true,/' "$helper"
+        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed live containment"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
+
+        sed -i \
+            '0,/        observations.outer_memory_swap_and_oom_group,/s//        true,/' "$helper"
+        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed outer-limit readback"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
+
+        sed -i \
+            '0,/        runtime_readback_satisfies(verify_runtime, observations.runtime_max),/s//        true,/' "$helper"
+        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed RuntimeMax readback"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
+
+        sed -i '0,/        observations.per_step_cgroups,/s//        true,/' "$helper"
+        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed per-step cgroups"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
+        _scope_probe || die "safe-ci scope behavior probe did not recover after mutations"
+        unset -f _scope_probe
+    )
+}
+
 # The strict-compat lane used to permit 1800s internally inside a 900s hosted
 # job. The external kill necessarily won, leaving neither a named probe nor its
 # per-probe rows. Assert the deployed values, not hand-copied policy numbers.
@@ -797,9 +905,7 @@ function assert_strict_compat_budget_ladder {
         die "strict-compat whole-run budget has no in-process deadline consumer"
     grep -Fq 'STEP_STARTED_MONOTONIC_NS_ENV' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat starts a fresh inner clock instead of inheriting the outer node epoch"
-    grep -Fq 'expected_scope_runtime_max_s' "$ROOT_DIR/scripts/validate.rs" &&
-        grep -Fq 'verify_scope_runtime_max' "$ROOT_DIR/scripts/validate.rs" ||
-        die "strict-compat requests a scope RuntimeMaxSec without reading the live value back"
+    assert_safe_ci_scope_enforcement "$ROOT_DIR"
     grep -Fq 'forward_step_profiles(&first, jobs)' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat inner rows are not forwarded to the hosted artifact directory"
     [[ $cmd == *'SAFE_CI_DAG_RUNNER_LOG_DIR="${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs"'* ]] ||
@@ -1755,6 +1861,7 @@ EOF
     assert_validate_driver_entrypoint
     assert_node_budgets_fit_their_job_kill
     assert_budget_guard_brackets
+    assert_safe_ci_scope_enforcement_brackets
 
     # This validation command contains real concurrent rustc probes. Three warm
     # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane
@@ -2356,6 +2463,189 @@ function emit_failure_reason {
     fi
 }
 
+# A successful compiler exit is not enough when the host denies the final
+# executable-mode update.  Keep this check at the build boundary so the
+# retained compiler output (including any environmental refusal) explains the
+# failure and the scheduler can retry the build step instead of discovering a
+# non-executable fixture later during guest launch.
+function require_executable_guest_program {
+    local path=$1
+    local id=$2
+    if [[ -f $path && -x $path ]]; then
+        return 0
+    fi
+    printf 'compiled guest is missing or not executable for %s: %s\n' "$id" "$path" >&2
+    return 1
+}
+
+function require_compiled_guest_program {
+    local path=$1
+    local id=$2
+    local stdout_file=$3
+    local stderr_file=$4
+    if require_executable_guest_program "$path" "$id"; then
+        return 0
+    fi
+    # The compiler may return success even when the host denies its final mode
+    # update.  Replay its captured diagnostics so environmental refusals remain
+    # visible to the scheduler at the build step that actually encountered them.
+    if [[ -s $stderr_file ]]; then
+        cat "$stderr_file" >&2
+    elif [[ -s $stdout_file ]]; then
+        cat "$stdout_file" >&2
+    fi
+    return 1
+}
+
+function audit_executable_guest_program_contract {
+    (
+        local scratch program output status fixture_mode fixture_kind fixture_write_output
+        local prebuilt_id prebuilt_root cell
+        local -a prebuilt_roots=()
+        scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-executable-guest.XXXXXX")
+        trap 'rm -rf -- "$scratch" "${prebuilt_roots[@]}"' EXIT
+        program="$scratch/program"
+        : >"$program"
+        chmod 755 "$program"
+        require_executable_guest_program "$program" fixture/executable ||
+            die "an executable compiled guest must remain accepted"
+        chmod 644 "$program"
+        if require_executable_guest_program "$program" fixture/non-executable >/dev/null 2>&1; then
+            die "a compiler-success artifact without execute permission must be refused"
+        fi
+        rm -f -- "$program"
+        if require_executable_guest_program "$program" fixture/missing >/dev/null 2>&1; then
+            die "a missing compiler-success artifact must be refused"
+        fi
+
+        # Exercise the actual compile branch without invoking a real compiler.
+        # The planted compiler reports success but chooses the requested mode.
+        function metadata_json {
+            jq -cn --arg kind "$fixture_kind" --arg id "fixture/$fixture_kind" \
+                '{program_kind:$kind,id:$id,compile_args:[]}'
+        }
+        function run_capture {
+            local stdout_file=$1 stderr_file=$2
+            shift 3
+            local compiled=""
+            while (($#)); do
+                if [[ $1 == -o && $# -ge 2 ]]; then
+                    compiled=$2
+                    break
+                fi
+                shift
+            done
+            [[ -n $compiled ]] || return 99
+            : >"$stdout_file"
+            if ((fixture_write_output == 1)); then
+                : >"$compiled"
+                chmod "$fixture_mode" "$compiled"
+                if [[ $fixture_mode != 755 ]]; then
+                    printf 'An action was blocked on this server based on a security policy!\nEnforcer: FS, Reason: FILE_OPEN\n' >"$stderr_file"
+                else
+                    : >"$stderr_file"
+                fi
+            else
+                : >"$stderr_file"
+            fi
+        }
+
+        PREBUILT=0
+        for fixture_kind in c rust; do
+            fixture_mode=755
+            fixture_write_output=1
+            cell="$scratch/$fixture_kind-good"
+            prepare_cell_dirs "$cell"
+            prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 ||
+                die "an executable $fixture_kind compiler-success artifact must remain accepted"
+
+            # A success that writes nothing must not inherit the planted stale
+            # executable. This fails if the pre-compile removal is deleted.
+            cell="$scratch/$fixture_kind-stale"
+            prepare_cell_dirs "$cell"
+            : >"$cell/fixtures/program"
+            chmod 755 "$cell/fixtures/program"
+            fixture_write_output=0
+            status=0
+            prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 >/dev/null 2>&1 || status=$?
+            ((status != 0)) ||
+                die "$fixture_kind compiler success without output inherited a stale executable"
+            [[ ! -e $cell/fixtures/program ]] ||
+                die "$fixture_kind compile did not remove its stale executable destination"
+
+            # A newly written non-executable must still be refused. This fails if
+            # the post-compile executable check is deleted.
+            fixture_mode=644
+            fixture_write_output=1
+            cell="$scratch/$fixture_kind-nonexec"
+            prepare_cell_dirs "$cell"
+            status=0
+            output=$(prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 2>&1) || status=$?
+            ((status != 0)) ||
+                die "a $fixture_kind compiler-success artifact without execute permission must be refused"
+            grep -Fq 'Enforcer: FS, Reason: FILE_OPEN' <<<"$output" ||
+                die "a $fixture_kind compiler-success refusal lost captured environmental diagnostics"
+        done
+
+        # Exercise the prebuilt copy path for every program kind. Shell has no
+        # fixtures/program; C and Rust require one. Each C/Rust negative plants a
+        # stale destination while the source omits it, then a non-executable
+        # source, so both removal and enforcement are independently load-bearing.
+        PREBUILT=1
+        for fixture_kind in shell c rust; do
+            prebuilt_id="contract-prebuilt-$fixture_kind-$$"
+            prebuilt_root="$BUILD_ROOT/$prebuilt_id"
+            prebuilt_roots+=("$prebuilt_root")
+            mkdir -p "$prebuilt_root/fixtures"
+            if [[ $fixture_kind != shell ]]; then
+                : >"$prebuilt_root/fixtures/program"
+                chmod 755 "$prebuilt_root/fixtures/program"
+            fi
+            function metadata_json {
+                jq -cn --arg kind "$fixture_kind" --arg id "$prebuilt_id" \
+                    '{program_kind:$kind,id:$id,compile_args:[]}'
+            }
+
+            cell="$scratch/$fixture_kind-prebuilt-good"
+            prepare_cell_dirs "$cell"
+            if [[ $fixture_kind == shell ]]; then
+                : >"$cell/fixtures/program"
+                chmod 755 "$cell/fixtures/program"
+            fi
+            prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 ||
+                die "a legitimate prebuilt $fixture_kind guest was refused"
+            if [[ $fixture_kind == shell ]]; then
+                [[ ! -e $cell/fixtures/program ]] ||
+                    die "prebuilt shell copy retained a stale guest executable"
+                continue
+            fi
+            [[ -x $cell/fixtures/program ]] ||
+                die "prebuilt $fixture_kind copy lost its executable guest"
+
+            rm -f -- "$prebuilt_root/fixtures/program"
+            cell="$scratch/$fixture_kind-prebuilt-stale"
+            prepare_cell_dirs "$cell"
+            : >"$cell/fixtures/program"
+            chmod 755 "$cell/fixtures/program"
+            status=0
+            prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 >/dev/null 2>&1 || status=$?
+            ((status != 0)) ||
+                die "prebuilt $fixture_kind copy inherited a stale executable absent from its source"
+            [[ ! -e $cell/fixtures/program ]] ||
+                die "prebuilt $fixture_kind copy did not remove its stale executable destination"
+
+            : >"$prebuilt_root/fixtures/program"
+            chmod 644 "$prebuilt_root/fixtures/program"
+            cell="$scratch/$fixture_kind-prebuilt-nonexec"
+            prepare_cell_dirs "$cell"
+            status=0
+            prepare_test "$scratch/fixture.$fixture_kind" "$cell" 10 >/dev/null 2>&1 || status=$?
+            ((status != 0)) ||
+                die "prebuilt $fixture_kind copy accepted a non-executable guest"
+        done
+    )
+}
+
 # Hermit validates the program before creating the guest.  Those refusals are
 # harness no-results: no guest observation exists to count as a chaos failure.
 # Carry that distinction alongside the process status instead of asking each
@@ -2823,8 +3113,18 @@ function prepare_test {
             echo "prebuilt fixture is missing for $id: $prebuilt_fixtures" >&2
             return 1
         }
+        # A reused cell directory may contain an executable from an earlier
+        # attempt. Remove the one output whose existence authorizes C/Rust guest
+        # execution before copying this attempt's fixture set.
+        rm -f -- "$cell_dir/fixtures/program" || {
+            echo "cannot remove stale guest program before copying prebuilt fixture for $id" >&2
+            return 1
+        }
         cp -a "$prebuilt_fixtures/." "$cell_dir/fixtures/"
-        return 0
+        if [[ $kind == c || $kind == rust ]]; then
+            require_executable_guest_program "$cell_dir/fixtures/program" "$id"
+        fi
+        return
     fi
     local -a prepare_args=() compile_args=()
     # Each failure path below captures the child's exit status rather than
@@ -2834,6 +3134,10 @@ function prepare_test {
     local status
     if [[ $kind == c ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
+        rm -f -- "$cell_dir/fixtures/program" || {
+            echo "cannot remove stale guest program before compiling $id" >&2
+            return 1
+        }
         status=0
         run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
             cc -std=c11 -O2 -g -Wall -Wextra -Werror "${compile_args[@]}" \
@@ -2843,10 +3147,16 @@ function prepare_test {
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return "$status"
         fi
-        return 0
+        require_compiled_guest_program \
+            "$cell_dir/fixtures/program" "$id" "$stdout_file" "$stderr_file"
+        return
     fi
     if [[ $kind == rust ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
+        rm -f -- "$cell_dir/fixtures/program" || {
+            echo "cannot remove stale guest program before compiling $id" >&2
+            return 1
+        }
         status=0
         run_capture "$stdout_file" "$stderr_file" "$timeout_seconds" \
             rustc -O "${compile_args[@]}" "$test" -o "$cell_dir/fixtures/program" || status=$?
@@ -2855,7 +3165,9 @@ function prepare_test {
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return "$status"
         fi
-        return 0
+        require_compiled_guest_program \
+            "$cell_dir/fixtures/program" "$id" "$stdout_file" "$stderr_file"
+        return
     fi
     [[ $kind != direct && $kind != direct-argv ]] || return 0
     mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
@@ -3666,6 +3978,7 @@ case "$subcommand" in
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
         audit_immutable_hermit_binary
+        audit_executable_guest_program_contract
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_chaos_seed_contract
