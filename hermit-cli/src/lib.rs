@@ -1527,7 +1527,7 @@ async fn run_dbt(
         let launch = || {
             let output = match output_backend_stdin_file()? {
                 Some(input) => {
-                    runner.output_with_environment_and_reader(&guest, &environment, input)
+                    runner.output_with_environment_and_stdin_file(&guest, &environment, input)
                 }
                 None => runner.output_with_environment(&guest, &environment),
             };
