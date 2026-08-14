@@ -61,6 +61,33 @@ pub struct Event {
 /// mutable data expected to be modified by the kernel need to be recorded. If
 /// this rule is applied uniformly for all syscalls, then we should be able to
 /// implement full record and replay.
+///
+/// THAT LAST SENTENCE IS NOT TRUE, AND THE ENUMERATION ABOVE IS WHY. A guest also
+/// observes SIGNAL DELIVERY, which is neither a mutable pointer nor a return
+/// value, and this schema has no event for it. Reverie's `Tool` trait offers
+/// `handle_signal_event`; Detcore implements it (`detcore/src/lib.rs`), while
+/// `Recorder` and `Replayer` both take the default pass-through. So a signal
+/// that arrives during recording is logged but never written to the event
+/// stream, and during replay the guest sees only whatever signals the live
+/// kernel happens to raise.
+///
+/// Measured on the `awk` row of the record/replay compatibility corpus
+/// (`ci/compat/corpus-rr.json`), a bash pipeline with a process substitution:
+///
+///     record: SIGCHLD delivered to dtid 9 AND to dtid 3
+///     replay: SIGCHLD delivered to dtid 3 only -- the dtid 9 signal never arrives
+///     INFO message counts 1486 vs 1483
+///
+/// The comparison fails where the recording handles that signal and the replay
+/// instead proceeds to the next `read`. Five corpus rows share this exact
+/// signature -- awk, paste, comm, join, fgrep -- all of them shell pipelines
+/// whose children raise SIGCHLD. Their siblings `grep`, `egrep` and `sed` pass,
+/// so the discriminator is whether the guest actually observes a signal, not the
+/// shell shape.
+///
+/// Recording signal delivery is therefore a prerequisite for record/replay of
+/// any guest that reaps children, and it is a schema change plus a
+/// `handle_signal_event` implementation on both tools, not a per-syscall fix.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SyscallEvent {
     Bytes(Vec<u8>),
