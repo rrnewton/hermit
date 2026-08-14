@@ -299,7 +299,7 @@ fn hermit_command(
                 fail("internal error: chaos command construction requires a declared seed")
             });
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
             )
         }
         "custom" => {
@@ -320,10 +320,9 @@ fn hermit_command(
     format!("timeout --kill-after=10s {timeout}s {command}")
 }
 
-/// Default `--log` level per mode, matching the CI expansion (`off` for chaos,
-/// `info` otherwise).
-fn default_log(mode: &str) -> &'static str {
-    if mode == "chaos" { "off" } else { "info" }
+/// Default `--log` level per mode, matching the CI expansion.
+fn default_log(_mode: &str) -> &'static str {
+    "info"
 }
 
 struct Manifests {
@@ -711,11 +710,14 @@ fn self_test() -> ExitCode {
         Some(7),
         &[],
         false,
-        "off",
+        "info",
         &[],
         "guest",
     );
     assert!(chaos.contains("run --base-env=minimal"));
+    assert!(chaos.contains("--verify --verify-allow=both"));
+    assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
+    assert!(chaos.contains("--log=info"));
     assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
     let seeded_chaos: Value = "seeds = [7, 9]".parse().unwrap();
     let no_seed_chaos = Value::Table(Default::default());
@@ -858,7 +860,7 @@ FILTERS (list):
 
 get/run:
   --mode/--backend/--lane pick the cell (defaults: verify mode, first enabled backend, test lane)
-  --log      override the --log= level (info|debug|trace|off); default info (off for chaos)
+  --log      override the --log= level (info|debug|trace|off); default info for every mode
   --all-modes (get only) print every enabled (mode,backend) command
   -- <flags> (run only) extra hermit flags injected before the `-- <guest>` separator
   A chaos mode without declared seeds is unavailable; get/run refuse rather than invent seed 0.

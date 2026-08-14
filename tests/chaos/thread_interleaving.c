@@ -30,8 +30,8 @@
  * mutex-protected append, so the printed permutation is a pure function of the
  * scheduling decisions Detcore makes, and those are themselves a function of
  * the seed. Nothing here reads wall-clock time, host randomness, pids, or
- * addresses. The harness enforces this: it runs every seed twice and requires
- * both runs to agree bit-for-bit (`repeat_mismatches` must be 0).
+ * addresses. The harness enforces this with one Hermit verification per seed;
+ * Hermit's verifier requires both guest executions to agree.
  */
 
 #include <pthread.h>

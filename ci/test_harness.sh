@@ -2439,6 +2439,193 @@ function audit_chaos_seed_contract {
         die "a no-seed chaos cell must not prepare, execute, or write a result"
     fi
     rm -r -- "$scratch"
+
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-chaos-verdict.XXXXXX")
+    printf '%s\n' \
+        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        >"$scratch/pass.json"
+    printf '%s\n' '{"verified":true}' >"$scratch/incomplete.json"
+    printf '%s\n' \
+        '{"verified":true,"verdict":"different","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        >"$scratch/wrong-verdict.json"
+    printf '%s\n' \
+        '{"verified":true,"verdict":"matched","comparison":{"strictness":"strict","compare_logs":true}}' \
+        >"$scratch/wrong-strictness.json"
+    printf '%s\n' \
+        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped"}}' \
+        >"$scratch/missing-compare-logs.json"
+    printf '%s\n' \
+        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":false}}' \
+        >"$scratch/false-compare-logs.json"
+    printf '%s\n' \
+        '{"verified":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        >"$scratch/verified-false.json"
+    printf '%s\n' '{not-json' >"$scratch/malformed.json"
+    assert_chaos_verify_verdict "$scratch/pass.json" >/dev/null || {
+        rm -r -- "$scratch"
+        die "an affirmative chaos verification verdict must remain acceptable"
+    }
+    local refused_verdict
+    for refused_verdict in \
+        incomplete wrong-verdict wrong-strictness missing-compare-logs \
+        false-compare-logs verified-false missing malformed; do
+        if assert_chaos_verify_verdict "$scratch/$refused_verdict.json" >/dev/null; then
+            rm -r -- "$scratch"
+            die "chaos verification must refuse $refused_verdict evidence"
+        fi
+    done
+    rm -r -- "$scratch"
+
+    # Exercise the public harness front door with a controlled Hermit executable.
+    # Every seed presents two observable outcome classes and a well-formed verdict.
+    # First make seed 7 report verified=false: the cell must remain red specifically
+    # because that verdict is negative, not because diversity or launch failed.
+    # Then reuse one run id after a passing run while the fake executable writes no
+    # reports. The second run must remove the first run's reports and fail because
+    # the new process published no verdict.
+    local fake results invocation_log expected result_row
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-chaos-verify.XXXXXX")
+    fake="$scratch/hermit"
+    results="$scratch/results"
+    invocation_log="$scratch/invocations"
+    cat >"$fake" <<'FAKE_HERMIT'
+#!/usr/bin/env bash
+set -euo pipefail
+verdict= seed= seen_log=0 seen_verify=0 seen_allow=0 seen_chaos=0
+while (($#)); do
+    case "$1" in
+        --log=info) seen_log=1; shift ;;
+        --verify) seen_verify=1; shift ;;
+        --verify-allow=both) seen_allow=1; shift ;;
+        --verify-json) verdict=${2:?missing verify path}; shift 2 ;;
+        --chaos) seen_chaos=1; shift ;;
+        --seed=*) seed=${1#--seed=}; shift ;;
+        *) shift ;;
+    esac
+done
+if [[ -z $verdict || -z $seed || $seen_log != 1 || $seen_verify != 1 ||
+      $seen_allow != 1 || $seen_chaos != 1 ]]; then
+    printf 'BAD log=%s verify=%s allow=%s chaos=%s seed=%s verdict=%s\n' \
+        "$seen_log" "$seen_verify" "$seen_allow" "$seen_chaos" "$seed" "$verdict" \
+        >>"${FAKE_HERMIT_INVOCATIONS:?}"
+    exit 97
+fi
+printf 'OK %s\n' "$seed" >>"${FAKE_HERMIT_INVOCATIONS:?}"
+mkdir -p "$(dirname "$verdict")"
+case "${FAKE_HERMIT_VERDICT_BEHAVIOR:-pass}" in
+    pass)
+        printf '%s\n' \
+            '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+            >"$verdict"
+        ;;
+    one-false)
+        if [[ $seed == 7 ]]; then
+            printf '%s\n' \
+                '{"verified":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+                >"$verdict"
+        else
+            printf '%s\n' \
+                '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+                >"$verdict"
+        fi
+        ;;
+    none) : ;;
+    *) exit 98 ;;
+esac
+if ((seed % 2 == 0)); then
+    printf 'Hello world!\n'
+    exit 0
+fi
+printf 'ERROR! global_str is null at use.\n'
+exit 1
+FAKE_HERMIT
+    chmod 755 "$fake"
+    if output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+        FAKE_HERMIT_VERDICT_BEHAVIOR=one-false \
+        E2E_RESULT_ROOT="$results" E2E_RUN_ID=negative-chaos-verdict \
+        "$ROOT_DIR/ci/test_harness.sh" run \
+        --test determinism-stress/order-violation --mode chaos --backend ptrace \
+        --ci-only 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    if ((status != 1)); then
+        printf '%s\n' "$output" >&2
+        rm -r -- "$scratch"
+        die "a chaos cell with verified=false must fail through the public harness front door"
+    fi
+    if grep -q '^BAD ' "$invocation_log"; then
+        cat "$invocation_log" >&2
+        rm -r -- "$scratch"
+        die "the chaos harness omitted a required verification argument"
+    fi
+    expected=$(chaos_seed_count "${METADATA_BY_ID[determinism-stress/order-violation]}")
+    [[ $(grep -c '^OK ' "$invocation_log") == "$expected" ]] || {
+        cat "$invocation_log" >&2
+        rm -r -- "$scratch"
+        die "the chaos harness did not make exactly one verified invocation per seed"
+    }
+    result_row="$results/negative-chaos-verdict/results.jsonl"
+    if ! jq -e --argjson expected "$expected" '
+        .outcome == "FAIL"
+        and (.reason | contains("1 seed(s) did not pass same-seed verification"))
+        and (.reason | contains("verified=false"))
+        and .diversity.distinct == 2
+        and .diversity.seeds == $expected
+    ' "$result_row" >/dev/null; then
+        printf '%s\n' "$output" >&2
+        cat "$result_row" >&2
+        rm -r -- "$scratch"
+        die "the controlled negative verdict did not remain a failing otherwise-diverse chaos cell"
+    fi
+
+    : >"$invocation_log"
+    if ! output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+        FAKE_HERMIT_VERDICT_BEHAVIOR=pass \
+        E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
+        "$ROOT_DIR/ci/test_harness.sh" run \
+        --test determinism-stress/order-violation --mode chaos --backend ptrace \
+        --ci-only 2>&1); then
+        printf '%s\n' "$output" >&2
+        rm -r -- "$scratch"
+        die "the controlled affirmative chaos verdict must pass before the stale-report bracket"
+    fi
+    : >"$invocation_log"
+    if output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+        FAKE_HERMIT_VERDICT_BEHAVIOR=none \
+        E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
+        "$ROOT_DIR/ci/test_harness.sh" run \
+        --test determinism-stress/order-violation --mode chaos --backend ptrace \
+        --ci-only 2>&1); then
+        status=0
+    else
+        status=$?
+    fi
+    if ((status != 1)); then
+        printf '%s\n' "$output" >&2
+        rm -r -- "$scratch"
+        die "a reused run id must not accept verification reports from its earlier process"
+    fi
+    [[ $(grep -c '^OK ' "$invocation_log") == "$expected" ]] || {
+        cat "$invocation_log" >&2
+        rm -r -- "$scratch"
+        die "the stale-report bracket did not make exactly one invocation per seed"
+    }
+    result_row="$results/reused-chaos-verdict/results.jsonl"
+    if ! jq -e --argjson expected "$expected" '
+        .outcome == "FAIL"
+        and (.reason | contains("did not pass same-seed verification"))
+        and (.reason | contains("verify wrote no verdict"))
+        and .diversity.distinct == 2
+        and .diversity.seeds == $expected
+    ' "$result_row" >/dev/null; then
+        printf '%s\n' "$output" >&2
+        cat "$result_row" >&2
+        rm -r -- "$scratch"
+        die "the planted stale reports were not refused specifically as missing new verdicts"
+    fi
+    rm -r -- "$scratch"
 }
 
 function audit_guest_launch_classification_contract {
@@ -2577,7 +2764,7 @@ function collect_sabre_path_evidence {
 # point must know this number, not merely report whatever arrived.
 function expected_sabre_execution_count {
     case $1 in
-    verify | replay) echo 2 ;;
+    verify | replay | chaos) echo 2 ;;
     *) echo 1 ;;
     esac
 }
@@ -2720,6 +2907,39 @@ function assert_bitwise_parity_verdict {
     return 0
 }
 
+# Fail closed unless Hermit's per-seed comparison published an affirmative
+# same-backend repeatability verdict. Chaos deliberately permits either guest
+# exit status, so the process status alone cannot distinguish a reproduced
+# nonzero outcome from a comparison failure.
+function assert_chaos_verify_verdict {
+    local verdict=$1
+    if [[ ! -f $verdict ]]; then
+        printf 'verify wrote no verdict to %s\n' "${verdict##*/}"
+        return 1
+    fi
+    if ! jq -e 'type == "object"' "$verdict" >/dev/null 2>&1; then
+        printf 'verify verdict %s is not a readable JSON object\n' "${verdict##*/}"
+        return 1
+    fi
+    local summary
+    summary=$(jq -r '
+        "verified=\(if has("verified") then (.verified | tostring) else "missing" end) "
+        + "verdict=\(.verdict // "missing") "
+        + "strictness=\(.comparison.strictness // "missing") "
+        + "compared=\(if ((.comparison | type) == "object" and (.comparison | has("compare_logs"))) then (.comparison.compare_logs | tostring) else "missing" end)"
+    ' "$verdict")
+    if ! jq -e '
+        (.verified == true)
+        and (.verdict == "matched")
+        and (.comparison.strictness == "stripped")
+        and (.comparison.compare_logs == true)
+    ' "$verdict" >/dev/null; then
+        printf 'same-seed verification did not pass the M1 comparison: %s\n' "$summary"
+        return 1
+    fi
+    printf 'same-seed verification passed: %s\n' "$summary"
+}
+
 function execute_attempt {
     local test=$1
     local metadata=$2
@@ -2760,6 +2980,7 @@ function execute_attempt {
         env_args+=(HERMIT_SABRE_PATH_EVIDENCE="$path_evidence_file")
     fi
     local -a command guest_command profile run_args guest_args custom_args verify_log_flags
+    local verify_report=''
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     mapfile -t guest_args < <(
         jq -r --arg mode "$mode" --arg backend "$guest_backend" \
@@ -2795,6 +3016,15 @@ function execute_attempt {
         verify_log_flags=(--keep-logs --verify-log-dir "$verify_log_dir")
     fi
 
+    # A run id can be deliberately reused while debugging. Never let a report
+    # left by an earlier process stand in for the process about to launch.
+    # Invalidate the exact output path for every mode that asks Hermit to write
+    # a verification report, immediately before constructing that command.
+    if [[ $mode == verify || $mode == replay || $mode == chaos ]]; then
+        verify_report=$(verify_verdict_path "$cell_dir" "$attempt")
+        rm -f -- "$verify_report"
+    fi
+
     case "$mode" in
         naked)
             command=("${guest_command[@]}")
@@ -2807,8 +3037,7 @@ function execute_attempt {
             # parity comparator and made to emit a machine-readable verdict, which
             # run_cell then checks -- otherwise the cell would be justified by a
             # parity measurement it never actually performs.
-            local verify_strict_flags=(--verify-json
-                "$(verify_verdict_path "$cell_dir" "$attempt")")
+            local verify_strict_flags=(--verify-json "$verify_report")
             if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
                 verify_strict_flags=(--verify-strict "${verify_strict_flags[@]}")
             fi
@@ -2817,15 +3046,19 @@ function execute_attempt {
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
-                --verify-json "$(verify_verdict_path "$cell_dir" "$attempt")"
+                --verify-json "$verify_report"
                 --data-dir "$cell_dir/recording" --record-timeout "$timeout_seconds" -- "${guest_command[@]}")
             ;;
         chaos)
             # Chaos seeds are witnesses for a guest schedule, so the guest's initial
             # stack must not inherit run-specific host variables such as RESULT_ROOT.
             # Keep the witness independent of the harness run id and checkout path.
-            command=("$HERMIT_BIN" --log=off run --base-env=minimal --backend "$backend" --strict --chaos
-                --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
+            # Hermit's verifier executes the same seed twice. `both` permits a
+            # reproduced nonzero guest outcome while the JSON verdict distinguishes
+            # it from a failed comparison.
+            command=("$HERMIT_BIN" --log=info run --base-env=minimal --backend "$backend" --strict
+                --verify --verify-allow=both --verify-json "$verify_report"
+                --chaos --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         custom)
             mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
@@ -2865,11 +3098,17 @@ function execute_attempt {
         printf '%s\n' "$normalized_status" >"$verify_log_dir/normalized-ptrace-golden.status"
     fi
 
-    local hash attempt_execution
+    local hash attempt_execution verification_failure=''
+    if [[ $mode == chaos ]]; then
+        if verification_failure=$(assert_chaos_verify_verdict "$verify_report"); then
+            verification_failure=''
+        fi
+    fi
     hash=$(observation_hash "$metadata" "$status" "$stdout_file" "$stderr_file" "$cell_dir/tmp")
     attempt_execution=$(classify_attempt_execution "$mode" "$status" "$stderr_file" "$stdout_file")
-    printf '%s\t%s\t%s\t%s\t%s\n' \
-        "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$status" "$hash" "$stdout_file" "$stderr_file" "$attempt_execution" \
+        "$verification_failure"
 }
 
 function append_result {
@@ -2930,8 +3169,11 @@ function append_result {
             ;;
         chaos)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=off","run","--base-env=minimal",("--backend=" + $backend),"--strict","--chaos","--sched-heuristic=random"]')
-            log_level=off
+                '["--log=info","run","--base-env=minimal",("--backend=" + $backend),
+                  "--strict","--verify","--verify-allow=both","--verify-json",
+                  "<per-seed-verify-report>","--chaos","--sched-heuristic=random",
+                  "--seed=<manifest-seed>"]')
+            log_level=info
             ;;
         custom)
             custom_effective_args=$(jq -c '.modes.custom.args // []' \
@@ -3021,7 +3263,7 @@ function run_cell {
         min_distinct=$(jq -r '.modes.naked.assert.min_distinct // 2' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution <<<"$row"
+            IFS=$'\t' read -r status hash _stdout_file _stderr_file attempt_execution _verification_failure <<<"$row"
             hashes+=("$hash")
             if timeout_reason=$(individual_test_timeout_reason \
                 "$id" "$mode" native "$attempt" "$timeout_seconds" "$status" \
@@ -3046,11 +3288,12 @@ function run_cell {
             reason="naked control observed $distinct distinct outcomes across $runs runs"
         fi
     elif [[ $mode == chaos ]]; then
-        local min_distinct min_passes min_failures seed row1 row2 status1 hash1 status2 hash2
-        local stdout1 stderr1 execution1 stdout2 stderr2 execution2
+        local min_distinct min_passes min_failures seed row status hash
+        local stdout_file stderr_file attempt_execution verification_failure
         local outcome_classes min_normalized_entropy
-        local passes=0 failures=0 repeat_mismatches=0
+        local passes=0 failures=0
         local -a hashes=()
+        local -a verification_failures=()
         min_distinct=$(jq -r '.modes.chaos.assert.min_distinct // 2' <<<"$metadata")
         min_passes=$(jq -r '.modes.chaos.assert.min_passes // 0' <<<"$metadata")
         min_failures=$(jq -r '.modes.chaos.assert.min_failures // 0' <<<"$metadata")
@@ -3058,37 +3301,27 @@ function run_cell {
         min_normalized_entropy=$(jq -r \
             '.modes.chaos.assert.min_normalized_entropy // "none"' <<<"$metadata")
         while IFS= read -r seed; do
-            row1=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-a" "$seed")
-            IFS=$'\t' read -r status1 hash1 stdout1 stderr1 execution1 <<<"$row1"
-            if [[ $execution1 == LAUNCH_REFUSED ]]; then
-                launch_refusal_stderr=$stderr1
+            row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed" "$seed")
+            IFS=$'\t' read -r status hash stdout_file stderr_file attempt_execution verification_failure <<<"$row"
+            if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
+                launch_refusal_stderr=$stderr_file
                 break
             fi
             if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" "$backend" "seed-$seed-a" "$timeout_seconds" "$status1" \
-                "${stderr1}.timeout"); then
+                "$id" "$mode" "$backend" "seed-$seed" "$timeout_seconds" "$status" \
+                "${stderr_file}.timeout"); then
                 break
             fi
             timeout_reason=''
-            row2=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "seed-$seed-b" "$seed")
-            IFS=$'\t' read -r status2 hash2 stdout2 stderr2 execution2 <<<"$row2"
-            if [[ $execution2 == LAUNCH_REFUSED ]]; then
-                launch_refusal_stderr=$stderr2
-                break
-            fi
-            if timeout_reason=$(individual_test_timeout_reason \
-                "$id" "$mode" "$backend" "seed-$seed-b" "$timeout_seconds" "$status2" \
-                "${stderr2}.timeout"); then
-                break
-            fi
-            timeout_reason=''
-            hashes+=("$hash1")
-            if [[ $status1 == 0 ]]; then
+            hashes+=("$hash")
+            if [[ $status == 0 ]]; then
                 ((passes += 1))
             else
                 ((failures += 1))
             fi
-            [[ $status1 == "$status2" && $hash1 == "$hash2" ]] || ((repeat_mismatches += 1))
+            if [[ -n $verification_failure ]]; then
+                verification_failures+=("seed $seed: $verification_failure")
+            fi
         done < <(jq -r '.modes.chaos.seeds[]' <<<"$metadata")
         if [[ -n $launch_refusal_stderr ]]; then
             outcome=ERROR
@@ -3176,8 +3409,8 @@ function run_cell {
             # whole story when min_failures was unmet too. The count is stated so a
             # reader can tell a single-leg failure from a broad one.
             local -a unmet=()
-            ((repeat_mismatches > 0)) &&
-                unmet+=("repeat_mismatches=$repeat_mismatches (a seed did not reproduce; this is a DETERMINISM failure, not a diversity one)")
+            ((${#verification_failures[@]} > 0)) &&
+                unmet+=("${#verification_failures[@]} seed(s) did not pass same-seed verification (${verification_failures[0]})")
             ((distinct < min_distinct)) &&
                 unmet+=("distinct $distinct < min_distinct $min_distinct")
             ((passes < min_passes)) && unmet+=("passes $passes < min_passes $min_passes")
@@ -3188,14 +3421,13 @@ function run_cell {
             if ((${#unmet[@]} > 0)); then
                 outcome=FAIL
                 reason="chaos $diversity_summary passes=$passes failures=$failures"
-                reason+=" repeat_mismatches=$repeat_mismatches"
                 reason+="; ${#unmet[@]} of 5 assertions unmet: "
                 local joined
                 printf -v joined '%s; ' "${unmet[@]}"
                 reason+="${joined%; }"
             else
                 reason="chaos $diversity_summary passes=$passes failures=$failures;"
-                reason+=" every seed reproduced"
+                reason+=" every seed passed same-seed verification"
             fi
         fi
     elif [[ $mode == custom ]]; then
@@ -3206,7 +3438,7 @@ function run_cell {
         repeat_identical=$(jq -r '.modes.custom.assert.repeat_identical // false' <<<"$metadata")
         for ((attempt = 1; attempt <= runs; attempt++)); do
             row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" "$attempt")
-            IFS=$'\t' read -r status hash stdout_file stderr_file attempt_execution <<<"$row"
+            IFS=$'\t' read -r status hash stdout_file stderr_file attempt_execution _verification_failure <<<"$row"
             if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
                 launch_refusal_stderr=$stderr_file
                 break
@@ -3240,7 +3472,7 @@ function run_cell {
     else
         local row status _hash stdout_file stderr_file attempt_execution
         row=$(execute_attempt "$test" "$metadata" "$mode" "$backend" "$cell_dir" 1)
-        IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution <<<"$row"
+        IFS=$'\t' read -r status _hash stdout_file stderr_file attempt_execution _verification_failure <<<"$row"
         if [[ $attempt_execution == LAUNCH_REFUSED ]]; then
             outcome=ERROR
             error_kind=guest-launch-refused

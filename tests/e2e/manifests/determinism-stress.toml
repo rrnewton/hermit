@@ -272,19 +272,21 @@ ci = true
 # not curate individual seeds, and never restore diversity by relaxing the
 # assertions below or by weakening --strict/--chaos.
 #
-# Seed sweeps, ptrace chaos, portable profile, one 316-core x86_64 host,
-# each 64 seeds x 2 runs = 128 invocations
-# (--log=off run --backend ptrace --strict --chaos --sched-heuristic=random
-#  --seed=N --no-virtualize-cpuid --max-timeslice=disabled):
+# Seed sweeps, ptrace chaos, portable profile, one 316-core x86_64 host.
+# The current cell uses one Hermit verification per seed (two guest executions):
+# (--log=info run --backend ptrace --strict --verify --verify-allow=both
+#  --verify-json=verify-seed-N.json --chaos --sched-heuristic=random --seed=N
+#  --no-virtualize-cpuid --max-timeslice=disabled):
 #   2026-08-06, build A @ 4c70658e7858: failures 18 of 64 (28.1%)
 #   2026-08-06, build B @ 4c70658e7858: failures 12 of 64 (18.8%)
 # distinct = 2 in both, and 2 is also the CEILING -- the guest has exactly two
 # observable outcomes (rc=0 "Hello world!" vs rc=1 "ERROR! global_str is null
 # at use."), so min_distinct = 2 is simultaneously the floor and the maximum
-# the oracle can ever report. repeat_mismatches = 0 of 64 in both sweeps:
-# every seed reproduced bit-for-bit, so determinization is intact per seed and
-# the only thing this cell can fail on is schedule diversity.
-# Median 45 ms/run; the 32-seed cell costs ~3 s for its 64 invocations.
+# the oracle can ever report. The earlier outer-run hashes matched for all 64
+# seeds in both sweeps. The current harness instead requires each seed's
+# machine-readable Hermit verification verdict; a missing, unreadable, or
+# negative verdict fails the cell before it can count as deterministic.
+# Median 45 ms/guest execution; the 32-seed cell executes 64 guests.
 #
 # WHICH SEEDS EXPOSE THE RACE IS A PROPERTY OF THE BUILD, NOT OF THE SEED, AND
 # IT RESHUFFLES EVEN AT A FIXED SOURCE COMMIT. The two sweeps above are the
@@ -365,7 +367,7 @@ native = "Native scheduling need not visit a representative set of interleavings
 ci = false
 backends_enabled = []
 [test.modes.verify.backends_disabled]
-ptrace = "Chaos mode owns this guest; repeat-identity per seed is already asserted by repeat_mismatches"
+ptrace = "Chaos mode owns this guest; Hermit verifies same-seed repeatability inside every chaos attempt"
 dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
 sabre = "SaBRe requires its external runtime"
@@ -395,9 +397,10 @@ ci = true
 # as the order-violation cell: a curated list is a fixture keyed to the build
 # it was curated on.
 #
-# DERIVED FLOORS -- measured, not chosen. ptrace chaos, portable profile
-# (--log=off run --backend ptrace --strict --chaos --sched-heuristic=random
-#  --seed=N --no-virtualize-cpuid --max-timeslice=disabled), 2026-08-06:
+# DERIVED FLOORS -- measured, not chosen. ptrace chaos, portable profile. The
+# current command uses `--log=info run --strict --verify --verify-allow=both`
+# with a per-seed JSON verdict, plus `--chaos --sched-heuristic=random --seed=N`
+# and the portable-profile flags. Measurements from 2026-08-06:
 #
 #   healthy baseline, seeds 0..31, THREE independent hermit builds
 #   (f89c69766, 2e97833a1, 01c223266) -- byte-identical on all three:
@@ -405,7 +408,8 @@ ci = true
 #     [13,7,4,3,1,1,1,1,1]
 #   eight disjoint 32-seed windows over seeds 0..255, one build:
 #     distinct = 9, 11, 10, 14, 9, 12, 11, 11  (min 9, median 11, max 14)
-#   determinism: repeat_mismatches = 0 of 256 seeds over 512 invocations.
+#   same-seed outer-run hashes matched for all 256 seeds over 512 executions;
+#   the current harness requires Hermit's affirmative per-seed verdict instead.
 #
 #   planted PARTIAL narrowing (the workers run as two serialized pairs, so the
 #   reachable permutations drop to perm{0,1} x perm{2,3} while the guest still

@@ -51,9 +51,9 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by ci/expected-e2e-plan.json and is not a
-chaos-mode race-exposure check. Everything else in the manifest is red until it
-is measured, promoted into the selected plan, and passes validate.
+Green means that the cell is selected by ci/expected-e2e-plan.json. Everything
+else in the manifest is red until it is measured, promoted into the selected
+plan, and passes validate.
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -449,17 +449,21 @@ fn derive(root: &Path) -> Result<Derived, String> {
             ));
         }
     }
-    let green = selected
-        .iter()
-        .filter(|id| id.mode != "chaos" && population.contains(*id))
-        .cloned()
-        .collect();
+    let green = selected_green(&selected, &population);
     Ok(Derived {
         population,
         enabled,
         selected,
         green,
     })
+}
+
+fn selected_green(selected: &BTreeSet<CellId>, population: &BTreeSet<CellId>) -> BTreeSet<CellId> {
+    selected
+        .iter()
+        .filter(|id| population.contains(*id))
+        .cloned()
+        .collect()
 }
 
 fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
@@ -486,13 +490,13 @@ fn render_scorecard(derived: &Derived) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is in `ci/expected-e2e-plan.json`, is not a chaos-mode \
-race-exposure check, and is therefore required to pass by ordinary validation. **Red** is every \
+**Green** means the cell is in `ci/expected-e2e-plan.json` and is therefore required to pass by \
+ordinary validation. **Red** is every \
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
-These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell runs the same backend \
-twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
+These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell, and every seed in a \
+selected `chaos` cell, runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
 same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
 parity.\n\n\
 | Backend | Green | Red | Total |\n\
@@ -626,8 +630,8 @@ denominator.\n\n\
         .count();
     out.push_str(&format!(
         "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above, {chaos} chaos-mode race-exposure checks, and {custom} explicit custom \
-commands outside the comparable denominator. A passing validate must produce a fresh result for \
+compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
+explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
 all of them; a failing green cell is a regression, not permission to move it to red.\n",
         derived.selected.len()
     ));
@@ -1170,6 +1174,17 @@ fn self_test() -> Result<(), String> {
     {
         return Err("negative result bracket accepted a failing row".into());
     }
+    let chaos_id = CellId {
+        mode: "chaos".into(),
+        ..id.clone()
+    };
+    let population = BTreeSet::from([chaos_id.clone()]);
+    if !selected_green(&BTreeSet::from([chaos_id.clone()]), &population).contains(&chaos_id) {
+        return Err("a selected chaos cell was structurally excluded from green".into());
+    }
+    if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
+        return Err("an unselected chaos cell was accepted as green".into());
+    }
     let old_green = TrackedCells {
         schema: SCHEMA,
         cells: vec![TrackedCell {
@@ -1342,7 +1357,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: result, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: result, selected-chaos, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }

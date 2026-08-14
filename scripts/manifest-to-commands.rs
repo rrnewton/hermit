@@ -271,8 +271,9 @@ fn hermit_command(
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=off run --base-env=minimal --backend {} --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
+            seed.unwrap_or(0),
             seed.unwrap_or(0)
         ),
         "custom" => {
@@ -376,11 +377,11 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
                     verify_bitwise_parity,
                     &guest,
                 );
-                let runs = match mode {
-                    "chaos" => 2,
-                    "custom" => custom_runs,
-                    _ => 1,
-                };
+                // A chaos command already asks Hermit to execute the same seed
+                // twice via --verify. Repeating the whole command here would
+                // turn one declared seed into four guest executions and make
+                // this front door disagree with the harness.
+                let runs = if mode == "custom" { custom_runs } else { 1 };
                 let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
                 lines.push(format!(
                     "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
@@ -709,6 +710,9 @@ backends_enabled = ["ptrace"]
             "guest",
         );
         assert!(chaos.contains("run --base-env=minimal"));
+        assert!(chaos.contains("--verify --verify-allow=both"));
+        assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
+        assert!(chaos.contains("--log=info"));
         assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
 
         let custom = hermit_command(
@@ -727,5 +731,28 @@ backends_enabled = ["ptrace"]
 
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
         assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+    }
+
+    #[test]
+    fn one_chaos_seed_emits_one_internally_verified_command() {
+        let tests = manifest(
+            r#"
+[[test]]
+id = "c-programs/one-chaos-seed"
+program = "tests/c/one-chaos-seed.c"
+[test.modes.chaos]
+backends_enabled = ["ptrace"]
+seeds = [7]
+"#,
+        );
+        let commands = commands_for_test(&tests[0].1, &tests[0].0);
+
+        assert_eq!(commands.len(), 1, "one seed must emit one outer command");
+        assert!(commands[0].contains("--seed=7"));
+        assert_eq!(commands[0].matches("--verify-json").count(), 1);
+        assert!(
+            !commands[0].contains("for _run"),
+            "Hermit's internal --verify repeat must not be wrapped in another repeat"
+        );
     }
 }

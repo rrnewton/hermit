@@ -954,9 +954,9 @@ fn optional_positive_integer(
 }
 
 /// Number of `execute_attempt` calls made by the existing harness for one mode.
-/// A verify call still performs Hermit's internal two-run comparison, and a
-/// replay call still performs record and replay. `None` means the manifest does
-/// not declare an executable chaos recipe.
+/// Verify and chaos calls still perform Hermit's internal two-run comparison,
+/// and a replay call still performs record and replay. `None` means the
+/// manifest does not declare an executable chaos recipe.
 fn mode_attempts(id: &str, mode: &str, spec_value: &Value) -> Option<i64> {
     let spec = spec_value
         .as_table()
@@ -1012,11 +1012,10 @@ fn mode_attempts(id: &str, mode: &str, spec_value: &Value) -> Option<i64> {
                     "{id}: chaos seeds must contain at least two unique integers"
                 ));
             }
-            let seeds = i64::try_from(seeds.len())
-                .ok()
-                .and_then(|count| count.checked_mul(2))
-                .unwrap_or_else(|| die(format!("{id}: chaos seed count is too large")));
-            Some(seeds)
+            Some(
+                i64::try_from(seeds.len())
+                    .unwrap_or_else(|_| die(format!("{id}: chaos seed count is too large"))),
+            )
         }
         other => die(format!("{id}: unknown mode `{other}`")),
     }
@@ -1154,7 +1153,7 @@ liteinst = "unsupported"
         let custom = parse_mode("[assert]\nruns = 4\n");
         assert_eq!(mode_attempts("bucket/test", "custom", &custom), Some(4));
         let chaos = parse_mode("seeds = [0, 3, 9]\n");
-        assert_eq!(mode_attempts("bucket/test", "chaos", &chaos), Some(6));
+        assert_eq!(mode_attempts("bucket/test", "chaos", &chaos), Some(3));
         let empty_chaos = parse_mode("seeds = []\n");
         assert_eq!(mode_attempts("bucket/test", "chaos", &empty_chaos), None);
     }

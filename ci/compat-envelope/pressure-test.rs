@@ -2800,9 +2800,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     let unavailable_chaos = manifest_budgets
         .get(&("applications/timed-progress-bar".into(), "chaos".into()))
         .ok_or("self-test manifest lost applications/timed-progress-bar chaos budget")?;
-    if seeded_chaos.attempts != Some(64) || unavailable_chaos.attempts.is_some() {
+    if seeded_chaos.attempts != Some(32) || unavailable_chaos.attempts.is_some() {
         return Err(format!(
-            "chaos attemptability diverges from the manifest: seeded={:?} (want 64), no-seed={:?} (want unavailable)",
+            "chaos attemptability diverges from the manifest: seeded={:?} (want 32), no-seed={:?} (want unavailable)",
             seeded_chaos.attempts, unavailable_chaos.attempts
         ));
     }
@@ -2819,7 +2819,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if pressure_timeout(
         &CellBudget {
             timeout_seconds: 1800,
-            attempts: Some(64),
+            attempts: Some(32),
         },
         None,
     )? != PRESSURE_CELL_TIMEOUT_SECONDS
@@ -2829,7 +2829,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     if pressure_timeout(
         &CellBudget {
             timeout_seconds: 1800,
-            attempts: Some(64),
+            attempts: Some(32),
         },
         Some(37),
     )? != 37

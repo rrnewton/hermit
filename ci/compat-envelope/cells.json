@@ -42918,7 +42918,7 @@
       "mode": "chaos",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": []
     },
     {
@@ -43398,7 +43398,7 @@
       "mode": "chaos",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": []
     },
     {
