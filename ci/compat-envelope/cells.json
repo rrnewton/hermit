@@ -21797,7 +21797,7 @@
       "test": "c-programs/ipc-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
@@ -39717,7 +39717,7 @@
       "test": "c-programs/thread-sync-determinism",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
@@ -45157,7 +45157,7 @@
       "test": "determinism-stress-c/thread-contention",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },

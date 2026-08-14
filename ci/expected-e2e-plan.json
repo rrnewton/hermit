@@ -680,6 +680,13 @@
       "test": "c-programs/ioctl-fioclex"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/ipc-determinism"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
@@ -755,6 +762,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/random-sources"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "c-programs/thread-sync-determinism"
     },
     {
       "backend": "ptrace",
@@ -874,6 +888,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/signal-order"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress-c/thread-contention"
     },
     {
       "backend": "ptrace",
