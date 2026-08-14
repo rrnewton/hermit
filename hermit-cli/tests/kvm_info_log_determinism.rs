@@ -101,6 +101,35 @@ fn canonical_info(log: &str) -> CanonicalInfo {
     }
 }
 
+/// Compare two captures with the production structured INFO comparator. Unlike
+/// `write_canonical_info`, this retains message boundaries, including for
+/// multiline messages that contain embedded newlines.
+fn compare_canonical_info(left: &str, right: &str) -> detcore::logdiff::LogDiffSummary {
+    let mut left_input = NamedTempFile::new().expect("failed to create first temporary KVM log");
+    left_input
+        .write_all(left.as_bytes())
+        .expect("failed to write first temporary KVM log");
+    left_input
+        .flush()
+        .expect("failed to flush first temporary KVM log");
+    let mut right_input = NamedTempFile::new().expect("failed to create second temporary KVM log");
+    right_input
+        .write_all(right.as_bytes())
+        .expect("failed to write second temporary KVM log");
+    right_input
+        .flush()
+        .expect("failed to flush second temporary KVM log");
+
+    let options = detcore::logdiff::LogDiffOpts {
+        canonicalize_addresses: true,
+        comparison: detcore::logdiff::LogComparisonMode::Info,
+        no_color: true,
+        ..Default::default()
+    };
+    detcore::logdiff::try_log_diff_detailed(left_input.path(), right_input.path(), &options)
+        .expect("failed to compare canonical KVM INFO streams")
+}
+
 #[test]
 fn kvm_info_stream_repeats_exactly_across_two_runs() {
     // Host limitation, not a product result: without /dev/kvm there is no KVM
@@ -120,6 +149,7 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
 
     let first = canonical_info(&first_log);
     let second = canonical_info(&second_log);
+    let comparison = compare_canonical_info(&first_log, &second_log);
 
     // Guard the comparison itself: an empty or truncated capture would make the
     // equality below vacuously true, which is the classic false green.
@@ -130,9 +160,11 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
         first.message_count,
     );
     assert_eq!(
-        first.message_count, second.message_count,
+        comparison.compared_left, comparison.compared_right,
         "KVM INFO stream changed message count between two runs of the same guest",
     );
+    assert_eq!(first.message_count, comparison.compared_left);
+    assert_eq!(second.message_count, comparison.compared_right);
 
     let first_lines = first.text.lines().collect::<Vec<_>>();
     let second_lines = second.text.lines().collect::<Vec<_>>();
@@ -145,7 +177,7 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
         .collect();
 
     assert!(
-        first.text == second.text,
+        comparison.matched_with_evidence(),
         "KVM INFO stream is not reproducible across two runs of the same guest. \
          Every line below differs with no guest cause, so it carries a host value \
          that must not be in the compared stream:\n{}",
@@ -183,6 +215,37 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
             debug_timing_lines[0],
         );
     }
+}
+
+#[test]
+fn canonical_info_comparison_preserves_multiline_message_boundaries() {
+    let left = concat!(
+        "2026-08-14T01:00:00.000000Z INFO first\n",
+        "INFO continuation\n",
+        "2026-08-14T01:00:00.000001Z INFO second\n",
+    );
+    let right = concat!(
+        "2026-08-14T01:00:00.000000Z INFO first\n",
+        "2026-08-14T01:00:00.000001Z INFO continuation\n",
+        "INFO second\n",
+    );
+
+    let flat_left = canonical_info(left);
+    let flat_right = canonical_info(right);
+    assert_eq!(flat_left.message_count, 2);
+    assert_eq!(flat_right.message_count, 2);
+    assert_eq!(
+        flat_left.text, flat_right.text,
+        "fixture must demonstrate why flattened canonical text is insufficient",
+    );
+
+    let structured = compare_canonical_info(left, right);
+    assert_eq!(structured.compared_left, 2);
+    assert_eq!(structured.compared_right, 2);
+    assert!(
+        structured.diff_found,
+        "production comparison must reject a multiline message-boundary shift",
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
