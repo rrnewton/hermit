@@ -1480,6 +1480,7 @@ async fn run_dbt(
     config: DetConfig,
     print_summary: bool,
     capture_output: bool,
+    diagnostic_file: Option<fs::File>,
 ) -> Result<Output, Error> {
     if !config.sequentialize_threads {
         return Err(anyhow!(
@@ -1503,6 +1504,9 @@ async fn run_dbt(
         })?
         .summary(print_summary)
         .isolated_process_group(panic_on_unsupported_syscalls);
+    if let Some(file) = diagnostic_file {
+        runner = runner.diagnostic_file(file);
+    }
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
@@ -1521,9 +1525,13 @@ async fn run_dbt(
 
     if capture_output {
         let launch = || {
-            runner
-                .output_with_environment(&guest, &environment)
-                .map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
+            let output = match output_backend_stdin_file()? {
+                Some(input) => {
+                    runner.output_with_environment_and_reader(&guest, &environment, input)
+                }
+                None => runner.output_with_environment(&guest, &environment),
+            };
+            output.map_err(|error| anyhow!("failed to launch drrun ({}): {error}", drrun.display()))
         };
         let mut output = launch()?;
         if dbt_client_thread_start_failed(&output.status) {
@@ -1655,7 +1663,9 @@ async fn run_with_backend_inner(
     if backend == Backend::Dbt {
         #[cfg(feature = "dbt")]
         {
-            return Ok(run_dbt(command, config, print_summary, false).await?.status);
+            return Ok(run_dbt(command, config, print_summary, false, None)
+                .await?
+                .status);
         }
         #[cfg(not(feature = "dbt"))]
         {
@@ -1729,6 +1739,26 @@ pub fn run_with_output_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
 ) -> Result<Output, Error> {
+    run_with_output_backend_diagnostic_file(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        None,
+    )
+}
+
+/// Variant of [`run_with_output_backend`] that sends DBT runtime diagnostics
+/// to a dedicated file while guest stderr remains captured in [`Output`].
+pub fn run_with_output_backend_diagnostic_file(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    diagnostic_file: Option<fs::File>,
+) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
@@ -1739,6 +1769,7 @@ pub fn run_with_output_backend(
         print_summary,
         print_summary_to_json_file,
         backend,
+        diagnostic_file,
     )
 }
 
@@ -1749,6 +1780,7 @@ async fn run_with_output_backend_inner(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
+    diagnostic_file: Option<fs::File>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         return run_kvm(
@@ -1763,7 +1795,7 @@ async fn run_with_output_backend_inner(
     if backend == Backend::Dbt {
         #[cfg(feature = "dbt")]
         {
-            return run_dbt(command, config, print_summary, true).await;
+            return run_dbt(command, config, print_summary, true, diagnostic_file).await;
         }
         #[cfg(not(feature = "dbt"))]
         {

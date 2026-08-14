@@ -29,6 +29,7 @@ static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -57,6 +58,39 @@ fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
     child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
+}
+
+fn dbt_stderr_guest() -> &'static Path {
+    DBT_STDERR_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-stderr-nostdlib");
+        fs::create_dir_all(&build_root).expect("failed to create DBT stderr guest directory");
+        let guest = build_root.join("stderr_nostdlib");
+        let output = Command::new("cc")
+            .args([
+                "-nostdlib",
+                "-static",
+                "-fno-pie",
+                "-no-pie",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(repository.join("tests/c/simple/stderr_nostdlib.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBT stderr guest");
+        assert!(
+            output.status.success(),
+            "DBT stderr guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
 }
 
 fn liteinst_inert_runtime() -> &'static Path {
@@ -823,26 +857,72 @@ fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
 // TODO-HUMAN-REVIEW(#679): validate the dedicated DBT diagnostic channel.
 #[test]
 fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
-    let script = r#"set -euo pipefail; output=$(/bin/sh -c 'printf guest-stderr >&2' 2>&1); test "$output" = guest-stderr; printf 'isolated=%s\n' "$output""#;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT stderr verification directory");
+    let logs = directory.path().join("logs");
+    fs::create_dir(&logs).expect("failed to create DBT stderr verification log directory");
+    let verdict = directory.path().join("verdict.json");
+    let program = dbt_stderr_guest()
+        .to_str()
+        .expect("DBT stderr guest path should be UTF-8");
     let args = [
+        "--log",
+        "INFO",
         "run",
         "--backend",
         "dbt",
+        "--tmp=/tmp",
         "--strict",
         "--verify",
+        "--verify-strict",
+        "--keep-logs",
+        "--verify-log-dir",
+        logs.to_str()
+            .expect("DBT stderr verification log path should be UTF-8"),
+        "--verify-json",
+        verdict
+            .to_str()
+            .expect("DBT stderr verification verdict path should be UTF-8"),
         "--",
-        "/bin/bash",
-        "-c",
-        script,
+        program,
     ];
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "isolated=guest-stderr\n");
-    assert!(
-        stderr(&output).contains(":: DBT path confirmed: DynamoRIO client reported tool=Detcore"),
-        "DBT confirmation missing:\n{}",
+    assert!(stdout(&output).is_empty(), "unexpected stdout: {output:?}");
+    assert_eq!(
+        stderr(&output).matches("guest-stderr").count(),
+        1,
+        "guest stderr was not preserved exactly once:\n{}",
         stderr(&output),
+    );
+    let mut retained_logs = fs::read_dir(&logs)
+        .expect("failed to read retained DBT verification logs")
+        .map(|entry| entry.expect("failed to read retained log entry").path())
+        .collect::<Vec<_>>();
+    retained_logs.sort();
+    assert_eq!(retained_logs.len(), 2, "unexpected logs: {retained_logs:?}");
+    for log in retained_logs {
+        let contents = fs::read_to_string(&log).expect("failed to read retained DBT log");
+        assert!(
+            contents.contains("INFO detcore"),
+            "missing Detcore INFO: {log:?}"
+        );
+        assert!(
+            !contents.contains("guest-stderr"),
+            "guest stderr leaked into DBT diagnostics: {log:?}"
+        );
+    }
+    let verdict: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict).expect("failed to read DBT stderr verification verdict"),
+    )
+    .expect("DBT stderr verification verdict should be JSON");
+    assert_eq!(verdict["verified"], true);
+    assert_eq!(verdict["bitwise_parity"], true);
+    assert!(
+        verdict["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
     );
 }
 

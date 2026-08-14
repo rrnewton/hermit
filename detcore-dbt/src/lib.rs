@@ -35,6 +35,8 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
+use std::time::Instant;
 
 use detcore::Config;
 use detcore::DetTid;
@@ -91,6 +93,11 @@ struct DbtSubscriber {
     level: DbtLogLevel,
 }
 
+// The standard verifier removes this wall-clock field before comparison. DBT
+// runs inside the guest process and therefore cannot use the controller's
+// tracing formatter, so emit the same parse boundary with a fixed value.
+const DBT_LOG_RECORD_PREFIX: &str = "1970-01-01T00:00:00.000000Z ";
+
 impl Subscriber for DbtSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         self.level.enables(metadata.level())
@@ -109,7 +116,7 @@ impl Subscriber for DbtSubscriber {
         let mut visitor = DbtEventVisitor::default();
         event.record(&mut visitor);
         let line = format!(
-            "{} {}: {}\n",
+            "{DBT_LOG_RECORD_PREFIX}{} {}: {}\n",
             metadata.level(),
             metadata.target(),
             visitor.fields
@@ -179,15 +186,31 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
 ///
 /// These progress markers narrate DBT backend startup and are useful when
 /// debugging the runtime, but they are noise for a normal `hermit run --backend
-/// dbt`. Gate them behind `HERMIT_LOG=info` (or `debug`/`trace`) so a default
-/// run is quiet. Genuine warnings and unsupported-syscall diagnostics do not go
-/// through this helper and stay unconditional. The decision is read once and
-/// cached, so hot callers pay only an atomic load.
+/// dbt`. Gate them behind `HERMIT_LOG=debug` (or `trace`) and tag them as DEBUG
+/// records so the standard log reader can parse a complete diagnostic file.
+/// Genuine warnings and unsupported-syscall diagnostics do not go through this
+/// helper and stay unconditional. The decision is read once and cached, so hot
+/// callers pay only an atomic load.
 fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if *ENABLED.get_or_init(info_logging_enabled) {
-        emit_marker(emit, message);
+    if *ENABLED.get_or_init(debug_logging_enabled) {
+        let mut record =
+            Vec::with_capacity(DBT_LOG_RECORD_PREFIX.len() + b"DEBUG ".len() + message.len());
+        record.extend_from_slice(DBT_LOG_RECORD_PREFIX.as_bytes());
+        record.extend_from_slice(b"DEBUG ");
+        record.extend_from_slice(message);
+        unsafe { emit(record.as_ptr(), record.len()) };
     }
+}
+
+fn debug_logging_enabled() -> bool {
+    matches!(
+        std::env::var("HERMIT_LOG")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "debug" | "trace"
+    )
 }
 
 fn info_logging_enabled() -> bool {
@@ -367,6 +390,17 @@ fn run_ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+fn wait_for_flag(flag: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !flag.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 struct Runtime {
     config: Config,
     global: GlobalState,
@@ -413,6 +447,9 @@ static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static PROCESS_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_STARTED: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_COMPLETED: AtomicBool = AtomicBool::new(false);
 static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 static COPIED_UNSUPPORTED_REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 static RUNTIME_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -837,7 +874,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
     let emit = callbacks.emit;
-    RUNTIME_SHUTDOWN.store(false, Ordering::Release);
+    SCHEDULER_COMPLETED.store(false, Ordering::Release);
+    SCHEDULER_STARTED.store(true, Ordering::Release);
+    if PROCESS_EXIT_STARTED.load(Ordering::Acquire) {
+        SCHEDULER_COMPLETED.store(true, Ordering::Release);
+        return;
+    }
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
     emit_lifecycle_marker(emit, b"detcore-dbt: background client thread entered\n");
@@ -916,13 +958,71 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
         callbacks.idle,
     );
     emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler completed\n");
+    drop(runtime);
+    SCHEDULER_COMPLETED.store(true, Ordering::Release);
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm process-exit scheduler ownership.
 pub extern "C" fn reverie_dbt_runtime_process_exit() {
+    const NATURAL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+    const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    PROCESS_EXIT_STARTED.store(true, Ordering::Release);
     READY_IMAGE.store(0, Ordering::Release);
+    if !SCHEDULER_STARTED.load(Ordering::Acquire) {
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        return;
+    }
+    if !wait_for_flag(&SCHEDULER_COMPLETED, NATURAL_COMPLETION_TIMEOUT) {
+        tracing::error!(
+            target: "detcore_dbt",
+            "DBT scheduler did not complete naturally before process exit; cleanup incomplete"
+        );
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        if !wait_for_flag(&SCHEDULER_COMPLETED, FORCED_SHUTDOWN_TIMEOUT) {
+            tracing::error!(
+                target: "detcore_dbt",
+                "DBT scheduler did not stop after shutdown request; cleanup incomplete"
+            );
+        }
+        return;
+    }
+    let runtime = match RUNTIME.write() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => {
+            tracing::error!(
+                target: "detcore_dbt",
+                "DBT runtime lock was poisoned at process exit; cleanup incomplete"
+            );
+            RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+            return;
+        }
+    };
+    let Some(runtime) = runtime else {
+        tracing::error!(
+            target: "detcore_dbt",
+            "DBT runtime was absent at process exit; cleanup incomplete"
+        );
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        return;
+    };
+    let owners = Arc::strong_count(&runtime);
+    if owners != 1 {
+        tracing::error!(
+            target: "detcore_dbt",
+            owners,
+            "DBT runtime still had live users at process exit; cleanup incomplete"
+        );
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        return;
+    }
+    let runtime = Arc::try_unwrap(runtime)
+        .unwrap_or_else(|_| unreachable!("strong count was checked immediately before unwrap"));
+    let no_summary_file = None;
+    run_ready(runtime.global.clean_up(false, &no_summary_file));
+    tracing::info!(target: "hermit::backend_stats", "backend run complete");
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
 }
 
@@ -2570,5 +2670,20 @@ mod tests {
         }
 
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
+    }
+
+    #[test]
+    fn scheduler_completion_wait_is_bounded_and_observes_completion() {
+        let pending = AtomicBool::new(false);
+        assert!(!wait_for_flag(&pending, Duration::ZERO));
+
+        let completed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                completed.store(true, Ordering::Release);
+            });
+            assert!(wait_for_flag(&completed, Duration::from_secs(1)));
+        });
     }
 }

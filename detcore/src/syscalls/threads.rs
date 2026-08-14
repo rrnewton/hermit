@@ -414,6 +414,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        info!(
+            "[tool] (tid {}) beginning tail_inject of syscall: exit",
+            guest.tid()
+        );
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -433,6 +437,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        info!(
+            "[tool] (tid {}) beginning tail_inject of syscall: exit_group",
+            guest.tid()
+        );
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
