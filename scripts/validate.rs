@@ -851,6 +851,7 @@ fn self_test() -> Result<(), String> {
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
     coverage_schema_bracket()?;
+    test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
@@ -3938,29 +3939,229 @@ fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
     )
 }
 
-fn typed_libtest_count_bracket() -> Result<(), String> {
-    let outcome = |tag: &str, executed_tests, filtered_tests| StepOutcome {
+/// Correct only an incorrect zero classification from the parent finalizer when this
+/// driver's typed final outcome proves that the same planned node ran tests.
+/// The parent remains the plan/coverage authority. Every other classification,
+/// and every malformed or incomplete coverage object, is preserved fail-closed.
+fn correct_test_node_coverage(
+    mut coverage: serde_json::Value,
+    planned_test_nodes: &BTreeSet<String>,
+    outcomes: &[StepOutcome],
+) -> serde_json::Value {
+    let Some(planned_count) = coverage
+        .get("planned_test_nodes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return coverage;
+    };
+    let Some(executed_count) = coverage
+        .get("executed_test_nodes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return coverage;
+    };
+    let strings = |field: &str| -> Option<Vec<String>> {
+        coverage
+            .get(field)?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+    let Some(zero_executed_nodes) = strings("zero_executed_nodes") else {
+        return coverage;
+    };
+    let Some(absent_nodes) = strings("absent_nodes") else {
+        return coverage;
+    };
+
+    let zero_set: BTreeSet<String> = zero_executed_nodes.iter().cloned().collect();
+    let absent_set: BTreeSet<String> = absent_nodes.iter().cloned().collect();
+    let shape_is_valid = planned_count == planned_test_nodes.len() as u64
+        && zero_set.len() == zero_executed_nodes.len()
+        && absent_set.len() == absent_nodes.len()
+        && zero_set.is_disjoint(&absent_set)
+        && zero_set.iter().chain(absent_set.iter()).all(|tag| planned_test_nodes.contains(tag))
+        && executed_count
+            .checked_add(zero_set.len() as u64)
+            .and_then(|count| count.checked_add(absent_set.len() as u64))
+            == Some(planned_count);
+    if !shape_is_valid {
+        return coverage;
+    }
+
+    let final_outcomes: BTreeMap<&str, &StepOutcome> =
+        outcomes.iter().map(|outcome| (outcome.tag.as_str(), outcome)).collect();
+    let corrected: BTreeSet<String> = zero_set
+        .iter()
+        .filter(|tag| {
+            final_outcomes
+                .get(tag.as_str())
+                .is_some_and(|outcome| {
+                    !outcome.ok
+                        && !outcome.aborted
+                        && outcome.executed_tests.is_some_and(|n| n > 0)
+                })
+        })
+        .cloned()
+        .collect();
+    if corrected.is_empty() {
+        return coverage;
+    }
+    let Some(new_executed_count) = executed_count.checked_add(corrected.len() as u64) else {
+        return coverage;
+    };
+    let remaining_zero: Vec<String> = zero_executed_nodes
+        .into_iter()
+        .filter(|tag| !corrected.contains(tag.as_str()))
+        .collect();
+    let Some(object) = coverage.as_object_mut() else {
+        return coverage;
+    };
+    object.insert("executed_test_nodes".into(), serde_json::json!(new_executed_count));
+    object.insert("zero_executed_nodes".into(), serde_json::json!(remaining_zero));
+    coverage
+}
+
+/// Two-sided bracket for the narrow zero-classification correction. It proves that a
+/// failed node with a positive typed count is corrected without changing its
+/// failure, while every unproved or malformed case remains byte-for-value.
+fn test_node_coverage_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, ok: bool, aborted: bool, executed_tests| StepOutcome {
         tag: tag.into(),
-        ok: true,
+        ok,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests,
+        filtered_tests: Some(0),
+        returncode: Some(if ok { 0 } else { 100 }),
+        reason: if ok { String::new() } else { "test failure".into() },
+        aborted,
+    };
+
+    let planned = BTreeSet::from(["test.ran_failed".to_string()]);
+    let parent_zero = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 0,
+        "zero_executed_nodes": ["test.ran_failed"],
+        "absent_nodes": [],
+    });
+    let ran_failed = outcome("test.ran_failed", false, false, Some(23));
+    let coverage = correct_test_node_coverage(
+        parent_zero.clone(),
+        &planned,
+        &[ran_failed.clone()],
+    );
+    if coverage
+        != serde_json::json!({
+            "planned_test_nodes": 1,
+            "executed_test_nodes": 1,
+            "zero_executed_nodes": [],
+            "absent_nodes": [],
+        })
+        || ran_failed.ok
+    {
+        return Err(
+            "test-node coverage: a 23-test failed node must be executed and remain failed".into(),
+        );
+    }
+
+    for (name, outcomes) in [
+        ("missing", Vec::new()),
+        ("zero", vec![outcome("test.ran_failed", true, false, Some(0))]),
+        ("passing", vec![outcome("test.ran_failed", true, false, Some(23))]),
+        ("count-unknown", vec![outcome("test.ran_failed", true, false, None)]),
+        ("aborted", vec![outcome("test.ran_failed", false, true, Some(23))]),
+        ("unplanned", vec![outcome("test.other", false, false, Some(23))]),
+    ] {
+        let unchanged = correct_test_node_coverage(parent_zero.clone(), &planned, &outcomes);
+        if unchanged != parent_zero {
+            return Err(format!(
+                "test-node coverage: {name} evidence must not change the parent's classification"
+            ));
+        }
+    }
+
+    let parent_absent = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 0,
+        "zero_executed_nodes": [],
+        "absent_nodes": ["test.ran_failed"],
+    });
+    if correct_test_node_coverage(parent_absent.clone(), &planned, &[ran_failed.clone()])
+        != parent_absent
+    {
+        return Err("test-node coverage: an absent classification must not be rewritten".into());
+    }
+    let parent_executed = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 1,
+        "zero_executed_nodes": [],
+        "absent_nodes": [],
+    });
+    if correct_test_node_coverage(parent_executed.clone(), &planned, &[ran_failed.clone()])
+        != parent_executed
+    {
+        return Err("test-node coverage: an already-executed classification must not change".into());
+    }
+    for malformed in [
+        serde_json::Value::Null,
+        serde_json::json!({"planned_test_nodes": 1}),
+        serde_json::json!({
+            "planned_test_nodes": 1,
+            "executed_test_nodes": 1,
+            "zero_executed_nodes": ["test.ran_failed"],
+            "absent_nodes": [],
+        }),
+    ] {
+        if correct_test_node_coverage(malformed.clone(), &planned, &[ran_failed.clone()])
+            != malformed
+        {
+            return Err("test-node coverage: malformed evidence must remain unchanged".into());
+        }
+    }
+
+    println!(
+        "  test-node coverage: one incorrect zero corrected; unproved and malformed cases unchanged"
+    );
+    Ok(())
+}
+
+fn typed_libtest_count_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, ok: bool, executed_tests, filtered_tests| StepOutcome {
+        tag: tag.into(),
+        ok,
         duration_s: 0.0,
         summary: String::new(),
         executed_tests,
         filtered_tests,
-        returncode: Some(0),
-        reason: String::new(),
+        returncode: Some(if ok { 0 } else { 100 }),
+        reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
-    let full = vec![outcome("test.a", Some(398), Some(0)), outcome("test.b", Some(475), Some(350))];
+    let full = vec![
+        outcome("test.a", true, Some(398), Some(0)),
+        outcome("test.b", true, Some(475), Some(350)),
+    ];
     if libtest_counts(&full) != (Some(873), Some(350)) {
         return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
     }
-    if libtest_counts(&[outcome("test.zero", Some(0), Some(0))]) != (Some(0), Some(0)) {
+    let failed = outcome("test.failed", false, Some(23), Some(5));
+    if libtest_counts(&[failed.clone()]) != (Some(23), Some(5)) || failed.ok {
+        return Err(
+            "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
+                .into(),
+        );
+    }
+    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))]) != (Some(0), Some(0)) {
         return Err("typed libtest counts: demonstrated zero was not preserved".into());
     }
-    if libtest_counts(&[outcome("build.only", None, None)]) != (None, None) {
+    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
-    println!("  typed libtest counts: 873/350 complete accepted; 0/0 preserved; unknown stayed null");
+    println!(
+        "  typed libtest counts: 873/350 pass and 23/5 failure counted; 0/0 preserved; unknown stayed null"
+    );
     Ok(())
 }
 
@@ -5159,10 +5360,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Coverage and base identities come from the parent's single finalizer. A
-    // local reconstruction here would create a second receipt authority.
+    // The parent remains the plan/coverage authority. Correct only the one case
+    // it cannot see in a failed nextest log: a planned node it classified as zero
+    // whose typed final outcome carries a positive executed-test count.
     let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
-    let coverage = receipt.coverage.clone();
+    let coverage = correct_test_node_coverage(
+        receipt.coverage.clone(),
+        &plan.planned_test_nodes,
+        &outcomes,
+    );
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
         .unwrap_or_else(|| "0 0".into());
