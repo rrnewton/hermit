@@ -203,6 +203,7 @@ fn workloads() -> &'static [Workload] {
             ("c_ioctl_fioclex", "ioctl_fioclex.c"),
             ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
             ("c_record_replay_fd_close", "record_replay_fd_close.c"),
+            ("c_fcntl_get_lock", "record_replay_fcntl_get_lock.c"),
             ("c_pidfd_open_self", "pidfd_open_self.c"),
             ("c_pidfd_poll_self", "pidfd_poll_self.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
@@ -345,6 +346,11 @@ fn record_replay_matrix() {
 #[test]
 fn record_reopened_inherited_and_cloned_file_state() {
     run_record_replay("c_record_replay_file_state");
+}
+
+#[test]
+fn record_fcntl_get_lock_buffers_and_errors() {
+    run_record_replay("c_fcntl_get_lock");
 }
 
 /// Regression test for the record/replay regular-file `lseek(SEEK_CUR)` bug.

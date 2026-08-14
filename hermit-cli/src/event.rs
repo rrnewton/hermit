@@ -139,6 +139,13 @@ pub enum SyscallEvent {
     /// printed `ok=6` recording and `ok=4` replaying -- exactly its two
     /// buffer-reading checks.
     FcntlOwnerEx(Vec<u8>),
+    /// The `struct flock` an `fcntl(F_GETLK)` or `fcntl(F_OFD_GETLK)` wrote
+    /// into the guest's buffer, as raw bytes.
+    ///
+    /// Both commands report success through a zero return value and place the
+    /// queried lock state in the caller's buffer. Recording only the return
+    /// value therefore loses guest-visible output needed by replay.
+    FcntlGetLock(Vec<u8>),
 }
 
 /// Recorded output and signal side effects of a read syscall.

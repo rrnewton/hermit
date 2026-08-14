@@ -1399,6 +1399,12 @@
       "why": "tests/c/rcx_canonicalization.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_fcntl_get_lock.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_fcntl_get_lock.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test directly compiles the C guest, records it, and replays it; successful F_GETLK and F_OFD_GETLK calls must restore their output buffers, null pointers must return EFAULT, and bad descriptors must return EBADF without modifying the buffer."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_fd_close.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",

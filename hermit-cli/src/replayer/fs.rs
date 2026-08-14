@@ -875,6 +875,24 @@ impl Replayer {
         Ok(0)
     }
 
+    /// Restore the `struct flock` produced by `fcntl(F_GETLK)` or
+    /// `fcntl(F_OFD_GETLK)`.
+    pub(super) async fn handle_fcntl_get_lock<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        buf: Option<Addr<'_, libc::flock>>,
+    ) -> Result<i64, Errno> {
+        // Consume the recorded result before examining the current pointer so
+        // a recorded EBADF or EFAULT retains Linux's error precedence and does
+        // not write to guest memory.
+        let bytes = next_event!(guest, FcntlGetLock)?;
+        assert_eq!(bytes.len(), std::mem::size_of::<libc::flock>());
+        let addr = buf.ok_or(Errno::EFAULT)?;
+        let dst: AddrMut<u8> = AddrMut::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?;
+        guest.memory().write_exact(dst, &bytes)?;
+        Ok(0)
+    }
+
     pub(super) async fn handle_statfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

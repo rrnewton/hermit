@@ -714,6 +714,29 @@ impl Recorder {
         result
     }
 
+    /// Record the `struct flock` that `fcntl(F_GETLK)` or
+    /// `fcntl(F_OFD_GETLK)` writes into the guest's buffer.
+    pub(super) async fn handle_fcntl_get_lock<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        buf: Option<Addr<'_, libc::flock>>,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|_| {
+                let addr = buf.ok_or(Errno::EFAULT)?;
+                let mut bytes = vec![0; std::mem::size_of::<libc::flock>()];
+                guest.memory().read_exact(addr.cast(), &mut bytes)?;
+                Ok(SyscallEvent::FcntlGetLock(bytes))
+            }),
+        );
+
+        result
+    }
+
     pub(super) async fn handle_statfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

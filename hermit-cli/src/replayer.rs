@@ -301,6 +301,15 @@ impl Tool for Replayer {
                 };
                 self.handle_fcntl_owner_ex(guest, buf).await
             }
+            Syscall::Fcntl(call)
+                if matches!(call.cmd(), FcntlCmd::F_GETLK(_) | FcntlCmd::F_OFD_GETLK(_)) =>
+            {
+                let buf = match call.cmd() {
+                    FcntlCmd::F_GETLK(buf) | FcntlCmd::F_OFD_GETLK(buf) => buf,
+                    _ => unreachable!("guarded by the match arm above"),
+                };
+                self.handle_fcntl_get_lock(guest, buf).await
+            }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
