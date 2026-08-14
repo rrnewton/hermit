@@ -3777,8 +3777,8 @@
       "test": "backend-parity-c/fcntl-owner",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

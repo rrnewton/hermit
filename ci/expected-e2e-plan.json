@@ -270,6 +270,13 @@
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
+      "mode": "replay",
+      "test": "backend-parity-c/fcntl-owner"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/fcntl-owner"
     },

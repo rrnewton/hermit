@@ -96,6 +96,22 @@ pub enum SyscallEvent {
     FtruncateV2(FtruncateEvent),
     /// Destination length after a successful clone ioctl.
     FileClone(FileCloneEvent),
+    /// The `struct f_owner_ex` an `fcntl(F_GETOWN_EX)` wrote into the guest's
+    /// buffer, as raw bytes.
+    ///
+    /// Stored as bytes rather than a typed struct because
+    /// `reverie_syscalls::fcntl::f_owner_ex` has private fields; the layout is
+    /// `#[repr(C)]`, so a byte round-trip is exact. This mirrors
+    /// [`SyscallEvent::Statfs`].
+    ///
+    /// Needed because F_GETOWN_EX returns its whole result through that buffer
+    /// and only `0` through the return value. Replaying the return value alone
+    /// left the buffer holding whatever was on the guest stack, so the guest
+    /// read stale memory. Measured on `backend-parity-c/fcntl-owner`: the fcntl
+    /// stream was byte-identical between record and replay, yet the guest
+    /// printed `ok=6` recording and `ok=4` replaying -- exactly its two
+    /// buffer-reading checks.
+    FcntlOwnerEx(Vec<u8>),
 }
 
 /// Recorded output and signal side effects of a read syscall.

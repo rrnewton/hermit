@@ -855,6 +855,26 @@ impl Replayer {
         })
     }
 
+    /// Restore the `struct f_owner_ex` an `fcntl(F_GETOWN_EX)` produced.
+    ///
+    /// Counterpart to the recorder handler of the same name. Without this the
+    /// return value replayed correctly and the buffer did not, which is exactly
+    /// what `backend-parity-c/fcntl-owner` caught: identical fcntl streams,
+    /// `ok=6` recording versus `ok=4` replaying, the two failures being its only
+    /// two buffer-reading checks.
+    pub(super) async fn handle_fcntl_owner_ex<G: Guest<Self>, T>(
+        &self,
+        guest: &mut G,
+        buf: Option<Addr<'_, T>>,
+    ) -> Result<i64, Errno> {
+        let bytes = next_event!(guest, FcntlOwnerEx)?;
+        debug_assert_eq!(bytes.len(), std::mem::size_of::<T>());
+        let addr = buf.ok_or(Errno::EFAULT)?;
+        let dst: AddrMut<u8> = AddrMut::from_raw(addr.as_raw()).ok_or(Errno::EFAULT)?;
+        guest.memory().write_exact(dst, &bytes)?;
+        Ok(0)
+    }
+
     pub(super) async fn handle_statfs<G: Guest<Self>>(
         &self,
         guest: &mut G,

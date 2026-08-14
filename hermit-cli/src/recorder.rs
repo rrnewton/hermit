@@ -27,6 +27,7 @@ use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
@@ -359,6 +360,16 @@ impl Tool for Recorder {
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
+            // F_GETOWN_EX returns its entire result through the caller's
+            // `struct f_owner_ex` buffer and only `0` through the return value,
+            // so `handle_simple` (which records the return value alone) loses it.
+            Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_GETOWN_EX(_)) => {
+                let buf = match call.cmd() {
+                    FcntlCmd::F_GETOWN_EX(buf) => buf,
+                    _ => unreachable!("guarded by the match arm above"),
+                };
+                self.handle_fcntl_owner_ex(guest, syscall, buf).await
+            }
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,

@@ -4853,11 +4853,10 @@ backends_enabled = []
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

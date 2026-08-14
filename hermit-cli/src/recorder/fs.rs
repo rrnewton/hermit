@@ -685,6 +685,35 @@ impl Recorder {
         result
     }
 
+    /// Record the `struct f_owner_ex` that `fcntl(F_GETOWN_EX)` writes into the
+    /// guest's buffer.
+    ///
+    /// The syscall's whole result lives in that buffer; the return value is just
+    /// `0`. The generic `handle_simple` path records only the return value, so
+    /// replay used to restore `0` and leave the buffer untouched, and the guest
+    /// read whatever was on its stack. Bytes rather than a typed struct because
+    /// the `f_owner_ex` pointee type is not re-exported by reverie and has private fields and is `#[repr(C)]`.
+    pub(super) async fn handle_fcntl_owner_ex<G: Guest<Self>, T>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        buf: Option<Addr<'_, T>>,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|_| {
+                let addr = buf.ok_or(Errno::EFAULT)?;
+                let mut bytes = vec![0; std::mem::size_of::<T>()];
+                guest.memory().read_exact(addr.cast(), &mut bytes)?;
+                Ok(SyscallEvent::FcntlOwnerEx(bytes))
+            }),
+        );
+
+        result
+    }
+
     pub(super) async fn handle_statfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
