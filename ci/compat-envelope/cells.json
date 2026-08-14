@@ -41637,8 +41637,8 @@
       "test": "chaos-c/lock-granularity",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
