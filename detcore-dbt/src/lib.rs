@@ -383,6 +383,7 @@ struct ThreadRuntime {
 
 struct PendingThreadParent {
     parent_tid: Tid,
+    virtual_child_tid: Tid,
     rng_entropy: u128,
     state: DetcoreThreadState,
 }
@@ -441,9 +442,27 @@ fn dbt_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBT child TIDs.
-fn dbt_scheduler_tid(host_tid: i32) -> Option<Tid> {
-    (host_tid > 0).then(|| Tid::from_raw(host_tid))
+// TODO-HUMAN-REVIEW(lane-dbi-determinism-and-parity): Review DBT virtual scheduler IDs.
+fn dbt_scheduler_tid(virtual_tid: i32) -> Option<Tid> {
+    (virtual_tid > 0).then(|| Tid::from_raw(virtual_tid))
+}
+
+fn dbt_process_pid(virtual_pid: i32) -> Option<Pid> {
+    (virtual_pid > 0).then(|| Pid::from_raw(virtual_pid))
+}
+
+fn take_pending_thread_parent(
+    pending: &mut HashMap<i32, PendingThreadParent>,
+    physical_child_tid: i32,
+    virtual_child_tid: Tid,
+) -> Option<PendingThreadParent> {
+    if !pending
+        .get(&physical_child_tid)
+        .is_some_and(|parent| parent.virtual_child_tid == virtual_child_tid)
+    {
+        return None;
+    }
+    pending.remove(&physical_child_tid)
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -974,36 +993,45 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 
     let host_tid = tid;
     let host_pid = pid;
+    if host_tid <= 0 || host_pid <= 0 {
+        return -1;
+    }
+    let Some(det_tid) = dbt_scheduler_tid(scratch.virtual_tid) else {
+        return -1;
+    };
+    let Some(det_pid) = dbt_process_pid(scratch.virtual_pid) else {
+        return -1;
+    };
     let runtime = current_runtime();
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let parent = if host_tid == host_pid {
         None
     } else {
-        let parent = PENDING_THREAD_PARENTS
-            .lock()
-            .expect("pending DBT thread parent lock poisoned")
-            .remove(&host_tid);
-        let Some(parent) = parent else {
+        let Some(parent) = take_pending_thread_parent(
+            &mut PENDING_THREAD_PARENTS
+                .lock()
+                .expect("pending DBT thread parent lock poisoned"),
+            host_tid,
+            det_tid,
+        ) else {
             return 1;
         };
         Some(parent)
     };
-    let Some(det_tid) = dbt_scheduler_tid(host_tid) else {
-        return -1;
-    };
     let parent_ref = parent
         .as_ref()
         .map(|parent| (parent.parent_tid, &parent.state));
-    let det_pid = Pid::from_raw(det_tid.into());
+    let det_tid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
-    let mut state = tool.init_thread_state(det_tid, parent_ref);
+    let mut state = tool.init_thread_state(Tid::from_raw(det_tid.into()), parent_ref);
+    state.detpid = Some(DetTid::from_raw(det_pid.into()));
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
-        tid: det_pid,
+        tid: det_tid,
         state,
         initialized: false,
         post_exec_pending: host_tid == pid,
@@ -1011,7 +1039,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     if reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
-        det_pid,
+        det_tid,
         host_pid,
         branch_count,
         &mut thread.state,
@@ -1044,10 +1072,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
     scratch: *mut c_void,
     context: *mut c_void,
-    _parent_tid: i32,
+    parent_tid: i32,
     pid: i32,
     branch_count: u64,
     child_tid: i32,
+    virtual_child_tid: i32,
     child_tid_addr: u64,
     flags: u64,
     invoke_syscall: SyscallInvoker,
@@ -1056,6 +1085,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
 ) -> i32 {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
+        return -1;
+    }
+    if parent_tid <= 0 || pid <= 0 || child_tid <= 0 {
         return -1;
     }
 
@@ -1074,7 +1106,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
         parent.state.clone_flags = None;
         return -1;
     };
-    let Some(child_scheduler_tid) = dbt_scheduler_tid(child_tid) else {
+    let Some(child_scheduler_tid) = dbt_scheduler_tid(virtual_child_tid) else {
         parent.state.clone_flags = None;
         return -1;
     };
@@ -1085,6 +1117,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
             child_tid,
             PendingThreadParent {
                 parent_tid: Tid::from_raw(parent.tid.into()),
+                virtual_child_tid: child_scheduler_tid,
                 rng_entropy,
                 state: parent_snapshot,
             },
@@ -1292,7 +1325,7 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm native process dispatch pauses only exec.
 // TODO-HUMAN-REVIEW(PR-874): Review deferred-syscall and register-writer ABI compatibility.
-// TODO-HUMAN-REVIEW(PR-1060): Review host child DetTid syscall dispatch.
+// TODO-HUMAN-REVIEW(lane-dbi-determinism-and-parity): Review virtual DetTid syscall dispatch.
 // TODO-HUMAN-REVIEW(PR-1118): Review fault-safe DBT getrandom memory writes.
 pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     context: *mut c_void,
@@ -1320,6 +1353,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if tid <= 0 || pid <= 0 {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
+    let Some(det_tid) = dbt_scheduler_tid(scratch.virtual_tid) else {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    };
+    let Some(det_pid) = dbt_process_pid(scratch.virtual_pid) else {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    };
     translate_self_identity_targets(
         sysnum,
         &mut dispatch_args,
@@ -1391,11 +1439,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = current_runtime();
-    let tid = Pid::from_raw(tid);
     let pid = Pid::from_raw(pid);
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(pid, &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
@@ -1415,15 +1462,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
         }
-        let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
-        if scratch.virtual_tid > 0 {
-            state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
-        }
+        let mut state = tool.init_thread_state(det_tid, None);
+        state.detpid = Some(DetTid::from_raw(det_pid.into()));
+        state.set_open_file_creator(DetTid::from_raw(det_tid.into()));
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid,
+            tid: Pid::from_raw(det_tid.into()),
             state,
             initialized: false,
             post_exec_pending: true,
@@ -1607,12 +1653,43 @@ mod tests {
     }
 
     #[test]
-    fn child_scheduler_identity_remains_the_host_tid() {
-        let host_tid = 42_001;
-        let scheduler_tid: i32 = dbt_scheduler_tid(host_tid).unwrap().into();
-        assert_eq!(scheduler_tid, host_tid);
+    fn scheduler_and_process_identities_require_positive_virtual_ids() {
+        let scheduler_tid: i32 = dbt_scheduler_tid(4).unwrap().into();
+        let process_pid: i32 = dbt_process_pid(3).unwrap().into();
+        assert_eq!(scheduler_tid, 4);
+        assert_eq!(process_pid, 3);
         assert_eq!(dbt_scheduler_tid(0), None);
         assert_eq!(dbt_scheduler_tid(-1), None);
+        assert_eq!(dbt_process_pid(0), None);
+        assert_eq!(dbt_process_pid(-1), None);
+    }
+
+    #[test]
+    fn pending_thread_parent_requires_physical_key_and_virtual_identity() {
+        let make_parent = |virtual_child_tid| {
+            let config = Config::default();
+            let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(3),
+                virtual_child_tid: Tid::from_raw(virtual_child_tid),
+                rng_entropy: dbt_child_rng_entropy(3, 1).unwrap(),
+                state: tool.init_thread_state(Tid::from_raw(3), None),
+            }
+        };
+
+        let mut matching = HashMap::new();
+        matching.insert(42_001, make_parent(4));
+        assert!(take_pending_thread_parent(&mut matching, 42_001, Tid::from_raw(4)).is_some());
+        assert!(matching.is_empty());
+
+        let mut mismatching = HashMap::new();
+        mismatching.insert(42_001, make_parent(9));
+        assert!(take_pending_thread_parent(&mut mismatching, 42_002, Tid::from_raw(9)).is_none());
+        assert_eq!(mismatching.len(), 1);
+        assert!(take_pending_thread_parent(&mut mismatching, 42_001, Tid::from_raw(4)).is_none());
+        assert_eq!(mismatching.len(), 1);
+        assert!(take_pending_thread_parent(&mut mismatching, 42_001, Tid::from_raw(9)).is_some());
+        assert!(mismatching.is_empty());
     }
 
     #[test]
