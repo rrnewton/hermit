@@ -872,6 +872,13 @@
       "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress-c/signal-order"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/signal-order"
     },

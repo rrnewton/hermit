@@ -44997,7 +44997,7 @@
       "test": "determinism-stress-c/signal-order",
       "mode": "chaos",
       "backend": "ptrace",
-      "enabled": false,
+      "enabled": true,
       "status": "red",
       "observations": []
     },
