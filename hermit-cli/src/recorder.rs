@@ -655,3 +655,26 @@ impl Recorder {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::record_or_replay_config;
+    use crate::replayer::Replayer;
+
+    #[test]
+    fn record_and_replay_effective_subscriptions_intercept_membarrier() {
+        let config = record_or_replay_config(std::path::Path::new("replay-data"));
+        let recorder = <detcore::Detcore<Recorder> as Tool>::subscriptions(&config);
+        let replayer = <detcore::Detcore<Replayer> as Tool>::subscriptions(&config);
+
+        for (mode, subscriptions) in [("record", recorder), ("replay", replayer)] {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|sysno| sysno == Sysno::membarrier),
+                "{mode} must route membarrier through Detcore"
+            );
+        }
+    }
+}
