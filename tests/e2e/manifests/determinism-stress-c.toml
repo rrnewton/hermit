@@ -92,10 +92,10 @@ backends_enabled = []
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -201,10 +201,10 @@ backends_enabled = []
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -259,10 +259,10 @@ backends_enabled = []
 native = "Native pids are host values by definition; this fixture asserts virtualization"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the pid-identity contract"
 dbt = "Record/replay qualification is separate from the pid-identity contract"
 kvm = "Record/replay qualification is separate from the pid-identity contract"
 sabre = "Record/replay qualification is separate from the pid-identity contract"
@@ -367,10 +367,10 @@ backends_enabled = []
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -423,10 +423,10 @@ backends_enabled = ["native"]
 [test.modes.naked.backends_disabled]
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the strict-verification determinism cell"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -480,10 +480,10 @@ backends_enabled = []
 native = "This migration inventories strict verification; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from the initial strict-verification migration"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

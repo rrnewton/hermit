@@ -577,8 +577,8 @@
       "test": "applications/timed-progress-bar",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -587,16 +587,6 @@
       "test": "applications/timed-progress-bar",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "applications",
-      "test": "applications/timed-progress-bar",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -606,6 +596,16 @@
       "category": "applications",
       "test": "applications/timed-progress-bar",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "applications",
+      "test": "applications/timed-progress-bar",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -1057,8 +1057,8 @@
       "test": "backend-parity-c/bind-getsockname",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -1067,16 +1067,6 @@
       "test": "backend-parity-c/bind-getsockname",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/bind-getsockname",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -1086,6 +1076,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/bind-getsockname",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/bind-getsockname",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4257,8 +4257,8 @@
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4267,16 +4267,6 @@
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/file-io-roundtrip",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4286,6 +4276,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/file-io-roundtrip",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -16897,26 +16897,6 @@
       "test": "c-programs/cachestat-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/cachestat-enosys",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/cachestat-enosys",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -16925,8 +16905,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/cachestat-enosys",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -16936,6 +16916,26 @@
       "category": "c-programs",
       "test": "c-programs/cachestat-enosys",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/cachestat-enosys",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/cachestat-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -19457,26 +19457,6 @@
       "test": "c-programs/futex-waitv-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/futex-waitv-enosys",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/futex-waitv-enosys",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -19485,8 +19465,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/futex-waitv-enosys",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -19496,6 +19476,26 @@
       "category": "c-programs",
       "test": "c-programs/futex-waitv-enosys",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/futex-waitv-enosys",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/futex-waitv-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -19937,26 +19937,6 @@
       "test": "c-programs/get-robust-list-self",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/get-robust-list-self",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/get-robust-list-self",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -19965,8 +19945,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/get-robust-list-self",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -19976,6 +19956,26 @@
       "category": "c-programs",
       "test": "c-programs/get-robust-list-self",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/get-robust-list-self",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/get-robust-list-self",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -21537,26 +21537,6 @@
       "test": "c-programs/ioctl-fioclex",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/ioctl-fioclex",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/ioctl-fioclex",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -21565,8 +21545,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/ioctl-fioclex",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -21576,6 +21556,26 @@
       "category": "c-programs",
       "test": "c-programs/ioctl-fioclex",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/ioctl-fioclex",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/ioctl-fioclex",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -22177,26 +22177,6 @@
       "test": "c-programs/kcmp-eperm",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/kcmp-eperm",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/kcmp-eperm",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -22205,8 +22185,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/kcmp-eperm",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -22216,6 +22196,26 @@
       "category": "c-programs",
       "test": "c-programs/kcmp-eperm",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/kcmp-eperm",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/kcmp-eperm",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -22657,26 +22657,6 @@
       "test": "c-programs/listmount-enosys",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/listmount-enosys",
-      "mode": "replay",
-      "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/listmount-enosys",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -22685,8 +22665,8 @@
       "lane": "portable",
       "category": "c-programs",
       "test": "c-programs/listmount-enosys",
-      "mode": "verify",
-      "backend": "kvm",
+      "mode": "replay",
+      "backend": "sabre",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -22696,6 +22676,26 @@
       "category": "c-programs",
       "test": "c-programs/listmount-enosys",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/listmount-enosys",
+      "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/listmount-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -26977,8 +26977,8 @@
       "test": "c-programs/pause-alarm-interrupt",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -26987,16 +26987,6 @@
       "test": "c-programs/pause-alarm-interrupt",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/pause-alarm-interrupt",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -27006,6 +26996,16 @@
       "category": "c-programs",
       "test": "c-programs/pause-alarm-interrupt",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/pause-alarm-interrupt",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -31777,8 +31777,8 @@
       "test": "c-programs/random-sources",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -31787,16 +31787,6 @@
       "test": "c-programs/random-sources",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/random-sources",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -31806,6 +31796,16 @@
       "category": "c-programs",
       "test": "c-programs/random-sources",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/random-sources",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -42497,8 +42497,8 @@
       "test": "data-handling/zstd-multithread",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -42507,16 +42507,6 @@
       "test": "data-handling/zstd-multithread",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "data-handling",
-      "test": "data-handling/zstd-multithread",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -42526,6 +42516,16 @@
       "category": "data-handling",
       "test": "data-handling/zstd-multithread",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "data-handling",
+      "test": "data-handling/zstd-multithread",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -42977,8 +42977,8 @@
       "test": "determinism-stress/order-violation",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -42987,16 +42987,6 @@
       "test": "determinism-stress/order-violation",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress",
-      "test": "determinism-stress/order-violation",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -43006,6 +42996,16 @@
       "category": "determinism-stress",
       "test": "determinism-stress/order-violation",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress",
+      "test": "determinism-stress/order-violation",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -43137,8 +43137,8 @@
       "test": "determinism-stress/process-chains",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43147,16 +43147,6 @@
       "test": "determinism-stress/process-chains",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress",
-      "test": "determinism-stress/process-chains",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -43166,6 +43156,16 @@
       "category": "determinism-stress",
       "test": "determinism-stress/process-chains",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress",
+      "test": "determinism-stress/process-chains",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -43297,8 +43297,8 @@
       "test": "determinism-stress/thread-contention",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43307,16 +43307,6 @@
       "test": "determinism-stress/thread-contention",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress",
-      "test": "determinism-stress/thread-contention",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -43326,6 +43316,16 @@
       "category": "determinism-stress",
       "test": "determinism-stress/thread-contention",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress",
+      "test": "determinism-stress/thread-contention",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -43617,8 +43617,8 @@
       "test": "determinism-stress/thread-output",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43627,16 +43627,6 @@
       "test": "determinism-stress/thread-output",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress",
-      "test": "determinism-stress/thread-output",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -43646,6 +43636,16 @@
       "category": "determinism-stress",
       "test": "determinism-stress/thread-output",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress",
+      "test": "determinism-stress/thread-output",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -43937,8 +43937,8 @@
       "test": "determinism-stress-c/lock-free",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -43947,16 +43947,6 @@
       "test": "determinism-stress-c/lock-free",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/lock-free",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -43966,6 +43956,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/lock-free",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/lock-free",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -44257,8 +44257,8 @@
       "test": "determinism-stress-c/pid-tid",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44267,16 +44267,6 @@
       "test": "determinism-stress-c/pid-tid",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/pid-tid",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -44286,6 +44276,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/pid-tid",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/pid-tid",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -44417,8 +44417,8 @@
       "test": "determinism-stress-c/pid-tid-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44427,16 +44427,6 @@
       "test": "determinism-stress-c/pid-tid-identity",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/pid-tid-identity",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -44446,6 +44436,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/pid-tid-identity",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/pid-tid-identity",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -44737,8 +44737,8 @@
       "test": "determinism-stress-c/pipe-prefill",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44747,16 +44747,6 @@
       "test": "determinism-stress-c/pipe-prefill",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/pipe-prefill",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -44766,6 +44756,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/pipe-prefill",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/pipe-prefill",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -44897,8 +44897,8 @@
       "test": "determinism-stress-c/producer-consumer",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -44907,16 +44907,6 @@
       "test": "determinism-stress-c/producer-consumer",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/producer-consumer",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -44926,6 +44916,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/producer-consumer",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/producer-consumer",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -45057,8 +45057,8 @@
       "test": "determinism-stress-c/signal-order",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -45067,16 +45067,6 @@
       "test": "determinism-stress-c/signal-order",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "determinism-stress-c",
-      "test": "determinism-stress-c/signal-order",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -45086,6 +45076,16 @@
       "category": "determinism-stress-c",
       "test": "determinism-stress-c/signal-order",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "determinism-stress-c",
+      "test": "determinism-stress-c/signal-order",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -45697,8 +45697,8 @@
       "test": "language-runtimes/bash-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -45707,16 +45707,6 @@
       "test": "language-runtimes/bash-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/bash-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -45726,6 +45716,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/bash-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/bash-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -45857,8 +45857,8 @@
       "test": "language-runtimes/cpp-stl-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -45867,16 +45867,6 @@
       "test": "language-runtimes/cpp-stl-determinism",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/cpp-stl-determinism",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -45886,6 +45876,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/cpp-stl-determinism",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/cpp-stl-determinism",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -46177,8 +46177,8 @@
       "test": "language-runtimes/gawk-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -46187,16 +46187,6 @@
       "test": "language-runtimes/gawk-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/gawk-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -46206,6 +46196,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/gawk-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/gawk-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -46337,8 +46337,8 @@
       "test": "language-runtimes/lua-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -46347,16 +46347,6 @@
       "test": "language-runtimes/lua-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/lua-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -46366,6 +46356,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/lua-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/lua-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -46817,8 +46817,8 @@
       "test": "language-runtimes/perl-hash-order",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -46827,16 +46827,6 @@
       "test": "language-runtimes/perl-hash-order",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/perl-hash-order",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -46846,6 +46836,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/perl-hash-order",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/perl-hash-order",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -47137,8 +47137,8 @@
       "test": "language-runtimes/perl-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -47147,16 +47147,6 @@
       "test": "language-runtimes/perl-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/perl-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -47166,6 +47156,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/perl-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/perl-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -47457,8 +47457,8 @@
       "test": "language-runtimes/python-hash-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -47467,16 +47467,6 @@
       "test": "language-runtimes/python-hash-determinism",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/python-hash-determinism",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -47486,6 +47476,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/python-hash-determinism",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/python-hash-determinism",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -47937,8 +47937,8 @@
       "test": "language-runtimes/python-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -47947,16 +47947,6 @@
       "test": "language-runtimes/python-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/python-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -47966,6 +47956,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/python-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/python-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -48097,8 +48097,8 @@
       "test": "language-runtimes/ruby-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -48107,16 +48107,6 @@
       "test": "language-runtimes/ruby-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/ruby-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -48126,6 +48116,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/ruby-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/ruby-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -48257,8 +48257,8 @@
       "test": "language-runtimes/rust-hashmap-iteration",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -48267,16 +48267,6 @@
       "test": "language-runtimes/rust-hashmap-iteration",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "language-runtimes",
-      "test": "language-runtimes/rust-hashmap-iteration",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -48286,6 +48276,16 @@
       "category": "language-runtimes",
       "test": "language-runtimes/rust-hashmap-iteration",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "language-runtimes",
+      "test": "language-runtimes/rust-hashmap-iteration",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -49217,8 +49217,8 @@
       "test": "system-utils/clock-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -49227,16 +49227,6 @@
       "test": "system-utils/clock-determinism",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/clock-determinism",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -49246,6 +49236,16 @@
       "category": "system-utils",
       "test": "system-utils/clock-determinism",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -49537,8 +49537,8 @@
       "test": "system-utils/date-nanoseconds",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -49547,16 +49547,6 @@
       "test": "system-utils/date-nanoseconds",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/date-nanoseconds",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -49566,6 +49556,16 @@
       "category": "system-utils",
       "test": "system-utils/date-nanoseconds",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/date-nanoseconds",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -49697,8 +49697,8 @@
       "test": "system-utils/du-tree-summary",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -49707,16 +49707,6 @@
       "test": "system-utils/du-tree-summary",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/du-tree-summary",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -49726,6 +49716,16 @@
       "category": "system-utils",
       "test": "system-utils/du-tree-summary",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/du-tree-summary",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -50177,8 +50177,8 @@
       "test": "system-utils/file-timestamp-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -50187,16 +50187,6 @@
       "test": "system-utils/file-timestamp-identity",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/file-timestamp-identity",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -50206,6 +50196,16 @@
       "category": "system-utils",
       "test": "system-utils/file-timestamp-identity",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/file-timestamp-identity",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -50337,8 +50337,8 @@
       "test": "system-utils/find-tree-metadata",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -50347,16 +50347,6 @@
       "test": "system-utils/find-tree-metadata",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/find-tree-metadata",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -50366,6 +50356,16 @@
       "category": "system-utils",
       "test": "system-utils/find-tree-metadata",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/find-tree-metadata",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -50497,8 +50497,8 @@
       "test": "system-utils/mcookie-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -50507,16 +50507,6 @@
       "test": "system-utils/mcookie-random",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/mcookie-random",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -50526,6 +50516,16 @@
       "category": "system-utils",
       "test": "system-utils/mcookie-random",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/mcookie-random",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -50657,8 +50657,8 @@
       "test": "system-utils/mktemp-name",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -50667,16 +50667,6 @@
       "test": "system-utils/mktemp-name",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/mktemp-name",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -50686,6 +50676,16 @@
       "category": "system-utils",
       "test": "system-utils/mktemp-name",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/mktemp-name",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -50977,8 +50977,8 @@
       "test": "system-utils/openssl-genpkey",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -50987,16 +50987,6 @@
       "test": "system-utils/openssl-genpkey",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/openssl-genpkey",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51006,6 +50996,16 @@
       "category": "system-utils",
       "test": "system-utils/openssl-genpkey",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/openssl-genpkey",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51137,8 +51137,8 @@
       "test": "system-utils/openssl-passwd",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51147,16 +51147,6 @@
       "test": "system-utils/openssl-passwd",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/openssl-passwd",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51166,6 +51156,16 @@
       "category": "system-utils",
       "test": "system-utils/openssl-passwd",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/openssl-passwd",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51297,8 +51297,8 @@
       "test": "system-utils/openssl-rand",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51307,16 +51307,6 @@
       "test": "system-utils/openssl-rand",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/openssl-rand",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51326,6 +51316,16 @@
       "category": "system-utils",
       "test": "system-utils/openssl-rand",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/openssl-rand",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51457,8 +51457,8 @@
       "test": "system-utils/openssl-x509",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51467,16 +51467,6 @@
       "test": "system-utils/openssl-x509",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/openssl-x509",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51486,6 +51476,16 @@
       "category": "system-utils",
       "test": "system-utils/openssl-x509",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/openssl-x509",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51617,8 +51617,8 @@
       "test": "system-utils/proc-random-uuid",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51627,16 +51627,6 @@
       "test": "system-utils/proc-random-uuid",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/proc-random-uuid",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51646,6 +51636,16 @@
       "category": "system-utils",
       "test": "system-utils/proc-random-uuid",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/proc-random-uuid",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51777,8 +51777,8 @@
       "test": "system-utils/proc-uptime",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51787,16 +51787,6 @@
       "test": "system-utils/proc-uptime",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/proc-uptime",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51806,6 +51796,16 @@
       "category": "system-utils",
       "test": "system-utils/proc-uptime",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/proc-uptime",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51937,8 +51937,8 @@
       "test": "system-utils/random-device",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -51947,16 +51947,6 @@
       "test": "system-utils/random-device",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/random-device",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -51966,6 +51956,16 @@
       "category": "system-utils",
       "test": "system-utils/random-device",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/random-device",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -52257,8 +52257,8 @@
       "test": "system-utils/shm-coherency-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -52417,8 +52417,8 @@
       "test": "system-utils/shuf-permutation",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -52897,8 +52897,8 @@
       "test": "system-utils/startup-surface-identity",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -53057,8 +53057,8 @@
       "test": "system-utils/uuidgen-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

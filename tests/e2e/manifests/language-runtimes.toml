@@ -90,10 +90,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Bash qualification is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -146,10 +146,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst C++ qualification is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -253,10 +253,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst awk support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -418,10 +418,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Perl support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -473,10 +473,10 @@ sabre = "SaBRe and ptrace each reach L2, but consume different deterministic ent
 liteinst = "LiteInst Python support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -584,10 +584,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Python support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -640,10 +640,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Rust qualification is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -696,10 +696,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Ruby support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -752,10 +752,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst perl support is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -808,10 +808,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst Lua qualification is tracked by backend compatibility"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

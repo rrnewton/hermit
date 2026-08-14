@@ -255,10 +255,10 @@ sabre = "SaBRe strict verification intermittently diverges on multi-thread DETLO
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

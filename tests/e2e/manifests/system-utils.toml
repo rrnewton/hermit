@@ -36,10 +36,10 @@ kvm = "Enable after the ptrace baseline for direct C guests is trusted"
 sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "Clock replay divergence is tracked separately from this determinism entry"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -91,10 +91,10 @@ liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 sabre = "The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The date utility currently diverges while replaying timezone-file reads"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -251,10 +251,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -306,10 +306,10 @@ sabre = "Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -416,10 +416,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -471,10 +471,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -527,10 +527,10 @@ sabre = "SaBRe and ptrace each reach L2, but libcrypto consumes different determ
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -582,10 +582,10 @@ sabre = "Certificate issuance combines wall-clock validity with multiple entropy
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -638,10 +638,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -694,10 +694,10 @@ liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 sabre = "Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The hexdump process tree currently diverges during replay"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -805,10 +805,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The focused C sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -970,10 +970,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -1026,10 +1026,10 @@ sabre = "SaBRe requires its external runtime"
 liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -1081,10 +1081,10 @@ sabre = "Qualify recursive du independently against the new ptrace golden baseli
 liteinst = "Qualify recursive du independently against the new ptrace golden baseline"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -1136,10 +1136,10 @@ sabre = "Qualify recursive find independently against the new ptrace golden base
 liteinst = "Qualify recursive find independently against the new ptrace golden baseline"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
-ptrace = "The record-getpid sentinel owns the blocking replay contract"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -1214,13 +1214,13 @@ ptrace = "No custom multi-run assertion needed; verify's double-run comparison i
 sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
 dbt = "Record/replay identity of file timestamps is a separate contract"
 kvm = "Record/replay identity of file timestamps is a separate contract"
 liteinst = "Record/replay identity of file timestamps is a separate contract"
-ptrace = "Record/replay identity of file timestamps is a separate contract"
 sabre = "Record/replay identity of file timestamps is a separate contract"
 
 [[test]]
@@ -1272,13 +1272,13 @@ ptrace = "No custom multi-run assertion is needed; verify's double-run compariso
 sabre = "No custom multi-run assertion is needed; verify's double-run comparison is the whole contract"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
 dbt = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 kvm = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 liteinst = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
-ptrace = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 sabre = "Record/replay identity of the startup surface is a separate contract and is not what this fixture pins"
 
 [[test]]
@@ -1330,13 +1330,13 @@ ptrace = "No custom multi-run assertion needed; verify's double-run comparison i
 sabre = "No custom multi-run assertion needed; verify's double-run comparison is the contract"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.replay.backends_disabled]
 dbt = "Record/replay identity of shared-memory observation is a separate contract"
 kvm = "Record/replay identity of shared-memory observation is a separate contract"
 liteinst = "Record/replay identity of shared-memory observation is a separate contract"
-ptrace = "Record/replay identity of shared-memory observation is a separate contract"
 sabre = "Record/replay identity of shared-memory observation is a separate contract"
 
 [[test]]

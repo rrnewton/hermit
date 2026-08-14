@@ -18,6 +18,13 @@
       "backend": "ptrace",
       "category": "applications",
       "lane": "portable",
+      "mode": "replay",
+      "test": "applications/timed-progress-bar"
+    },
+    {
+      "backend": "ptrace",
+      "category": "applications",
+      "lane": "portable",
       "mode": "verify",
       "test": "applications/timed-progress-bar"
     },
@@ -48,6 +55,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/append-pwrite"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "backend-parity-c/bind-getsockname"
     },
     {
       "backend": "ptrace",
@@ -272,6 +286,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/file-backed-mmap"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "backend-parity-c/file-io-roundtrip"
     },
     {
       "backend": "ptrace",
@@ -1058,6 +1079,13 @@
       "test": "c-programs/add-key-enosys"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
@@ -1077,6 +1105,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/futex-waitv-enosys"
     },
     {
       "backend": "dbt",
@@ -1100,6 +1135,13 @@
       "test": "c-programs/futex-waitv-enosys"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
@@ -1121,6 +1163,13 @@
       "test": "c-programs/get-robust-list-self"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
@@ -1140,6 +1189,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/kcmp-eperm"
     },
     {
       "backend": "dbt",
@@ -1184,6 +1240,13 @@
       "test": "c-programs/keyctl-enosys"
     },
     {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
       "backend": "dbt",
       "category": "c-programs",
       "lane": "portable",
@@ -1203,6 +1266,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/pause-alarm-interrupt"
     },
     {
       "backend": "ptrace",
@@ -1210,6 +1280,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/pause-alarm-interrupt"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "c-programs/random-sources"
     },
     {
       "backend": "ptrace",
@@ -1250,6 +1327,13 @@
       "backend": "ptrace",
       "category": "data-handling",
       "lane": "portable",
+      "mode": "replay",
+      "test": "data-handling/zstd-multithread"
+    },
+    {
+      "backend": "ptrace",
+      "category": "data-handling",
+      "lane": "portable",
       "mode": "verify",
       "test": "data-handling/zstd-multithread"
     },
@@ -1264,7 +1348,7 @@
       "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
-      "mode": "verify",
+      "mode": "replay",
       "test": "determinism-stress/order-violation"
     },
     {
@@ -1272,7 +1356,28 @@
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "replay",
       "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress/thread-contention"
     },
     {
       "backend": "ptrace",
@@ -1292,8 +1397,22 @@
       "backend": "ptrace",
       "category": "determinism-stress",
       "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/lock-free"
     },
     {
       "backend": "ptrace",
@@ -1306,8 +1425,22 @@
       "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/pid-tid-identity"
     },
     {
       "backend": "ptrace",
@@ -1320,7 +1453,7 @@
       "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
-      "mode": "verify",
+      "mode": "replay",
       "test": "determinism-stress-c/pipe-prefill"
     },
     {
@@ -1328,7 +1461,28 @@
       "category": "determinism-stress-c",
       "lane": "portable",
       "mode": "verify",
+      "test": "determinism-stress-c/pipe-prefill"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
       "test": "determinism-stress-c/producer-consumer"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/producer-consumer"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "determinism-stress-c/signal-order"
     },
     {
       "backend": "ptrace",
@@ -1348,8 +1502,22 @@
       "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/bash-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/bash-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/cpp-stl-determinism"
     },
     {
       "backend": "ptrace",
@@ -1362,8 +1530,22 @@
       "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/gawk-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/gawk-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/lua-random"
     },
     {
       "backend": "ptrace",
@@ -1390,6 +1572,13 @@
       "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/perl-hash-order"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/perl-hash-order"
     },
@@ -1404,6 +1593,13 @@
       "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/perl-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/perl-random"
     },
@@ -1413,6 +1609,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/python-dict-hash-iteration"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/python-hash-determinism"
     },
     {
       "backend": "ptrace",
@@ -1439,7 +1642,7 @@
       "backend": "ptrace",
       "category": "language-runtimes",
       "lane": "portable",
-      "mode": "verify",
+      "mode": "replay",
       "test": "language-runtimes/python-random"
     },
     {
@@ -1447,7 +1650,28 @@
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "verify",
+      "test": "language-runtimes/python-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "replay",
       "test": "language-runtimes/ruby-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/ruby-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "language-runtimes/rust-hashmap-iteration"
     },
     {
       "backend": "ptrace",
@@ -1478,6 +1702,13 @@
       "test": "system-utils/clock-determinism"
     },
     {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/clock-determinism"
+    },
+    {
       "backend": "liteinst",
       "category": "system-utils",
       "lane": "portable",
@@ -1502,8 +1733,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/date-nanoseconds"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/date-nanoseconds"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/du-tree-summary"
     },
     {
       "backend": "ptrace",
@@ -1516,8 +1761,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/file-timestamp-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/file-timestamp-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/find-tree-metadata"
     },
     {
       "backend": "ptrace",
@@ -1530,8 +1789,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/mcookie-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/mcookie-random"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/mktemp-name"
     },
     {
       "backend": "ptrace",
@@ -1551,8 +1824,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/openssl-genpkey"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/openssl-genpkey"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/openssl-passwd"
     },
     {
       "backend": "ptrace",
@@ -1565,8 +1852,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/openssl-rand"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/openssl-rand"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/openssl-x509"
     },
     {
       "backend": "ptrace",
@@ -1579,7 +1880,7 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
-      "mode": "verify",
+      "mode": "replay",
       "test": "system-utils/proc-random-uuid"
     },
     {
@@ -1587,7 +1888,28 @@
       "category": "system-utils",
       "lane": "portable",
       "mode": "verify",
+      "test": "system-utils/proc-random-uuid"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
       "test": "system-utils/proc-uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/proc-uptime"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/random-device"
     },
     {
       "backend": "ptrace",
@@ -1628,8 +1950,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/shm-coherency-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/shm-coherency-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/shuf-permutation"
     },
     {
       "backend": "ptrace",
@@ -1656,8 +1992,22 @@
       "backend": "ptrace",
       "category": "system-utils",
       "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/startup-surface-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
       "mode": "verify",
       "test": "system-utils/startup-surface-identity"
+    },
+    {
+      "backend": "ptrace",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "replay",
+      "test": "system-utils/uuidgen-random"
     },
     {
       "backend": "ptrace",
