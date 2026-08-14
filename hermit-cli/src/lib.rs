@@ -1442,7 +1442,16 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
 
-    tracing::info!(
+    // Host wall-clock durations, so these values cannot repeat across two runs.
+    // They are emitted at DEBUG, not INFO, because INFO is the stream the
+    // determinism comparison reads: `--verify-strict` compares INFO events under
+    // the canonical policy, which removes only the wall-clock *prefix* and
+    // compares the rest of the line exactly. Host timings left in an INFO message
+    // body would therefore make every KVM run differ from every other KVM run on
+    // this line alone, independently of anything the guest did. DEBUG keeps the
+    // measurement available (`--log debug`) without putting an irreproducible
+    // host value inside the compared stream.
+    tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
         setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
