@@ -335,8 +335,15 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
 
 struct FreshCheckout {
     source: PathBuf,
+    parent: PathBuf,
+    canonical_parent: PathBuf,
+    parent_device: u64,
+    parent_inode: u64,
     path: PathBuf,
+    path_device: u64,
+    path_inode: u64,
     sha: String,
+    marker_written: bool,
 }
 
 struct SelfTestDirectory {
@@ -389,6 +396,177 @@ impl Drop for SelfTestDirectory {
 
 const LOCAL_CLONE_ARGS: [&str; 4] = ["clone", "--local", "--no-hardlinks", "--no-checkout"];
 
+fn fresh_checkout_parent(source: &Path) -> Result<(PathBuf, PathBuf, u64, u64), String> {
+    let host_tmp = fs::canonicalize("/tmp")
+        .map_err(|e| format!("cannot resolve host /tmp before pressure execution: {e}"))?;
+    let canonical_source = fs::canonicalize(source).map_err(|e| {
+        format!(
+            "cannot resolve pressure-test source checkout {}: {e}",
+            source.display()
+        )
+    })?;
+    if canonical_source.starts_with(&host_tmp) {
+        return Err(format!(
+            "batch pressure execution refuses source checkout {} because it is under host /tmp, which Hermit replaces for the guest; use a checkout outside /tmp",
+            source.display()
+        ));
+    }
+
+    let parent = source.join("ignored");
+    match fs::symlink_metadata(&parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "batch pressure execution refuses symlinked generated-checkout parent {}",
+                parent.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "generated-checkout parent {} is not a directory",
+                parent.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&parent).map_err(|e| {
+                format!(
+                    "cannot create fresh-checkout parent {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect fresh-checkout parent {}: {error}",
+                parent.display()
+            ));
+        }
+    }
+    let ignored = Command::new("git")
+        .args([
+            "-C",
+            &source.to_string_lossy(),
+            "check-ignore",
+            "-q",
+            "--",
+            "ignored/",
+        ])
+        .status()
+        .map_err(|e| {
+            format!(
+                "cannot verify that {} is ignored by Git: {e}",
+                parent.display()
+            )
+        })?;
+    if !ignored.success() {
+        return Err(format!(
+            "batch pressure execution refuses generated-checkout parent {} because Git does not ignore it",
+            parent.display()
+        ));
+    }
+    let canonical_parent = fs::canonicalize(&parent).map_err(|e| {
+        format!(
+            "cannot resolve fresh-checkout parent {}: {e}",
+            parent.display()
+        )
+    })?;
+    if canonical_parent.starts_with(&host_tmp) {
+        return Err(format!(
+            "batch pressure execution refuses generated checkout parent {} because it resolves under host /tmp, which Hermit replaces for the guest",
+            parent.display()
+        ));
+    }
+    if !canonical_parent.starts_with(&canonical_source) {
+        return Err(format!(
+            "batch pressure execution refuses generated-checkout parent {} because it resolves outside source checkout {}",
+            parent.display(),
+            source.display()
+        ));
+    }
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(&parent).map_err(|e| {
+        format!(
+            "cannot inspect generated-checkout parent {}: {e}",
+            parent.display()
+        )
+    })?;
+    Ok((parent, canonical_parent, metadata.dev(), metadata.ino()))
+}
+
+fn validate_generated_checkout_path(
+    path: &Path,
+    parent: &Path,
+    canonical_parent: &Path,
+    parent_device: u64,
+    parent_inode: u64,
+    expected_path_identity: Option<(u64, u64)>,
+) -> Result<(u64, u64), String> {
+    let name_ok = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("pressure-fresh-"));
+    if path.parent() != Some(parent) || !name_ok {
+        return Err(format!(
+            "generated checkout has unexpected path {}",
+            path.display()
+        ));
+    }
+    use std::os::unix::fs::MetadataExt;
+    let observed_parent = fs::symlink_metadata(parent).map_err(|e| {
+        format!(
+            "cannot inspect generated-checkout parent {}: {e}",
+            parent.display()
+        )
+    })?;
+    if observed_parent.file_type().is_symlink()
+        || !observed_parent.is_dir()
+        || observed_parent.dev() != parent_device
+        || observed_parent.ino() != parent_inode
+    {
+        return Err(format!(
+            "generated-checkout parent changed after selection: {}",
+            parent.display()
+        ));
+    }
+    let observed_canonical_parent = fs::canonicalize(parent).map_err(|e| {
+        format!(
+            "cannot resolve generated-checkout parent {}: {e}",
+            parent.display()
+        )
+    })?;
+    if observed_canonical_parent != canonical_parent {
+        return Err(format!(
+            "generated-checkout parent changed location after selection: {}",
+            parent.display()
+        ));
+    }
+    let observed_path = fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot inspect generated checkout {}: {e}", path.display()))?;
+    if observed_path.file_type().is_symlink() || !observed_path.is_dir() {
+        return Err(format!(
+            "generated checkout is not a real directory: {}",
+            path.display()
+        ));
+    }
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve generated checkout {}: {e}", path.display()))?;
+    if canonical_path.parent() != Some(canonical_parent) {
+        return Err(format!(
+            "generated checkout {} resolves outside its recorded parent {}",
+            path.display(),
+            parent.display()
+        ));
+    }
+    let observed_identity = (observed_path.dev(), observed_path.ino());
+    if expected_path_identity.is_some_and(|expected| expected != observed_identity) {
+        return Err(format!(
+            "generated checkout changed after creation: {}",
+            path.display()
+        ));
+    }
+    Ok(observed_identity)
+}
+
 fn clone_local_without_hardlinks(source: &Path, destination: &Path) -> Result<(), String> {
     command_ok(
         Command::new("git")
@@ -401,17 +579,8 @@ fn clone_local_without_hardlinks(source: &Path, destination: &Path) -> Result<()
 
 impl FreshCheckout {
     fn prepare(source: &Path, sha: &str) -> Result<Self, String> {
-        let parent = source
-            .parent()
-            .filter(|path| path.join("ci-hub").is_dir())
-            .map(|path| path.join("ignored"))
-            .unwrap_or_else(env::temp_dir);
-        fs::create_dir_all(&parent).map_err(|e| {
-            format!(
-                "cannot create fresh-checkout parent {}: {e}",
-                parent.display()
-            )
-        })?;
+        let (parent, canonical_parent, parent_device, parent_inode) =
+            fresh_checkout_parent(source)?;
         let template = parent.join("pressure-fresh-XXXXXXXX");
         let output = Command::new("mktemp")
             .args(["-d", &template.to_string_lossy()])
@@ -424,10 +593,25 @@ impl FreshCheckout {
             ));
         }
         let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-        let checkout = Self {
+        let (path_device, path_inode) = validate_generated_checkout_path(
+            &path,
+            &parent,
+            &canonical_parent,
+            parent_device,
+            parent_inode,
+            None,
+        )?;
+        let mut checkout = Self {
             source: source.to_path_buf(),
+            parent,
+            canonical_parent,
+            parent_device,
+            parent_inode,
             path,
+            path_device,
+            path_inode,
             sha: sha.to_string(),
+            marker_written: false,
         };
         let initialize = (|| {
             clone_local_without_hardlinks(source, &checkout.path)?;
@@ -440,6 +624,7 @@ impl FreshCheckout {
                 format!("source={}\nsha={}\n", source.display(), sha),
             )
             .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
+            checkout.marker_written = true;
             command_ok(
                 Command::new("git")
                     .args([
@@ -491,23 +676,20 @@ impl FreshCheckout {
     }
 
     fn cleanup(&self) -> Result<(), String> {
-        let expected_parent = self
-            .source
-            .parent()
-            .filter(|path| path.join("ci-hub").is_dir())
-            .map(|path| path.join("ignored"))
-            .unwrap_or_else(env::temp_dir);
-        let name_ok = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("pressure-fresh-"));
-        if self.path.parent() != Some(expected_parent.as_path()) || !name_ok {
-            return Err(format!(
-                "refusing to remove generated checkout at unexpected path {}",
+        validate_generated_checkout_path(
+            &self.path,
+            &self.parent,
+            &self.canonical_parent,
+            self.parent_device,
+            self.parent_inode,
+            Some((self.path_device, self.path_inode)),
+        )
+        .map_err(|error| {
+            format!(
+                "refusing to remove generated checkout {}: {error}",
                 self.path.display()
-            ));
-        }
+            )
+        })?;
         let marker = self
             .path
             .join(".git")
@@ -521,7 +703,7 @@ impl FreshCheckout {
                     marker.display()
                 ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !self.marker_written => {
                 // Initialization may fail before the marker is written. This
                 // object still owns the freshly minted, parent/name-checked
                 // directory, so refusing here would leak every failed clone.
@@ -4117,12 +4299,53 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("plan-time scorecard check accepted a stale scorecard".into());
     }
 
-    // The real runner clones a clean commit into /tmp when its checkout has no
-    // dev-hermit parent. A local clone must copy objects rather than hard-link
-    // them: hard links fail with EXDEV when source and destination are on
-    // different filesystems. Exercise the exact Git front door with a tiny
-    // repository on the checkout filesystem, and prove the copied checkout is
-    // detached at the requested commit and usable.
+    // Batch execution must keep its generated checkout on the host-visible
+    // checkout filesystem. Hermit replaces guest /tmp, so silently falling
+    // back there would make script-backed cells refuse before execution.
+    // Refuse that placement before scheduling.
+    let tmp_source = scratch.join("tmp-source");
+    fs::create_dir(&tmp_source)
+        .map_err(|e| format!("cannot create host-/tmp checkout fixture: {e}"))?;
+    command_ok(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&tmp_source),
+        "initialize host-/tmp checkout fixture",
+    )?;
+    fs::write(tmp_source.join(".gitignore"), "/ignored/\n")
+        .map_err(|e| format!("cannot write host-/tmp checkout fixture: {e}"))?;
+    let tmp_refusal = match FreshCheckout::prepare(&tmp_source, "0") {
+        Ok(unexpected) => {
+            let path = unexpected.path.clone();
+            let cleanup = unexpected.cleanup();
+            return Err(match cleanup {
+                Ok(()) => format!(
+                    "source checkout under host /tmp unexpectedly prepared {}",
+                    path.display()
+                ),
+                Err(cleanup) => format!(
+                    "source checkout under host /tmp unexpectedly prepared {}; cleanup also failed: {cleanup}",
+                    path.display()
+                ),
+            });
+        }
+        Err(error) => error,
+    };
+    if !tmp_refusal.contains("under host /tmp") {
+        return Err(format!(
+            "host-/tmp refusal did not name the visibility boundary: {tmp_refusal}"
+        ));
+    }
+    if tmp_source.join("ignored").exists() {
+        return Err("host-/tmp refusal created a generated-checkout parent".into());
+    }
+
+    // A local clone must also copy objects rather than hard-link them: hard
+    // links fail with EXDEV when source and destination are on different
+    // filesystems. Exercise the complete generated-checkout front door with a
+    // tiny repository on the real checkout filesystem, and prove the copied
+    // checkout is detached at the requested commit, usable, and removed only
+    // from its recorded parent.
     if !LOCAL_CLONE_ARGS.contains(&"--no-hardlinks") {
         return Err("fresh local clone does not disable object hard links".into());
     }
@@ -4154,11 +4377,29 @@ fn self_test(root: &Path) -> Result<(), String> {
             .current_dir(&clone_source),
         "initialize no-hardlinks clone fixture",
     )?;
+    fs::write(clone_source.join(".gitignore"), "/ignored/\n")
+        .map_err(|e| format!("cannot write generated-checkout fixture ignore rule: {e}"))?;
+    for required in [
+        "ci/compat-envelope/pressure-test.rs",
+        "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+    ] {
+        let path = clone_source.join(required);
+        fs::create_dir_all(path.parent().expect("required fixture path has parent"))
+            .map_err(|e| format!("cannot create generated-checkout fixture path: {e}"))?;
+        fs::write(&path, "fixture\n")
+            .map_err(|e| format!("cannot write generated-checkout fixture: {e}"))?;
+    }
     fs::write(clone_source.join("tracked"), "usable\n")
         .map_err(|e| format!("cannot write no-hardlinks clone fixture: {e}"))?;
     command_ok(
         Command::new("git")
-            .args(["add", "tracked"])
+            .args([
+                "add",
+                ".gitignore",
+                "tracked",
+                "ci/compat-envelope/pressure-test.rs",
+                "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+            ])
             .current_dir(&clone_source),
         "stage no-hardlinks clone fixture",
     )?;
@@ -4178,58 +4419,88 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     let clone_sha = git_output(&clone_source, &["rev-parse", "HEAD"])?;
     let blob_sha = git_output(&clone_source, &["rev-parse", "HEAD:tracked"])?;
-    let clone_destination = scratch.join("no-hardlinks-checkout");
-    clone_local_without_hardlinks(&clone_source, &clone_destination)?;
-    command_ok(
-        Command::new("git")
-            .args([
-                "-C",
-                &clone_destination.to_string_lossy(),
-                "checkout",
-                "--detach",
-            ])
-            .arg(&clone_sha),
-        "check out no-hardlinks clone fixture",
-    )?;
-    let cloned_sha = git_output(&clone_destination, &["rev-parse", "HEAD"])?;
-    if cloned_sha != clone_sha
-        || fs::read_to_string(clone_destination.join("tracked"))
-            .ok()
-            .as_deref()
-            != Some("usable\n")
-    {
+    if worktree_dirty(&clone_source)? {
+        return Err("generated-checkout source fixture is dirty before preparation".into());
+    }
+    let fresh_fixture = FreshCheckout::prepare(&clone_source, &clone_sha)?;
+    let fresh_path = fresh_fixture.path.clone();
+    let inspect_fresh = (|| -> Result<(), String> {
+        let expected_parent = clone_source.join("ignored");
+        if fresh_fixture.parent != expected_parent
+            || fresh_path.parent() != Some(expected_parent.as_path())
+        {
+            return Err(format!(
+                "generated checkout used unexpected parent {}",
+                fresh_path.display()
+            ));
+        }
+        if worktree_dirty(&clone_source)? {
+            return Err("generated checkout made its source fixture dirty".into());
+        }
+        let cloned_sha = git_output(&fresh_path, &["rev-parse", "HEAD"])?;
+        if cloned_sha != clone_sha
+            || fs::read_to_string(fresh_path.join("tracked"))
+                .ok()
+                .as_deref()
+                != Some("usable\n")
+        {
+            return Err(format!(
+                "no-hardlinks clone is not an exact usable checkout: expected {clone_sha}, observed {cloned_sha}"
+            ));
+        }
+        if blob_sha.len() < 3 {
+            return Err("clone fixture produced a malformed object ID".into());
+        }
+        let (object_dir, object_name) = blob_sha.split_at(2);
+        let source_object = clone_source
+            .join(".git/objects")
+            .join(object_dir)
+            .join(object_name);
+        let cloned_object = fresh_path
+            .join(".git/objects")
+            .join(object_dir)
+            .join(object_name);
+        let source_object_metadata = fs::metadata(&source_object).map_err(|e| {
+            format!(
+                "cannot inspect source clone-fixture object {}: {e}",
+                source_object.display()
+            )
+        })?;
+        let cloned_object_metadata = fs::metadata(&cloned_object).map_err(|e| {
+            format!(
+                "cannot inspect copied clone-fixture object {}: {e}",
+                cloned_object.display()
+            )
+        })?;
+        {
+            use std::os::unix::fs::MetadataExt;
+            if source_object_metadata.dev() == cloned_object_metadata.dev()
+                && source_object_metadata.ino() == cloned_object_metadata.ino()
+            {
+                return Err("fresh local clone hard-linked its source object".into());
+            }
+        }
+        Ok(())
+    })();
+    let cleanup_fresh = fresh_fixture.cleanup();
+    match (inspect_fresh, cleanup_fresh) {
+        (Ok(()), Ok(())) => {}
+        (Err(inspect), Ok(())) => return Err(inspect),
+        (Ok(()), Err(cleanup)) => return Err(cleanup),
+        (Err(inspect), Err(cleanup)) => {
+            return Err(format!(
+                "{inspect}; generated-checkout cleanup also failed: {cleanup}"
+            ));
+        }
+    }
+    if fresh_path.exists() {
         return Err(format!(
-            "no-hardlinks clone is not an exact usable checkout: expected {clone_sha}, observed {cloned_sha}"
+            "generated-checkout cleanup left {} behind",
+            fresh_path.display()
         ));
     }
-    if blob_sha.len() < 3 {
-        return Err("clone fixture produced a malformed object ID".into());
-    }
-    let (object_dir, object_name) = blob_sha.split_at(2);
-    let source_object = clone_source.join(".git/objects").join(object_dir).join(object_name);
-    let cloned_object = clone_destination
-        .join(".git/objects")
-        .join(object_dir)
-        .join(object_name);
-    let source_object_metadata = fs::metadata(&source_object).map_err(|e| {
-        format!(
-            "cannot inspect source clone-fixture object {}: {e}",
-            source_object.display()
-        )
-    })?;
-    let cloned_object_metadata = fs::metadata(&cloned_object).map_err(|e| {
-        format!(
-            "cannot inspect copied clone-fixture object {}: {e}",
-            cloned_object.display()
-        )
-    })?;
-    {
-        use std::os::unix::fs::MetadataExt;
-        if source_object_metadata.dev() == cloned_object_metadata.dev()
-            && source_object_metadata.ino() == cloned_object_metadata.ino()
-        {
-            return Err("fresh local clone hard-linked its source object".into());
-        }
+    if worktree_dirty(&clone_source)? {
+        return Err("generated-checkout cleanup left its source fixture dirty".into());
     }
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
