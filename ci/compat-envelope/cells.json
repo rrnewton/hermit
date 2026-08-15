@@ -777,8 +777,8 @@
       "test": "backend-parity-c/aio-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
