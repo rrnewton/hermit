@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d0783e9e2b574d630941beefcce818af04fa100b ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie d0783e9e2b574d630941beefcce818af04fa100b" >&2
     return 2
 fi
 
@@ -513,6 +513,46 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
 
+# CARRY TO d0783e9 (2026-08-13). RECIPE IDENTITY IS PRESERVED AND THE BUDGET
+# CARRIES. This is the 038e993 case, not the c261050 case: the reverie-dbt
+# subtree DOES differ, but neither source_recipe_key() input does, so the key
+# does not move.
+#
+#   git log --oneline c261050..d0783e9  -> d0783e9 Export captured DBT diagnostics
+#                                          d52dc71 Capture DBT diagnostics separately
+#   git diff --name-only c261050..d0783e9 -> reverie-dbt/src/launcher.rs
+#                                            reverie-dbt/src/lib.rs
+#   git rev-parse c261050:reverie-dbt                  -> 1a54c31a601c0d83dd4b86e8e75d891ab94b2010
+#   git rev-parse d0783e9:reverie-dbt                  -> ce4aacc2aad8bf6c1abcd1659d8699217cb97879  DIFFERS
+#   git rev-parse c261050:reverie-dbt/build.rs         -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   git rev-parse d0783e9:reverie-dbt/build.rs         -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0  IDENTICAL
+#   git rev-parse c261050:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse d0783e9:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de  IDENTICAL
+#
+# source_recipe_key() is computed over exactly {source_dir =
+# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE, $CMAKE_GENERATOR}
+# (reverie-dbt/build.rs:79). Both file inputs are byte-identical by git object
+# identity at the two pins, and CMAKE/CMAKE_GENERATOR are environment, not pin,
+# state. The recipe identity therefore stays
+# sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d --
+# the same value the c261050 entry above derived and the same value the wrapper
+# records in carried-to-pin-on-dynamorio-recipe-key. No new key derivation is
+# claimed here because no key input changed.
+#
+# The two changed files are reverie-dbt RUNTIME source (a separate fd for the
+# DBT diagnostic stream and its accessors). build_dynamorio() cmake-configures
+# and cmake-builds only vendor/dynamorio (build.rs:199-220); it does not read
+# src/. So the quantity this budget governs -- the elapsed time of a DynamoRIO
+# content-key MISS -- cannot have moved. MAX_PARALLEL_JOBS is still 16
+# (reverie-dbt/build.rs:29) and the 1050 effective-job-second threshold
+# (263s at 4 effective jobs; 66s at 16) carries unchanged. Evidenced by input
+# identity rather than a fresh timing run, exactly as the 6a6b4ec, dd3c178,
+# 0ae0c01, 6144323 and 038e993 carries above.
+#
+# BUILD-RELEVANT ANYWAY: reverie-dbt/src is compiled by hermit, so this bump
+# requires REAL exact-head validation; no prior receipt may be reused. The
+# >=5-clean-Hermit-lane-samples replacement bar is still unmet, so nothing is
+# recalibrated here.
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
 export THIRD_PARTY_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS

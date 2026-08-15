@@ -868,6 +868,47 @@ fn run_dbt_forwards_detcore_info_logs() {
     );
 }
 
+#[test]
+fn run_dbt_emits_typed_verification_report_at_the_honest_tier() {
+    let directory = tempfile::tempdir().expect("failed to create DBT report directory");
+    let report = directory.path().join("verification.json");
+    let report_arg = format!("--verify-json={}", report.display());
+    let args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        &report_arg,
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&report).expect("DBT verification report was not published"),
+    )
+    .expect("DBT verification report is not valid JSON");
+    assert_eq!(report["verdict"], "matched");
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["bitwise_parity"], false);
+    assert_eq!(report["comparison"]["strictness"], "stripped");
+    assert_eq!(report["comparison"]["compare_logs"], true);
+    assert!(
+        report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "DBT report carried no run-1 log evidence: {report}"
+    );
+    assert!(
+        report["compared_log_messages"]["right"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "DBT report carried no run-2 log evidence: {report}"
+    );
+}
+
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
 #[test]
 fn run_dbt_verifies_queued_self_signals() {
