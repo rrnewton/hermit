@@ -50,6 +50,13 @@
       "test": "backend-parity-c/cachestat-refusal"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/child-subreaper-refusal"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -489,6 +496,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/robust-list"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/seccomp-refusal"
     },
     {
       "backend": "ptrace",

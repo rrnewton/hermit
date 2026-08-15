@@ -1417,16 +1417,6 @@
       "test": "backend-parity-c/child-subreaper-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/child-subreaper-refusal",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -1436,6 +1426,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/child-subreaper-refusal",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/child-subreaper-refusal",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -12137,8 +12137,8 @@
       "test": "backend-parity-c/seccomp-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
