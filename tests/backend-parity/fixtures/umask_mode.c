@@ -18,7 +18,7 @@
 
 /* Number of behavioral steps this fixture must complete; a lower count is a
    failure, not a smaller success. */
-#define EXPECTED_STEPS 5
+#define EXPECTED_CHECKS 5
 
 /* Return the low permission bits (st_mode & 07777) for a path, or -1. */
 static int perm_bits(const char *path) {
@@ -94,8 +94,8 @@ int main(void) {
      no matter how many steps failed, so a real semantic regression only lowers
      the printed count -- and because both --verify runs lower it identically,
      bitwise parity still holds and the cell passes green. */
-  if (ok != EXPECTED_STEPS) {
-    fprintf(stderr, "umask completed %d of %d steps\n", ok, EXPECTED_STEPS);
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "umask completed %d of %d steps\n", ok, EXPECTED_CHECKS);
     return 1;
   }
   return 0;

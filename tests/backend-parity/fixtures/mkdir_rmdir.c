@@ -41,7 +41,7 @@
 
 /* Number of behavioral steps this fixture must complete; a lower count is a
    failure, not a smaller success. */
-#define EXPECTED_STEPS 6
+#define EXPECTED_CHECKS 6
 
 static void fail(const char *message) {
   fprintf(stderr, "%s: %s\n", message, strerror(errno));
@@ -105,12 +105,12 @@ int main(void) {
      no matter how many steps failed, so a real semantic regression only lowers
      the printed count -- and because both --verify runs lower it identically,
      bitwise parity still holds and the cell passes green. */
-  if (ok != EXPECTED_STEPS) {
+  if (ok != EXPECTED_CHECKS) {
     fprintf(
         stderr,
         "mkdir_rmdir completed %d of %d steps\n",
         ok,
-        EXPECTED_STEPS);
+        EXPECTED_CHECKS);
     return 1;
   }
   return 0;

@@ -44,7 +44,7 @@
 
 /* Number of behavioral steps this fixture must complete; a lower count is a
    failure, not a smaller success. */
-#define EXPECTED_STEPS 6
+#define EXPECTED_CHECKS 6
 
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
@@ -146,9 +146,9 @@ int main(void) {
      no matter how many steps failed, so a real semantic regression only lowers
      the printed count -- and because both --verify runs lower it identically,
      bitwise parity still holds and the cell passes green. */
-  if (ok != EXPECTED_STEPS) {
+  if (ok != EXPECTED_CHECKS) {
     fprintf(
-        stderr, "symlink_ops completed %d of %d steps\n", ok, EXPECTED_STEPS);
+        stderr, "symlink_ops completed %d of %d steps\n", ok, EXPECTED_CHECKS);
     return 1;
   }
   return 0;
