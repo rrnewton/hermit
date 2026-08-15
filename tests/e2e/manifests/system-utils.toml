@@ -299,6 +299,7 @@ backends_enabled = ["native"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
@@ -520,6 +521,7 @@ backends_enabled = ["native"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"
@@ -962,6 +964,7 @@ backends_enabled = ["native"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "DBT coverage is owned by its backend parity partition"
 kvm = "KVM requires the privileged runner"

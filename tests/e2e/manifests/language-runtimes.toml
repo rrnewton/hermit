@@ -577,6 +577,7 @@ backends_enabled = ["native"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "DBT Python support is tracked by backend compatibility"
 kvm = "KVM Python coverage is in the privileged applications bucket"
