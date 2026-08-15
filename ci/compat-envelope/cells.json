@@ -14857,8 +14857,8 @@
       "test": "backend-parity-c/thp-disable",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
