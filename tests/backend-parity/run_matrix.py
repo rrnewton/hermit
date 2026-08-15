@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import NamedTuple
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -166,11 +167,11 @@ def scorecard_fieldnames(actual_header, path):
         )
     return actual, parity_column
 
-# L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
-# contract cannot currently be verified at L2 on that backend. "guest" is
-# guest-visible L2: the two --verify runs produced identical stdout+exit but the
-# internal trace is not compared (KVM concurrent mode). "detlog" is full L2: the
-# two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBT).
+# `--verify` evidence kinds, ordered weakest to strongest. "gap" means the
+# contract cannot currently be verified on that backend. "guest" means the two
+# runs produced identical stdout+exit but the internal trace is not compared
+# (KVM concurrent mode). "bitwise" is full L2: the two runs produced matching
+# INFO streams under the canonical BitwiseInfoV1 policy (ptrace, DBT).
 #
 # `stripped` is the rung that was missing, and its absence is what made every
 # green over-tiered: plain `--verify` DOES compare the DETLOG, but under the
@@ -186,6 +187,65 @@ L2_ALLOWED = {
     "dbt": {"stripped", "bitwise", "gap"},
     "kvm": {"guest", "gap"},
 }
+
+
+class VerifyPolicy(NamedTuple):
+    """The one verification policy this matrix actually requests."""
+
+    hermit_flags: tuple[str, ...]
+    expected_non_kvm_tier: str
+    comparison_claim: str
+
+    @classmethod
+    def checked(
+        cls,
+        hermit_flags: tuple[str, ...],
+        expected_non_kvm_tier: str,
+        comparison_claim: str,
+    ) -> VerifyPolicy:
+        if "--verify" not in hermit_flags:
+            raise ValueError("a verification policy must request --verify")
+        if not any(
+            hermit_flags[index : index + 2] == ("--verify-allow", "both")
+            for index in range(len(hermit_flags) - 1)
+        ):
+            raise ValueError(
+                "a verification policy must preserve guest exit-status handling"
+            )
+        if expected_non_kvm_tier not in {"stripped", "bitwise"}:
+            raise ValueError(
+                "a non-KVM verification policy must expect stripped or bitwise evidence"
+            )
+        requests_canonical = "--verify-strict" in hermit_flags
+        expects_bitwise = expected_non_kvm_tier == "bitwise"
+        if requests_canonical != expects_bitwise:
+            raise ValueError(
+                "--verify-strict and the bitwise evidence tier must move together"
+            )
+        return cls(hermit_flags, expected_non_kvm_tier, comparison_claim)
+
+    def displayed_flags(self) -> tuple[str, ...]:
+        return ("--strict", *self.hermit_flags)
+
+    def assurance_label(self) -> str:
+        return "L2" if self.expected_non_kvm_tier == "bitwise" else "below L2"
+
+    def mode_summary(self) -> str:
+        return (
+            f"MODE: verification ({shlex.join(self.displayed_flags())}); "
+            f"requested policy is {self.assurance_label()}: "
+            f"{self.comparison_claim}"
+        )
+
+
+DEFAULT_VERIFY_POLICY = VerifyPolicy.checked(
+    hermit_flags=("--verify", "--verify-allow", "both"),
+    expected_non_kvm_tier="stripped",
+    comparison_claim=(
+        "Stripped DETLOG comparison "
+        "(numbers/addresses/paths normalized; NOT bitwise)"
+    ),
+)
 
 
 class MatrixError(Exception):
@@ -502,7 +562,9 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
     # with the INFO-tier comparator work, not with this correction -- asserting
     # it now would red every ptrace/DBT cell for a comparator limitation rather
     # than a guest defect, which is the mirror image of the bug being fixed.
-    return ("guest" if backend == "kvm" else "stripped"), "-"
+    return (
+        "guest" if backend == "kvm" else DEFAULT_VERIFY_POLICY.expected_non_kvm_tier
+    ), "-"
 
 
 def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes | None]:
@@ -568,7 +630,7 @@ def hermit_command(
         # `--verify-allow both` keeps the guest's own exit status (including
         # deliberate non-zero cases such as exit_status) flowing through so the
         # runner can still enforce exit-status parity.
-        command.extend(["--verify", "--verify-allow", "both"])
+        command.extend(DEFAULT_VERIFY_POLICY.hermit_flags)
         if verify_json is not None:
             command.append(f"--verify-json={verify_json}")
     command.extend(
@@ -832,15 +894,15 @@ def run_case_verify(
     expected_l2: str,
     evidence: dict[str, str] | None = None,
 ) -> tuple[str, str, float]:
-    """L2 probe: one `hermit run --strict --verify` invocation.
+    """Verification probe: one `hermit run --strict --verify` invocation.
 
     `--verify` runs the guest twice inside hermit and diverts the guest's own
     stdout into per-run temp logs, so this path cannot compare guest stdout the
-    way the L1 path does. The L2 contract it enforces instead is: the guest exit
-    status matches, and hermit's internal double-run comparison reports success
-    at *at least* the assurance kind the matrix records (`expected_l2`). A run
-    that only reaches guest-visible L2 fails a `detlog` contract; DETLOG L2
-    satisfies a `guest` contract because it is strictly stronger.
+    way the L1 path does. The contract it enforces instead is: the guest exit
+    status matches, and Hermit's internal double-run comparison reports success
+    at *at least* the evidence tier the matrix records (`expected_l2`). A
+    Stripped DETLOG result satisfies a `guest` contract because it compares more
+    observations; the reverse fails. Only a bitwise result establishes L2.
     """
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="hermit-verify-json-") as verify_dir:
@@ -932,7 +994,7 @@ def run_case_verify(
     if expected_l2 != "gap" and L2_RANK[observed] < L2_RANK[expected_l2]:
         return (
             "FAIL",
-            f"reached L2 {observed} but contract requires {expected_l2}",
+            f"reached verification tier {observed} but contract requires {expected_l2}",
             time.monotonic() - started,
         )
     # Each label states the comparison it EARNED.  The old "detlog" entry read
@@ -945,11 +1007,12 @@ def run_case_verify(
             "nonzero compared-message count"
         ),
         "stripped": (
-            "L2 stripped-DETLOG: --verify double-run matched under the Stripped "
+            "Stripped DETLOG: --verify double-run matched under the Stripped "
             "policy (numbers/addresses/paths normalized; NOT bitwise)"
         ),
         "guest": (
-            "L2 guest-visible: output+exit matched (internal trace not compared)"
+            "Guest-visible verification: output+exit matched "
+            "(internal trace not compared)"
         ),
     }[observed]
     return "PASS", label, time.monotonic() - started
@@ -1307,8 +1370,8 @@ def append_parent_scorecard(
         detail = result["detail"]
         if verify and result["backend"] == "kvm" and passed:
             detail = (
-                "L2 guest-visible only (stdout+exit compared; internal trace not "
-                f"compared): {detail}"
+                "Guest-visible verification only (stdout+exit compared; internal "
+                f"trace not compared): {detail}"
             )
         rows.append(
             {
@@ -1507,8 +1570,9 @@ def parse_args() -> argparse.Namespace:
         "--verify",
         action="store_true",
         help=(
-            "lift every probe to L2: run with hermit run --strict --verify so "
-            "hermit's internal double-run asserts a bitwise-identical DETLOG "
+            "verify every probe twice using the "
+            f"{DEFAULT_VERIFY_POLICY.comparison_claim}; this policy is "
+            f"{DEFAULT_VERIFY_POLICY.assurance_label()} "
             "(implies --strict; guest stdout is diverted, so stdout parity is "
             "not checked in this mode)"
         ),
@@ -1520,11 +1584,11 @@ def main() -> int:
     args = parse_args()
     names = validate_catalog()
     backends = args.backends or list(BACKENDS)
-    # --verify is the L2 lift and presupposes strict mode (L2 = --strict
-    # --verify); enable strict implicitly so callers can ask for L2 with one flag.
+    # --verify presupposes strict mode.  The default Stripped comparator remains
+    # below L2; only canonical --verify-strict evidence can establish L2.
     strict = args.strict or args.verify
     if args.verify:
-        print("MODE: L2 (--strict --verify), byte-identical DETLOG per probe")
+        print(DEFAULT_VERIFY_POLICY.mode_summary())
     elif strict:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
@@ -1533,7 +1597,8 @@ def main() -> int:
     for backend in BACKENDS:
         passing = baseline - sum(gap_backend == backend for gap_backend, _ in L1_GAPS)
         print(f"RATCHET {backend}: {passing}/{baseline} ({passing / baseline:.1%})")
-    # L2 ratchet: how many contracts each backend verifies under --verify, split
+    # Verification ratchet: how many contracts each backend verifies under
+    # --verify, split
     # by assurance kind.  These are CONTRACTS, not earned results: the tier a run
     # actually reaches is read from its own verdict (`verify_tier_from_json`).
     # The split used to print `detlog=`, which asserted bitwise identity for a
@@ -1541,12 +1606,18 @@ def main() -> int:
     # now so the headline cannot overstate the corpus.
     for backend in BACKENDS:
         verified = baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
-        stripped = verified if backend != "kvm" else 0
-        guest = verified if backend == "kvm" else 0
+        tier_counts = {"stripped": 0, "guest": 0, "bitwise": 0}
+        tier = (
+            "guest"
+            if backend == "kvm"
+            else DEFAULT_VERIFY_POLICY.expected_non_kvm_tier
+        )
+        tier_counts[tier] = verified
         print(
-            f"RATCHET-L2 {backend}: {verified}/{baseline} "
-            f"({verified / baseline:.1%}) [stripped-DETLOG={stripped} "
-            f"guest-visible={guest} bitwise=0]"
+            f"RATCHET --verify {backend}: {verified}/{baseline} "
+            f"({verified / baseline:.1%}) "
+            f"[stripped-DETLOG={tier_counts['stripped']} "
+            f"guest-visible={tier_counts['guest']} bitwise={tier_counts['bitwise']}]"
         )
     if args.check:
         return 0
