@@ -835,6 +835,13 @@ fn compare_two_runs_with_unsupported_scan(
             // both were flipped together, so the sole bitwise comparison was also the
             // loudest — decoupling them lets a quiet run be bitwise-strict.
             let diff_options = logdiff::LogDiffOpts {
+                // Same discipline as the messages this function prints: the diff
+                // engine is shared, so tell it what the two streams ACTUALLY are
+                // rather than letting it fall back to run-mode vocabulary. Left
+                // unset (the CLI default) it still says "run 1"/"run 2", which is
+                // what a bare `hermit log-diff` of two arbitrary files should say.
+                left_label: Some(label1.to_owned()),
+                right_label: Some(label2.to_owned()),
                 strip_lines: spec.strip_lines,
                 // Thread canonical address normalization from the spec so the parity
                 // (`Canonical`) policy actually rewrites host addresses to ordinals

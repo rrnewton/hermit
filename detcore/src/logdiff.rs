@@ -41,6 +41,24 @@ pub enum LogComparisonMode {
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser, Clone)]
 pub struct LogDiffOpts {
+    /// What the left-hand stream IS, in the reader's terms. `None` keeps the
+    /// historical wording, so `hermit log-diff` -- which compares two arbitrary
+    /// log files and has no better name for them -- is unchanged.
+    ///
+    /// This exists because the diff engine is shared by callers with different
+    /// execution models and it hard-coded run-mode vocabulary for all of them.
+    /// `hermit run --verify` really does perform two fresh executions, so
+    /// "run 1"/"run 2" is accurate there. `hermit record start --verify`
+    /// executes once and replays that recording, and reporting those two sides
+    /// as two runs reads as a claim the guest ran twice. Two reviewers
+    /// independently drew exactly that conclusion from this output.
+    #[clap(skip)]
+    pub left_label: Option<String>,
+
+    /// What the right-hand stream is. See [`Self::left_label`].
+    #[clap(skip)]
+    pub right_label: Option<String>,
+
     /// UNSAFE: strips numbers and temporary paths before comparison.
     ///
     /// This erases timestamps and syscall values that bitwise parity exists to
@@ -183,6 +201,18 @@ impl FromStr for DetLogFilter {
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
+impl LogDiffOpts {
+    /// The left stream's name, falling back to the historical wording.
+    pub fn left_label(&self) -> &str {
+        self.left_label.as_deref().unwrap_or("run 1")
+    }
+
+    /// The right stream's name, falling back to the historical wording.
+    pub fn right_label(&self) -> &str {
+        self.right_label.as_deref().unwrap_or("run 2")
+    }
+}
+
 impl Default for LogDiffOpts {
     fn default() -> Self {
         let v: Vec<String> = vec![];
@@ -584,8 +614,10 @@ fn write_syscall_context(
     right_index: usize,
     left_syscalls: &[(usize, &str)],
     right_syscalls: &[(usize, &str)],
-    history_count: u64,
+    opts: &LogDiffOpts,
 ) -> std::io::Result<()> {
+    let history_count = opts.syscall_history;
+    let (left_label, right_label) = (opts.left_label(), opts.right_label());
     if history_count == 0 {
         return Ok(());
     }
@@ -597,7 +629,7 @@ fn write_syscall_context(
     }
 
     writeln!(w, "Divergent syscall context:")?;
-    for (label, current) in [("run 1", left_current), ("run 2", right_current)] {
+    for (label, current) in [(left_label, left_current), (right_label, right_current)] {
         if let Some((index, syscall)) = current {
             writeln!(w, "  {label}, log message {index}: {syscall}")?;
         } else {
@@ -607,8 +639,8 @@ fn write_syscall_context(
 
     let history_limit = usize::try_from(history_count).unwrap_or(usize::MAX);
     for (label, index, syscalls) in [
-        ("run 1", left_index, left_syscalls),
-        ("run 2", right_index, right_syscalls),
+        (left_label, left_index, left_syscalls),
+        (right_label, right_index, right_syscalls),
     ] {
         let history_boundary =
             syscall_at_or_before(syscalls, index).map_or(index, |(current_index, _)| current_index);
@@ -717,7 +749,9 @@ fn diff_vecs(
 
         write!(
             w,
-            "({which}) Mismatch at log messages {left_index} (run 1) and {right_index} (run 2): {}",
+            "({which}) Mismatch at log messages {left_index} ({}) and {right_index} ({}): {}",
+            opts.left_label(),
+            opts.right_label(),
             Comparison::new(opts.no_color, left_compared, right_compared)
         )?;
         if opts.strip_lines || opts.canonicalize_addresses {
@@ -733,7 +767,7 @@ fn diff_vecs(
             *right_index,
             left_syscalls,
             right_syscalls,
-            opts.syscall_history,
+            opts,
         )?;
 
         diff_count += 1;
@@ -1091,6 +1125,8 @@ mod test {
             str1,
             str2,
             &super::LogDiffOpts {
+                left_label: None,
+                right_label: None,
                 limit: 1,
                 strip_lines: false,
                 canonicalize_addresses: false,
@@ -1147,6 +1183,68 @@ mod test {
         assert!(output.contains("Prior completed syscalls for run 1:"));
         assert!(output.contains("Prior completed syscalls for run 2:"));
         assert_eq!(output.matches("finish syscall #1: read").count(), 2);
+        Ok(())
+    }
+
+    /// The diff engine is shared by callers with different execution models, so
+    /// it must name the two streams it was given. BOTH directions are asserted:
+    /// a caller that supplies names gets them everywhere the engine prints a
+    /// side, and a caller that supplies none -- `hermit log-diff` on two
+    /// arbitrary files -- still gets the historical "run 1"/"run 2", because a
+    /// blanket rename would be just as wrong in the other direction.
+    #[test]
+    fn diff_output_names_the_streams_the_caller_supplied() -> std::io::Result<()> {
+        let log_a = "INFO detcore: DETLOG [syscall] finish syscall #1: write(1, 0x2000, 1) = Ok(1)";
+        let log_b = "INFO detcore: DETLOG [syscall] finish syscall #1: write(1, 0x3000, 1) = Ok(1)";
+
+        let labelled = super::LogDiffOpts {
+            left_label: Some("the recording".to_owned()),
+            right_label: Some("the replay".to_owned()),
+            comparison: super::LogComparisonMode::FullTrace,
+            strip_lines: false,
+            syscall_history: 1,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        assert!(super::log_diff_from_strs(
+            log_a, log_b, &labelled, &mut out
+        )?);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("(the recording) and") && out.contains("(the replay)"),
+            "the mismatch header must name the supplied streams, got: {out}"
+        );
+        assert!(
+            out.contains("the recording, log message"),
+            "the per-message lines must name the supplied streams, got: {out}"
+        );
+        assert!(
+            !out.contains("run 1") && !out.contains("run 2"),
+            "a record/replay diff must not describe itself as two runs, got: {out}"
+        );
+
+        // Unlabelled: unchanged, because `log-diff` on two arbitrary files has
+        // no better name for them than "run 1" and "run 2".
+        let unlabelled = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::FullTrace,
+            strip_lines: false,
+            syscall_history: 1,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        assert!(super::log_diff_from_strs(
+            log_a,
+            log_b,
+            &unlabelled,
+            &mut out
+        )?);
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("(run 1) and") && out.contains("(run 2)"),
+            "the default wording must be preserved for callers that supply none, got: {out}"
+        );
         Ok(())
     }
 
