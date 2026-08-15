@@ -942,12 +942,12 @@ function gate_manifest_rust_compilation_work {
         '"$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test' \
         <<<"$validate_body")
     pressure_scorecard=$(grep -Fc \
-        'let checked_scorecard = check_scorecard(root)?;' <<<"$self_test_body")
+        'let checked_scorecard = check_scorecard_with_self_test(root)?;' <<<"$self_test_body")
     scorecard=$((outer_scorecard + pressure_scorecard))
     total=$((scorecard + scope + pressure_entry))
 
-    [[ $outer_scorecard == 1 && $pressure_scorecard == 1 && $scorecard == 2 && \
-       $scope == 1 && $pressure_entry == 1 && $total == 4 ]] || {
+    [[ $outer_scorecard == 0 && $pressure_scorecard == 1 && $scorecard == 1 && \
+       $scope == 1 && $pressure_entry == 1 && $total == 3 ]] || {
         printf 'manifest forced Rust compilation work drifted: scorecard=%d (outer=%d pressure-self-test=%d) safe-ci-scope=%d pressure-test=%d total=%d\n' \
             "$scorecard" "$outer_scorecard" "$pressure_scorecard" \
             "$scope" "$pressure_entry" "$total" >&2
@@ -958,7 +958,7 @@ function gate_manifest_rust_compilation_work {
         printf 'pressure self-test no longer reuses one checked scorecard across all seven plan cases\n' >&2
         return 1
     }
-    printf 'manifest forced Rust compilation work: scorecard=2 safe-ci-scope=1 pressure-test=1 total=4 (instrumented base: 9+7+1=17)\n'
+    printf 'manifest forced Rust compilation work: scorecard=1 safe-ci-scope=1 pressure-test=1 total=3 (instrumented base: 9+7+1=17)\n'
 }
 
 function assert_gate_manifest_rust_compilation_work {
@@ -966,18 +966,28 @@ function assert_gate_manifest_rust_compilation_work {
     local pressure_source="$ROOT_DIR/ci/compat-envelope/pressure-test.rs"
     local scratch
     gate_manifest_rust_compilation_work "$harness" "$pressure_source" ||
-        die "gate.manifest Rust compilation work is not consolidated to 4 launches"
+        die "gate.manifest Rust compilation work is not consolidated to 3 launches"
 
     scratch=$(mktemp -d) || die "manifest compilation work bracket: mktemp failed"
     cp "$harness" "$scratch/test_harness.sh"
     cp "$pressure_source" "$scratch/pressure-test.rs"
 
-    sed -i '/scorecard.rs" self-test-and-check/p' "$scratch/test_harness.sh"
+    sed -i '/pressure-test.rs" self-test/i\        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test-and-check' \
+        "$scratch/test_harness.sh"
     ! gate_manifest_rust_compilation_work \
         "$scratch/test_harness.sh" "$scratch/pressure-test.rs" >/dev/null 2>&1 ||
         die "manifest compilation work audit accepted an extra forced scorecard compilation"
 
     cp "$harness" "$scratch/test_harness.sh"
+    cp "$pressure_source" "$scratch/pressure-test.rs"
+    sed -i 's/check_scorecard_with_self_test(root)?/check_scorecard(root)?/' \
+        "$scratch/pressure-test.rs"
+    ! gate_manifest_rust_compilation_work \
+        "$scratch/test_harness.sh" "$scratch/pressure-test.rs" >/dev/null 2>&1 ||
+        die "manifest compilation work audit accepted a pressure self-test that skipped the scorecard self-test"
+
+    cp "$harness" "$scratch/test_harness.sh"
+    cp "$pressure_source" "$scratch/pressure-test.rs"
     sed -i '/pressure-test.rs" self-test/d' "$scratch/test_harness.sh"
     ! gate_manifest_rust_compilation_work \
         "$scratch/test_harness.sh" "$scratch/pressure-test.rs" >/dev/null 2>&1 ||
@@ -4099,7 +4109,6 @@ case "$subcommand" in
         audit_inventory
         audit_ci_correspondence
         "$ROOT_DIR/tests/manifest-cli.rs" self-test
-        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test-and-check
         "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
