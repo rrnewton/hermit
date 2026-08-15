@@ -113,6 +113,13 @@
       "test": "backend-parity-c/event-delivery-ordering"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/eventfd-semantics"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -167,6 +174,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/file-backed-mmap"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/file-io-roundtrip"
     },
     {
       "backend": "ptrace",
@@ -442,6 +456,13 @@
       "test": "backend-parity-c/seccomp-refusal"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sendfile-copy"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -468,6 +489,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/shutdown-socketpair"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/signal-delivery-sequence"
     },
     {
       "backend": "ptrace",
@@ -575,6 +603,13 @@
       "test": "backend-parity-c/vectored-file-io"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/vectored-io"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -667,6 +702,13 @@
     },
     {
       "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "liteinst",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",

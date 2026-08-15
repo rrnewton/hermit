@@ -2857,16 +2857,6 @@
       "test": "backend-parity-c/eventfd-semantics",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/eventfd-semantics",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -2876,6 +2866,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/eventfd-semantics",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/eventfd-semantics",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -4297,8 +4297,8 @@
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12297,8 +12297,8 @@
       "test": "backend-parity-c/sendfile-copy",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12937,8 +12937,8 @@
       "test": "backend-parity-c/signal-delivery-sequence",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -15657,8 +15657,8 @@
       "test": "backend-parity-c/vectored-io",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -21577,8 +21577,8 @@
       "test": "c-programs/ioctl-fioclex",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

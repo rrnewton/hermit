@@ -3489,12 +3489,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM ElfExecutor personality returns deterministic ENOSYS for sendfile(2); the in-kernel copy path is not yet emulated"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -3846,12 +3845,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -3904,12 +3902,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -5536,12 +5533,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately"
 kvm = "New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately"
 sabre = "New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"
-liteinst = "New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately"
 
 [test.modes.naked]
 ci = false
@@ -5595,12 +5591,11 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 [test.modes.verify.backends_disabled]
 dbt = "New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately"
 kvm = "New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately"
 sabre = "New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately"
-liteinst = "New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately"
 
 [test.modes.naked]
 ci = false
