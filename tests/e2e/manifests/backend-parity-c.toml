@@ -675,6 +675,7 @@ cflags = ["-D_GNU_SOURCE"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
@@ -1495,6 +1496,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
@@ -3368,6 +3370,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM msync returns 0 but its in-memory mapping model does not flush MAP_SHARED writes to the backing file, so the pread write-through checks fail and it observes ok=3 instead of ok=5"
