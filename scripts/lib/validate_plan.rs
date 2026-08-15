@@ -62,16 +62,20 @@ const PREFLIGHT_TIMEOUT_S: i64 = 900;
 /// finite spin guard with ample observed headroom. `gate.manifest` is no longer
 /// in this cost class; it has a separately measured budget below.
 pub(crate) const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
-/// Current productive-work allowance for `gate.manifest`. Recent hard-green
-/// runs consumed 259--265 CPU-s, while a cold run exhausted the former 300 s
-/// ceiling during an active scorecard/Serde compile. 350 s is 32% above the
-/// highest completed sample and 17% beyond that truncation point.
+/// Current productive-work allowance for `gate.manifest`. Measured on
+/// devbig014 at 3641632a86a74ff2e571e21a44f6bcb990a2f8ce with a cold cache,
+/// outer DAG `-j16`, `CARGO_BUILD_JOBS=1`, and the production one-CPU step
+/// cgroup: `cpu.stat` reached 259.791 CPU-s immediately before PASS at 268 wall-s.
+/// The completed CPU cost is therefore in [259.791, 268.000] s. 350 s leaves
+/// at least 82 CPU-s (30.6%) above that observed upper bound for ordinary
+/// compiler/cache variance and further bounded manifest growth.
 pub(crate) const MANIFEST_WORK_ALLOWANCE_S: i64 = 350;
 /// Keep ordinary qualifying work at or below 70% of the CPU ceiling. The other
-/// 30% absorbs compiler/cache/scheduling variance without turning the guard
-/// into a non-cap. This gate's manifest and pressure-runner surface can keep
-/// growing; remeasure and revisit the allowance when successful runs approach
-/// 70% rather than waiting for another timeout.
+/// 30% keeps the guard finite while reserving 150 CPU-s beyond the current-work
+/// allowance. The measured run uses at most 53.6% of the resulting cap, leaving
+/// at least 232 CPU-s of observed headroom. This gate's manifest and pressure-
+/// runner surface can keep growing; remeasure and revisit the allowance when
+/// successful runs approach 70% rather than waiting for another timeout.
 pub(crate) const MANIFEST_TARGET_MAX_UTIL_PERCENT: i64 = 70;
 /// `ceil(350 / 0.70) = 500` CPU-s.
 pub(crate) const MANIFEST_CPU_TIMEOUT_S: i64 =

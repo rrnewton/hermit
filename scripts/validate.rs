@@ -869,24 +869,35 @@ fn self_test() -> Result<(), String> {
         }
     }
     let manifest_cap = cpu_for("gate.manifest")?;
-    let work = validate_plan::MANIFEST_WORK_ALLOWANCE_S;
-    let target = validate_plan::MANIFEST_TARGET_MAX_UTIL_PERCENT;
-    if manifest_cap != validate_plan::MANIFEST_CPU_TIMEOUT_S
-        || work * 100 > manifest_cap * target
-    {
+    let contract = (
+        validate_plan::MANIFEST_WORK_ALLOWANCE_S,
+        validate_plan::MANIFEST_TARGET_MAX_UTIL_PERCENT,
+        validate_plan::MANIFEST_CPU_TIMEOUT_S,
+    );
+    // Pin the evidence-backed values independently of the production formula.
+    // A source edit cannot raise its own target or cap and have this test follow
+    // automatically. In particular, (350, 99, 354) is the discriminating
+    // mutation: it satisfies the arithmetic and still leaves 98.9% planned
+    // utilization, so exact contract identity is load-bearing.
+    let accepts_contract = |candidate: (i64, i64, i64)| {
+        candidate == (350, 70, 500) && candidate.0 * 100 <= candidate.2 * candidate.1
+    };
+    if contract != (350, 70, 500) || manifest_cap != 500 || !accepts_contract(contract) {
         return Err(format!(
-            "manifest budget bracket: {work}s allowance exceeds {target}% of {manifest_cap}s"
+            "manifest budget bracket: expected exact (allowance,target,cap)=(350,70,500), got {contract:?} and plan cap {manifest_cap}"
         ));
     }
-    if work * 100 <= validate_plan::PREFLIGHT_CPU_TIMEOUT_S * target {
-        return Err(
-            "manifest budget bracket: former 300s cap unexpectedly satisfies the 70% target"
-                .into(),
-        );
+    for refused in [(350, 99, 354), (350, 70, 300), (350, 70, 501), (700, 70, 1000)] {
+        if accepts_contract(refused) {
+            return Err(format!(
+                "manifest budget bracket: weakening mutation {refused:?} was accepted"
+            ));
+        }
     }
     println!(
-        "  manifest budget: {work}s allowance / {manifest_cap}s cap = {target}% target; \
-         former {}s cap refused; cheap preflight caps unchanged",
+        "  manifest budget: exact 350s allowance / {manifest_cap}s cap = 70% target; \
+         99%-target, former-cap, higher-cap, and doubled-work mutations refused; \
+         cheap preflight caps unchanged at {}s",
         validate_plan::PREFLIGHT_CPU_TIMEOUT_S
     );
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
