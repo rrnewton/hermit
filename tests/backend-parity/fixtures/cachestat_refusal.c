@@ -73,6 +73,7 @@ static int refused_and_untouched(int fd) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 2 };
     int ok = 0;
 
     int dir_fd = open("/tmp", O_RDONLY);
@@ -94,5 +95,5 @@ int main(void) {
     }
 
     printf("cachestat ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

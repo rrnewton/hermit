@@ -29,6 +29,7 @@ static int lmode(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
   int ok = 0;
 
   char root[] = "/tmp/mknodXXXXXX";
@@ -84,5 +85,5 @@ int main(void) {
   rmdir(root);
 
   printf("mknod ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

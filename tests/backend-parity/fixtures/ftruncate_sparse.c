@@ -80,6 +80,7 @@ static int all_zero(const char *buf, size_t from, size_t to) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/ftruncate_sparse_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -132,5 +133,5 @@ int main(void) {
 
   printf("ftruncate_sparse size=%ld checksum=%ld ok=%d\n", (long)final_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -60,6 +60,7 @@ static off_t path_size(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/path_file_ops_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -114,5 +115,5 @@ int main(void) {
 
   printf("path_file_ops size=%ld checksum=%ld ok=%d\n", (long)final_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

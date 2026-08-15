@@ -15,10 +15,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 7 };
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sv)
@@ -67,5 +69,5 @@ int main(void) {
     close(sv[0]);
     close(sv[1]);
     printf("socketpair ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

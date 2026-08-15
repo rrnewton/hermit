@@ -21,6 +21,7 @@
  * Uses only the libc uname() wrapper and POSIX <sys/utsname.h>; no _GNU_SOURCE.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/utsname.h>
 
@@ -30,6 +31,7 @@
 #define PINNED_NODENAME "hermetic-container.local"
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 4 };
     int ok = 0;
     struct utsname u;
 
@@ -50,5 +52,5 @@ int main(void) {
     }
 
     printf("uname ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -48,6 +49,7 @@ static long get_mode(int *mode, void *addr, unsigned long flags)
 
 int main(void)
 {
+	enum { EXPECTED_CHECKS = 4 };
 	int ok = 0;
 	int mode;
 	int probe = 7; /* an address whose governing policy we query */
@@ -71,5 +73,5 @@ int main(void)
 		ok += 1;
 
 	printf("mempolicy ok=%d\n", ok);
-	return 0;
+	return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

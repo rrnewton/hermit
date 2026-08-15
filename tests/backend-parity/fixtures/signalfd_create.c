@@ -18,10 +18,12 @@
 #define _GNU_SOURCE
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/signalfd.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
 
     sigset_t m1;
@@ -54,5 +56,5 @@ int main(void) {
     }
 
     printf("sfd ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

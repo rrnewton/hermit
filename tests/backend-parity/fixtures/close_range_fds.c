@@ -57,6 +57,7 @@ static int is_closed(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/close_range_fds_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -108,5 +109,5 @@ int main(void) {
     fail("unlink");
 
   printf("close_range_fds size=%ld checksum=%ld ok=%d\n", size, checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

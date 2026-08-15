@@ -14,12 +14,14 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
     // Fixed abstract name: leading NUL marks the abstract namespace.
     static const char name[] = "\0hermit-parity-bind";
@@ -56,5 +58,5 @@ int main(void) {
 
     close(fd);
     printf("bind_name ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

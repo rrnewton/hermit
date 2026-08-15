@@ -59,6 +59,7 @@ static off_t fd_size(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   char template[] = "/tmp/file_backed_mmap_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -115,5 +116,5 @@ int main(void) {
 
   printf("file_backed_mmap size=%ld checksum=%ld ok=%d\n", (long)final_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

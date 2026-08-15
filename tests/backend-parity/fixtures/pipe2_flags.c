@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 // 1 if FD_CLOEXEC is set on the descriptor, 0 if clear, -1 on error.
@@ -30,6 +31,7 @@ static int fd_nonblock(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
   int ok = 0;
   int fds[2];
 
@@ -72,5 +74,5 @@ int main(void) {
   close(fds[1]);
 
   printf("pipe2_flags ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -105,6 +105,7 @@ static short ppoll_one(int fd, short events) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 8 };
   int fds[2];
   if (pipe(fds) != 0)
     fail("pipe");
@@ -155,5 +156,5 @@ int main(void) {
     fail("close rd");
 
   printf("poll_readiness ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

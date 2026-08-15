@@ -52,6 +52,7 @@ static void fail(const char *message) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   char template[] = "/tmp/statx_metadata_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -106,5 +107,5 @@ int main(void) {
     fail("unlink");
 
   printf("statx_metadata size=%ld checksum=%ld ok=%d\n", size, checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
