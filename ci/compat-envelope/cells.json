@@ -1417,16 +1417,6 @@
       "test": "backend-parity-c/child-subreaper-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/child-subreaper-refusal",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -1436,6 +1426,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/child-subreaper-refusal",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/child-subreaper-refusal",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -2057,16 +2057,6 @@
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/cwd-roundtrip",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -2076,6 +2066,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/cwd-roundtrip",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -3817,8 +3817,8 @@
       "test": "backend-parity-c/fcntl-owner",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -5417,8 +5417,8 @@
       "test": "backend-parity-c/getrusage-self-accounting",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6697,8 +6697,8 @@
       "test": "backend-parity-c/mce-kill-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -6857,8 +6857,8 @@
       "test": "backend-parity-c/membarrier-query",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -8617,8 +8617,8 @@
       "test": "backend-parity-c/o-tmpfile-anon",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9257,8 +9257,8 @@
       "test": "backend-parity-c/personality-domain",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9737,8 +9737,8 @@
       "test": "backend-parity-c/pipe-capacity",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -10537,8 +10537,8 @@
       "test": "backend-parity-c/prctl-pdeathsig",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11177,8 +11177,8 @@
       "test": "backend-parity-c/record-lock",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -11817,8 +11817,8 @@
       "test": "backend-parity-c/robust-list",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -12137,8 +12137,8 @@
       "test": "backend-parity-c/seccomp-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14537,8 +14537,8 @@
       "test": "backend-parity-c/sync-file-range",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14697,8 +14697,8 @@
       "test": "backend-parity-c/sysv-ipc-refusal",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -14857,8 +14857,8 @@
       "test": "backend-parity-c/thp-disable",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -16297,8 +16297,8 @@
       "test": "c-programs/add-key-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -16937,8 +16937,8 @@
       "test": "c-programs/cachestat-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19497,8 +19497,8 @@
       "test": "c-programs/futex-waitv-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -19977,8 +19977,8 @@
       "test": "c-programs/get-robust-list-self",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22217,8 +22217,8 @@
       "test": "c-programs/kcmp-eperm",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22377,8 +22377,8 @@
       "test": "c-programs/keyctl-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22697,8 +22697,8 @@
       "test": "c-programs/listmount-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
