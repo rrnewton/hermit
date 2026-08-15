@@ -276,7 +276,7 @@ impl AnalyzeOpts {
         }
     }
 
-    /// A weaker log difference that does not expect certain lines to be conserved in preemption replay.
+    /// Compare preemption replay logs with the canonical INFO comparison.
     fn log_diff_preemption_replay(
         &self,
         global: &GlobalOpts,
@@ -286,13 +286,12 @@ impl AnalyzeOpts {
         if self.verbose {
             yellow_msg("[comparing] with log-diff command:");
             eprintln!(
-                "    hermit log-diff --ignore-lines=CHAOSRAND {} {}",
+                "    hermit log-diff {} {}",
                 run1_log_path.display(),
                 run2_log_path.display(),
             );
         }
-        let mut ldopts = LogDiffCLIOpts::new(run1_log_path, run2_log_path);
-        ldopts.more.ignore_lines = vec!["CHAOSRAND".to_string(), "SCHEDRAND".to_string()];
+        let ldopts = LogDiffCLIOpts::new(run1_log_path, run2_log_path);
         ldopts.main(global)
     }
 

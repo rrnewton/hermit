@@ -141,7 +141,8 @@ run_strict_verify() {
     STRICT_STDERR=$SYSTEM_UTIL_WORKDIR/strict.stderr
     VERIFY_STDOUT=$SYSTEM_UTIL_WORKDIR/verify.stdout
     VERIFY_STDERR=$SYSTEM_UTIL_WORKDIR/verify.stderr
-    readonly STRICT_STDOUT STRICT_STDERR VERIFY_STDOUT VERIFY_STDERR
+    VERIFY_REPORT=$SYSTEM_UTIL_WORKDIR/verify.json
+    readonly STRICT_STDOUT STRICT_STDERR VERIFY_STDOUT VERIFY_STDERR VERIFY_REPORT
 
     local status
     set +e
@@ -158,7 +159,7 @@ run_strict_verify() {
     set +e
     timeout -k 5s "${SYSTEM_UTIL_TIMEOUT_SECONDS}s" \
         "$HERMIT_BIN" --log INFO run --backend "$SYSTEM_UTIL_BACKEND" \
-        --strict --verify -- "$@" >"$VERIFY_STDOUT" 2>"$VERIFY_STDERR"
+        --strict --verify --verify-json "$VERIFY_REPORT" -- "$@" >"$VERIFY_STDOUT" 2>"$VERIFY_STDERR"
     status=$?
     set -e
     if ((status != 0)); then
@@ -166,11 +167,17 @@ run_strict_verify() {
         fail "strict verification exited $status"
     fi
 
-    if ! grep -Fq 'Determinism verified' "$VERIFY_STDERR" \
-        && ! grep -Fq 'KVM guest output and exit status matched' "$VERIFY_STDERR"; then
+    local evidence_filter
+    if [[ $SYSTEM_UTIL_BACKEND == kvm ]]; then
+        evidence_filter='(.verified == true) and (.verdict == "matched") and (.bitwise_parity == false) and (.comparison.compare_logs == false) and (.compared_log_messages == null)'
+    else
+        evidence_filter='(.verified == true) and (.verdict == "matched") and (.bitwise_parity == true) and (.comparison.strictness == "canonical") and (.comparison.compare_logs == true) and ((.compared_log_messages.left // 0) > 0) and ((.compared_log_messages.right // 0) > 0)'
+    fi
+    if ! jq -e "$evidence_filter" "$VERIFY_REPORT" >/dev/null 2>&1; then
         cat "$VERIFY_STDOUT" >&2
         tail -80 "$VERIFY_STDERR" >&2
-        fail "verification exited successfully without a determinism verdict"
+        [[ ! -f $VERIFY_REPORT ]] || cat "$VERIFY_REPORT" >&2
+        fail "verification exited successfully without the required typed evidence"
     fi
 
     printf '%s strict stdout:\n' "$SYSTEM_UTIL_TEST_NAME"

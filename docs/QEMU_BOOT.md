@@ -3,10 +3,11 @@
 Hermit can boot a minimal x86_64 Linux guest with QEMU's TCG accelerator in
 two modes:
 
-- The strict, sequentialized profile passed Stripped verification, not L2. The harness boots to
-  the initramfs marker and powers off once as an oracle, then repeats that
-  exact boot twice under `--strict --verify` and compares Detcore logs after
-  selected numeric, address, path, and time fields are stripped.
+- The strict, sequentialized harness boots to the initramfs marker and powers
+  off once as an oracle, then repeats that exact boot twice under
+  `--strict --verify --verify-json`. Its current pass condition requires a
+  matched canonical INFO verdict, bitwise parity, no filtering, and positive
+  compared-message counts. The older Stripped result described below is historical.
 - A faster compatibility profile reached the same marker in 13.25 seconds. It
   uses `--no-sequentialize-threads`, so QEMU's host-thread interleavings are not
   controlled by Hermit.
@@ -96,10 +97,10 @@ timeout --kill-after=10s --signal=TERM 180s \
 ```
 
 This command uses the ptrace backend, INFO logging, and no relaxations. A
-successful exit and marker establish L1. Use the bounded harness for Stripped
-two-run verification; it also rejects the known clock-calibration failures and
+successful exit and marker establish L1. Use the bounded harness for canonical
+typed two-run verification; it also rejects the known clock-calibration failures and
 gives each verifier phase its own timeout. The environment variable and script
-retain historical `L2` names, but bare `--verify` does not establish L2:
+retain historical `L2` names:
 
 ```bash
 env HERMIT_BIN="$PWD/target/release/hermit" \
@@ -111,7 +112,7 @@ env HERMIT_BIN="$PWD/target/release/hermit" \
 
 The harness runs the same QEMU command shown above, first with `run --strict`
 to require `SHARED_FUTEX_QEMU_KERNEL_OK`, then with
-`run --strict --verify`. A 2026-07-28 run on QEMU 10.1.0 and Linux 6.17.13
+`run --strict --verify --verify-json`. A historical 2026-07-28 run on QEMU 10.1.0 and Linux 6.17.13
 compared 516137 messages per verifier run, including 459588 Detcore messages
 and 363693 DETLOG/scheduler COMMIT messages after Stripped normalization. It
 found no substantive differences and reported the harness's historical marker:
@@ -121,7 +122,8 @@ found no substantive differences and reported the harness's historical marker:
 QEMU strict L2 boot passed.
 ```
 
-That marker records a Stripped pass; it is not canonical L2 evidence.
+That dated marker recorded a Stripped pass; it is not evidence for the current
+canonical gate.
 
 Do not add `--no-sequentialize-threads` or disable preemption when evaluating
 the strict profile. Those options select the compatibility profile below.

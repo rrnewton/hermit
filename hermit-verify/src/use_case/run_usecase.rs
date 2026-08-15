@@ -35,20 +35,7 @@ fn compare_results<T: UseCase>(
         result &= verify.verify_stderr(left, right)?;
     }
 
-    if options.should_log_diff() {
-        result &= verify.verify_logs(
-            left,
-            right,
-            LogDiffOptions {
-                ignore_lines: options.ignore_lines,
-                skip_commits: !options.verify_commits,
-                skip_detlog_others: !options.verify_detlog_others,
-                skip_detlog_syscalls: !options.verify_detlog_syscalls,
-                skip_detlog_syscall_results: !options.verify_detlog_syscall_results,
-                syscall_history: 5,
-            },
-        )?;
-    }
+    result &= verify.verify_logs(left, right, LogDiffOptions { syscall_history: 5 })?;
 
     if options.verify_exit_statuses {
         result &= verify.verify_exit_statuses(left, right)?;

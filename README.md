@@ -137,11 +137,10 @@ invocation of each eligible syscall site and installs an instruction-punning
 hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.
 
-`--verify` compares captured status and output and applies the `Stripped`
-comparison to selected Detcore scheduler messages. A successful result is a
-useful diagnostic, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts.
+`--verify` compares captured status and output exactly and applies canonical INFO
+comparison to Detcore events. A qualifying result requires
+`--verify-json REPORT.json`, `bitwise_parity: true`, and nonzero compared-message
+counts. KVM remains output-only and does not qualify for that claim.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
 unsupported because runtime rebootstrap after image replacement is not yet
@@ -155,7 +154,7 @@ e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
 
 SaBRe is built only with the non-default `third-party-backends` feature. Its
-measured post-0.2 `Stripped` envelope, build instructions, and explicit
+historical post-0.2 `Stripped` measurements, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
 
@@ -206,7 +205,7 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not strict determinism |
+| Verify two executions | `hermit run --verify --verify-json REPORT.json -- PROGRAM` | Requires canonical INFO parity with nonzero typed evidence on supported canonical evidence paths; direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |

@@ -117,14 +117,8 @@ OPTIONAL_SCORECARD_COLUMNS = (
     "heap_parity",
 )
 
-# Recorded as the comparator when the run produced no typed verdict at all, so a
-# reader can tell "no verdict existed" from "a verdict existed and was stripped".
-# A blank would conflate those two, and only one of them is a measurement.
-VERIFY_COMPARE_UNAVAILABLE = "unavailable:no-verify-json"
-
-# Comparators whose match may be read as bitwise identity. An allowlist, not a
-# not-equal-to-"stripped" test: an unrecognised comparator name is an unknown
-# policy, and an unknown policy cannot license the strongest claim in the ladder.
+# Comparators whose match may be read as bitwise identity. An unrecognised
+# comparator name is an unknown policy and cannot license the strongest claim.
 BITWISE_CAPABLE_COMPARATORS = ("canonical",)
 
 PRODUCED_COLUMNS = tuple(
@@ -167,24 +161,16 @@ def scorecard_fieldnames(actual_header, path):
     return actual, parity_column
 
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
-# contract cannot currently be verified at L2 on that backend. "guest" is
-# guest-visible L2: the two --verify runs produced identical stdout+exit but the
-# internal trace is not compared (KVM concurrent mode). "detlog" is full L2: the
-# two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBT).
-#
-# `stripped` is the rung that was missing, and its absence is what made every
-# green over-tiered: plain `--verify` DOES compare the DETLOG, but under the
-# `Stripped` policy, whose own `--verify-json` reports `bitwise_parity: false`.
-# Calling that `detlog` conflated "the DETLOG was compared" with "the DETLOG was
-# identical".  `bitwise` is the real thing and is claimable only from a typed
-# verdict (see `verify_tier_from_json`).
-L2_RANK = {"gap": 0, "guest": 1, "stripped": 2, "bitwise": 3}
-# Per-backend L2 values the matrix may record. KVM's concurrent verify path can
-# never emit a DETLOG witness, so it is capped at guest-visible L2.
+# contract does not have canonical INFO evidence on that backend. `bitwise` is
+# claimable only from a typed verdict with a nonzero compared INFO count.
+# KVM's output-only verifier remains unqualified and therefore stays a gap.
+L2_RANK = {"gap": 0, "bitwise": 1}
+# Per-backend L2 values the matrix may record. KVM cannot emit the required
+# canonical INFO witness.
 L2_ALLOWED = {
-    "ptrace": {"stripped", "bitwise"},
-    "dbt": {"stripped", "bitwise", "gap"},
-    "kvm": {"guest", "gap"},
+    "ptrace": {"bitwise"},
+    "dbt": {"gap"},
+    "kvm": {"gap"},
 }
 
 
@@ -456,11 +442,6 @@ L2_GAPS = {
         "the guest before any --verify double-run, so no L2 determinism witness "
         "can be produced"
     ),
-    ("dbt", "exit_status"): (
-        "hermit --verify runs the DBT guest only once when the first run exits "
-        "non-zero (--verify-allow both), so the double-run DETLOG comparison "
-        "never executes for this non-zero-exit contract"
-    ),
     ("dbt", "pthread_lifecycle"): ("DynamoRIO startup stall prevents an L2 verify run"),
     ("kvm", "process_wait_accounting"): (
         "under --verify the concurrent double-run races child reaping: waitid "
@@ -497,12 +478,19 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
         return "gap", reason
     if not verify:
         return "pass", "-"
-    # `stripped`, not `bitwise`: this is the tier the probe's own comparator can
-    # actually earn today.  Raising it to `bitwise` is a RATCHET that belongs
-    # with the INFO-tier comparator work, not with this correction -- asserting
-    # it now would red every ptrace/DBT cell for a comparator limitation rather
-    # than a guest defect, which is the mirror image of the bug being fixed.
-    return ("guest" if backend == "kvm" else "stripped"), "-"
+    if backend == "dbt":
+        return (
+            "gap",
+            "DBT verification fails closed until Reverie provides a protected "
+            "internal descriptor for canonical Detcore evidence",
+        )
+    if backend == "kvm":
+        return (
+            "gap",
+            "KVM verification compares output and exit status without canonical "
+            "INFO evidence",
+        )
+    return "bitwise", "-"
 
 
 def case_command(name: str, fixtures: Fixtures) -> tuple[list[str], int, bytes | None]:
@@ -554,16 +542,9 @@ def hermit_command(
     if strict:
         command.append("--strict")
     if verify:
-        # hermit runs the guest twice internally and compares them.  `--verify`
-        # ALONE is the `Stripped` comparison, NOT a bitwise one: it strips the
-        # wall-clock prefix and applies
-        # `unsafe-numeric-address-and-path-normalization/v1`, which normalises
-        # numbers generally -- so a differing read() return length, a differing
-        # pointer argument and a differing openat path all collapse to the same
-        # token.  Mutation testing measured 3 of 5 planted defects surviving it
-        # (dev-hermit experiments/strict-certification-mutation-sweep_20260806).
-        # Whatever this run earns is read off `--verify-json` below; it is not
-        # assumed from the flag and it is not scraped from the banner.
+        # Hermit runs the guest twice under canonical INFO comparison. Whatever
+        # this run earns is read from `--verify-json`; it is never inferred from
+        # the flag or scraped from the banner.
         #
         # `--verify-allow both` keeps the guest's own exit status (including
         # deliberate non-zero cases such as exit_status) flowing through so the
@@ -760,39 +741,24 @@ def capture_ptrace_reference(
     return reference.stdout, "", False
 
 
-# Two distinct `--verify` success witnesses, and they are NOT the same assurance:
+# A positive `--verify` witness requires a typed canonical INFO comparison with
+# nonzero evidence. KVM's output-only result is retained as a gap, not promoted
+# to a weaker positive assurance.
 #
-#  * DETLOG-bitwise (ptrace, DBT): hermit re-runs the guest and finds the two
-#    DETLOG streams bitwise-identical after normalization. This is full L2 -- the
-#    internal syscall/scheduling trace is itself reproducible.
-#  * guest-visible (KVM): reverie-kvm runs concurrently and states outright that
-#    "internal syscall trace order is not deterministic", so `--verify` compares
-#    only guest stdout and exit status across the two runs. That is a strictly
-#    weaker guest-visible L2; do not report it as DETLOG determinism.
-#
-# Recording which witness fired keeps the matrix honest about what each backend
-# actually proves under --verify (no false parity).
-VERIFY_WITNESS_DETLOG = b"Determinism verified"
-VERIFY_WITNESS_GUEST_VISIBLE = b"guest output and exit status matched"
-
-
 def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     """Read the tier a `--verify` run actually earned from its typed verdict.
 
-    This is the whole point of the correction.  The banner strings above are a
-    PROXY: `":: Success: deterministic. Determinism verified."` is printed by a
-    run whose own `--verify-json` says `bitwise_parity: false`, so scraping it
-    cannot distinguish a stripped match from a bitwise one.  `--verify-json`
-    carries the condition with the value -- strictness, the parity boolean, and
-    the counts that make the boolean falsifiable -- so read that instead.
+    `--verify-json` carries the condition with the value -- strictness, the
+    parity boolean, and the counts that make the boolean falsifiable -- so read
+    that instead of scraping a success banner.
 
-    `bitwise` requires BOTH `bitwise_parity` and a nonzero compared count on both
-    sides.  The count is not redundant: an empty-vs-empty log comparison reports
+    `bitwise` requires a terminal matched verdict, `verified=true`,
+    `bitwise_parity=true`, canonical log comparison, and equal positive integer
+    counts on both sides. The count is not redundant: an empty-vs-empty log comparison reports
     "no difference" under the strictest possible spec, so without it a run that
     produced no DETLOG at all would certify as bitwise parity.
 
-    Returns ``None`` when no usable record exists -- notably the DBT backend,
-    which accepts `--verify-json` and writes nothing (measured: rc=0, no file).
+    Returns ``None`` when no usable record exists.
     """
     try:
         record = json.loads(path.read_text(encoding="utf-8").strip() or "{}")
@@ -805,16 +771,24 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     left, right = counts.get("left"), counts.get("right")
     compared = f"{left}|{right}" if left is not None and right is not None else ""
     strictness = str(comparison.get("strictness") or "")
-    bitwise = bool(record.get("bitwise_parity")) and bool(left) and bool(right)
-    if not record.get("verified"):
-        tier = "gap"
-    elif bitwise:
-        tier = "bitwise"
-    elif comparison.get("compare_logs"):
-        tier = "stripped"
-    else:
-        # Verified without comparing the log stream at all: stdout+exit only.
-        tier = "guest"
+    positive_count = (
+        type(left) is int
+        and type(right) is int
+        and left > 0
+        and right > 0
+        and left == right
+    )
+    bitwise = (
+        record.get("verified") is True
+        and record.get("verdict") == "matched"
+        and record.get("bitwise_parity") is True
+        and strictness == "canonical"
+        and comparison.get("compare_logs") is True
+        and positive_count
+    )
+    # A contradictory, output-only, malformed, or vacuous record is below the
+    # matrix contract even if one boolean claims parity.
+    tier = "bitwise" if bitwise else "gap"
     return {
         "tier": tier,
         "verify_compare": strictness,
@@ -839,10 +813,10 @@ def run_case_verify(
     way the L1 path does. The L2 contract it enforces instead is: the guest exit
     status matches, and hermit's internal double-run comparison reports success
     at *at least* the assurance kind the matrix records (`expected_l2`). A run
-    that only reaches guest-visible L2 fails a `detlog` contract; DETLOG L2
-    satisfies a `guest` contract because it is strictly stronger.
+    An output-only result remains a gap.
     """
     started = time.monotonic()
+    raw_verdict = None
     with tempfile.TemporaryDirectory(prefix="hermit-verify-json-") as verify_dir:
         verdict_path = Path(verify_dir) / "verdict.json"
         command = hermit_command(
@@ -858,12 +832,29 @@ def run_case_verify(
         observed_evidence = (
             verify_tier_from_json(verdict_path) if verdict_path.exists() else None
         )
+        if verdict_path.exists():
+            try:
+                raw_verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw_verdict = None
     if evidence is not None and observed_evidence:
         evidence.update(observed_evidence)
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
+    if (
+        backend == "dbt"
+        and isinstance(raw_verdict, dict)
+        and raw_verdict.get("verdict") == "no_result"
+        and "protected Reverie internal descriptor" in diagnostic
+    ):
+        return (
+            "GAP",
+            "DBT verification refused before guest execution: protected Reverie "
+            "internal descriptor for canonical Detcore evidence is unavailable",
+            time.monotonic() - started,
+        )
     if result.returncode != expected_status:
         if cpuid_policy_is_blocked(backend, name, diagnostic):
             return (
@@ -877,56 +868,13 @@ def run_case_verify(
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
         )
-    if observed_evidence is not None:
-        # Typed verdict: authoritative.
-        observed = observed_evidence["tier"]
-    elif VERIFY_WITNESS_DETLOG in result.stderr:
-        # No `--verify-json` record (DBT accepts the flag and writes nothing;
-        # measured rc=0, no file).  The banner proves the DETLOG was COMPARED; it
-        # cannot say under WHICH policy or over HOW MANY messages.  Those are the
-        # two fields a determinism claim rests on, so this run cannot support one.
-        #
-        # It is still a contract PASS -- the guest ran and hermit's own compare
-        # succeeded -- but the row is published UNMEASURED (`deterministic=""`,
-        # which is exactly what blank already means in that column) rather than as
-        # a positive with hollow evidence.  Emitting `deterministic=1` beside a
-        # blank comparator and blank counts is the shape a wired verifier must
-        # refuse, and producing rows designed to be refused is not a contract.
-        observed = "stripped"
-        if evidence is not None:
-            evidence.update(
-                {
-                    "tier": "stripped",
-                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                    "bitwise_parity": "0",
-                    "compared_log_messages": "",
-                    "determinism_unmeasured": "1",
-                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
-                }
-            )
-    elif VERIFY_WITNESS_GUEST_VISIBLE in result.stderr:
-        # Guest-visible: stdout+exit compared, the log stream deliberately not.
-        # Absent counts are CORRECT here rather than missing, so this tier can
-        # carry a determinism claim without them -- but it still needs to say
-        # which comparison produced it.
-        observed = "guest"
-        if evidence is not None:
-            evidence.update(
-                {
-                    "tier": "guest",
-                    "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                    "bitwise_parity": "0",
-                    "compared_log_messages": "",
-                    "determinism_unmeasured": "1",
-                    COMPARISON_TIER_COLUMN: COMPARISON_TIER_SELF_VERIFY_ONLY,
-                }
-            )
-    else:
+    if observed_evidence is None:
         return (
             "FAIL",
-            f"verify produced no determinism witness: {diagnostic[-300:]}",
+            f"verify produced no usable typed verdict: {diagnostic[-300:]}",
             time.monotonic() - started,
         )
+    observed = observed_evidence["tier"]
     # A gap being probed (--probe-gaps) has no positive contract to meet; report
     # what it actually reached so it can be evaluated for promotion.
     if expected_l2 != "gap" and L2_RANK[observed] < L2_RANK[expected_l2]:
@@ -935,21 +883,16 @@ def run_case_verify(
             f"reached L2 {observed} but contract requires {expected_l2}",
             time.monotonic() - started,
         )
-    # Each label states the comparison it EARNED.  The old "detlog" entry read
-    # "L2 DETLOG-bitwise: --verify double-run matched" for a Stripped compare
-    # whose own verdict says bitwise_parity:false -- that claim is what this
-    # correction removes.
+    if expected_l2 == "gap" and observed == "gap":
+        return (
+            "GAP",
+            "typed verdict did not provide canonical non-vacuous INFO parity",
+            time.monotonic() - started,
+        )
     label = {
         "bitwise": (
             "L2 DETLOG-bitwise: verify-json reported bitwise_parity over a "
             "nonzero compared-message count"
-        ),
-        "stripped": (
-            "L2 stripped-DETLOG: --verify double-run matched under the Stripped "
-            "policy (numbers/addresses/paths normalized; NOT bitwise)"
-        ),
-        "guest": (
-            "L2 guest-visible: output+exit matched (internal trace not compared)"
         ),
     }[observed]
     return "PASS", label, time.monotonic() - started
@@ -1305,11 +1248,6 @@ def append_parent_scorecard(
         # parity boolean is derived solely from the two hashes captured above.
         parity = stdout_evidence.get("stdout_parity", "")
         detail = result["detail"]
-        if verify and result["backend"] == "kvm" and passed:
-            detail = (
-                "L2 guest-visible only (stdout+exit compared; internal trace not "
-                f"compared): {detail}"
-            )
         rows.append(
             {
                 "run_id": run_id,
@@ -1347,9 +1285,9 @@ def append_parent_scorecard(
                 },
                 # The comparison this row's verdict rests on.  `deterministic`
                 # alone is the ambiguous field the audit flagged -- a bare 1
-                # cannot distinguish a stripped match from a bitwise one -- so it
-                # now always travels with the tier that earned it and the counts
-                # that make the tier falsifiable.  Written only into files that
+                # cannot distinguish a policy-qualified match from a weaker one,
+                # so it always travels with the tier that earned it and the
+                # counts that make the tier falsifiable. Written only into files that
                 # carry these columns (see EVIDENCE_COLUMNS).
                 **{
                     column: stdout_evidence.get(column, "")
@@ -1507,8 +1445,8 @@ def parse_args() -> argparse.Namespace:
         "--verify",
         action="store_true",
         help=(
-            "lift every probe to L2: run with hermit run --strict --verify so "
-            "hermit's internal double-run asserts a bitwise-identical DETLOG "
+            "run every probe with hermit run --strict --verify so Hermit's "
+            "internal double-run requires canonical INFO parity "
             "(implies --strict; guest stdout is diverted, so stdout parity is "
             "not checked in this mode)"
         ),
@@ -1520,11 +1458,10 @@ def main() -> int:
     args = parse_args()
     names = validate_catalog()
     backends = args.backends or list(BACKENDS)
-    # --verify is the L2 lift and presupposes strict mode (L2 = --strict
-    # --verify); enable strict implicitly so callers can ask for L2 with one flag.
+    # --verify presupposes strict mode; enable strict implicitly.
     strict = args.strict or args.verify
     if args.verify:
-        print("MODE: L2 (--strict --verify), byte-identical DETLOG per probe")
+        print("MODE: --strict --verify, canonical non-vacuous INFO parity per probe")
     elif strict:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
@@ -1533,20 +1470,17 @@ def main() -> int:
     for backend in BACKENDS:
         passing = baseline - sum(gap_backend == backend for gap_backend, _ in L1_GAPS)
         print(f"RATCHET {backend}: {passing}/{baseline} ({passing / baseline:.1%})")
-    # L2 ratchet: how many contracts each backend verifies under --verify, split
-    # by assurance kind.  These are CONTRACTS, not earned results: the tier a run
-    # actually reaches is read from its own verdict (`verify_tier_from_json`).
-    # The split used to print `detlog=`, which asserted bitwise identity for a
-    # comparison that only ever normalised-and-compared; it prints `stripped=`
-    # now so the headline cannot overstate the corpus.
+    # Verification contracts, not earned results: the tier a run actually
+    # reaches is read from its own verdict (`verify_tier_from_json`).
     for backend in BACKENDS:
-        verified = baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
-        stripped = verified if backend != "kvm" else 0
-        guest = verified if backend == "kvm" else 0
+        verified = (
+            0
+            if backend in ("dbt", "kvm")
+            else baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
+        )
         print(
             f"RATCHET-L2 {backend}: {verified}/{baseline} "
-            f"({verified / baseline:.1%}) [stripped-DETLOG={stripped} "
-            f"guest-visible={guest} bitwise=0]"
+            f"({verified / baseline:.1%}) [bitwise={verified}]"
         )
     if args.check:
         return 0

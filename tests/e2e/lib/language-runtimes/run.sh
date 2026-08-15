@@ -42,6 +42,7 @@ function run_l2 {
   shift 3
   local strict_output="$BUILD_DIR/$slug.strict.log"
   local verify_output="$BUILD_DIR/$slug.verify.log"
+  local verify_report="$BUILD_DIR/$slug.verify.json"
 
   printf '==> %s: %s category probe (--strict)\n' "$label" "$BACKEND"
   if ! timeout --foreground --kill-after=10s "$RUNTIME_TIMEOUT" \
@@ -63,23 +64,29 @@ function run_l2 {
     fi
   done
 
-  printf '==> %s: %s L2 (--strict --verify)\n' "$label" "$BACKEND"
+  printf '==> %s: %s verification (--strict --verify)\n' "$label" "$BACKEND"
+  rm -f -- "$verify_report"
   if ! timeout --foreground --kill-after=10s "$RUNTIME_TIMEOUT" \
-      "$HERMIT_BIN" --log=off --backend "$BACKEND" run \
-      --strict --verify --no-virtualize-cpuid --max-timeslice=disabled \
+      "$HERMIT_BIN" --log=info --backend "$BACKEND" run \
+      --strict --verify --verify-json "$verify_report" \
+      --no-virtualize-cpuid --max-timeslice=disabled \
       --base-env=minimal --env="HERMIT_RUNTIME_SENTINEL=$SENTINEL" -- \
       "$program" "$@" >"$verify_output" 2>&1; then
     cat "$verify_output" >&2
-    echo "FAIL: $label did not reach $BACKEND L2" >&2
+    echo "FAIL: $label did not complete $BACKEND verification" >&2
     return 1
   fi
 
   cat "$verify_output"
-  if ! grep -q "Determinism verified" "$verify_output"; then
-    echo "FAIL: $label exited zero without Hermit's verification marker" >&2
-    return 1
+  if [[ $BACKEND == kvm ]]; then
+    jq -e '(.verified == true) and (.verdict == "matched") and (.bitwise_parity == false) and (.comparison.compare_logs == false)' \
+      "$verify_report" >/dev/null || return 1
+    printf 'PASS: %s reached %s output/status repeatability with all four categories (not L2)\n' "$label" "$BACKEND"
+  else
+    jq -e '(.verified == true) and (.verdict == "matched") and (.bitwise_parity == true) and (.comparison.strictness == "canonical") and (.comparison.compare_logs == true) and ((.compared_log_messages.left // 0) > 0) and ((.compared_log_messages.right // 0) > 0)' \
+      "$verify_report" >/dev/null || return 1
+    printf 'PASS: %s reached %s L2 with all four categories\n' "$label" "$BACKEND"
   fi
-  printf 'PASS: %s reached %s L2 with all four categories\n' "$label" "$BACKEND"
 }
 
 available=0

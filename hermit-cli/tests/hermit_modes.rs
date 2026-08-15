@@ -1068,7 +1068,7 @@ fn verify_verbose_compares_the_full_trace() {
 }
 
 #[test]
-fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
+fn verify_reports_typed_memory_parity_on_landed_fixture() {
     let _guard = hermit_run_lock();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1085,13 +1085,7 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
     let report = tmp.path().join("verify.json");
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "run",
-            "--verify",
-            "--verify-strict",
-            "--verify-logs",
-        ])
+        .args(["--log=info", "run", "--verify", "--verify-logs"])
         .arg("--verify-json")
         .arg(&report)
         .args([
@@ -1146,6 +1140,14 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
     .expect("strict verification report was not valid JSON");
     assert_eq!(report["verified"], serde_json::json!(true));
     assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(
+        report["comparison"]["strictness"],
+        serde_json::json!("canonical")
+    );
+    assert_eq!(
+        report["comparison"]["compare_logs"],
+        serde_json::json!(true)
+    );
     assert_eq!(report["comparison"]["log_scope"], serde_json::json!("info"));
     assert!(
         report["compared_log_messages"]["left"]

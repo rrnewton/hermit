@@ -243,7 +243,6 @@ fn hermit_command(
     timeout: i64,
     seed: Option<i64>,
     mode_args: &[String],
-    verify_bitwise_parity: bool,
     log: &str,
     extra: &[String],
     guest: &str,
@@ -280,26 +279,29 @@ fn hermit_command(
                 .join(" ")
         )
     };
-    let command = match mode {
-        "verify" => {
-            let strict = if verify_bitwise_parity {
-                " --verify-strict"
-            } else {
-                ""
-            };
+    let (command, report) = match mode {
+        "verify" => (
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict} --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
-            )
-        }
-        "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+            ),
+            Some("\"$cell/captures/verify.json\"".to_owned()),
+        ),
+        "replay" => (
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
+            ),
+            Some("\"$cell/captures/verify.json\"".to_owned()),
         ),
         "chaos" => {
             let seed = seed.unwrap_or_else(|| {
                 fail("internal error: chaos command construction requires a declared seed")
             });
-            format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+            let report = format!("\"$cell/captures/verify-seed-{seed}.json\"");
+            (
+                format!(
+                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --verify --verify-allow=both --verify-json {report} --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+                ),
+                Some(report),
             )
         }
         "custom" => {
@@ -311,13 +313,53 @@ fn hermit_command(
                 .collect::<Vec<_>>()
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
-            format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
+            (
+                format!(
+                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
+                ),
+                None,
             )
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    format!("timeout --kill-after=10s {timeout}s {command}")
+    let command = format!("timeout --kill-after=10s {timeout}s {command}");
+    match report {
+        Some(report) => verified_command(&command, &report),
+        None => command,
+    }
+}
+
+fn verified_command(command: &str, report: &str) -> String {
+    format!(
+        "rm -f {report} && (if {command}; then _hermit_status=0; else \
+         _hermit_status=$?; fi; jq -e \
+         '(.verified == true) and (.verdict == \"matched\") and \
+         (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+         (.comparison.compare_logs == true) and \
+         ((.compared_log_messages.left // 0) > 0) and \
+         ((.compared_log_messages.right // 0) > 0)' {report} >/dev/null || exit $?; \
+         exit \"$_hermit_status\")"
+    )
+}
+
+fn executable_receipt_bracket(report_json: &str, guest_status: i32) -> std::process::ExitStatus {
+    let report = std::env::temp_dir().join(format!(
+        "hermit-manifest-cli-receipt-{}-{guest_status}.json",
+        std::process::id()
+    ));
+    let report_word = shell_quote(&report.to_string_lossy());
+    let payload = shell_quote(report_json);
+    let command = format!(
+        "bash -c 'printf \"%s\\n\" \"$1\" > \"$2\"; exit \"$3\"' _ \
+         {payload} {report_word} {guest_status}"
+    );
+    let wrapped = verified_command(&command, &report_word);
+    let status = Command::new("bash")
+        .args(["-c", &wrapped])
+        .status()
+        .expect("failed to execute generated verification wrapper");
+    let _ = fs::remove_file(report);
+    status
 }
 
 /// Default `--log` level per mode, matching the CI expansion.
@@ -650,16 +692,6 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     } else {
         Vec::new()
     };
-    let verify_bitwise_parity = if mode == "verify" {
-        modes_table(test, id)[&mode]
-            .get("assert")
-            .and_then(Value::as_table)
-            .and_then(|assert| assert.get("bitwise_parity"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    } else {
-        false
-    };
     let seed = if mode == "chaos" {
         let modes = modes_table(test, id);
         Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
@@ -676,7 +708,6 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             timeout,
             seed,
             &mode_args,
-            verify_bitwise_parity,
             &log,
             &args.passthrough,
             &guest,
@@ -694,12 +725,14 @@ fn self_test() -> ExitCode {
         60,
         None,
         &[],
-        false,
         "info",
         &[],
         "guest",
     );
     assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+    assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+    assert!(replay.contains("(.comparison.strictness == \"canonical\")"));
+    assert!(replay.contains("(.compared_log_messages.left // 0) > 0"));
     assert!(!replay.contains("--no-virtualize-cpuid"));
 
     let chaos = hermit_command(
@@ -709,7 +742,6 @@ fn self_test() -> ExitCode {
         60,
         Some(7),
         &[],
-        false,
         "info",
         &[],
         "guest",
@@ -717,6 +749,7 @@ fn self_test() -> ExitCode {
     assert!(chaos.contains("run --base-env=minimal"));
     assert!(chaos.contains("--verify --verify-allow=both"));
     assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
+    assert!(chaos.contains("(.comparison.strictness == \"canonical\")"));
     assert!(chaos.contains("--log=info"));
     assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
     let seeded_chaos: Value = "seeds = [7, 9]".parse().unwrap();
@@ -735,7 +768,6 @@ fn self_test() -> ExitCode {
         60,
         None,
         &["--base-env=minimal".to_owned()],
-        false,
         "info",
         &[],
         "guest",
@@ -751,26 +783,25 @@ fn self_test() -> ExitCode {
         60,
         None,
         &[],
-        true,
         "info",
         &[],
         "guest",
     );
-    assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
-    let weak_verify = hermit_command(
-        "verify",
-        "ptrace",
-        "portable",
-        60,
-        None,
-        &[],
-        false,
-        "info",
-        &[],
-        "guest",
+    assert!(verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
+    assert!(verify.contains("(.bitwise_parity == true)"));
+
+    let canonical = r#"{"verified":true,"verdict":"matched","bitwise_parity":true,"comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":2,"right":2}}"#;
+    assert_eq!(
+        executable_receipt_bracket(canonical, 23).code(),
+        Some(23),
+        "a valid receipt must preserve the allowed nonzero guest status"
     );
-    assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
-    assert!(!weak_verify.contains("--verify-strict"));
+    let contradictory = r#"{"verified":true,"verdict":"diverged","bitwise_parity":true,"comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":2,"right":2}}"#;
+    assert_eq!(
+        executable_receipt_bracket(contradictory, 23).code(),
+        Some(1),
+        "an invalid receipt must fail instead of hiding behind the guest status"
+    );
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }

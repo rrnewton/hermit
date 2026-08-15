@@ -4,7 +4,7 @@ This table is derived from the manifest, not from a separately maintained parent
 
 **Green** means the cell is in `ci/expected-e2e-plan.json` and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
 
-These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend parity.
+These are the current Basic Sanity contracts. Every `verify` cell, every `replay` cell, and every seed in a selected `chaos` cell requires a typed canonical verdict. A positive result on a supported canonical evidence path requires non-vacuous INFO-log bitwise parity. Direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor; KVM remains output-only and therefore unqualified for that claim. The counts below are unchanged pending the approved combined measurement.
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |

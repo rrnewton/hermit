@@ -105,9 +105,13 @@ Record exact `file:line -> symbol -> symbol` paths, commands, and literal output
 
 A backend is REAL if and only if:
 
-1. **The real CLI runs an arbitrary guest on main.** For non-KVM backends use
-   `hermit run --backend X --strict --verify --verify-strict --verify-json
-   <path> -- echo hello` and require `bitwise_parity: true`.
+1. **The real CLI runs an arbitrary guest on main.** Start with
+   `hermit run --backend X --strict -- echo hello`. On a backend with a
+   supported canonical evidence path, also use `--verify --verify-json <path>`
+   and require `bitwise_parity: true`.
+   Direct DBT verification currently must return `no_result` before guest
+   execution until Reverie provides a protected internal descriptor for
+   canonical Detcore evidence; do not treat that refusal as an L2 pass.
    KVM currently provides exact exit/stdout/stderr repeat parity only; its
    internal logs are not compared, so never score that result as L2.
    - If --backend flag doesn't exist on main: NOT a real backend yet
@@ -123,8 +127,9 @@ A backend is REAL if and only if:
 
 4. **Arbitrary programs run**: test at least 3 real programs (echo, true, cat)
    - All must produce correct output
-   - Non-KVM L2 claims require strict JSON `bitwise_parity: true`; KVM results
-     stay explicitly output/status-only
+   - L2 claims require strict JSON `bitwise_parity: true` from a supported
+     canonical evidence path; KVM stays output/status-only and DBT stays L1
+     while its protected evidence descriptor is unavailable
 
 5. **hermit-cli links the backend**: check Cargo.toml dependencies
    - If hermit-cli doesn't depend on reverie-xxx: not wired in
@@ -136,8 +141,8 @@ A backend is REAL if and only if:
 | B0 | Crate exists, compiles |
 | B1 | Guest trait partially implemented |
 | B2 | Can run trivial programs through Detcore<XxxGuest> |
-| B3 | Passes 50%+ of ptrace strict-verify corpus |
-| B4 | Passes 100% of ptrace strict-verify corpus = DONE |
+| B3 | Passes 50%+ of ptrace strict-verify corpus with canonical typed evidence |
+| B4 | Passes 100% of ptrace strict-verify corpus with canonical typed evidence = DONE |
 
 Detcore integration is a hard prerequisite. A backend that bypasses Detcore is
 B0 even if its observed program tests would otherwise qualify for a higher level.
@@ -166,22 +171,23 @@ rg -n 'run_kvm|run_dbt|detcore::Config|Detcore<' hermit-cli/src/ detcore/src/
 rg -n 'syscall|intercept|passthrough|forward' hermit-cli/src/ detcore/src/ reverie-*/src/
 
 # 7. Try running real programs (if --backend exists)
-target/release/hermit run --backend X --strict --verify --verify-strict \
-  --verify-json /tmp/backend-X-echo.json -- echo hello 2>&1
-target/release/hermit run --backend X --strict --verify --verify-strict \
-  --verify-json /tmp/backend-X-true.json -- /bin/true 2>&1
-target/release/hermit run --backend X --strict --verify --verify-strict \
-  --verify-json /tmp/backend-X-cat.json -- cat /dev/null 2>&1
+target/release/hermit run --backend X --strict -- echo hello 2>&1
+target/release/hermit run --backend X --strict -- /bin/true 2>&1
+target/release/hermit run --backend X --strict -- cat /dev/null 2>&1
+
+# On a supported canonical evidence path, additionally run --verify-json and
+# require a matched, canonical, non-vacuous receipt. DBT currently refuses this
+# command with no_result until Reverie supplies a protected internal descriptor.
 
 # 8. Capture and compare INFO-level syscall handling with ptrace
-target/release/hermit --log info run --strict --verify --verify-strict -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
-target/release/hermit --log info run --backend X --strict --verify --verify-strict -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
+target/release/hermit --log info run --strict --verify --verify-json /tmp/hermit-ptrace.json -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info
+target/release/hermit --log info run --backend X --strict --verify --verify-json /tmp/hermit-backend-X.json -- echo hello > /tmp/hermit-backend-X.out 2> /tmp/hermit-backend-X.info
 diff -u /tmp/hermit-ptrace.info /tmp/hermit-backend-X.info
 ```
 
-For KVM, omit `--verify-strict` only to measure its supported output/status
-repeat path and mark the INFO comparison unavailable. Do not reinterpret the
-output-only JSON verdict as full parity.
+For KVM, measure its supported output/status repeat path and mark the INFO
+comparison unavailable. Do not reinterpret the output-only JSON verdict as full
+parity.
 
 ## Report Format
 

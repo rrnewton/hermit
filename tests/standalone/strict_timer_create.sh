@@ -57,12 +57,24 @@ periodic_guest="$work/periodic_setitimer_guest"
 "$cc_bin" -std=c11 -O2 -Wall -Wextra -Werror -o "$periodic_guest" "$periodic_src"
 
 for guest in "$state_guest" "$signal_guest" "$periodic_guest"; do
-    if "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 \
-        | grep -q "Determinism verified"; then
+    report="$work/$(basename "$guest").verify.json"
+    output="$work/$(basename "$guest").verify.output"
+    if "$hermit" run --strict --verify --verify-json "$report" -- "$guest" \
+        < /dev/null >"$output" 2>&1 \
+        && jq -e '
+            (.verified == true)
+            and (.verdict == "matched")
+            and (.bitwise_parity == true)
+            and (.comparison.strictness == "canonical")
+            and (.comparison.compare_logs == true)
+            and ((.compared_log_messages.left // 0) > 0)
+            and ((.compared_log_messages.right // 0) > 0)
+        ' "$report" >/dev/null 2>&1; then
         echo "ok: $(basename "$guest") verified deterministic under --strict"
     else
         echo "FAIL: $(basename "$guest") did not verify deterministic under --strict"
-        "$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 | tail -20
+        tail -20 "$output"
+        [[ ! -e $report ]] || cat "$report"
         exit 1
     fi
 done

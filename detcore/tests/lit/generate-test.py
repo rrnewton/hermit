@@ -87,7 +87,10 @@ CHECK: Hello world!
 """
 
 HERMIT_RUN_STRICT_VERIFY_LIT_TEST = """\
-RUN: %hermit run --verify -- %me
+RUN: %hermit run --verify --verify-json %t.verify.json -- %me
+RUN: grep -q '"strictness":"canonical"' %t.verify.json
+RUN: grep -q '"compare_logs":true' %t.verify.json
+RUN: grep -Eq '"left":[1-9][0-9]*,"right":[1-9][0-9]*' %t.verify.json
 """
 
 
