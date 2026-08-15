@@ -3993,6 +3993,8 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        DETERMINISM_STRESS_EVIDENCE_SELF_TEST=1 \
+            "$ROOT_DIR/tests/e2e/lib/determinism-stress/common.sh"
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
         audit_immutable_hermit_binary

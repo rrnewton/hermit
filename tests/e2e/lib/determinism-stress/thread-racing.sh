@@ -20,5 +20,5 @@ if ! verify_guest "lock-free CAS contention" "$lock_free_guest"; then
   failures=$((failures + 1))
 fi
 
-((failures == 0)) || fail "$failures thread-race target(s) failed strict L2"
+((failures == 0)) || fail "$failures thread-race target(s) failed verification"
 stress_success "mutex, condition-variable, semaphore, rwlock, and lock-free races"

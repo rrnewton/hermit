@@ -7,7 +7,12 @@ Every test case invokes the exact verifier path:
 hermit --log info run --strict --verify -- PROGRAM [ARGS...]
 ```
 
-No determinism relaxations are used. Native executions run first and print the
+The default `--verify` comparison uses the lossy
+`unsafe-numeric-address-and-path-normalization/v1` relaxation. The stress
+summary reports the comparison and relaxations emitted by Hermit; it reports
+`relaxations=none` only when the selected comparison applies none. This is
+evidence only: the commands, determinism marker, and acceptance criteria are
+unchanged. Native executions run first and print the
 SHA-256 of each output, making host nondeterminism visible without making a
 probabilistic native difference a test prerequisite. The Hermit phase requires
 the explicit `Determinism verified` marker.
