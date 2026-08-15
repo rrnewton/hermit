@@ -17,9 +17,59 @@ use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
+use crate::event::PpollEvent;
+
+fn replay_ppoll_event<M: MemoryAccess>(
+    memory: &mut M,
+    fds_address: Option<AddrMut<'_, libc::pollfd>>,
+    timeout_address: Option<AddrMut<'_, Timespec>>,
+    nfds: usize,
+    event: PpollEvent,
+) -> Result<i64, Errno> {
+    let PpollEvent {
+        result,
+        fds_pointer_present,
+        fds,
+        timeout,
+    } = event;
+
+    if let Ok(updated) = result {
+        assert!(updated >= 0);
+        assert!((updated as usize) <= nfds);
+    }
+
+    assert_eq!(
+        fds_address.is_some(),
+        fds_pointer_present,
+        "recorded ppoll pollfd pointer shape diverged during replay"
+    );
+    if let Some(fds) = fds {
+        assert_eq!(fds.len(), nfds);
+        memory.write_values(
+            fds_address
+                .expect("recorded ppoll values require a pollfd pointer")
+                .cast::<PollFd>(),
+            &fds,
+        )?;
+    }
+
+    match (timeout_address, timeout) {
+        (Some(address), Some(timeout)) => {
+            if let Err(error) = memory.write_value(address, &timeout) {
+                // Linux preserves the ppoll result when remaining-time copyout faults.
+                tracing::trace!(?error, "ignoring replayed ppoll timeout writeback failure");
+            }
+        }
+        (None, None) => {}
+        _ => panic!("recorded ppoll timeout pointer shape diverged during replay"),
+    }
+
+    result
+}
 
 fn write_bytes<M: MemoryAccess>(
     memory: &mut M,
@@ -160,26 +210,14 @@ impl Replayer {
         guest: &mut G,
         syscall: Ppoll,
     ) -> Result<i64, Errno> {
-        // `ppoll` shares `poll`'s recorded output (the updated pollfd array and
-        // return count), so it reuses the `Poll` event. We restore every
-        // recorded `revents` field without consulting live descriptors, and we
-        // never inject the call, so the recorded temporary signal mask has no
-        // replay effect (a recorded `EINTR` is reproduced via the event's
-        // `Result`, handled before we get here).
-        let event = next_event!(guest, Poll)?;
-
-        let nfds = syscall.nfds() as usize;
-        assert_eq!(event.fds.len(), nfds);
-
-        // Write out the recorded fds (if any). `Ppoll::fds()` is typed as
-        // `AddrMut<libc::pollfd>`; cast to the layout-compatible `PollFd`.
-        if let Some(addr) = syscall.fds() {
-            guest
-                .memory()
-                .write_values(addr.cast::<PollFd>(), &event.fds)?;
-        }
-
-        Ok(event.updated as i64)
+        let event = next_event!(guest, Ppoll)?;
+        replay_ppoll_event(
+            &mut guest.memory(),
+            syscall.fds(),
+            syscall.timeout(),
+            syscall.nfds() as usize,
+            event,
+        )
     }
 
     pub(super) async fn handle_sockopt_family<G: Guest<Self>>(
@@ -255,5 +293,179 @@ impl Replayer {
             .write_exact(syscall.buf().unwrap(), &buf)
             .unwrap();
         Ok(buf.len() as i64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::MemoryAccess;
+    use reverie::syscalls::PollFlags;
+
+    use super::*;
+
+    struct FailSecondWrite {
+        memory: LocalMemory,
+        writes: usize,
+    }
+
+    impl MemoryAccess for FailSecondWrite {
+        fn read_vectored(
+            &self,
+            read_from: &[io::IoSlice],
+            write_to: &mut [io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            self.memory.read_vectored(read_from, write_to)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[io::IoSlice],
+            _write_to: &mut [io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            unreachable!("write_exact dispatches through the overridden write method")
+        }
+
+        fn write(&mut self, address: AddrMut<u8>, bytes: &[u8]) -> Result<usize, Errno> {
+            self.writes += 1;
+            if self.writes == 2 {
+                Err(Errno::EFAULT)
+            } else {
+                self.memory.write(address, bytes)
+            }
+        }
+    }
+
+    #[test]
+    fn replay_ppoll_restores_exact_timeout_and_successful_pollfds() {
+        let mut output_fd = libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut output_timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let recorded_timeout = Timespec {
+            tv_sec: 3,
+            tv_nsec: 456_789_123,
+        };
+        let event = PpollEvent {
+            result: Ok(1),
+            fds_pointer_present: true,
+            fds: Some(vec![PollFd {
+                fd: 7,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::POLLIN,
+            }]),
+            timeout: Some(recorded_timeout),
+        };
+
+        let result = replay_ppoll_event(
+            &mut LocalMemory::new(),
+            AddrMut::from_raw((&mut output_fd as *mut libc::pollfd) as usize),
+            AddrMut::from_raw((&mut output_timeout as *mut Timespec) as usize),
+            1,
+            event,
+        );
+
+        assert_eq!(result, Ok(1));
+        assert_eq!(output_fd.revents, libc::POLLIN);
+        assert_eq!(output_timeout, recorded_timeout);
+    }
+
+    #[test]
+    fn replay_ppoll_restores_exact_timeout_before_recorded_error() {
+        let mut output_timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let recorded_timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 345_678_901,
+        };
+        let event = PpollEvent {
+            result: Err(Errno::EINTR),
+            fds_pointer_present: false,
+            fds: None,
+            timeout: Some(recorded_timeout),
+        };
+
+        let result = replay_ppoll_event(
+            &mut LocalMemory::new(),
+            None,
+            AddrMut::from_raw((&mut output_timeout as *mut Timespec) as usize),
+            0,
+            event,
+        );
+
+        assert_eq!(result, Err(Errno::EINTR));
+        assert_eq!(output_timeout, recorded_timeout);
+    }
+
+    #[test]
+    fn replay_ppoll_writes_ready_fds_and_preserves_result_on_timeout_copyout_error() {
+        let mut output_fd = libc::pollfd {
+            fd: 7,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let mut output_timeout = Timespec {
+            tv_sec: 9,
+            tv_nsec: 876_543_210,
+        };
+        let original_timeout = output_timeout;
+        let event = PpollEvent {
+            result: Ok(1),
+            fds_pointer_present: true,
+            fds: Some(vec![PollFd {
+                fd: 7,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::POLLIN,
+            }]),
+            timeout: Some(Timespec {
+                tv_sec: 3,
+                tv_nsec: 456_789_123,
+            }),
+        };
+        let mut memory = FailSecondWrite {
+            memory: LocalMemory::new(),
+            writes: 0,
+        };
+
+        let result = replay_ppoll_event(
+            &mut memory,
+            AddrMut::from_raw((&mut output_fd as *mut libc::pollfd) as usize),
+            AddrMut::from_raw((&mut output_timeout as *mut Timespec) as usize),
+            1,
+            event,
+        );
+
+        assert_eq!(result, Ok(1));
+        assert_eq!(memory.writes, 2);
+        assert_eq!(output_fd.revents, libc::POLLIN);
+        assert_eq!(output_timeout, original_timeout);
+    }
+
+    #[test]
+    fn replay_ppoll_early_error_with_pollfd_pointer_performs_no_fd_write() {
+        let event = PpollEvent {
+            result: Err(Errno::EINVAL),
+            fds_pointer_present: true,
+            fds: None,
+            timeout: None,
+        };
+        let mut memory = FailSecondWrite {
+            memory: LocalMemory::new(),
+            writes: 0,
+        };
+
+        let result = replay_ppoll_event(&mut memory, AddrMut::from_raw(1), None, usize::MAX, event);
+
+        assert_eq!(result, Err(Errno::EINVAL));
+        assert_eq!(memory.writes, 0);
     }
 }

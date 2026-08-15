@@ -11,6 +11,7 @@
 use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
@@ -19,11 +20,13 @@ use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
 use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
+use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
@@ -59,6 +62,37 @@ fn read_iovecs<M: MemoryAccess>(
     ];
     memory.read_values(address, &mut iovecs)?;
     Ok(iovecs)
+}
+
+fn capture_ppoll_event<M: MemoryAccess>(
+    memory: &M,
+    fds_address: Option<AddrMut<'_, libc::pollfd>>,
+    timeout_address: Option<AddrMut<'_, Timespec>>,
+    nfds: usize,
+    result: Result<i64, Errno>,
+) -> Result<PpollEvent, Errno> {
+    let fds_pointer_present = fds_address.is_some();
+    let fds = if matches!(result, Ok(_) | Err(Errno::EINTR)) {
+        fds_address
+            .map(|address| -> Result<Vec<PollFd>, Errno> {
+                let mut fds = vec![PollFd::default(); nfds];
+                memory.read_values(address.cast::<PollFd>().into(), &mut fds)?;
+                Ok(fds)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let timeout = timeout_address
+        .map(|address| memory.read_value(address))
+        .transpose()?;
+
+    Ok(PpollEvent {
+        result,
+        fds_pointer_present,
+        fds,
+        timeout,
+    })
 }
 
 impl Recorder {
@@ -121,27 +155,27 @@ impl Recorder {
         syscall: Ppoll,
     ) -> Result<i64, Errno> {
         let len = syscall.nfds() as usize;
+        let timeout_is_zero = syscall
+            .timeout()
+            .and_then(|address| {
+                let timeout: Timespec = guest.memory().read_value(address).ok()?;
+                Some(timeout)
+            })
+            .is_some_and(|timeout| timeout.tv_sec == 0 && timeout.tv_nsec == 0);
+        tracing::trace!(
+            has_signal_mask = syscall.sigmask().is_some(),
+            timeout_is_zero,
+            "Recorder observed ppoll input"
+        );
         let result = guest.inject(syscall).await;
-
-        let event = result.and_then(|ret| {
-            let mut fds = vec![PollFd::default(); len];
-
-            // `ppoll` shares `poll`'s output semantics: the kernel writes the
-            // `revents` field of each pollfd. `Ppoll::fds()` is typed as
-            // `AddrMut<libc::pollfd>`, which is layout-compatible with the
-            // `PollFd` we store, so we cast the address and read the whole array.
-            //
-            // A NULL fds pointer (a pure `ppoll` sleep) leaves `fds` empty and
-            // records `updated == 0` on timeout.
-            if let Some(addr) = syscall.fds() {
-                guest
-                    .memory()
-                    .read_values(addr.cast::<PollFd>().into(), &mut fds)?;
-            }
-
-            let updated = ret as usize;
-            Ok(SyscallEvent::Poll(PollEvent { fds, updated }))
-        });
+        let event = capture_ppoll_event(
+            &guest.memory(),
+            syscall.fds(),
+            syscall.timeout(),
+            len,
+            result,
+        )
+        .map(SyscallEvent::Ppoll);
 
         self.record_event(guest, event);
 
@@ -260,4 +294,78 @@ impl Recorder {
     }
 
     // TODO: Add support for ppoll, epoll, and select here.
+}
+
+#[cfg(test)]
+mod tests {
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::PollFlags;
+
+    use super::*;
+
+    #[test]
+    fn capture_ppoll_preserves_exact_timeout_on_eintr() {
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 345_678_901,
+        };
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            None,
+            AddrMut::from_raw((&timeout as *const Timespec) as usize),
+            0,
+            Err(Errno::EINTR),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EINTR));
+        assert!(!event.fds_pointer_present);
+        assert!(event.fds.is_none());
+        assert_eq!(event.timeout, Some(timeout));
+    }
+
+    #[test]
+    fn capture_ppoll_preserves_ready_fds_and_unchanged_timeout() {
+        let fds = [PollFd {
+            fd: 7,
+            events: PollFlags::POLLIN,
+            revents: PollFlags::POLLIN,
+        }];
+        let timeout = Timespec {
+            tv_sec: 3,
+            tv_nsec: 456_789_123,
+        };
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(fds.as_ptr() as usize),
+            AddrMut::from_raw((&timeout as *const Timespec) as usize),
+            fds.len(),
+            Ok(1),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Ok(1));
+        assert!(event.fds_pointer_present);
+        assert_eq!(event.fds.unwrap()[0].revents, PollFlags::POLLIN);
+        assert_eq!(event.timeout, Some(timeout));
+    }
+
+    #[test]
+    fn capture_ppoll_early_error_does_not_read_or_allocate_pollfds() {
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(1),
+            None,
+            usize::MAX,
+            Err(Errno::EINVAL),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EINVAL));
+        assert!(event.fds_pointer_present);
+        assert!(event.fds.is_none());
+        assert!(event.timeout.is_none());
+    }
 }
