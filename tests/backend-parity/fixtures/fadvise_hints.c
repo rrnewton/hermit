@@ -16,6 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must pass under Hermit. */
+#define EXPECTED_CHECKS 5
+
 int main(void) {
     char path[] = "/tmp/fadviseXXXXXX";
     int fd = mkstemp(path);
@@ -59,5 +62,17 @@ int main(void) {
     close(fd);
     unlink(path);
     printf("fadvise ok=%d\n", ok);
+
+    /* Every check above must have passed. Without this the guest exits 0
+       no matter how many failed, so a real regression only lowers the
+       printed count -- and because both --verify runs lower it identically,
+       parity still holds and the cell passes green. The expected count is
+       the value observed UNDER HERMIT; this guest is not run natively in CI
+       (its naked mode is ci = false), and several checks here assert
+       determinized behaviour that native Linux does not exhibit. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "fadvise completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+        return 1;
+    }
     return 0;
 }
