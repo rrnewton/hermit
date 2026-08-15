@@ -142,13 +142,12 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "DBT completes the five-step contract but its dedicated adapter publishes typed no_result with no INFO comparison, so it cannot establish L2"
 kvm = "Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available"
 sabre = "Not yet qualified for the personality(2) execution-domain round-trip"
-liteinst = "Not yet qualified for the personality(2) execution-domain round-trip"
 
 [test.modes.naked]
 ci = false
@@ -1028,13 +1027,12 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -4962,13 +4960,12 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false

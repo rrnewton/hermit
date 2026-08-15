@@ -12,19 +12,19 @@ These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell, a
 | `dbt` | 9 | 999 | 1008 |
 | `kvm` | 0 | 1008 | 1008 |
 | `sabre` | 9 | 999 | 1008 |
-| `liteinst` | 19 | 989 | 1008 |
+| `liteinst` | 22 | 986 | 1008 |
 | `native` | 0 | 336 | 336 |
-| **Total** | **187** | **5189** | **5376** |
+| **Total** | **190** | **5186** | **5376** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 19 / 336 | — | 184 | 1496 | 1680 |
+| `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 22 / 336 | — | 187 | 1493 | 1680 |
 | `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
 | `chaos` | 2 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 2 | 1678 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
-| **Total** | | | | | | | **187** | **5189** | **5376** |
+| **Total** | | | | | | | **190** | **5186** | **5376** |
 
 ## Cross-backend parity
 
@@ -50,4 +50,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 23 / 25 | 1 / 25 | 0 / 25 | 24 | 75 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 189 selected regression cells: the 187 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 192 selected regression cells: the 190 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

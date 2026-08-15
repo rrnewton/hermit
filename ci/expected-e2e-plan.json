@@ -232,6 +232,13 @@
       "test": "backend-parity-c/ftruncate-sparse"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getrusage-self-accounting"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -286,6 +293,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/mce-kill-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/membarrier-query"
     },
     {
       "backend": "ptrace",
@@ -391,6 +405,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/path-file-ops"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/personality-domain"
     },
     {
       "backend": "ptrace",
