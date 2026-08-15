@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 
 /*
@@ -29,6 +30,7 @@
  */
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   int ok = 0;
 
   /* Set the parent-death signal to SIGUSR1 and read it back. */
@@ -77,5 +79,5 @@ int main(void) {
   }
 
   printf("pdeathsig ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 
 /*
@@ -27,6 +28,7 @@
  */
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 2 };
   int ok = 0;
 
   errno = 0;
@@ -57,5 +59,5 @@ int main(void) {
   }
 
   printf("subreaper ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

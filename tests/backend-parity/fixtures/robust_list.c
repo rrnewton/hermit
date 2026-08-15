@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@ struct robust_head {
 };
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   int ok = 0;
 
   /* The initial query (glibc has already registered a head) must succeed; its
@@ -103,5 +105,5 @@ int main(void) {
   }
 
   printf("robustlist ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
