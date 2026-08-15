@@ -137,9 +137,12 @@ backends_enabled = []
 native = "The existing date-nanoseconds test owns the native-variation assertion"
 
 [test.modes.verify]
-ci = false
-backends_enabled = ["ptrace", "dbt", "kvm", "sabre"]
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
+dbt = "DBT coverage is owned by its backend parity partition"
+kvm = "KVM requires the privileged runner"
+sabre = "Required date/clock virtual-time support remains owner-gated for SaBRe"
 liteinst = "The preload runtime cannot survive the date script's post-start exec"
 
 [test.modes.replay]
