@@ -16297,16 +16297,6 @@
       "test": "c-programs/add-key-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/add-key-enosys",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -16316,6 +16306,16 @@
       "category": "c-programs",
       "test": "c-programs/add-key-enosys",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/add-key-enosys",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": true,
       "status": "green",
@@ -19497,8 +19497,8 @@
       "test": "c-programs/futex-waitv-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -22697,8 +22697,8 @@
       "test": "c-programs/listmount-enosys",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
