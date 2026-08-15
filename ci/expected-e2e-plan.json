@@ -253,6 +253,13 @@
       "test": "backend-parity-c/mce-kill-refusal"
     },
     {
+      "backend": "sabre",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mce-kill-refusal"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",

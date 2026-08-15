@@ -6717,8 +6717,8 @@
       "test": "backend-parity-c/mce-kill-refusal",
       "mode": "verify",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
