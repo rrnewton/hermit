@@ -49877,7 +49877,7 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
+      "enabled": false,
       "status": "red",
       "observations": []
     },
@@ -49887,7 +49887,7 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "kvm",
-      "enabled": true,
+      "enabled": false,
       "status": "red",
       "observations": []
     },
@@ -49908,7 +49908,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": []
     },
     {
@@ -49917,7 +49917,7 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "sabre",
-      "enabled": true,
+      "enabled": false,
       "status": "red",
       "observations": []
     },
