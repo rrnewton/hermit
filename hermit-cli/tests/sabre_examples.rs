@@ -164,6 +164,7 @@ fn example_command(
     backend: Option<&Path>,
     verify: bool,
     diagnostic_log: Option<&Path>,
+    retained_verify_log_dir: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(hermit_binary());
     command.arg(if verify { "--log=info" } else { "--log=warn" });
@@ -183,6 +184,13 @@ fn example_command(
     ]);
     if verify {
         command.arg("--verify");
+        if let Some(directory) = retained_verify_log_dir {
+            command
+                .args(["--verify-strict", "--keep-logs", "--verify-log-dir"])
+                .arg(directory)
+                .arg("--verify-json")
+                .arg(directory.join("verify.json"));
+        }
     }
     command.arg("--").arg(example).args(args);
     command
@@ -196,7 +204,14 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
     let output = run_bounded(
-        example_command(example, args, backend, false, Some(diagnostic_log.path())),
+        example_command(
+            example,
+            args,
+            backend,
+            false,
+            Some(diagnostic_log.path()),
+            None,
+        ),
         label,
         Some(diagnostic_log.path()),
     );
@@ -280,7 +295,7 @@ fn assert_backend_parity_and_sabre_verify(
 
 fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str) {
     let verify = run_bounded(
-        example_command(program, args, Some(loader), true, None),
+        example_command(program, args, Some(loader), true, None, None),
         &format!("SaBRe strict portable verification for {label}"),
         None,
     );
@@ -365,6 +380,108 @@ fn sabre_root_pid_matches_ptrace() {
         &loader,
         "root-pid",
     );
+}
+
+#[test]
+fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let retained_logs = tempfile::Builder::new()
+        .prefix("sabre-verify-logs-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create retained SaBRe verification log directory");
+    let verify = run_bounded(
+        example_command(
+            Path::new("/bin/sh"),
+            &["-c", "printf 'ok\\n'"],
+            Some(&loader),
+            true,
+            None,
+            Some(retained_logs.path()),
+        ),
+        "SaBRe strict verification with retained logs",
+        None,
+    );
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr),
+    );
+    assert!(
+        diagnostics.contains("Success: deterministic. Determinism verified."),
+        "SaBRe strict verification omitted its success verdict:\n{diagnostics}",
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(retained_logs.path().join("verify.json"))
+            .expect("SaBRe strict verification did not publish its report"),
+    )
+    .expect("SaBRe strict verification report was not valid JSON");
+    assert!(
+        report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info",
+        "SaBRe verification report was not canonical bitwise INFO parity: {report}",
+    );
+
+    let retained_log = |prefix: &str| {
+        let mut matches = std::fs::read_dir(retained_logs.path())
+            .expect("failed to read retained SaBRe verification log directory")
+            .map(|entry| {
+                entry
+                    .expect("failed to read retained SaBRe verification log entry")
+                    .path()
+            })
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "SaBRe strict verification must retain exactly one {prefix} file: {matches:?}",
+        );
+        matches.pop().unwrap()
+    };
+    let logs = [retained_log("run1_log_"), retained_log("run2_log_")];
+
+    const SCHEDULER_EMPTY: &str =
+        " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";
+    const FALLBACK_COMPLETED: &str =
+        " INFO hermit::sabre::fallback: SaBRe ptrace fallback completed";
+    for (index, path) in logs.iter().enumerate() {
+        let log = std::fs::read_to_string(path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read retained run log {}: {error}",
+                path.display()
+            )
+        });
+        let scheduler_empty = log.match_indices(SCHEDULER_EMPTY).collect::<Vec<_>>();
+        let fallback_completed = log.match_indices(FALLBACK_COMPLETED).collect::<Vec<_>>();
+        assert_eq!(
+            scheduler_empty.len(),
+            1,
+            "retained run {} must contain exactly one scheduler-empty INFO:\n{log}",
+            index + 1,
+        );
+        assert_eq!(
+            fallback_completed.len(),
+            1,
+            "retained run {} must contain exactly one fallback-completed INFO:\n{log}",
+            index + 1,
+        );
+        assert!(
+            scheduler_empty[0].0 < fallback_completed[0].0,
+            "retained run {} logged fallback completion before scheduler completion:\n{log}",
+            index + 1,
+        );
+    }
 }
 
 #[test]

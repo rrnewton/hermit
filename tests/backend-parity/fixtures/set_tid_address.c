@@ -40,5 +40,5 @@ int main(void) {
     if (tid == r1) ok++;
 
     printf("set_tid_address ok=%d\n", ok);
-    return 0;
+    return ok == 4 ? 0 : 1;
 }
