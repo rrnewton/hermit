@@ -141,6 +141,39 @@ impl Metadata {
     }
 }
 
+/// The detcore configuration for both phases of record/replay.
+///
+/// # Why so much virtualization is OFF here
+///
+/// `virtualize_time`, `virtualize_metadata` and `deterministic_io` are all
+/// `false`, and that is a POSITION ON A DESIGNED BOUNDARY rather than an
+/// oversight. Hermit can handle each source of nondeterminism in one of two
+/// ways: DETERMINIZE it (substitute a deterministic value, what `hermit run`
+/// does) or RECORD it (capture the host's value at record time and replay it
+/// back). Record mode sits on the record side. The seam is `Detcore<T>` being
+/// generic over `T: RecordOrReplay`, and per subsystem the choice is exactly
+/// "call the determinizing `handle_*`" versus "forward to `record_or_replay`".
+/// With `virtualize_time` off, the time syscalls take the second path:
+/// `handle_unsupported_syscall` -> `passthrough` -> `record_or_replay`, so the
+/// host clock is captured and reproduced.
+///
+/// Two consequences follow, and both are intended:
+///
+/// * A recording can contain host-derived values, so TWO SEPARATE RECORDINGS OF
+///   THE SAME GUEST NEED NOT AGREE. What record/replay guarantees is that a
+///   replay reproduces ITS OWN recording. `hermit run --strict --verify` is the
+///   determinism claim; a green `record start --verify` is a fidelity claim.
+///   `hermit record start --verify --verify-json` reports `virtualize_time` for
+///   exactly this reason, so a consumer cannot mistake one for the other.
+/// * Which subsystems are recorded rather than determinized is meant to become
+///   a user choice (`--record-time`, `--record-cpuid`, ...). That work is
+///   designed but NOT built: there is no such flag today, so the settings below
+///   are the fixed default, and the `TODO` under this comment is the natural
+///   home for making them selectable.
+///
+/// Do not flip one of these to `true` as a "determinism fix" without treating it
+/// as the product decision it is: it moves a subsystem from the record side of
+/// the boundary to the determinize side.
 // TODO: Record this in the metadata instead of hardcoding this.
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same detcore
