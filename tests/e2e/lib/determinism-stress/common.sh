@@ -16,6 +16,102 @@ fail() {
   exit 1
 }
 
+comparison_display=""
+comparison_relaxations=""
+comparison_evidence_complete=true
+comparison_evidence_observations=0
+comparison_evidence_self_test_scratch=""
+
+reset_comparison_evidence() {
+  comparison_display=""
+  comparison_relaxations=""
+  comparison_evidence_complete=true
+  comparison_evidence_observations=0
+}
+
+record_comparison_evidence() {
+  local stderr_file=$1
+  local -a evidence_lines=()
+  local evidence comparison relaxations
+  mapfile -t evidence_lines < <(
+    grep -E '^:: comparison=[^[:space:]]+ relaxations=[^[:space:]]+$' \
+      "$stderr_file" || true
+  )
+  if ((${#evidence_lines[@]} != 1)); then
+    comparison_evidence_complete=false
+    printf 'warning: expected one comparison-evidence line, found %s; reporting unknown\n' \
+      "${#evidence_lines[@]}" >&2
+    return 0
+  fi
+
+  evidence=${evidence_lines[0]#:: comparison=}
+  comparison=${evidence%% relaxations=*}
+  relaxations=${evidence#* relaxations=}
+  comparison_evidence_observations=$((comparison_evidence_observations + 1))
+  if [[ -z $comparison_display ]]; then
+    comparison_display=$comparison
+    comparison_relaxations=$relaxations
+  elif [[ $comparison_display != "$comparison" || $comparison_relaxations != "$relaxations" ]]; then
+    comparison_evidence_complete=false
+    printf 'warning: verification attempts reported different comparison evidence; reporting unknown\n' >&2
+  fi
+}
+
+stress_success() {
+  local display=unknown relaxations=unknown
+  if [[ $comparison_evidence_complete == true &&
+        $comparison_evidence_observations -gt 0 ]]; then
+    display=$comparison_display
+    relaxations=$comparison_relaxations
+  fi
+  printf '\nPASS: %s (ptrace backend, comparison=%s, log=info, relaxations=%s)\n' \
+    "$1" "$display" "$relaxations"
+}
+
+comparison_evidence_self_test() {
+  local output
+  comparison_evidence_self_test_scratch=$(mktemp -d \
+    "${TMPDIR:-/tmp}/determinism-stress-evidence.XXXXXX")
+  trap 'rm -rf -- "$comparison_evidence_self_test_scratch"' EXIT
+
+  printf '%s\n' \
+    ':: comparison=Stripped relaxations=unsafe-numeric-address-and-path-normalization/v1' \
+    >"$comparison_evidence_self_test_scratch/stripped.stderr"
+  reset_comparison_evidence
+  record_comparison_evidence "$comparison_evidence_self_test_scratch/stripped.stderr"
+  output=$(stress_success stripped-control)
+  [[ $output == *'comparison=Stripped'* ]] ||
+    fail "Stripped comparison display was not preserved"
+  [[ $output == *'relaxations=unsafe-numeric-address-and-path-normalization/v1'* ]] ||
+    fail "Stripped comparison did not report its lossy relaxation"
+  [[ $output != *'relaxations=none'* ]] ||
+    fail "Stripped comparison falsely reported relaxations=none"
+
+  printf '%s\n' ':: comparison=BitwiseInfoV1 relaxations=none' \
+    >"$comparison_evidence_self_test_scratch/canonical.stderr"
+  reset_comparison_evidence
+  record_comparison_evidence "$comparison_evidence_self_test_scratch/canonical.stderr"
+  output=$(stress_success canonical-control)
+  [[ $output == *'comparison=BitwiseInfoV1'* ]] ||
+    fail "canonical comparison display was not preserved"
+  [[ $output == *'relaxations=none'* ]] ||
+    fail "a comparison without relaxations must still report relaxations=none"
+
+  : >"$comparison_evidence_self_test_scratch/missing.stderr"
+  reset_comparison_evidence
+  record_comparison_evidence "$comparison_evidence_self_test_scratch/missing.stderr"
+  output=$(stress_success missing-control)
+  [[ $output == *'comparison=unknown'* && $output == *'relaxations=unknown'* ]] ||
+    fail "missing comparison evidence must not invent a policy or relaxation claim"
+
+  printf 'determinism-stress comparison evidence self-test: both claim directions pass\n'
+}
+
+if [[ ${DETERMINISM_STRESS_EVIDENCE_SELF_TEST:-0} == 1 ]]; then
+  comparison_evidence_self_test
+  exit 0
+fi
+
 [[ -x $hermit_bin ]] || fail \
   "Hermit release binary not found: $hermit_bin (run: cargo build --release -p hermit --bin hermit)"
 command -v "$cc_bin" >/dev/null 2>&1 || fail "C compiler not found: $cc_bin"
@@ -85,7 +181,7 @@ verify_guest() {
     local stdout=$stress_workdir/verify-$verify_index.stdout
     local stderr=$stress_workdir/verify-$verify_index.stderr
 
-    printf '[hermit L2] %s (attempt %s/%s)\n' \
+    printf '[hermit verify] %s (attempt %s/%s)\n' \
       "$label" "$attempt" "$verify_repetitions"
     if ! timeout --kill-after=10 "${verify_timeout}s" \
       "$hermit_bin" --log info run --strict --verify -- "$@" \
@@ -101,9 +197,6 @@ verify_guest() {
       printf 'error: %s exited without the determinism marker\n' "$label" >&2
       return 1
     fi
+    record_comparison_evidence "$stderr"
   done
-}
-
-stress_success() {
-  printf '\nPASS: %s (ptrace backend, strict L2, log=info, relaxations=none)\n' "$1"
 }

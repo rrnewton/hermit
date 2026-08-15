@@ -58,13 +58,14 @@ RUN_ID=${E2E_RUN_ID:-"local-$(date +%s)-$$"}
 SOURCE_TREE_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
 BUILD_ROOT=${E2E_BUILD_ROOT:-$RESULT_ROOT/build/$SOURCE_TREE_SHA}
 DAG_ROOT=${E2E_DAG_ROOT:-$ROOT_DIR/ci/dag}
+HARNESS_MANIFEST_JSON=${E2E_HARNESS_MANIFEST_JSON:-}
 if [[ -n $(git -C "$ROOT_DIR" status --porcelain --untracked-files=no) ]]; then
     SOURCE_TREE_DIRTY=true
 else
     SOURCE_TREE_DIRTY=false
 fi
 
-readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT
+readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT HARNESS_MANIFEST_JSON
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbt kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
@@ -371,8 +372,25 @@ function load_tests {
     ID_BY_TEST=()
     METADATA_BY_ID=()
     local documents raw metadata id test relative kind
-    documents=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json) ||
-        die "TOML manifest validation failed"
+    if [[ -n $HARNESS_MANIFEST_JSON ]]; then
+        [[ -f $HARNESS_MANIFEST_JSON && ! -L $HARNESS_MANIFEST_JSON && -s $HARNESS_MANIFEST_JSON ]] ||
+            die "E2E_HARNESS_MANIFEST_JSON is not a nonempty regular file: $HARNESS_MANIFEST_JSON"
+        [[ ! -w $HARNESS_MANIFEST_JSON ]] ||
+            die "E2E_HARNESS_MANIFEST_JSON must be read-only: $HARNESS_MANIFEST_JSON"
+        jq -e '
+            type == "array" and length > 0 and
+            all(.[];
+                type == "object" and (.bucket | type == "string" and length > 0) and
+                (.test | type == "array" and length > 0 and
+                    all(.[]; type == "object" and (.id | type == "string" and length > 0))))
+        ' "$HARNESS_MANIFEST_JSON" >/dev/null ||
+            die "E2E_HARNESS_MANIFEST_JSON is not valid nonempty harness JSON: $HARNESS_MANIFEST_JSON"
+        documents=$(<"$HARNESS_MANIFEST_JSON") ||
+            die "cannot read E2E_HARNESS_MANIFEST_JSON: $HARNESS_MANIFEST_JSON"
+    else
+        documents=$(cargo run --quiet -p hermit-manifest-plan -- --format harness-json) ||
+            die "TOML manifest validation failed"
+    fi
     while IFS= read -r raw; do
         id=$(jq -r .id <<<"$raw")
         relative=$(jq -r '.program // ""' <<<"$raw")
@@ -3975,6 +3993,8 @@ load_tests
 case "$subcommand" in
     validate)
         (($# == 0)) || true
+        DETERMINISM_STRESS_EVIDENCE_SELF_TEST=1 \
+            "$ROOT_DIR/tests/e2e/lib/determinism-stress/common.sh"
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
         audit_immutable_hermit_binary

@@ -49,5 +49,5 @@ for entry in "${cases[@]}"; do
   fi
 done
 
-((failures == 0)) || fail "$failures syscall target(s) failed strict L2"
+((failures == 0)) || fail "$failures syscall target(s) failed verification"
 stress_success "targeted syscall matrix"
