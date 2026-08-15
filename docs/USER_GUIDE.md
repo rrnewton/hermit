@@ -310,6 +310,15 @@ divergent scheduler turn and virtual nanoseconds when the logs contain that
 position. An empty or unreadable comparison exits with an error rather than
 reporting a match.
 
+For a two-log comparison, add `--print-logs` to print both selected streams to
+stderr exactly as the comparator receives them. The output names the active
+policy: `Deterministic` for the default DETLOG/scheduler-COMMIT subset,
+`Stripped` when `--unsafe-strip-lines` applies its lossy substitutions, or
+`Canonical` when `--canonical-info` selects the INFO stream and canonicalizes
+marked host addresses. This output is produced by the shared comparator path,
+after wall-clock-prefix removal, line filtering, message selection, and any
+requested substitutions.
+
 The guest must be idempotent. A first run that modifies an input file,
 database, cache, or other host-visible state can legitimately change the
 second run. Use disposable or resettable inputs for verification.
