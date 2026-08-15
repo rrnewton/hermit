@@ -35,21 +35,27 @@ int main(void) {
         ok++;
     }
     char moved[4096];
+    /* Load-bearing, not cosmetic: `moved` is read below to derive moved_dir, so
+     * it must be initialised even when this getcwd fails. */
     moved[0] = '\0';
-    if (getcwd(moved, sizeof(moved)) != NULL && strcmp(moved, start) != 0) {
+    int moved_differs = (getcwd(moved, sizeof(moved)) != NULL && strcmp(moved, start) != 0);
+    if (moved_differs) {
         ok++;
     }
     if (startfd >= 0 && fchdir(startfd) == 0) {
         ok++;
     }
     char back1[4096];
-    if (getcwd(back1, sizeof(back1)) != NULL && strcmp(back1, start) == 0) {
+    int back1_eq = (getcwd(back1, sizeof(back1)) != NULL && strcmp(back1, start) == 0);
+    if (back1_eq) {
         ok++;
     }
     /* leave via a second chdir to confirm absolute-path chdir round-trips too */
+    int abs_roundtrip = 0;
     if (dir != NULL && chdir(dir) == 0 && chdir(start) == 0) {
         char back2[4096];
-        if (getcwd(back2, sizeof(back2)) != NULL && strcmp(back2, start) == 0) {
+        abs_roundtrip = (getcwd(back2, sizeof(back2)) != NULL && strcmp(back2, start) == 0);
+        if (abs_roundtrip) {
             ok++;
         }
     }
@@ -86,6 +92,18 @@ int main(void) {
     } else {
         snprintf(moved_dir, sizeof(moved_dir), "%s", "<no-slash>");
     }
-    printf("cwd ok=%d moved_dir=%s\n", ok, moved_dir);
+    /*
+     * ...AND DE-ALIAS THE SUM. These two are not redundant, they cover disjoint
+     * classes and neither subsumes the other:
+     *   moved_dir  distinguishes what was OBSERVED on a fully passing run --
+     *              measured "/tmp" vs "/vroot/tmp" against a consistent
+     *              path-virtualising backend where both sides reach ok=6.
+     *   the flags  attribute WHICH check failed on a failing run -- `ok=%d` is a
+     *              sum, so two backends failing DIFFERENT checks alias to the
+     *              same total; measured back1_eq=0 abs_roundtrip=1 where the
+     *              tally alone shows only ok=4.
+     */
+    printf("cwd ok=%d moved_dir=%s moved_differs=%d back1_eq=%d abs_roundtrip=%d\n",
+           ok, moved_dir, moved_differs, back1_eq, abs_roundtrip);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -20,6 +20,21 @@
 // The fixture first burns measurable CPU so native and Hermit have nonzero total
 // CPU time. Under Hermit all six checks pass (ok=6). Native typically scores
 // ok=5: it also advances CPU time, but exposes host page faults and context switches.
+//
+// EMISSION CONTRACT: the fixture prints every accounting field it checked, not
+// just a count of passing checks. The advancing logical CPU time and zeroed
+// counters are the observations here, so hiding them behind `ok=N` is what made
+// this fixture blind. Two
+// concrete failures the old `getrusage ok=N` line could not express:
+//   * A backend that reports the wrong logical CPU time but zeroes ru_minflt,
+//     and a backend that reports CPU time correctly but leaks ru_minflt, can
+//     print the same tally. Same bytes, different defects, so
+//     cross-backend parity can never separate them.
+//   * A backend that reports a wrong-but-constant CPU value can score exactly
+//     as low as one where host time leaks into the guest.
+// The fixture also used to `return 0` unconditionally, so it could not fail by
+// exit status either -- the tally was its only channel and the tally was blind.
+// It now fails closed when any check fails.
 
 #include <stdio.h>
 #include <string.h>
@@ -100,6 +115,16 @@ int main(void) {
 
     // Consume acc so the burn loop cannot be optimized away.
     if (acc == 0) return 2;
-    printf("getrusage ok=%d\n", ok);
+    // Emit every accounting field that was checked. The line distinguishes
+    // advancing logical CPU accounting from a wrong constant or leaked host
+    // value, and identifies which zeroed counter diverged.
+    printf("getrusage ok=%d accepted=%d utime_sec=%lld utime_usec=%lld "
+           "stime_sec=%lld stime_usec=%lld minflt=%ld majflt=%ld "
+           "nvcsw=%ld nivcsw=%ld\n",
+           ok, rc == 0,
+           (long long)ru.ru_utime.tv_sec, (long long)ru.ru_utime.tv_usec,
+           (long long)ru.ru_stime.tv_sec, (long long)ru.ru_stime.tv_usec,
+           ru.ru_minflt, ru.ru_majflt, ru.ru_nvcsw, ru.ru_nivcsw);
+
     return ok == 6 ? 0 : 1;
 }

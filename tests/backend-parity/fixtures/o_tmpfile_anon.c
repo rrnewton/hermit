@@ -40,10 +40,14 @@ int main(void) {
         ok++;
     }
     char buf[8] = {0};
-    if (fd >= 0 && pread(fd, buf, 6, 0) == 6 && memcmp(buf, "hello\n", 6) == 0) {
+    ssize_t pread_len = (fd >= 0) ? pread(fd, buf, 6, 0) : -1;
+    if (pread_len == 6 && memcmp(buf, "hello\n", 6) == 0) {
         ok++;
     }
+    off_t trunc_size = -1;
     if (fd >= 0 && ftruncate(fd, 10) == 0) {
+        struct stat ts = {0};
+        trunc_size = (fstat(fd, &ts) == 0) ? ts.st_size : -1;
         char tail[10];
         if (pread(fd, tail, 10, 0) == 10 && tail[6] == 0 && tail[7] == 0 &&
             tail[8] == 0 && tail[9] == 0) {
@@ -56,6 +60,12 @@ int main(void) {
 #ifdef HERMIT_TEST_ORACLE_NEGATIVE
     ok--; /* plant one failed contract check to bracket the exit oracle */
 #endif
-    printf("otmpfile ok=%d\n", ok);
+    /* Emit the OBSERVED VALUES. `ok=%d` is a SUM: two backends failing DIFFERENT
+     * checks alias to the same total, and a sum cannot expose a wrong-but-accepted
+     * value. Every field below is guest-determined (we wrote 6 bytes, truncated to
+     * 10), so the byte stream stays host-independent. */
+    printf("otmpfile ok=%d size=%lld nlink=%llu preadlen=%zd truncsize=%lld\n",
+           ok, (long long)st.st_size, (unsigned long long)st.st_nlink,
+           pread_len, (long long)trunc_size);
     return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

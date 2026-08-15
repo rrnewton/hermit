@@ -14,6 +14,12 @@
     },
     {
       "disposition": "special-driver",
+      "path": "tests/backend-parity/classify_emission.py",
+      "runner": "backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output)",
+      "why": "tests/backend-parity/classify_emission.py is owned by backend-parity fixture emission census (manual; runs every fixture under hermit and caches full output): Standalone census driver that runs every backend-parity C fixture under hermit, caches each fixture's complete stdout, stderr, and exit status to a file, and classifies the emission shape in Python so that no shell pipeline and no truncation can participate in the count. It exists because this census was re-derived by hand three times and produced three irreconcilable denominators, twice from method failures (a head -2 that truncated multi-line output, and a grep pipeline that classified the same input differently inside a loop). Fixtures must run under hermit rather than natively, because the refusal fixtures bail before their emit path when the syscall is allowed to succeed. It stays a manual driver rather than a manifest-plan program because it observes the fixture family as a whole rather than executing one program."
+    },
+    {
+      "disposition": "special-driver",
       "path": "tests/backend-parity/e9patch_corpus.py",
       "runner": "e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI)",
       "why": "tests/backend-parity/e9patch_corpus.py is owned by e9patch preprocessing parity driver (manual; requires e9tool and hermit --features e9patch, absent in CI): Standalone driver that compiles each freestanding corpus guest, rewrites it with e9tool, and enforces exit-status and stdout parity, golden and e9patch L2, full direct-AOT coverage with mapped==candidate, no SIGILL fallback with b0==0, and a guest-syscall DETLOG tail-match against golden ptrace. It needs e9tool and a hermit built --features e9patch, both absent in CI, so it is BLOCKED there like the KVM /dev/kvm gate rather than a manifest-plan program."
@@ -226,7 +232,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/event_delivery_ordering.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
-      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM omits the inotify family"
+      "why": "tests/backend-parity/fixtures/event_delivery_ordering.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): it is the deliberate complement to inotify_watch.c and signalfd_create.c, which both stop short of reading an event; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM omits the inotify family"
     },
     {
       "disposition": "manifest-test",
@@ -326,6 +332,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/inline_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/inline_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): places raw inline syscall instructions in the main ELF so a main-ELF binary rewriter has sites to patch, and pins that the rewritten program still produces identical output under strict verification"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/inotify_watch.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/inotify_watch.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -389,6 +401,12 @@
       "path": "tests/backend-parity/fixtures/mincore_residency.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/mincore_residency.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/mixed_inline_and_libc_syscalls.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): interleaves patchable inline syscall sites with unpatched libc.so syscalls in one run, pinning that a partially rewritten program is still deterministic under strict verification"
     },
     {
       "disposition": "manifest-test",
@@ -518,6 +536,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/readdir_order_identity.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/readdir_order_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): pins directory-enumeration order across a double strict run, asserting the small (single-buffer) case is determinized via --require-small-determinized while the large per-buffer-sort gap stays reported-only; the 90s budget is set from four measured 7.59-7.99s verify runs"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/record_lock.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/record_lock.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -562,7 +586,7 @@
       "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/short_io_split_identity.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
-      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBI does not complete the guest and KVM does not start"
+      "why": "tests/backend-parity/fixtures/short_io_split_identity.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): completion and return-value sanity are asserted in-guest while the partial-transfer split itself is printed and pinned by the harness stdout comparison; ptrace is calibrated for blocking verification, DBT does not complete the guest and KVM does not start"
     },
     {
       "disposition": "manifest-test",
@@ -629,6 +653,12 @@
       "path": "tests/backend-parity/fixtures/statfs_free_determinism.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/statfs_free_determinism.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI)",
+      "why": "tests/backend-parity/fixtures/static_nolibc_syscall_sites.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (portable CI): is a freestanding static guest with no PLT and no interpreter, so the whole program including every syscall site lives in the main ELF, pinning the rewriter's coverage of that layout"
     },
     {
       "disposition": "manifest-test",
@@ -2000,6 +2030,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/data-handling/dd-partial-transfers.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/data-handling/dd-partial-transfers.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/data-handling/jq-json-transform.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/data-handling/jq-json-transform.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
@@ -2576,6 +2612,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/auxv-loader-dump.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/auxv-loader-dump.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/date-nanoseconds.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/date-nanoseconds.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
@@ -2633,6 +2675,12 @@
       "path": "tests/e2e/system-utils/proc-uptime.sh",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
       "why": "tests/e2e/system-utils/proc-uptime.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/e2e/system-utils/ps-proc-table.sh",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/*.toml",
+      "why": "tests/e2e/system-utils/ps-proc-table.sh is owned by ci/test_harness.sh via tests/e2e/manifests/*.toml: Direct schema-v2 program; all modes and backend policy are centralized in the TOML bucket manifests"
     },
     {
       "disposition": "manifest-test",

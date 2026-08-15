@@ -24,8 +24,12 @@
  *
  * ptrace and DBT drive the full state machine; KVM's ElfExecutor does not
  * implement the PR_*_PDEATHSIG requests and refuses them with ENOSYS (recorded
- * as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT. The fixture
- * prints only a check count.
+ * as a KVM gap in matrix.tsv), so this row runs on ptrace and DBT.
+ *
+ * EMISSION CONTRACT: the fixture prints the signal number read back after each
+ * set, not just a check count. The values are guest-chosen (SIGUSR1, then
+ * SIGUSR2, then cleared), so they are host-independent, and printing them makes
+ * a wrong read-back visible in the byte stream instead of only in a lower total.
  */
 
 int main(void) {
@@ -38,11 +42,11 @@ int main(void) {
     fprintf(stderr, "PR_SET_PDEATHSIG(SIGUSR1) errno %d\n", errno);
     return 1;
   }
-  int got = -1;
-  if (prctl(PR_GET_PDEATHSIG, &got, 0, 0, 0) == 0 && got == SIGUSR1) {
+  int got1 = -1;
+  if (prctl(PR_GET_PDEATHSIG, &got1, 0, 0, 0) == 0 && got1 == SIGUSR1) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got, errno, SIGUSR1);
+    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got1, errno, SIGUSR1);
     return 1;
   }
 
@@ -53,11 +57,11 @@ int main(void) {
     fprintf(stderr, "PR_SET_PDEATHSIG(SIGUSR2) errno %d\n", errno);
     return 1;
   }
-  got = -1;
-  if (prctl(PR_GET_PDEATHSIG, &got, 0, 0, 0) == 0 && got == SIGUSR2) {
+  int got2 = -1;
+  if (prctl(PR_GET_PDEATHSIG, &got2, 0, 0, 0) == 0 && got2 == SIGUSR2) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got, errno, SIGUSR2);
+    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want %d)\n", got2, errno, SIGUSR2);
     return 1;
   }
 
@@ -68,14 +72,16 @@ int main(void) {
     fprintf(stderr, "PR_SET_PDEATHSIG(0) errno %d\n", errno);
     return 1;
   }
-  got = -1;
-  if (prctl(PR_GET_PDEATHSIG, &got, 0, 0, 0) == 0 && got == 0) {
+  int got3 = -1;
+  if (prctl(PR_GET_PDEATHSIG, &got3, 0, 0, 0) == 0 && got3 == 0) {
     ok++;
   } else {
-    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want 0)\n", got, errno);
+    fprintf(stderr, "PR_GET_PDEATHSIG got %d errno %d (want 0)\n", got3, errno);
     return 1;
   }
 
-  printf("pdeathsig ok=%d\n", ok);
-  return 0;
+  printf("pdeathsig ok=%d set_usr1_readback=%d set_usr2_readback=%d "
+         "cleared_readback=%d\n",
+         ok, got1, got2, got3);
+  return ok == 6 ? 0 : 1;
 }
