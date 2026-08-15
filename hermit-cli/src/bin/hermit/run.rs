@@ -2884,6 +2884,7 @@ impl RunOpts {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: self.det_opts.det_config.virtualize_time,
                 success_message: if kvm_output_only {
                     "Success: KVM guest output and exit status matched."
                 } else {

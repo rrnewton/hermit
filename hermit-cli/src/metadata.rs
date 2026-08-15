@@ -249,6 +249,26 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x110)));
     }
 
+    /// The `--strict` help text on `record start` tells the user that recording
+    /// does NOT virtualize time, and `record start --verify` reports the same
+    /// fact in its JSON so a consumer cannot read replay fidelity as a
+    /// determinism result. Both statements are about THIS value. If it is ever
+    /// deliberately changed, this test is the reminder to update the help text
+    /// and the reporting rationale in the same commit rather than leaving the
+    /// documentation asserting the opposite of the configuration.
+    ///
+    /// The setting is undocumented in this repository's history (it dates to the
+    /// squashed initial commit) and no issue explains it, so it is deliberately
+    /// pinned here rather than assumed.
+    #[test]
+    fn recording_does_not_virtualize_time_as_documented() {
+        assert!(
+            !record_or_replay_config(Path::new("replay-data")).virtualize_time,
+            "record/replay runs with virtual time OFF; if this changed, update \
+             the `record start --strict` help text and the verify report rationale"
+        );
+    }
+
     #[test]
     fn record_and_replay_preserve_partial_subscriptions() {
         assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);

@@ -482,6 +482,13 @@ impl StartOpts {
                 label: "the replay",
             },
             ComparisonOptions {
+                // Read from the configuration this run actually used rather
+                // than restating it: a literal here can drift out of agreement
+                // with the config, and the report would then assert something
+                // the run did not do. `record_or_replay_config` currently sets
+                // this false, so a match here is replay fidelity, not a
+                // determinism result.
+                virtualize_time: hermit::record_or_replay_config(data_dir).virtualize_time,
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,

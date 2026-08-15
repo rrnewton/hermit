@@ -25,6 +25,7 @@ mod id;
 pub mod instruction_map;
 mod interp;
 mod metadata;
+pub use metadata::record_or_replay_config;
 mod record;
 mod recorder;
 mod replay;

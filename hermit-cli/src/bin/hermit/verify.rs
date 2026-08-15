@@ -47,6 +47,15 @@ pub(crate) struct ComparedRun<'a> {
 }
 
 pub(crate) struct ComparisonOptions<'a> {
+    /// Whether the detcore configuration under which BOTH sides ran virtualized
+    /// time. Carried into the report because it changes what a `matched`
+    /// verdict is entitled to mean: with virtual time on, matching sides are
+    /// evidence about the guest; with it off, the compared values may be
+    /// host-derived and a match only says the second side reproduced whatever
+    /// the first observed. `record start` runs with it off
+    /// (`record_or_replay_config` sets `virtualize_time: false`), so a green
+    /// record/replay verdict must not be read as a determinism result.
+    pub virtualize_time: bool,
     pub success_message: &'a str,
     pub failure_message: &'a str,
     /// Controls only how much diff *output* is printed (a larger syscall-history
@@ -417,6 +426,9 @@ pub struct VerificationOutcome {
     /// The two sides' labels, carried so the terminal error names what was
     /// actually compared instead of assuming two fresh executions.
     pub compared_labels: (String, String),
+    /// Whether time was virtualized for both sides. See
+    /// [`ComparisonOptions::virtualize_time`].
+    pub virtualize_time: bool,
 }
 
 impl VerificationOutcome {
@@ -490,6 +502,21 @@ pub struct VerificationReport {
     pub first_divergent_scheduler_turn: Option<u64>,
     /// Virtual nanoseconds at that same point, with the same nullability rules.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// The two things this verdict compared, in the order they were compared:
+    /// `["run 1", "run 2"]` for the two fresh executions `hermit run --verify`
+    /// performs, `["the recording", "the replay"]` for `hermit record start
+    /// --verify`. A consumer reading `verified` cannot otherwise tell which
+    /// question was answered.
+    pub compared: [String; 2],
+    /// Whether time was virtualized. **A `bitwise_parity: true` from a run with
+    /// `virtualize_time: false` is NOT a determinism result.** It says the
+    /// second side reproduced the first; if the guest read a host-derived value
+    /// such as the real monotonic clock, that value was captured and faithfully
+    /// reproduced, and a separate invocation would capture a different one.
+    /// Measured: the same guest under `record start` yields a different
+    /// `CLOCK_MONOTONIC` on every invocation while each invocation's own
+    /// verdict is `matched`.
+    pub virtualize_time: bool,
 }
 
 impl VerificationReport {
@@ -506,6 +533,10 @@ impl VerificationReport {
             guest_signal: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            // No verdict was reached, so nothing was compared. Naming sides here
+            // would imply a comparison that did not happen.
+            compared: [String::new(), String::new()],
+            virtualize_time: false,
         }
     }
 }
@@ -536,6 +567,11 @@ impl From<&VerificationOutcome> for VerificationReport {
             guest_signal: outcome.guest_status.signal(),
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
+            compared: [
+                outcome.compared_labels.0.clone(),
+                outcome.compared_labels.1.clone(),
+            ],
+            virtualize_time: outcome.virtualize_time,
         }
     }
 }
@@ -894,6 +930,7 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             compared_labels: (label1.to_owned(), label2.to_owned()),
+            virtualize_time: options.virtualize_time,
         })
     } else {
         eprintln!(":: {}", options.success_message.green().bold());
@@ -905,6 +942,7 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             compared_labels: (label1.to_owned(), label2.to_owned()),
+            virtualize_time: options.virtualize_time,
         })
     }
 }
@@ -1055,6 +1093,7 @@ mod tests {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
@@ -1175,6 +1214,7 @@ mod tests {
                 label: label2,
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
@@ -1187,6 +1227,62 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.verdict, Verdict::Diverged);
         outcome.into_exit_status().unwrap_err().to_string()
+    }
+
+    /// A green verdict must carry the two facts a consumer needs to know what
+    /// it is entitled to conclude: WHAT was compared, and whether time was
+    /// virtualized. `record start --verify` runs with `virtualize_time: false`,
+    /// so its `bitwise_parity: true` means "the replay reproduced this
+    /// recording" and NOT "this guest is deterministic" -- the same guest yields
+    /// a different CLOCK_MONOTONIC on every invocation while each invocation's
+    /// own verdict is `matched`.
+    #[test]
+    fn a_green_report_says_what_it_compared_and_whether_time_was_virtual() {
+        let same = output(0, b"identical", b"");
+        let (left_log, right_log) = empty_logs();
+
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &same,
+                log: left_log,
+                label: "the recording",
+            },
+            ComparedRun {
+                output: &same,
+                log: right_log,
+                label: "the replay",
+            },
+            ComparisonOptions {
+                virtualize_time: false,
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: false,
+                diagnostic_full_trace: false,
+                keep_logs: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Matched);
+
+        let report = VerificationReport::from(&outcome);
+        assert!(report.verified, "this fixture is deliberately a MATCH");
+        assert_eq!(
+            report.compared,
+            ["the recording".to_owned(), "the replay".to_owned()],
+            "a verified report must name what it compared"
+        );
+        assert!(
+            !report.virtualize_time,
+            "a record/replay verdict must report that time was NOT virtualized, \
+             otherwise a consumer can read replay fidelity as determinism"
+        );
+
+        // The no-verdict record claims nothing about either.
+        let pending = VerificationReport::no_result();
+        assert!(!pending.verified);
+        assert_eq!(pending.compared, [String::new(), String::new()]);
     }
 
     /// The comparator is shared by two paths with different execution models,
@@ -1242,6 +1338,7 @@ mod tests {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
@@ -1377,6 +1474,7 @@ mod tests {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: true,
@@ -1476,6 +1574,7 @@ mod tests {
                     label: "run 2",
                 },
                 ComparisonOptions {
+                    virtualize_time: true,
                     success_message: "verified",
                     failure_message: "failed",
                     verbose: false,
@@ -1518,6 +1617,7 @@ mod tests {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
@@ -1579,6 +1679,7 @@ mod tests {
                 label: "run 2",
             },
             ComparisonOptions {
+                virtualize_time: true,
                 success_message: "verified",
                 failure_message: "failed",
                 verbose: false,
@@ -1999,6 +2100,7 @@ mod tests {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             compared_labels: ("run 1".to_owned(), "run 2".to_owned()),
+            virtualize_time: true,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }
