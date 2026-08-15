@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -35,5 +36,11 @@ int main(void) {
                         KEY_SPEC_SESSION_KEYRING, 0, 0, 0);
   int is_enosys = (result == -1 && errno == ENOSYS) ? 1 : 0;
   printf("keyctl_enosys=%d\n", is_enosys);
-  return 0;
+
+  /* Hermit refuses keyctl with ENOSYS; the fixture computed that verdict
+     above and previously discarded it, so a passthrough regression printed
+     keyctl_enosys=0 and still exited 0. */
+  enum { EXPECTED_CHECKS = 1 };
+  int ok = is_enosys ? 1 : 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
