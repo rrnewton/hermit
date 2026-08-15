@@ -4657,6 +4657,7 @@ cflags = ["-D_GNU_SOURCE"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM ElfExecutor does not implement the F_GETPIPE_SZ/F_SETPIPE_SZ pipe-capacity fcntl commands and returns a deterministic error"
@@ -4905,6 +4906,7 @@ cflags = ["-D_GNU_SOURCE"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM ElfExecutor returns a deterministic error for the F_SETOWN/F_GETOWN async-I/O owner fcntl family, so the SIGIO/SIGURG owner round-trip is unavailable"
@@ -5348,6 +5350,7 @@ cflags = ["-D_GNU_SOURCE"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "Measured: the guest produces NO stdout and hermit exits 1 under --backend dbi, so the fixture does not complete there. Recorded as an observed gap, not diagnosed by this change"
 kvm = "KVM times out before guest start on the validation host, so no split-pattern verdict is available"
@@ -5410,6 +5413,7 @@ cflags = ["-D_GNU_SOURCE"]
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change"
 kvm = "KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family"
