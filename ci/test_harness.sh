@@ -767,6 +767,59 @@ function workflow_non_dag_step_budget_seconds {
     ' "$workflow"
 }
 
+function rust_code_has_line {
+    [[ $(perl -0pe \
+        's{(?(DEFINE)(?<block>/\*(?:[^*/]+|/(?!\*)|\*(?!/)|(?&block))*\*/))(?&block)|(?:br|cr|r)(?<hash>\#{0,255})".*?"\k<hash>|[bc]?"(?:\\.|[^"\\])*"|//[^\n]*}{}gsx' \
+        "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' |
+        grep -Fxc -- "$2" || true) == 1 ]]
+}
+
+function assert_safe_ci_scope_enforcement {
+    local validate="$1/scripts/validate.rs" helper="$1/scripts/lib/safe_ci_scope.rs"
+    [[ -f $helper ]] &&
+        rust_code_has_line "$validate" 'mod safe_ci_scope;' &&
+        rust_code_has_line "$validate" 'safe_ci_scope::resolve_cgroups(' ||
+        die "validate must compile and execute the shared safe-ci scope helper"
+    rust_code_has_line "$helper" \
+        'let outer_limits_observed = enable_outer_oom_group() && verify_scope_limits(memory_max);' &&
+        rust_code_has_line "$helper" \
+            '!verify_runtime || expected_scope_runtime_max_s().is_some_and(verify_scope_runtime_max);' ||
+        die "the shared helper must execute outer memory/swap/OOM-group and RuntimeMax readback"
+}
+
+function assert_safe_ci_scope_enforcement_brackets {
+    (
+        local tmp
+        tmp=$(mktemp -d) || die "safe-ci scope guard bracket: mktemp failed"
+        trap 'rm -rf -- "$tmp"' EXIT
+        trap 'exit 130' HUP INT TERM
+        mkdir -p "$tmp/scripts/lib"
+        cp "$ROOT_DIR/scripts/validate.rs" "$tmp/scripts/validate.rs"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$tmp/scripts/lib/safe_ci_scope.rs"
+        assert_safe_ci_scope_enforcement "$tmp"
+
+        sed -i '/^[[:space:]]*safe_ci_scope::resolve_cgroups([[:space:]]*$/d' \
+            "$tmp/scripts/validate.rs"
+        ! ( assert_safe_ci_scope_enforcement "$tmp" ) >/dev/null 2>&1 ||
+            die "safe-ci scope guard accepted a deleted executable helper call"
+        cp "$ROOT_DIR/scripts/validate.rs" "$tmp/scripts/validate.rs"
+
+        sed -i \
+            '/^[[:space:]]*let outer_limits_observed = enable_outer_oom_group() && verify_scope_limits(memory_max);[[:space:]]*$/c\
+    let outer_limits_observed = true;\
+    /*\
+    let outer_limits_observed = enable_outer_oom_group() && verify_scope_limits(memory_max);\
+    */\
+    const _OUTER_LIMITS_DECOY: &str = r#"\
+    let outer_limits_observed = enable_outer_oom_group() && verify_scope_limits(memory_max);\
+    "#;' "$tmp/scripts/lib/safe_ci_scope.rs"
+        ! ( assert_safe_ci_scope_enforcement "$tmp" ) >/dev/null 2>&1 ||
+            die "safe-ci scope guard accepted replaced outer-limit readback hidden by a block comment"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$tmp/scripts/lib/safe_ci_scope.rs"
+        assert_safe_ci_scope_enforcement "$tmp"
+    )
+}
+
 # The strict-compat lane used to permit 1800s internally inside a 900s hosted
 # job. The external kill necessarily won, leaving neither a named probe nor its
 # per-probe rows. Assert the deployed values, not hand-copied policy numbers.
@@ -797,9 +850,7 @@ function assert_strict_compat_budget_ladder {
         die "strict-compat whole-run budget has no in-process deadline consumer"
     grep -Fq 'STEP_STARTED_MONOTONIC_NS_ENV' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat starts a fresh inner clock instead of inheriting the outer node epoch"
-    grep -Fq 'expected_scope_runtime_max_s' "$ROOT_DIR/scripts/validate.rs" &&
-        grep -Fq 'verify_scope_runtime_max' "$ROOT_DIR/scripts/validate.rs" ||
-        die "strict-compat requests a scope RuntimeMaxSec without reading the live value back"
+    assert_safe_ci_scope_enforcement "$ROOT_DIR"
     grep -Fq 'forward_step_profiles(&first, jobs)' "$ROOT_DIR/scripts/validate.rs" ||
         die "strict-compat inner rows are not forwarded to the hosted artifact directory"
     [[ $cmd == *'SAFE_CI_DAG_RUNNER_LOG_DIR="${RUN_NODE_PERF_DIR:-$PWD/ignored/ci/perf/strict-compat}/logs"'* ]] ||
@@ -1755,6 +1806,7 @@ EOF
     assert_validate_driver_entrypoint
     assert_node_budgets_fit_their_job_kill
     assert_budget_guard_brackets
+    assert_safe_ci_scope_enforcement_brackets
 
     # This validation command contains real concurrent rustc probes. Three warm
     # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane
@@ -2356,6 +2408,119 @@ function emit_failure_reason {
     fi
 }
 
+# A successful compiler exit is not enough when the host denies the final
+# executable-mode update.  Keep this check at the build boundary so the
+# retained compiler output (including any environmental refusal) explains the
+# failure and the scheduler can retry the build step instead of discovering a
+# non-executable fixture later during guest launch.
+function require_executable_guest_program {
+    local path=$1
+    local id=$2
+    if [[ -f $path && -x $path ]]; then
+        return 0
+    fi
+    printf 'compiled guest is missing or not executable for %s: %s\n' "$id" "$path" >&2
+    return 1
+}
+
+function require_compiled_guest_program {
+    local path=$1
+    local id=$2
+    local stdout_file=$3
+    local stderr_file=$4
+    if require_executable_guest_program "$path" "$id"; then
+        return 0
+    fi
+    # The compiler may return success even when the host denies its final mode
+    # update.  Replay its captured diagnostics so environmental refusals remain
+    # visible to the scheduler at the build step that actually encountered them.
+    if [[ -s $stderr_file ]]; then
+        cat "$stderr_file" >&2
+    elif [[ -s $stdout_file ]]; then
+        cat "$stdout_file" >&2
+    fi
+    return 1
+}
+
+function audit_executable_guest_program_contract {
+    (
+        local scratch program output status fixture_mode fixture_kind
+        local prebuilt_id="contract-prebuilt-shell-$$"
+        local prebuilt_root="$BUILD_ROOT/$prebuilt_id"
+        scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-executable-guest.XXXXXX")
+        trap 'rm -rf -- "$scratch" "$prebuilt_root"' EXIT
+        program="$scratch/program"
+        : >"$program"
+        chmod 755 "$program"
+        require_executable_guest_program "$program" fixture/executable ||
+            die "an executable compiled guest must remain accepted"
+        chmod 644 "$program"
+        if require_executable_guest_program "$program" fixture/non-executable >/dev/null 2>&1; then
+            die "a compiler-success artifact without execute permission must be refused"
+        fi
+        rm -f -- "$program"
+        if require_executable_guest_program "$program" fixture/missing >/dev/null 2>&1; then
+            die "a missing compiler-success artifact must be refused"
+        fi
+
+        # Exercise the actual compile branch without invoking a real compiler.
+        # The planted compiler reports success but chooses the requested mode.
+        function metadata_json {
+            jq -cn --arg kind "$fixture_kind" --arg id "fixture/$fixture_kind" \
+                '{program_kind:$kind,id:$id,compile_args:[]}'
+        }
+        function run_capture {
+            local stdout_file=$1 stderr_file=$2
+            shift 3
+            local compiled=""
+            while (($#)); do
+                if [[ $1 == -o && $# -ge 2 ]]; then
+                    compiled=$2
+                    break
+                fi
+                shift
+            done
+            [[ -n $compiled ]] || return 99
+            : >"$stdout_file"
+            : >"$compiled"
+            chmod "$fixture_mode" "$compiled"
+            if [[ $fixture_mode != 755 ]]; then
+                printf 'An action was blocked on this server based on a security policy!\nEnforcer: FS, Reason: FILE_OPEN\n' >"$stderr_file"
+            else
+                : >"$stderr_file"
+            fi
+        }
+
+        PREBUILT=0
+        fixture_kind=c
+        fixture_mode=755
+        prepare_cell_dirs "$scratch/c-good"
+        prepare_test "$scratch/fixture.c" "$scratch/c-good" 10 ||
+            die "an executable C compiler-success artifact must remain accepted"
+        fixture_mode=644
+        prepare_cell_dirs "$scratch/c-bad"
+        status=0
+        output=$(prepare_test "$scratch/fixture.c" "$scratch/c-bad" 10 2>&1) || status=$?
+        ((status != 0)) ||
+            die "a C compiler-success artifact without execute permission must be refused"
+        grep -Fq 'Enforcer: FS, Reason: FILE_OPEN' <<<"$output" ||
+            die "a compiler-success executable refusal must retain captured environmental diagnostics"
+
+        # Shell manifests execute their wrapper and need not create
+        # fixtures/program.  Keep that legitimate prebuilt path accepted.
+        fixture_kind=shell
+        mkdir -p "$prebuilt_root/fixtures"
+        prepare_cell_dirs "$scratch/shell-prebuilt"
+        function metadata_json {
+            jq -cn --arg id "$prebuilt_id" \
+                '{program_kind:"shell",id:$id,compile_args:[]}'
+        }
+        PREBUILT=1
+        prepare_test "$scratch/fixture.sh" "$scratch/shell-prebuilt" 10 ||
+            die "a legitimate prebuilt shell guest without fixtures/program must remain accepted"
+    )
+}
+
 # Hermit validates the program before creating the guest.  Those refusals are
 # harness no-results: no guest observation exists to count as a chaos failure.
 # Carry that distinction alongside the process status instead of asking each
@@ -2824,7 +2989,10 @@ function prepare_test {
             return 1
         }
         cp -a "$prebuilt_fixtures/." "$cell_dir/fixtures/"
-        return 0
+        if [[ $kind == c || $kind == rust ]]; then
+            require_executable_guest_program "$cell_dir/fixtures/program" "$id"
+        fi
+        return
     fi
     local -a prepare_args=() compile_args=()
     # Each failure path below captures the child's exit status rather than
@@ -2843,7 +3011,9 @@ function prepare_test {
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return "$status"
         fi
-        return 0
+        require_compiled_guest_program \
+            "$cell_dir/fixtures/program" "$id" "$stdout_file" "$stderr_file"
+        return
     fi
     if [[ $kind == rust ]]; then
         mapfile -t compile_args < <(jq -r '.compile_args[]' <<<"$metadata")
@@ -2855,7 +3025,9 @@ function prepare_test {
             emit_failure_reason "$status" "$stdout_file" "$stderr_file"
             return "$status"
         fi
-        return 0
+        require_compiled_guest_program \
+            "$cell_dir/fixtures/program" "$id" "$stdout_file" "$stderr_file"
+        return
     fi
     [[ $kind != direct && $kind != direct-argv ]] || return 0
     mapfile -t prepare_args < <(jq -r '.prepare_args[]' <<<"$metadata")
@@ -3666,6 +3838,7 @@ case "$subcommand" in
         audit_innermost_e2e_timeout
         audit_innermost_timeout_coverage
         audit_immutable_hermit_binary
+        audit_executable_guest_program_contract
         audit_test_binary_registration
         audit_guest_launch_classification_contract
         audit_chaos_seed_contract

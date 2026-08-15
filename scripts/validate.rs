@@ -79,6 +79,9 @@ mod validate_receipt;
 #[path = "lib/validate_runtime.rs"]
 mod validate_runtime;
 
+#[path = "lib/safe_ci_scope.rs"]
+mod safe_ci_scope;
+
 #[path = "lib/validate_super.rs"]
 mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic args onto nextest.
 
@@ -88,15 +91,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::Arc;
-
-use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
-use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
-use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
-use safe_ci_dag_runner::cgroup::CgroupManager;
-use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::StepOutcome;
@@ -834,6 +829,8 @@ fn self_test() -> Result<(), String> {
     // none of them runs a gate, publishes a label, writes the real ledger, or
     // touches a PR — see each module's `self_test` doc for why that matters.
     for line in [
+        safe_ci_scope::self_test()?,
+        scheduler_accounting_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
@@ -1556,72 +1553,29 @@ fn resolve_cgroups(
     run_timeout_s: Option<i64>,
     deadline_ns: Option<u64>,
 ) -> Result<BoxedCgroups, u8> {
-    if is_in_scope() {
-        // A RuntimeMaxSec request is only this invocation's backstop when the marker carries this
-        // invocation's absolute deadline. Nested validates inherit an outer scope and its env;
-        // treating that inherited request as the nested 660s rung would compare unrelated clocks.
-        if owns_scope_request(deadline_ns) {
-            let verified = expected_scope_runtime_max_s()
-                .is_some_and(verify_scope_runtime_max);
-            if !verified {
-                let msg = "this invocation's outer RuntimeMaxSec readback failed; the requested \
-                           scope backstop is not proven on the live unit";
-                if allow_failure {
-                    eprintln!(
-                        "validate: WARNING: {msg}; running UNBOXED (--allow-cgroup-failure)."
-                    );
-                    return Ok(None);
-                }
-                eprintln!("validate: ERROR: {msg}.");
-                return Err(3);
-            }
-        } else if run_timeout_s.is_some() {
-            eprintln!(
-                "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
-                 the anchored in-process deadline remains inside the enclosing DAG node limit"
-            );
-        }
-        let mgr = Cgroups::new();
-        if mgr.enabled() {
-            install_scope_teardown();
-            eprintln!(
-                "validate: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU \
-                 caps + setsid-proof teardown)."
-            );
-            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
-        }
-        if allow_failure {
-            eprintln!("validate: WARNING: per-step cgroup setup failed; running UNBOXED (--allow-cgroup-failure).");
-            return Ok(None);
-        }
+    let owns_request = owns_scope_request(deadline_ns);
+    if is_in_scope() && run_timeout_s.is_some() && !owns_request {
         eprintln!(
-            "validate: ERROR: inside a managed scope but per-step cgroups could not be set up; \
-             re-run with --allow-cgroup-failure to run UNBOXED."
+            "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+             the anchored in-process deadline remains inside the enclosing DAG node limit"
         );
-        return Err(3);
-    }
-    if allow_failure {
-        eprintln!(
-            "validate: WARNING: cgroup boxing not established (--allow-cgroup-failure); running \
-             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
-        );
-        return Ok(None);
     }
     let scope_runtime_s = run_timeout_s.and_then(|run| {
         remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
     });
-    if let Some(deadline) = deadline_ns {
-        std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
-    } else {
-        std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+    if !allow_failure {
+        if let Some(deadline) = deadline_ns {
+            std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
+        } else {
+            std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+        }
     }
-    let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
-    let detail = attempt.describe();
-    eprintln!(
-        "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
-         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
-    );
-    Err(3)
+    safe_ci_scope::resolve_cgroups(
+        "validate",
+        allow_failure,
+        scope_runtime_s,
+        owns_request,
+    )
 }
 
 // --------------------------------------------------------------------------- durable log
@@ -3513,6 +3467,113 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
     })
 }
 
+/// Planned runnable steps absent from both scheduler result collections.
+fn unreported_non_intentional_steps(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+    skipped: &[String],
+) -> Vec<String> {
+    let skipped: BTreeSet<&str> = skipped.iter().map(String::as_str).collect();
+    cfg.steps
+        .iter()
+        .filter(|step| {
+            let tag = step.tag();
+            step.skip_reason.is_none()
+                && !by_tag.contains_key(&tag)
+                && !skipped.contains(tag.as_str())
+        })
+        .map(|step| step.tag())
+        .collect()
+}
+
+/// Fast front-door bracket for the scheduler result shape consumed below.
+fn scheduler_accounting_bracket() -> Result<String, String> {
+    let step = |job: &str, cmd: &str| {
+        step_with_caps(
+            "fixture",
+            job,
+            "validate scheduler accounting fixture",
+            cmd.to_string(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        )
+    };
+    let tags = vec![
+        "fixture.fail".to_string(),
+        "fixture.pending_a".to_string(),
+        "fixture.pending_b".to_string(),
+    ];
+    let mut cfg = DagConfig::default();
+    cfg.steps = vec![
+        step("fail", "exit 1"),
+        step("pending_a", "true"),
+        step("pending_b", "true"),
+    ];
+    let stopped = run_dag_boxed_deadline(
+        &cfg,
+        1,
+        true,
+        0,
+        None,
+        Some(tags.clone()),
+        None,
+        None,
+    );
+    let stopped_by_tag: BTreeMap<String, StepOutcome> = stopped
+        .outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+        .collect();
+    let unreported = unreported_non_intentional_steps(&cfg, &stopped_by_tag, &stopped.skipped);
+    if stopped.ok
+        || stopped.outcomes.len() != 1
+        || stopped.outcomes[0].tag != tags[0]
+        || !stopped.skipped.is_empty()
+        || unreported != tags[1..]
+    {
+        return Err(format!(
+            "scheduler accounting: fail-fast fixture did not expose its two unreported runnable steps: ok={} outcomes={:?} skipped={:?} unreported={unreported:?}",
+            stopped.ok,
+            stopped.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<Vec<_>>(),
+            stopped.skipped
+        ));
+    }
+
+    cfg.steps[0].cmd = "true".to_string();
+    let complete = run_dag_boxed_deadline(
+        &cfg,
+        1,
+        true,
+        0,
+        None,
+        Some(tags),
+        None,
+        None,
+    );
+    let complete_by_tag: BTreeMap<String, StepOutcome> = complete
+        .outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+        .collect();
+    let unreported =
+        unreported_non_intentional_steps(&cfg, &complete_by_tag, &complete.skipped);
+    if !complete.ok
+        || complete.outcomes.len() != 3
+        || !complete.skipped.is_empty()
+        || !unreported.is_empty()
+    {
+        return Err(format!(
+            "scheduler accounting: complete three-step fixture was not accepted: ok={} outcomes={} skipped={:?} unreported={unreported:?}",
+            complete.ok,
+            complete.outcomes.len(),
+            complete.skipped
+        ));
+    }
+    Ok("scheduler accounting: complete plan accepted; fail-fast runnable steps detected".into())
+}
+
 /// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
 ///
 /// This is `run_check_with_timeout`'s retry loop (validate.sh:2119) moved to DAG
@@ -3534,8 +3595,9 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 ///   silently greened, only relabelled from "test failure" to "environmental".
 /// * **Nodes that never ran because the blocked node failed are retried with
 ///   it.** In the bash the retry happened INSIDE the gate, so downstream never
-///   got skipped; reproducing that here means the retry DAG carries the skipped
-///   and aborted nodes too, with dependencies restricted to the retry set.
+///   got skipped; reproducing that here means the retry DAG carries the skipped,
+///   aborted, and otherwise unreported nodes too, with dependencies restricted
+///   to the retry set.
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -3610,10 +3672,13 @@ fn run_lane_with_env_retries(
             );
         }
         // The retry set: the blocked nodes, plus everything that never ran (or was
-        // aborted) because of them.
+        // aborted) because of them. The scheduler's fail-fast result reports only
+        // dependency-skipped nodes; an independent runnable node can otherwise be
+        // absent from both outcomes and skipped.
         let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
         keep.extend(skipped.iter().cloned());
         keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
+        keep.extend(unreported_non_intentional_steps(cfg, &by_tag, &skipped));
         let steps: Vec<safe_ci_dag_runner::model::Step> = cfg
             .steps
             .iter()
@@ -3685,10 +3750,21 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
+    let unreported = unreported_non_intentional_steps(cfg, &by_tag, &skipped);
+    if !unreported.is_empty() {
+        eprintln!(
+            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
+             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
+            unreported.len(),
+            unreported.join(", ")
+        );
+    }
     // Eager-exit aborts after a genuine peer failure are neutral, but steps cut
     // by the whole-run clock are not a green. Without the typed run bit here an
     // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
-    let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
+    let ok = !run_timed_out
+        && unreported.is_empty()
+        && outcomes.iter().all(|o| o.ok || o.aborted);
     LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
 }
 

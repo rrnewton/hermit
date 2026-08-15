@@ -969,16 +969,30 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
     let custom_checked = expected.iter().filter(|id| id.mode == "custom").count();
     println!();
     println!(
-        "Fresh result check: {}/{} selected cells passed at {} ({} compatibility green, {} chaos, {} custom).",
-        expected.len(),
-        expected.len(),
-        head,
-        green_checked,
-        chaos_checked,
-        custom_checked
+        "{}",
+        fresh_result_summary(
+            expected.len(),
+            &head,
+            green_checked,
+            chaos_checked,
+            custom_checked,
+        )
     );
     println!("Result directory: {}", result_root.display());
     Ok(())
+}
+
+fn fresh_result_summary(
+    selected: usize,
+    head: &str,
+    green: usize,
+    chaos: usize,
+    custom: usize,
+) -> String {
+    format!(
+        "Fresh result check: {selected}/{selected} selected cells passed at {head} \
+({green} compatibility green, including {chaos} chaos; {custom} custom outside the comparable denominator)."
+    )
 }
 
 fn git_head(root: &Path) -> Result<String, String> {
@@ -1134,6 +1148,15 @@ fn display_id(id: &CellId) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
+    let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
+(170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
+    if summary != expected_summary {
+        return Err(format!(
+            "fresh-result summary obscures overlapping compatibility/chaos counts: {summary}"
+        ));
+    }
+
     let id = CellId {
         lane: "portable".into(),
         category: "fixture".into(),
