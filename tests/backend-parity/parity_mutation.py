@@ -135,13 +135,13 @@ FIXTURES: dict[str, FixtureSpec] = {
 #   TIER-4  + stack/heap observations (not yet produced by this harness)
 #
 # RELATIONSHIP TO THE PRODUCT'S OWN L-LEVELS, stated so the two vocabularies do
-# not silently drift apart. `hermit run --strict --verify --verify-strict`
-# establishes L2 under the `BitwiseInfoV1` policy (detcore/src/logdiff.rs), and
-# that is the authority for what "bitwise" means in this repository. But
+# not silently drift apart. `hermit run --strict --verify` establishes L2 under
+# the canonical INFO policy, and that is the authority for what "bitwise" means
+# in this repository. But
 # --verify compares a backend against ITSELF on a repeat run; it cannot compare
 # one backend against another, which is what parity means here. So this harness
-# is not a substitute for --verify-strict and does not reimplement it -- it
-# applies the same idea across backends.
+# is not a substitute for the product verifier and does not reimplement it --
+# it applies the same comparison across backends.
 #
 # TIER-2 corresponds to what KVM's --verify can currently assert (exit status,
 # stdout, stderr) and TIER-3 to the full-INFO envelope, which is why the repo

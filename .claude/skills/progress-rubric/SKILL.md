@@ -14,9 +14,11 @@ leading mode to trailing modes**.
 
 1. Measure one exact `origin/main` SHA in a clean checkout. If main moves and
    product code changed, update and rerun affected measurements.
-2. Run the same app probes through non-KVM
-   `--strict --verify --verify-strict --verify-json`, record/replay, DBT, and
-   KVM. Require `bitwise_parity: true` for every L2 cell. KVM's current
+2. Run the same app probes through ptrace
+   `--strict --verify --verify-json`, record/replay, DBT strict execution, and
+   KVM. Require `bitwise_parity: true` for every L2 cell. DBT direct
+   verification currently fails closed with `no_result` until Reverie provides
+   a protected internal descriptor for canonical Detcore evidence. KVM's current
    output/status-only verification is a separate, lower-assurance cell. Do not
    substitute old task notes for live results.
 3. Use only code and artifacts available from main. Unlanded work belongs in a
@@ -76,17 +78,17 @@ minimum is:
 For each probe, run:
 
 ```bash
-./target/debug/hermit run --strict --verify --verify-strict \
+./target/debug/hermit run --strict --verify \
   --verify-json /tmp/progress-verify.json -- PROGRAM ARGS...
-./target/debug/hermit record start --verify --verify-strict --record-timeout 90 \
+./target/debug/hermit record start --verify --verify-json /tmp/progress-replay.json --record-timeout 90 \
   --data-dir "$(mktemp -d /tmp/hermit-report-rr.XXXXXX)" -- PROGRAM ARGS...
-./target/debug/hermit run --backend dbt --strict --verify --verify-strict \
-  --verify-json /tmp/progress-dbt-verify.json -- PROGRAM ARGS...
+./target/debug/hermit run --backend dbt --strict -- PROGRAM ARGS...
 ./target/debug/hermit run --backend kvm --strict --verify \
   --verify-json /tmp/progress-kvm-output.json -- PROGRAM ARGS...
 ```
 
-If DBT or KVM has a backend-wide preflight failure, run one representative
+Also attempt one representative DBT `--verify --verify-json` command and retain
+the expected protected-descriptor `no_result` receipt. If DBT or KVM has a backend-wide preflight failure, run one representative
 probe, quote the error, and mark the remaining cells `BLOCKED*` with one shared
 footnote. Do not use a client, SDK, pin, or proof branch that is not supplied by
 main. For R/R, distinguish record timeout, replay divergence, output mismatch,
@@ -110,7 +112,7 @@ ignored counts separately.
 
 ## Cell vocabulary
 
-- `PASS L2`: non-KVM strict verification completed and its exact-SHA JSON
+- `PASS L2`: a supported canonical strict-verification path completed and its exact-SHA JSON
   verdict reports `bitwise_parity: true` with nonzero compared INFO messages.
 - `PASS OUTPUT`: KVM repeat execution matched exit status/stdout/stderr; internal
   logs were not compared. Never report this as L2.

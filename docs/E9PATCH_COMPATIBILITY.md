@@ -19,9 +19,9 @@ HERMIT_E9PATCH_BACKEND=/path/to/e9patch \
 
 The mode runs the 155 semantic installed-program probes in the compatibility
 matrix. Every available probe uses `hermit run --backend e9patch --strict
---verify`, so a pass establishes Stripped two-run equality, not L2. Stripped
-verification compares status, stdout, and stderr after removing selected
-numeric, address, path, and time fields. A program that fails or lacks a backend
+--verify --verify-json`; a pass now requires a matched canonical INFO verdict,
+bitwise parity, log comparison, no filtering, and positive compared-message
+counts. A program that fails or lacks a backend
 diagnostic fails the gate. Missing e9patch artifacts fail before the matrix
 starts. The former 56-row optional banner matrix was retired because `--help`,
 `--version`, and no-argument invocations did not exercise meaningful program
@@ -130,8 +130,9 @@ cache-miss budget.
 
 ## Current limits and intentional failures
 
-- The matrix uses bounded semantic workloads. It establishes Stripped equality,
-  not L2, for only the measured workloads.
+- The matrix uses bounded semantic workloads. The historical counts below were
+  measured with the deleted Stripped comparator and have not yet been requalified
+  under the current canonical typed gate.
 - Only the main executable is preprocessed. Shared objects, the vDSO, JIT code,
   and child executables remain on the ptrace correctness path.
 - Empty trampolines preserve the original instructions. Raw `RDRAND`, `RDSEED`,

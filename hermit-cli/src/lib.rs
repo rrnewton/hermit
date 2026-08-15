@@ -1059,7 +1059,7 @@ async fn run_sabre(
     // the absolute path differs on every launch by design -- that is what keeps
     // concurrent hermit invocations on a shared host from binding the same
     // coordinator socket. Emitting it at INFO put per-launch randomness into the
-    // INFO stream, which `--verify-strict` compares:
+    // INFO stream, which `--verify` compares:
     //
     //   Mismatch at log messages 2 (run 1) and 2 (run 2):
     //   < socket=/tmp/hermit-sabre-rpc-Gw6tUi/coordinator.sock

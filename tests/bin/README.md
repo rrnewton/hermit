@@ -90,9 +90,10 @@ queue.
 ### Polling-mode diagnostic
 
 Polling mode observes the kernel's owner-death word update instead of relying
-on Detcore's precise waiter queue. It passes Stripped verification, not L2
-(ptrace backend, ERROR log level, `--debug-futex-mode polling`, no determinism
-relaxations):
+on Detcore's precise waiter queue. The following is a historical Stripped
+verification result from before that comparator was removed; it is not a
+current canonical verification result (ptrace backend, ERROR log level,
+`--debug-futex-mode polling`, no determinism relaxations):
 
 ```text
 $ timeout 20s target/release/hermit --log error run --strict --verify \

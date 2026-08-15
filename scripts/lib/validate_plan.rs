@@ -111,29 +111,47 @@ impl CompatMode {
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "legacy stripped verify",
+            CompatMode::Strict | CompatMode::PortableStrict => "canonical verify",
             CompatMode::Sabre => "SaBRe",
-            CompatMode::E9patch => "e9patch legacy stripped verify",
+            CompatMode::E9patch => "e9patch canonical verify",
             CompatMode::Rr => "rr",
         }
     }
 
     /// The `hermit run ...` flags preceding `--`, reproducing the `run_args`
     /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
-    pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
+    pub fn run_args(self, label: &str, nsswitch: &str, verify_json: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::Strict => vec![s("run"), s("--strict"), s("--verify"), s("--")],
+            CompatMode::Strict => vec![
+                s("run"),
+                s("--strict"),
+                s("--verify"),
+                s("--verify-json"),
+                s(verify_json),
+                s("--"),
+            ],
             CompatMode::PortableStrict => vec![
                 s("run"),
                 s("--strict"),
                 s("--verify"),
+                s("--verify-json"),
+                s(verify_json),
                 s("--no-virtualize-cpuid"),
                 s("--max-timeslice=disabled"),
                 s("--"),
             ],
             CompatMode::Sabre => {
-                vec![s("run"), s("--backend"), s("sabre"), s("--strict"), s("--verify"), s("--")]
+                vec![
+                    s("run"),
+                    s("--backend"),
+                    s("sabre"),
+                    s("--strict"),
+                    s("--verify"),
+                    s("--verify-json"),
+                    s(verify_json),
+                    s("--"),
+                ]
             }
             CompatMode::E9patch => {
                 let mut v = vec![s("run"), s("--backend"), s("e9patch")];
@@ -147,13 +165,22 @@ impl CompatMode {
                 }
                 v.push(s("--strict"));
                 v.push(s("--verify"));
+                v.push(s("--verify-json"));
+                v.push(s(verify_json));
                 v.push(s("--"));
                 v
             }
             // rr rows are driven through `hermit record start --verify`, matching
             // rr_compatibility_probe rather than the plain run path.
             CompatMode::Rr => {
-                vec![s("record"), s("start"), s("--verify"), s("--verify-strict"), s("--")]
+                vec![
+                    s("record"),
+                    s("start"),
+                    s("--verify"),
+                    s("--verify-json"),
+                    s(verify_json),
+                    s("--"),
+                ]
             }
         }
     }
@@ -412,15 +439,30 @@ pub fn compat_nodes_for(
         {
             continue;
         }
+        let job = sanitize_job(&row.label);
+        let verify_dir = root.join("target/validate-verify");
+        let verify_json = verify_dir.join(format!("{}-{job}.json", mode.corpus_name()));
+        let verify_json_text = verify_json.to_string_lossy().into_owned();
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch));
+        argv.extend(mode.run_args(&row.label, nsswitch, &verify_json_text));
         argv.extend(row.argv.iter().cloned());
         let wall = wall_override.unwrap_or_else(|| mode.timeout_for(&row.label));
+        let verify_dir = shell_quote(&verify_dir.to_string_lossy());
+        let verify_json = shell_quote(&verify_json_text);
+        let command = format!(
+            "mkdir -p {verify_dir} && rm -f {verify_json} && {} </dev/null && \
+             jq -e '(.verified == true) and (.verdict == \"matched\") and \
+             (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+             (.comparison.compare_logs == true) and \
+             ((.compared_log_messages.left // 0) > 0) and \
+             ((.compared_log_messages.right // 0) > 0)' {verify_json} >/dev/null",
+            shell_join(&argv)
+        );
         out.push(node(
             "compat",
-            &sanitize_job(&row.label),
+            &job,
             &format!("{} compatibility: {}", mode.display_name(), row.label),
-            format!("{} </dev/null", shell_join(&argv)),
+            command,
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
             COMPAT_CPU_TIMEOUT_S.max(wall),

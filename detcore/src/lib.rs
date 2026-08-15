@@ -134,6 +134,20 @@ fn select_thread_exit_detpid(
     }
 }
 
+fn thread_start_is_root(
+    guest_tid: Tid,
+    state_dettid: DetTid,
+    state_detpid: DetPid,
+    tool_detpid: DetPid,
+) -> bool {
+    let guest_dettid = DetTid::from_raw(guest_tid.into());
+    assert_eq!(
+        guest_dettid, state_dettid,
+        "backend thread identity disagrees with Detcore thread state"
+    );
+    state_dettid == state_detpid && state_detpid == tool_detpid
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
 /// Identifies an unsupported syscall that a backend must terminate without unwinding.
@@ -1423,12 +1437,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
-        let detpid = DetPid::from_raw(guest.pid().into());
-        let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
+        let guest_detpid = DetPid::from_raw(guest.pid().into());
+        let new_dettid = guest.thread_state().dettid;
+        let detpid = guest.thread_state().detpid.unwrap_or(guest_detpid);
+        let is_root_thread = thread_start_is_root(guest.tid(), new_dettid, detpid, self.detpid);
         trace!(
-            "[tid {}] detcore handle_thread_start, pid={}",
-            guest.tid(),
-            detpid
+            "[dettid {}] detcore handle_thread_start, detpid={}",
+            new_dettid, detpid
         );
 
         // Delayed initialization of thread_state for this new thread:
@@ -1441,11 +1456,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        assert_eq!(new_dettid, guest.thread_state().dettid);
-
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
-        } else if guest.is_root_thread() {
+        } else if is_root_thread {
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -2828,6 +2841,52 @@ mod thread_exit_identity_tests {
         assert_eq!(
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod thread_start_identity_tests {
+    use super::*;
+
+    #[test]
+    fn root_process_worker_is_not_misclassified_as_root_thread() {
+        assert!(!thread_start_is_root(
+            Tid::from_raw(4),
+            DetTid::from_raw(4),
+            DetPid::from_raw(3),
+            DetPid::from_raw(3),
+        ));
+    }
+
+    #[test]
+    fn fork_child_leader_is_not_misclassified_as_traced_root() {
+        assert!(!thread_start_is_root(
+            Tid::from_raw(4),
+            DetTid::from_raw(4),
+            DetPid::from_raw(4),
+            DetPid::from_raw(3),
+        ));
+    }
+
+    #[test]
+    fn traced_root_identity_is_accepted() {
+        assert!(thread_start_is_root(
+            Tid::from_raw(3),
+            DetTid::from_raw(3),
+            DetPid::from_raw(3),
+            DetPid::from_raw(3),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "backend thread identity disagrees with Detcore thread state")]
+    fn corrupted_native_thread_state_is_refused() {
+        let _ = thread_start_is_root(
+            Tid::from_raw(41),
+            DetTid::from_raw(42),
+            DetPid::from_raw(41),
+            DetPid::from_raw(41),
         );
     }
 }

@@ -6,9 +6,15 @@
 # LICENSE file in the root directory of this source tree.
 
 # RUN: %hermit run --bind /tmp -- %s
-# RUN: %hermit run --bind /tmp --sched-heuristic=random --verify -- %s
-# RUN: %hermit run --bind /tmp --seed-from=Args --sched-heuristic=random --verify -- %s
-# RUN: %hermit run --bind /tmp --seed-from=Args --sched-heuristic=stickyrandom --verify -- %s
+# RUN: %hermit run --bind /tmp --sched-heuristic=random --verify --verify-json %t.random.json -- %s
+# RUN: grep -q '"strictness":"canonical"' %t.random.json
+# RUN: grep -Eq '"left":[1-9][0-9]*,"right":[1-9][0-9]*' %t.random.json
+# RUN: %hermit run --bind /tmp --seed-from=Args --sched-heuristic=random --verify --verify-json %t.seed-random.json -- %s
+# RUN: grep -q '"strictness":"canonical"' %t.seed-random.json
+# RUN: grep -Eq '"left":[1-9][0-9]*,"right":[1-9][0-9]*' %t.seed-random.json
+# RUN: %hermit run --bind /tmp --seed-from=Args --sched-heuristic=stickyrandom --verify --verify-json %t.seed-sticky.json -- %s
+# RUN: grep -q '"strictness":"canonical"' %t.seed-sticky.json
+# RUN: grep -Eq '"left":[1-9][0-9]*,"right":[1-9][0-9]*' %t.seed-sticky.json
 
 function prnt {
     for ((i=0; i<500; i++)); do

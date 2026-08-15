@@ -2843,24 +2843,27 @@ function audit_chaos_seed_contract {
 
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/hermit-harness-chaos-verdict.XXXXXX")
     printf '%s\n' \
-        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
         >"$scratch/pass.json"
     printf '%s\n' '{"verified":true}' >"$scratch/incomplete.json"
     printf '%s\n' \
-        '{"verified":true,"verdict":"different","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"different","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
         >"$scratch/wrong-verdict.json"
     printf '%s\n' \
-        '{"verified":true,"verdict":"matched","comparison":{"strictness":"strict","compare_logs":true}}' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
         >"$scratch/wrong-strictness.json"
     printf '%s\n' \
-        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped"}}' \
+        '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":4,"right":4}}' \
         >"$scratch/missing-compare-logs.json"
     printf '%s\n' \
-        '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":false}}' \
+        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":false},"compared_log_messages":null}' \
         >"$scratch/false-compare-logs.json"
     printf '%s\n' \
-        '{"verified":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+        '{"verified":false,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
         >"$scratch/verified-false.json"
+    printf '%s\n' \
+        '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":0,"right":0}}' \
+        >"$scratch/zero-messages.json"
     printf '%s\n' '{not-json' >"$scratch/malformed.json"
     assert_chaos_verify_verdict "$scratch/pass.json" >/dev/null || {
         rm -r -- "$scratch"
@@ -2869,7 +2872,7 @@ function audit_chaos_seed_contract {
     local refused_verdict
     for refused_verdict in \
         incomplete wrong-verdict wrong-strictness missing-compare-logs \
-        false-compare-logs verified-false missing malformed; do
+        false-compare-logs verified-false zero-messages missing malformed; do
         if assert_chaos_verify_verdict "$scratch/$refused_verdict.json" >/dev/null; then
             rm -r -- "$scratch"
             die "chaos verification must refuse $refused_verdict evidence"
@@ -2916,17 +2919,17 @@ mkdir -p "$(dirname "$verdict")"
 case "${FAKE_HERMIT_VERDICT_BEHAVIOR:-pass}" in
     pass)
         printf '%s\n' \
-            '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+            '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
             >"$verdict"
         ;;
     one-false)
         if [[ $seed == 7 ]]; then
             printf '%s\n' \
-                '{"verified":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+                '{"verified":false,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
                 >"$verdict"
         else
             printf '%s\n' \
-                '{"verified":true,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true}}' \
+                '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":4,"right":4}}' \
                 >"$verdict"
         fi
         ;;
@@ -3292,12 +3295,6 @@ function prepare_test {
     fi
 }
 
-# Does this test's verify mode opt into the strict bitwise-parity assertion?
-function verify_asserts_bitwise_parity {
-    local metadata=$1
-    jq -r '.modes.verify.assert.bitwise_parity // false' <<<"$metadata"
-}
-
 # Where a verify attempt writes its machine-readable verdict.
 function verify_verdict_path {
     local cell_dir=$1 attempt=$2
@@ -3322,7 +3319,15 @@ function assert_bitwise_parity_verdict {
         printf 'verify parity verdict %s is not readable JSON\n' "${verdict##*/}"
         return 1
     fi
-    if [[ $(jq -r '(.verified == true) and (.bitwise_parity == true)' "$verdict") != true ]]; then
+    if [[ $(jq -r '
+        (.verified == true)
+        and (.verdict == "matched")
+        and (.bitwise_parity == true)
+        and (.comparison.strictness == "canonical")
+        and (.comparison.compare_logs == true)
+        and ((.compared_log_messages.left // 0) > 0)
+        and ((.compared_log_messages.right // 0) > 0)
+    ' "$verdict") != true ]]; then
         printf 'verify did not reach strict bitwise parity: %s\n' "$summary"
         return 1
     fi
@@ -3347,17 +3352,22 @@ function assert_chaos_verify_verdict {
     local summary
     summary=$(jq -r '
         "verified=\(if has("verified") then (.verified | tostring) else "missing" end) "
+        + "bitwise_parity=\(if has("bitwise_parity") then (.bitwise_parity | tostring) else "missing" end) "
         + "verdict=\(.verdict // "missing") "
         + "strictness=\(.comparison.strictness // "missing") "
-        + "compared=\(if ((.comparison | type) == "object" and (.comparison | has("compare_logs"))) then (.comparison.compare_logs | tostring) else "missing" end)"
+        + "compared=\(if ((.comparison | type) == "object" and (.comparison | has("compare_logs"))) then (.comparison.compare_logs | tostring) else "missing" end) "
+        + "messages=\(.compared_log_messages.left // 0)/\(.compared_log_messages.right // 0)"
     ' "$verdict")
     if ! jq -e '
         (.verified == true)
         and (.verdict == "matched")
-        and (.comparison.strictness == "stripped")
+        and (.bitwise_parity == true)
+        and (.comparison.strictness == "canonical")
         and (.comparison.compare_logs == true)
+        and ((.compared_log_messages.left // 0) > 0)
+        and ((.compared_log_messages.right // 0) > 0)
     ' "$verdict" >/dev/null; then
-        printf 'same-seed verification did not pass the M1 comparison: %s\n' "$summary"
+        printf 'same-seed verification did not reach canonical bitwise parity: %s\n' "$summary"
         return 1
     fi
     printf 'same-seed verification passed: %s\n' "$summary"
@@ -3453,19 +3463,10 @@ function execute_attempt {
             command=("${guest_command[@]}")
             ;;
         verify)
-            # Plain `--strict --verify` runs the LOSSY `Stripped` comparator,
-            # which normalizes numbers/addresses/paths away wholesale and so
-            # cannot establish strict determinism. A cell that opts into
-            # `assert = { bitwise_parity = true }` is upgraded to the canonical
-            # parity comparator and made to emit a machine-readable verdict, which
-            # run_cell then checks -- otherwise the cell would be justified by a
-            # parity measurement it never actually performs.
-            local verify_strict_flags=(--verify-json "$verify_report")
-            if [[ $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-                verify_strict_flags=(--verify-strict "${verify_strict_flags[@]}")
-            fi
+            # Every verify cell uses the canonical INFO comparison and publishes
+            # the typed verdict that run_cell requires below.
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                "${verify_strict_flags[@]}" "${verify_log_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
+                --verify-json "$verify_report" "${verify_log_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -3568,17 +3569,11 @@ function append_result {
             log_level=
             ;;
         verify)
-            # The receipt must record the flags that actually ran. Reporting a
-            # bare `--strict --verify` for a cell that ran the parity comparator
-            # (or vice versa) is how a stripped result gets mistaken for a
-            # strict bitwise-parity result.
             local keep_verify_logs=false
             [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 ]] && keep_verify_logs=true
             effective_args=$(jq -cn --arg backend "$backend" \
-                --argjson strict "$(verify_asserts_bitwise_parity "${METADATA_BY_ID[$test_id]}")" \
                 --argjson keep "$keep_verify_logs" \
                 '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
-                 + (if $strict then ["--verify-strict"] else [] end)
                  + ["--verify-json","<cell-verify-report>"]
                  + (if $keep then ["--keep-logs","--verify-log-dir","<cell-verify-log-dir>"] else [] end)')
             log_level=info
@@ -3907,10 +3902,9 @@ function run_cell {
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
-        elif [[ $mode == verify && $(verify_asserts_bitwise_parity "$metadata") == true ]]; then
-            # A zero exit only means the comparator this run used was satisfied.
-            # For a strict bitwise-parity cell, read the verdict the run itself published and
-            # require full parity; anything else is a FAIL, not a PASS.
+        elif [[ $mode == verify || $mode == replay ]]; then
+            # A zero exit is insufficient: every verification mode must publish
+            # non-vacuous canonical bitwise parity.
             local parity_reason
             if parity_reason=$(assert_bitwise_parity_verdict \
                 "$(verify_verdict_path "$cell_dir" 1)"); then

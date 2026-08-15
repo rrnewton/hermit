@@ -9,8 +9,7 @@ The runner builds the timestamp-bearing leaf crate twice natively and twice
 under Hermit. Native object files differ because they embed host wall time.
 Hermit virtualizes that clock, so its two object files are byte-for-byte
 identical. It also runs the compiler command with `--strict --verify` to check
-status, output, and Stripped execution logs. That comparison removes selected
-numeric, address, path, and time fields; it is not an L2 comparison.
+status, output, and canonical INFO execution logs.
 
 ```bash
 cargo build --release -p hermit --bin hermit
@@ -24,10 +23,9 @@ the fixture's ignored `target/reproducible-builds/` directory for inspection.
 
 - Backend: ptrace (the default).
 - Hermit mode: strict, with no determinism relaxations.
-- Assurance: two independent L1 builds with a direct bitwise artifact check,
-  plus a Stripped `--strict --verify` run of the same compiler command. The
-  direct object-file comparison, not bare `--verify`, supplies the bitwise
-  artifact claim.
+- Assurance: canonical `--strict --verify` evidence plus two independent builds
+  with a direct bitwise object-file check. The direct comparison supplies the
+  artifact-identity claim.
 - Artifact: an ELF object produced with `rustc --emit=obj`. Avoiding the linker
   keeps the example focused on the compile-time clock input.
 - Compiler: Hermit's pinned nightly with `-Z threads=1`, which keeps `rustc`

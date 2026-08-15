@@ -138,7 +138,7 @@ guest_command=(
   -append 'console=ttyS0 panic=-1 rdinit=/init'
 )
 boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-verify_command=("$hermit_bin" --log info run --strict --verify --verify-strict \
+verify_command=("$hermit_bin" --log info run --strict --verify \
   --verify-json "$verify_report" -- "${guest_command[@]}")
 
 # --- Phase 1: boot oracle. Run once under strict mode and assert the guest
@@ -250,6 +250,8 @@ jq -e '
   and .verdict == "matched"
   and .verified == true
   and .bitwise_parity == true
+  and .comparison.strictness == "canonical"
+  and .comparison.compare_logs == true
   and ((.compared_log_messages.left // 0) > 0)
   and ((.compared_log_messages.right // 0) > 0)
 ' "$verify_report" >/dev/null || {

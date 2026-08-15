@@ -1,16 +1,16 @@
 # Targeted determinism stress tests
 
-These scripts exercise the ptrace backend with Stripped verification, not L2.
+These scripts exercise the ptrace backend with canonical INFO verification.
 Every test case invokes the exact verifier path:
 
 ```text
-hermit --log info run --strict --verify -- PROGRAM [ARGS...]
+hermit --log info run --strict --verify --verify-json REPORT.json -- PROGRAM [ARGS...]
 ```
 
 No determinism relaxations are used. Native executions run first and print the
 SHA-256 of each output, making host nondeterminism visible without making a
 probabilistic native difference a test prerequisite. The Hermit phase requires
-the explicit `Determinism verified` marker.
+a typed `bitwise_parity: true` verdict with nonzero compared INFO messages.
 
 Build Hermit once, then run a category or the complete matrix:
 
@@ -20,11 +20,9 @@ tests/e2e/lib/determinism-stress/random.sh
 tests/e2e/lib/determinism-stress/run.sh
 ```
 
-`DETERMINISM_STRESS_REPETITIONS=20` repeats every internal two-run comparison
-twenty times for repeated Stripped stress evidence. Repetition does not promote
-Stripped evidence to L4 because the underlying comparison is not L2. The
-default is one Stripped comparison so the full targeted matrix remains
-practical. Other controls are:
+`DETERMINISM_STRESS_REPETITIONS=20` repeats every internal two-run canonical
+comparison twenty times. The default is one comparison so the full targeted
+matrix remains practical. Other controls are:
 
 ```text
 HERMIT_BIN                           release Hermit path
@@ -94,6 +92,6 @@ Cargo targets. Detcore's Rust test infrastructure provides
 `make_det_test_variants!` and direct `#[test]` cases for syscall semantics in
 `detcore/tests/{misc,time,...}`, including Jason White's historical lit-test
 and scheduler-affinity work. There is no generated one-test-per-syscall
-completeness manifest. This shell suite therefore adds explicit Stripped
+completeness manifest. This shell suite therefore adds explicit canonical
 verification coverage at the CLI boundary rather than treating green unit
-tests as complete end-to-end syscall coverage. It does not establish L2.
+tests as complete end-to-end syscall coverage.
