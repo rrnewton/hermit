@@ -72,16 +72,42 @@ fn capture_ppoll_event<M: MemoryAccess>(
     result: Result<i64, Errno>,
 ) -> Result<PpollEvent, Errno> {
     let fds_pointer_present = fds_address.is_some();
-    let fds = if matches!(result, Ok(_) | Err(Errno::EINTR)) {
-        fds_address
-            .map(|address| -> Result<Vec<PollFd>, Errno> {
-                let mut fds = vec![PollFd::default(); nfds];
-                memory.read_values(address.cast::<PollFd>().into(), &mut fds)?;
-                Ok(fds)
-            })
-            .transpose()?
-    } else {
-        None
+    let read_fds = |address: AddrMut<'_, libc::pollfd>| -> Result<Vec<PollFd>, Errno> {
+        let mut fds = vec![PollFd::default(); nfds];
+        memory.read_values(address.cast::<PollFd>().into(), &mut fds)?;
+        Ok(fds)
+    };
+    let fds = match result {
+        Ok(_) | Err(Errno::EINTR) => fds_address.map(read_fds).transpose()?,
+        // Linux writes `revents` entry by entry and can fault partway through
+        // the copy-out, so an EFAULT return may still leave earlier entries
+        // written. Those are guest-visible, so capture them or replay restores
+        // nothing and the guest keeps its pre-syscall values.
+        //
+        // BEST EFFORT, AND THAT IS LOAD-BEARING. The same EFAULT is also what a
+        // wholly bad `fds` pointer produces, and then this read fails too. `?`
+        // here would discard the WHOLE event -- including the captured timeout
+        // this function exists to preserve -- and record a bare `Err` instead.
+        // `fds_pointer_present` already distinguishes "no pointer" from "pointer
+        // we could not read", so `None` here is not ambiguous.
+        //
+        // NOT UNIT-TESTED, DELIBERATELY, AND THIS IS NOT AN OVERSIGHT: the unit
+        // tests use `LocalMemory`, which reads this process's own memory
+        // directly, so an unreadable address SEGFAULTS THE TEST BINARY instead
+        // of returning `Err` -- `.ok()` cannot catch that, and a test written
+        // that way crashes rather than failing. Guest memory in production goes
+        // through `process_vm_readv`, which does return `Err`. The policy is
+        // therefore covered end to end by `review-cases invalid-nfds` staying
+        // matched, not by a unit test.
+        //
+        // Note the predicate, not just the policy: errors other than EFAULT and
+        // EINTR must not read at all. An earlier attempt read on EVERY error and
+        // regressed `review-cases invalid-nfds`, which passes fds=(void*)1 with
+        // nfds over RLIMIT_NOFILE and gets EINVAL -- the read's own EFAULT(14)
+        // replaced the kernel's EINVAL(22) and flipped that case from matched to
+        // diverged.
+        Err(Errno::EFAULT) => fds_address.and_then(|address| read_fds(address).ok()),
+        _ => None,
     };
     let timeout = timeout_address
         .map(|address| memory.read_value(address))
@@ -323,6 +349,45 @@ mod tests {
         assert!(!event.fds_pointer_present);
         assert!(event.fds.is_none());
         assert_eq!(event.timeout, Some(timeout));
+    }
+
+    /// Linux can fault partway through the `revents` copy-out, leaving earlier
+    /// entries written and still returning EFAULT. Those writes are
+    /// guest-visible, so they must be captured or replay restores nothing and
+    /// the guest keeps its pre-syscall sentinels -- measured as a real
+    /// divergence: record `revents0=1` against replay `revents0=4660`, where
+    /// 4660 is 0x1234, the value the guest itself wrote before the call.
+    #[test]
+    fn capture_ppoll_keeps_the_partial_copyout_on_efault() {
+        let fds = [
+            PollFd {
+                fd: 3,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::POLLIN,
+            },
+            PollFd {
+                fd: 5,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::empty(),
+            },
+        ];
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(fds.as_ptr() as usize),
+            None,
+            fds.len(),
+            Err(Errno::EFAULT),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EFAULT));
+        assert!(event.fds_pointer_present);
+        assert_eq!(
+            event.fds.as_deref(),
+            Some(&fds[..]),
+            "a partially completed copy-out must be captured, not discarded"
+        );
     }
 
     #[test]
