@@ -2057,8 +2057,8 @@
       "test": "backend-parity-c/cwd-roundtrip",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
