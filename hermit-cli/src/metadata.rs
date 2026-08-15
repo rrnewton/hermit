@@ -59,8 +59,16 @@ impl RecordVersion {
 // TODO-HUMAN-REVIEW(#2272)
 // 0x10c -> 0x10d: `Ppoll` becomes its OWN event rather than sharing `Poll`'s,
 // because ppoll additionally copies out a timeout and must preserve it on
-// EINTR and on a partial EFAULT copy-out. The recorded stream therefore
-// carries a different event shape for every ppoll call.
+// EINTR and on a partial EFAULT copy-out; and `Poll` itself now records the
+// partial `revents` copy-out an error return leaves behind. The recorded
+// stream therefore carries a different event shape for both syscalls.
+//
+// ONE increment covers BOTH halves deliberately. This branch bumped twice --
+// once per format change -- but a reader either understands the new stream or
+// it does not, so what matters is that the version differs from every stream
+// a different shape was written under. Landing two increments would imply a
+// 0x10d recording exists that this build can read and it cannot: no build
+// ever wrote one.
 //
 // ⚠️ THIS BUMP IS WHY THE REBASE COULD NOT SIMPLY TAKE EITHER SIDE. This
 // change was authored against 0x10a and bumped to 0x10b; main has since gone
