@@ -31,6 +31,27 @@ pub(crate) struct ComparedRun<'a> {
     pub log: TempPath,
 }
 
+/// Which executions supplied the two sides of a verification comparison.
+///
+/// The comparison engine is shared by `run --verify` (two fresh runs) and
+/// `record start --verify` (a recording and its replay). Keep this typed value
+/// with the comparison so every diagnostic names the executions that actually
+/// produced its evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparedExecutions {
+    Runs,
+    RecordingAndReplay,
+}
+
+impl ComparedExecutions {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Runs => ("run 1", "run 2"),
+            Self::RecordingAndReplay => ("recording", "replay"),
+        }
+    }
+}
+
 pub(crate) struct ComparisonOptions<'a> {
     pub success_message: &'a str,
     pub failure_message: &'a str,
@@ -399,6 +420,10 @@ pub struct VerificationOutcome {
     pub first_divergent_scheduler_turn: Option<u64>,
     /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// The executions compared to produce this outcome. This is retained so a
+    /// later terminal error cannot fall back to a fixed label that describes a
+    /// different verification path.
+    compared_executions: ComparedExecutions,
 }
 
 impl VerificationOutcome {
@@ -413,10 +438,13 @@ impl VerificationOutcome {
     /// code must read [`Self::verdict`] / [`Self::verified`] (or the
     /// `--verify-json` report) *before* calling this.
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
+        let (first_label, second_label) = self.compared_executions.labels();
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => Err(Error::msg("Mismatch between run 1 and run 2 outputs.")),
-            // Unreachable in practice: `compare_two_runs` only ever yields
+            Verdict::Diverged => Err(Error::msg(format!(
+                "Mismatch between {first_label} and {second_label} outputs."
+            ))),
+            // Unreachable in practice: the comparison helpers only ever yield
             // Matched/Diverged, and the no-result state is published directly to
             // the JSON artifact rather than carried in an outcome. Fail closed
             // rather than mapping "no verdict" onto a guest exit status.
@@ -702,15 +730,36 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     Ok(retained)
 }
 
-pub fn compare_two_runs(
+pub fn compare_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
     options: ComparisonOptions<'_>,
 ) -> Result<VerificationOutcome, Error> {
-    compare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
+    compare_executions_with_unsupported_scan(
+        ComparedExecutions::Runs,
+        first,
+        second,
+        options,
+        unsupported_syscalls_from_log,
+    )
 }
 
-fn compare_two_runs_with_unsupported_scan(
+pub fn compare_recording_and_replay(
+    recording: ComparedRun<'_>,
+    replay: ComparedRun<'_>,
+    options: ComparisonOptions<'_>,
+) -> Result<VerificationOutcome, Error> {
+    compare_executions_with_unsupported_scan(
+        ComparedExecutions::RecordingAndReplay,
+        recording,
+        replay,
+        options,
+        unsupported_syscalls_from_log,
+    )
+}
+
+fn compare_executions_with_unsupported_scan(
+    compared_executions: ComparedExecutions,
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
     options: ComparisonOptions<'_>,
@@ -731,6 +780,7 @@ fn compare_two_runs_with_unsupported_scan(
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
+    let (first_label, second_label) = compared_executions.labels();
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -743,7 +793,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stdout != out2.stdout {
         failed = true;
-        eprintln!("Mismatch in stdout between run 1 and run 2:");
+        eprintln!("Mismatch in stdout between {first_label} and {second_label}:");
         let str1 = String::from_utf8_lossy(&out1.stdout);
         let str2 = String::from_utf8_lossy(&out2.stdout);
         if str1.lines().count() > 1 {
@@ -755,7 +805,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stderr != out2.stderr {
         failed = true;
-        eprintln!("Mismatch in stderr between run 1 and run 2:");
+        eprintln!("Mismatch in stderr between {first_label} and {second_label}:");
         let str1 = String::from_utf8_lossy(&out1.stderr);
         let str2 = String::from_utf8_lossy(&out2.stderr);
         if str1.lines().count() > 1 {
@@ -810,7 +860,12 @@ fn compare_two_runs_with_unsupported_scan(
                 failed = true;
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
-                eprintln!(":: {}", "Log differences found between runs.".red().bold());
+                eprintln!(
+                    ":: {}",
+                    format!("Log differences found between {first_label} and {second_label}.")
+                        .red()
+                        .bold()
+                );
             }
         } else {
             eprintln!(
@@ -821,7 +876,7 @@ fn compare_two_runs_with_unsupported_scan(
         if out1.status != out2.status {
             failed = true;
             eprintln!(
-                "Mismatch in exit status between run 1 and run 2: {}",
+                "Mismatch in exit status between {first_label} and {second_label}: {}",
                 Comparison::new(&out1.status, &out2.status)
             );
         }
@@ -838,7 +893,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if let Err(error) = log_processing_result {
         if options.keep_logs || failed {
-            retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+            retain_verification_logs([(first_label, log1), (second_label, log2)])?;
         }
         return Err(error);
     }
@@ -847,7 +902,7 @@ fn compare_two_runs_with_unsupported_scan(
     // that behavior to successful comparisons instead of changing the failure
     // path.
     if options.keep_logs || failed {
-        retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+        retain_verification_logs([(first_label, log1), (second_label, log2)])?;
     }
 
     if failed {
@@ -863,6 +918,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            compared_executions,
         })
     } else {
         eprintln!(":: {}", options.success_message.green().bold());
@@ -873,6 +929,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            compared_executions,
         })
     }
 }
@@ -1011,7 +1068,7 @@ mod tests {
         right_log: TempPath,
         strictness: LogCompareStrictness,
     ) -> Result<VerificationOutcome, Error> {
-        compare_two_runs(
+        compare_runs(
             ComparedRun {
                 output: left,
                 log: left_log,
@@ -1046,6 +1103,70 @@ mod tests {
             right_log,
             LogCompareStrictness::Stripped,
         )
+    }
+
+    #[test]
+    fn terminal_mismatch_names_the_executions_that_were_compared() {
+        let left = output(0, b"left", b"");
+        let right = output(0, b"right", b"");
+
+        let (left_log, right_log) = empty_logs();
+        let run_error = compare_runs(
+            ComparedRun {
+                output: &left,
+                log: left_log,
+            },
+            ComparedRun {
+                output: &right,
+                log: right_log,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: false,
+                diagnostic_full_trace: false,
+                keep_logs: false,
+            },
+        )
+        .unwrap()
+        .into_exit_status()
+        .unwrap_err();
+        assert_eq!(
+            run_error.to_string(),
+            "Mismatch between run 1 and run 2 outputs."
+        );
+
+        let (recording_log, replay_log) = empty_logs();
+        let replay_error = compare_recording_and_replay(
+            ComparedRun {
+                output: &left,
+                log: recording_log,
+            },
+            ComparedRun {
+                output: &right,
+                log: replay_log,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: false,
+                diagnostic_full_trace: false,
+                keep_logs: false,
+            },
+        )
+        .unwrap()
+        .into_exit_status()
+        .unwrap_err();
+        assert_eq!(
+            replay_error.to_string(),
+            "Mismatch between recording and replay outputs."
+        );
+        assert!(!replay_error.to_string().contains("run 1"));
+        assert!(!replay_error.to_string().contains("run 2"));
     }
 
     /// A DETLOG log message whose only variable is a numeric syscall value. The
@@ -1130,7 +1251,7 @@ mod tests {
         fs::write(&left_log, "DETLOG root event A\n").unwrap();
         fs::write(&right_log, "DETLOG root event B\n").unwrap();
 
-        let outcome = compare_two_runs(
+        let outcome = compare_runs(
             ComparedRun {
                 output: &left,
                 log: left_log,
@@ -1263,7 +1384,7 @@ mod tests {
         let (left, right) = make_logs(7);
         let left_path = left.to_path_buf();
         let right_path = right.to_path_buf();
-        let debug_diverged = compare_two_runs(
+        let debug_diverged = compare_runs(
             ComparedRun {
                 output: &out,
                 log: left,
@@ -1360,7 +1481,7 @@ mod tests {
             fs::write(right.path(), detlog_with_value(right_value)).unwrap();
             let left_path = left.path().to_path_buf();
             let right_path = right.path().to_path_buf();
-            let outcome = compare_two_runs(
+            let outcome = compare_runs(
                 ComparedRun {
                     output: &output,
                     log: left.into_temp_path(),
@@ -1400,7 +1521,8 @@ mod tests {
         let left_path = left.path().to_path_buf();
         let right_path = right.path().to_path_buf();
 
-        let error = compare_two_runs_with_unsupported_scan(
+        let error = compare_executions_with_unsupported_scan(
+            ComparedExecutions::Runs,
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
@@ -1459,7 +1581,7 @@ mod tests {
             "the test must make the run-1 log unreadable"
         );
 
-        let result = compare_two_runs(
+        let result = compare_runs(
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
@@ -1888,12 +2010,13 @@ mod tests {
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            compared_executions: ComparedExecutions::Runs,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }
 
     // Binds the `ComparisonSpec::new` no-filter assumption (and the
-    // `compare_two_runs` debug_assert) to reality: the diff engine's default must
+    // comparison-helper debug_assert) to reality: the diff engine's default must
     // actually apply no line filters. If a future default started filtering, the
     // spec would silently misreport "no filters" — this catches that.
     #[test]

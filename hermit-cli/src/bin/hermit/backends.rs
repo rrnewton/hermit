@@ -575,7 +575,7 @@ pub(super) fn run_dbt(
     // a deliberately non-zero guest (e.g. the `exit_status` parity contract with
     // `--verify-allow both`) can verify deterministically, and the DBT backend
     // must surface that status to match the ptrace `--verify` path
-    // (`compare_two_runs` returns `out2.status`).
+    // (the verification comparison returns `out2.status`).
     Ok(output_status(&first))
 }
 

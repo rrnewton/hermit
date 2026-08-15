@@ -44,7 +44,7 @@ use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
-use super::verify::compare_two_runs;
+use super::verify::compare_recording_and_replay;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
 use super::verify::write_pending_verification_json;
@@ -460,7 +460,7 @@ impl StartOpts {
             })
             .context("Container exited unexpectedly")??;
 
-        let outcome = compare_two_runs(
+        let outcome = compare_recording_and_replay(
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
