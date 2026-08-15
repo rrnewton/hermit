@@ -378,6 +378,62 @@ fn remove_retained_verify_logs(stderr: &str) {
     }
 }
 
+fn assert_exact_stderr_line_once(stderr: &str, expected: &str) {
+    let count = stderr.lines().filter(|line| *line == expected).count();
+    assert_eq!(
+        count, 1,
+        "expected stderr line exactly once: {expected:?}\nstderr:\n{stderr}"
+    );
+}
+
+fn assert_diverged_verify_report(report_path: &Path, expected_guest_exit_code: i64) {
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read verification report {}: {error}",
+                report_path.display()
+            )
+        }))
+        .expect("verification report was not valid JSON");
+
+    assert_eq!(
+        report.get("verdict").and_then(serde_json::Value::as_str),
+        Some("diverged"),
+        "unexpected verification verdict: {report}"
+    );
+    assert_eq!(
+        report.get("verified").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "diverged report was not typed verified=false: {report}"
+    );
+    assert_eq!(
+        report
+            .get("guest_exit_code")
+            .and_then(serde_json::Value::as_i64),
+        Some(expected_guest_exit_code),
+        "unexpected typed guest exit code: {report}"
+    );
+    assert_eq!(
+        report.get("guest_signal"),
+        Some(&serde_json::Value::Null),
+        "guest signal was missing or non-null: {report}"
+    );
+
+    let compared = report
+        .get("compared_log_messages")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("missing typed log-comparison counts: {report}"));
+    for side in ["left", "right"] {
+        assert!(
+            compared
+                .get(side)
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "compared_log_messages.{side} was not a positive integer: {report}"
+        );
+    }
+}
+
 fn default_hermit_command(base_env: &str) -> Command {
     let mut command = hermit_command(base_env);
     command.args(["--no-sequentialize-threads", "--no-deterministic-io"]);
@@ -991,10 +1047,12 @@ fn verify_rejects_explicit_log_levels_below_info() {
 fn verify_reports_stdout_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tmp.path().join("verify.json");
+    let verify_json = format!("--verify-json={}", report.display());
     let mut command = verify_guest_command(
         tmp.path(),
-        "#!/bin/sh\nif [ -e /tmp/state ]; then printf second; else printf first; fi\n: > /tmp/state\n",
-        &[],
+        "#!/bin/sh\nif [ -e /tmp/state ]; then printf second; else printf first; fi | cat\n: > /tmp/state\n",
+        &[&verify_json],
     );
 
     let output = command.output().expect("failed to run stdout verification");
@@ -1004,14 +1062,9 @@ fn verify_reports_stdout_divergence() {
         Some(1),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Mismatch in stdout between run 1 and run 2"),
-        "missing stdout diagnostic:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("Failure: nondeterministic."),
-        "missing verification failure:\n{stderr}"
-    );
+    assert_exact_stderr_line_once(&stderr, "Mismatch in stdout between run 1 and run 2:");
+    assert_exact_stderr_line_once(&stderr, ":: Failure: nondeterministic.");
+    assert_diverged_verify_report(&report, 0);
     remove_retained_verify_logs(&stderr);
 }
 
@@ -1019,10 +1072,12 @@ fn verify_reports_stdout_divergence() {
 fn verify_reports_exit_status_divergence() {
     let _guard = hermit_run_lock();
     let tmp = tempfile::tempdir().expect("failed to create verify tmp directory");
+    let report = tmp.path().join("verify.json");
+    let verify_json = format!("--verify-json={}", report.display());
     let mut command = verify_guest_command(
         tmp.path(),
         "#!/bin/sh\nif [ -e /tmp/state ]; then exit 17; fi\n: > /tmp/state\nexit 0\n",
-        &["--verify-allow=both"],
+        &["--verify-allow=both", &verify_json],
     );
 
     let output = command
@@ -1034,10 +1089,16 @@ fn verify_reports_exit_status_divergence() {
         Some(1),
         "unexpected status:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Mismatch in exit status between run 1 and run 2"),
-        "missing exit-status diagnostic:\n{stderr}"
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| { line.starts_with("Mismatch in exit status between run 1 and run 2:") })
+            .count(),
+        1,
+        "missing or repeated exit-status diagnostic:\n{stderr}"
     );
+    assert_exact_stderr_line_once(&stderr, ":: Failure: nondeterministic.");
+    assert_diverged_verify_report(&report, 17);
     remove_retained_verify_logs(&stderr);
 }
 

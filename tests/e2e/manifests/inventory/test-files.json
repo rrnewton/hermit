@@ -1268,6 +1268,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/pipe2_errno_precedence.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI)",
+      "why": "tests/c/pipe2_errno_precedence.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (portable CI): asserts Linux's pipe2 argument-validation PRECEDENCE rather than only run-to-run agreement -- flags are checked before pipefd, so a bad pointer with bad flags must be EINVAL while a bad pointer with good flags must be EFAULT, and it also covers NULL and a working pipe so a regression cannot be hidden by narrowing the fix or by disabling capacity pinning; a deterministic WRONG errno would satisfy a pure verify comparison, which is why this guest asserts values"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/ppoll_readv.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
