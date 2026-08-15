@@ -798,6 +798,37 @@ fn nested_scope_self_test() -> Result<String, String> {
     Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
 }
 
+/// The literal flag that makes a compatibility run a qualifying strict run.
+///
+/// Spelled out here, in the CONSUMER, on purpose. Deriving it from
+/// `CompatMode::run_args` — the code being checked — would make the check agree
+/// with whatever that code happens to emit, which is exactly the defect this
+/// constant exists to catch: deleting `--strict` from the rendered plans left
+/// `--self-test` exiting 0 and printing success, because nothing compared the
+/// rendered command against an independently stated expectation.
+const QUALIFYING_STRICT_FLAG: &str = "--strict";
+
+/// Compatibility modes whose rendered command must carry [`QUALIFYING_STRICT_FLAG`].
+///
+/// `CompatMode::Rr` is deliberately absent rather than overlooked: it renders
+/// `record start --verify --verify-strict`, a different path with a different
+/// marker, so folding it into this list would assert something untrue about it.
+const STRICT_FLAG_MODES: [CompatMode; 4] = [
+    CompatMode::Strict,
+    CompatMode::PortableStrict,
+    CompatMode::Sabre,
+    CompatMode::E9patch,
+];
+
+/// Whether a rendered plan is missing the literal strict flag.
+///
+/// Takes the already-rendered argv so the same predicate can be pointed at a
+/// real plan and at a plan with the flag removed, which is what makes the
+/// bracket two-directional instead of only ever seeing the passing case.
+fn strict_flag_missing_from(argv: &[String]) -> bool {
+    !argv.iter().any(|arg| arg == QUALIFYING_STRICT_FLAG)
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -806,6 +837,39 @@ fn nested_scope_self_test() -> Result<String, String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // Strict-flag bracket. `--strict` is what distinguishes a qualifying run
+    // from a legacy one, so every mode that claims strict must actually render
+    // it, and the check must fire when it is absent. Both directions are
+    // exercised here because a check that has only ever seen the passing case
+    // cannot show that it discriminates.
+    for mode in STRICT_FLAG_MODES {
+        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf");
+        if strict_flag_missing_from(&rendered) {
+            return Err(format!(
+                "{mode:?} rendered a compatibility plan WITHOUT the literal \
+                 {QUALIFYING_STRICT_FLAG}, so the run would not be a qualifying \
+                 strict run: {rendered:?}"
+            ));
+        }
+        let stripped: Vec<String> = rendered
+            .iter()
+            .filter(|arg| *arg != QUALIFYING_STRICT_FLAG)
+            .cloned()
+            .collect();
+        if stripped.len() == rendered.len() {
+            return Err(format!(
+                "{mode:?}: removing {QUALIFYING_STRICT_FLAG} changed nothing, so the \
+                 refusing direction below would be vacuous"
+            ));
+        }
+        if !strict_flag_missing_from(&stripped) {
+            return Err(format!(
+                "the strict-flag check did not notice {QUALIFYING_STRICT_FLAG} missing \
+                 from a {mode:?} plan, so it cannot detect its deletion"
+            ));
+        }
+    }
+
     if !nested_scope_probe_selected(true, true)
         || nested_scope_probe_selected(false, true)
         || nested_scope_probe_selected(true, false)
