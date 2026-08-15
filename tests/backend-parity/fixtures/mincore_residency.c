@@ -19,6 +19,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete UNDER HERMIT; a lower
+   count is a failure, not a smaller success. Native is expected to reach only
+   4 (the faithful checks), which is why this fixture is a Hermit probe and its
+   `naked` mode is disabled in the manifest. */
+#define EXPECTED_CHECKS_UNDER_HERMIT 6
+
 int main(void) {
     long pg = sysconf(_SC_PAGESIZE);
     size_t np = 6;
@@ -81,5 +87,25 @@ int main(void) {
     }
 
     printf("mincore ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the guest
+       exits 0 whatever `ok` reached, so a determinization that stopped
+       reporting every mapped page resident, or an error path that stopped
+       matching Linux, only lowered the printed number -- and under --verify
+       both runs lower it identically, so the comparison still matches and the
+       cell stays green. The six checks above are unchanged; this only requires
+       all of them.
+
+       The expected value is 6 UNDER HERMIT and 4 natively, as the header
+       states: checks 1-2 observe Detcore's determinization and native reports
+       true residency instead. This fixture exists to probe Hermit, its `naked`
+       mode is disabled, and the only enabled cell is verify/ptrace, so 6 is the
+       contract wherever it actually runs. Run standalone it will now exit 1,
+       which is the honest report that the determinization it tests was absent. */
+    if (ok != EXPECTED_CHECKS_UNDER_HERMIT) {
+        fprintf(stderr, "mincore completed %d of %d checks under Hermit\n", ok,
+                EXPECTED_CHECKS_UNDER_HERMIT);
+        return 1;
+    }
     return 0;
 }

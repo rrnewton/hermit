@@ -22,27 +22,31 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 5
+
 int main(void) {
     int ok = 0;
     char tmpl[] = "/tmp/msync_writeback_XXXXXX";
     int fd = mkstemp(tmpl);
     if (fd < 0) {
-        printf("msync ok=0 [mkstemp fail]\n");
-        return 0;
+        printf("msync SETUP_FAIL [mkstemp]\n");
+        return 1;
     }
     if (ftruncate(fd, 4096) != 0) {
         unlink(tmpl);
         close(fd);
-        printf("msync ok=0 [ftruncate fail]\n");
-        return 0;
+        printf("msync SETUP_FAIL [ftruncate]\n");
+        return 1;
     }
 
     void *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         unlink(tmpl);
         close(fd);
-        printf("msync ok=0 [mmap fail]\n");
-        return 0;
+        printf("msync SETUP_FAIL [mmap]\n");
+        return 1;
     }
 
     char buf[8];
@@ -67,5 +71,19 @@ int main(void) {
     unlink(tmpl);
     close(fd);
     printf("msync ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the guest
+       exits 0 whatever `ok` reached, so a writeback that stopped being visible
+       through the fd only lowered the printed number -- and under --verify both
+       runs lower it identically, so the comparison still matches and the cell
+       stays green. The five checks above are unchanged; this only requires all
+       of them. The setup paths above now say SETUP_FAIL rather than ok=0,
+       because ok=0 is also what a total behavioural failure prints and the two
+       must not be confusable. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "msync completed %d of %d checks\n", ok,
+                EXPECTED_CHECKS);
+        return 1;
+    }
     return 0;
 }
