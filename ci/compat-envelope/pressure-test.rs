@@ -120,15 +120,17 @@ Commands:
       [--green --repetitions COUNT] [--jobs COUNT]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
-      labelled exploratory and cannot promote the scorecard. Batch runs require
-      a clean commit and use an isolated checkout. With no filters, this
-      selects all red cells, but refuses a plan whose declared worst-case cell
-      occupancy cannot fit the whole-run wall bound. Use --sample for a bounded
-      random batch, --mode to narrow its population, or give --test, --mode,
-      and --backend together for exactly one cell. The default result directory
-      is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
-      manifest declares no seeds remains red but is unavailable: exact requests
-      refuse it, while batches report and omit it rather than inventing a run.
+      labelled exploratory and cannot promote the scorecard. Batch and repeated
+      runs require a clean commit and execute from that repository root, with
+      HEAD and cleanliness checked before and after execution. With no filters,
+      this selects all red cells, but refuses a plan whose declared worst-case
+      cell occupancy cannot fit the whole-run wall bound. Use --sample for a
+      bounded random batch, --mode to narrow its population, or give --test,
+      --mode, and --backend together for exactly one cell. The default result
+      directory is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos
+      cell whose manifest declares no seeds remains red but is unavailable:
+      exact requests refuse it, while batches report and omit it rather than
+      inventing a run.
       Add --repetitions N to an exact currently green cell to run N independent
       boxed checks against the same clean committed source. Use --green with
       --repetitions to select every enabled green cell in one shared-build DAG;
@@ -1232,40 +1234,39 @@ fn run() -> Result<(), String> {
                 );
             }
             let exact_cell = selection.is_exact();
-            if !selection.allows_dirty_source() && worktree_dirty(&root)? {
-                return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
-            }
+            let clean_sha = if selection.allows_dirty_source() {
+                eprintln!(
+                    "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
+                );
+                None
+            } else {
+                Some(require_clean_source(&root, None, "before planning")?)
+            };
             let run_timeout_seconds = selection
                 .run_timeout_seconds
                 .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
             let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
             require_empty_result_dir(&results)?;
             let started = Instant::now();
-            let sha = git_output(&root, &["rev-parse", "HEAD"])?;
-            let fresh = if selection.allows_dirty_source() {
-                eprintln!(
-                    "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
-                );
-                None
-            } else {
-                let fresh = FreshCheckout::prepare(&root, &sha)?;
-                println!("Fresh checkout: {}", fresh.path.display());
-                Some(fresh)
-            };
-            let execution_root = fresh
-                .as_ref()
-                .map(|checkout| checkout.path.as_path())
-                .unwrap_or(root.as_path());
             let output = results.join("dag.json");
             let run_result = (|| {
-                let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
+                let (metadata, dag) = write_plan(&root, &results, &output, &selection)?;
+                if let Some(expected_sha) = clean_sha.as_deref() {
+                    if metadata.hermit_sha != expected_sha || metadata.source_tree_dirty {
+                        return Err(format!(
+                            "clean pressure plan lost its source binding: expected HEAD {expected_sha} and source_tree_dirty=false, recorded HEAD {} and source_tree_dirty={}",
+                            metadata.hermit_sha, metadata.source_tree_dirty
+                        ));
+                    }
+                    require_clean_source(&root, Some(expected_sha), "before execution")?;
+                }
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
-                    print_exact_manifest_command(execution_root, &metadata.cells[0], &selection)?;
+                    print_exact_manifest_command(&root, &metadata.cells[0], &selection)?;
                 }
-                let execution = with_runner_log_dir(&results, || {
-                    with_execution_root(execution_root, || {
+                let execution_result = with_runner_log_dir(&results, || {
+                    with_execution_root(&root, || {
                         execute_typed_dag(
                             &dag,
                             metadata.jobs,
@@ -1274,7 +1275,22 @@ fn run() -> Result<(), String> {
                             metadata.run_timeout_seconds,
                         )
                     })
-                })?;
+                });
+                let source_result = match clean_sha.as_deref() {
+                    Some(expected_sha) => {
+                        require_clean_source(&root, Some(expected_sha), "after execution")
+                            .map(|_| ())
+                    }
+                    None => Ok(()),
+                };
+                let execution = match (execution_result, source_result) {
+                    (Ok(execution), Ok(())) => execution,
+                    (Err(execution), Ok(())) => return Err(execution),
+                    (Ok(_), Err(source)) => return Err(source),
+                    (Err(execution), Err(source)) => {
+                        return Err(format!("{execution}; {source}"));
+                    }
+                };
                 let runner_evidence = retain_execution_evidence(&results, &execution)?;
                 let expected_runs = metadata
                     .cells
@@ -1291,26 +1307,13 @@ fn run() -> Result<(), String> {
                     execution.passes, metadata.jobs, execution.scheduler_wall_s,
                 );
                 summarize(
-                    execution_root,
+                    &root,
                     &results,
                     selection.allows_dirty_source(),
                     Some(&runner_evidence),
                 )
             })();
-            let cleanup_result = match fresh {
-                Some(fresh) => fresh.cleanup(),
-                None => Ok(()),
-            };
-            match (run_result, cleanup_result) {
-                (Ok(()), Ok(())) => {}
-                (Err(run), Ok(())) => return Err(run),
-                (Ok(()), Err(cleanup)) => return Err(cleanup),
-                (Err(run), Err(cleanup)) => {
-                    return Err(format!(
-                        "{run}; fresh-checkout cleanup also failed: {cleanup}"
-                    ));
-                }
-            }
+            run_result?;
         }
         "summarize" => {
             let (results, output, _) = result_options(&root, &mut args, false, false)?;
@@ -1641,8 +1644,33 @@ fn worktree_dirty(root: &Path) -> Result<bool, String> {
     Ok(output
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .any(|entry| entry != b"?? .pressure-test-generated-checkout"))
+        .any(|entry| !entry.is_empty()))
+}
+
+fn require_clean_source(
+    root: &Path,
+    expected_sha: Option<&str>,
+    phase: &str,
+) -> Result<String, String> {
+    let observed_sha = git_output(root, &["rev-parse", "HEAD"])?;
+    if expected_sha.is_some_and(|expected| observed_sha != expected) {
+        return Err(format!(
+            "run refuses source checkout because HEAD changed {phase}: expected {}, observed {observed_sha}",
+            expected_sha.expect("checked expected SHA")
+        ));
+    }
+    if worktree_dirty(root)? {
+        return Err(format!(
+            "run refuses source checkout because it is dirty {phase}; commit first so every row binds to reproducible source"
+        ));
+    }
+    let confirmed_sha = git_output(root, &["rev-parse", "HEAD"])?;
+    if confirmed_sha != observed_sha {
+        return Err(format!(
+            "run refuses source checkout because HEAD changed {phase}: observed {observed_sha}, then {confirmed_sha}"
+        ));
+    }
+    Ok(confirmed_sha)
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -4988,6 +5016,51 @@ fn self_test(root: &Path) -> Result<(), String> {
     if worktree_dirty(&clone_source)? {
         return Err("generated-checkout cleanup left its source fixture dirty".into());
     }
+
+    // Clean batch and repeated execution uses the selected repository root
+    // directly. Bracket the source check with an inert repository so a clean,
+    // unchanged root is accepted while either post-run mutation is refused.
+    let bound_sha = require_clean_source(&clone_source, None, "before execution")?;
+    if bound_sha != clone_sha {
+        return Err("clean-root source check bound the wrong commit".into());
+    }
+    let planted_dirty = clone_source.join("post-run-dirty");
+    fs::write(&planted_dirty, "changed during execution\n")
+        .map_err(|e| format!("cannot plant post-run dirty source: {e}"))?;
+    let dirty_refusal = require_clean_source(&clone_source, Some(&bound_sha), "after execution")
+        .err()
+        .ok_or("post-run source check accepted a dirty worktree")?;
+    if !dirty_refusal.contains("dirty after execution") {
+        return Err(format!(
+            "post-run dirty refusal lost its phase and cause: {dirty_refusal}"
+        ));
+    }
+    fs::remove_file(&planted_dirty)
+        .map_err(|e| format!("cannot remove planted post-run dirty source: {e}"))?;
+    command_ok(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=pressure-test self-test",
+                "-c",
+                "user.email=pressure-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "change HEAD",
+            ])
+            .current_dir(&clone_source),
+        "plant post-run HEAD change",
+    )?;
+    let head_refusal = require_clean_source(&clone_source, Some(&bound_sha), "after execution")
+        .err()
+        .ok_or("post-run source check accepted a changed HEAD")?;
+    if !head_refusal.contains("HEAD changed after execution") {
+        return Err(format!(
+            "post-run HEAD refusal lost its phase and cause: {head_refusal}"
+        ));
+    }
+
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
@@ -5036,9 +5109,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         "owned marker\n",
     )
     .map_err(|e| format!("cannot write generated-checkout marker fixture: {e}"))?;
-    if worktree_dirty(&dirty_fixture)? {
-        return Err("the tool-owned generated-checkout marker made clean source dirty".into());
+    if !worktree_dirty(&dirty_fixture)? {
+        return Err("an untracked generated-checkout marker was treated as clean".into());
     }
+    fs::remove_file(dirty_fixture.join(".pressure-test-generated-checkout"))
+        .map_err(|e| format!("cannot remove generated-checkout marker fixture: {e}"))?;
     fs::write(dirty_fixture.join("arbitrary-source"), "untracked\n")
         .map_err(|e| format!("cannot write arbitrary untracked-source fixture: {e}"))?;
     if !worktree_dirty(&dirty_fixture)? {
@@ -5283,9 +5358,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             ));
         }
     }
-    if preparation_steps[0].env.get("E2E_HARNESS_MANIFEST_JSON")
-        != Some(&valid_manifest_text)
-    {
+    if preparation_steps[0].env.get("E2E_HARNESS_MANIFEST_JSON") != Some(&valid_manifest_text) {
         return Err("preparation did not receive the exact retained harness manifest".into());
     }
     if !checkout_temporary_directory(root, "../../escape")
@@ -6236,7 +6309,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: clean-root source binding, no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
