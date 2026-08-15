@@ -267,6 +267,13 @@
       "test": "backend-parity-c/linkat-flags"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mce-kill-refusal"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
