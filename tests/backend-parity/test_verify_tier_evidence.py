@@ -22,6 +22,8 @@ and each negative plants a record that MUST NOT reach `bitwise`.
 from __future__ import annotations
 
 import json
+import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -31,8 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
     L2_RANK,
+    DEFAULT_VERIFY_POLICY,
     SCORECARD_HEADER,
+    VerifyPolicy,
     expectation,
+    hermit_command,
     verify_tier_from_json,
 )
 
@@ -131,6 +136,75 @@ check("guest < stripped < bitwise",
       L2_RANK["guest"] < L2_RANK["stripped"] < L2_RANK["bitwise"], repr(L2_RANK))
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
 
+print("case MODE — the summary and Hermit flags come from one comparison policy")
+stripped_summary = DEFAULT_VERIFY_POLICY.mode_summary()
+stripped_command = hermit_command(
+    Path("/hermit"), "ptrace", ["/bin/true"], "hello_stdout", True,
+    verify=True,
+)
+expected_prefix = ["/hermit", "run", *DEFAULT_VERIFY_POLICY.displayed_flags()]
+check("the policy supplies the exact Hermit command prefix",
+      stripped_command[:len(expected_prefix)] == expected_prefix,
+      repr(stripped_command))
+check("the summary prints the exact requested flags",
+      shlex.join(DEFAULT_VERIFY_POLICY.displayed_flags()) in stripped_summary,
+      stripped_summary)
+check("Stripped summary names the lossy policy", "Stripped" in stripped_summary,
+      stripped_summary)
+check("Stripped summary does NOT claim byte identity",
+      "byte-identical" not in stripped_summary, stripped_summary)
+check("Stripped summary does NOT label the mode L2",
+      "MODE: L2" not in stripped_summary and "below L2" in stripped_summary,
+      stripped_summary)
+check("Stripped command does NOT request --verify-strict",
+      "--verify-strict" not in stripped_command, repr(stripped_command))
+check("the default policy preserves the exact command flags",
+      DEFAULT_VERIFY_POLICY.hermit_flags ==
+      ("--verify", "--verify-allow", "both"),
+      repr(DEFAULT_VERIFY_POLICY.hermit_flags))
+
+canonical_policy = VerifyPolicy.checked(
+    hermit_flags=("--verify", "--verify-strict", "--verify-allow", "both"),
+    expected_non_kvm_tier="bitwise",
+    comparison_claim="canonical BitwiseInfoV1 INFO comparison",
+)
+canonical_summary = canonical_policy.mode_summary()
+check("a genuinely canonical policy still claims L2",
+      canonical_policy.assurance_label() == "L2" and "L2" in canonical_summary,
+      canonical_summary)
+check("the canonical bracket requests --verify-strict",
+      "--verify-strict" in canonical_policy.hermit_flags,
+      repr(canonical_policy.hermit_flags))
+for name, flags, tier in (
+    ("bitwise without --verify-strict",
+     ("--verify", "--verify-allow", "both"), "bitwise"),
+    ("--verify-strict without bitwise",
+     ("--verify", "--verify-strict", "--verify-allow", "both"), "stripped"),
+    ("missing exit-status handling", ("--verify",), "stripped"),
+):
+    try:
+        VerifyPolicy.checked(flags, tier, "invalid test policy")
+    except ValueError:
+        refused = True
+    else:
+        refused = False
+    check(f"policy refuses {name}", refused)
+
+check_only = subprocess.run(
+    [sys.executable, str(Path(__file__).with_name("run_matrix.py")),
+     "--check", "--verify", "--backend", "ptrace"],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+check("the public check-only path succeeds", check_only.returncode == 0,
+      check_only.stderr)
+check("the public output has no false L2 mode or ratchet label",
+      "MODE: L2" not in check_only.stdout and "RATCHET-L2" not in check_only.stdout,
+      check_only.stdout)
+check("the public ratchet names the actual --verify mode",
+      "RATCHET --verify ptrace:" in check_only.stdout, check_only.stdout)
+
 print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
 # Asserting bitwise before an INFO-tier comparator exists would red every
 # ptrace/DBT cell for a comparator limitation, not a guest defect.
@@ -157,14 +231,15 @@ from run_matrix import (  # noqa: E402
 )
 
 
-def emitted_row(evidence):
+def emitted_row(evidence, *, backend="dbt", detail="d"):
     with _tf.TemporaryDirectory(prefix="fallback-") as tmp:
         path = Path(tmp) / "sc.csv"
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
         append_parent_scorecard(
             path,
-            [{"test_name": "t", "backend": "dbt", "expectation": "stripped",
-              "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
+            [{"test_name": "t", "backend": backend, "expectation": "stripped",
+              "result": "PASS", "seconds": "1.0", "detail": detail,
+              "evidence": evidence}],
             strict=True, verify=True, probe_gaps=False)
         return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
 
@@ -187,6 +262,16 @@ check("a typed verdict DOES still claim deterministic=1 (not inert)",
       typed["deterministic"] == "1", repr(typed["deterministic"]))
 check("typed row carries its counts into the row",
       typed["compared_log_messages"] == "348|348", repr(typed["compared_log_messages"]))
+
+kvm = emitted_row(
+    {"tier": "guest", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
+     "bitwise_parity": "0", "compared_log_messages": ""},
+    backend="kvm",
+    detail="output+exit matched",
+)
+check("persisted KVM evidence is not mislabeled L2",
+      kvm["reason"].startswith("Guest-visible verification only") and
+      not kvm["reason"].startswith("L2"), repr(kvm["reason"]))
 
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:
