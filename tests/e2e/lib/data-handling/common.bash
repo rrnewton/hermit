@@ -24,7 +24,7 @@ function require_tools {
     done
 }
 
-require_tools cat cut grep mktemp readlink rm sha256sum sleep timeout
+require_tools cat cut grep jq mktemp readlink rm sha256sum sleep timeout
 
 function run_captured {
     local stdout=$1
@@ -103,6 +103,7 @@ function assert_deterministic_with_hermit {
     local evidence
     local stdout
     local stderr
+    local report
 
     if [[ ! -x $HERMIT_BIN ]]; then
         echo "Hermit binary is not executable: $HERMIT_BIN" >&2
@@ -112,10 +113,11 @@ function assert_deterministic_with_hermit {
     evidence=$(mktemp -d "${TMPDIR:-/tmp}/hermit-data-strict.XXXXXX")
     stdout=$evidence/stdout
     stderr=$evidence/stderr
+    report=$evidence/verify.json
 
     if ! run_captured "$stdout" "$stderr" \
         "$HERMIT_BIN" --log=info run \
-        --strict --verify \
+        --strict --verify --verify-json "$report" \
         --no-virtualize-cpuid --max-timeslice=disabled \
         -- "$@"; then
         echo "$label: strict Hermit verification failed" >&2
@@ -124,10 +126,19 @@ function assert_deterministic_with_hermit {
         rm -rf -- "$evidence"
         return 1
     fi
-    if ! grep -Fq 'Determinism verified' "$stdout" "$stderr"; then
-        echo "$label: Hermit exited without a determinism verdict" >&2
+    if ! jq -e '
+        (.verified == true)
+        and (.verdict == "matched")
+        and (.bitwise_parity == true)
+        and (.comparison.strictness == "canonical")
+        and (.comparison.compare_logs == true)
+        and ((.compared_log_messages.left // 0) > 0)
+        and ((.compared_log_messages.right // 0) > 0)
+    ' "$report" >/dev/null; then
+        echo "$label: Hermit did not publish canonical non-vacuous verification evidence" >&2
         cat "$stdout" >&2
         cat "$stderr" >&2
+        [[ ! -e $report ]] || cat "$report" >&2
         rm -rf -- "$evidence"
         return 1
     fi

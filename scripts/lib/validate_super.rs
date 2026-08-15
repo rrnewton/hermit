@@ -74,6 +74,26 @@ const BUILD_MEM_BYTES: i64 = 16 * 1024 * 1024 * 1024;
 /// Memory ceiling for a `cargo test` diagnostic node.
 const TEST_MEM_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 
+fn require_verification_report(command: String, report: &Path, canonical: bool) -> String {
+    let directory = shell_quote(&report.parent().unwrap_or(Path::new(".")).to_string_lossy());
+    let report = shell_quote(&report.to_string_lossy());
+    let predicate = if canonical {
+        "(.verified == true) and (.verdict == \"matched\") and \
+         (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+         (.comparison.compare_logs == true) and \
+         ((.compared_log_messages.left // 0) > 0) and \
+         ((.compared_log_messages.right // 0) > 0)"
+    } else {
+        "(.verified == true) and (.verdict == \"matched\") and \
+         (.bitwise_parity == false) and (.comparison.strictness == \"canonical\") and \
+         (.comparison.compare_logs == false) and (.compared_log_messages == null)"
+    };
+    format!(
+        "mkdir -p {directory} && rm -f {report} && {command} && \
+         jq -e '{predicate}' {report} >/dev/null"
+    )
+}
+
 /// One row of the mechanically extracted gate table.
 #[derive(Clone, Debug)]
 pub struct SuperGate {
@@ -216,7 +236,7 @@ pub enum StressProbe {
     PtracePipeline,
     PtraceRecordReplay,
     KvmVerify,
-    DbtVerify,
+    DbtStrict,
 }
 
 impl StressProbe {
@@ -226,7 +246,7 @@ impl StressProbe {
             StressProbe::PtracePipeline => "ptrace-pipeline",
             StressProbe::PtraceRecordReplay => "ptrace-record-replay",
             StressProbe::KvmVerify => "kvm-verify",
-            StressProbe::DbtVerify => "dbt-verify",
+            StressProbe::DbtStrict => "dbt-strict",
         }
     }
 
@@ -238,7 +258,7 @@ impl StressProbe {
     fn availability_job(self) -> Option<&'static str> {
         match self {
             StressProbe::KvmVerify => Some("kvm_available"),
-            StressProbe::DbtVerify => Some("dbt_available"),
+            StressProbe::DbtStrict => Some("dbt_available"),
             _ => None,
         }
     }
@@ -249,7 +269,7 @@ impl StressProbe {
     /// DBT stress have never actually been measured by `validate.sh`. Their
     /// first measurement is reported, not ratcheted.
     pub fn nonblocking(self) -> bool {
-        matches!(self, StressProbe::KvmVerify | StressProbe::DbtVerify)
+        matches!(self, StressProbe::KvmVerify | StressProbe::DbtStrict)
     }
 
     /// One repetition's shell command, reproducing `super_probe_command`
@@ -259,12 +279,24 @@ impl StressProbe {
     fn command(self, iteration: i64, release_bin: &str, debug_bin: &str, tmp: &Path) -> String {
         let rel = shell_quote(release_bin);
         let dbg = shell_quote(debug_bin);
+        let report = tmp.join(format!("super-{}-{iteration}.verify.json", self.slug()));
+        let report_arg = shell_quote(&report.to_string_lossy());
         match self {
-            StressProbe::PtraceStrictVerify => format!(
-                "{rel} run --strict --verify -- /bin/echo hermit-super-{iteration} </dev/null"
+            StressProbe::PtraceStrictVerify => require_verification_report(
+                format!(
+                    "{rel} run --strict --verify --verify-json {report_arg} -- \
+                     /bin/echo hermit-super-{iteration} </dev/null"
+                ),
+                &report,
+                true,
             ),
-            StressProbe::PtracePipeline => format!(
-                "{rel} run --strict --verify -- bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
+            StressProbe::PtracePipeline => require_verification_report(
+                format!(
+                    "{rel} run --strict --verify --verify-json {report_arg} -- \
+                     bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
+                ),
+                &report,
+                true,
             ),
             StressProbe::PtraceRecordReplay => {
                 let dir = shell_quote(
@@ -273,16 +305,29 @@ impl StressProbe {
                 // The bash removed the data dir before AND after, preserving the
                 // record phase's exit status across the second removal.
                 format!(
-                    "rm -rf {dir}; {rel} record start --verify --data-dir {dir} -- \
+                    "mkdir -p {} && rm -f {report_arg}; rm -rf {dir}; \
+                     {rel} record start --verify --verify-json {report_arg} --data-dir {dir} -- \
                      /bin/echo hermit-super-record-{iteration} </dev/null; \
-                     status=$?; rm -rf {dir}; exit $status"
+                     status=$?; rm -rf {dir}; [ $status -eq 0 ] || exit $status; \
+                     jq -e '(.verified == true) and (.verdict == \"matched\") and \
+                     (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+                     (.comparison.compare_logs == true) and \
+                     ((.compared_log_messages.left // 0) > 0) and \
+                     ((.compared_log_messages.right // 0) > 0)' {report_arg} >/dev/null",
+                    shell_quote(&report.parent().unwrap_or(Path::new(".")).to_string_lossy())
                 )
             }
-            StressProbe::KvmVerify => format!(
-                "{dbg} run --backend kvm --verify -- /bin/echo hermit-super-kvm-{iteration} </dev/null"
+            StressProbe::KvmVerify => require_verification_report(
+                format!(
+                    "{dbg} run --backend kvm --verify --verify-json {report_arg} -- \
+                     /bin/echo hermit-super-kvm-{iteration} </dev/null"
+                ),
+                &report,
+                false,
             ),
-            StressProbe::DbtVerify => format!(
-                "{dbg} run --backend dbt --verify -- /bin/echo hermit-super-dbt-{iteration} </dev/null"
+            StressProbe::DbtStrict => format!(
+                "{dbg} run --backend dbt --strict -- \
+                 /bin/echo hermit-super-dbt-{iteration} </dev/null"
             ),
         }
     }
@@ -293,7 +338,7 @@ pub const STRESS_PROBES: &[StressProbe] = &[
     StressProbe::PtracePipeline,
     StressProbe::PtraceRecordReplay,
     StressProbe::KvmVerify,
-    StressProbe::DbtVerify,
+    StressProbe::DbtStrict,
 ];
 
 /// The two backend-availability nodes.
@@ -319,7 +364,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             "dbt_available",
             "DBT backend availability (gates the DBT stress rows)",
             format!(
-                "{dbg} --log=info run --backend dbt --strict --verify -- \
+                "{dbg} --log=info run --backend dbt --strict -- \
                  /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
             ),
             vec![build_dep.to_string()],
@@ -344,7 +389,7 @@ pub fn stress_nodes(
     for probe in STRESS_PROBES {
         let stem = probe.job_stem();
         let base_dep = match probe {
-            StressProbe::KvmVerify | StressProbe::DbtVerify => debug_dep,
+            StressProbe::KvmVerify | StressProbe::DbtStrict => debug_dep,
             _ => release_dep,
         };
         let mut deps = vec![base_dep.to_string()];
@@ -617,6 +662,30 @@ pub fn self_test(root: &Path) -> Result<String, String> {
     one_kvm_miss[kvm_idx] = mk("superstress.kvm_verify_01", false);
     if count_blocking(&stress_rates(&one_kvm_miss, reps)) != 0 {
         return Err("stress verdict: a KVM repetition failure must stay NONBLOCKING".into());
+    }
+    let dbt_command = StressProbe::DbtStrict.command(
+        1,
+        "target/release/hermit",
+        "target/debug/hermit",
+        Path::new("target/validate-verify"),
+    );
+    if !dbt_command.contains("run --backend dbt --strict --")
+        || dbt_command.contains("--verify")
+        || dbt_command.contains("--verify-json")
+    {
+        return Err(format!(
+            "DBT super probe must measure strict execution without claiming verification: {dbt_command}"
+        ));
+    }
+    let dbt_available = availability_nodes("target/debug/hermit", "build.debug")
+        .into_iter()
+        .find(|step| step.tag() == "superstress.dbt_available")
+        .ok_or("DBT availability node missing")?;
+    if dbt_available.cmd.contains("--verify") {
+        return Err(format!(
+            "DBT availability must not depend on unavailable verification: {}",
+            dbt_available.cmd
+        ));
     }
     Ok(format!(
         "super: {} gate rows ({} synthetic, {nextest_rows} cargo-nextest + calibrated analyze), {refused} malformed tables refused, \

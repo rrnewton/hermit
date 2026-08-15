@@ -84,21 +84,32 @@ verify_guest() {
     verify_index=$((verify_index + 1))
     local stdout=$stress_workdir/verify-$verify_index.stdout
     local stderr=$stress_workdir/verify-$verify_index.stderr
+    local report=$stress_workdir/verify-$verify_index.json
+    rm -f -- "$report"
 
     printf '[hermit L2] %s (attempt %s/%s)\n' \
       "$label" "$attempt" "$verify_repetitions"
     if ! timeout --kill-after=10 "${verify_timeout}s" \
-      "$hermit_bin" --log info run --strict --verify -- "$@" \
+      "$hermit_bin" --log info run --strict --verify --verify-json "$report" -- "$@" \
       >"$stdout" 2>"$stderr"; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2
       printf 'error: %s failed under hermit run --strict --verify\n' "$label" >&2
       return 1
     fi
-    if ! grep -Fq 'Determinism verified' "$stdout" "$stderr"; then
+    if ! jq -e '
+      (.verified == true)
+      and (.verdict == "matched")
+      and (.bitwise_parity == true)
+      and (.comparison.strictness == "canonical")
+      and (.comparison.compare_logs == true)
+      and ((.compared_log_messages.left // 0) > 0)
+      and ((.compared_log_messages.right // 0) > 0)
+    ' "$report" >/dev/null 2>&1; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2
-      printf 'error: %s exited without the determinism marker\n' "$label" >&2
+      [[ ! -f $report ]] || cat "$report" >&2
+      printf 'error: %s did not publish canonical non-vacuous parity\n' "$label" >&2
       return 1
     fi
   done

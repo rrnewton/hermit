@@ -67,11 +67,19 @@ fi
 
 # Pre-create the output so both verification runs observe the same unlink.
 : > "$artifact_dir/verified.o"
+verify_report="$artifact_dir/verify.json"
+rm -f -- "$verify_report"
 # The single-quoted variables expand in the guest bash process.
 # shellcheck disable=SC2016
-"$hermit_bin" run --strict --verify --workdir "$fixture" -- \
+"$hermit_bin" run --strict --verify --verify-json "$verify_report" --workdir "$fixture" -- \
     bash -c 'output=$1; shift; rm -f "$output"; "$@" -o "$output"' \
     _ "$artifact_dir/verified.o" "${compile[@]}"
+jq -e '
+    (.verified == true) and (.verdict == "matched") and
+    (.bitwise_parity == true) and (.comparison.strictness == "canonical") and
+    ((.compared_log_messages.left // 0) > 0) and
+    ((.compared_log_messages.right // 0) > 0)
+' "$verify_report" >/dev/null
 
 printf 'native-one  %s\n' "$native_one"
 printf 'native-two  %s\n' "$native_two"

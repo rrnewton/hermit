@@ -131,7 +131,9 @@ guest_command=(
   -append 'console=ttyS0 panic=-1 rdinit=/init'
 )
 boot_command=("$hermit_bin" --log info run --strict -- "${guest_command[@]}")
-verify_command=("$hermit_bin" --log info run --strict --verify -- "${guest_command[@]}")
+verify_report=$run_dir/verify.json
+verify_command=("$hermit_bin" --log info run --strict --verify \
+  --verify-json "$verify_report" -- "${guest_command[@]}")
 
 setsid --wait "${boot_command[@]}" >"$boot_stdout" 2>"$boot_stderr" &
 active_pid=$!
@@ -211,8 +213,13 @@ cat "$verifier_stderr" >&2
 if ((status != 0)); then
   fail "QEMU strict L2 verification exited with status $status"
 fi
-grep -Fq ':: Success: deterministic. Determinism verified.' "$verifier_stderr" || \
-  fail "Hermit exited successfully without the L2 verification marker"
+jq -e '
+  (.verified == true) and (.verdict == "matched") and
+  (.bitwise_parity == true) and (.comparison.strictness == "canonical") and
+  (.comparison.compare_logs == true) and
+  ((.compared_log_messages.left // 0) > 0) and
+  ((.compared_log_messages.right // 0) > 0)
+' "$verify_report" >/dev/null || fail "typed verification did not establish canonical parity"
 stop_active_group
 
 printf 'QEMU strict L2 boot passed.\n'

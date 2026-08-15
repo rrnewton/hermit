@@ -3879,7 +3879,7 @@ fn summarize(
     }
     println!();
     println!(
-        "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
+        "Metric: current manifest contract. Verify, replay, and same-seed chaos require canonical typed evidence; passes on a supported canonical evidence path require bitwise_parity=true with nonzero compared INFO messages."
     );
     println!();
     if metadata.source_tree_dirty {

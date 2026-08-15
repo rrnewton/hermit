@@ -74,16 +74,14 @@ wc -l /tmp/good.log /tmp/broken.log
 hermit log-diff --syscall-history 5 /tmp/good.log /tmp/broken.log
 ```
 
-`--unsafe-strip-lines` is only a non-parity localization aid. It erases the
-virtual-time and syscall values that strict parity exists to compare; using it
-to make a failing parity diff pass is cheating.
+The old lossy log-diff flags have been deleted. Do not recreate their numeric,
+path, PID, or virtual-time erasure in a wrapper: those values are evidence.
 
-When the two logs come from different binaries/versions and `log-diff` can't
-pair them, fall back to canonicalizing (strip timestamps/PIDs/pointers) and
-plain `diff`, then read **only the first divergence** — everything after it is
-downstream noise. This more aggressively canonicalized comparison is only a
-localization aid, never verification or parity evidence. The eventual non-KVM
-fix must pass `--verify --verify-strict --verify-json` with
+When the two logs come from different binaries/versions and `log-diff` cannot
+pair them, use plain `diff` and read **only the first divergence** — everything
+after it is downstream noise. Do not strip timestamps embedded in payloads,
+PIDs, pointers, syscall values, or virtual time to force alignment. The eventual fix on a
+supported canonical evidence path must pass `--verify --verify-json` with
 `bitwise_parity: true`: exact exit/stdout/stderr plus INFO events under the
 declared `BitwiseInfoV1` wall-clock/address envelope.
 Anchor on the last matching `COMMIT turn`/`inbound syscall`
