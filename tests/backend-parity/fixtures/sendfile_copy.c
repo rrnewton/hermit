@@ -49,6 +49,22 @@ static void fail(const char *message) {
   exit(1);
 }
 
+/*
+ * The e2e harness has no golden-output field: its verify oracle is exit status
+ * plus cross-attempt determinism. A deterministically wrong stdout therefore
+ * passes unnoticed unless the guest checks itself, so every invariant below is
+ * asserted rather than merely printed.
+ */
+static int violations;
+
+static void expect(const char *name, long long observed, long long wanted) {
+  if (observed != wanted) {
+    fprintf(stderr, "invariant %s: observed %lld, wanted %lld\n", name, observed,
+            wanted);
+    violations++;
+  }
+}
+
 /* Create a temporary regular file, unlink its path, and return the open fd. */
 static int temp_file(void) {
   char template[] = "/tmp/sendfile_XXXXXX";
@@ -157,7 +173,15 @@ int main(void) {
   if (close(dst) != 0)
     fail("close dst");
 
+  /* The three observed invariants the header describes. `copied` is not
+     asserted: it is the literal 256 assigned above, so comparing it against 256
+     could never fail and would read as coverage without adding any. The two
+     source-offset invariants it stands for are already enforced by the
+     `fail("src offset after ...")` checks above. */
+  expect("checksum", (long long)checksum, 32640);
+  expect("pos", (long long)pos, 50);
+  expect("own_offset_kept", (long long)own_offset_kept, 1);
   printf("sendfile copied=%zu checksum=%ld pos=%ld own_offset_kept=%d\n", copied,
          checksum, (long)pos, own_offset_kept);
-  return 0;
+  return violations == 0 ? 0 : 1;
 }
