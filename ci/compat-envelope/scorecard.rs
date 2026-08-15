@@ -48,6 +48,8 @@ Commands:
       selected regression cell in the named lanes. The default is both lanes.
   self-test
       Exercise accepting and refusing result sets without running a guest.
+  self-test-and-check
+      Run the self-test and exact tracked-file check in one forced compilation.
   --help
       Show this text.
 
@@ -269,10 +271,10 @@ fn run() -> Result<(), String> {
         }
         "check" => {
             no_more(&mut args)?;
-            check_tracked(&root)?;
+            let derived = check_tracked(&root)?;
             println!(
                 "compatibility scorecard: tracked table and {} cells are current",
-                derive(&root)?.population.len()
+                derived.population.len()
             );
         }
         "update" => {
@@ -344,6 +346,15 @@ fn run() -> Result<(), String> {
         "self-test" => {
             no_more(&mut args)?;
             self_test()?;
+        }
+        "self-test-and-check" => {
+            no_more(&mut args)?;
+            self_test()?;
+            let derived = check_tracked(&root)?;
+            println!(
+                "compatibility scorecard: tracked table and {} cells are current",
+                derived.population.len()
+            );
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
     }
@@ -734,13 +745,13 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     Ok(text)
 }
 
-fn check_tracked(root: &Path) -> Result<(), String> {
+fn check_tracked(root: &Path) -> Result<Derived, String> {
     let derived = derive(root)?;
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
     let cells = tracked_from(&derived, load_existing(root)?, false, false)?;
     compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
-    Ok(())
+    Ok(derived)
 }
 
 fn compare_file(path: &Path, expected: &str) -> Result<(), String> {
