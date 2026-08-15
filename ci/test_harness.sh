@@ -819,60 +819,170 @@ function assert_safe_ci_scope_enforcement_brackets {
             "$tmp/ci/compat-envelope/pressure-test.rs"
         assert_safe_ci_scope_enforcement "$tmp"
 
-        # Compile and execute the helper's own decision path from the mutated
-        # copy. These are behavior mutations: each replaces one required false
-        # observation with true, and the probe must then fail because the
-        # two-sided self-test sees the planted refusal disappear.
+        # Compile the original helper and all five behavior mutations together.
+        # Each mutation replaces one required false observation with true; the
+        # shared probe requires the initial and final positive results and all
+        # five refusals from one forced Rust compilation.
+        mkdir -p "$tmp/scope-helpers"
+        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$tmp/scope-helpers/original.rs"
+        cp "$tmp/scope-helpers/original.rs" "$tmp/scope-helpers/discarded-result.rs"
+        cp "$tmp/scope-helpers/original.rs" "$tmp/scope-helpers/live-containment.rs"
+        cp "$tmp/scope-helpers/original.rs" "$tmp/scope-helpers/outer-limits.rs"
+        cp "$tmp/scope-helpers/original.rs" "$tmp/scope-helpers/runtime-max.rs"
+        cp "$tmp/scope-helpers/original.rs" "$tmp/scope-helpers/per-step-cgroups.rs"
+
+        perl -0pi -e \
+            's/pub fn propagate_result\(result: Result<BoxedCgroups, u8>\) -> Result<BoxedCgroups, u8> \{\n    result\n\}/pub fn propagate_result(result: Result<BoxedCgroups, u8>) -> Result<BoxedCgroups, u8> {\n    let _ = result;\n    Ok(None)\n}/' \
+            "$tmp/scope-helpers/discarded-result.rs"
+        sed -i '0,/        observations.live_containment,/s//        true,/' \
+            "$tmp/scope-helpers/live-containment.rs"
+        sed -i \
+            '0,/        observations.outer_memory_swap_and_oom_group,/s//        true,/' \
+            "$tmp/scope-helpers/outer-limits.rs"
+        sed -i \
+            '0,/        runtime_readback_satisfies(verify_runtime, observations.runtime_max),/s//        true,/' \
+            "$tmp/scope-helpers/runtime-max.rs"
+        sed -i '0,/        observations.per_step_cgroups,/s//        true,/' \
+            "$tmp/scope-helpers/per-step-cgroups.rs"
+
         cat >"$tmp/scope-probe.rs" <<EOF
 #!/usr/bin/env -S rust-script --force
 //! \`\`\`cargo
 //! [dependencies]
 //! safe-ci-dag-runner = { path = "$ROOT_DIR/agent-utils/rs/safe-ci-dag-runner" }
 //! \`\`\`
-#[path = "scripts/lib/safe_ci_scope.rs"]
-mod safe_ci_scope;
+#[path = "scope-helpers/original.rs"]
+mod original;
+#[path = "scope-helpers/discarded-result.rs"]
+mod discarded_result;
+#[path = "scope-helpers/live-containment.rs"]
+mod live_containment;
+#[path = "scope-helpers/outer-limits.rs"]
+mod outer_limits;
+#[path = "scope-helpers/runtime-max.rs"]
+mod runtime_max;
+#[path = "scope-helpers/per-step-cgroups.rs"]
+mod per_step_cgroups;
+
+fn accept<T, F>(label: &str, run: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<T, String> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(problem)) => Err(format!("{label} positive refused: {problem}")),
+        Err(_) => Err(format!("{label} positive panicked")),
+    }
+}
+
+fn refuse<T, F>(label: &str, run: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<T, String> + std::panic::UnwindSafe,
+{
+    match std::panic::catch_unwind(run) {
+        Ok(Ok(_)) => Err(format!("{label} mutation was accepted")),
+        Ok(Err(_)) | Err(_) => Ok(()),
+    }
+}
+
+fn run() -> Result<(), String> {
+    accept("initial", original::self_test)?;
+    refuse("discarded Result", discarded_result::self_test)?;
+    refuse("live containment", live_containment::self_test)?;
+    refuse("outer limits", outer_limits::self_test)?;
+    refuse("RuntimeMax", runtime_max::self_test)?;
+    refuse("per-step cgroups", per_step_cgroups::self_test)?;
+    accept("final", original::self_test)?;
+    println!("safe-ci scope behavior probe: 2 positive and 5 refusal outcomes pass in one forced compilation");
+    Ok(())
+}
 
 fn main() {
-    if let Err(problem) = safe_ci_scope::self_test() {
+    if let Err(problem) = run() {
         eprintln!("{problem}");
         std::process::exit(1);
     }
 }
 EOF
-        _scope_probe() (
+        local scope_output
+        scope_output=$(
             cd "$tmp"
             XDG_CACHE_HOME="$tmp/cache" CARGO_TARGET_DIR="$tmp/target" \
-                rust-script --force "$tmp/scope-probe.rs" >/dev/null 2>&1
-        )
-        _scope_probe || die "safe-ci scope behavior probe refused the unmodified helper"
-
-        local helper="$tmp/scripts/lib/safe_ci_scope.rs"
-        perl -0pi -e \
-            's/pub fn propagate_result\(result: Result<BoxedCgroups, u8>\) -> Result<BoxedCgroups, u8> \{\n    result\n\}/pub fn propagate_result(result: Result<BoxedCgroups, u8>) -> Result<BoxedCgroups, u8> {\n    let _ = result;\n    Ok(None)\n}/' \
-            "$helper"
-        ! _scope_probe || die "safe-ci scope behavior probe accepted a discarded helper Result"
-        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
-
-        sed -i '0,/        observations.live_containment,/s//        true,/' "$helper"
-        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed live containment"
-        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
-
-        sed -i \
-            '0,/        observations.outer_memory_swap_and_oom_group,/s//        true,/' "$helper"
-        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed outer-limit readback"
-        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
-
-        sed -i \
-            '0,/        runtime_readback_satisfies(verify_runtime, observations.runtime_max),/s//        true,/' "$helper"
-        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed RuntimeMax readback"
-        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
-
-        sed -i '0,/        observations.per_step_cgroups,/s//        true,/' "$helper"
-        ! _scope_probe || die "safe-ci scope behavior probe accepted bypassed per-step cgroups"
-        cp "$ROOT_DIR/scripts/lib/safe_ci_scope.rs" "$helper"
-        _scope_probe || die "safe-ci scope behavior probe did not recover after mutations"
-        unset -f _scope_probe
+                rust-script --force "$tmp/scope-probe.rs" 2>&1
+        ) || {
+            printf '%s\n' "$scope_output" >&2
+            die "safe-ci scope behavior probe did not preserve all seven outcomes"
+        }
+        [[ $(tail -1 <<<"$scope_output") == \
+           'safe-ci scope behavior probe: 2 positive and 5 refusal outcomes pass in one forced compilation' ]] ||
+            die "safe-ci scope behavior probe did not report its exact work and outcomes"
+        printf '%s\n' "$(tail -1 <<<"$scope_output")"
     )
+}
+
+function gate_manifest_rust_compilation_work {
+    local harness=$1 pressure_source=$2
+    local validate_body scope_body self_test_body
+    local outer_scorecard scope pressure_entry pressure_scorecard scorecard total
+    validate_body=$(sed -n '/^    validate)/,/^        ;;/p' "$harness")
+    scope_body=$(sed -n \
+        '/^function assert_safe_ci_scope_enforcement_brackets {/,/^function gate_manifest_rust_compilation_work/p' \
+        "$harness")
+    self_test_body=$(sed -n '/^fn self_test(root: &Path)/,/^}/p' "$pressure_source")
+
+    # These are literal source spellings; local expansion would invalidate the audit.
+    # shellcheck disable=SC2016
+    outer_scorecard=$(grep -Fc \
+        '"$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test-and-check' \
+        <<<"$validate_body")
+    # shellcheck disable=SC2016
+    scope=$(grep -Fc 'rust-script --force "$tmp/scope-probe.rs"' <<<"$scope_body")
+    # shellcheck disable=SC2016
+    pressure_entry=$(grep -Fc \
+        '"$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test' \
+        <<<"$validate_body")
+    pressure_scorecard=$(grep -Fc \
+        'let checked_scorecard = check_scorecard(root)?;' <<<"$self_test_body")
+    scorecard=$((outer_scorecard + pressure_scorecard))
+    total=$((scorecard + scope + pressure_entry))
+
+    [[ $outer_scorecard == 1 && $pressure_scorecard == 1 && $scorecard == 2 && \
+       $scope == 1 && $pressure_entry == 1 && $total == 4 ]] || {
+        printf 'manifest forced Rust compilation work drifted: scorecard=%d (outer=%d pressure-self-test=%d) safe-ci-scope=%d pressure-test=%d total=%d\n' \
+            "$scorecard" "$outer_scorecard" "$pressure_scorecard" \
+            "$scope" "$pressure_entry" "$total" >&2
+        return 1
+    }
+    [[ $(grep -Fc 'write_plan(' <<<"$self_test_body") == 0 && \
+       $(grep -Fc 'write_plan_after_scorecard_check(' <<<"$self_test_body") == 7 ]] || {
+        printf 'pressure self-test no longer reuses one checked scorecard across all seven plan cases\n' >&2
+        return 1
+    }
+    printf 'manifest forced Rust compilation work: scorecard=2 safe-ci-scope=1 pressure-test=1 total=4 (instrumented base: 9+7+1=17)\n'
+}
+
+function assert_gate_manifest_rust_compilation_work {
+    local harness="$ROOT_DIR/ci/test_harness.sh"
+    local pressure_source="$ROOT_DIR/ci/compat-envelope/pressure-test.rs"
+    local scratch
+    gate_manifest_rust_compilation_work "$harness" "$pressure_source" ||
+        die "gate.manifest Rust compilation work is not consolidated to 4 launches"
+
+    scratch=$(mktemp -d) || die "manifest compilation work bracket: mktemp failed"
+    cp "$harness" "$scratch/test_harness.sh"
+    cp "$pressure_source" "$scratch/pressure-test.rs"
+
+    sed -i '/scorecard.rs" self-test-and-check/p' "$scratch/test_harness.sh"
+    ! gate_manifest_rust_compilation_work \
+        "$scratch/test_harness.sh" "$scratch/pressure-test.rs" >/dev/null 2>&1 ||
+        die "manifest compilation work audit accepted an extra forced scorecard compilation"
+
+    cp "$harness" "$scratch/test_harness.sh"
+    sed -i '/pressure-test.rs" self-test/d' "$scratch/test_harness.sh"
+    ! gate_manifest_rust_compilation_work \
+        "$scratch/test_harness.sh" "$scratch/pressure-test.rs" >/dev/null 2>&1 ||
+        die "manifest compilation work audit accepted a missing pressure-test entrypoint"
+    rm -rf -- "$scratch"
 }
 
 # The strict-compat lane used to permit 1800s internally inside a 900s hosted
@@ -1862,6 +1972,7 @@ EOF
     assert_node_budgets_fit_their_job_kill
     assert_budget_guard_brackets
     assert_safe_ci_scope_enforcement_brackets
+    assert_gate_manifest_rust_compilation_work
 
     # This validation command contains real concurrent rustc probes. Three warm
     # samples measured 71.44-73.84s wall, with 58.36-60.38s CPU. Keep both lane
@@ -3988,8 +4099,7 @@ case "$subcommand" in
         audit_inventory
         audit_ci_correspondence
         "$ROOT_DIR/tests/manifest-cli.rs" self-test
-        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test
-        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" check
+        "$ROOT_DIR/ci/compat-envelope/scorecard.rs" self-test-and-check
         "$ROOT_DIR/ci/compat-envelope/pressure-test.rs" self-test
         echo "PASS: ${#TESTS[@]} E2E tests have valid syntax and centralized schema-v2 manifests"
         emit_required_plan | jq -s '{tests:(map(.test)|unique|length),required_cells:length,by_mode:(group_by(.mode)|map({key:.[0].mode,value:length})|from_entries)}'
