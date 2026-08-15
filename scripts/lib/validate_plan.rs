@@ -57,9 +57,26 @@ use crate::validate_corpus::CorpusPaths;
 /// through `with-proxy`, so it needs more than a trivial ceiling but must not
 /// inherit a lane-sized one.
 const PREFLIGHT_TIMEOUT_S: i64 = 900;
-/// CPU budget for preflight. These gates are I/O-bound (clone, fetch, a small
-/// rustc); a tight CPU ceiling catches a spin without flaking under host load.
-const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
+/// CPU budget for the submodule and Reverie-pin preflight gates. They remain
+/// dominated by clone/fetch and one small checker compile, so 300 s is still a
+/// finite spin guard with ample observed headroom. `gate.manifest` is no longer
+/// in this cost class; it has a separately measured budget below.
+pub(crate) const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
+/// Current productive-work allowance for `gate.manifest`. Recent hard-green
+/// runs consumed 259--265 CPU-s, while a cold run exhausted the former 300 s
+/// ceiling during an active scorecard/Serde compile. 350 s is 32% above the
+/// highest completed sample and 17% beyond that truncation point.
+pub(crate) const MANIFEST_WORK_ALLOWANCE_S: i64 = 350;
+/// Keep ordinary qualifying work at or below 70% of the CPU ceiling. The other
+/// 30% absorbs compiler/cache/scheduling variance without turning the guard
+/// into a non-cap. This gate's manifest and pressure-runner surface can keep
+/// growing; remeasure and revisit the allowance when successful runs approach
+/// 70% rather than waiting for another timeout.
+pub(crate) const MANIFEST_TARGET_MAX_UTIL_PERCENT: i64 = 70;
+/// `ceil(350 / 0.70) = 500` CPU-s.
+pub(crate) const MANIFEST_CPU_TIMEOUT_S: i64 =
+    (MANIFEST_WORK_ALLOWANCE_S * 100 + MANIFEST_TARGET_MAX_UTIL_PERCENT - 1)
+        / MANIFEST_TARGET_MAX_UTIL_PERCENT;
 /// Memory ceiling for a preflight gate. `git submodule update --recursive` on
 /// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
 /// non-cap.
@@ -283,7 +300,7 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             "./ci/test_harness.sh validate".to_string(),
             vec!["pre.reverie_pin".to_string()],
             PREFLIGHT_TIMEOUT_S,
-            PREFLIGHT_CPU_TIMEOUT_S,
+            MANIFEST_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
         ),
     ]

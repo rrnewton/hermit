@@ -847,6 +847,48 @@ fn self_test() -> Result<(), String> {
     if scope_grace_s(600) != 60 || 600 + scope_grace_s(600) >= 720 {
         return Err("run-timeout scope backstop no longer satisfies 600 < 660 < 720".into());
     }
+    // Resource-budget bracket: the measured manifest allowance must be
+    // accepted at the stated utilization target, while the former 300 s cap
+    // must be refused by the same predicate. The two genuinely cheap preflight
+    // gates must not inherit the manifest increase.
+    let preflight = validate_plan::preflight_nodes(std::path::Path::new("/inert"), false);
+    let cpu_for = |tag: &str| {
+        preflight
+            .iter()
+            .find(|step| step.tag() == tag)
+            .map(|step| step.cpu_timeout)
+            .ok_or_else(|| format!("preflight budget bracket: missing {tag}"))
+    };
+    for tag in ["pre.submodules", "pre.reverie_pin"] {
+        let actual = cpu_for(tag)?;
+        if actual != validate_plan::PREFLIGHT_CPU_TIMEOUT_S {
+            return Err(format!(
+                "preflight budget bracket: {tag} inherited {actual}s, expected unchanged {}s",
+                validate_plan::PREFLIGHT_CPU_TIMEOUT_S
+            ));
+        }
+    }
+    let manifest_cap = cpu_for("gate.manifest")?;
+    let work = validate_plan::MANIFEST_WORK_ALLOWANCE_S;
+    let target = validate_plan::MANIFEST_TARGET_MAX_UTIL_PERCENT;
+    if manifest_cap != validate_plan::MANIFEST_CPU_TIMEOUT_S
+        || work * 100 > manifest_cap * target
+    {
+        return Err(format!(
+            "manifest budget bracket: {work}s allowance exceeds {target}% of {manifest_cap}s"
+        ));
+    }
+    if work * 100 <= validate_plan::PREFLIGHT_CPU_TIMEOUT_S * target {
+        return Err(
+            "manifest budget bracket: former 300s cap unexpectedly satisfies the 70% target"
+                .into(),
+        );
+    }
+    println!(
+        "  manifest budget: {work}s allowance / {manifest_cap}s cap = {target}% target; \
+         former {}s cap refused; cheap preflight caps unchanged",
+        validate_plan::PREFLIGHT_CPU_TIMEOUT_S
+    );
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
         || cold_compat.hint.classification != safe_ci_dag_runner::model::StepClass::CpuBound
