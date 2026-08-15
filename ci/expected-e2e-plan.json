@@ -106,6 +106,13 @@
       "test": "backend-parity-c/epoll-readiness"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/event-delivery-ordering"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -160,6 +167,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/fchmodat2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fcntl-owner"
     },
     {
       "backend": "ptrace",
@@ -370,6 +384,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/personality-domain"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-capacity"
     },
     {
       "backend": "ptrace",

@@ -2697,16 +2697,6 @@
       "test": "backend-parity-c/event-delivery-ordering",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/event-delivery-ordering",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -2716,6 +2706,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/event-delivery-ordering",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/event-delivery-ordering",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -3817,8 +3817,8 @@
       "test": "backend-parity-c/fcntl-owner",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -9737,8 +9737,8 @@
       "test": "backend-parity-c/pipe-capacity",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

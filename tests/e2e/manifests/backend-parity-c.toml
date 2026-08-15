@@ -4656,13 +4656,12 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM ElfExecutor does not implement the F_GETPIPE_SZ/F_SETPIPE_SZ pipe-capacity fcntl commands and returns a deterministic error"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -4907,13 +4906,12 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "KVM ElfExecutor returns a deterministic error for the F_SETOWN/F_GETOWN async-I/O owner fcntl family, so the SIGIO/SIGURG owner round-trip is unavailable"
 sabre = "Not evaluated in the source backend-parity matrix; qualify SaBRe separately"
-liteinst = "Not evaluated in the source backend-parity matrix; qualify LiteInst separately"
 
 [test.modes.naked]
 ci = false
@@ -5415,13 +5413,12 @@ cflags = ["-D_GNU_SOURCE"]
 
 [test.modes.verify]
 ci = true
-backends_enabled = ["ptrace"]
+backends_enabled = ["ptrace", "liteinst"]
 assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change"
 kvm = "KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family"
 sabre = "Not yet qualified for inotify/signalfd event delivery"
-liteinst = "Not yet qualified for inotify/signalfd event delivery"
 
 [test.modes.naked]
 ci = false
