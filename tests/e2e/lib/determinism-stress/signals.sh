@@ -33,5 +33,5 @@ for scenario in "${scenarios[@]}"; do
   fi
 done
 
-((failures == 0)) || fail "$failures signal target(s) failed strict L2"
+((failures == 0)) || fail "$failures signal target(s) failed verification"
 stress_success "signal delivery ordering"

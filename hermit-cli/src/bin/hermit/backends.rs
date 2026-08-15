@@ -1048,6 +1048,7 @@ pub(super) fn run_dbt(
             compare_logs: true,
             diagnostic_full_trace: verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
+            virtualize_time: config.virtualize_time,
             // A backend-observed divergence needs the same retained evidence
             // as a divergence found by the ordinary comparator.
             keep_logs: keep_logs || branch_clock_diverged,
@@ -1501,6 +1502,7 @@ mod tests {
                 false,
                 true,
                 RecordEnvelope::all_records_v1().policy(),
+                true,
             ),
             compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
             dbt_counted_branches: None,

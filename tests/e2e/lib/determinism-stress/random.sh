@@ -19,5 +19,5 @@ if ! verify_guest "Python PRNGs" "$python" -c "$python_program"; then
   failures=$((failures + 1))
 fi
 
-((failures == 0)) || fail "$failures random source(s) failed strict L2"
+((failures == 0)) || fail "$failures random source(s) failed verification"
 stress_success "random number generation"
