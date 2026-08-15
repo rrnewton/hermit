@@ -666,6 +666,13 @@
       "test": "c-programs/cachestat-enosys"
     },
     {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -772,6 +779,13 @@
     },
     {
       "backend": "dbt",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "liteinst",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
