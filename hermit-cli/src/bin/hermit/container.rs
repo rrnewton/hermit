@@ -6,11 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::any::Any;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::panic;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
+use anyhow::anyhow;
 use hermit::Context;
 use hermit::Error;
 use hermit::SerializableError;
@@ -258,6 +263,116 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
     Ok((container, identity_guard))
 }
 
+/// Where the most recent panic inside the container child happened.
+///
+/// `catch_unwind` hands back the panic PAYLOAD but not the LOCATION, and the
+/// location is the more useful half of a divergence report. A panic hook is the
+/// only place the location is available, so record it there and read it back
+/// after the unwind.
+static PANIC_LOCATION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn panic_location() -> &'static Mutex<Option<String>> {
+    PANIC_LOCATION.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the location-recording hook, once, in the container child.
+///
+/// The previous hook is still called, so the ordinary `thread '...' panicked
+/// at ...` report continues to reach stderr; this only ADDS a machine-readable
+/// copy of the location.
+fn install_panic_location_hook() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if let Some(location) = info.location() {
+                let recorded = format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                );
+                if let Ok(mut slot) = panic_location().lock() {
+                    *slot = Some(recorded);
+                }
+            }
+            previous(info);
+        }));
+    });
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<panic payload was not a string>".to_string()
+    }
+}
+
+/// Run `f`, converting a panic into an ordinary error.
+///
+/// WHY THIS EXISTS. The container child's entry point is `extern "C"` (see
+/// `reverie_process::clone::clone_with_stack`) and is therefore NOUNWIND. A
+/// panic that reaches it hits `panic_cannot_unwind` and ABORTS, and the parent
+/// reports that abort as `Signaled(SIGSEGV, true)` -- indistinguishable from a
+/// genuine memory fault, with the cause carried nowhere except stderr. That has
+/// already sent one investigation hunting a bad dereference that did not exist.
+/// Catching the unwind HERE, in Hermit's own closure, means the panic never
+/// reaches the nounwind frame and instead travels the result channel
+/// `Container::run` already provides.
+///
+/// This deliberately does NOT change how a REAL fault behaves: `catch_unwind`
+/// cannot catch `SIGSEGV`, so a genuine memory fault in the child still aborts
+/// and is still reported as a signal. Keeping those two outcomes
+/// distinguishable is the point of the change, so both directions are covered
+/// by tests.
+/// Deliberate fault injection for the two-directional test below. INERT unless
+/// `HERMIT_TEST_CONTAINER_CHILD_FAULT` is set, so it cannot fire in normal use.
+///
+/// Both arms are required, and the SECOND is the one that gives the test its
+/// force: if a real fault stopped reporting as a signal after this change, the
+/// change would have made a genuine memory error indistinguishable from a
+/// caught panic, which is the same blindness in the other direction.
+fn inject_test_fault() {
+    match std::env::var("HERMIT_TEST_CONTAINER_CHILD_FAULT")
+        .ok()
+        .as_deref()
+    {
+        Some("panic") => panic!("deliberate container-child panic for fault-injection testing"),
+        Some("segv") => {
+            // A genuine memory fault, NOT a panic. catch_unwind must not touch this.
+            unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
+        }
+        _ => {}
+    }
+}
+
+fn catch_child_panic<F, T>(f: &mut F) -> Result<T, Error>
+where
+    F: FnMut() -> Result<T, Error>,
+{
+    install_panic_location_hook();
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        inject_test_fault();
+        f()
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let location = panic_location()
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            Err(anyhow!(
+                "panic in container child at {location}: {}",
+                panic_message(&*payload)
+            ))
+        }
+    }
+}
+
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
@@ -266,13 +381,44 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
     Ok(container
-        .run(|| f().map_err(SerializableError::from))
+        .run(|| catch_child_panic(&mut f).map_err(SerializableError::from))
         .context("Sandbox container exited unexpectedly")??)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_panic_becomes_an_error_naming_message_and_location() {
+        let mut f = || -> Result<(), Error> { panic!("divergence detail that must survive") };
+        let error = catch_child_panic(&mut f).expect_err("a panic must not be reported as success");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("divergence detail that must survive"),
+            "panic message was lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("container.rs:"),
+            "panic location was lost, which is the half catch_unwind does not give us: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ordinary_results_pass_through_unchanged() {
+        let mut ok = || -> Result<u32, Error> { Ok(7) };
+        assert_eq!(catch_child_panic(&mut ok).unwrap(), 7);
+        let mut err = || -> Result<u32, Error> { Err(anyhow!("a plain error, not a panic")) };
+        let rendered = format!("{:#}", catch_child_panic(&mut err).unwrap_err());
+        assert!(
+            rendered.contains("a plain error, not a panic"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("panic in container child"),
+            "an ordinary error must not be relabelled as a panic: {rendered}"
+        );
+    }
 
     // The frozen group database must always resolve the overflow GID so that
     // guest group-name lookups (e.g. `groups`) do not depend on nondeterministic
