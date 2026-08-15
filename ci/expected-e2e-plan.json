@@ -442,6 +442,13 @@
       "test": "backend-parity-c/poll-readiness"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/prctl-pdeathsig"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -489,6 +496,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/renameat2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/robust-list"
     },
     {
       "backend": "ptrace",
