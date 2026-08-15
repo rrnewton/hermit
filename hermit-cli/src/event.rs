@@ -230,21 +230,25 @@ pub struct TimespecEvent {
 /// Records the guest-visible outputs of a `poll` call.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PollEvent {
-    /// The complete list of file descriptors. Note that only the `revents` field
-    /// in `pollfd` is an output of the syscall. Technically, we only need to
-    /// store the `revents` field, but it is easier to store everything for
-    /// replay purposes (only one simple call to `process_vm_writev` is needed).
-    /// It is possible to do a vectored write, skipping the other fields, but
-    /// that is a little more complicated. For programs that need to wait on many
-    /// file descriptors at once, they should be using `epoll` instead.
-    pub fds: Vec<PollFd>,
-
-    /// The return value (i.e., the number of items in the above list that have
-    /// been updated).
+    /// The exact return value or errno observed while recording.
     ///
-    /// A value of 0 indicates that the call timed out and no file descriptors
-    /// were ready.
-    pub updated: usize,
+    /// Carried INSIDE the event, not outside it. Previously an error return was
+    /// recorded as a bare `Err` with no event at all, so replay had nothing to
+    /// restore and returned the errno before writing anything back. Linux can
+    /// write some `revents` entries and THEN fault, and those writes are
+    /// guest-visible, so the outputs have to survive an error result.
+    pub result: Result<i64, Errno>,
+
+    /// Whether the guest supplied a non-null pollfd pointer.
+    pub fds_pointer_present: bool,
+
+    /// The complete post-kernel pollfd output when the guest supplied a non-null
+    /// pollfd pointer and Linux reached pollfd copyout. Early errors retain the
+    /// pointer-presence field above but store no pollfd values.
+    ///
+    /// Only the `revents` field is an output, but the whole array is stored so
+    /// replay is one `process_vm_writev`.
+    pub fds: Option<Vec<PollFd>>,
 }
 
 /// Records every guest-visible output of a raw `ppoll` call.
