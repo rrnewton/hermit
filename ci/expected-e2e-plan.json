@@ -316,6 +316,13 @@
       "test": "backend-parity-c/mincore-residency"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mkdir-rmdir"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -349,6 +356,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/no-new-privs-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/o-tmpfile-anon"
     },
     {
       "backend": "ptrace",
@@ -442,6 +456,13 @@
       "test": "backend-parity-c/readdir-entries"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/record-lock"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -489,6 +510,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/sendfile-copy"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/set-tid-address"
     },
     {
       "backend": "ptrace",
@@ -568,6 +596,13 @@
       "test": "backend-parity-c/statx-metadata"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/symlink-ops"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -594,6 +629,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/thp-disable"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/umask-mode"
     },
     {
       "backend": "ptrace",
