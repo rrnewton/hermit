@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -35,6 +36,7 @@
 #endif
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 2 };
   int ok = 0;
 
   /* PR_GET_SECCOMP: query the calling thread's seccomp mode. */
@@ -58,5 +60,5 @@ int main(void) {
   }
 
   printf("seccomp ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

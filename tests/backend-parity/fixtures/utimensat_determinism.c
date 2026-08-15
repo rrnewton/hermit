@@ -23,6 +23,7 @@
 #include <time.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     char dir[] = "/tmp/utimensat_determinism.XXXXXX";
     if (!mkdtemp(dir)) {
         printf("utimensat MKDTEMP_FAIL\n");
@@ -68,5 +69,5 @@ int main(void) {
     unlink(path);
     rmdir(dir);
     printf("utimensat ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

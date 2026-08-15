@@ -38,6 +38,7 @@ static long path_mode(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   char path[] = "/tmp/fchmod_bits_XXXXXX";
   int fd = mkstemp(path);
   if (fd < 0) {
@@ -84,5 +85,5 @@ int main(void) {
   }
 
   printf("fchmod_bits mode=%ld ok=%d\n", mode, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

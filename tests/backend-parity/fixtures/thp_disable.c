@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 
 /*
@@ -36,6 +37,7 @@
 #endif
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
   int ok = 0;
 
   /* Disable transparent hugepages for this process and read the flag back. */
@@ -67,5 +69,5 @@ int main(void) {
   }
 
   printf("thp ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
