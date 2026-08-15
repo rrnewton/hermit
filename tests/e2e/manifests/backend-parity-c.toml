@@ -1554,6 +1554,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
@@ -2723,6 +2724,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
@@ -2956,6 +2958,7 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
+assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
