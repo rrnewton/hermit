@@ -2872,10 +2872,16 @@ impl RunOpts {
             ComparedRun {
                 output: &out1,
                 log: log1_path,
+                // Accurate on this path: `verify` calls `run_verify` twice, and
+                // each call builds its own container and guest command and
+                // reaches a separate tracer spawn, so these really are two
+                // fresh executions of the guest.
+                label: "run 1",
             },
             ComparedRun {
                 output: &out2,
                 log: log2_path,
+                label: "run 2",
             },
             ComparisonOptions {
                 success_message: if kvm_output_only {
