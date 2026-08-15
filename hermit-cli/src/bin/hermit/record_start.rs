@@ -37,6 +37,7 @@ use reverie::process::Mount;
 use reverie::process::MountFlags;
 
 use super::container::IdentityGuard;
+use super::container::RunGuarded;
 use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
 use super::run::is_elf_file;
@@ -406,7 +407,7 @@ impl StartOpts {
                     let data = hermit.create_recording_dir()?;
                     let data_path = data.path().to_path_buf();
                     let exit_status = container
-                        .run(|| {
+                        .run_guarded(|| {
                             // Namespace init: arm the stop guards before anything else.
                             crate::container::arm_container_init_guards()?;
                             let _guard = global.init_tracing();
@@ -420,7 +421,7 @@ impl StartOpts {
                     hermit.commit_recording(data, exit_status)?
                 }
                 None => container
-                    .run(|| {
+                    .run_guarded(|| {
                         // Namespace init: arm the stop guards before anything else.
                         crate::container::arm_container_init_guards()?;
                         let _guard = global.init_tracing();
@@ -467,7 +468,7 @@ impl StartOpts {
         let record_timeout = self.record_timeout();
 
         let recording = recording_container
-            .run(|| {
+            .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global1.init_tracing();
@@ -489,7 +490,7 @@ impl StartOpts {
         // Replay the recording.
         let (mut replay_container, _replay_identity_guard) = deterministic_container()?;
         let replay = replay_container
-            .run(|| {
+            .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global2.init_tracing();
@@ -544,7 +545,7 @@ impl StartOpts {
         let record_timeout = self.record_timeout();
 
         let _result = container
-            .run(|| {
+            .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
@@ -602,7 +603,7 @@ impl StartOpts {
         // that restriction be lifted.
         let (mut container, _identity_guard) = deterministic_container()?;
         let result = container
-            .run(|| {
+            .run_guarded(|| {
                 // Namespace init: arm the stop guards before anything else.
                 crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
