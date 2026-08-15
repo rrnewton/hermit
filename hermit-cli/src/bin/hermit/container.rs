@@ -26,6 +26,7 @@ use reverie::process::Container;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Namespace;
+use reverie::process::RunError;
 
 const GROUP_FILE: &str = "/etc/group";
 const NSCD_DIR: &str = "/var/run/nscd";
@@ -301,6 +302,14 @@ fn install_panic_location_hook() {
     });
 }
 
+fn take_panic_location() -> String {
+    panic_location()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .unwrap_or_else(|| "<unknown location>".to_string())
+}
+
 fn panic_message(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         (*message).to_string()
@@ -360,16 +369,49 @@ where
     })) {
         Ok(result) => result,
         Err(payload) => {
-            let location = panic_location()
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take())
-                .unwrap_or_else(|| "<unknown location>".to_string());
+            let location = take_panic_location();
             Err(anyhow!(
                 "panic in container child at {location}: {}",
                 panic_message(&*payload)
             ))
         }
+    }
+}
+
+/// Runs a container-child closure with panics converted to errors.
+///
+/// Every `Container::run` call site in Hermit should use this instead of
+/// `run`, so that no Hermit closure can reach the nounwind child entry point
+/// while unwinding. `with_container` uses it; so do the direct call sites in
+/// `record_start`, which is the path the partial-revents-copyout replay
+/// divergence takes.
+pub trait RunGuarded {
+    fn run_guarded<F, T>(&mut self, f: F) -> Result<Result<T, SerializableError>, RunError>
+    where
+        F: FnMut() -> Result<T, SerializableError>,
+        T: serde::Serialize + serde::de::DeserializeOwned;
+}
+
+impl RunGuarded for Container {
+    fn run_guarded<F, T>(&mut self, mut f: F) -> Result<Result<T, SerializableError>, RunError>
+    where
+        F: FnMut() -> Result<T, SerializableError>,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        self.run(move || {
+            install_panic_location_hook();
+            match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                inject_test_fault();
+                f()
+            })) {
+                Ok(result) => result,
+                Err(payload) => Err(SerializableError::from(anyhow!(
+                    "panic in container child at {}: {}",
+                    take_panic_location(),
+                    panic_message(&*payload)
+                ))),
+            }
+        })
     }
 }
 
