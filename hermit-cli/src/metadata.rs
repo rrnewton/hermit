@@ -55,7 +55,23 @@ impl RecordVersion {
 // recorder, even though flock was already classified Determinized -- so
 // replaying one under this build would read the next thread event for every
 // flock and desynchronize the stream. The version gate must refuse it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10c);
+//
+// TODO-HUMAN-REVIEW(#2272)
+// 0x10c -> 0x10d: `Ppoll` becomes its OWN event rather than sharing `Poll`'s,
+// because ppoll additionally copies out a timeout and must preserve it on
+// EINTR and on a partial EFAULT copy-out. The recorded stream therefore
+// carries a different event shape for every ppoll call.
+//
+// ⚠️ THIS BUMP IS WHY THE REBASE COULD NOT SIMPLY TAKE EITHER SIDE. This
+// change was authored against 0x10a and bumped to 0x10b; main has since gone
+// to 0x10c for the unrelated flock work. Keeping the branch's 0x10b would
+// move the version BACKWARDS and let a 0x10c flock recording be replayed by a
+// build whose ppoll events have a different shape. Keeping main's 0x10c
+// unchanged would be worse: the format would change with no bump at all, so a
+// recording made here would claim 0x10c while containing a `Ppoll` event the
+// 0x10c reader does not know -- exactly the desynchronization the paragraph
+// above exists to prevent. The version must go FORWARD once more.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10d);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -294,6 +310,7 @@ mod tests {
     #[test]
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x110)));
     }
