@@ -14537,8 +14537,8 @@
       "test": "backend-parity-c/sync-file-range",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
