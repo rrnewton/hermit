@@ -386,6 +386,14 @@ fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     mask & !(1_u64 << signal_bit)
 }
 
+fn ppoll_uses_kernel_wait(
+    sequentialize_threads: bool,
+    recordreplay_modes: bool,
+    has_signal_mask: bool,
+) -> bool {
+    !sequentialize_threads || (recordreplay_modes && !has_signal_mask)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
@@ -848,14 +856,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(guest.inject_with_retry(probe).await?)
             };
             if let Some(timeout_address) = timeout_address {
-                guest
+                if let Err(error) = guest
                     .memory()
-                    .write_value(timeout_address, &timespec_from_duration(Duration::ZERO))?;
+                    .write_value(timeout_address, &timespec_from_duration(Duration::ZERO))
+                {
+                    // Linux preserves the ppoll result when remaining-time copyout faults.
+                    trace!(?error, "ignoring ppoll zero-timeout writeback failure");
+                }
             }
             result
-        } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            // The kernel owns the blocking wait in these modes. Use scratch memory only
-            // for the signal mask so raw ppoll can still update the guest timeout.
+        } else if ppoll_uses_kernel_wait(
+            self.cfg.sequentialize_threads,
+            self.cfg.recordreplay_modes,
+            call.sigmask().is_some(),
+        ) {
+            // The kernel owns the blocking wait when threads are not sequentialized and for
+            // unmasked record/replay calls. A masked sequentialized wait must use the probe
+            // below so a call that would block keeps the strict fail-closed behavior.
+            // Use scratch memory only for the signal mask so raw ppoll can still update the
+            // guest timeout.
             let mut signal_mask_guard = None;
             let call = if let Some(signal_mask) = call.sigmask() {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
@@ -934,7 +953,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // closed rather than letting a masked signal interrupt a simulated wait.
         if call.sigmask().is_some() {
             let (probe, _probe_guard) = self.prepare_ppoll_probe(guest, call).await?;
-            let result = guest.inject_with_retry(probe).await;
+            let result = if self.cfg.recordreplay_modes {
+                self.record_or_replay(guest, probe).await
+            } else {
+                guest.inject_with_retry(probe).await
+            };
             if probe.syscall_would_have_blocked(result) {
                 return Err(Errno::ENOSYS.into());
             }
@@ -971,9 +994,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = thread_observe_time(guest).await;
         let elapsed = Duration::from_nanos(now.as_nanos().saturating_sub(started_at.as_nanos()));
         let remaining = timeout.saturating_sub(elapsed);
-        guest
+        if let Err(error) = guest
             .memory()
-            .write_value(timeout_address, &timespec_from_duration(remaining))?;
+            .write_value(timeout_address, &timespec_from_duration(remaining))
+        {
+            // Linux preserves the ppoll result when remaining-time copyout faults.
+            trace!(?error, "ignoring ppoll timeout writeback failure");
+        }
         Ok(())
     }
 
@@ -1822,6 +1849,14 @@ mod tests {
     fn ppoll_signal_mask_keeps_reverie_preemption_unblocked() {
         let preemption_bit = 1_u64 << ((reverie::PERF_EVENT_SIGNAL as usize) - 1);
         assert_eq!(sanitize_ppoll_signal_mask(u64::MAX), !preemption_bit);
+    }
+
+    #[test]
+    fn ppoll_record_replay_masked_waits_keep_fail_closed_probe() {
+        assert!(!ppoll_uses_kernel_wait(true, true, true));
+        assert!(ppoll_uses_kernel_wait(true, true, false));
+        assert!(!ppoll_uses_kernel_wait(true, false, true));
+        assert!(ppoll_uses_kernel_wait(false, true, true));
     }
 
     #[test]
