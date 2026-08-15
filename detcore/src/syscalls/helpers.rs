@@ -181,6 +181,91 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Complete a logically blocking scalar pipe write after Hermit has made the pipe
+    /// physically nonblocking. Linux may return a positive short count for the physical
+    /// write, but the guest requested blocking behavior, so continue from the unwritten
+    /// suffix until the request completes, a signal arrives, or an error follows progress.
+    pub async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        const PIPE_BUF: usize = 4096;
+
+        let target = call.len().min(MAX_RW_COUNT);
+        if target <= PIPE_BUF {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        }
+        let Some(initial_buf) = call.buf() else {
+            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        };
+
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let subtool = self.cfg.recordreplay_modes.then_some(self);
+        let mut current = call;
+        let mut written_total = 0usize;
+
+        loop {
+            if resources.poll_attempt > 0
+                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
+            {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            let result = match subtool {
+                Some(detcore) => detcore.record_or_replay(guest, current).await,
+                None => guest.inject_with_retry(current).await,
+            };
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    if written > target - written_total {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total += written;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                    let Some(next_addr) = initial_buf.as_raw().checked_add(written_total) else {
+                        break Err(Errno::EFAULT.into());
+                    };
+                    let Some(next_buf) = Addr::<u8>::from_raw(next_addr) else {
+                        break Err(Errno::EFAULT.into());
+                    };
+                    current = call
+                        .with_buf(Some(next_buf))
+                        .with_len(target - written_total);
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Errno::EAGAIN) => {}
+                Err(error) => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write after {:?}: {}",
+                resources.poll_attempt,
+                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
     /// Complete a logically blocking pipe writev after Hermit has made the pipe physically

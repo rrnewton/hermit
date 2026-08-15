@@ -12,6 +12,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
+use async_trait::async_trait;
 use nix::fcntl::OFlag;
 use rand::RngExt as _;
 use reverie::Error;
@@ -31,11 +32,13 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
 use super::deterministic_stdio_inode;
+use crate::DETERMINISTIC_PIPE_CAPACITY;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
@@ -59,6 +62,70 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
+
+// One x86_64 page is a valid Linux pipe capacity and is always a shrink or no-op for a
+// newly created empty pipe, including when per-user pipe-page pressure is already high.
+fn deterministic_pipe_set_result(requested: i32, capacity_limit: i32) -> Result<i32, Errno> {
+    if requested < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if requested <= capacity_limit {
+        return Ok(capacity_limit);
+    }
+    // Hermit's supported execution does not have CAP_SYS_RESOURCE in the initial user
+    // namespace. Linux refuses an unprivileged request above pipe-max-size with EPERM;
+    // procfs exposes this same deterministic capacity as /proc/sys/fs/pipe-max-size.
+    Err(Errno::EPERM)
+}
+
+#[async_trait]
+trait PipeCapacityOperations: Send {
+    async fn set_capacity(&mut self, fd: i32, capacity: i32) -> Result<i64, Errno>;
+    async fn close(&mut self, fd: i32);
+}
+
+struct GuestPipeCapacityOperations<'a, G, T>(&'a mut G, std::marker::PhantomData<T>);
+
+#[async_trait]
+impl<T: RecordOrReplay, G: Guest<Detcore<T>>> PipeCapacityOperations
+    for GuestPipeCapacityOperations<'_, G, T>
+{
+    async fn set_capacity(&mut self, fd: i32, capacity: i32) -> Result<i64, Errno> {
+        self.0
+            .inject(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_SETPIPE_SZ(capacity)),
+            )
+            .await
+    }
+
+    async fn close(&mut self, fd: i32) {
+        let _ = self.0.inject(syscalls::Close::new().with_fd(fd)).await;
+    }
+}
+
+async fn pin_created_pipe_capacity<O: PipeCapacityOperations>(
+    operations: &mut O,
+    created_fds: [i32; 2],
+    capacity: i32,
+) -> Result<i64, Errno> {
+    let result = operations.set_capacity(created_fds[1], capacity).await;
+    if result != Ok(i64::from(capacity)) {
+        for fd in created_fds {
+            operations.close(fd).await;
+        }
+    }
+    result
+}
+
+fn unfixed_pipe_capacity_requires_shutdown(
+    fd_type: FdType,
+    fixed_capacity: Option<i32>,
+    sequentialize_threads: bool,
+) -> bool {
+    fd_type == FdType::Pipe && fixed_capacity.is_none() && sequentialize_threads
+}
 
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
@@ -259,6 +326,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved))
                 });
+                // Pipe capacity is host-backed when threads are not sequentialized, so its
+                // procfs limit must remain host-backed in that mode as well.
+                if !self.cfg.sequentialize_threads
+                    && procfs.as_ref().is_some_and(ProcfsFile::is_pipe_max_size)
+                {
+                    procfs = None;
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -942,7 +1016,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to run in the background, which assumes non-interference -- but a pipe/socket write
         // and its paired read are not independent, deadlocking the scheduler. Blocking-fd
         // writes therefore use the original synchronous path, as before this feature.
-        let res = if physically_nonblocking
+        let res = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking {
+            self.execute_blocking_pipe_write(guest, call).await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
@@ -1544,6 +1620,68 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => OFlag::empty(),
         };
         match call.cmd() {
+            F_GETPIPE_SZ => {
+                let (fd_type, fixed_capacity) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (detfd.ty(), detfd.deterministic_pipe_capacity())
+                })?;
+                if unfixed_pipe_capacity_requires_shutdown(
+                    fd_type,
+                    fixed_capacity,
+                    self.cfg.sequentialize_threads,
+                ) {
+                    error!(
+                        "[detcore] cannot expose host-selected capacity for inherited pipe fd {}",
+                        fd
+                    );
+                    unrecoverable_shutdown(guest).await;
+                }
+                let result = self.record_or_replay(guest, call).await;
+                if let Some(expected) = fixed_capacity {
+                    match result {
+                        Ok(actual) if actual == i64::from(expected) => Ok(actual),
+                        other => {
+                            error!(
+                                "[detcore] fixed pipe capacity changed: expected {} bytes, got {:?}",
+                                expected, other
+                            );
+                            unrecoverable_shutdown(guest).await;
+                        }
+                    }
+                } else {
+                    Ok(result?)
+                }
+            }
+            F_SETPIPE_SZ(requested) => {
+                let (fd_type, fixed_capacity) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (detfd.ty(), detfd.deterministic_pipe_capacity())
+                })?;
+                let Some(current) = fixed_capacity else {
+                    if unfixed_pipe_capacity_requires_shutdown(
+                        fd_type,
+                        fixed_capacity,
+                        self.cfg.sequentialize_threads,
+                    ) {
+                        error!(
+                            "[detcore] cannot resize inherited pipe fd {} from host-selected state",
+                            fd
+                        );
+                        unrecoverable_shutdown(guest).await;
+                    }
+                    return Ok(self.record_or_replay(guest, call).await?);
+                };
+                let expected = deterministic_pipe_set_result(requested, current)?;
+                let result = self.record_or_replay(guest, call).await;
+                match result {
+                    Ok(actual) if actual == i64::from(expected) => Ok(actual),
+                    other => {
+                        error!(
+                            "[detcore] fixed pipe capacity update changed: expected {} bytes, got {:?}",
+                            expected, other
+                        );
+                        unrecoverable_shutdown(guest).await;
+                    }
+                }
+            }
             F_GETFL => {
                 let physical_flags = self.record_or_replay(guest, call).await?;
                 let logical_nonblocking = guest
@@ -1811,11 +1949,35 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
+            if internally_nonblocking {
+                let capacity_result = pin_created_pipe_capacity(
+                    &mut GuestPipeCapacityOperations(guest, std::marker::PhantomData::<T>),
+                    fds,
+                    DETERMINISTIC_PIPE_CAPACITY,
+                )
+                .await;
+                if capacity_result != Ok(i64::from(DETERMINISTIC_PIPE_CAPACITY)) {
+                    // Linux has already validated and written pipefd, so no tool-side guest
+                    // memory access preceded the kernel's pipe2 argument checks. Do not hand
+                    // the guest a host-selected capacity when the physical pin is unavailable.
+                    error!(
+                        "[detcore] cannot pin scheduler-managed pipe to {} bytes: {:?}",
+                        DETERMINISTIC_PIPE_CAPACITY, capacity_result
+                    );
+                    unrecoverable_shutdown(guest).await;
+                }
+            }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
                 .await?;
             if internally_nonblocking {
+                guest.thread_state_mut().with_detfd(fds[0], |detfd| {
+                    detfd.set_deterministic_pipe_capacity(DETERMINISTIC_PIPE_CAPACITY)
+                })?;
+                guest.thread_state_mut().with_detfd(fds[1], |detfd| {
+                    detfd.set_deterministic_pipe_capacity(DETERMINISTIC_PIPE_CAPACITY)
+                })?;
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
             }
@@ -2726,12 +2888,20 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod test {
     use nix::fcntl::OFlag;
 
+    use super::DETERMINISTIC_PIPE_CAPACITY;
+    use super::Errno;
+    use super::PipeCapacityOperations;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::deterministic_pipe_set_result;
+    use super::pin_created_pipe_capacity;
     use super::should_tag_sabre_internal_pipe_io;
+    use super::unfixed_pipe_capacity_requires_shutdown;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use crate::fd::FdType;
+    use crate::procfs::ProcfsFile;
+    use crate::procfs::ProcfsSnapshotContext;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2739,6 +2909,117 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn fixed_pipe_capacity_preserves_linux_request_edges() {
+        let current = DETERMINISTIC_PIPE_CAPACITY;
+        assert_eq!(
+            deterministic_pipe_set_result(-1, current),
+            Err(Errno::EINVAL)
+        );
+        for requested in [0, 1, 4095, 4096] {
+            assert_eq!(
+                deterministic_pipe_set_result(requested, current),
+                Ok(current)
+            );
+        }
+        for requested in [4097, 8192, 65536] {
+            assert_eq!(
+                deterministic_pipe_set_result(requested, current),
+                Err(Errno::EPERM)
+            );
+        }
+    }
+
+    #[test]
+    fn pipe_capacity_growth_refusal_matches_exposed_maximum() {
+        let mut file = ProcfsFile::from_path(std::path::Path::new("/proc/sys/fs/pipe-max-size"))
+            .expect("pipe maximum must be virtualized");
+        file.initialize(b"1048576\n".to_vec(), ProcfsSnapshotContext::default());
+        let maximum = std::str::from_utf8(&file.take(128).expect("snapshot must be readable"))
+            .expect("pipe maximum must be UTF-8")
+            .trim()
+            .parse::<i32>()
+            .expect("pipe maximum must be numeric");
+
+        assert_eq!(maximum, DETERMINISTIC_PIPE_CAPACITY);
+        assert_eq!(
+            deterministic_pipe_set_result(maximum + 1, maximum),
+            Err(Errno::EPERM)
+        );
+    }
+
+    struct TestPipeCapacityOperations {
+        result: Result<i64, Errno>,
+        set_calls: Vec<(i32, i32)>,
+        close_calls: Vec<i32>,
+    }
+
+    #[async_trait::async_trait]
+    impl PipeCapacityOperations for TestPipeCapacityOperations {
+        async fn set_capacity(&mut self, fd: i32, capacity: i32) -> Result<i64, Errno> {
+            self.set_calls.push((fd, capacity));
+            self.result
+        }
+
+        async fn close(&mut self, fd: i32) {
+            self.close_calls.push(fd);
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_capacity_failure_closes_both_created_fds() {
+        let mut operations = TestPipeCapacityOperations {
+            result: Err(Errno::EPERM),
+            set_calls: Vec::new(),
+            close_calls: Vec::new(),
+        };
+        assert_eq!(
+            pin_created_pipe_capacity(&mut operations, [17, 18], 4096).await,
+            Err(Errno::EPERM)
+        );
+        assert_eq!(operations.set_calls, [(18, 4096)]);
+        assert_eq!(operations.close_calls, [17, 18]);
+    }
+
+    #[tokio::test]
+    async fn fixed_pipe_capacity_leaves_created_fds_open() {
+        let mut operations = TestPipeCapacityOperations {
+            result: Ok(4096),
+            set_calls: Vec::new(),
+            close_calls: Vec::new(),
+        };
+        assert_eq!(
+            pin_created_pipe_capacity(&mut operations, [17, 18], 4096).await,
+            Ok(4096)
+        );
+        assert_eq!(operations.set_calls, [(18, 4096)]);
+        assert!(operations.close_calls.is_empty());
+    }
+
+    #[test]
+    fn unfixed_pipe_capacity_is_refused_only_during_sequentialized_execution() {
+        assert!(unfixed_pipe_capacity_requires_shutdown(
+            FdType::Pipe,
+            None,
+            true
+        ));
+        assert!(!unfixed_pipe_capacity_requires_shutdown(
+            FdType::Pipe,
+            Some(DETERMINISTIC_PIPE_CAPACITY),
+            true
+        ));
+        assert!(!unfixed_pipe_capacity_requires_shutdown(
+            FdType::Pipe,
+            None,
+            false
+        ));
+        assert!(!unfixed_pipe_capacity_requires_shutdown(
+            FdType::Regular,
+            None,
+            true
+        ));
     }
 
     #[test]

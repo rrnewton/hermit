@@ -104,6 +104,12 @@ struct OpenFileDescription {
     /// purposes.
     physically_nonblocking: bool,
 
+    /// Capacity of a pipe that Detcore physically pinned before exposing either endpoint.
+    /// `None` means the pipe has unknown provenance. Sequentialized execution refuses
+    /// capacity access; non-sequentialized execution keeps host-backed `fcntl` behavior.
+    #[serde(default)]
+    deterministic_pipe_capacity: Option<i32>,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -178,6 +184,7 @@ impl DetFd {
                 loopback_peer: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
+                deterministic_pipe_capacity: None,
             })),
         }
     }
@@ -410,6 +417,16 @@ impl DetFd {
     /// Mark every alias of this open file description physically nonblocking.
     pub fn set_physically_nonblocking(&self) {
         self.description().physically_nonblocking = true;
+    }
+
+    /// Record the physical capacity fixed before this pipe became guest-visible.
+    pub fn set_deterministic_pipe_capacity(&self, capacity: i32) {
+        self.description().deterministic_pipe_capacity = Some(capacity);
+    }
+
+    /// Return the fixed physical capacity, if this is a Detcore-created pipe.
+    pub fn deterministic_pipe_capacity(&self) -> Option<i32> {
+        self.description().deterministic_pipe_capacity
     }
 
     /// Update file status flags for every alias of this open file description.

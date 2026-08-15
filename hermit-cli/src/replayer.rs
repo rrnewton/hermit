@@ -37,8 +37,11 @@ use reverie::syscalls::Close;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
 use reverie::syscalls::Fchdir;
+use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::OFlag;
+use reverie::syscalls::Pipe2;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
@@ -295,6 +298,8 @@ impl Tool for Replayer {
                     .await
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Pipe(call) => self.handle_pipe2(guest, call.into()).await,
+            Syscall::Pipe2(call) => self.handle_pipe2(guest, call).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
@@ -343,6 +348,30 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    async fn handle_pipe2<G: Guest<Self>>(&self, guest: &mut G, call: Pipe2) -> Result<i64, Errno> {
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(call).await;
+            assert_eq!(actual, recorded, "replayed pipe creation diverged");
+            if let Some(pipefd) = call.pipefd() {
+                let fds: [i32; 2] = guest.memory().read_value(pipefd)?;
+                let capacity = guest
+                    .inject(
+                        Fcntl::new()
+                            .with_fd(fds[1])
+                            .with_cmd(FcntlCmd::F_SETPIPE_SZ(detcore::DETERMINISTIC_PIPE_CAPACITY)),
+                    )
+                    .await;
+                assert_eq!(
+                    capacity,
+                    Ok(i64::from(detcore::DETERMINISTIC_PIPE_CAPACITY)),
+                    "replayed pipe capacity diverged"
+                );
+            }
+        }
+        recorded
+    }
+
     pub(super) async fn reserve_replay_fd<G: Guest<Self>>(
         &self,
         guest: &mut G,

@@ -218,6 +218,8 @@ impl Tool for Recorder {
             Sysno::dup3,
             Sysno::ioctl,
             Sysno::socket,
+            Sysno::pipe,
+            Sysno::pipe2,
             Sysno::clock_gettime,
             Sysno::gettimeofday,
             Sysno::settimeofday,
@@ -347,6 +349,10 @@ impl Tool for Recorder {
             }
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
+            // pipe/pipe2 also write the new descriptor pair to guest memory. Replayer
+            // explicitly re-injects successful calls to reproduce that kernel side effect,
+            // then fixes the recreated pipe's capacity before the guest can observe it.
+            Syscall::Pipe(_) | Syscall::Pipe2(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-979): pidfd_open is an input-only,
             // fd-returning syscall (like socket): record its return value so

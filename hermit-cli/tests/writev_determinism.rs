@@ -10,6 +10,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
+
+use nix::fcntl::OFlag;
+use nix::unistd::pipe2;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
@@ -43,6 +47,101 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&guest);
     command_output(compile, "writev guest compilation");
 
+    // Both executions receive a duplicate of the same host pipe as standard input. This
+    // compares pass-through behavior on one pipe object instead of comparing independently
+    // selected capacities from two newly created pipes. O_CLOEXEC keeps the parent copies
+    // out of both children; Stdio installs only the requested duplicate as fd 0.
+    let (capacity_read, capacity_write) =
+        pipe2(OFlag::O_CLOEXEC).expect("failed to create inherited capacity pipe");
+    let mut native_capacity = Command::new(&guest);
+    native_capacity.arg("pipe-capacity").stdin(Stdio::from(
+        capacity_read
+            .try_clone()
+            .expect("failed to duplicate native capacity pipe"),
+    ));
+    let native_capacity_output = command_output(native_capacity, "native pipe capacity report");
+    let native_capacity_stdout = String::from_utf8_lossy(&native_capacity_output.stdout);
+    assert!(
+        native_capacity_stdout.contains("pipe-max-size=")
+            && native_capacity_stdout.contains("get=")
+            && native_capacity_stdout.contains("set-current="),
+        "native pipe capacity report omitted successful F_GETPIPE_SZ/F_SETPIPE_SZ evidence:\n\
+         {native_capacity_stdout}",
+    );
+
+    let mut host_backed_capacity = Command::new("timeout");
+    host_backed_capacity
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--no-sequentialize-threads",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("pipe-capacity")
+        .stdin(Stdio::from(
+            capacity_read
+                .try_clone()
+                .expect("failed to duplicate Hermit capacity pipe"),
+        ));
+    let host_backed_capacity_output = command_output(
+        host_backed_capacity,
+        "non-sequentialized pipe capacity report",
+    );
+    assert_eq!(
+        host_backed_capacity_output.stdout,
+        native_capacity_output.stdout,
+        "non-sequentialized Hermit did not preserve the host pipe limit and F_SETPIPE_SZ behavior\n\
+         native stdout:\n{}\nHermit stdout:\n{}\nHermit stderr:\n{}",
+        native_capacity_stdout,
+        String::from_utf8_lossy(&host_backed_capacity_output.stdout),
+        String::from_utf8_lossy(&host_backed_capacity_output.stderr),
+    );
+    drop(capacity_read);
+    drop(capacity_write);
+
+    for (mode, diagnostic) in [
+        (
+            "inherited-pipe-get",
+            "cannot expose host-selected capacity for inherited pipe fd 0",
+        ),
+        (
+            "inherited-pipe-set",
+            "cannot resize inherited pipe fd 0 from host-selected state",
+        ),
+    ] {
+        let mut inherited = Command::new("timeout");
+        inherited
+            .args(["--kill-after", "5s", "30s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "run",
+                "--strict",
+                "--panic-on-unsupported-syscalls",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg(mode)
+            .stdin(Stdio::piped());
+        let output = inherited
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start inherited-pipe {mode}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(diagnostic),
+            "inherited-pipe {mode} was not refused by the typed capacity path\n\
+             status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+    }
+
     let mut trace = Command::new("timeout");
     trace
         .args(["--kill-after", "5s", "30s"])
@@ -55,7 +154,9 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest);
+        .arg(&guest)
+        .arg("4096")
+        .stdin(Stdio::piped());
     let trace_output = command_output(trace, "strict writev trace");
     let trace_stdout = String::from_utf8_lossy(&trace_output.stdout);
     let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
@@ -73,39 +174,80 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
 
-    for (label, strict, extra_arg) in [
-        ("strict writev verification", true, None),
-        (
-            "passthru-opt writev verification",
-            false,
-            Some("--passthru-opt"),
-        ),
-    ] {
-        let mut verify = Command::new("timeout");
-        verify
-            .args(["--kill-after", "5s", "30s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
-            .args(["--log=info", "run", "--verify", "--base-env=minimal"]);
-        if strict {
-            verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
-        }
-        if let Some(arg) = extra_arg {
-            verify.arg(arg);
-        }
-        verify.arg("--").arg(&guest);
-        let verify_output = command_output(verify, label);
-        let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
-        let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+    let strict_report = build_root.join("strict-verify.json");
+    let _ = fs::remove_file(&strict_report);
+    let mut strict_verify = Command::new("timeout");
+    strict_verify
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--verify-strict",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+        ])
+        .arg("--verify-json")
+        .arg(&strict_report)
+        .arg("--")
+        .arg(&guest)
+        .arg("4096");
+    command_output(strict_verify, "canonical strict writev verification");
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&strict_report).expect("strict verification omitted its JSON report"),
+    )
+    .expect("strict verification report was not valid JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"));
+    assert_eq!(report["verified"], serde_json::json!(true));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert_eq!(
+        report["comparison"]["strictness"],
+        serde_json::json!("canonical")
+    );
+    for side in ["left", "right"] {
         assert!(
-            verify_stdout.contains("Determinism verified")
-                || verify_stderr.contains("Determinism verified"),
-            "Hermit omitted its determinism marker for {label}\n\
-             stdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "canonical verification reported no compared {side} messages: {report}"
         );
     }
 
-    // Exercise record mode on pipe retries separately. Replaying dynamically allocated
-    // pipe fds is currently blocked by the recorder's independent fd-numbering gap.
+    // This compatibility case intentionally exercises the Stripped comparator. It is not
+    // evidence for bitwise parity and its JSON verdict must keep saying so.
+    let passthru_report = build_root.join("passthru-verify.json");
+    let _ = fs::remove_file(&passthru_report);
+    let mut passthru_verify = Command::new("timeout");
+    passthru_verify
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "run",
+            "--verify",
+            "--passthru-opt",
+            "--base-env=minimal",
+        ])
+        .arg("--verify-json")
+        .arg(&passthru_report)
+        .arg("--")
+        .arg(&guest);
+    command_output(passthru_verify, "Stripped passthru-opt writev verification");
+    let passthru: serde_json::Value = serde_json::from_slice(
+        &fs::read(&passthru_report).expect("passthru verification omitted its JSON report"),
+    )
+    .expect("passthru verification report was not valid JSON");
+    assert_eq!(passthru["verified"], serde_json::json!(true));
+    assert_eq!(passthru["bitwise_parity"], serde_json::json!(false));
+    assert_eq!(
+        passthru["comparison"]["strictness"],
+        serde_json::json!("stripped")
+    );
+
+    // Exercise record mode on the smallest pipe-retry workload separately before the
+    // full fixed-capacity workload is recorded and replayed below.
     let pipe_recording = build_root.join("pipe-recording");
     let _ = fs::remove_dir_all(&pipe_recording);
     let mut pipe_record = Command::new("timeout");
@@ -145,7 +287,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg(&recording)
         .arg("--")
         .arg(&guest)
-        .arg("record");
+        .arg("4096");
     let record_output = command_output(record, "writev record/replay verification");
     let record_stdout = String::from_utf8_lossy(&record_output.stdout);
     let record_stderr = String::from_utf8_lossy(&record_output.stderr);
