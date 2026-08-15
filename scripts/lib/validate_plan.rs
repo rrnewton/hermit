@@ -62,8 +62,8 @@ const PREFLIGHT_TIMEOUT_S: i64 = 900;
 /// finite spin guard with ample observed headroom. `gate.manifest` is no longer
 /// in this cost class; it has a separately measured budget below.
 pub(crate) const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
-/// Current productive-work allowance for `gate.manifest`. Measured on
-/// devbig014 at 3641632a86a74ff2e571e21a44f6bcb990a2f8ce with a cold cache,
+/// Current productive-work allowance for `gate.manifest`. Measured on the
+/// validation host at 3641632a86a74ff2e571e21a44f6bcb990a2f8ce with a cold cache,
 /// outer DAG `-j16`, `CARGO_BUILD_JOBS=1`, and the production one-CPU step
 /// cgroup: `cpu.stat` reached 259.791 CPU-s immediately before PASS at 268 wall-s.
 /// The completed CPU cost is therefore in [259.791, 268.000] s. 350 s leaves
