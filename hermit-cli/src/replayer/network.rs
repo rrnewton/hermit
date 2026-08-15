@@ -20,7 +20,46 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
+use crate::event::PollEvent;
 use crate::event::PpollEvent;
+
+/// Restore `poll`'s recorded outputs and THEN return its recorded result.
+///
+/// The ordering is the fix: the previous code returned the recorded error
+/// before writing anything, so a guest that recorded a partial `revents`
+/// copy-out saw its own pre-syscall sentinels on replay.
+fn replay_poll_event<M: MemoryAccess>(
+    memory: &mut M,
+    fds_address: Option<AddrMut<'_, PollFd>>,
+    nfds: usize,
+    event: PollEvent,
+) -> Result<i64, Errno> {
+    let PollEvent {
+        result,
+        fds_pointer_present,
+        fds,
+    } = event;
+
+    if let Ok(updated) = result {
+        assert!(updated >= 0);
+        assert!((updated as usize) <= nfds);
+    }
+
+    assert_eq!(
+        fds_address.is_some(),
+        fds_pointer_present,
+        "recorded poll pollfd pointer shape diverged during replay"
+    );
+    if let Some(fds) = fds {
+        assert_eq!(fds.len(), nfds);
+        memory.write_values(
+            fds_address.expect("recorded poll values require a pollfd pointer"),
+            &fds,
+        )?;
+    }
+
+    result
+}
 
 fn replay_ppoll_event<M: MemoryAccess>(
     memory: &mut M,
@@ -172,17 +211,12 @@ impl Replayer {
         syscall: Poll,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Poll)?;
-
-        let nfds = syscall.nfds() as usize;
-
-        assert_eq!(event.fds.len(), nfds);
-
-        // Write out the recorded fds (if any).
-        if let Some(addr) = syscall.fds() {
-            guest.memory().write_values(addr, &event.fds)?;
-        }
-
-        Ok(event.updated as i64)
+        replay_poll_event(
+            &mut guest.memory(),
+            syscall.fds(),
+            syscall.nfds() as usize,
+            event,
+        )
     }
 
     pub(super) async fn handle_ppoll<G: Guest<Self>>(
@@ -428,6 +462,59 @@ mod tests {
         assert_eq!(memory.writes, 2);
         assert_eq!(output_fd.revents, libc::POLLIN);
         assert_eq!(output_timeout, original_timeout);
+    }
+
+    #[test]
+    fn replay_poll_restores_fds_before_returning_a_recorded_error() {
+        // THE ORDERING IS THE FIX. The old replayer returned the recorded error
+        // before writing anything, so a guest that recorded a partial `revents`
+        // copy-out saw its own pre-syscall sentinels instead.
+        let mut observed = [PollFd {
+            fd: 7,
+            events: PollFlags::POLLIN,
+            revents: PollFlags::empty(),
+        }];
+        let event = PollEvent {
+            result: Err(Errno::EFAULT),
+            fds_pointer_present: true,
+            fds: Some(vec![PollFd {
+                fd: 7,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::POLLIN,
+            }]),
+        };
+
+        let result = replay_poll_event(
+            &mut LocalMemory::new(),
+            AddrMut::from_raw(observed.as_mut_ptr() as usize),
+            observed.len(),
+            event,
+        );
+
+        assert_eq!(result, Err(Errno::EFAULT));
+        assert_eq!(
+            observed[0].revents,
+            PollFlags::POLLIN,
+            "the recorded partial copy-out must be restored even though the call errored"
+        );
+    }
+
+    #[test]
+    fn replay_poll_early_error_with_pollfd_pointer_performs_no_fd_write() {
+        let event = PollEvent {
+            result: Err(Errno::EINVAL),
+            fds_pointer_present: true,
+            fds: None,
+        };
+        let mut memory = FailSecondWrite {
+            memory: LocalMemory::new(),
+            writes: 0,
+        };
+
+        let result = replay_poll_event(&mut memory, AddrMut::from_raw(1), usize::MAX, event);
+
+        assert_eq!(result, Err(Errno::EINVAL));
+        assert_eq!(memory.writes, 0);
     }
 
     #[test]

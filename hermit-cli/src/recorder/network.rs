@@ -45,23 +45,59 @@ fn read_bytes<M: MemoryAccess>(
     Ok(bytes)
 }
 
-fn read_iovecs<M: MemoryAccess>(
+
+/// Capture `poll`'s guest-visible outputs, INCLUDING on the error path.
+///
+/// This mirrors [`capture_ppoll_event`]; see that function for the full
+/// reasoning. The short version: `poll` previously built its event with
+/// `result.and_then(..)`, and `and_then` NEVER RUNS ITS CLOSURE ON AN `Err`, so
+/// an EFAULT return after Linux had already written some `revents` entries
+/// discarded every one of them. Measured divergence: record `revents0=1`
+/// against replay `revents0=4660`, where 4660 is 0x1234, the sentinel the guest
+/// itself wrote before the call -- the field was never written back.
+fn capture_poll_event<M: MemoryAccess>(
     memory: &M,
-    message: &libc::msghdr,
-) -> Result<Vec<libc::iovec>, Errno> {
-    if message.msg_iovlen == 0 {
-        return Ok(Vec::new());
-    }
-    let address = Addr::from_raw(message.msg_iov as usize).ok_or(Errno::EFAULT)?;
-    let mut iovecs = vec![
-        libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        message.msg_iovlen
-    ];
-    memory.read_values(address, &mut iovecs)?;
-    Ok(iovecs)
+    fds_address: Option<AddrMut<'_, PollFd>>,
+    nfds: usize,
+    result: Result<i64, Errno>,
+) -> Result<PollEvent, Errno> {
+    let fds_pointer_present = fds_address.is_some();
+    let read_fds = |address: AddrMut<'_, PollFd>| -> Result<Vec<PollFd>, Errno> {
+        let mut fds = vec![PollFd::default(); nfds];
+        memory.read_values(address.into(), &mut fds)?;
+        Ok(fds)
+    };
+    let fds = match result {
+        // It is fine for `fds` to be NULL: poll is then effectively a sleep.
+        Ok(_) | Err(Errno::EINTR) => fds_address.map(read_fds).transpose()?,
+        // BEST EFFORT, AND THE PREDICATE MUST STAY THIS NARROW. The same EFAULT
+        // is also what a wholly bad `fds` pointer produces, and then this read
+        // fails too; `?` here would discard the whole event and record a bare
+        // `Err` -- exactly the bug being fixed. `fds_pointer_present` already
+        // distinguishes "no pointer" from "pointer we could not read".
+        //
+        // Errors other than EFAULT and EINTR must not read AT ALL. An earlier
+        // attempt on the ppoll side read on EVERY error and regressed
+        // `review-cases invalid-nfds`, which passes fds=(void*)1 with nfds over
+        // RLIMIT_NOFILE and gets EINVAL -- the read's own EFAULT(14) replaced
+        // the kernel's EINVAL(22) and flipped that case from matched to
+        // diverged. WITHOUT THAT GUARD THIS CHANGE LOOKS CORRECT AND SILENTLY
+        // CORRUPTS A RECORDED ERRNO.
+        //
+        // NOT UNIT-TESTED, DELIBERATELY: the unit tests use `LocalMemory`, which
+        // reads this process's own memory and SEGFAULTS THE TEST BINARY on a bad
+        // pointer instead of returning `Err`, so `.ok()` cannot catch it. The
+        // policy is covered end to end by `review-cases invalid-nfds` staying
+        // matched.
+        Err(Errno::EFAULT) => fds_address.and_then(|address| read_fds(address).ok()),
+        _ => None,
+    };
+
+    Ok(PollEvent {
+        result,
+        fds_pointer_present,
+        fds,
+    })
 }
 
 fn capture_ppoll_event<M: MemoryAccess>(
@@ -157,18 +193,8 @@ impl Recorder {
         let len = syscall.nfds() as usize;
         let result = guest.inject(syscall).await;
 
-        let event = result.and_then(|ret| {
-            let mut fds = vec![PollFd::default(); len];
-
-            // It is fine for `fds` to be NULL. Poll is effectively a
-            // `sleep` call and will always return 0 after a "timeout".
-            if let Some(addr) = syscall.fds() {
-                guest.memory().read_values(addr.into(), &mut fds)?;
-            }
-
-            let updated = ret as usize;
-            Ok(SyscallEvent::Poll(PollEvent { fds, updated }))
-        });
+        let event =
+            capture_poll_event(&guest.memory(), syscall.fds(), len, result).map(SyscallEvent::Poll);
 
         self.record_event(guest, event);
 
@@ -388,6 +414,59 @@ mod tests {
             Some(&fds[..]),
             "a partially completed copy-out must be captured, not discarded"
         );
+    }
+
+    #[test]
+    fn capture_poll_preserves_ready_fds() {
+        let fds = [PollFd {
+            fd: 7,
+            events: PollFlags::POLLIN,
+            revents: PollFlags::POLLIN,
+        }];
+
+        let event = capture_poll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(fds.as_ptr() as usize),
+            fds.len(),
+            Ok(1),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Ok(1));
+        assert!(event.fds_pointer_present);
+        assert_eq!(event.fds.unwrap()[0].revents, PollFlags::POLLIN);
+    }
+
+    #[test]
+    fn capture_poll_keeps_the_result_on_an_error_return() {
+        // The defect this fixes: the old `result.and_then(..)` recorded NOTHING
+        // on an error, so the event -- and with it every already-written
+        // `revents` entry -- was discarded. The result must now live inside the
+        // event so replay has something to restore before returning it.
+        let event = capture_poll_event(&LocalMemory::new(), None, 0, Err(Errno::EFAULT)).unwrap();
+
+        assert_eq!(event.result, Err(Errno::EFAULT));
+        assert!(!event.fds_pointer_present);
+        assert!(event.fds.is_none());
+    }
+
+    #[test]
+    fn capture_poll_early_error_does_not_read_or_allocate_pollfds() {
+        // EINVAL must not trigger the best-effort read. An earlier attempt on
+        // the ppoll side read on EVERY error and the read's own EFAULT replaced
+        // the kernel's EINVAL, flipping `review-cases invalid-nfds` red. `nfds`
+        // is deliberately absurd: a read would try to allocate it and abort.
+        let event = capture_poll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(1),
+            usize::MAX,
+            Err(Errno::EINVAL),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EINVAL));
+        assert!(event.fds_pointer_present);
+        assert!(event.fds.is_none());
     }
 
     #[test]
