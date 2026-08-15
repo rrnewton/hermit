@@ -846,13 +846,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(guest.inject_with_retry(probe).await?)
             };
             if let Some(timeout_address) = timeout_address {
-                if let Err(error) = guest
+                // Linux preserves the ppoll result when remaining-time copyout faults,
+                // so a failed writeback is logged and dropped rather than propagated.
+                let _ = guest
                     .memory()
                     .write_value(timeout_address, &timespec_from_duration(Duration::ZERO))
-                {
-                    // Linux preserves the ppoll result when remaining-time copyout faults.
-                    trace!(?error, "ignoring ppoll zero-timeout writeback failure");
-                }
+                    .inspect_err(|error| {
+                        trace!(?error, "ignoring ppoll zero-timeout writeback failure");
+                    });
             }
             result
         } else if ppoll_uses_kernel_wait(
