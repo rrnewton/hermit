@@ -31,12 +31,16 @@ static int roundtrip(int fd, int opt, int value) {
     return readback == 0;
 }
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        printf("sockopt ok=0 [socketpair fail]\n");
-        return 0;
+        printf("sockopt SETUP_FAIL [socketpair]\n");
+        return 1;
     }
 
     if (roundtrip(sv[0], SO_REUSEADDR, 1)) ok++;  // (1) enable, reads back set.
@@ -49,5 +53,18 @@ int main(void) {
     close(sv[0]);
     close(sv[1]);
     printf("sockopt ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a socket-option round-trip
+       stopped reading back the value just set only lowered the printed number
+       -- and under --verify both runs lower it identically, so the comparison
+       still matches and the cell stays green. The checks above are unchanged;
+       this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "sockopt completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }
