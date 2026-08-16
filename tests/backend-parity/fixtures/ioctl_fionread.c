@@ -17,18 +17,22 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
     int ok = 0;
     int fds[2];
     if (pipe(fds) != 0) {
-        printf("fionread ok=0 [pipe fail]\n");
-        return 0;
+        printf("fionread SETUP_FAIL [pipe]\n");
+        return 1;
     }
 
     // Guest writes exactly six bytes into the pipe.
     if (write(fds[1], "hello\n", 6) != 6) {
-        printf("fionread ok=0 [write fail]\n");
-        return 0;
+        printf("fionread SETUP_FAIL [write]\n");
+        return 1;
     }
 
     // (1) FIONREAD reports bytes readable; (2) the count equals what we wrote.
@@ -51,5 +55,18 @@ int main(void) {
     close(fds[0]);
     close(fds[1]);
     printf("fionread ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a FIONREAD or FIONBIO check
+       stopped holding only lowered the printed number -- and under --verify
+       both runs lower it identically, so the comparison still matches and the
+       cell stays green. The checks above are unchanged; this only requires
+       all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "fionread completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }

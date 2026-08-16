@@ -34,13 +34,19 @@ static long fd_size(int fd) {
   return (long)st.st_size;
 }
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 5
+
 int main(void) {
   int ok = 0;
 
   int fd = memfd_create("parity", MFD_CLOEXEC);
   if (fd < 0) {
+    /* This is check 1 failing, not a setup error, so the honest report is
+       ok=0 and a non-zero exit -- not a separate SETUP_FAIL label. */
     printf("memfd_create ok=%d\n", ok);
-    return 0;
+    return 1;
   }
   ok++; // 1: descriptor created
 
@@ -71,5 +77,18 @@ int main(void) {
 
   close(fd);
   printf("memfd_create ok=%d\n", ok);
+
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a memfd descriptor, write, read-back or
+     ftruncate check stopped holding only lowered the printed number -- and
+     under --verify both runs lower it identically, so the comparison still
+     matches and the cell stays green. The checks above are unchanged; this
+     only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "memfd_create completed %d of %d checks\n",
+            ok, EXPECTED_CHECKS);
+    return 1;
+  }
+
   return 0;
 }

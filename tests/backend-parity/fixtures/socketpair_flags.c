@@ -18,13 +18,19 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 7
+
 int main(void) {
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, sv)
         != 0) {
-        printf("socketpair ok=0 [socketpair fail]\n");
-        return 0;
+        /* This is check (1) failing, not a setup error, so the honest report
+           is ok=0 and a non-zero exit -- not a separate SETUP_FAIL label. */
+        printf("socketpair ok=%d\n", ok);
+        return 1;
     }
     ok++;  // (1) socketpair with combined flags succeeded.
 
@@ -67,5 +73,18 @@ int main(void) {
     close(sv[0]);
     close(sv[1]);
     printf("socketpair ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a creation-derived socketpair
+       flag or option stopped reporting its value only lowered the printed
+       number -- and under --verify both runs lower it identically, so the
+       comparison still matches and the cell stays green. The checks above are
+       unchanged; this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "socketpair completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }

@@ -19,6 +19,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
     int ok = 0;
     // Fixed abstract name: leading NUL marks the abstract namespace.
@@ -27,8 +31,8 @@ int main(void) {
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        printf("bind_name ok=0 [socket fail]\n");
-        return 0;
+        printf("bind_name SETUP_FAIL [socket]\n");
+        return 1;
     }
 
     struct sockaddr_un addr;
@@ -56,5 +60,18 @@ int main(void) {
 
     close(fd);
     printf("bind_name ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so an abstract-name bind or the
+       getsockname echo of it stopped matching only lowered the printed number
+       -- and under --verify both runs lower it identically, so the comparison
+       still matches and the cell stays green. The checks above are unchanged;
+       this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "bind_name completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }

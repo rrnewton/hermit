@@ -15,12 +15,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 5
+
 int main(void) {
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-        printf("shutdown ok=0 [stream socketpair fail]\n");
-        return 0;
+        printf("shutdown SETUP_FAIL [socketpair]\n");
+        return 1;
     }
 
     if (shutdown(sv[0], SHUT_RD) == 0) ok++;    // (1) half-close read side.
@@ -40,5 +44,18 @@ int main(void) {
     if (shutdown(-1, SHUT_RDWR) == -1 && errno == EBADF) ok++;
 
     printf("shutdown ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a shutdown step or its EBADF
+       rejection stopped holding only lowered the printed number -- and under
+       --verify both runs lower it identically, so the comparison still
+       matches and the cell stays green. The checks above are unchanged; this
+       only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "shutdown completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }
