@@ -566,6 +566,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "language-runtimes/tcl-rand-clock"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "backend-parity-c/instruction-nondeterminism"
     }
   ],
   "schema": 1

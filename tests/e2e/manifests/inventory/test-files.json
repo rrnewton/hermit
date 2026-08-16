@@ -3101,6 +3101,12 @@
       "path": "tests/backend-parity/test_scorecard_header_compat.py",
       "runner": "tests/backend-parity/run_matrix.py maintainers",
       "why": "tests/backend-parity/test_scorecard_header_compat.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's outer-scorecard writer, asserting that the writer binds to the target file's header so a parent-side column addition cannot refuse every append. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/instruction_nondeterminism.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace verify; explicit native mode)",
+      "why": "tests/backend-parity/fixtures/instruction_nondeterminism.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (blocking ptrace verify; explicit native mode): Blocking ptrace establishes the CPUID/RDTSC reference trajectory, native multi-run execution brackets real instruction nondeterminism, and LiteInst remains explicitly disabled until direct RDRAND/RDSEED interception is proven"
     }
   ],
   "schema": 2
