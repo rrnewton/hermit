@@ -1405,6 +1405,12 @@
       "why": "tests/c/rcx_canonicalization.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_execveat_paths.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_execveat_paths.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this self-reexecuting guest and runs record/replay verification across AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, dirfd-relative execveat, /proc/self/fd, and /dev/fd paths; the generic C manifest cannot express the multi-image phase sequence or record/replay contract."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/record_replay_fd_close.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
@@ -1421,6 +1427,18 @@
       "path": "tests/c/record_replay_lseek_seek_cur.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/record_replay_lseek_seek_cur.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_mkdir_eexist.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_mkdir_eexist.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test constructs temporary directory, regular-file, symlink-walk, unusable-dirfd, and missing-parent fixtures, passes all eleven paths to this guest, and verifies their Linux mkdir and mkdirat record/replay results; the generic C manifest cannot create that filesystem setup."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_poll_partial_copyout.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The Rust integration test compiles this guest and runs three canonical record/replay cases with distinct argv—poll partial revents copyout, ppoll partial revents plus timeout copyout, and invalid nfds—requiring matched JSON and nonzero INFO evidence; the generic C manifest cannot express that record/replay matrix."
     },
     {
       "disposition": "manifest-test",
