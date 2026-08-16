@@ -59,16 +59,17 @@ be reported as such; they are not permission to weaken assertions.
 - A stale receipt, dirty worktree, wrong profile, skipped node, or zero-test run
   is an evidence defect. Repair the run rather than relabeling it green.
 
-For determinism or parity failures on a supported canonical evidence path, use `--verify` and require a
-`--verify-json` verdict with `bitwise_parity: true`. That compares exit status,
-stdout, and stderr byte-for-byte and INFO events under `BitwiseInfoV1`, which
-retains numeric payloads while removing only wall-clock prefixes and
-ordinalizing host addresses. KVM's output-only fallback and more aggressively
-normalized diagnostic logs cannot establish L2 INFO parity; they may only help
-localize the first divergence.
-Direct DBT verification currently fails closed with `no_result` until Reverie
-provides a protected internal descriptor; diagnose ordinary DBT execution with
-`--strict` without claiming L2.
+For determinism or parity failures on a supported canonical evidence path, use
+bare `--verify --verify-json` and require a verdict with
+`bitwise_parity: true`. That compares exit status, stdout, and stderr
+byte-for-byte and INFO events under `BitwiseInfoV1`, which retains numeric
+payloads while removing only wall-clock prefixes and ordinalizing host
+addresses. A DBT L2 result additionally requires present, nonempty protected
+framed evidence that authenticates and validates successfully, with nonzero
+INFO counts for both runs. Missing, empty, or invalid DBT evidence fails closed
+and is not L2. KVM's output-only fallback and more aggressively normalized
+diagnostic logs cannot establish L2 INFO parity; they may only help localize the
+first divergence.
 
 ## Requalify the final head once
 

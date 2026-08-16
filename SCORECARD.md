@@ -4,27 +4,27 @@ This table is derived from the manifest, not from a separately maintained parent
 
 **Green** means the cell is in `ci/expected-e2e-plan.json` and is therefore required to pass by ordinary validation. **Red** is every other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, not omitted: a cell that cannot run is not green.
 
-These are the current Basic Sanity contracts. Every `verify` cell, every `replay` cell, and every seed in a selected `chaos` cell requires a typed canonical verdict. A positive result on a supported canonical evidence path requires non-vacuous INFO-log bitwise parity. Direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor; KVM remains output-only and therefore unqualified for that claim. The counts below are unchanged pending the approved combined measurement.
+These are the current Medium Sanity M2 contracts. Every `verify` cell, every `replay` cell, and every seed in a selected `chaos` cell requires a typed canonical verdict. The canonical strict metric requires exact status/stdout/stderr parity and, on a supported canonical evidence path, non-vacuous INFO-log bitwise parity; KVM remains output-only and therefore unqualified for that claim.
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 150 | 858 | 1008 |
+| `ptrace` | 156 | 852 | 1008 |
 | `dbt` | 9 | 999 | 1008 |
 | `kvm` | 0 | 1008 | 1008 |
 | `sabre` | 9 | 999 | 1008 |
 | `liteinst` | 2 | 1006 | 1008 |
 | `native` | 0 | 336 | 336 |
-| **Total** | **170** | **5206** | **5376** |
+| **Total** | **176** | **5200** | **5376** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `verify` | 147 / 336 | 9 / 336 | 0 / 336 | 9 / 336 | 2 / 336 | — | 167 | 1513 | 1680 |
-| `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
+| `replay` | 7 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 7 | 1673 | 1680 |
 | `chaos` | 2 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 2 | 1678 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
-| **Total** | | | | | | | **170** | **5206** | **5376** |
+| **Total** | | | | | | | **176** | **5200** | **5376** |
 
 ## Cross-backend parity
 
@@ -32,22 +32,22 @@ The manifest-backed scorecard does not yet contain cross-backend parity cells. I
 
 ## Ptrace by manifest category
 
-This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
+This view uses the same Medium Sanity M2 canonical strict contracts as the tables above, but makes the ptrace workload mix visible. Each entry is `green / total`; `custom` commands are not part of this denominator.
 
 | Manifest category | Verify | Replay | Chaos | Green | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
-| `backend-parity-c` | 78 / 95 | 0 / 95 | 0 / 95 | 78 | 285 |
+| `backend-parity-c` | 78 / 95 | 2 / 95 | 0 / 95 | 80 | 285 |
 | `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
-| `c-programs` | 10 / 160 | 0 / 160 | 0 / 160 | 10 | 480 |
+| `c-programs` | 11 / 160 | 0 / 160 | 0 / 160 | 11 | 480 |
 | `chaos-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 | `data-handling` | 5 / 5 | 0 / 5 | 0 / 5 | 5 | 15 |
 | `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 | `determinism-stress` | 4 / 6 | 0 / 6 | 2 / 6 | 6 | 18 |
 | `determinism-stress-c` | 6 / 11 | 0 / 11 | 0 / 11 | 6 | 33 |
-| `language-runtimes` | 18 / 19 | 0 / 19 | 0 / 19 | 18 | 57 |
+| `language-runtimes` | 17 / 19 | 1 / 19 | 0 / 19 | 18 | 57 |
 | `shared-futex-c` | 0 / 4 | 0 / 4 | 0 / 4 | 0 | 12 |
-| `system-utils` | 23 / 25 | 1 / 25 | 0 / 25 | 24 | 75 |
+| `system-utils` | 23 / 25 | 4 / 25 | 0 / 25 | 27 | 75 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 172 selected regression cells: the 170 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 178 selected regression cells: the 176 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

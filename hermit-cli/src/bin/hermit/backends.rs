@@ -32,6 +32,10 @@ use std::io::IsTerminal as _;
 #[cfg(feature = "dbt")]
 use std::io::Read;
 #[cfg(feature = "dbt")]
+use std::io::Seek;
+#[cfg(feature = "dbt")]
+use std::io::SeekFrom;
+#[cfg(feature = "dbt")]
 use std::io::Write;
 #[cfg(feature = "dbt")]
 use std::os::fd::AsRawFd;
@@ -51,12 +55,28 @@ use detcore::Config;
 use hermit::Error;
 use hermit::ExitStatus;
 #[cfg(feature = "dbt")]
+use reverie_dbt::DbtEvidenceLogLevel;
+#[cfg(feature = "dbt")]
 use reverie_dbt::DbtRunner;
 use tracing::metadata::LevelFilter;
 
 use super::run::VerifyAllow;
 #[cfg(feature = "dbt")]
+use super::verify::ComparedRun;
+#[cfg(feature = "dbt")]
+use super::verify::ComparisonOptions;
+#[cfg(feature = "dbt")]
+use super::verify::compare_two_runs;
+#[cfg(feature = "dbt")]
+use super::verify::retain_verification_logs;
+#[cfg(feature = "dbt")]
+use super::verify::temp_log_files_in;
+#[cfg(feature = "dbt")]
+use super::verify::verification_log_level;
+#[cfg(feature = "dbt")]
 use super::verify::write_pending_verification_json;
+#[cfg(feature = "dbt")]
+use super::verify::write_verification_json;
 
 #[derive(Debug)]
 #[cfg(feature = "dbt")]
@@ -334,11 +354,107 @@ impl Drop for DbtUnsupportedSyscallReport {
     }
 }
 
+#[cfg(feature = "dbt")]
+struct TeeReader<R, W> {
+    input: R,
+    replay: W,
+}
+
+#[cfg(feature = "dbt")]
+impl<R: Read, W: Write> Read for TeeReader<R, W> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.input.read(buffer)?;
+        self.replay.write_all(&buffer[..read])?;
+        Ok(read)
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_evidence_log_level(
+    requested: Option<LevelFilter>,
+    diagnostic_full_trace: bool,
+) -> DbtEvidenceLogLevel {
+    let level = verification_log_level(requested, diagnostic_full_trace);
+    if level >= LevelFilter::TRACE {
+        DbtEvidenceLogLevel::Trace
+    } else if level >= LevelFilter::DEBUG {
+        DbtEvidenceLogLevel::Debug
+    } else {
+        DbtEvidenceLogLevel::Info
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<Vec<Vec<u8>>, Error> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut encoded = Vec::new();
+    file.read_to_end(&mut encoded)?;
+    if encoded.is_empty() {
+        return Err(Error::msg("DBT canonical evidence was empty"));
+    }
+    reverie_dbt::decode_evidence(&encoded)
+        .map(reverie_dbt::DbtEvidence::into_records)
+        .map_err(|error| {
+            Error::msg(format!(
+                "DBT canonical evidence was malformed or truncated: {error}"
+            ))
+        })
+}
+
+#[cfg(feature = "dbt")]
+fn materialize_dbt_comparison_log(
+    records: &[Vec<u8>],
+    mut log: std::fs::File,
+    path: &Path,
+) -> Result<usize, Error> {
+    if records.is_empty() {
+        return Err(Error::msg("DBT canonical evidence contained no records"));
+    }
+    log.set_len(0)?;
+    log.seek(SeekFrom::Start(0))?;
+    for record in records {
+        let Some(payload) = record.strip_suffix(b"\n") else {
+            return Err(Error::msg(
+                "DBT canonical evidence record was missing its terminal newline",
+            ));
+        };
+        if payload.contains(&b'\n') || payload.contains(&b'\r') {
+            return Err(Error::msg(
+                "DBT canonical evidence record contained an embedded line boundary",
+            ));
+        }
+        log.write_all(record)?;
+    }
+    log.flush()?;
+
+    let compared = detcore::logdiff::canonical_info_count(path).map_err(|error| {
+        Error::msg(format!(
+            "DBT canonical evidence did not contain a valid log stream: {error}"
+        ))
+    })?;
+    if compared == 0 {
+        return Err(Error::msg(
+            "DBT canonical evidence contained no INFO records",
+        ));
+    }
+    Ok(compared)
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_verification_output(output: Output) -> reverie::process::Output {
+    reverie::process::Output {
+        status: process_status(output.status),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
 ///
-/// Direct DBT verification refuses before launch until Reverie provides a
-/// protected internal descriptor for canonical Detcore evidence. Ordinary DBT
-/// execution remains available; it cannot issue a verification verdict.
+/// Verification obtains structured tracing records through Reverie's
+/// authenticated per-run evidence channel, decodes the finalized framed
+/// artifact after the complete process tree is reaped, and hands the resulting
+/// log plus exact stdout/stderr/status to Hermit's ordinary typed comparator.
 // This mirrors the option surface of `hermit run`, so its parameters track the
 // CLI run flags rather than a cohesive value object; bundling them would not
 // clarify the dispatch shim.
@@ -348,30 +464,25 @@ pub(super) fn run_dbt(
     program: &Path,
     args: &[String],
     verify: bool,
-    _verify_verbose: bool,
-    _verify_allow: VerifyAllow,
-    _print_verify_logs: bool,
-    _keep_logs: bool,
-    _verify_log_dir: Option<&Path>,
+    verify_verbose: bool,
+    verify_allow: VerifyAllow,
+    print_verify_logs: bool,
+    keep_logs: bool,
+    verify_log_dir: Option<&Path>,
     verify_json: Option<&Path>,
     summary: bool,
     log: Option<LevelFilter>,
     log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
+    verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
         write_pending_verification_json(path)?;
     }
-    if verify {
+    if log_file.is_some() && !verify {
         return Err(Error::msg(
-            "DBT verification produced no result: canonical Detcore evidence requires a \
-             protected Reverie internal descriptor, which the pinned Reverie revision does not provide",
-        ));
-    }
-    if log_file.is_some() {
-        return Err(Error::msg(
-            "DBT --log-file is unavailable until Reverie provides a protected internal descriptor",
+            "DBT --log-file is unavailable on the ordinary single-run adapter",
         ));
     }
     // The DBT backend drives a single Detcore external scheduler, so it cannot
@@ -408,7 +519,7 @@ pub(super) fn run_dbt(
                 client.display()
             ))
         })?
-        .summary(summary)
+        .summary(summary && !verify)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -426,7 +537,7 @@ pub(super) fn run_dbt(
         environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
     );
     let mut guest = StdCommand::new(&prepared.program);
-    if let Some(level) = log {
+    if !verify && let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
     environment.remove(OsStr::new("HERMIT_LOG_FILE"));
@@ -434,28 +545,171 @@ pub(super) fn run_dbt(
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
 
-    if stdin_is_terminal {
-        let status = runner
-            .status(&guest)
-            .map_err(|error| launch_error(&drrun, error))?;
-        if summary {
-            eprintln!(
-                ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
-                 (run without a terminal on stdin for the labeled block)"
-            );
+    if !verify {
+        if stdin_is_terminal {
+            let status = runner
+                .status(&guest)
+                .map_err(|error| launch_error(&drrun, error))?;
+            if summary {
+                eprintln!(
+                    ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
+                     (run without a terminal on stdin for the labeled block)"
+                );
+            }
+            return Ok(process_status(status));
         }
-        return Ok(process_status(status));
+
+        let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
+        write_output(&output)?;
+        if summary {
+            match detcore_summary(&output) {
+                Ok(stats) => eprint!("{}", format_dbt_stats(&stats)),
+                Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
+            }
+        }
+        return Ok(output_status(&output));
     }
 
-    let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
-    write_output(&output)?;
-    if summary {
-        match detcore_summary(&output) {
-            Ok(stats) => eprint!("{}", format_dbt_stats(&stats)),
-            Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
+    let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
+        .map_err(|error| Error::msg(format!("failed to create DBT verification logs: {error}")))?;
+    let (log1_file, log1_path) = log1.into_parts();
+    let (log2_file, log2_path) = log2.into_parts();
+    let evidence_level = dbt_evidence_log_level(log, verify_verbose);
+    let mut evidence1 = tempfile::tempfile()?;
+    let runner1 = runner
+        .clone()
+        .evidence_file(&evidence1)
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to configure protected DBT run-1 evidence: {error}"
+            ))
+        })?
+        .evidence_log_level(evidence_level);
+    let mut evidence2 = tempfile::tempfile()?;
+    let runner2 = runner
+        .evidence_file(&evidence2)
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to configure protected DBT run-2 evidence: {error}"
+            ))
+        })?
+        .evidence_log_level(evidence_level);
+
+    let mut replay = tempfile::tempfile()?;
+    let replayable_stdin = verification_stdin.filter(|file| {
+        // SAFETY: `as_raw_fd` borrows a live descriptor for this check.
+        (unsafe { libc::isatty(file.as_raw_fd()) }) != 1
+    });
+
+    eprintln!(":: DBT Run1...");
+    let first_raw = match replayable_stdin {
+        Some(input) => run_once(
+            &runner1,
+            &guest,
+            &drrun,
+            TeeReader {
+                input,
+                replay: replay.try_clone()?,
+            },
+        ),
+        None => run_once(&runner1, &guest, &drrun, std::io::empty()),
+    };
+    let first_raw = match first_raw {
+        Ok(output) => output,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
         }
+    };
+    let first_records = match decode_dbt_evidence(&mut evidence1) {
+        Ok(records) => records,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = materialize_dbt_comparison_log(&first_records, log1_file, &log1_path) {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(error);
     }
-    Ok(output_status(&output))
+    if print_verify_logs {
+        std::io::stderr().write_all(&fs::read(&log1_path)?)?;
+    }
+    let first = dbt_verification_output(first_raw);
+    if !verify_allow.satisfies(first.status) {
+        eprintln!(
+            "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr),
+        );
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(Error::msg("First run during --verify exited in error"));
+    }
+
+    replay.seek(SeekFrom::Start(0))?;
+    eprintln!(":: DBT Run2...");
+    let second_raw = match run_once(&runner2, &guest, &drrun, replay.try_clone()?) {
+        Ok(output) => output,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    let second_records = match decode_dbt_evidence(&mut evidence2) {
+        Ok(records) => records,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = materialize_dbt_comparison_log(&second_records, log2_file, &log2_path) {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+        }
+        return Err(error);
+    }
+    let second = dbt_verification_output(second_raw);
+
+    let outcome = compare_two_runs(
+        ComparedRun {
+            output: &first,
+            log: log1_path,
+        },
+        ComparedRun {
+            output: &second,
+            log: log2_path,
+        },
+        ComparisonOptions {
+            success_message: "Success: deterministic. Determinism verified.",
+            failure_message: "Failure: nondeterministic.",
+            verbose: verify_verbose,
+            compare_logs: true,
+            diagnostic_full_trace: verify_verbose,
+            keep_logs,
+        },
+    )?;
+    if let Some(path) = verify_json {
+        write_verification_json(path, &outcome)?;
+    }
+    if !outcome.verified() {
+        return outcome.into_exit_status();
+    }
+
+    std::io::stdout().write_all(&first.stdout)?;
+    std::io::stderr().write_all(&first.stderr)?;
+    Ok(outcome.guest_status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,6 +729,7 @@ pub(super) fn run_dbt(
     _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
+    _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
@@ -705,6 +960,87 @@ mod tests {
             )
             .into_bytes(),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_evidence_materialization_preserves_records_and_requires_info() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = log.into_parts();
+        let records = vec![
+            b"1970-01-01T00:00:00.000000Z DEBUG detcore: diagnostic\n".to_vec(),
+            b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG stable\n".to_vec(),
+        ];
+
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
+
+        assert_eq!(compared, 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            concat!(
+                "1970-01-01T00:00:00.000000Z DEBUG detcore: diagnostic\n",
+                "1970-01-01T00:00:00.000000Z INFO detcore: DETLOG stable\n",
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_evidence_materialization_rejects_empty_or_injected_records() {
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let (empty_file, empty_path) = empty.into_parts();
+        assert!(
+            materialize_dbt_comparison_log(&[], empty_file, &empty_path)
+                .unwrap_err()
+                .to_string()
+                .contains("no records")
+        );
+
+        let no_info = tempfile::NamedTempFile::new().unwrap();
+        let (no_info_file, no_info_path) = no_info.into_parts();
+        let error = materialize_dbt_comparison_log(
+            &[b"1970-01-01T00:00:00.000000Z DEBUG detcore: only diagnostic\n".to_vec()],
+            no_info_file,
+            &no_info_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no INFO records"), "{error}");
+
+        for (record, expected) in [
+            (
+                b"1970-01-01T00:00:00.000000Z INFO detcore: truncated".to_vec(),
+                "terminal newline",
+            ),
+            (
+                b"1970-01-01T00:00:00.000000Z INFO detcore: forged\nINFO fake\n".to_vec(),
+                "embedded line boundary",
+            ),
+        ] {
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let (file, path) = log.into_parts();
+            let error = materialize_dbt_comparison_log(&[record], file, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_evidence_decoder_rejects_missing_and_truncated_artifacts() {
+        let mut missing = tempfile::tempfile().unwrap();
+        assert!(
+            decode_dbt_evidence(&mut missing)
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+
+        let mut truncated = tempfile::tempfile().unwrap();
+        truncated.write_all(b"RVDBTEF1\x01").unwrap();
+        let error = decode_dbt_evidence(&mut truncated).unwrap_err().to_string();
+        assert!(error.contains("malformed or truncated"), "{error}");
     }
 
     #[test]

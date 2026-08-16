@@ -506,9 +506,9 @@ ordinary validation. **Red** is every \
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
-These are the current Basic Sanity contracts. Every `verify` cell, every `replay` cell, and every seed in a \
-selected `chaos` cell requires a typed canonical verdict. Verification passes on a supported canonical evidence path require non-vacuous \
-INFO-log bitwise parity; KVM remains output-only and therefore unqualified for that claim.\n\n\
+These are the current Medium Sanity M2 contracts. Every `verify` cell, every `replay` cell, and every seed in a \
+selected `chaos` cell requires a typed canonical verdict. The canonical strict metric requires exact status/stdout/stderr parity and, on a \
+supported canonical evidence path, non-vacuous INFO-log bitwise parity; KVM remains output-only and therefore unqualified for that claim.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
     );
@@ -591,7 +591,7 @@ Standalone backend gates exercise selected comparisons, but their results are no
 Until a cell actually compares a fresh ptrace log with the corresponding backend log, this table \
 reports no cross-backend parity number.\n\n\
 ## Ptrace by manifest category\n\n\
-This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
+This view uses the same Medium Sanity M2 canonical strict contracts as the tables above, but makes the ptrace \
 workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
 denominator.\n\n\
 | Manifest category | Verify | Replay | Chaos | Green | Total |\n\

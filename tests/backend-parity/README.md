@@ -189,14 +189,20 @@ three byte-identical runs. The runner disables PMU timeslicing for portability.
 ### Canonical verification (`--verify`)
 
 Passing `--verify` adds a two-run comparison: the runner invokes
-`hermit run --strict --verify --verify-allow both`. On ptrace, Hermit compares
-the canonical INFO streams. The runner supplies `--verify-json` and
-requires `bitwise_parity: true`, `comparison.strictness: "canonical"`, log
-comparison enabled, and nonzero compared-message counts. It does not infer a
-pass from a command-line flag or success banner. Direct DBT verification
-currently returns an invocation-bound `no_result` before guest execution until
-Reverie provides a protected internal descriptor for canonical Detcore
-evidence. KVM's output-only result also stays a `gap`.
+`hermit run --strict --verify` and supplies a per-row `--verify-json` path. On
+non-KVM backends, bare `--verify --verify-json` is the canonical path. Hermit
+compares canonical INFO streams and the runner requires
+`bitwise_parity: true`, `comparison.strictness: "canonical"`, log comparison
+enabled, and nonzero compared-message counts. It does not infer a pass from a
+command-line flag or success banner. A DBT result may claim L2 only when its
+protected framed evidence is present and nonempty and the frame authenticates
+and validates successfully; missing, empty, or invalid evidence fails closed.
+KVM's output/status-only result stays a `gap`.
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Rows requiring those
+operations are outside the selected M2 DBT L2 scope; selected-row results do
+not establish whole-corpus or arbitrary process-tree parity.
 
 One contract holds at L1 but not under `--verify` and is recorded as a `gap`
 with its reason in the runner:
@@ -352,9 +358,10 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
 Probe verification by adding `--verify` (it implies `--strict`). The runner
-requires a typed non-vacuous canonical verdict for a positive result. DBT
-currently reports the protected-descriptor gap, and KVM remains a gap because
-it cannot provide canonical INFO evidence:
+requires a typed non-vacuous canonical verdict for a positive result. DBT can
+produce that verdict only from present, nonempty, authenticated and validated
+protected framed evidence with JSON `bitwise_parity: true`. KVM remains a gap
+because it cannot provide canonical INFO evidence:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend

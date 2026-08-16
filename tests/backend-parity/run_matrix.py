@@ -165,11 +165,12 @@ def scorecard_fieldnames(actual_header, path):
 # claimable only from a typed verdict with a nonzero compared INFO count.
 # KVM's output-only verifier remains unqualified and therefore stays a gap.
 L2_RANK = {"gap": 0, "bitwise": 1}
-# Per-backend L2 values the matrix may record. KVM cannot emit the required
-# canonical INFO witness.
+# Per-backend L2 values the matrix may record. DBT has a protected canonical
+# evidence path but retains explicitly declared workload gaps. KVM cannot emit
+# the required canonical INFO witness.
 L2_ALLOWED = {
     "ptrace": {"bitwise"},
-    "dbt": {"gap"},
+    "dbt": {"gap", "bitwise"},
     "kvm": {"gap"},
 }
 
@@ -478,12 +479,6 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
         return "gap", reason
     if not verify:
         return "pass", "-"
-    if backend == "dbt":
-        return (
-            "gap",
-            "DBT verification fails closed until Reverie provides a protected "
-            "internal descriptor for canonical Detcore evidence",
-        )
     if backend == "kvm":
         return (
             "gap",
@@ -535,6 +530,7 @@ def hermit_command(
     strict: bool,
     verify: bool = False,
     verify_json: Path | None = None,
+    verify_allow_failure: bool = False,
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
@@ -545,11 +541,12 @@ def hermit_command(
         # Hermit runs the guest twice under canonical INFO comparison. Whatever
         # this run earns is read from `--verify-json`; it is never inferred from
         # the flag or scraped from the banner.
-        #
-        # `--verify-allow both` keeps the guest's own exit status (including
-        # deliberate non-zero cases such as exit_status) flowing through so the
-        # runner can still enforce exit-status parity.
-        command.extend(["--verify", "--verify-allow", "both"])
+        command.append("--verify")
+        # The ordinary path stays bare. The one deliberate nonzero-exit case
+        # opts into failed-guest comparison without selecting a different log
+        # comparator; the runner still checks the exact exit code afterward.
+        if verify_allow_failure:
+            command.append("--verify-allow=failure")
         if verify_json is not None:
             command.append(f"--verify-json={verify_json}")
     command.extend(
@@ -808,15 +805,14 @@ def run_case_verify(
 ) -> tuple[str, str, float]:
     """L2 probe: one `hermit run --strict --verify` invocation.
 
-    `--verify` runs the guest twice inside hermit and diverts the guest's own
-    stdout into per-run temp logs, so this path cannot compare guest stdout the
-    way the L1 path does. The L2 contract it enforces instead is: the guest exit
-    status matches, and hermit's internal double-run comparison reports success
-    at *at least* the assurance kind the matrix records (`expected_l2`). A run
-    An output-only result remains a gap.
+    `--verify` runs the guest twice inside Hermit and compares exit status,
+    stdout, and stderr byte-for-byte alongside the canonical INFO evidence.
+    The runner consumes Hermit's typed verdict rather than re-comparing the two
+    per-run captures itself. The L2 contract requires the expected guest status
+    and an internal double-run result at *at least* the assurance kind the
+    matrix records (`expected_l2`). An output-only result remains a gap.
     """
     started = time.monotonic()
-    raw_verdict = None
     with tempfile.TemporaryDirectory(prefix="hermit-verify-json-") as verify_dir:
         verdict_path = Path(verify_dir) / "verdict.json"
         command = hermit_command(
@@ -827,34 +823,18 @@ def run_case_verify(
             strict=True,
             verify=True,
             verify_json=verdict_path,
+            verify_allow_failure=expected_status != 0,
         )
         result = run_with_timeout(command)
         observed_evidence = (
             verify_tier_from_json(verdict_path) if verdict_path.exists() else None
         )
-        if verdict_path.exists():
-            try:
-                raw_verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                raw_verdict = None
     if evidence is not None and observed_evidence:
         evidence.update(observed_evidence)
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
         return "FAIL", "verify run timed out", time.monotonic() - started
     diagnostic = result.stderr.decode(errors="replace").strip()
-    if (
-        backend == "dbt"
-        and isinstance(raw_verdict, dict)
-        and raw_verdict.get("verdict") == "no_result"
-        and "protected Reverie internal descriptor" in diagnostic
-    ):
-        return (
-            "GAP",
-            "DBT verification refused before guest execution: protected Reverie "
-            "internal descriptor for canonical Detcore evidence is unavailable",
-            time.monotonic() - started,
-        )
     if result.returncode != expected_status:
         if cpuid_policy_is_blocked(backend, name, diagnostic):
             return (
@@ -1475,7 +1455,7 @@ def main() -> int:
     for backend in BACKENDS:
         verified = (
             0
-            if backend in ("dbt", "kvm")
+            if backend == "kvm"
             else baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
         )
         print(

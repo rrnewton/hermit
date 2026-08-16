@@ -9,11 +9,14 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use reverie::Errno;
 use reverie::Tid;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -32,20 +35,61 @@ pub struct DebugEvent {
 
     /// The pretty, displayable version of the syscall.
     pretty: String,
+
+    /// Exec pathname bytes and lookup context. Raw syscall registers only hold
+    /// a pointer, so this snapshot prevents a changed failed exec request from
+    /// silently consuming an event that happened to return the same errno.
+    exec_request: Option<DebugExecRequest>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DebugExecRequest {
+    dirfd: libc::c_int,
+    path: Result<Vec<u8>, Errno>,
+    flags: libc::c_int,
 }
 
 impl DebugEvent {
     /// Constructs a new `DebugEvent`.
     pub fn new<M: MemoryAccess>(syscall: Syscall, memory: &M) -> Self {
+        let exec_request = match syscall {
+            Syscall::Execve(call) => {
+                let call: reverie::syscalls::Execveat = call.into();
+                Some(DebugExecRequest {
+                    dirfd: call.dirfd(),
+                    path: call
+                        .path()
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|path| path.read(memory))
+                        .map(|path| path.as_os_str().as_bytes().to_vec()),
+                    flags: call.flags(),
+                })
+            }
+            Syscall::Execveat(call) => Some(DebugExecRequest {
+                dirfd: call.dirfd(),
+                path: call
+                    .path()
+                    .ok_or(Errno::EFAULT)
+                    .and_then(|path| path.read(memory))
+                    .map(|path| path.as_os_str().as_bytes().to_vec()),
+                flags: call.flags(),
+            }),
+            _ => None,
+        };
         Self {
             syscall: syscall.into_parts(),
             pretty: format!("{}", syscall.display(memory)),
+            exec_request,
         }
     }
 
     /// Returns the syscall associated with this debug event.
     pub fn syscall(&self) -> Syscall {
         Syscall::from_raw(self.syscall.0, self.syscall.1)
+    }
+
+    pub(crate) fn exec_request_matches(&self, other: &Self) -> bool {
+        self.exec_request == other.exec_request
     }
 }
 

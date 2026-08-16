@@ -205,11 +205,16 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify --verify-json REPORT.json -- PROGRAM` | Requires canonical INFO parity with nonzero typed evidence on supported canonical evidence paths; direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor |
+| Verify two executions | `hermit run --verify --verify-json REPORT.json -- PROGRAM` | Bare `--verify --verify-json` is canonical on non-KVM backends. DBT additionally requires protected framed evidence that is present, nonempty, authenticated, and validated; require nonzero INFO counts and JSON `bitwise_parity: true`. KVM remains output/status-only and is not L2. |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |
 | Diagnose a concurrency failure | `hermit analyze --search -- PROGRAM` | Advanced, may run the guest many times |
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Workloads requiring
+those operations are outside the selected M2 DBT L2 scope; selected-cell
+results do not establish whole-corpus or arbitrary process-tree parity.
 
 A minimal record/replay session is:
 

@@ -440,11 +440,11 @@ mod tests {
         );
     }
 
-    /// The DBT arm has no protected evidence descriptor in the pinned Reverie
-    /// revision. It must leave the invocation-bound pending report in place and
-    /// refuse instead of publishing a terminal verdict through an old comparator.
+    /// DBT must preserve the same invocation-bound pending stamp as every other
+    /// backend, then publish a terminal verdict only after authenticated framed
+    /// evidence reaches the ordinary typed comparator.
     #[test]
-    fn dbt_arm_fails_closed_without_publishing_a_terminal_verdict() {
+    fn dbt_arm_routes_protected_evidence_through_the_typed_comparator() {
         let source = include_str!("backends.rs");
         let signatures: Vec<&str> = source
             .match_indices("fn run_dbt(")
@@ -478,12 +478,20 @@ mod tests {
             "DBT verification must stamp an invocation-bound no-result report"
         );
         assert!(
-            implementation.contains("DBT verification produced no result"),
-            "DBT verification must explain the held protected-descriptor prerequisite"
+            implementation.contains("evidence_file(&evidence1)"),
+            "DBT run 1 must use Reverie's protected evidence channel"
         );
         assert!(
-            !implementation.contains("write_verification_json"),
-            "DBT must not publish a terminal verdict without protected canonical evidence"
+            implementation.contains("decode_dbt_evidence(&mut evidence1)"),
+            "DBT must decode the finalized framed evidence before comparison"
+        );
+        assert!(
+            implementation.contains("compare_two_runs("),
+            "DBT must use the shared typed comparator"
+        );
+        assert!(
+            implementation.contains("write_verification_json(path, &outcome)"),
+            "DBT must publish the typed terminal verdict"
         );
     }
 

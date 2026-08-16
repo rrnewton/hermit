@@ -109,9 +109,12 @@ A backend is REAL if and only if:
    `hermit run --backend X --strict -- echo hello`. On a backend with a
    supported canonical evidence path, also use `--verify --verify-json <path>`
    and require `bitwise_parity: true`.
-   Direct DBT verification currently must return `no_result` before guest
-   execution until Reverie provides a protected internal descriptor for
-   canonical Detcore evidence; do not treat that refusal as an L2 pass.
+   On non-KVM backends, those bare verification flags select the canonical
+   comparison; `--verify-strict` is not required. DBT may claim L2 only when
+   protected framed evidence is present and nonempty, authenticates and
+   validates successfully, contains nonzero INFO records for both runs, and
+   the JSON reports `bitwise_parity: true`. Missing, empty, or invalid DBT
+   evidence fails closed and is not L2.
    KVM currently provides exact exit/stdout/stderr repeat parity only; its
    internal logs are not compared, so never score that result as L2.
    - If --backend flag doesn't exist on main: NOT a real backend yet
@@ -128,8 +131,9 @@ A backend is REAL if and only if:
 4. **Arbitrary programs run**: test at least 3 real programs (echo, true, cat)
    - All must produce correct output
    - L2 claims require strict JSON `bitwise_parity: true` from a supported
-     canonical evidence path; KVM stays output/status-only and DBT stays L1
-     while its protected evidence descriptor is unavailable
+     canonical evidence path with nonzero compared INFO counts; DBT also
+     requires present, nonempty, authenticated and validated protected framed
+     evidence, while KVM stays output/status-only
 
 5. **hermit-cli links the backend**: check Cargo.toml dependencies
    - If hermit-cli doesn't depend on reverie-xxx: not wired in
@@ -175,9 +179,10 @@ target/release/hermit run --backend X --strict -- echo hello 2>&1
 target/release/hermit run --backend X --strict -- /bin/true 2>&1
 target/release/hermit run --backend X --strict -- cat /dev/null 2>&1
 
-# On a supported canonical evidence path, additionally run --verify-json and
-# require a matched, canonical, non-vacuous receipt. DBT currently refuses this
-# command with no_result until Reverie supplies a protected internal descriptor.
+# On a non-KVM canonical evidence path, additionally run bare --verify and
+# --verify-json and require a matched, canonical, non-vacuous receipt. For DBT,
+# also require present, nonempty, authenticated and validated protected framed
+# evidence; missing or invalid evidence fails closed and cannot establish L2.
 
 # 8. Capture and compare INFO-level syscall handling with ptrace
 target/release/hermit --log info run --strict --verify --verify-json /tmp/hermit-ptrace.json -- echo hello > /tmp/hermit-ptrace.out 2> /tmp/hermit-ptrace.info

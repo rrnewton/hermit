@@ -288,11 +288,19 @@ Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
 the compared observations differ or if the guest exit status is not allowed.
 
-The log comparison is canonical INFO parity: it removes only the real
-wall-clock prefix, canonicalizes host addresses to first-appearance ordinals,
-and compares the remainder exactly. Use `--verify-json REPORT.json` and require
-`bitwise_parity: true` with nonzero compared-message counts. KVM's output-only
-result remains unqualified.
+On non-KVM backends, bare `--verify --verify-json REPORT.json` selects canonical
+INFO parity; no `--verify-strict` flag is required. The comparison removes only
+the real wall-clock prefix, canonicalizes host addresses to first-appearance
+ordinals, and compares the remainder exactly. Require `bitwise_parity: true`
+with nonzero compared-message counts. DBT may claim L2 only when its protected
+framed evidence is present and nonempty and the frame authenticates and
+validates successfully. Missing, empty, or invalid DBT evidence is not L2.
+KVM's output/status-only result remains unqualified.
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Workloads requiring
+those operations are outside the selected M2 DBT L2 scope; selected-cell
+results do not establish whole-corpus or arbitrary process-tree parity.
 
 Matching verification logs are temporary by default; divergent comparisons
 retain both. Keep both runs regardless of verdict with `--keep-logs`; Hermit

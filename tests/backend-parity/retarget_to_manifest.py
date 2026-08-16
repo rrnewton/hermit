@@ -205,8 +205,8 @@ def build_plan(
             elif backend == "dbt":
                 disabled[backend] = (
                     f"Legacy DBT {l2} evidence is not a fresh typed canonical verdict; "
-                    "direct DBT verification currently refuses until Reverie provides "
-                    "a protected internal descriptor for canonical Detcore evidence"
+                    "the current protected canonical evidence path must re-run this "
+                    "workload before DBT can be enabled"
                 )
             else:
                 disabled[backend] = (
@@ -218,9 +218,9 @@ def build_plan(
             if l1 == "pass":
                 if backend == "dbt":
                     disabled[backend] = (
-                        "L1 parity established in the source matrix row; direct DBT "
-                        "verification currently refuses until Reverie provides a protected "
-                        "internal descriptor for canonical Detcore evidence"
+                        "L1 parity established in the source matrix row; DBT now has a "
+                        "protected canonical evidence path, but this workload has no fresh "
+                        "typed, non-vacuous L2 verdict"
                     )
                 else:
                     disabled[backend] = (

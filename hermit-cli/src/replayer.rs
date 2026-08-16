@@ -15,8 +15,18 @@ mod network;
 mod random;
 mod time;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,15 +40,24 @@ use reverie::Guest;
 use reverie::Pid;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
+use reverie::Stack;
 use reverie::Subscription;
 use reverie::Tid;
 use reverie::Tool;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Close;
+use reverie::syscalls::Dup3;
 use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
 use reverie::syscalls::Fchdir;
+use reverie::syscalls::Fcntl;
 use reverie::syscalls::FcntlCmd;
+use reverie::syscalls::FromToRaw;
+use reverie::syscalls::Lseek;
+use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::OFlag;
+use reverie::syscalls::Openat;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Sysno;
@@ -57,6 +76,7 @@ fn capture_guest_fd(pid: Pid, fd: libc::c_int) -> (Option<std::os::fd::OwnedFd>,
 fn replay_root(pid: Pid) -> Option<PathBuf> {
     std::fs::canonicalize(format!("/proc/{}/root", pid.as_raw())).ok()
 }
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ReplayFileIdentity {
     device: u64,
@@ -72,10 +92,81 @@ impl ReplayFileIdentity {
     }
 }
 
-static MATERIALIZED_FILES: OnceLock<Mutex<BTreeSet<ReplayFileIdentity>>> = OnceLock::new();
+type MaterializedFiles = BTreeMap<ReplayFileIdentity, BTreeMap<ReplayFileIdentity, OwnedFd>>;
 
-fn materialized_files() -> &'static Mutex<BTreeSet<ReplayFileIdentity>> {
-    MATERIALIZED_FILES.get_or_init(|| Mutex::new(BTreeSet::new()))
+static MATERIALIZED_FILES: OnceLock<Mutex<MaterializedFiles>> = OnceLock::new();
+
+fn materialized_files() -> &'static Mutex<MaterializedFiles> {
+    MATERIALIZED_FILES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn identity_for_fd(fd: libc::c_int) -> io::Result<ReplayFileIdentity> {
+    Ok(ReplayFileIdentity::from_metadata(&std::fs::metadata(
+        format!("/proc/self/fd/{fd}"),
+    )?))
+}
+
+fn replay_root_identity(pid: Pid) -> io::Result<ReplayFileIdentity> {
+    Ok(ReplayFileIdentity::from_metadata(&std::fs::metadata(
+        format!("/proc/{}/root", pid.as_raw()),
+    )?))
+}
+
+pub(crate) struct ReplayMaterializationScope {
+    identity: ReplayFileIdentity,
+    _root: OwnedFd,
+}
+
+impl ReplayMaterializationScope {
+    pub(crate) fn new(root_fd: libc::c_int) -> io::Result<Self> {
+        let root = duplicate_controller_fd(root_fd)?;
+        Ok(Self {
+            identity: identity_for_fd(root.as_raw_fd())?,
+            _root: root,
+        })
+    }
+}
+
+impl Drop for ReplayMaterializationScope {
+    fn drop(&mut self) {
+        materialized_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.identity);
+    }
+}
+
+fn duplicate_controller_fd(fd: libc::c_int) -> io::Result<OwnedFd> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this process.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+    }
+}
+
+fn register_materialized(root: ReplayFileIdentity, object: OwnedFd) -> io::Result<()> {
+    let identity = identity_for_fd(object.as_raw_fd())?;
+    materialized_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(root)
+        .or_default()
+        .entry(identity)
+        .or_insert(object);
+    Ok(())
+}
+
+fn materialized_file_is_registered(pid: Pid, metadata: &std::fs::Metadata) -> bool {
+    let Ok(root) = replay_root_identity(pid) else {
+        return false;
+    };
+    materialized_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&root)
+        .is_some_and(|files| files.contains_key(&ReplayFileIdentity::from_metadata(metadata)))
 }
 
 fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
@@ -83,17 +174,82 @@ fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
         return;
     };
     if metadata.file_type().is_file() {
-        materialized_files()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(ReplayFileIdentity::from_metadata(&metadata));
+        let Ok(root) = replay_root_identity(pid) else {
+            return;
+        };
+        let Ok(object) = crate::record_replay_path::open_process_fd(pid, fd) else {
+            return;
+        };
+        let _ = register_materialized(root, object);
     }
 }
 
+pub(crate) fn remember_materialized_object(
+    root_fd: libc::c_int,
+    fd: libc::c_int,
+) -> io::Result<()> {
+    let metadata = std::fs::metadata(format!("/proc/self/fd/{fd}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exec materialization did not resolve to a regular file",
+        ));
+    }
+    register_materialized(identity_for_fd(root_fd)?, duplicate_controller_fd(fd)?)
+}
+
+#[cfg(test)]
+pub(crate) fn registered_materialized_count(root_fd: libc::c_int) -> usize {
+    let Ok(root) = identity_for_fd(root_fd) else {
+        return 0;
+    };
+    materialized_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&root)
+        .map_or(0, BTreeMap::len)
+}
+
+fn remember_materialized_path(
+    root: &std::os::fd::OwnedFd,
+    start: &std::os::fd::OwnedFd,
+    path: &Path,
+) -> io::Result<()> {
+    let resolved = crate::record_replay_path::resolve_existing_path(root, start, path, false)?;
+    remember_materialized_object(root.as_raw_fd(), resolved.object.as_raw_fd())
+}
+
 use crate::desync::DesyncError;
+use crate::event::OpenMaterialization;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::normalize_unused_args;
+
+#[derive(Serialize, Deserialize)]
+pub struct ReplayerThreadState {
+    events: EventReader,
+    bootstrapped: bool,
+}
+
+impl Deref for ReplayerThreadState {
+    type Target = EventReader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl DerefMut for ReplayerThreadState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
+impl Default for ReplayerThreadState {
+    fn default() -> Self {
+        panic!("thread state should be explicitly initialized in init_thread_state")
+    }
+}
 
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
@@ -121,7 +277,7 @@ pub struct Replayer {
 #[reverie::tool]
 impl Tool for Replayer {
     type GlobalState = detcore::GlobalState;
-    type ThreadState = EventReader;
+    type ThreadState = ReplayerThreadState;
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
@@ -140,15 +296,18 @@ impl Tool for Replayer {
     fn init_thread_state(
         &self,
         child: Tid,
-        _parent: Option<(Tid, &Self::ThreadState)>,
+        parent: Option<(Tid, &Self::ThreadState)>,
     ) -> Self::ThreadState {
         // We have to unwrap because there is now way to handle errors here.
-        EventReader::open(&self.data, child).unwrap_or_else(|err| {
-            panic!(
-                "Failed to open {:?} for thread {}: {}",
-                self.data, child, err
-            )
-        })
+        ReplayerThreadState {
+            events: EventReader::open(&self.data, child).unwrap_or_else(|err| {
+                panic!(
+                    "Failed to open {:?} for thread {}: {}",
+                    self.data, child, err
+                )
+            }),
+            bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+        }
     }
 
     fn subscriptions(config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
@@ -170,11 +329,7 @@ impl Tool for Replayer {
         // FIXME: Figure out a way to avoid duplicate code. (Merge record/replay
         // into a single tool?)
         Ok(match syscall {
-            // We must let through execve without any modification. Recording
-            // events for these is hard because execve only returns upon
-            // failure.
-            Syscall::Execve(_) => guest.inject(syscall).await,
-            Syscall::Execveat(_) => guest.inject(syscall).await,
+            Syscall::Execve(_) | Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
             Syscall::ArchPrctl(_) => {
@@ -312,14 +467,11 @@ impl Tool for Replayer {
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#653)
-            Syscall::Mkdir(_) => {
-                self.handle_replayed_side_effect(guest, syscall, "mkdir")
-                    .await
-            }
+            Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall, false).await,
             Syscall::Unlink(_) => self.handle_optional_path_removal(guest, syscall).await,
             Syscall::Unlinkat(call) => self.handle_unlinkat(guest, call).await,
-            Syscall::Mkdirat(_)
-            | Syscall::Mknodat(_)
+            Syscall::Mkdirat(_) => self.handle_mkdir(guest, syscall, true).await,
+            Syscall::Mknodat(_)
             | Syscall::Fchownat(_)
             | Syscall::Linkat(_)
             | Syscall::Renameat(_)
@@ -333,6 +485,11 @@ impl Tool for Replayer {
         }?)
     }
 
+    async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        guest.thread_state_mut().bootstrapped = true;
+        Ok(())
+    }
+
     async fn handle_rdtsc_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -343,6 +500,477 @@ impl Tool for Replayer {
 }
 
 impl Replayer {
+    async fn handle_exec<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let event = match next_event!(guest, Exec) {
+            Ok(event) => event,
+            Err(error) => return Err(error),
+        };
+        let actual_request = self
+            .read_exec_request(guest, syscall)
+            .unwrap_or_else(|error| {
+                panic!("could not read replay exec request after recorded success: {error}")
+            });
+        assert_eq!(
+            actual_request.dirfd, event.request.dirfd,
+            "replay exec directory context differs from recording"
+        );
+        assert_eq!(
+            actual_request.flags, event.request.flags,
+            "replay exec flags differ from recording"
+        );
+        let bootstrap_path = if actual_request.path == event.request.path {
+            None
+        } else {
+            let valid_bootstrap_substitution = guest.is_root_thread()
+                && !guest.thread_state().bootstrapped
+                && matches!(
+                    &event.target,
+                    crate::event::ExecTarget::Materialize(materialization)
+                        if matches!(
+                            materialization.base,
+                            crate::event::ExecMaterializationBase::Root
+                        ) && materialization.path == event.request.path
+                );
+            assert!(
+                valid_bootstrap_substitution,
+                "replay exec pathname differs from recording outside the root bootstrap"
+            );
+            assert!(
+                actual_request.path.len() >= event.request.path.len(),
+                "private replay bootstrap pathname is shorter than the recorded pathname"
+            );
+            Some(event.request.path.clone())
+        };
+
+        let root = crate::record_replay_path::open_process_root(guest.pid())
+            .unwrap_or_else(|error| panic!("could not pin replay root for exec: {error}"));
+        for dependency in &event.dependencies {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(dependency.path.clone()));
+            let start = match dependency.base {
+                crate::event::ExecMaterializationBase::Root => {
+                    crate::record_replay_path::open_process_root(guest.pid())
+                }
+                crate::event::ExecMaterializationBase::Cwd => {
+                    crate::record_replay_path::open_process_cwd(guest.pid())
+                }
+                crate::event::ExecMaterializationBase::DirectoryFd(fd) => {
+                    crate::record_replay_path::open_process_directory_fd(guest.pid(), fd)
+                }
+            }
+            .unwrap_or_else(|error| panic!("could not pin replay exec dependency base: {error}"));
+            let mut snapshot = self
+                .open_exec_snapshot(&dependency.image)
+                .unwrap_or_else(|error| {
+                    panic!("could not open recorded exec dependency snapshot: {error}")
+                });
+            crate::record_replay_path::materialize_regular_file(
+                &root,
+                &start,
+                &path,
+                &dependency.symlinks,
+                &mut snapshot,
+                dependency.image.digest,
+                dependency.image.mode,
+            )
+            .unwrap_or_else(|error| {
+                panic!("could not materialize recorded exec dependency {path:?}: {error}")
+            });
+            remember_materialized_path(&root, &start, &path).unwrap_or_else(|error| {
+                panic!("could not register recorded exec dependency {path:?}: {error}")
+            });
+        }
+
+        if let crate::event::ExecTarget::Materialize(materialization) = &event.target {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(materialization.path.clone()));
+            let start = match materialization.base {
+                crate::event::ExecMaterializationBase::Root => {
+                    crate::record_replay_path::open_process_root(guest.pid())
+                }
+                crate::event::ExecMaterializationBase::Cwd => {
+                    crate::record_replay_path::open_process_cwd(guest.pid())
+                }
+                crate::event::ExecMaterializationBase::DirectoryFd(fd) => {
+                    crate::record_replay_path::open_process_directory_fd(guest.pid(), fd)
+                }
+            }
+            .unwrap_or_else(|error| {
+                panic!("could not pin replay exec materialization base: {error}")
+            });
+            let mut snapshot = self
+                .open_exec_snapshot(&event.executable)
+                .unwrap_or_else(|error| panic!("could not open recorded exec snapshot: {error}"));
+            crate::record_replay_path::materialize_regular_file(
+                &root,
+                &start,
+                &path,
+                &materialization.symlinks,
+                &mut snapshot,
+                event.executable.digest,
+                event.executable.mode,
+            )
+            .and_then(|()| remember_materialized_path(&root, &start, &path))
+            .unwrap_or_else(|error| {
+                panic!("could not materialize recorded exec target {path:?}: {error}")
+            });
+        }
+
+        if let crate::event::ExecTarget::RestoreDescriptor(descriptor) = &event.target {
+            self.restore_exec_descriptor(guest, descriptor, &event.executable)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "could not restore recorded executable descriptor {}: {error}",
+                        descriptor.target_fd
+                    )
+                });
+        }
+
+        self.verify_live_exec_target(guest, syscall, &event.executable)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "replay exec target {:?} (dirfd {}, flags {:#x}) does not match recorded image: {error}",
+                    std::ffi::OsString::from_vec(event.request.path.clone()),
+                    event.request.dirfd,
+                    event.request.flags,
+                )
+            });
+
+        if let Some(path) = bootstrap_path {
+            return self
+                .inject_successful_exec_at_path(guest, syscall, &path)
+                .await;
+        }
+
+        match guest.inject(syscall).await {
+            Err(error) => panic!(
+                "replayed exec returned {error} after recording successfully replaced the image"
+            ),
+            Ok(value) => panic!(
+                "replayed exec returned {value} after recording successfully replaced the image"
+            ),
+        }
+    }
+
+    async fn inject_successful_exec_at_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        path: &[u8],
+    ) -> Result<i64, Errno> {
+        let address = match syscall {
+            Syscall::Execve(call) => <Option<PathPtr<'_>> as FromToRaw>::into_raw(call.path()),
+            Syscall::Execveat(call) => <Option<PathPtr<'_>> as FromToRaw>::into_raw(call.path()),
+            _ => unreachable!("bootstrap path rewrite requested for {syscall:?}"),
+        };
+        assert_ne!(
+            address, 0,
+            "successful bootstrap exec has a non-null pathname"
+        );
+        let mut replacement = path.to_vec();
+        replacement.push(0);
+        guest.memory().write_exact(
+            AddrMut::<u8>::from_raw(address).expect("bootstrap pathname address is non-null"),
+            &replacement,
+        )?;
+        match guest.inject(syscall).await {
+            Err(error) => panic!(
+                "replayed bootstrap exec returned {error} after recording successfully replaced the image"
+            ),
+            Ok(value) => panic!(
+                "replayed bootstrap exec returned {value} after recording successfully replaced the image"
+            ),
+        }
+    }
+
+    async fn restore_exec_descriptor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        descriptor: &crate::event::ExecDescriptor,
+        image: &crate::event::ExecImage,
+    ) -> io::Result<()> {
+        if descriptor.aliases.is_empty()
+            || !descriptor
+                .aliases
+                .iter()
+                .any(|alias| alias.fd == descriptor.target_fd)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorded exec descriptor has no target alias",
+            ));
+        }
+        for alias in &descriptor.aliases {
+            let actual = guest
+                .inject_with_retry(Fcntl::new().with_fd(alias.fd).with_cmd(FcntlCmd::F_GETFD))
+                .await
+                .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+                as libc::c_int;
+            if actual != alias.descriptor_flags {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "replay descriptor {} flags differ before exec restore: expected {:#x}, found {actual:#x}",
+                        alias.fd, alias.descriptor_flags
+                    ),
+                ));
+            }
+        }
+
+        let root = crate::record_replay_path::open_process_root(guest.pid())?;
+        let mut snapshot = self.open_exec_snapshot(image)?;
+        let private_name = crate::record_replay_path::create_root_temporary_regular_file(
+            &root,
+            &mut snapshot,
+            image.digest,
+            image.mode,
+        )?;
+        let private_path = Path::new("/").join(&private_name);
+        let path_bytes = private_path.as_os_str().as_bytes();
+        if path_bytes.len() + 1 > 128 {
+            let _ = crate::record_replay_path::unlink_root_entry(&root, &private_name);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "temporary executable pathname is too long",
+            ));
+        }
+        let mut path = [0_u8; 128];
+        path[..path_bytes.len()].copy_from_slice(path_bytes);
+        let mut stack = guest.stack().await;
+        let path_addr = stack.push(path);
+        let path_ptr =
+            PathPtr::from_ptr(unsafe { path_addr.cast::<u8>().as_ptr().cast::<libc::c_char>() })
+                .expect("guest stack address is non-null");
+        let _path_guard = stack
+            .commit()
+            .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+        let reopen_flags = OFlag::from_bits_truncate(descriptor.status_flags) | OFlag::O_CLOEXEC;
+        let source_fd = match guest
+            .inject_with_retry(
+                Openat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(Some(path_ptr))
+                    .with_flags(reopen_flags),
+            )
+            .await
+        {
+            Ok(fd) => fd as libc::c_int,
+            Err(error) => {
+                let _ = crate::record_replay_path::unlink_root_entry(&root, &private_name);
+                return Err(io::Error::from_raw_os_error(error.into_raw()));
+            }
+        };
+        drop(_path_guard);
+        crate::record_replay_path::unlink_root_entry(&root, &private_name)?;
+
+        let result = async {
+            let actual_status = guest
+                .inject_with_retry(Fcntl::new().with_fd(source_fd).with_cmd(FcntlCmd::F_GETFL))
+                .await
+                .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?
+                as libc::c_int;
+            if actual_status != descriptor.status_flags {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "restored exec descriptor status flags differ: expected {:#x}, found {actual_status:#x}",
+                        descriptor.status_flags
+                    ),
+                ));
+            }
+            if let Some(offset) = descriptor.offset {
+                let actual = guest
+                    .inject_with_retry(
+                        Lseek::new()
+                            .with_fd(source_fd)
+                            .with_offset(offset)
+                            .with_whence(Whence::SEEK_SET),
+                    )
+                    .await
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+                if actual != offset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "restored exec descriptor offset differs: expected {offset}, found {actual}"
+                        ),
+                    ));
+                }
+            }
+
+            for alias in &descriptor.aliases {
+                let flags = if alias.descriptor_flags & libc::FD_CLOEXEC != 0 {
+                    OFlag::O_CLOEXEC
+                } else {
+                    OFlag::empty()
+                };
+                let actual = guest
+                    .inject_with_retry(
+                        Dup3::new()
+                            .with_oldfd(source_fd)
+                            .with_newfd(alias.fd)
+                            .with_flags(flags),
+                    )
+                    .await
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+                if actual != i64::from(alias.fd) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "restored exec descriptor alias returned {actual}, expected {}",
+                            alias.fd
+                        ),
+                    ));
+                }
+                remember_materialized_file(guest.pid(), alias.fd);
+            }
+            Ok(())
+        }
+        .await;
+        let close_source = guest
+            .inject_with_retry(Close::new().with_fd(source_fd))
+            .await;
+        if close_source != Ok(0) && result.is_ok() {
+            return Err(io::Error::other(format!(
+                "could not close executable staging descriptor: {close_source:?}"
+            )));
+        }
+        result
+    }
+
+    fn read_exec_request<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+    ) -> io::Result<crate::event::ExecRequest> {
+        let call = match syscall {
+            Syscall::Execve(call) => call.into(),
+            Syscall::Execveat(call) => call,
+            _ => unreachable!("exec request read for {syscall:?}"),
+        };
+        let path = call
+            .path()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+            .read(&guest.memory())
+            .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+        Ok(crate::event::ExecRequest {
+            dirfd: call.dirfd(),
+            path: path.as_os_str().as_bytes().to_vec(),
+            flags: call.flags(),
+        })
+    }
+
+    fn open_exec_snapshot(&self, image: &crate::event::ExecImage) -> io::Result<File> {
+        let path = self
+            .data
+            .join(crate::consts::EXEC_FILES_NAME)
+            .join(image.digest.to_string());
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("recorded exec snapshot is not a regular file: {path:?}"),
+            ));
+        }
+        let mut file = File::open(&path)?;
+        let actual = detcore::Digest::digest_reader(&mut file)?;
+        if actual != image.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recorded exec snapshot digest mismatch at {path:?}: expected {}, found {}",
+                    image.digest, actual
+                ),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    async fn verify_live_exec_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        expected: &crate::event::ExecImage,
+    ) -> io::Result<()> {
+        let call = match syscall {
+            Syscall::Execve(call) => call.into(),
+            Syscall::Execveat(call) => call,
+            _ => unreachable!("exec target verification for {syscall:?}"),
+        };
+        let path_ptr = call
+            .path()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?;
+        let path = path_ptr
+            .read(&guest.memory())
+            .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+        let pinned = if path.as_os_str().is_empty() {
+            if call.flags() & libc::AT_EMPTY_PATH == 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            crate::record_replay_path::open_process_fd(guest.pid(), call.dirfd())?
+        } else {
+            let mut flags = OFlag::O_PATH | OFlag::O_CLOEXEC;
+            if call.flags() & libc::AT_SYMLINK_NOFOLLOW != 0 {
+                flags |= OFlag::O_NOFOLLOW;
+            }
+            let temporary = guest
+                .inject_with_retry(
+                    reverie::syscalls::Openat::new()
+                        .with_dirfd(call.dirfd())
+                        .with_path(Some(path_ptr))
+                        .with_flags(flags),
+                )
+                .await
+                .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?;
+            let pinned =
+                crate::record_replay_path::open_process_fd(guest.pid(), temporary as libc::c_int);
+            let close = guest
+                .inject_with_retry(Close::new().with_fd(temporary as libc::c_int))
+                .await;
+            if close != Ok(0) {
+                return Err(io::Error::other(format!(
+                    "could not close temporary replay exec descriptor: {close:?}"
+                )));
+            }
+            pinned?
+        };
+        let identity = crate::record_replay_path::file_identity(pinned.as_raw_fd())?;
+        if !crate::record_replay_path::is_regular_file(identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replay exec target is not a regular file",
+            ));
+        }
+        if identity.mode & 0o7777 != expected.mode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay exec mode differs: expected {:o}, found {:o}",
+                    expected.mode,
+                    identity.mode & 0o7777
+                ),
+            ));
+        }
+        let actual = detcore::Digest::digest_reader(crate::record_replay_path::open_readable_fd(
+            pinned.as_raw_fd(),
+        )?)?;
+        if actual != expected.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay exec digest differs: expected {}, found {}",
+                    expected.digest, actual
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn reserve_replay_fd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -373,10 +1001,7 @@ impl Replayer {
             return false;
         };
         if metadata.file_type().is_file() {
-            return materialized_files()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&ReplayFileIdentity::from_metadata(&metadata));
+            return materialized_file_is_registered(pid, &metadata);
         }
         if !metadata.file_type().is_dir() {
             return false;
@@ -444,12 +1069,11 @@ impl Replayer {
         let event = next_event!(guest, Open)?;
         let recorded = event.result;
         if let Ok(fd) = recorded {
-            let candidate = event
-                .materialize
+            let candidate = (event.materialize != OpenMaterialization::None)
                 .then(|| self.open_path_in_replay_root(guest, syscall))
                 .flatten();
             if let Some(candidate) = &candidate {
-                if flags.contains(OFlag::O_DIRECTORY) {
+                if event.materialize == OpenMaterialization::Directory {
                     let _ = std::fs::create_dir_all(candidate);
                 } else if flags.contains(OFlag::O_CREAT)
                     && let Some(parent) = candidate.parent()
@@ -461,13 +1085,14 @@ impl Replayer {
                 if flags.contains(OFlag::O_TMPFILE) {
                     return candidate.is_dir();
                 }
-                match std::fs::metadata(candidate) {
-                    Ok(metadata) if metadata.file_type().is_dir() => true,
-                    Ok(metadata) if metadata.file_type().is_file() => materialized_files()
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .contains(&ReplayFileIdentity::from_metadata(&metadata)),
-                    Err(error)
+                match (event.materialize, std::fs::metadata(candidate)) {
+                    (OpenMaterialization::Directory, Ok(metadata)) => metadata.file_type().is_dir(),
+                    (OpenMaterialization::RegularFile, Ok(metadata))
+                        if metadata.file_type().is_file() =>
+                    {
+                        materialized_file_is_registered(guest.pid(), &metadata)
+                    }
+                    (OpenMaterialization::RegularFile, Err(error))
                         if error.kind() == std::io::ErrorKind::NotFound
                             && flags.contains(OFlag::O_CREAT) =>
                     {
@@ -502,6 +1127,109 @@ impl Replayer {
         }
         recorded
     }
+
+    fn mkdir_request<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+    ) -> io::Result<(libc::c_int, PathBuf)> {
+        let (dirfd, path) = match syscall {
+            Syscall::Mkdir(call) => (
+                libc::AT_FDCWD,
+                call.path()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                    .read(&guest.memory())
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+            ),
+            Syscall::Mkdirat(call) => (
+                call.dirfd(),
+                call.path()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EFAULT))?
+                    .read(&guest.memory())
+                    .map_err(|error| io::Error::from_raw_os_error(error.into_raw()))?,
+            ),
+            _ => unreachable!("mkdir replay path requested for {syscall:?}"),
+        };
+        Ok((dirfd, path))
+    }
+
+    fn materialize_recorded_mkdir<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        syscall: Syscall,
+    ) -> io::Result<bool> {
+        let (dirfd, path) = self.mkdir_request(guest, syscall)?;
+        let root = crate::record_replay_path::open_process_root(guest.pid())?;
+        if path.is_absolute() {
+            crate::record_replay_path::ensure_directory_path(&root, &root, &path)?;
+            return Ok(true);
+        }
+
+        let start = if dirfd == libc::AT_FDCWD {
+            crate::record_replay_path::open_process_cwd(guest.pid())
+        } else {
+            crate::record_replay_path::open_process_directory_fd(guest.pid(), dirfd)
+        };
+        let Ok(start) = start else {
+            tracing::debug!(
+                ?syscall,
+                "recorded mkdir directory has no live replay directory base"
+            );
+            return Ok(false);
+        };
+        match crate::record_replay_path::directory_is_beneath(&root, &start) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                tracing::debug!(
+                    ?syscall,
+                    "recorded mkdir directory base is not confined to replay root"
+                );
+                return Ok(false);
+            }
+        }
+        crate::record_replay_path::ensure_directory_path(&root, &start, &path)?;
+        Ok(true)
+    }
+
+    /// Replays successful mkdir side effects exactly as before. For a recorded
+    /// `EEXIST` caused by a directory, it reconstructs that directory in the
+    /// fresh chroot while still returning the recorded error to the guest.
+    async fn handle_mkdir<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+        confined_dirfd: bool,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Mkdir)?;
+        if event.result == Err(Errno::EEXIST) && event.existing_directory {
+            self.materialize_recorded_mkdir(guest, syscall)
+                .unwrap_or_else(|error| {
+                    panic!("failed to materialize recorded mkdir directory: {error}")
+                });
+        } else if let Ok(expected) = event.result {
+            if !confined_dirfd {
+                let actual = guest.inject_with_retry(syscall).await;
+                assert_eq!(actual, Ok(expected), "mkdir side effects diverged");
+            } else if self.path_mutation_dirfds_are_confined(guest.pid(), syscall) {
+                match guest.inject_with_retry(syscall).await {
+                    Ok(actual) => assert_eq!(
+                        actual, expected,
+                        "replayed mkdirat returned a different result"
+                    ),
+                    Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
+                        tracing::debug!(?syscall, %error, "replay mkdirat kept virtual");
+                    }
+                    Err(error) => {
+                        panic!(
+                            "replayed mkdirat {syscall:?} failed after recording returned {expected}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        event.result
+    }
+
     fn dirfd_is_confined(&self, pid: Pid, fd: libc::c_int) -> bool {
         fd == libc::AT_FDCWD || self.fd_is_in_replay_root(pid, fd)
     }
@@ -739,30 +1467,30 @@ impl Replayer {
                 )
             });
 
+        let actual_event = DebugEvent::new(syscall, &guest.memory());
+        let exec_syscall = matches!(syscall, Syscall::Execve(_) | Syscall::Execveat(_));
+
         // Compare only the argument registers the syscall actually uses. Reverie
         // keeps all six raw registers in every typed syscall and derives
         // `PartialEq` over them, so unused registers (which hold arbitrary
         // leftover guest values) would otherwise produce false desyncs for any
         // syscall with fewer than six arguments.
-        if normalize_unused_args(debug_event.syscall()) == normalize_unused_args(syscall) {
+        if normalize_unused_args(debug_event.syscall()) == normalize_unused_args(syscall)
+            && debug_event.exec_request_matches(&actual_event)
+        {
             return;
         }
 
-        if guest.is_root_thread() {
-            // execve and execveat for the root thread are special cases. Even
-            // when ASLR is turned off, these can have different pointer values
-            // than what we originally recorded because the pointers originate
-            // outside of the current address space.
-            match syscall {
-                Syscall::Execve(_) | Syscall::Execveat(_) => return,
-                _ => {}
-            }
+        if guest.is_root_thread() && !guest.thread_state().bootstrapped && exec_syscall {
+            // The controller-visible replay bootstrap pathname is deliberately
+            // substituted before injection and therefore differs here.
+            return;
         }
 
         let error = DesyncError {
             thread,
             count: guest.thread_state().count,
-            actual: DebugEvent::new(syscall, &guest.memory()),
+            actual: actual_event,
             expected: debug_event,
         };
         let summary = error.summary(&self.data, 16, 4).to_string();
@@ -872,5 +1600,102 @@ impl Replayer {
             assert_eq!(actual, recorded, "close_range side effects diverged");
         }
         recorded
+    }
+}
+
+#[cfg(test)]
+mod exec_snapshot_tests {
+    use super::*;
+
+    fn replayer_with_snapshot(
+        contents: &[u8],
+    ) -> (tempfile::TempDir, Replayer, crate::event::ExecImage) {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = detcore::Digest::new(contents);
+        let snapshots = directory.path().join(crate::consts::EXEC_FILES_NAME);
+        std::fs::create_dir(&snapshots).unwrap();
+        std::fs::write(snapshots.join(digest.to_string()), contents).unwrap();
+        let replayer = Replayer {
+            data: directory.path().to_path_buf(),
+            ..Default::default()
+        };
+        let image = crate::event::ExecImage {
+            digest,
+            mode: 0o755,
+        };
+        (directory, replayer, image)
+    }
+
+    #[test]
+    fn recorded_exec_snapshot_digest_is_verified() {
+        let (directory, replayer, image) = replayer_with_snapshot(b"recorded image");
+        std::fs::write(
+            directory
+                .path()
+                .join(crate::consts::EXEC_FILES_NAME)
+                .join(image.digest.to_string()),
+            b"corrupt image",
+        )
+        .unwrap();
+
+        let error = replayer.open_exec_snapshot(&image).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn missing_recorded_exec_snapshot_fails_closed() {
+        let (directory, replayer, image) = replayer_with_snapshot(b"recorded image");
+        std::fs::remove_file(
+            directory
+                .path()
+                .join(crate::consts::EXEC_FILES_NAME)
+                .join(image.digest.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            replayer.open_exec_snapshot(&image).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn materialized_object_pin_survives_unlink_until_scope_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::record_replay_path::open_directory_path(directory.path()).unwrap();
+        let scope = ReplayMaterializationScope::new(root.as_raw_fd()).unwrap();
+        let root_identity = identity_for_fd(root.as_raw_fd()).unwrap();
+        let path = directory.path().join("image");
+        std::fs::write(&path, b"recorded").unwrap();
+        let object: OwnedFd = File::open(&path).unwrap().into();
+        let identity = identity_for_fd(object.as_raw_fd()).unwrap();
+        register_materialized(root_identity, object).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let registry = materialized_files()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pin = registry
+            .get(&root_identity)
+            .and_then(|files| files.get(&identity))
+            .expect("registered object remains pinned after unlink");
+        let pinned = std::fs::metadata(format!("/proc/self/fd/{}", pin.as_raw_fd())).unwrap();
+        assert_eq!(
+            (pinned.dev(), pinned.ino()),
+            (identity.device, identity.inode)
+        );
+        drop(registry);
+
+        std::fs::write(&path, b"replacement").unwrap();
+        let replacement = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            (replacement.dev(), replacement.ino()),
+            (identity.device, identity.inode)
+        );
+        assert_eq!(registered_materialized_count(root.as_raw_fd()), 1);
+
+        drop(scope);
+        assert_eq!(registered_materialized_count(root.as_raw_fd()), 0);
     }
 }

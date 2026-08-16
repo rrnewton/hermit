@@ -1366,14 +1366,14 @@ mod tests {
         let right_path = right.to_path_buf();
         fs::write(
             &left_path,
-            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
-             INFO detcore: DETLOG value=1\n",
+            "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+             2026-08-13T01:02:03.000001Z INFO detcore: DETLOG value=1\n",
         )
         .unwrap();
         fs::write(
             &right_path,
-            "INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
-             INFO detcore: DETLOG value=2\n",
+            "2026-08-13T01:02:04.000000Z INFO detcore::scheduler: COMMIT turn 23 at time 4567890123\n\
+             2026-08-13T01:02:04.000001Z INFO detcore: DETLOG value=2\n",
         )
         .unwrap();
 

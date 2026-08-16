@@ -89,14 +89,16 @@ The mode contracts are:
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
 An enabled `verify` cell attempts backend-local canonical INFO parity and can
-pass only with a typed nonzero verdict. Direct DBT verification currently
-fails closed with `no_result` until Reverie provides a protected internal
-descriptor for canonical Detcore evidence; DBT cells remain enabled as
-deliberate attempts and cannot pass while that prerequisite is held. KVM's
-output-only result remains unqualified. A
-same-backend result is not, by itself, a cross-backend parity claim; that also
-requires fresh observations from both backends. `--detlog-stack` and
-`--detlog-heap` remain the additional memory-determinism evidence.
+pass only with a typed nonzero verdict. On non-KVM backends, bare
+`--verify --verify-json` is the canonical path. A DBT cell may claim L2 only
+when its protected framed evidence is present and nonempty, authenticates and
+validates successfully, contains nonzero INFO records for both runs, and the
+JSON reports `bitwise_parity: true`. Missing, empty, or invalid DBT evidence
+fails closed and cannot pass. KVM's output/status-only result remains
+unqualified. A same-backend result is not, by itself, a cross-backend parity
+claim; that also requires fresh observations from both backends.
+`--detlog-stack` and `--detlog-heap` remain the additional memory-determinism
+evidence.
 
 An enabled SaBRe cell has an additional execution-path contract. Every E2E
 Hermit execution writes structured evidence into the cell capture: the

@@ -214,9 +214,13 @@ relaxations:
 - **L2** canonical full-observation parity on a supported evidence path:
   `hermit run --strict --verify --verify-json <path> -- ...`,
   with JSON `bitwise_parity: true`.
-- **DBT current limit**: direct `--verify` fails closed with `no_result` before
-  guest execution until Reverie supplies a protected internal descriptor for
-  canonical Detcore evidence; use plain `--strict` only for L1 diagnosis.
+- **DBT L2**: bare `--verify --verify-json` is canonical only when protected
+  framed evidence is present and nonempty, authenticates and validates
+  successfully, contains nonzero INFO records for both runs, and the JSON
+  reports `bitwise_parity: true`. Missing, empty, or invalid evidence fails
+  closed and is not L2.
+- **KVM current limit**: output/status-only verification is not full L2 INFO
+  parity.
 - **L3** memory determinism: add `--detlog-heap --detlog-stack` to L2.
 - **L4** stress-hardened: L2/L3 repeated ~20x with no divergence.
 

@@ -135,6 +135,8 @@ fn select_thread_exit_detpid(
 }
 
 fn thread_start_is_root(
+    guest_is_root_thread: bool,
+    state_detpid_was_explicit: bool,
     guest_tid: Tid,
     state_dettid: DetTid,
     state_detpid: DetPid,
@@ -145,7 +147,18 @@ fn thread_start_is_root(
         guest_dettid, state_dettid,
         "backend thread identity disagrees with Detcore thread state"
     );
-    state_dettid == state_detpid && state_detpid == tool_detpid
+    if guest_is_root_thread {
+        return true;
+    }
+
+    // DBT explicitly seeds the deterministic process identity for its root
+    // application image, which can retain a physical parent. Accept that one
+    // narrow fallback, but never infer root status merely because a
+    // per-process Tool carries the same identity as an ordinary fork child.
+    state_detpid_was_explicit
+        && state_dettid == ROOT_DETPID
+        && state_detpid == ROOT_DETPID
+        && tool_detpid == ROOT_DETPID
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1439,8 +1452,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let guest_detpid = DetPid::from_raw(guest.pid().into());
         let new_dettid = guest.thread_state().dettid;
-        let detpid = guest.thread_state().detpid.unwrap_or(guest_detpid);
-        let is_root_thread = thread_start_is_root(guest.tid(), new_dettid, detpid, self.detpid);
+        let state_detpid = guest.thread_state().detpid;
+        let detpid = state_detpid.unwrap_or(guest_detpid);
+        let is_root_thread = thread_start_is_root(
+            guest.is_root_thread(),
+            state_detpid.is_some(),
+            guest.tid(),
+            new_dettid,
+            detpid,
+            self.detpid,
+        );
         trace!(
             "[dettid {}] detcore handle_thread_start, detpid={}",
             new_dettid, detpid
@@ -1512,8 +1533,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             guest.memory().write_value(ptr, &bytes)?;
         }
 
+        let result = self
+            .record_or_replay
+            .handle_post_exec(&mut guest.into_guest())
+            .await;
         self.post_handler_hook(guest).await;
-        Ok(())
+        result
     }
 
     /// A timer fires to preempt the guest and give other threads a turn.
@@ -2852,6 +2877,8 @@ mod thread_start_identity_tests {
     #[test]
     fn root_process_worker_is_not_misclassified_as_root_thread() {
         assert!(!thread_start_is_root(
+            false,
+            false,
             Tid::from_raw(4),
             DetTid::from_raw(4),
             DetPid::from_raw(3),
@@ -2862,16 +2889,20 @@ mod thread_start_identity_tests {
     #[test]
     fn fork_child_leader_is_not_misclassified_as_traced_root() {
         assert!(!thread_start_is_root(
+            false,
+            true,
             Tid::from_raw(4),
             DetTid::from_raw(4),
             DetPid::from_raw(4),
-            DetPid::from_raw(3),
+            DetPid::from_raw(4),
         ));
     }
 
     #[test]
     fn traced_root_identity_is_accepted() {
         assert!(thread_start_is_root(
+            true,
+            false,
             Tid::from_raw(3),
             DetTid::from_raw(3),
             DetPid::from_raw(3),
@@ -2880,9 +2911,23 @@ mod thread_start_identity_tests {
     }
 
     #[test]
+    fn canonical_dbt_root_image_is_accepted_when_backend_parent_is_visible() {
+        assert!(thread_start_is_root(
+            false,
+            true,
+            Tid::from_raw(ROOT_DETPID.as_raw()),
+            ROOT_DETPID,
+            ROOT_DETPID,
+            ROOT_DETPID,
+        ));
+    }
+
+    #[test]
     #[should_panic(expected = "backend thread identity disagrees with Detcore thread state")]
     fn corrupted_native_thread_state_is_refused() {
         let _ = thread_start_is_root(
+            false,
+            false,
             Tid::from_raw(41),
             DetTid::from_raw(42),
             DetPid::from_raw(41),

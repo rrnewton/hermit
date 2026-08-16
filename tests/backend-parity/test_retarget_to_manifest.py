@@ -30,8 +30,8 @@ def plan_for(row: str):
 print("case LEGACY-L2 — old detlog/guest tokens do not enable a backend")
 plan = plan_for("probe\tpass\tpass\tpass\t-\t-\tdetlog\tdetlog\tguest\t-\t-")
 check("only ptrace is enabled", plan.enabled == ["ptrace"], repr(plan.enabled))
-check("DBT names the protected evidence prerequisite",
-      "protected internal descriptor" in plan.disabled["dbt"],
+check("DBT requires a fresh verdict from the protected evidence path",
+      "current protected canonical evidence path" in plan.disabled["dbt"],
       plan.disabled["dbt"])
 check("KVM remains unqualified",
       "KVM remains unqualified" in plan.disabled["kvm"],
@@ -48,8 +48,9 @@ check("KVM is absent from enabled", "kvm" not in plan.enabled, repr(plan.enabled
 print("case L1-ONLY — a row with no L2 evidence remains ptrace-only")
 plan = plan_for("probe\tpass\tpass\tpass\t-\t-")
 check("six-column row enables only ptrace", plan.enabled == ["ptrace"], repr(plan.enabled))
-check("DBT L1 reason names the protected evidence prerequisite",
-      "protected internal descriptor" in plan.disabled["dbt"])
+check("DBT L1 reason requires a fresh non-vacuous L2 verdict",
+      "protected canonical evidence path" in plan.disabled["dbt"]
+      and "no fresh typed, non-vacuous L2 verdict" in plan.disabled["dbt"])
 check("KVM L1 reason remains explicit", "L2 --verify witness was not recorded" in plan.disabled["kvm"])
 
 if FAILURES:

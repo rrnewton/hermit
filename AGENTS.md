@@ -243,11 +243,18 @@ aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
 must match. A comparison with zero INFO messages fails verification. State this
 canonical envelope rather than calling the raw log files literally
-byte-identical. KVM's output-only fallback reports `bitwise_parity: false` and
-is not L2. Direct DBT verification currently fails closed with `no_result`
-before guest execution because the pinned Reverie revision does not provide a
-protected internal descriptor for canonical Detcore evidence. A DBT
-`hermit run --backend dbt --strict` result is L1 evidence only.
+byte-identical. On non-KVM backends, bare `--verify --verify-json <path>`
+selects this canonical comparison; `--verify-strict` is not required. DBT may
+claim L2 only when its protected framed evidence is present and nonempty, the
+frame authenticates and validates successfully, both compared INFO counts are
+nonzero, and the JSON reports `bitwise_parity: true`. Missing, empty, or invalid
+DBT evidence fails closed and is not L2. KVM's output-only fallback reports
+`bitwise_parity: false` and is not L2.
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Workloads requiring
+those operations are outside the selected M2 DBT L2 scope; selected-cell
+results do not establish whole-corpus or arbitrary process-tree parity.
 
 ## Debugging
 

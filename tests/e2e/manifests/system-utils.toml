@@ -36,10 +36,9 @@ kvm = "Enable after the ptrace baseline for direct C guests is trusted"
 sabre = "SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.replay.backends_disabled]
-ptrace = "Clock replay divergence is tracked separately from this determinism entry"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -91,10 +90,9 @@ liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 sabre = "The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.replay.backends_disabled]
-ptrace = "The date utility currently diverges while replaying timezone-file reads"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -694,10 +692,9 @@ liteinst = "LiteInst coverage is owned by its backend compatibility partition"
 sabre = "Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support"
 
 [test.modes.replay]
-ci = false
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.replay.backends_disabled]
-ptrace = "The hexdump process tree currently diverges during replay"
 dbt = "Record/replay is unsupported by DBT"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

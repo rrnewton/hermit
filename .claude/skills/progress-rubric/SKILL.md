@@ -15,12 +15,13 @@ leading mode to trailing modes**.
 1. Measure one exact `origin/main` SHA in a clean checkout. If main moves and
    product code changed, update and rerun affected measurements.
 2. Run the same app probes through ptrace
-   `--strict --verify --verify-json`, record/replay, DBT strict execution, and
-   KVM. Require `bitwise_parity: true` for every L2 cell. DBT direct
-   verification currently fails closed with `no_result` until Reverie provides
-   a protected internal descriptor for canonical Detcore evidence. KVM's current
-   output/status-only verification is a separate, lower-assurance cell. Do not
-   substitute old task notes for live results.
+   `--strict --verify --verify-json`, record/replay, DBT
+   `--strict --verify --verify-json`, and KVM. Require `bitwise_parity: true`
+   with nonzero compared INFO counts for every L2 cell. A DBT L2 cell also
+   requires present, nonempty protected framed evidence that authenticates and
+   validates successfully. KVM's current output/status-only verification is a
+   separate, lower-assurance cell. Do not substitute old task notes for live
+   results.
 3. Use only code and artifacts available from main. Unlanded work belongs in a
    final footnote, never in the coverage totals.
 4. Mark unavailable or interrupted measurements honestly. `BLOCKED`, `NOT RUN`,
@@ -82,17 +83,20 @@ For each probe, run:
   --verify-json /tmp/progress-verify.json -- PROGRAM ARGS...
 ./target/debug/hermit record start --verify --verify-json /tmp/progress-replay.json --record-timeout 90 \
   --data-dir "$(mktemp -d /tmp/hermit-report-rr.XXXXXX)" -- PROGRAM ARGS...
-./target/debug/hermit run --backend dbt --strict -- PROGRAM ARGS...
+./target/debug/hermit run --backend dbt --strict --verify \
+  --verify-json /tmp/progress-dbt.json -- PROGRAM ARGS...
 ./target/debug/hermit run --backend kvm --strict --verify \
   --verify-json /tmp/progress-kvm-output.json -- PROGRAM ARGS...
 ```
 
-Also attempt one representative DBT `--verify --verify-json` command and retain
-the expected protected-descriptor `no_result` receipt. If DBT or KVM has a backend-wide preflight failure, run one representative
-probe, quote the error, and mark the remaining cells `BLOCKED*` with one shared
-footnote. Do not use a client, SDK, pin, or proof branch that is not supplied by
-main. For R/R, distinguish record timeout, replay divergence, output mismatch,
-and successful round trip.
+Retain each DBT verification report and require protected framed evidence that
+is present and nonempty, authenticates and validates successfully, contains
+nonzero INFO records for both runs, and produces JSON `bitwise_parity: true`.
+Missing, empty, or invalid evidence is not L2. If DBT or KVM has a backend-wide
+preflight failure, run one representative probe, quote the error, and mark the
+remaining cells `BLOCKED*` with one shared footnote. Do not use a client, SDK,
+pin, or proof branch that is not supplied by main. For R/R, distinguish record
+timeout, replay divergence, output mismatch, and successful round trip.
 
 ### Repository health
 
@@ -114,6 +118,8 @@ ignored counts separately.
 
 - `PASS L2`: a supported canonical strict-verification path completed and its exact-SHA JSON
   verdict reports `bitwise_parity: true` with nonzero compared INFO messages.
+- A DBT `PASS L2` additionally requires present, nonempty protected framed
+  evidence that authenticates and validates successfully.
 - `PASS OUTPUT`: KVM repeat execution matched exit status/stdout/stderr; internal
   logs were not compared. Never report this as L2.
 - `PASS R/R`: record completed, replay completed, and outputs/logs matched.

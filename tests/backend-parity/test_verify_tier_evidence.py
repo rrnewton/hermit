@@ -20,8 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run_matrix as matrix  # noqa: E402
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
+    L2_ALLOWED,
     L2_RANK,
     SCORECARD_HEADER,
     expectation,
@@ -142,15 +144,111 @@ check("gap < bitwise", L2_RANK["gap"] < L2_RANK["bitwise"], repr(L2_RANK))
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
 check("'stripped' is no longer a tier name", "stripped" not in L2_RANK, repr(L2_RANK))
 
-print("case CONTRACT — only supported canonical verify paths demand bitwise evidence")
+print("case CONTRACT — non-KVM canonical verify paths demand bitwise evidence")
 check("ptrace verify contract is 'bitwise'",
       expectation("ptrace", "exit_status", True)[0] == "bitwise")
-check("dbt verify contract stays a 'gap' while protected evidence is unavailable",
-      expectation("dbt", "hello_stdout", True)[0] == "gap")
-check("dbt nonzero exit verify contract stays a 'gap'",
-      expectation("dbt", "exit_status", True)[0] == "gap")
+check("dbt verify contract is 'bitwise'",
+      expectation("dbt", "hello_stdout", True)[0] == "bitwise")
+check("dbt nonzero exit verify contract is 'bitwise'",
+      expectation("dbt", "exit_status", True)[0] == "bitwise")
+check("dbt file-metadata gap remains explicit",
+      expectation("dbt", "file_metadata", True)[0] == "gap")
+check("dbt pthread gap remains explicit",
+      expectation("dbt", "pthread_lifecycle", True)[0] == "gap")
 check("kvm output-only verify contract stays a 'gap'",
       expectation("kvm", "exit_status", True)[0] == "gap")
+check("dbt allows both explicit gaps and canonical bitwise contracts",
+      L2_ALLOWED["dbt"] == {"gap", "bitwise"}, repr(L2_ALLOWED["dbt"]))
+
+print("case DBT COMMAND — bare --verify consumes typed canonical evidence")
+seen_commands: list[list[str]] = []
+original_run_with_timeout = matrix.run_with_timeout
+
+
+def verdict_path(command: list[str]) -> Path:
+    argument = next(arg for arg in command if arg.startswith("--verify-json="))
+    return Path(argument.split("=", 1)[1])
+
+
+def planted_dbt_match(command: list[str]):
+    seen_commands.append(command)
+    verdict_path(command).write_text(json.dumps(record(left=348, right=348)), encoding="utf-8")
+    return matrix.subprocess.CompletedProcess(command, 0, b"", b"")
+
+
+matrix.run_with_timeout = planted_dbt_match
+try:
+    dbt_evidence: dict[str, str] = {}
+    dbt_status, dbt_detail, _ = matrix.run_case_verify(
+        Path("/hermit"),
+        "dbt",
+        "hello_stdout",
+        ["/bin/true"],
+        0,
+        "bitwise",
+        dbt_evidence,
+    )
+finally:
+    matrix.run_with_timeout = original_run_with_timeout
+
+check("typed DBT canonical evidence passes", dbt_status == "PASS", dbt_detail)
+check("DBT evidence records the bitwise tier",
+      dbt_evidence.get("tier") == "bitwise", repr(dbt_evidence))
+dbt_command = seen_commands[-1]
+check("command emits exactly one bare --verify", dbt_command.count("--verify") == 1,
+      repr(dbt_command))
+check("deleted --verify-strict is never emitted", "--verify-strict" not in dbt_command,
+      repr(dbt_command))
+check("successful probes do not add a status relaxation",
+      not any(arg.startswith("--verify-allow") for arg in dbt_command), repr(dbt_command))
+check("command requests a typed verdict",
+      any(arg.startswith("--verify-json=") for arg in dbt_command), repr(dbt_command))
+
+failure_command = matrix.hermit_command(
+    Path("/hermit"),
+    "dbt",
+    ["/bin/sh", "-c", "exit 23"],
+    "exit_status",
+    strict=True,
+    verify=True,
+    verify_json=Path("/tmp/dbt-failure.json"),
+    verify_allow_failure=True,
+)
+check("nonzero guest probe admits only failed statuses",
+      "--verify-allow=failure" in failure_command, repr(failure_command))
+check("nonzero guest probe never uses the broad 'both' allowance",
+      "both" not in failure_command, repr(failure_command))
+
+print("case DBT NO-RESULT — missing canonical evidence is a failure, not a gap")
+
+
+def planted_dbt_no_result(command: list[str]):
+    verdict_path(command).write_text(
+        json.dumps({"verdict": "no_result", "verified": False}),
+        encoding="utf-8",
+    )
+    return matrix.subprocess.CompletedProcess(
+        command,
+        1,
+        b"",
+        b"DBT canonical evidence was empty",
+    )
+
+
+matrix.run_with_timeout = planted_dbt_no_result
+try:
+    no_result_status, no_result_detail, _ = matrix.run_case_verify(
+        Path("/hermit"),
+        "dbt",
+        "hello_stdout",
+        ["/bin/true"],
+        0,
+        "bitwise",
+    )
+finally:
+    matrix.run_with_timeout = original_run_with_timeout
+
+check("DBT no_result is red", no_result_status == "FAIL", no_result_detail)
 
 print("case SCORECARD — only typed canonical evidence may issue a positive")
 import tempfile as _tf, csv as _csv  # noqa: E402

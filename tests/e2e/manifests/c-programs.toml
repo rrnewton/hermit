@@ -5526,7 +5526,7 @@ program = "tests/c/record_replay_file_state.c"
 observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 
 [test.modes.verify]
-ci = false
+ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
 dbt = "Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately"

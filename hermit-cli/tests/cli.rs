@@ -518,12 +518,15 @@ fn run_dbt_uses_the_requested_guest_environment() {
 }
 
 #[test]
-fn run_dbt_verify_fails_closed_before_guest_execution() {
+fn run_dbt_verify_publishes_canonical_evidence() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create DBT verification-refusal directory");
-    let marker = directory.path().join("guest-executed");
+        .expect("failed to create DBT canonical-verification directory");
+    let logs = directory.path().join("logs");
     let report = directory.path().join("verify.json");
-    let marker_text = marker.to_str().expect("DBT marker path should be UTF-8");
+    fs::create_dir(&logs).expect("failed to create DBT verification-log directory");
+    let logs_text = logs
+        .to_str()
+        .expect("DBT verification-log path should be UTF-8");
     let report_text = report.to_str().expect("DBT report path should be UTF-8");
     let args = [
         "run",
@@ -531,45 +534,55 @@ fn run_dbt_verify_fails_closed_before_guest_execution() {
         "dbt",
         "--strict",
         "--verify",
+        "--keep-logs",
+        "--verify-log-dir",
+        logs_text,
         "--verify-json",
         report_text,
         "--",
-        "/bin/sh",
-        "-c",
-        "touch \"$1\"",
-        "sh",
-        marker_text,
+        "/bin/true",
     ];
     let output = hermit(&args);
 
-    assert!(!output.status.success(), "DBT verification must refuse");
-    assert!(!marker.exists(), "DBT verification executed the guest");
+    assert_success(&output, &args);
     assert!(output.stdout.is_empty(), "unexpected stdout: {output:?}");
-    let error = stderr(&output);
+    let diagnostic = stderr(&output);
     assert!(
-        error.contains("DBT verification produced no result"),
-        "{error}"
-    );
-    assert!(
-        error.contains("protected Reverie internal descriptor"),
-        "{error}"
+        diagnostic.contains("Success: deterministic. Determinism verified."),
+        "{diagnostic}"
     );
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(report).expect("verification JSON should exist"))
             .expect("verification JSON should parse");
-    assert_eq!(report["verified"], false);
-    assert_eq!(report["bitwise_parity"], false);
-    assert_eq!(report["verdict"], "no_result");
-    assert_eq!(report["comparison"], serde_json::Value::Null);
-    assert_eq!(report["compared_log_messages"], serde_json::Value::Null);
-    for obsolete in [
-        ":: DBT Run1",
-        ":: DBT Run2",
-        "Success: deterministic",
-        "DBT path confirmed",
-        "Comparing DBT",
-    ] {
-        assert!(!error.contains(obsolete), "old comparator ran: {error}");
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["bitwise_parity"], true);
+    assert_eq!(report["verdict"], "matched");
+    assert_eq!(report["comparison"]["strictness"], "canonical");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "missing DBT {side} INFO count: {report}"
+        );
+    }
+
+    let retained = fs::read_dir(&logs)
+        .expect("failed to read retained DBT logs")
+        .map(|entry| entry.expect("failed to read retained DBT log").path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained.len(),
+        2,
+        "unexpected retained DBT logs: {retained:?}"
+    );
+    for path in retained {
+        assert!(
+            detcore::logdiff::canonical_info_count(&path).expect("retained DBT log should parse")
+                > 0,
+            "retained DBT log had no canonical INFO: {}",
+            path.display()
+        );
     }
 }
 
@@ -969,17 +982,61 @@ fn run_dbt_virtualizes_process_identities() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit strict coverage.
+// TODO-HUMAN-REVIEW(PR-1065): Review cross-backend self-prlimit identity coverage.
 #[test]
-fn run_dbt_executes_self_prlimit() {
+fn run_ptrace_and_dbt_verify_virtual_self_prlimit() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
     let program = dbt_prlimit_self_guest()
         .to_str()
         .expect("DBT self-prlimit guest path should be UTF-8");
-    let args = ["run", "--backend", "dbt", "--strict", "--", program];
-    let output = hermit(&args);
+    for backend in ["ptrace", "dbt"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create self-prlimit verification directory");
+        let logs = directory.path().join("logs");
+        fs::create_dir(&logs).expect("failed to create self-prlimit verification-log directory");
+        let logs_text = logs
+            .to_str()
+            .expect("self-prlimit verification-log path should be UTF-8");
+        let args = [
+            "run",
+            "--backend",
+            backend,
+            "--strict",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+            logs_text,
+            "--",
+            program,
+        ];
+        let output = hermit(&args);
 
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "dbt-prlimit-self-ok\n");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "dbt-prlimit-self-ok\n");
+        let retained = fs::read_dir(&logs)
+            .expect("failed to read self-prlimit verification logs")
+            .map(|entry| {
+                entry
+                    .expect("failed to read self-prlimit verification log")
+                    .path()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained.len(),
+            2,
+            "unexpected {backend} self-prlimit verification logs: {retained:?}"
+        );
+        for path in retained {
+            let log = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            assert!(
+                log.lines()
+                    .any(|line| line.contains("inbound syscall: prlimit64(3, 7,")),
+                "{backend} canonical evidence lost the virtual self pid in {}:\n{log}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]

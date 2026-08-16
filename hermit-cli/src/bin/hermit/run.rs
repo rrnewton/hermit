@@ -1863,12 +1863,14 @@ impl RunOpts {
         }
         if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
-        } else if self.verify {
+        } else if self.verify && self.selected_backend() != Backend::Dbt {
             // `--verify` runs the guest twice through the output-capturing
             // backend, which otherwise feeds the guest an empty stdin. Snapshot
             // the real stdin now so both runs replay identical input; without
             // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
             // -x c -`) is dropped and hermit reports a false deterministic pass.
+            // The dedicated DBT adapter owns an equivalent tee-and-replay
+            // snapshot because it launches outside this container path.
             hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
         }
 
@@ -1929,6 +1931,11 @@ impl RunOpts {
             Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
                 let retained_log_dir = self.retained_verify_log_dir()?;
+                let verification_stdin = self
+                    .verify
+                    .then(super::startup_stdin)
+                    .transpose()?
+                    .flatten();
                 return super::backends::run_dbt(
                     &self.program,
                     &self.args,
@@ -1944,6 +1951,7 @@ impl RunOpts {
                     global.log_file.as_deref(),
                     &self.effective_det_config(),
                     environment,
+                    verification_stdin,
                 );
             }
         }
