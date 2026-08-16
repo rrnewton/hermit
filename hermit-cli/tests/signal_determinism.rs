@@ -112,6 +112,65 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
     }
 }
 
+fn verify_signal_scenario(scenario: &str, expected_stdout: &str) {
+    let _guard = hermit_signal_lock();
+
+    for iteration in 0..DETERMINISM_RUNS {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create signal verification directory");
+        let report_path = directory.path().join("verify.json");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "30s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--verify",
+            ])
+            .arg(format!("--verify-json={}", report_path.display()))
+            .args([
+                "--base-env=minimal",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                "--",
+            ])
+            .arg(signal_guest())
+            .arg(scenario);
+        let output = command_output(
+            command,
+            &format!(
+                "strict signal verification {scenario}, iteration {}",
+                iteration + 1
+            ),
+        );
+        assert_eq!(
+            output.stdout,
+            expected_stdout.as_bytes(),
+            "unexpected output for strict signal verification {scenario}, iteration {}\nstderr:\n{}",
+            iteration + 1,
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report_path).expect("strict signal verification omitted verify JSON"),
+        )
+        .expect("strict signal verification verify JSON was invalid");
+        assert_eq!(report["verdict"], serde_json::json!("matched"));
+        assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+        for side in ["left", "right"] {
+            assert!(
+                report["compared_log_messages"][side]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "strict signal verification omitted compared {side} INFO messages: {report}"
+            );
+        }
+    }
+}
+
 #[test]
 fn sigalrm_itimer_delivery_is_deterministic() {
     run_signal_scenario(
@@ -200,4 +259,9 @@ fn pending_signal_and_mask_survive_exec() {
         "pending-exec",
         "exec mask=blocked pending=preserved consumed=SIGUSR1\n",
     );
+}
+
+#[test]
+fn fork_kill_waitpid_is_strictly_deterministic() {
+    verify_signal_scenario("fork-kill-waitpid", "fork-kill-waitpid-ok\n");
 }

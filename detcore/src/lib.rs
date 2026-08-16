@@ -1265,10 +1265,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             let dettid = guest.thread_state().dettid;
             let mycount = guest.thread_state().stats.signal_count;
-            info!(
-                "[dtid {}] handling inbound signal (#{}) {}",
-                dettid, mycount, signal
-            );
             guest.thread_state_mut().stats.count_signal();
             let time = &guest.thread_state().thread_logical_time;
             let nanos = time.as_nanos();
@@ -1294,6 +1290,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Permission::RW,
             );
             resource_request(guest, request).await;
+            // The backend observes physical signal arrival asynchronously. Publish
+            // the INFO event only after the deterministic scheduler grants signal
+            // delivery, so canonical ordering follows the committed turn rather
+            // than host callback timing.
+            info!(
+                "[dtid {}] handling inbound signal (#{}) {}",
+                dettid, mycount, signal
+            );
             info!(
                 "[dtid {}] finish delivering signal (#{}) {}",
                 dettid, mycount, signal

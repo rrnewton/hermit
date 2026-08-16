@@ -776,6 +776,37 @@ static int test_itimer_is_discarded_on_process_exit(void) {
   return 0;
 }
 
+static int test_fork_kill_waitpid(void) {
+  const pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (kill(child, SIGKILL) != 0) {
+    perror("kill");
+    return 1;
+  }
+
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+    fprintf(stderr, "unexpected child status: %d\n", status);
+    return 1;
+  }
+
+  puts("fork-kill-waitpid-ok");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
@@ -819,6 +850,9 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pending-exec-check") == 0) {
     return check_pending_after_exec();
+  }
+  if (strcmp(argv[1], "fork-kill-waitpid") == 0) {
+    return test_fork_kill_waitpid();
   }
   fprintf(stderr, "unknown scenario: %s\n", argv[1]);
   return 2;

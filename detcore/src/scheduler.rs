@@ -538,6 +538,10 @@ pub struct Scheduler {
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
 
+    /// Threads whose logical-removal INFO diagnostic has already been emitted
+    /// at a scheduler-controlled exit point.
+    logical_kill_logged: BTreeSet<DetTid>,
+
     /// Whether the backend defers spawning a vfork child until after the parent posts its
     /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
     /// still on its way rather than that the clone failed. See
@@ -1232,6 +1236,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
+            logical_kill_logged: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
@@ -1545,8 +1550,8 @@ impl Scheduler {
                 );
             }
             Some(nextturn) => {
-                info!(
-                    "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
+                trace!(
+                    "logically_kill: backend removed [det]tid {} in pid {}",
                     dtid, detpid
                 );
                 // Put in a dummy request to unblock the scheduler that might be
@@ -1741,6 +1746,21 @@ impl Scheduler {
             inserted
         } else {
             false
+        }
+    }
+
+    fn log_logical_kill(&mut self, dettid: DetTid, detpid: DetPid) {
+        if self.logical_kill_logged.insert(dettid) {
+            info!(
+                "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
+                dettid, detpid
+            );
+        }
+    }
+
+    pub(crate) fn log_process_exit(&mut self, detpid: DetPid) {
+        for dettid in self.thread_tree.my_thread_group(&detpid) {
+            self.log_logical_kill(dettid, detpid);
         }
     }
 
@@ -2068,16 +2088,8 @@ impl Scheduler {
                 ) => {
                     // Deterministic child-exit SIGCHLD. If the host-async signal
                     // already arrived and was parked by the InboundSignal deferral
-                    // gate, release it now at this logical time — that real signal
-                    // is sufficient, so do not also synthesize one (avoids a
-                    // duplicate delivery). Otherwise synthesize the delivery so the
-                    // parent is notified deterministically regardless of host
-                    // signal latency. Either way mark the parent `sigchld_ready` so
-                    // its InboundSignal turn is granted here rather than deferred a
-                    // second time. Releasing the deferred signal at a logical
-                    // deadline (rather than only at run-queue quiescence, as
-                    // step2e does) is what breaks the redis_deep starvation
-                    // deadlock: a busy sibling can no longer starve the reaper.
+                    // gate, release it now at this logical time. Otherwise synthesize
+                    // delivery so the parent cannot be starved by host signal latency.
                     self.blocked.sigchld_ready.insert(parent);
                     if self.blocked.sigchld_deferred.remove(&parent) {
                         self.run_queue.push_eager_io_repoll(parent);
@@ -3030,14 +3042,19 @@ impl Scheduler {
             // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
             // `make -jN` / redis `--strict --verify` nondeterminism source).
             ResourceID::Exit { group, process, .. } => {
-                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
-                    // Fire strictly after the current committed time so the event
-                    // is dispatched on a subsequent scheduler pass (DetTid == DetPid
-                    // for a group leader, so `parent` is also the parent thread id).
-                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
-                    self.blocked
-                        .timed_waiters
-                        .insert_child_exit(deadline, *process, parent, parent);
+                if *group {
+                    self.log_process_exit(*process);
+                    if let Some(parent) = self.thread_tree.parent_process(process) {
+                        // Fire strictly after the current committed time so the event
+                        // is dispatched on a subsequent scheduler pass (DetTid == DetPid
+                        // for a group leader, so `parent` is also the parent thread id).
+                        let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                        self.blocked
+                            .timed_waiters
+                            .insert_child_exit(deadline, *process, parent, parent);
+                    }
+                } else {
+                    self.log_logical_kill(dettid, *process);
                 }
                 Ok(())
             }
