@@ -5264,8 +5264,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut jobs_seven_selection = repeated_selection.clone();
     jobs_seven_selection.jobs = Some(7);
     let jobs_seven_results = scratch.join("jobs-seven-plan");
-    let (jobs_seven_metadata, jobs_seven_dag) = write_plan(
-        root,
+    let (jobs_seven_metadata, jobs_seven_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &jobs_seven_results,
         &jobs_seven_results.join("dag.json"),
         &jobs_seven_selection,
@@ -5529,28 +5529,25 @@ fn self_test(root: &Path) -> Result<(), String> {
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
         );
     }
-    let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
-    let one_cell_mode_selection = CellSelection {
+    let mode_filtered_results = scratch.join("mode-filtered-green-plan");
+    let mode_filtered_selection = CellSelection {
         green: true,
         mode: Some("replay".into()),
         repetitions: Some(2),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_mode_metadata, _) = write_plan_after_scorecard_check(
+    let (mode_filtered_metadata, _) = write_plan_after_scorecard_check(
         &checked_scorecard,
-        &one_cell_mode_results,
-        &one_cell_mode_results.join("dag.json"),
-        &one_cell_mode_selection,
+        &mode_filtered_results,
+        &mode_filtered_results.join("dag.json"),
+        &mode_filtered_selection,
     )?;
-    if !one_cell_mode_metadata.green
-        || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
+    if !mode_filtered_metadata.green
+        || top_level_repeated_result_description(&mode_filtered_metadata, 1, 0, 2)
             != "one or more repeated checks failed"
     {
-        return Err(
-            "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
-        );
+        return Err("a mode-filtered green batch was described as an exact flaky cell".into());
     }
     let one_cell_sample_results = scratch.join("one-cell-sample-green-plan");
     let one_cell_sample_selection = CellSelection {

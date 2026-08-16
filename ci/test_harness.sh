@@ -972,8 +972,8 @@ function gate_manifest_rust_compilation_work {
         return 1
     }
     [[ $(grep -Fc 'write_plan(' <<<"$self_test_body") == 0 && \
-       $(grep -Fc 'write_plan_after_scorecard_check(' <<<"$self_test_body") == 7 ]] || {
-        printf 'pressure self-test no longer reuses one checked scorecard across all seven plan cases\n' >&2
+       $(grep -Fc 'write_plan_after_scorecard_check(' <<<"$self_test_body") == 8 ]] || {
+        printf 'pressure self-test no longer reuses one checked scorecard across all eight plan cases\n' >&2
         return 1
     }
     printf 'manifest forced Rust compilation work: scorecard=2 safe-ci-scope=1 pressure-test=1 total=4 (instrumented base: 9+7+1=17)\n'
