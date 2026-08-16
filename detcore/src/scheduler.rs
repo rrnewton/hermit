@@ -960,6 +960,12 @@ async fn sched_loop_inner(
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
             {
+                // Publish the empty-scheduler diagnostic only at this terminal
+                // observation. Emitting it from step2 made the INFO stream depend
+                // on how many host-side loop iterations happened before teardown
+                // finished, so record and replay could differ by one copy while
+                // their turns, syscalls, and guest results were identical.
+                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
@@ -2681,7 +2687,9 @@ impl Scheduler {
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
-                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                trace!(
+                    "scheduler (step2_process_blocked): zero threads left anywhere, awaiting terminal observation."
+                );
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
                 return Err(self.report_terminal_deadlock());
