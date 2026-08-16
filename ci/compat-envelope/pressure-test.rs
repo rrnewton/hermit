@@ -1560,14 +1560,18 @@ fn command_ok(command: &mut Command, purpose: &str) -> Result<(), String> {
     }
 }
 
-fn check_scorecard(root: &Path) -> Result<(), String> {
+struct CheckedScorecard<'a> {
+    root: &'a Path,
+}
+
+fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
     let status = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
         .arg("check")
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot run scorecard check: {e}"))?;
     if status.success() {
-        Ok(())
+        Ok(CheckedScorecard { root })
     } else {
         Err("tracked scorecard is stale; update it before generating a pressure run".into())
     }
@@ -2059,7 +2063,17 @@ fn write_plan(
     output: &Path,
     selection: &CellSelection,
 ) -> Result<(RunMetadata, DagConfig), String> {
-    check_scorecard(root)?;
+    let checked_scorecard = check_scorecard(root)?;
+    write_plan_after_scorecard_check(&checked_scorecard, results, output, selection)
+}
+
+fn write_plan_after_scorecard_check(
+    checked_scorecard: &CheckedScorecard<'_>,
+    results: &Path,
+    output: &Path,
+    selection: &CellSelection,
+) -> Result<(RunMetadata, DagConfig), String> {
+    let root = checked_scorecard.root;
     let PressureCells {
         selected: cells,
         unavailable,
@@ -3865,6 +3879,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
 
 fn self_test(root: &Path) -> Result<(), String> {
     safe_ci_scope::self_test()?;
+    // The checked files remain immutable throughout this self-test. Production
+    // plan/run still checks at its command boundary before constructing a plan.
+    let checked_scorecard = check_scorecard(root)?;
     let explicit_null = decode_budgets(
         br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90,"attempts":null}]"#,
     )?;
@@ -4607,8 +4624,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         ..CellSelection::default()
     };
     let exact_results = scratch.join("exact-plan");
-    let (exact_metadata, _) = write_plan(
-        root,
+    let (exact_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &exact_results,
         &exact_results.join("dag.json"),
         &exact_selection,
@@ -4668,8 +4685,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let repeated_results = scratch.join("repeated-plan");
-    let (mut repeated_metadata, _) = write_plan(
-        root,
+    let (mut repeated_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &repeated_results,
         &repeated_results.join("dag.json"),
         &repeated_selection,
@@ -4681,8 +4698,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     huge_repetition_selection.repetitions = Some(usize::MAX);
     huge_repetition_selection.run_timeout_seconds = Some(i64::MAX);
     let huge_repetition_results = scratch.join("huge-repetition-plan");
-    let huge_repetition_error = write_plan(
-        root,
+    let huge_repetition_error = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &huge_repetition_results,
         &huge_repetition_results.join("dag.json"),
         &huge_repetition_selection,
@@ -4916,8 +4933,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_mode_metadata, _) = write_plan(
-        root,
+    let (one_cell_mode_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &one_cell_mode_results,
         &one_cell_mode_results.join("dag.json"),
         &one_cell_mode_selection,
@@ -4940,8 +4957,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_sample_metadata, _) = write_plan(
-        root,
+    let (one_cell_sample_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &one_cell_sample_results,
         &one_cell_sample_results.join("dag.json"),
         &one_cell_sample_selection,
@@ -4954,8 +4971,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("a one-cell sampled green batch was described as an exact flaky cell".into());
     }
     let green_batch_results = scratch.join("green-batch-plan");
-    let (mut green_batch_metadata, _) = write_plan(
-        root,
+    let (mut green_batch_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &green_batch_results,
         &green_batch_results.join("dag.json"),
         &green_batch_selection,
@@ -5142,8 +5159,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         ..CellSelection::default()
     };
     let sample_results = scratch.join("sample-plan");
-    let (mut sample_metadata, _) = write_plan(
-        root,
+    let (mut sample_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
         &sample_results,
         &sample_results.join("dag.json"),
         &sample_selection,
