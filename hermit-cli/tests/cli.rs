@@ -712,7 +712,7 @@ fn run_liteinst_verifies_detcore_backend() {
     let stderr = stderr(&output);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst direct] activation verified (traps=1, hooks=32); Detcore Tool active in guest"
         ),
         "{stderr}"
     );
@@ -721,9 +721,7 @@ fn run_liteinst_verifies_detcore_backend() {
         "{stderr}"
     );
     assert!(
-        stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
-        ),
+        stderr.contains("LiteInst direct (reverie-liteinst patch runtime + in-guest Detcore Tool)"),
         "{stderr}"
     );
 }
@@ -785,7 +783,7 @@ fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("does not register reverie_liteinst_initialize as a preload constructor"),
+        stderr.contains("does not register hermit_liteinst_initialize as a preload constructor"),
         "{stderr}"
     );
     assert!(!stderr.contains("activation verified"), "{stderr}");

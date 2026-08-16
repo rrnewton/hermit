@@ -107,6 +107,35 @@ enum KvmStdinReservation {
 
 static KVM_STDIN_RESERVATION: Mutex<Option<KvmStdinReservation>> = Mutex::new(None);
 
+/// Install Detcore inside a LiteInst guest when this cdylib is preloaded by the
+/// direct backend. The ordinary Hermit executable also links this crate, so an
+/// absent coordinator is deliberately a no-op.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hermit_liteinst_initialize() {
+    let Some(coordinator) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
+        // The standalone Reverie constructor is not retained automatically
+        // when its crate is linked into this larger cdylib. Delegate its host
+        // and compatibility selectors explicitly; with no selector it is a
+        // no-op, including in the ordinary Hermit executable.
+        unsafe { reverie_liteinst::reverie_liteinst_initialize() };
+        return;
+    };
+    if let Err(error) =
+        unsafe { reverie_liteinst::install_tool_quiescent::<Detcore>(PathBuf::from(coordinator)) }
+    {
+        let message = format!("hermit: LiteInst Detcore constructor failed: {error}\n");
+        unsafe {
+            libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+            libc::_exit(126);
+        }
+    }
+}
+
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+static HERMIT_LITEINST_CONSTRUCTOR: unsafe extern "C" fn() = hermit_liteinst_initialize;
+
 /// Saves stdin captured before Rust's process startup can reuse a closed fd 0.
 pub fn reserve_kvm_stdin(stdin: Option<fs::File>) -> io::Result<()> {
     let mut reservation = KVM_STDIN_RESERVATION
@@ -412,7 +441,7 @@ fn dbi_runtime_unavailable_reason() -> Option<String> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#688): Review LiteInst runtime discovery.
+// TODO-HUMAN-REVIEW(#688): Review LiteInst tool DSO discovery.
 fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     let bytes = fs::read(path).map_err(|error| {
         io::Error::new(
@@ -443,7 +472,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     }
 
     let required = [
-        "reverie_liteinst_initialize",
+        "hermit_liteinst_initialize",
         "reverie_liteinst_site_trap_count",
         "reverie_liteinst_site_hook_count",
     ];
@@ -467,7 +496,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         .iter()
         .enumerate()
         .find(|(_, symbol)| {
-            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
+            elf.dynstrtab.get_at(symbol.st_name) == Some("hermit_liteinst_initialize")
         })
         .ok_or_else(|| io::Error::other("checked LiteInst initializer disappeared"))?;
     let init_array = elf
@@ -510,7 +539,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "LiteInst runtime {} does not register reverie_liteinst_initialize as a preload constructor",
+                "LiteInst tool {} does not register hermit_liteinst_initialize as a preload constructor",
                 path.display()
             ),
         ));
@@ -518,7 +547,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     path.canonicalize()
 }
 
-/// Returns the LiteInst preload cdylib produced beside the Hermit binary.
+/// Returns the Detcore LiteInst tool cdylib produced beside the Hermit binary.
 #[doc(hidden)]
 pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("HERMIT_LITEINST_RUNTIME") {
@@ -545,15 +574,15 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
         )
     })?;
     if let Some(path) = [
-        directory.join("libreverie_liteinst.so"),
-        directory.join("deps/libreverie_liteinst.so"),
+        directory.join("libhermit.so"),
+        directory.join("deps/libhermit.so"),
     ]
     .into_iter()
     .find(|path| path.is_file())
     {
         return validate_liteinst_runtime_library(&path);
     }
-    if let Some(path) = hermit_resources::resource("libreverie_liteinst.so")?
+    if let Some(path) = hermit_resources::resource("libhermit.so")?
         && path.is_file()
     {
         return validate_liteinst_runtime_library(&path);
@@ -561,7 +590,7 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     Err(io::Error::new(
         io::ErrorKind::NotFound,
         format!(
-            "libreverie_liteinst.so was not built beside {} or staged as an installed resource",
+            "libhermit.so was not built beside {} or staged as an installed resource",
             executable.display()
         ),
     ))
@@ -570,7 +599,7 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_runtime_library_path().err().map(|error| {
         format!(
-            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
+            "the LiteInst Detcore tool is unavailable: {error}; build the hermit cdylib beside the hermit executable"
         )
     })
 }
@@ -598,7 +627,7 @@ pub enum Backend {
     Ptrace,
     /// Use the DynamoRIO backend.
     Dbi,
-    /// Use the ptrace-hosted LiteInst hybrid with one Detcore Tool.
+    /// Use the direct in-guest LiteInst backend with one Detcore Tool per process.
     Liteinst,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
@@ -1510,7 +1539,7 @@ fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_backend_inner(
-    command: Command,
+    mut command: Command,
     config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
@@ -1550,9 +1579,10 @@ async fn run_with_backend_inner(
         .status);
     }
     if backend == Backend::Liteinst {
+        command.env(reverie_liteinst::PROCESS_FORK_ENV, "1");
         let preload = liteinst_runtime_library_path()?;
         let (exit_status, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
@@ -1661,13 +1691,14 @@ async fn run_with_output_backend_inner(
     }
     if backend == Backend::Liteinst {
         command.stdin(output_backend_stdin()?);
+        command.env(reverie_liteinst::PROCESS_FORK_ENV, "1");
         let preload = liteinst_runtime_library_path()?;
         let (output, mut global_state) =
-            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
+            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
                 command, config, preload,
             )
             .await?;
-        let status = output.status;
+        let status: ExitStatus = output.status.into();
         if liteinst_requires_forced_shutdown(status) {
             global_state.force_shutdown_with_error();
             global_state.cancel_internal_scheduler().await;
@@ -1994,7 +2025,7 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_host_backend_preserves_ptrace_rcb_timeslices() {
+    fn liteinst_backend_preserves_rcb_timeslice_configuration() {
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
         assert!(
@@ -2057,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_public_dispatch_runs_ptrace_host_hybrid() {
+    fn liteinst_public_dispatch_runs_direct_in_guest_backend() {
         if Backend::Liteinst.ensure_available().is_err() {
             return;
         }
@@ -2071,7 +2102,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/echo through the ptrace-hosted LiteInst hybrid");
+        .expect("run /bin/echo through direct in-guest LiteInst");
         assert_eq!(output.status, super::ExitStatus::Exited(0));
         assert_eq!(output.stdout, b"hello\n");
 
@@ -2082,7 +2113,7 @@ mod tests {
             &None,
             Backend::Liteinst,
         )
-        .expect("run /bin/true through the ptrace-hosted LiteInst hybrid");
+        .expect("run /bin/true through direct in-guest LiteInst");
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 

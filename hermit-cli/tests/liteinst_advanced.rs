@@ -274,7 +274,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+            "liteinst direct] activation verified (traps=1, hooks=32); Detcore Tool active in guest"
         ),
         "{stderr}"
     );
@@ -289,9 +289,7 @@ fn assert_liteinst_strict_verify_output(output: Output) -> Output {
         "{stderr}"
     );
     assert!(
-        stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
-        ),
+        stderr.contains("LiteInst direct (reverie-liteinst patch runtime + in-guest Detcore Tool)"),
         "{stderr}"
     );
     output
@@ -810,14 +808,11 @@ fn assert_clone_boundary(mode: &str) {
         String::from_utf8_lossy(&output.stderr),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("ENOTSUPP (Operation is not supported)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Operation not supported"), "{stderr}");
     assert!(!stderr.contains("Bad system call"), "{stderr}");
 }
 
-/// Path to the freshly built `libreverie_liteinst.so` preload runtime.
+/// Path to the freshly built `libhermit.so` Detcore preload tool.
 ///
 /// [`liteinst_runtime::ensure_liteinst_runtime`] builds it beside the Hermit
 /// test binary, so it lives in the same profile directory.
@@ -826,17 +821,13 @@ fn liteinst_runtime_library() -> PathBuf {
     liteinst_runtime::liteinst_runtime_library()
 }
 
-/// A bare preload must not create a second in-guest Detcore Tool.
-///
-/// Host mode is selected only by `run_host_with_preload`. Without that private
-/// selector, even a stale legacy coordinator variable must leave the patch DSO
-/// inert and let the program run normally.
+/// The Detcore tool DSO must fail closed when its coordinator is stale.
 #[test]
-fn liteinst_preload_is_inert_without_host_runtime_selector() {
+fn liteinst_tool_preload_rejects_a_stale_coordinator() {
     let runtime = liteinst_runtime_library();
     assert!(
         runtime.is_file(),
-        "expected LiteInst preload runtime at {}",
+        "expected LiteInst Detcore tool at {}",
         runtime.display(),
     );
 
@@ -847,19 +838,19 @@ fn liteinst_preload_is_inert_without_host_runtime_selector() {
         )
         .env("LD_PRELOAD", &runtime)
         .output()
-        .expect("failed to launch /bin/true under the LiteInst preload");
+        .expect("failed to launch /bin/true under the LiteInst tool preload");
 
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "bare patch preload must remain inert\nstatus={:?}\nstdout={}\nstderr={}",
+        Some(126),
+        "stale coordinator must fail closed\nstatus={:?}\nstdout={}\nstderr={}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("reverie-liteinst initialization failed"),
-        "bare preload attempted to install an in-guest Detcore Tool: stderr={}",
+        String::from_utf8_lossy(&output.stderr).contains("LiteInst Detcore constructor failed"),
+        "tool preload did not report the stale coordinator: stderr={}",
         String::from_utf8_lossy(&output.stderr),
     );
 }
