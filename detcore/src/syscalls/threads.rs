@@ -69,6 +69,23 @@ const IOPRIO_BE_NORM: libc::c_int = 4;
 const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
     (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
 
+// The kernel rejects a sched_attr buffer larger than one page with E2BIG.
+const SCHED_ATTR_MAX_SIZE: usize = 4096;
+
+/// Whether Linux accepts `policy` as a scheduling policy for `sched_setattr`.
+/// Note the gap at 4: SCHED_ISO is reserved and never valid.
+fn is_valid_sched_policy(policy: u32) -> bool {
+    const SCHED_DEADLINE: u32 = 6;
+    matches!(
+        policy,
+        // SCHED_OTHER/NORMAL, FIFO, RR, BATCH
+        0 | 1 | 2 | 3
+        // SCHED_IDLE
+        | 5
+        | SCHED_DEADLINE
+    )
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-881)
 fn virtual_ioprio(which: libc::c_int) -> Result<i64, Errno> {
@@ -1126,13 +1143,46 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
     /// Linux scheduler attributes cannot affect Detcore's replacement
-    /// scheduler. Accept the request as a deterministic no-op, matching the
-    /// existing sched_setscheduler and sched_setparam policy.
+    /// scheduler, so a *well-formed* request is accepted as a deterministic
+    /// no-op, matching the existing sched_setscheduler and sched_setparam
+    /// policy.
+    ///
+    /// Suppressing the effect is not the same as accepting arguments Linux
+    /// refuses. The argument checks below run first, so a malformed request
+    /// fails exactly as it does natively; otherwise a guest probing for
+    /// EINVAL/E2BIG observes a success the kernel never returns. Every check is
+    /// a pure function of the guest's own arguments, so it consumes no host
+    /// state and is identical across `--verify` runs and record/replay.
     pub async fn handle_sched_setattr<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::SchedSetattr,
     ) -> Result<i64, Error> {
+        // `flags` is reserved and must be zero; the kernel rejects anything else.
+        if call.flags() != 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        // A null attribute pointer is EINVAL rather than EFAULT: the kernel
+        // rejects it before attempting any access. `AddrMut` is not `Copy`, so
+        // each typed read below derives its own address from the syscall
+        // argument rather than reusing a moved binding.
+        let attr = call.attr().ok_or(Errno::EINVAL)?;
+        // `size` is the first member, and the kernel reads it before anything
+        // else so it can reject a buffer too small to hold the base descriptor
+        // or implausibly large. `libc::sched_attr` is exactly the base
+        // descriptor, SCHED_ATTR_SIZE_VER0.
+        let size: u32 = guest.memory().read_value(attr.cast())?;
+        let ver0 = std::mem::size_of::<libc::sched_attr>();
+        if (size as usize) < ver0 || (size as usize) > SCHED_ATTR_MAX_SIZE {
+            return Err(Errno::E2BIG.into());
+        }
+        // Safe to read the whole base descriptor now that the guest has
+        // declared a buffer at least that large.
+        let base = call.attr().ok_or(Errno::EINVAL)?;
+        let sa: libc::sched_attr = guest.memory().read_value(base.cast())?;
+        if !is_valid_sched_policy(sa.sched_policy) {
+            return Err(Errno::EINVAL.into());
+        }
         info!(
             "Suppressing sched_setattr(pid={}, flags={}); Linux scheduler attributes are virtual",
             call.pid(),
