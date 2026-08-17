@@ -362,7 +362,7 @@ def _normalize_log_line(line: str) -> str:
 
 
 def hermit_log_diff(log1: Path, log2: Path) -> str:
-    """Return the first exact log divergence after normalizing host-physical noise."""
+    """Return the first exact log divergence after documented normalization."""
     before: List[Tuple[int, str, str]] = []
     with Path(log1).open(errors="replace") as left, Path(log2).open(
         errors="replace"
@@ -384,9 +384,10 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
                         "+ {!r}".format(normalized_right),
                     )
                 )
-                return "first divergence at line {} (wallclock + inode normalized):\n{}".format(
-                    line_number, "\n".join(context)
-                )
+                return (
+                    "first divergence at line {} "
+                    "(wallclock + inode + userspace address normalized):\n{}"
+                ).format(line_number, "\n".join(context))
             before.append((line_number, normalized_left, normalized_right))
             before = before[-3:]
 
@@ -423,29 +424,27 @@ def compare_runs(
                 )
             )
 
-    # The exact INFO-log comparison is a NON-FATAL diagnostic, not a pass/fail
-    # gate. The guest-observable artifacts above (qcow2 / serial / guest-output /
-    # QEMU-binary SHAs) are the determinism witness for the VM under test. The
-    # INFO log additionally captures the python launcher that spawns QEMU, and
-    # that launcher's import/allocation behavior is sensitive to the inherited
-    # host environment, which legitimately differs between two SEPARATE anchor
-    # invocations. That yields benign residual log divergence (relocated mmap
-    # arenas, shifted logical-time accumulation, uninitialized ENOENT-statbuf
-    # stack garbage) even though the guest does bit-identical work. Failing the
-    # demo on it would assert env-insensitivity of the scaffolding, not guest
-    # determinism, so the divergence is reported for information only. (A future
-    # stronger check could stabilize the launcher env via --base-env to make the
-    # whole-process log bit-identical.)
+    # Normalize only the documented host-physical fields above. Any remaining
+    # INFO difference is canonical execution evidence and must fail the repeat,
+    # even when the VM artifacts happen to be byte-identical. In particular, a
+    # difference that begins during Python startup can propagate into virtual
+    # clock values and the QEMU execution; its origin does not make the later
+    # guest-visible log evidence optional.
     anchor_log = anchor.get("info_log")
     current_log = current.get("info_log")
-    if anchor_log and current_log and Path(anchor_log).is_file():
+    if (
+        anchor_log
+        and current_log
+        and Path(anchor_log).is_file()
+        and Path(current_log).is_file()
+    ):
         difference = hermit_log_diff(Path(anchor_log), Path(current_log))
         if difference:
+            passed = False
             report.append(
-                "NOTE: Hermit INFO log differs from first run after normalizing "
+                "WARN: Hermit INFO log differs from first run after normalizing "
                 "wallclock timestamps, host inode numbers, and env-dependent guest "
-                "addresses (non-fatal: guest artifacts above are byte-identical; "
-                "residual is benign launcher-env nondeterminism)\n{}".format(
+                "addresses; canonical repeat verification failed\n{}".format(
                     difference
                 )
             )
@@ -456,9 +455,10 @@ def compare_runs(
                 "guest addresses"
             )
     else:
+        passed = False
         report.append(
-            "NOTE: Hermit INFO logs not compared because the first-run log is "
-            "unavailable (non-fatal: guest artifacts above are the determinism gate)"
+            "WARN: Hermit INFO logs not compared because the first-run or current "
+            "log is unavailable; canonical repeat verification requires both logs"
         )
     return passed, report
 
