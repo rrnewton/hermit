@@ -47,6 +47,7 @@
 //! [dependencies]
 //! safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! libc = "0.2"
 //! ```
 
@@ -69,6 +70,9 @@ mod validate_envelope;
 
 #[path = "lib/validate_history.rs"]
 mod validate_history;
+
+#[path = "lib/validate_cell_results.rs"]
+mod validate_cell_results;
 
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
@@ -212,6 +216,7 @@ enum Focused {
     LiteinstCompat,
     QemuL2,
     PrivilegedOnly,
+    RequalifyCell { test: String, mode: String, backend: String },
     Only { lane: String, nodes: String },
     Selective { shallow: bool },
     /// `--envelope-only`, plus `--envelope-compare FILE` which is the same
@@ -232,6 +237,7 @@ impl Focused {
             Focused::LiteinstCompat => "liteinst-compat-only".into(),
             Focused::QemuL2 => "qemu-l2-only".into(),
             Focused::PrivilegedOnly => "privileged-only".into(),
+            Focused::RequalifyCell { .. } => "cell-requalification".into(),
             Focused::Only { lane, .. } => format!("only-{lane}"),
             Focused::Selective { .. } => "selective".into(),
             // Both spellings record ONE profile, matching validate.sh:382, so
@@ -252,6 +258,7 @@ impl Focused {
             Focused::LiteinstCompat => "liteinst-compat-only",
             Focused::QemuL2 => "qemu-l2-only",
             Focused::PrivilegedOnly => "privileged-only",
+            Focused::RequalifyCell { .. } => "requalify-cell",
             Focused::Only { .. } => "only",
             Focused::Selective { shallow } => {
                 if *shallow {
@@ -317,6 +324,7 @@ fn usage() -> &'static str {
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
+     \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-6 requalification.\n\
      \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps).\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
@@ -455,6 +463,17 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--liteinst-compat-only" => focused.push(Focused::LiteinstCompat),
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
+            "--requalify-cell" => {
+                let test = argv.get(i + 1).cloned().unwrap_or_default();
+                let mode = argv.get(i + 2).cloned().unwrap_or_default();
+                let backend = argv.get(i + 3).cloned().unwrap_or_default();
+                if test.is_empty() || mode.is_empty() || backend.is_empty() {
+                    eprintln!("validate: --requalify-cell needs TEST MODE BACKEND");
+                    return Err(2);
+                }
+                focused.push(Focused::RequalifyCell { test, mode, backend });
+                i += 3;
+            }
             // `--envelope-only` and `--envelope-compare` are ONE mode in
             // validate.sh (both set ENVELOPE_MODE=only; the second merely adds a
             // baseline, validate.sh:172-176), so they accumulate into a single
@@ -1121,6 +1140,8 @@ fn self_test() -> Result<(), String> {
     coverage_schema_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
+    ledger_gate_origin_bracket()?;
+    requalification_plan_bracket(&root)?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
@@ -1955,6 +1976,9 @@ fn configure_e2e_result_root(
     log_path: &Path,
     temporary_build_root: &Path,
 ) -> Result<PathBuf, String> {
+    let run = log_path
+        .file_stem()
+        .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
     let path = match std::env::var_os("E2E_RESULT_ROOT") {
         Some(value) if !value.is_empty() => {
             let supplied = PathBuf::from(value);
@@ -1968,15 +1992,17 @@ fn configure_e2e_result_root(
             let log_dir = log_path
                 .parent()
                 .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
-            let run = log_path
-                .file_stem()
-                .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
             log_dir.join("e2e").join(run)
         }
     };
     std::fs::create_dir_all(&path)
         .map_err(|e| format!("cannot create E2E result directory {}: {e}", path.display()))?;
     std::env::set_var("E2E_RESULT_ROOT", &path);
+    // One full validate invokes the harness once per manifest bucket. Bind all
+    // bucket rows to the durable validate identity instead of letting each
+    // harness process mint a local timestamp. Schema-6 evidence is one complete
+    // selected population, not a pool of unrelated bucket attempts.
+    std::env::set_var("E2E_RUN_ID", run);
 
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
@@ -2362,6 +2388,10 @@ struct Plan {
     /// :655 runs before the `ENVELOPE_MODE` dispatch at :4877, with
     /// `VALIDATION_PROFILE=envelope-only`); that is a bug, not a contract.
     cacheable: bool,
+    /// Exact selected population for a targeted schema-6 evidence row. This is
+    /// deliberately separate from `suite_complete`: it may satisfy one open
+    /// cell obligation but can never authorize a whole-run landing receipt.
+    cell_evidence_expected: Option<Vec<serde_json::Value>>,
 }
 
 struct EnvelopePlan {
@@ -2384,6 +2414,7 @@ impl Default for Plan {
             nonblocking: BTreeSet::new(),
             force_keep_going: false,
             cacheable: true,
+            cell_evidence_expected: None,
         }
     }
 }
@@ -2522,6 +2553,60 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             second: None,
             profile: args.focused.as_ref().unwrap().profile(),
             selection_mode: "only",
+            ..Default::default()
+        });
+    }
+
+    // One-cell canonical requalification. The pressure runner already owns the
+    // exact-cell build/run mechanics and resource declarations; validate wraps
+    // it as one boxed gate and retains its typed result as schema 6. This plan
+    // is never suite-complete and therefore cannot grant whole-run authority.
+    if let Some(Focused::RequalifyCell { test, mode, backend }) = &args.focused {
+        let matches = validate_cell_results::expected_plan(root)?
+            .into_iter()
+            .filter(|cell| {
+                cell["test"] == *test && cell["mode"] == *mode && cell["backend"] == *backend
+            })
+            .collect::<Vec<_>>();
+        let [identity] = matches.as_slice() else {
+            return Err(format!(
+                "--requalify-cell must name exactly one currently selected cell; found {} for {test}/{mode}/{backend}",
+                matches.len()
+            ));
+        };
+        let command = format!(
+            "./ci/compat-envelope/pressure-test.rs run --results \"$E2E_RESULT_ROOT\" \
+             --test {} --mode {} --backend {} --repetitions 1 \
+             --run-id-prefix \"$E2E_RUN_ID-pid$$\" --jobs 1",
+            validate_plan::shell_quote(test),
+            validate_plan::shell_quote(mode),
+            validate_plan::shell_quote(backend),
+        );
+        let mut steps = pre;
+        // The pressure runner performs its own exact manifest/scorecard check
+        // after building test-harness. The ordinary gate.manifest assumes that
+        // binary was already built by a lane node, which this focused path does
+        // not have; retaining it would make every cold targeted run exit 127.
+        steps.retain(|step| step.tag() != gate);
+        steps.push(step_with_caps(
+            "requalify",
+            "cell",
+            "Targeted canonical cell requalification",
+            command,
+            vec![PIN_GATE_TAG.into()],
+            3600,
+            7200,
+            16 * 1024 * 1024 * 1024,
+        ));
+        let cfg = validate_plan::config_from(steps, "targeted cell requalification");
+        return Ok(Plan {
+            planned_test_nodes: BTreeSet::new(),
+            cfg,
+            second: None,
+            profile: "cell-requalification".into(),
+            selection_mode: "targeted",
+            cacheable: false,
+            cell_evidence_expected: Some(vec![identity.clone()]),
             ..Default::default()
         });
     }
@@ -4971,6 +5056,85 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     Ok(())
 }
 
+fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "name": outcome.tag,
+        "result": if outcome.ok { "pass" } else { "fail" },
+        "exit_code": outcome.returncode,
+        "reason": outcome.reason,
+        "aborted": outcome.aborted,
+        "real_seconds": outcome.duration_s,
+        // A StepOutcome is already the outer safe-ci DAG gate. Shell-era rows
+        // may bind a lane substep separately, but this producer never infers one
+        // from text after the fact.
+        "failure_origin": (!outcome.ok).then_some("outer_gate"),
+        "failed_substeps": serde_json::Value::Null,
+    })
+}
+
+fn ledger_gate_origin_bracket() -> Result<(), String> {
+    let failed = StepOutcome {
+        tag: "test.fixture".into(),
+        ok: false,
+        duration_s: 5.0,
+        summary: String::new(),
+        executed_tests: Some(1),
+        filtered_tests: Some(0),
+        returncode: Some(1),
+        reason: "fixture failure".into(),
+        aborted: false,
+    };
+    let row = ledger_gate(&failed);
+    if row["failure_origin"] != "outer_gate" || !row["failed_substeps"].is_null() {
+        return Err("ledger gate origin: failed outer gate was not bound synchronously".into());
+    }
+    let mut passed = failed;
+    passed.ok = true;
+    let row = ledger_gate(&passed);
+    if !row["failure_origin"].is_null() {
+        return Err("ledger gate origin: passing gate claimed a failure origin".into());
+    }
+    println!("  ledger gate origin: failed outer gate bound; passing gate remained null");
+    Ok(())
+}
+
+fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
+    let args = parse_argv(&[
+        "--requalify-cell".into(),
+        "applications/timed-progress-bar".into(),
+        "verify".into(),
+        "ptrace".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("requalification plan: CLI refused with exit {code}"))?;
+    let plan = build_plan(root, &args, &std::env::temp_dir().join("validate-requalification-plan"))?;
+    if plan.suite_complete
+        || plan.selection_mode != "targeted"
+        || plan.cell_evidence_expected.as_ref().map(Vec::len) != Some(1)
+    {
+        return Err("requalification plan: targeted evidence was mistaken for a full suite".into());
+    }
+    let step = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "requalify.cell")
+        .ok_or("requalification plan: exact cell step is absent")?;
+    for token in [
+        "--test applications/timed-progress-bar",
+        "--mode verify",
+        "--backend ptrace",
+        "--repetitions 1",
+        "--run-id-prefix \"$E2E_RUN_ID-pid$$\"",
+    ] {
+        if !step.cmd.contains(token) {
+            return Err(format!("requalification plan: command omitted {token}"));
+        }
+    }
+    println!("  requalification plan: one exact selected cell, schema-6 eligible, never full authority");
+    Ok(())
+}
+
 /// Write one validation record through the single configured authority.
 ///
 /// Every qualification is written HERE, at the single write point, so no
@@ -4988,8 +5152,10 @@ fn write_ledger(
     log_file: &str,
     suite_complete: bool,
     coverage: serde_json::Value,
+    cell_results: Option<&validate_cell_results::RetainedCellResults>,
 ) {
-    let (ledger_schema, coverage) = ledger_schema_and_coverage(coverage);
+    let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
+    let ledger_schema = if cell_results.is_some() { 6 } else { coverage_schema };
     let gates_run = outcomes.len();
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
     // An operator stop learned nothing new about the product. Preserve the raw
@@ -5009,19 +5175,7 @@ fn write_ledger(
     } else {
         serde_json::Value::Null
     };
-    let gates: Vec<serde_json::Value> = outcomes
-        .iter()
-        .map(|o| {
-            serde_json::json!({
-                "name": o.tag,
-                "result": if o.ok { "pass" } else { "fail" },
-                "exit_code": o.returncode,
-                "reason": o.reason,
-                "aborted": o.aborted,
-                "real_seconds": o.duration_s,
-            })
-        })
-        .collect();
+    let gates: Vec<serde_json::Value> = outcomes.iter().map(ledger_gate).collect();
     let record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -5031,6 +5185,7 @@ fn write_ledger(
         // repeats this shape with `corrects` set to the id it supersedes.
         "record_id": record_id,
         "corrects": serde_json::Value::Null,
+        "run_id": cell_results.map(|results| results.run_id.as_str()),
         "started_at": ctx.started_at,
         "finished_at": utc_now(),
         "host": ctx.host,
@@ -5098,6 +5253,7 @@ fn write_ledger(
         "real_seconds": wall_s,
         "log_file": log_file,
         "coverage": coverage,
+        "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
@@ -5939,8 +6095,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             s.ledger = Some(ledger.clone());
             return s;
         }
-        // A prior FAIL does NOT skip: it may be flaky or environmental, and only
-        // a PASS satisfies the landing predicate. Note it and run.
+        // A prior genuine FAIL prevents the PASS cache lookup above from
+        // succeeding. Note it and run so targeted requalification evidence can
+        // be produced; a lucky sibling PASS cannot turn this invocation into a
+        // zero-gate cache hit.
         if let Some(prev) = validate_history::cache_lookup(&ledger_rows, "fail", &cache_key) {
             eprintln!(
                 "# validate: tree {tree} has a prior FAIL record ({}) on this host+toolchain; \
@@ -6272,6 +6430,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &log_path.to_string_lossy(),
                 false,
                 coverage.clone(),
+                None,
             );
         }
         drop(run_record);
@@ -6450,6 +6609,40 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         pin_gate_bypassed = true;
     }
 
+    // A full top-level run must carry the exact per-cell population it just
+    // judged. Older schema-5 rows could say only that buckets passed; they could
+    // not open or satisfy a cell-specific failure obligation. Retain the typed
+    // rows before appending the ledger entry so schema 6 is emitted only when
+    // the artifact has actually been published and bound by checksum.
+    let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
+    let retained_cell_results = if !nesting.nested && should_retain_cells && execution_complete {
+        let expected = match &plan.cell_evidence_expected {
+            Some(expected) => Ok(expected.clone()),
+            None => validate_cell_results::expected_plan(&root),
+        };
+        let result = expected.and_then(|expected| {
+            validate_cell_results::retain(
+                parent.as_deref().unwrap_or(&root),
+                &e2e_result_root,
+                &commit,
+                &expected,
+            )
+        });
+        match result {
+            Ok(results) => Some(results),
+            Err(error) => {
+                eprintln!(
+                    "validate: ERROR: cannot retain complete per-cell evidence: {error}; \
+                     refusing a schema-6 receipt"
+                );
+                exit_code = 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
@@ -6464,6 +6657,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &log_path.to_string_lossy(),
             plan.suite_complete && execution_complete,
             coverage,
+            retained_cell_results.as_ref(),
         );
     }
 
@@ -6688,7 +6882,18 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &[],
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+        None,
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(

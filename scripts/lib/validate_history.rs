@@ -125,6 +125,114 @@ fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     }
 }
 
+fn row_matches_key(row: &serde_json::Value, key: &CacheKey<'_>) -> bool {
+    s(row, "tree") == key.tree
+        && s(row, "profile") == key.profile
+        && s(row, "host") == key.host
+        && s(row, "toolchain") == key.toolchain
+        && s(row, "selection_mode") == "full"
+        && row.get("commit_anchored").and_then(|v| v.as_bool()) == Some(true)
+        && row.get("tree_dirty").and_then(|v| v.as_bool()) == Some(false)
+}
+
+/// A failure which carries enough execution evidence to latch this cache key.
+/// Environment/no-result rows, contended runs and incomplete rows do not poison
+/// reuse; they still cause an actual run through their ordinary result path.
+fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) -> bool {
+    if !row_matches_key(row, key) || !matches!(s(row, "result"), "fail" | "failed" | "timeout") {
+        return false;
+    }
+    let Some(gates) = row.get("gates").and_then(|value| value.as_array()) else {
+        return false;
+    };
+    let red_gates: Vec<_> = gates
+        .iter()
+        .filter(|gate| matches!(s(gate, "result"), "fail" | "failed" | "timeout"))
+        .collect();
+    if red_gates.is_empty() {
+        return false;
+    }
+    let any_genuine_red = red_gates.iter().any(|gate| {
+        i(gate, "exit_code") != Some(127)
+            && gate
+                .get("real_seconds")
+                .and_then(|value| value.as_f64())
+                .is_some_and(|seconds| seconds > 0.0)
+    });
+    let command_not_found_storm = red_gates
+        .iter()
+        .any(|gate| i(gate, "exit_code") == Some(127))
+        && !any_genuine_red;
+    let subsecond_collapse = row
+        .get("real_seconds")
+        .and_then(|value| value.as_f64())
+        .is_some_and(|seconds| seconds <= 1.0)
+        && gates
+            .iter()
+            .all(|gate| matches!(s(gate, "result"), "fail" | "failed" | "timeout"));
+    if command_not_found_storm || subsecond_collapse {
+        return false;
+    }
+    let Some(expected) = i(row, "gates_expected") else {
+        return false;
+    };
+    let Some(ran) = i(row, "gates_run") else {
+        return false;
+    };
+    if expected <= 0 || ran < expected {
+        return false;
+    }
+    let has_real_failure =
+        i(row, "failures").is_some_and(|failures| failures >= 1) || !red_gates.is_empty();
+    let origin_bound = red_gates
+        .iter()
+        .all(|gate| match s(gate, "failure_origin") {
+            "outer_gate" => true,
+            "lane_substep" => gate
+                .get("failed_substeps")
+                .and_then(|value| value.as_array())
+                .is_some_and(|substeps| !substeps.is_empty()),
+            _ => false,
+        });
+    if !has_real_failure || !origin_bound {
+        return false;
+    }
+    let jobs = i(row, "dag_jobs");
+    let peers = i(row, "concurrent_validates");
+    let conditions_are_solo = jobs.is_some_and(|value| value <= 4) && peers == Some(0);
+    if !conditions_are_solo {
+        return false;
+    }
+    let typed_cell_divergence = row
+        .get("cell_results")
+        .and_then(|value| value.get("cells"))
+        .and_then(|value| value.as_array())
+        .is_some_and(|cells| {
+            cells.iter().any(|cell| {
+                cell.get("cell_verdict")
+                    .and_then(|verdict| verdict.get("state"))
+                    .and_then(|state| state.as_str())
+                    == Some("compared-and-diverged")
+            })
+        });
+    if typed_cell_divergence {
+        return true;
+    }
+    let known_flaky = row.get("known_flaky_failure").and_then(|v| v.as_bool());
+    let solo_confirmation = row.get("solo_rerun_confirmation").and_then(|v| v.as_bool());
+    match known_flaky {
+        Some(false) => true,
+        Some(true) => solo_confirmation == Some(true),
+        None => false,
+    }
+}
+
+fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool {
+    rows
+        .iter()
+        .any(|row| failure_row_blocks_pass_cache(row, key))
+}
+
 /// Does this PASS row carry everything a reuse needs?
 ///
 /// Dispatched on `producer`; an unrecognized producer is REFUSED rather than
@@ -138,7 +246,7 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
         return false;
     }
     match s(row, "producer") {
-        "validate.rs" => {
+        "validate.rs" | "hermit-validate-rs" => {
             if i(row, "executed_tests").unwrap_or(0) <= 0 {
                 return false;
             }
@@ -176,21 +284,16 @@ pub fn cache_lookup(
     if key.tree.is_empty() || key.tree == "unknown" {
         return None;
     }
+    // A clean full failure for this exact tree/profile/host/toolchain is a
+    // durable obligation. A sibling PASS cannot return a zero-gate cache hit;
+    // validate must execute and ci-hub will require calibrated per-cell
+    // requalification before the candidate can acquire landing authority.
+    if want_result == "pass" && has_blocking_failure(rows, key) {
+        return None;
+    }
     let mut best: Option<&serde_json::Value> = None;
     for row in rows {
-        if s(row, "tree") != key.tree
-            || s(row, "profile") != key.profile
-            || s(row, "host") != key.host
-            || s(row, "toolchain") != key.toolchain
-            || s(row, "selection_mode") != "full"
-            || s(row, "result") != want_result
-        {
-            continue;
-        }
-        if row.get("commit_anchored").and_then(|v| v.as_bool()) != Some(true) {
-            continue;
-        }
-        if row.get("tree_dirty").and_then(|v| v.as_bool()) != Some(false) {
+        if !row_matches_key(row, key) || s(row, "result") != want_result {
             continue;
         }
         if want_result == "pass" && !pass_row_qualifies(row) {
@@ -206,7 +309,7 @@ pub fn cache_lookup(
     }
     let row = best?;
     let producer = s(row, "producer");
-    let (executed, unit) = if producer == "validate.rs" {
+    let (executed, unit) = if matches!(producer, "validate.rs" | "hermit-validate-rs") {
         (i(row, "executed_nodes").unwrap_or(0), "node(s)")
     } else {
         (i(row, "executed_tests").unwrap_or(0), "test(s)")
@@ -373,7 +476,7 @@ pub fn self_test() -> Result<String, String> {
     // POSITIVE, both producers. A predicate that refuses everything would look
     // correct with negatives alone, so each authority gets a counted accept.
     let rs_pass = base(serde_json::json!({
-        "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 47,
+        "producer": "hermit-validate-rs", "executed_tests": 873, "executed_nodes": 47,
         "gates_expected": 47, "gates_run": 47,
         "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
     }));
@@ -434,9 +537,109 @@ pub fn self_test() -> Result<String, String> {
     }
 
     // A FAIL lookup must not require the pass conditions (a fail is noted, not reused).
-    let failing = base(serde_json::json!({"result": "fail", "failures": 3, "producer": "validate.rs"}));
+    let failing = base(serde_json::json!({
+        "result": "fail", "failures": 3, "producer": "hermit-validate-rs",
+        "dag_jobs": 4, "concurrent_validates": 0,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                   "failure_origin": "outer_gate"}],
+        "cell_results": {"cells": [{"cell_verdict": {"state": "compared-and-diverged"}}]}
+    }));
     if cache_lookup(std::slice::from_ref(&failing), "fail", &key).is_none() {
         return Err("cache: a prior FAIL record must be findable so it can be reported".into());
+    }
+
+    // The two historical orderings are both refused: fail-then-pass and
+    // pass-then-fail. A cache key is content identity, so append order must not
+    // decide whether a known-failing tree gets a zero-gate green.
+    for rows in [
+        vec![failing.clone(), rs_pass.clone()],
+        vec![rs_pass.clone(), failing.clone()],
+    ] {
+        if cache_lookup(&rows, "pass", &key).is_some() {
+            return Err("cache: a genuine same-key failure must latch over a PASS".into());
+        }
+    }
+
+    // Environment and incomplete evidence remain non-poisoning.
+    let environment = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "validate.rs",
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": false,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 127, "real_seconds": 0.1,
+                   "failure_origin": "outer_gate"}]
+    }));
+    if cache_lookup(&[environment, rs_pass.clone()], "pass", &key).is_none() {
+        return Err("cache: an environment fault must not poison a qualifying PASS".into());
+    }
+    let contended = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "validate.rs",
+        "dag_jobs": 16, "concurrent_validates": 2, "known_flaky_failure": false,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                   "failure_origin": "outer_gate"}]
+    }));
+    if cache_lookup(&[contended, rs_pass], "pass", &key).is_none() {
+        return Err("cache: an unconfirmed contended red must not poison a qualifying PASS".into());
+    }
+
+    let missing_origin = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "validate.rs",
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": false,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0}]
+    }));
+    let incomplete = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "validate.rs",
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": false,
+        "gates_expected": 2, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                   "failure_origin": "outer_gate"}]
+    }));
+    let subsecond = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "validate.rs",
+        "real_seconds": 0.5,
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": false,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 0.1,
+                   "failure_origin": "outer_gate"}]
+    }));
+    for (why, row) in [
+        ("missing failure origin", missing_origin),
+        ("incomplete gate accounting", incomplete),
+        ("sub-second all-red collapse", subsecond),
+    ] {
+        if cache_lookup(&[row, sh_pass.clone()], "pass", &key).is_none() {
+            return Err(format!("cache: {why} must not poison a qualifying PASS"));
+        }
+    }
+    let named_gate_without_aggregate = base(serde_json::json!({
+        "result": "fail", "failures": 0, "producer": "validate.rs",
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": false,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                   "failure_origin": "outer_gate"}]
+    }));
+    if cache_lookup(&[named_gate_without_aggregate, sh_pass.clone()], "pass", &key).is_some() {
+        return Err(
+            "cache: a bound named-gate failure must latch without an aggregate count".into(),
+        );
+    }
+
+    let flaky_unconfirmed = base(serde_json::json!({
+        "result": "fail", "failures": 1, "producer": "hermit-validate-rs",
+        "dag_jobs": 4, "concurrent_validates": 0, "known_flaky_failure": true,
+        "gates_expected": 1, "gates_run": 1,
+        "gates": [{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                   "failure_origin": "outer_gate"}]
+    }));
+    if cache_lookup(&[flaky_unconfirmed.clone(), sh_pass.clone()], "pass", &key).is_none() {
+        return Err("cache: unconfirmed known-flaky failure must remain NeedsRerun".into());
+    }
+    let mut flaky_confirmed = flaky_unconfirmed;
+    flaky_confirmed["solo_rerun_confirmation"] = serde_json::Value::Bool(true);
+    if cache_lookup(&[flaky_confirmed, sh_pass], "pass", &key).is_some() {
+        return Err("cache: solo-confirmed known-flaky failure must latch".into());
     }
 
     // Estimate brackets: below MIN it must SAY it is insufficient; at/above MIN

@@ -182,6 +182,9 @@ Exact-cell options (run and plan):
                            boxed jobs. COUNT must be positive. Plan and run
                            require a clean commit. At most four manifest guests
                            run at once, and KVM remains limited to one.
+  --run-id-prefix ID       Bind each retained result to this physical invocation.
+                           Accepted only with one exact repeated cell; letters,
+                           digits, '.', '_', and '-' only.
 
 Bounded-batch options (run and plan):
   --sample COUNT           Seeded random sample of red cells. Without --mode,
@@ -297,6 +300,8 @@ struct CellSelection {
     #[serde(default)]
     repetitions: Option<usize>,
     #[serde(default)]
+    run_id_prefix: Option<String>,
+    #[serde(default)]
     green: bool,
     #[serde(default)]
     jobs: Option<i64>,
@@ -330,6 +335,9 @@ impl CellSelection {
 
 fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String> {
     let Some(repetitions) = selection.repetitions else {
+        if selection.run_id_prefix.is_some() {
+            return Err("--run-id-prefix requires --repetitions".into());
+        }
         if selection.green {
             return Err("--green requires --repetitions".into());
         }
@@ -345,6 +353,18 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
         if selection.sample.is_some() || selection.seed.is_some() {
             return Err("an exact repeated cell cannot be combined with --sample or --seed".into());
         }
+        if let Some(prefix) = &selection.run_id_prefix {
+            if prefix.is_empty()
+                || !prefix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(
+                    "--run-id-prefix must contain only ASCII letters, digits, '.', '_', or '-'"
+                        .into(),
+                );
+            }
+        }
         return Ok(());
     }
     if !selection.green {
@@ -354,6 +374,9 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
     }
     if selection.test.is_some() || selection.backend.is_some() {
         return Err("a repeated green batch accepts only an optional --mode filter".into());
+    }
+    if selection.run_id_prefix.is_some() {
+        return Err("--run-id-prefix is limited to one exact repeated cell".into());
     }
     if selection.seed.is_some() && selection.sample.is_none() {
         return Err("--seed requires --sample".into());
@@ -839,6 +862,8 @@ struct RunMetadata {
     unavailable_cells: usize,
     #[serde(default)]
     repetitions: Option<usize>,
+    #[serde(default)]
+    run_id_prefix: Option<String>,
     #[serde(default)]
     green: bool,
     #[serde(default = "default_pressure_jobs")]
@@ -1413,6 +1438,12 @@ fn result_options(
                 }
                 if selection.repetitions.replace(value).is_some() {
                     return Err("--repetitions may be specified only once".into());
+                }
+            }
+            "--run-id-prefix" if allow_selection => {
+                let value = args.next().ok_or("--run-id-prefix requires a value")?;
+                if selection.run_id_prefix.replace(value).is_some() {
+                    return Err("--run-id-prefix may be specified only once".into());
                 }
             }
             "--green" if allow_selection => {
@@ -2106,6 +2137,15 @@ fn cell_run_slug(cell: &CellId, repetition: Option<usize>) -> String {
     })
 }
 
+fn cell_evidence_run_id(
+    cell: &CellId,
+    repetition: Option<usize>,
+    run_id_prefix: Option<&str>,
+) -> String {
+    let slug = cell_run_slug(cell, repetition);
+    run_id_prefix.map_or_else(|| slug.clone(), |prefix| format!("{prefix}--{slug}"))
+}
+
 fn write_plan(
     root: &Path,
     results: &Path,
@@ -2172,7 +2212,8 @@ fn write_plan_after_scorecard_check(
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build = exact_cell.is_some()
+            let direct_backend_build = tag == "build.runtime_release"
+                && exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
@@ -2289,6 +2330,11 @@ fn write_plan_after_scorecard_check(
             .ok_or_else(|| format!("no manifest budget for {}/{}", cell.test, cell.mode))?;
         for repetition in repetition_numbers(selection.repetitions) {
             let slug = cell_run_slug(cell, repetition);
+            let evidence_run_id = cell_evidence_run_id(
+                cell,
+                repetition,
+                selection.run_id_prefix.as_deref(),
+            );
             let tag = format!("cell.{slug}");
             let cell_dir = results.join("cells").join(&slug);
             let result_file = cell_dir.join("results.jsonl");
@@ -2363,7 +2409,7 @@ fn write_plan_after_scorecard_check(
                 cell_dir = shell_quote(&cell_dir.to_string_lossy()),
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
-                run_id = shell_quote(&slug),
+                run_id = shell_quote(&evidence_run_id),
                 harness = harness,
                 result_in_progress = shell_quote(&result_in_progress.to_string_lossy()),
                 result_file = shell_quote(&result_file.to_string_lossy()),
@@ -2510,6 +2556,7 @@ fn write_plan_after_scorecard_check(
         seed: selection.seed,
         unavailable_cells: unavailable.len(),
         repetitions: selection.repetitions,
+        run_id_prefix: selection.run_id_prefix.clone(),
         green: selection.green,
         jobs: selection.scheduler_jobs(),
         eligible_cells,
@@ -2695,6 +2742,7 @@ fn validate_run_contract(
         seed: metadata.seed,
         run_timeout_seconds: Some(metadata.run_timeout_seconds),
         repetitions: metadata.repetitions,
+        run_id_prefix: metadata.run_id_prefix.clone(),
         green: metadata.green,
         jobs: Some(metadata.jobs),
     };
@@ -3441,6 +3489,8 @@ fn summarize(
     for cell in &metadata.cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
+            let evidence_run_id =
+                cell_evidence_run_id(cell, repetition, metadata.run_id_prefix.as_deref());
             let cell_dir = results.join("cells").join(&slug);
             let step_tag = format!("cell.{slug}");
             let runner = runner_evidence.get(&step_tag).copied().unwrap_or_default();
@@ -3498,7 +3548,7 @@ fn summarize(
                                 Ok(row) => {
                                     let row_matches = result_row_matches_cell(
                                         &row,
-                                        &slug,
+                                        &evidence_run_id,
                                         &metadata,
                                         cell,
                                         expected.get(cell).copied().unwrap_or(false),
@@ -3560,7 +3610,7 @@ fn summarize(
             } else {
                 ("NO_RESULT".to_string(), false, None, None, None)
             };
-            let verification = match read_verification_report(results, cell, &slug) {
+            let verification = match read_verification_report(results, cell, &evidence_run_id) {
                 Ok(Some(report)) => Some(report),
                 Ok(None)
                     if matches!(cell.mode.as_str(), "verify" | "replay")
@@ -3569,7 +3619,7 @@ fn summarize(
                 {
                     evidence_errors.push(format!(
                         "missing verification report {}",
-                        verification_report_path(results, cell, &slug).display()
+                        verification_report_path(results, cell, &evidence_run_id).display()
                     ));
                     None
                 }
@@ -3583,14 +3633,14 @@ fn summarize(
                 .as_ref()
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
-            let verification_logs = match retained_verification_logs(results, cell, &slug) {
+            let verification_logs = match retained_verification_logs(results, cell, &evidence_run_id) {
                 Ok(logs) => logs,
                 Err(error) => {
                     evidence_errors.push(error);
                     Vec::new()
                 }
             };
-            let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell, &slug) {
+            let normalized_ptrace_golden = match normalized_ptrace_golden(results, cell, &evidence_run_id) {
                 Ok(path) => path,
                 Err(error) => {
                     evidence_errors.push(error);
@@ -3807,6 +3857,7 @@ fn summarize(
         "seed": metadata.seed,
         "unavailable_cells": metadata.unavailable_cells,
         "repetitions": metadata.repetitions,
+        "run_id_prefix": metadata.run_id_prefix,
         "green": metadata.green,
         "jobs": metadata.jobs,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
@@ -4170,6 +4221,20 @@ fn self_test(root: &Path) -> Result<(), String> {
     };
     validate_repetition_selection(&repeated_selection_contract)
         .map_err(|e| format!("valid repeated selection was refused: {e}"))?;
+    let mut prefixed_repetition = repeated_selection_contract.clone();
+    prefixed_repetition.run_id_prefix = Some("validate-run_1.pid-2".into());
+    validate_repetition_selection(&prefixed_repetition)
+        .map_err(|e| format!("valid run-id prefix was refused: {e}"))?;
+    let mut invalid_prefix = prefixed_repetition.clone();
+    invalid_prefix.run_id_prefix = Some("path/escape".into());
+    if validate_repetition_selection(&invalid_prefix).is_ok() {
+        return Err("run-id prefix accepted a path separator".into());
+    }
+    let mut prefix_without_repetition = prefixed_repetition;
+    prefix_without_repetition.repetitions = None;
+    if validate_repetition_selection(&prefix_without_repetition).is_ok() {
+        return Err("run-id prefix was accepted without repeated-cell evidence".into());
+    }
     let mut two_repetitions = repeated_selection_contract.clone();
     two_repetitions.repetitions = Some(2);
     validate_repetition_selection(&two_repetitions)
@@ -4855,6 +4920,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         mode: Some(green_id.mode.clone()),
         backend: Some(green_id.backend.clone()),
         repetitions: Some(3),
+        run_id_prefix: Some("validate-one-pid100".into()),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
@@ -4880,8 +4946,46 @@ fn self_test(root: &Path) -> Result<(), String> {
         &repeated_results.join("dag.json"),
         &repeated_selection,
     )?;
-    if repeated_metadata.cells != [green_id.clone()] || repeated_metadata.repetitions != Some(3) {
+    if repeated_metadata.cells != [green_id.clone()]
+        || repeated_metadata.repetitions != Some(3)
+        || repeated_metadata.run_id_prefix.as_deref() != Some("validate-one-pid100")
+    {
         return Err("generated repeated plan did not retain one cell and three repetitions".into());
+    }
+    let mut second_invocation = repeated_selection.clone();
+    second_invocation.run_id_prefix = Some("validate-two-pid200".into());
+    let second_invocation_results = scratch.join("repeated-plan-second-invocation");
+    write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &second_invocation_results,
+        &second_invocation_results.join("dag.json"),
+        &second_invocation,
+    )?;
+    let second_invocation_dag = dag_from_json(
+        &fs::read_to_string(second_invocation_results.join("dag.json"))
+            .map_err(|e| format!("cannot read second-invocation DAG: {e}"))?,
+    )
+    .map_err(|e| format!("cannot parse second-invocation DAG: {e}"))?;
+    let first_run_ids: BTreeSet<_> = (1..=3)
+        .map(|number| {
+            cell_evidence_run_id(&green_id, Some(number), Some("validate-one-pid100"))
+        })
+        .collect();
+    let second_run_ids: BTreeSet<_> = (1..=3)
+        .map(|number| {
+            cell_evidence_run_id(&green_id, Some(number), Some("validate-two-pid200"))
+        })
+        .collect();
+    if !first_run_ids.is_disjoint(&second_run_ids)
+        || second_invocation_dag.steps.iter().filter(|step| step.group == "cell").any(
+            |step| {
+                !step
+                    .cmd
+                    .contains(&format!("E2E_RUN_ID='validate-two-pid200--{}'", step.job))
+            },
+        )
+    {
+        return Err("independent repeated-cell invocations reused an evidence run ID".into());
     }
     let mut huge_repetition_selection = repeated_selection.clone();
     huge_repetition_selection.repetitions = Some(usize::MAX);
@@ -4919,6 +5023,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.tag() == "build.runtime_release")
         .collect();
+    let manifest_plan_steps: Vec<_> = repeated_dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "setup.manifest_plan")
+        .collect();
     let recursive_metadata_tags = [
         "e2e.metadata",
         "build.workspace",
@@ -4935,12 +5044,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         || repeated_jobs != expected_repeated_jobs
         || preparation_steps.len() != 1
         || runtime_build_steps.len() != 1
+        || manifest_plan_steps.len() != 1
         || repeated_dag
             .steps
             .iter()
             .any(|step| recursive_metadata_tags.contains(&step.tag().as_str()))
         || !runtime_build_steps[0].deps.is_empty()
         || !runtime_build_steps[0]
+            .cmd
+            .contains("cargo build --release --locked -p hermit --bin hermit")
+        || !manifest_plan_steps[0]
+            .cmd
+            .contains("cargo build -p hermit-manifest-plan --bins")
+        || manifest_plan_steps[0]
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
@@ -4968,7 +5084,9 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .cmd
                 .contains("HERMIT_BIN=\"$PWD/target/release/hermit\"")
             || step.cmd.contains("run-with-hermit-e2e-artifact.sh")
-            || !step.cmd.contains(&format!("E2E_RUN_ID='{}'", step.job))
+            || !step
+                .cmd
+                .contains(&format!("E2E_RUN_ID='validate-one-pid100--{}'", step.job))
             || !step.cmd.contains(&format!("/cells/{}/", step.job))
         {
             return Err(format!(
@@ -5748,6 +5866,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         seed: None,
         unavailable_cells: 0,
         repetitions: None,
+        run_id_prefix: None,
         green: false,
         jobs: default_jobs(),
         eligible_cells: 1,
