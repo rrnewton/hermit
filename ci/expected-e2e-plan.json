@@ -15,6 +15,13 @@
       "test": "applications/git-repository-workflow"
     },
     {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-shell-environment"
+    },
+    {
       "backend": "ptrace",
       "category": "applications",
       "lane": "portable",

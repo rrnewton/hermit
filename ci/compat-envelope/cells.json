@@ -280,7 +280,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 195: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -293,7 +293,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 195: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -306,7 +306,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 195: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -319,7 +319,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 195: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -16264,7 +16264,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification passed one of three repetitions and diverged in the other two. The first mismatch was scheduler turn 4 of 13 after clone3, where COMMIT virtual time was 2848750 versus 3697500 ns. The ptrace cell is unchanged by this KVM result."
       },
       "observations": []
     },
@@ -16297,7 +16297,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification passed one of three repetitions and diverged in the other two. The first mismatch was scheduler turn 4 of 13 after clone3, where COMMIT virtual time was 2848750 versus 3697500 ns. The ptrace cell is unchanged by this KVM result."
       },
       "observations": []
     },
@@ -16310,7 +16310,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification passed one of three repetitions and diverged in the other two. The first mismatch was scheduler turn 4 of 13 after clone3, where COMMIT virtual time was 2848750 versus 3697500 ns. The ptrace cell is unchanged by this KVM result."
       },
       "observations": []
     },
@@ -43730,7 +43730,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions in wait4 and InternalIOPolling order. The compared INFO counts were 16183 versus 16017, 5821 versus 10003, and 22469 versus 11755. The ptrace and SaBRe cells are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -43753,7 +43753,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions in wait4 and InternalIOPolling order. The compared INFO counts were 16183 versus 16017, 5821 versus 10003, and 22469 versus 11755. The ptrace and SaBRe cells are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -43766,7 +43766,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions in wait4 and InternalIOPolling order. The compared INFO counts were 16183 versus 16017, 5821 versus 10003, and 22469 versus 11755. The ptrace and SaBRe cells are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -46968,7 +46968,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 156: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. Both runs compared 3256 INFO messages in every repetition, so equal counts did not establish parity. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -46981,7 +46981,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 156: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. Both runs compared 3256 INFO messages in every repetition, so equal counts did not establish parity. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -46994,7 +46994,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 156: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. Both runs compared 3256 INFO messages in every repetition, so equal counts did not establish parity. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -47007,7 +47007,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 156: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. Both runs compared 3256 INFO messages in every repetition, so equal counts did not establish parity. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -47020,7 +47020,7 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 32 of 156: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2. Both runs compared 3256 INFO messages in every repetition, so equal counts did not establish parity. The other enabled backends are unchanged by this KVM result."
       },
       "observations": []
     },
@@ -54472,6 +54472,9 @@
       "backend": "kvm",
       "enabled": true,
       "status": "red",
+      "ci_disabled_reason": {
+        "reason": "KVM canonical verification diverged in all three repetitions at scheduler turn 45: lseek(2, 0, SEEK_CUR) returned 11 in run 1 and 22 in run 2."
+      },
       "observations": []
     },
     {
@@ -54631,7 +54634,7 @@
       "mode": "verify",
       "backend": "kvm",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": []
     },
     {

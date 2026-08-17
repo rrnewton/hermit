@@ -2923,12 +2923,7 @@ impl RunOpts {
             );
         }
 
-        let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        let success_message = if kvm_output_only {
-            "Success: KVM guest output and exit status matched."
-        } else {
-            "Success: deterministic. Determinism verified."
-        };
+        let success_message = "Success: deterministic. Determinism verified.";
         let failure_message = "Failure: nondeterministic.";
         let outcome = compare_two_runs(
             ComparedRun {
@@ -2949,7 +2944,7 @@ impl RunOpts {
                 } else {
                     LogCompareStrictness::Stripped
                 },
-                compare_logs: !kvm_output_only,
+                compare_logs: true,
                 diagnostic_full_trace: self.verify_verbose,
                 keep_logs: self.keep_logs,
             },
