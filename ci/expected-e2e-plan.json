@@ -1548,7 +1548,7 @@
       "test": "data-handling/archive-roundtrip"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "data-handling",
       "lane": "portable",
       "mode": "naked",
@@ -1569,7 +1569,7 @@
       "test": "data-handling/shell-pipeline"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "data-handling",
       "lane": "portable",
       "mode": "naked",
@@ -1618,7 +1618,7 @@
       "test": "determinism-stress-c/pipe-prefill"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "determinism-stress-c",
       "lane": "portable",
       "mode": "naked",
@@ -1667,7 +1667,7 @@
       "test": "determinism-stress/process-chains"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "determinism-stress",
       "lane": "portable",
       "mode": "naked",
@@ -1702,7 +1702,7 @@
       "test": "language-runtimes/bash-loop-pipe-time"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1716,7 +1716,7 @@
       "test": "language-runtimes/bash-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1730,7 +1730,7 @@
       "test": "language-runtimes/cpp-stl-determinism"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1744,7 +1744,7 @@
       "test": "language-runtimes/gawk-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1758,7 +1758,7 @@
       "test": "language-runtimes/lua-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1772,7 +1772,7 @@
       "test": "language-runtimes/m4-macro-mkstemp"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1786,7 +1786,7 @@
       "test": "language-runtimes/node-v8-jit"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1807,7 +1807,7 @@
       "test": "language-runtimes/perl-io-subprocess-time"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1828,7 +1828,7 @@
       "test": "language-runtimes/python-dict-hash-iteration"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1842,7 +1842,7 @@
       "test": "language-runtimes/python-hash-determinism"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1863,7 +1863,7 @@
       "test": "language-runtimes/python-io-subprocess-time"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1877,7 +1877,7 @@
       "test": "language-runtimes/python-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1891,7 +1891,7 @@
       "test": "language-runtimes/ruby-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1905,7 +1905,7 @@
       "test": "language-runtimes/rust-hashmap-iteration"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "language-runtimes",
       "lane": "portable",
       "mode": "naked",
@@ -1954,7 +1954,7 @@
       "test": "system-utils/clock-exec-continuity"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -1989,7 +1989,7 @@
       "test": "system-utils/find-tree-metadata"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2003,7 +2003,7 @@
       "test": "system-utils/mcookie-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2017,7 +2017,7 @@
       "test": "system-utils/mktemp-name"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2031,7 +2031,7 @@
       "test": "system-utils/openssl-enc"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2045,7 +2045,7 @@
       "test": "system-utils/openssl-genpkey"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2059,7 +2059,7 @@
       "test": "system-utils/openssl-passwd"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2073,7 +2073,7 @@
       "test": "system-utils/openssl-rand"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2087,7 +2087,7 @@
       "test": "system-utils/openssl-x509"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2101,7 +2101,7 @@
       "test": "system-utils/proc-random-uuid"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2115,7 +2115,7 @@
       "test": "system-utils/proc-uptime"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2164,7 +2164,7 @@
       "test": "system-utils/shm-coherency-identity"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2178,7 +2178,7 @@
       "test": "system-utils/shuf-permutation"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2192,7 +2192,7 @@
       "test": "system-utils/sort-random"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",
@@ -2213,7 +2213,7 @@
       "test": "system-utils/startup-surface-identity"
     },
     {
-      "backend": null,
+      "backend": "native",
       "category": "system-utils",
       "lane": "portable",
       "mode": "naked",

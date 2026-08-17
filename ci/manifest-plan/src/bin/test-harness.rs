@@ -318,7 +318,17 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
             ..Selection::default()
         })
         .unwrap_or_else(|e| fail(e));
-    let actual = cells.iter().map(|cell| serde_json::json!({"test":cell.id.test,"category":cell.category,"lane":cell.test.lane,"mode":cell.id.mode,"backend":cell.id.backend})).collect::<Vec<_>>();
+    let actual = cells
+        .iter()
+        .map(|cell| {
+            let backend = if cell.id.mode == "naked" {
+                Some("native")
+            } else {
+                cell.id.backend.as_deref()
+            };
+            serde_json::json!({"test":cell.id.test,"category":cell.category,"lane":cell.test.lane,"mode":cell.id.mode,"backend":backend})
+        })
+        .collect::<Vec<_>>();
     let expected: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap()).unwrap();
     let expected = expected["cells"].as_array().cloned().unwrap_or_default();
@@ -770,7 +780,7 @@ fn print_plan(manifests: &ManifestSet, args: &Args, population: Population) -> E
     let cells = manifests.select(&selection).unwrap_or_else(|e| fail(e));
     if args.format == "json" {
         println!("{}", serde_json::to_string(&cells.iter().map(|c| {
-            let backend = if population == Population::Disabled && c.id.mode == "naked" {
+            let backend = if c.id.mode == "naked" {
                 Some("native")
             } else {
                 c.id.backend.as_deref()
@@ -779,7 +789,7 @@ fn print_plan(manifests: &ManifestSet, args: &Args, population: Population) -> E
         }).collect::<Vec<_>>()).unwrap());
     } else {
         for cell in cells {
-            let backend = if population == Population::Disabled && cell.id.mode == "naked" {
+            let backend = if cell.id.mode == "naked" {
                 "native"
             } else {
                 cell.id.backend.as_deref().unwrap_or("-")
