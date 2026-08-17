@@ -294,8 +294,21 @@ fn assert_backend_parity_and_sabre_verify(
 }
 
 fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str) {
+    let retained_logs = tempfile::Builder::new()
+        .prefix("sabre-canonical-verify-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap_or_else(|error| {
+            panic!("failed to create canonical verification directory for {label}: {error}")
+        });
     let verify = run_bounded(
-        example_command(program, args, Some(loader), true, None, None),
+        example_command(
+            program,
+            args,
+            Some(loader),
+            true,
+            None,
+            Some(retained_logs.path()),
+        ),
         &format!("SaBRe strict portable verification for {label}"),
         None,
     );
@@ -311,6 +324,22 @@ fn assert_sabre_verify(program: &Path, args: &[&str], loader: &Path, label: &str
     assert!(
         diagnostics.contains("SaBRe syscall DETLOG records included: run1="),
         "SaBRe verifier omitted its syscall DETLOG inclusion count for {label}:\n{diagnostics}",
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(retained_logs.path().join("verify.json")).unwrap_or_else(|error| {
+            panic!("SaBRe verifier omitted its JSON report for {label}: {error}")
+        }),
+    )
+    .unwrap_or_else(|error| panic!("SaBRe verifier wrote invalid JSON for {label}: {error}"));
+    assert!(
+        report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["verdict"] == "matched"
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["compare_logs"] == true
+            && report["comparison"]["log_scope"] == "info",
+        "SaBRe verification was not canonical matched INFO parity for {label}: {report}",
     );
 }
 

@@ -1874,6 +1874,67 @@ fn sabre_rpc_socket_is_hidden_from_proc_environ() {
 }
 
 #[test]
+fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
+    let hermit_binary = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let executable_dir = hermit_binary.parent().unwrap();
+    let target_dir = executable_dir.parent().unwrap();
+    let loader = std::env::var_os("HERMIT_SABRE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target_dir.join("sabre/sabre"));
+    let plugin = std::env::var_os("HERMIT_INSTALL_DIR")
+        .map(PathBuf::from)
+        .map(|install| install.join("rsrcs/libdetcore_sabre.so"))
+        .unwrap_or_else(|| executable_dir.join("libdetcore_sabre.so"));
+    if !loader.is_file() || !plugin.is_file() {
+        return;
+    }
+
+    let host_tmpdir = tempfile::Builder::new()
+        .prefix("sabre-host-tmpdir-")
+        .tempdir_in("/tmp")
+        .expect("failed to create nested host TMPDIR");
+    let verify_report =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("sabre-nested-host-tmpdir-verify.json");
+    let _ = fs::remove_file(&verify_report);
+
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let args = [
+        "--log=info",
+        "run",
+        "--backend",
+        "sabre",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verify_report.to_str().unwrap(),
+        "--",
+        "/bin/true",
+    ];
+    let output = Command::new(hermit_binary)
+        .env("TMPDIR", host_tmpdir.path())
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(args)
+        .output()
+        .expect("failed to run SaBRe nested-TMPDIR regression");
+    assert_success(&output, &args);
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verify_report).expect("SaBRe nested-TMPDIR verification report was not written"),
+    )
+    .expect("SaBRe nested-TMPDIR verification report was not valid JSON");
+    assert!(
+        report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["verdict"] == "matched"
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["compare_logs"] == true
+            && report["comparison"]["log_scope"] == "info",
+        "SaBRe nested-TMPDIR run did not produce a canonical matched report:\n{report}"
+    );
+}
+
+#[test]
 fn global_position_rejects_unknown_backends() {
     let args = ["--backend", "unknown", "run", "--", "/bin/true"];
     let output = hermit(&args);
