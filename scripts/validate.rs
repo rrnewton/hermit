@@ -3788,7 +3788,37 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
     })
 }
 
-/// Planned runnable steps absent from both scheduler result collections.
+/// Planned non-intentional steps that could not run because a dependency failed.
+///
+/// Environmental retries execute subgraphs, so the last retry's scheduler result
+/// cannot by itself describe dependency skips in the original plan. Recompute the
+/// same transitive closure over every accumulated outcome before final accounting.
+fn dependency_skipped_non_intentional_steps(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+) -> Vec<String> {
+    let mut skipped = BTreeSet::new();
+    loop {
+        let before = skipped.len();
+        for step in &cfg.steps {
+            let tag = step.tag();
+            if step.skip_reason.is_some() || by_tag.contains_key(&tag) || skipped.contains(&tag) {
+                continue;
+            }
+            if step.deps.iter().any(|dependency| {
+                by_tag.get(dependency).is_some_and(|outcome| !outcome.ok)
+                    || skipped.contains(dependency)
+            }) {
+                skipped.insert(tag);
+            }
+        }
+        if skipped.len() == before {
+            return skipped.into_iter().collect();
+        }
+    }
+}
+
+/// Planned runnable steps absent from both final scheduler result collections.
 fn not_launched_non_intentional_steps(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
@@ -3986,6 +4016,36 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             fail_fast.env_retries,
             fail_fast.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>(),
             fail_fast.not_launched,
+        ));
+    }
+
+    // The final adapter accounting must preserve true dependency skips even if
+    // a later environmental retry subgraph omits them. The independent peer is
+    // not dependency-skipped and therefore remains not launched under fail-fast.
+    let mut dependent = step("dependent", "true");
+    dependent.deps = vec!["fixture.fail".into()];
+    let dependency_cfg = DagConfig {
+        steps: vec![step("fail", "exit 1"), dependent, step("independent", "true")],
+        ..Default::default()
+    };
+    let dependency_result = run_lane_with_env_retries(
+        &dependency_cfg,
+        1,
+        false,
+        0,
+        None,
+        &failure_log,
+        None,
+        1,
+        false,
+    );
+    if dependency_result.skipped != vec!["fixture.dependent".to_string()]
+        || dependency_result.not_launched != vec!["fixture.independent".to_string()]
+    {
+        return Err(format!(
+            "scheduler accounting: final dependency closure confused true dependents with not-launched work: skipped={:?} not_launched={:?}",
+            dependency_result.skipped,
+            dependency_result.not_launched,
         ));
     }
 
@@ -4503,6 +4563,7 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
+    skipped = dependency_skipped_non_intentional_steps(cfg, &by_tag);
     let final_not_launched = not_launched_non_intentional_steps(cfg, &by_tag, &skipped);
     if !final_not_launched.is_empty() {
         eprintln!(
