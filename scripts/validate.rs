@@ -1205,6 +1205,29 @@ cleared-caps refusal names {} starved step(s)",
             .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
             .expect("manifest audit exists")
             .clone();
+        let manifest_builders: Vec<&Step> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd == validate_plan::MANIFEST_PLAN_BUILD_COMMAND)
+            .collect();
+        if manifest_builders.len() != 1 || manifest_builders[0].tag() != "pre.manifest_plan" {
+            return Err(format!(
+                "full-plan bracket: manifest-plan build was not deduped to pre.manifest_plan: {:?}",
+                manifest_builders
+                    .iter()
+                    .map(|step| step.tag())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if manifest_builders[0].deps != [PIN_GATE_TAG]
+            || manifest_audit.deps != ["pre.manifest_plan"]
+        {
+            return Err(format!(
+                "full-plan bracket: cold manifest spine is not pin -> build -> audit: builder_deps={:?} audit_deps={:?}",
+                manifest_builders[0].deps, manifest_audit.deps
+            ));
+        }
         let mut wrong_invocation = vec![manifest_audit];
         wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
         if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
