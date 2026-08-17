@@ -2814,6 +2814,25 @@ function launch_refusal_reason {
     printf 'guest launch refused before execution: %s' "$first_line"
 }
 
+# A featureless Hermit binary refuses DBT, SaBRe, and e9patch before creating a
+# guest. Preserve that build-time cause instead of reducing it to the same
+# "exited with status 1" reason as a guest or backend runtime failure. This is
+# still a red result: it changes the diagnosis, not the pass gate.
+function backend_support_not_in_build_reason {
+    local status=$1 backend=$2 stderr_file=$3 stdout_file=$4 first_line
+    ((status != 0)) || return 1
+    [[ ! -s $stdout_file ]] || return 1
+    first_line=$(head -n 1 "$stderr_file")
+    case "$backend:$first_line" in
+        'dbt:Error: backend `dbt` is unavailable: DBT support was not included in this build'|\
+        'sabre:Error: backend `sabre` is unavailable: SaBRe support was not included in this build'|\
+        'e9patch:Error: backend `e9patch` is unavailable: e9patch support was not included in this build')
+            printf 'requested backend support is absent from HERMIT_BIN: %s' "${first_line#Error: }"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 # A chaos command exists only when the manifest supplies at least one seed.
 # Disabled chaos modes may omit the recipe entirely.  That cell remains red in
 # the scorecard, but running zero guests is not a failed attempt and must not
@@ -3099,6 +3118,46 @@ function audit_guest_launch_classification_contract {
         rm -rf "$fixture_dir"
         die "a genuine refusal (first-line message, no guest stdout) must still be a no-result"
     }
+
+    local backend_absence_stderr runtime_unavailable_stderr
+    backend_absence_stderr="$fixture_dir/backend-absence.stderr"
+    runtime_unavailable_stderr="$fixture_dir/runtime-unavailable.stderr"
+    for row in \
+        'dbt|DBT' \
+        'sabre|SaBRe' \
+        'e9patch|e9patch'; do
+        local backend=${row%%|*} display=${row#*|} build_reason
+        printf 'Error: backend `%s` is unavailable: %s support was not included in this build\n' \
+            "$backend" "$display" >"$backend_absence_stderr"
+        build_reason=$(backend_support_not_in_build_reason \
+            1 "$backend" "$backend_absence_stderr" /dev/null) || {
+            rm -rf "$fixture_dir"
+            die "$backend build-time absence was not detected"
+        }
+        [[ $build_reason == *"$display support was not included in this build"* ]] || {
+            rm -rf "$fixture_dir"
+            die "$backend build-time absence lost its exact cause"
+        }
+    done
+    printf '%s\n' \
+        'Error: backend `dbt` is unavailable: the DynamoRIO runtime was not found' \
+        >"$runtime_unavailable_stderr"
+    if backend_support_not_in_build_reason \
+        1 dbt "$runtime_unavailable_stderr" /dev/null >/dev/null; then
+        rm -rf "$fixture_dir"
+        die "a DBT runtime failure must not be labelled as missing build support"
+    fi
+    if backend_support_not_in_build_reason \
+        1 dbt "$backend_absence_stderr" /dev/null >/dev/null; then
+        rm -rf "$fixture_dir"
+        die "one backend's missing feature message must not be attributed to another backend"
+    fi
+    printf '%s\n' 'guest produced real output' >"$forged_stdout"
+    if backend_support_not_in_build_reason \
+        1 e9patch "$backend_absence_stderr" "$forged_stdout" >/dev/null; then
+        rm -rf "$fixture_dir"
+        die "a guest that produced stdout must not be labelled as missing build support"
+    fi
     rm -rf "$fixture_dir"
 }
 
@@ -3679,7 +3738,8 @@ function run_cell {
     prepare_cell_dirs "$cell_dir"
     start_ms=$(date +%s%3N)
 
-    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr='' diversity=null
+    local outcome=PASS reason='' error_kind='' path_evidence=null launch_refusal_stderr=''
+    local backend_build_absence_reason='' diversity=null
     local timeout_reason='' prepare_status=0
     prepare_test "$test" "$cell_dir" "$timeout_seconds" || prepare_status=$?
     if ((prepare_status != 0)); then
@@ -3743,6 +3803,11 @@ function run_cell {
                 launch_refusal_stderr=$stderr_file
                 break
             fi
+            if backend_build_absence_reason=$(backend_support_not_in_build_reason \
+                "$status" "$backend" "$stderr_file" "$stdout_file"); then
+                break
+            fi
+            backend_build_absence_reason=''
             if timeout_reason=$(individual_test_timeout_reason \
                 "$id" "$mode" "$backend" "seed-$seed" "$timeout_seconds" "$status" \
                 "${stderr_file}.timeout"); then
@@ -3759,7 +3824,11 @@ function run_cell {
                 verification_failures+=("seed $seed: $verification_failure")
             fi
         done < <(jq -r '.modes.chaos.seeds[]' <<<"$metadata")
-        if [[ -n $launch_refusal_stderr ]]; then
+        if [[ -n $backend_build_absence_reason ]]; then
+            outcome=ERROR
+            error_kind=backend-support-not-in-build
+            reason=$backend_build_absence_reason
+        elif [[ -n $launch_refusal_stderr ]]; then
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
@@ -3879,6 +3948,11 @@ function run_cell {
                 launch_refusal_stderr=$stderr_file
                 break
             fi
+            if backend_build_absence_reason=$(backend_support_not_in_build_reason \
+                "$status" "$backend" "$stderr_file" "$stdout_file"); then
+                break
+            fi
+            backend_build_absence_reason=''
             if timeout_reason=$(individual_test_timeout_reason \
                 "$id" "$mode" "$backend" "$attempt" "$timeout_seconds" "$status" \
                 "${stderr_file}.timeout"); then
@@ -3888,7 +3962,11 @@ function run_cell {
             hashes+=("$hash")
             [[ $status == 0 ]] || ((failed_runs += 1))
         done
-        if [[ -n $launch_refusal_stderr ]]; then
+        if [[ -n $backend_build_absence_reason ]]; then
+            outcome=ERROR
+            error_kind=backend-support-not-in-build
+            reason=$backend_build_absence_reason
+        elif [[ -n $launch_refusal_stderr ]]; then
             outcome=ERROR
             error_kind=guest-launch-refused
             reason=$(launch_refusal_reason "$launch_refusal_stderr")
@@ -3917,6 +3995,10 @@ function run_cell {
             "$id" "$mode" "$backend" 1 "$timeout_seconds" "$status" \
             "${stderr_file}.timeout"); then
             outcome=FAIL
+        elif reason=$(backend_support_not_in_build_reason \
+            "$status" "$backend" "$stderr_file" "$stdout_file"); then
+            outcome=ERROR
+            error_kind=backend-support-not-in-build
         elif [[ $status != 0 ]]; then
             outcome=FAIL
             reason="$mode exited with status $status"
@@ -3934,7 +4016,7 @@ function run_cell {
         fi
     fi
 
-    if [[ $backend == sabre ]]; then
+    if [[ $backend == sabre && $error_kind != backend-support-not-in-build ]]; then
         path_evidence=$(collect_sabre_path_evidence "$cell_dir" \
             "$(expected_sabre_execution_count "$mode")") || {
             outcome=ERROR

@@ -152,6 +152,12 @@ Callers that combine explicit mode/backend filters with CI policy must add
 `--ci-only`. This is how `scripts/validate.rs quick` avoids expanding the manual C
 inventory.
 
+If the selected Hermit binary was compiled without the requested DBT or SaBRe
+feature, the harness keeps the cell red and writes `outcome: "ERROR"` with
+`error_kind: "backend-support-not-in-build"`. The result reason retains the
+exact `support was not included in this build` diagnostic; it is not collapsed
+into the same status-only failure used for a backend or guest that actually ran.
+
 ## Inventory and validation
 
 `inventory/test-files.json` classifies every regular file and symlink below

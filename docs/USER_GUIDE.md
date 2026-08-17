@@ -201,8 +201,8 @@ The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
 guest-kernel ABI.
 
-SaBRe is available only in builds using the non-default
-`third-party-backends` feature. See
+SaBRe is available only in builds using the non-default `sabre` feature, or the
+`third-party-backends` aggregate. See
 [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
 historical `Stripped` allowlist, build commands, and known gaps. An enabled probe is
 not a blanket support claim for every workload in its subsystem.

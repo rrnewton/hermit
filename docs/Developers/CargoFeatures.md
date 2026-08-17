@@ -23,6 +23,29 @@ All Hermit-local features belong to the `hermit` package and are declared in
 | `e9patch` | Off | e9patch runtime availability. The preprocessing module remains compiled because it shares parser and instruction-map machinery with core code. |
 | `third-party-backends` | Off | Aggregate enabling `dbt`, `sabre`, and `e9patch`; it has no direct source cfg. |
 
+### Exact Hermit build flags
+
+The default feature set is empty. A plain build contains the `ptrace`, `kvm`,
+and `liteinst` selections, but it does **not** contain DBT, SaBRe, or e9patch:
+
+| Command | Backend selections compiled into `hermit` |
+| --- | --- |
+| `cargo build --release -p hermit --bin hermit` | `ptrace`, `kvm`, `liteinst` |
+| `cargo build --release -p hermit --bin hermit --features dbt` | Core selections plus `dbt` |
+| `cargo build --release -p hermit --bin hermit --features sabre` | Core selections plus `sabre` |
+| `cargo build --release -p hermit --bin hermit --features e9patch` | Core selections plus `e9patch` |
+| `cargo build --release -p hermit --bin hermit --features dbt,sabre` | Core selections plus `dbt` and `sabre` |
+| `cargo build --release -p hermit --bin hermit --features third-party-backends` | Core selections plus `dbt`, `sabre`, and `e9patch` |
+
+The Cargo feature only compiles the selection. DBT still needs DynamoRIO and
+`libdetcore_dbt.so`; SaBRe still needs the external SaBRe loader and
+`libdetcore_sabre.so`; LiteInst is already compiled in but still needs its
+staged runtime library.
+
+DBT is coupled to Hermit's pinned Reverie revision because `dbt` enables the
+optional `reverie-dbt` dependency. SaBRe is not: `sabre = []` adds no Rust or
+Reverie dependency, so enabling SaBRe does not require a Reverie pin advance.
+
 The workspace's
 [`default-members`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/Cargo.toml)
 exclude `detcore-dbt`, `detcore-sabre`, and `hermit-install`. The default Cargo
