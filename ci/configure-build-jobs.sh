@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e7972364634aae3ef62705527c70a1c0556c5784 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie e7972364634aae3ef62705527c70a1c0556c5784" >&2
     return 2
 fi
 
@@ -138,6 +138,11 @@ fi
 # (c38c979057f9fe3e4d46772c1fddd05a71db4bf9) and third-party/
 # (fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a) are identical at both pins, and
 # MAX_PARALLEL_JOBS is still 16.
+#
+# CARRY TO e797236 (2026-08-17). The c261050..e797236 change touches only
+# reverie-ptrace/src/tracer.rs. reverie-dbt/build.rs and the vendored
+# DynamoRIO tree are byte-identical at both pins, so this does not change the
+# calibrated native-build inputs or their content key.
 #
 # CARRY TO e159d6c (2026-08-06). The only 9470712..e159d6c change is a
 # hostname-neutral wording edit in reverie-dbt/build.rs. The vendored
