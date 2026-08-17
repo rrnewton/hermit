@@ -91,7 +91,7 @@ test:
         backends_disabled:
           dbt: Concurrent shell stdout differed between strict verification runs
           liteinst: The preload runtime cannot survive the shell script's post-start exec
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason: 'KVM canonical verification diverged in all three repetitions in wait4 and InternalIOPolling order, with differing INFO counts in every failure. The ptrace and SaBRe cells are unchanged by this KVM result.'
       replay:
         ci: false
         backends_enabled: []

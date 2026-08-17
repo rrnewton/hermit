@@ -243,8 +243,7 @@ wall-clock prefix, ordinalizes host addresses while preserving identity/order/
 aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
 must not be stripped. State this canonical envelope rather than calling the raw
-log files literally byte-identical. KVM's output-only fallback reports
-`bitwise_parity: false` and is not L2.
+log files literally byte-identical.
 
 ## Debugging
 
