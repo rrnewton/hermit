@@ -33,12 +33,12 @@ closure. Cargo cannot describe non-Cargo guest fixtures, backend runtime
 staging, or standalone scripts, so those semantic edges remain explicit in
 `ci/test-footprints-policy.json`.
 
-`ci/test_harness.sh validate` runs the generator in `--check` mode and fails the
+`target/debug/test-harness validate` runs the generator in `--check` mode and fails the
 `e2e.metadata` gate if the committed artifact differs byte-for-byte. A focused
 check is also available:
 
 ```bash
-ci/test_harness.sh audit-test-footprints
+target/debug/test-harness audit-test-footprints
 ```
 
 The generated map does not weaken selection. Unknown paths and force-full paths

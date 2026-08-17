@@ -13,7 +13,7 @@
 #     ==  { portable.json nodes } minus { e2e.manifest_* }
 #
 # The 13 e2e.manifest_* nodes are intentionally excluded here: they are covered by
-# the audited e2e (category x backend) matrix (ci/test_harness.sh plan), exactly
+# the audited e2e (category x backend) matrix (target/debug/test-harness plan), exactly
 # as the pre-existing ci-portable-fanout.yml already validates. This guard makes
 # it impossible for the parallel workflow to silently cover a different set than
 # the trusted portable DAG.

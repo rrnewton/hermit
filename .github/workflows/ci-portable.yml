@@ -28,7 +28,7 @@ name: CI (GitHub-managed portable)
 # CORRESPONDENCE (fail-closed): ci/check-shard-coverage.sh asserts the shard map
 # (ci/portable-shards.json) assigns every non-e2e portable node to exactly one
 # job; the e2e jobs are derived from the SAME audited manifest plan
-# (ci/test_harness.sh plan). Node COMMANDS live only in
+# (target/debug/test-harness plan). Node COMMANDS live only in
 # ci/dag/portable.json — shards reference nodes by key, so this fan-out cannot
 # silently diverge from the trusted DAG. The previous serial portable workflow
 # and the partial per-cell workflow were retired when this lane was promoted.
@@ -365,7 +365,7 @@ jobs:
             echo "No e2e cells selected; emitting empty cell matrix." >&2
             exit 0
           fi
-          plan=$(./ci/test_harness.sh plan --lane portable --ci-only --format json)
+          plan=$(target/debug/test-harness plan --lane portable --ci-only --format json)
           matrix=$(jq -c '
             [ .[] | {
                 category,
@@ -397,7 +397,7 @@ jobs:
       - name: Pack debug prebuilt tree
         run: |
           set -euo pipefail
-          # ignored/e2e/build is created lazily by `test_harness.sh build` only
+          # ignored/e2e/build is created lazily by `test-harness build` only
           # when at least one guest fixture stages; on trees that stage none it
           # never exists and `tar` would abort with "Cannot stat". Materialize an
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
@@ -412,6 +412,8 @@ jobs:
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
+            target/debug/test-harness \
+            target/debug/hermit-manifest-plan \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
@@ -743,7 +745,7 @@ jobs:
         run: |
           set -euo pipefail
           out="ignored/e2e/portable/${{ matrix.slug }}"
-          args=(./ci/test_harness.sh run --lane portable --category "${{ matrix.category }}" \
+          args=(target/debug/test-harness run --lane portable --category "${{ matrix.category }}" \
             --mode "${{ matrix.mode }}")
           if [[ "${{ matrix.backend }}" == "naked" ]]; then
             :
@@ -804,7 +806,7 @@ jobs:
   # coordinator socket cannot survive guest exec.
   sabre_non_gated_parity:
     name: SaBRe non-gating exec diagnostics
-    needs: [select, build-release]
+    needs: [select, build-debug, build-release]
     if: needs.select.outputs.build_release != 'false'
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -828,12 +830,20 @@ jobs:
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
           path: .
-      - name: Unpack full release prebuilt tree
+      - name: Download Rust E2E runner
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DEBUG_ARTIFACT }}
+          path: .
+      - name: Unpack product and runner trees
         run: |
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
+          tar --zstd -xf "$DEBUG_TARBALL"
+          rm -f "$DEBUG_TARBALL"
           test -x target/release/hermit
+          test -x target/debug/test-harness
           test -x target/install_pkg/rsrcs/sabre
       - name: Run known-red SaBRe exec probes
         run: |
@@ -844,7 +854,7 @@ jobs:
             slug=${test_id//\//-}
             out="ignored/e2e/sabre-non-gating/$slug"
             if timeout --foreground --kill-after=5s 75s \
-              ./ci/test_harness.sh run --lane portable --test "$test_id" \
+              target/debug/test-harness run --lane portable --test "$test_id" \
                 --mode verify --backend sabre --probe-disabled \
                 --results "$out/results.jsonl" --junit "$out/junit.xml"; then
               echo "::notice::SaBRe diagnostic unexpectedly passed: $test_id"

@@ -122,11 +122,11 @@ git grep -l "$(./ci/run-reverie-pin-check.sh --print-pin)" -- \
 On 2026-08-08 at Reverie `fb963d90` that
 returned three files holding 16 full-length occurrences:
 `ci/run-with-reverie-dbt-budget.sh` (1), `ci/configure-build-jobs.sh` (2), and
-`ci/test_harness.sh` (13). Treat the count as evidence the scope was exercised,
-not as a fixed expectation. Note that `ci/configure-build-jobs.sh` also mentions
-earlier revisions in short form inside its `CARRY TO` prose; the audit in
-`ci/test_harness.sh` counts full-length occurrences only, so keep prose in short
-form or the count breaks.
+the former `ci/test_harness.sh` (13). The Rust runner does not embed those pin
+copies, so this is historical scope evidence rather than a current expected
+count. Note that `ci/configure-build-jobs.sh` also mentions earlier revisions
+in short form inside its `CARRY TO` prose; inspect full-length occurrences when
+advancing the pin so historical prose is not mistaken for an active consumer.
 
 ## How to advance the pin
 
@@ -185,7 +185,7 @@ rediscovered this on 2026-08-08. After running it, carry the CI sites too:
 
    ```bash
    ./ci/run-reverie-pin-check.sh          # expect rc=0 and an ancestry/monotonicity verdict
-   ./ci/test_harness.sh audit-ci          # expect the budget-site counts to hold
+   ./scripts/validate.rs --self-test       # expect the Rust plan/pin-authority brackets to pass
    ```
 
 Steps 2 and 3 are mechanical and should move into `--update-to-latest`; step 1

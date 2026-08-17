@@ -243,7 +243,7 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
 pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     let proxy = if with_proxy { "with-proxy " } else { "" };
     // The Reverie-pin launcher is bound to THIS repository explicitly, never left
-    // to whatever directory the node happens to start in. `ci/test_harness.sh`'s
+    // to whatever directory the node happens to start in. `target/debug/test-harness`'s
     // `assert_reverie_pin_enforcement` audits that binding, because "it will be
     // the right repo because cwd is right" is an inference, not an observation —
     // and the archival pin is not a testing exemption.
@@ -280,7 +280,7 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
-            "./ci/test_harness.sh validate".to_string(),
+            "target/debug/test-harness validate".to_string(),
             vec!["pre.reverie_pin".to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
@@ -291,7 +291,7 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
 
 /// THE one place a CI lane's file is resolved.
 ///
-/// `ci/test_harness.sh` audits that this expression appears EXACTLY ONCE in this
+/// `target/debug/test-harness` audits that this expression appears EXACTLY ONCE in this
 /// file, so that a lane's node set can never be resolved from two places that
 /// could drift. Both `lane_nodes` (steps) and `lane_config` (top-level config)
 /// go through here; adding a second construction of the path is what the audit

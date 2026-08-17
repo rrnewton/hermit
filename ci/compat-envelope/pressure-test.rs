@@ -15,6 +15,9 @@ mod rust_script_prelude;
 #[path = "../../scripts/lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
 
+#[path = "../manifest-plan/src/canonical_verdict.rs"]
+mod canonical_verdict;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
@@ -46,9 +49,12 @@ use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
-const TRACKED_CELLS_SCHEMA: u64 = 3;
+const TRACKED_CELLS_SCHEMA: u64 = 4;
 const RUN_SCHEMA: u64 = 3;
-const REQUIRED_BUILD_TAGS: [&str; 4] = [
+const CELL_RESULT_SCHEMA: u64 = 4;
+const SUMMARY_SCHEMA: u64 = 4;
+const REQUIRED_BUILD_TAGS: [&str; 5] = [
+    "setup.manifest_plan",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -69,8 +75,30 @@ const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
 /// hours is an operational stop for the periodic experiment, not a pass
 /// threshold: breach makes the run incomplete and publishes no promotion.
 const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
-const PRESSURE_JOBS: i64 = 4;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
+
+/// Match validate's measured host-adaptive outer scheduling policy.
+///
+/// Pressure previously used a literal width of four with no host or workload
+/// evidence. That made the same cell population run under an arbitrary outer
+/// contention policy merely because it was selected as red rather than green.
+/// Population selection may differ; execution scheduling should not.
+fn default_jobs() -> i64 {
+    if let Ok(value) = env::var("CI_DAG_JOBS") {
+        if let Ok(jobs) = value.parse::<i64>() {
+            if jobs > 0 {
+                return jobs;
+            }
+        }
+        eprintln!(
+            "pressure-test: CI_DAG_JOBS={value:?} is not a positive integer; using the host-adaptive default"
+        );
+    }
+    let host = std::thread::available_parallelism()
+        .map(|count| count.get() as i64)
+        .unwrap_or(1);
+    (host / 8).clamp(2, 16)
+}
 
 fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
@@ -292,7 +320,7 @@ impl CellSelection {
     }
 
     fn scheduler_jobs(&self) -> i64 {
-        self.jobs.unwrap_or(PRESSURE_JOBS)
+        self.jobs.unwrap_or_else(default_jobs)
     }
 
     fn allows_dirty_source(&self) -> bool {
@@ -747,10 +775,30 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
+    attempts: Vec<JsonValue>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
     error_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct InvocationAttempt {
+    index: String,
+    outcome: String,
+    status: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -801,7 +849,7 @@ struct RunMetadata {
 }
 
 fn default_pressure_jobs() -> i64 {
-    PRESSURE_JOBS
+    default_jobs()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1944,10 +1992,10 @@ fn required_build_tags(
     // native command needs no Hermit build.
     if let Some((mode, backend)) = exact_cell {
         if mode == "naked" && backend == "native" {
-            return BTreeSet::new();
+            return BTreeSet::from(["setup.manifest_plan"]);
         }
         if backend != "liteinst" {
-            return BTreeSet::from(["build.runtime_release"]);
+            return BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
         }
     }
     REQUIRED_BUILD_TAGS
@@ -1981,7 +2029,7 @@ fn selected_cell_dependencies(
     preparation_tag: Option<&str>,
 ) -> Vec<String> {
     if exact_cell {
-        let mut deps = Vec::new();
+        let mut deps = vec!["setup.manifest_plan".into()];
         if shared_preparation {
             deps.push(
                 preparation_tag
@@ -1999,6 +2047,7 @@ fn selected_cell_dependencies(
         return deps;
     }
     let mut deps = vec![
+        "setup.manifest_plan".into(),
         preparation_tag
             .expect("batch cell has a preparation tag")
             .into(),
@@ -2188,7 +2237,7 @@ fn write_plan_after_scorecard_check(
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
-             ./ci/test_harness.sh build --include-manual --include-occasional \
+             target/debug/test-harness build --include-manual --include-occasional \
              --test {test} --mode {mode}{backend} || status=$?; \
              printf '%s\\n' \"$status\" > {status}; exit 0",
             status_dir = shell_quote(&status_path.parent().unwrap().to_string_lossy()),
@@ -2204,7 +2253,7 @@ fn write_plan_after_scorecard_check(
         let preparation_deps = if selection.is_exact() {
             selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
         } else {
-            vec!["build.e2e_artifact".into()]
+            vec!["setup.manifest_plan".into(), "build.e2e_artifact".into()]
         };
         steps.push(Step {
             group: "prepare".into(),
@@ -2281,7 +2330,7 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run {selector} --include-occasional{prebuilt} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
                     prebuilt = prebuilt,
                     test = shell_quote(&cell.test),
@@ -2292,7 +2341,7 @@ fn write_plan_after_scorecard_check(
                 )
             } else {
                 format!(
-                    "./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
                     selector = selector,
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
@@ -2937,7 +2986,7 @@ fn result_row_matches_cell(
             None
         }
     });
-    let identity_matches = row.schema == 3
+    let identity_matches = row.schema == CELL_RESULT_SCHEMA
         && row.run_id == slug
         && row.hermit_sha == metadata.hermit_sha
         && row.source_tree_dirty == metadata.source_tree_dirty
@@ -2957,7 +3006,50 @@ fn result_row_matches_cell(
         "FAIL" | "ERROR" => harness_status.is_some_and(|status| status != 0),
         _ => false,
     };
-    identity_matches && exit_matches
+    let invocation_is_bound = !row.argv.is_empty()
+        && !row.guest_argv.is_empty()
+        && !row.env.is_empty()
+        && !row.cwd.is_empty()
+        && !row.shell_command.is_empty()
+        && row.shell_command == literal_shell_command(&row.cwd, &row.env, &row.argv)
+        && !row.attempts.is_empty()
+        && invocation_attempts(row).is_ok()
+        && row.attempts.first().is_some_and(|attempt| {
+            attempt.get("argv") == Some(&serde_json::to_value(&row.argv).unwrap())
+                && attempt.get("guest_argv")
+                    == Some(&serde_json::to_value(&row.guest_argv).unwrap())
+                && attempt.get("env") == Some(&serde_json::to_value(&row.env).unwrap())
+                && attempt.get("cwd") == Some(&JsonValue::String(row.cwd.clone()))
+                && attempt.get("shell_command")
+                    == Some(&JsonValue::String(row.shell_command.clone()))
+        });
+    identity_matches && exit_matches && invocation_is_bound
+}
+
+fn invocation_attempts(row: &ResultRow) -> Result<Vec<InvocationAttempt>, String> {
+    let attempts = row
+        .attempts
+        .iter()
+        .cloned()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<InvocationAttempt>, _>>()
+        .map_err(|error| format!("result row has an invalid attempt invocation: {error}"))?;
+    if attempts.is_empty()
+        || attempts.iter().any(|attempt| {
+            attempt.index.trim().is_empty()
+                || attempt.outcome.trim().is_empty()
+                || attempt.argv.is_empty()
+                || attempt.guest_argv.is_empty()
+                || attempt.env.is_empty()
+                || attempt.cwd.trim().is_empty()
+                || attempt.shell_command.trim().is_empty()
+                || attempt.shell_command
+                    != literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv)
+        })
+    {
+        return Err("result row has an incomplete attempt invocation".into());
+    }
+    Ok(attempts)
 }
 
 fn classify_result(
@@ -3213,6 +3305,8 @@ fn read_verification_report(
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
     let evidence: VerificationEvidence = serde_json::from_value(report.clone())
         .map_err(|e| format!("incomplete verification report {}: {e}", path.display()))?;
+    let canonical = canonical_verdict::VerificationReport::from_json_value(report.clone())
+        .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
     match (evidence.verdict.as_str(), evidence.verified) {
         ("matched", true) | ("diverged" | "no_result", false) => {}
         (verdict, verified) => {
@@ -3249,6 +3343,20 @@ fn read_verification_report(
             "verification report {} claims bitwise parity without a match",
             path.display()
         ));
+    }
+    canonical.require_canonical_comparison().map_err(|error| {
+        format!(
+            "verification report {} cannot support a product verdict: {error}",
+            path.display()
+        )
+    })?;
+    if evidence.verdict == "matched" {
+        canonical.require_canonical_match().map_err(|error| {
+            format!(
+                "verification report {} cannot support a green result: {error}",
+                path.display()
+            )
+        })?;
     }
     if evidence.verdict != "diverged"
         && (evidence.first_divergent_scheduler_turn.0.is_some()
@@ -3371,7 +3479,7 @@ fn summarize(
             let proven_oom = is_proven_oom_attempt(runner, harness_status);
             let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
             let result_file = cell_dir.join("results.jsonl");
-            let (outcome, row_valid, reason, error_kind) = if result_file.is_file() {
+            let (outcome, row_valid, reason, error_kind, invocation) = if result_file.is_file() {
                 match fs::read_to_string(&result_file) {
                     Ok(text) => {
                         let lines: Vec<_> = text
@@ -3384,7 +3492,7 @@ fn summarize(
                                 result_file.display(),
                                 lines.len()
                             ));
-                            ("NO_RESULT".to_string(), false, None, None)
+                            ("NO_RESULT".to_string(), false, None, None, None)
                         } else {
                             match serde_json::from_str::<ResultRow>(lines[0]) {
                                 Ok(row) => {
@@ -3399,13 +3507,33 @@ fn summarize(
                                     let runner_completed =
                                         runner_observed_terminal_attempt(runner, harness_status);
                                     if row_matches && (proven_oom || runner_completed) {
-                                        (row.outcome, true, row.reason, row.error_kind)
+                                        match invocation_attempts(&row) {
+                                            Ok(attempts) => {
+                                                let invocation = json!({
+                                                    "run_id": row.run_id,
+                                                    "argv": row.argv,
+                                                    "guest_argv": row.guest_argv,
+                                                    "env": row.env,
+                                                    "cwd": row.cwd,
+                                                    "shell_command": row.shell_command,
+                                                    "attempts": attempts,
+                                                });
+                                                (row.outcome, true, row.reason, row.error_kind, Some(invocation))
+                                            }
+                                            Err(error) => {
+                                                evidence_errors.push(format!(
+                                                    "{} does not carry complete literal attempt invocations: {error}",
+                                                    result_file.display()
+                                                ));
+                                                ("NO_RESULT".to_string(), false, None, None, None)
+                                            }
+                                        }
                                     } else {
                                         evidence_errors.push(format!(
                                         "{} does not match the selected cell, harness exit, or retained runner result",
                                         result_file.display()
                                     ));
-                                        ("NO_RESULT".to_string(), false, None, None)
+                                        ("NO_RESULT".to_string(), false, None, None, None)
                                     }
                                 }
                                 Err(error) => {
@@ -3413,7 +3541,7 @@ fn summarize(
                                         "invalid result row {}: {error}",
                                         result_file.display()
                                     ));
-                                    ("NO_RESULT".to_string(), false, None, None)
+                                    ("NO_RESULT".to_string(), false, None, None, None)
                                 }
                             }
                         }
@@ -3423,14 +3551,14 @@ fn summarize(
                             "cannot read result row {}: {error}",
                             result_file.display()
                         ));
-                        ("NO_RESULT".to_string(), false, None, None)
+                        ("NO_RESULT".to_string(), false, None, None, None)
                     }
                 }
             } else if !proven_oom && !proven_timeout {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
-                ("NO_RESULT".to_string(), false, None, None)
+                ("NO_RESULT".to_string(), false, None, None, None)
             } else {
-                ("NO_RESULT".to_string(), false, None, None)
+                ("NO_RESULT".to_string(), false, None, None, None)
             };
             let verification = match read_verification_report(results, cell, &slug) {
                 Ok(Some(report)) => Some(report),
@@ -3489,6 +3617,9 @@ fn summarize(
                 evidence_errors
                     .push("terminal ptrace verify result has no normalized golden INFO log".into());
             }
+            if invocation.is_none() {
+                evidence_errors.push("selected result has no complete recorded invocation".into());
+            }
             let result = classify_result(
                 runner,
                 harness_status,
@@ -3520,6 +3651,7 @@ fn summarize(
                 "outcome": outcome,
                 "reason": reason,
                 "error_kind": error_kind,
+                "invocation": invocation,
                 "result_row_valid": row_valid,
                 "result": result,
                 "verification": verification,
@@ -3663,7 +3795,7 @@ fn summarize(
     };
 
     let summary = json!({
-        "schema": RUN_SCHEMA,
+        "schema": SUMMARY_SCHEMA,
         "hermit_sha": metadata.hermit_sha,
         "detcore_tree": metadata.detcore_tree,
         "source_tree_dirty": metadata.source_tree_dirty,
@@ -3721,6 +3853,37 @@ fn sanitize(value: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn literal_shell_command(
+    cwd: &str,
+    env: &BTreeMap<String, String>,
+    argv: &[String],
+) -> String {
+    let mut words = vec![
+        "cd".into(),
+        recorded_shell_quote(cwd),
+        "&&".into(),
+        "env".into(),
+    ];
+    words.extend(
+        env.iter()
+            .map(|(name, value)| recorded_shell_quote(&format!("{name}={value}"))),
+    );
+    words.extend(argv.iter().map(|arg| recorded_shell_quote(arg)));
+    words.join(" ")
+}
+
+fn recorded_shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.into()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn display_id(cell: &CellId) -> String {
@@ -3790,7 +3953,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     .map_err(|error| format!("cannot parse direct-scheduler fixture: {error}"))?;
 
     let execution = with_execution_root(scratch, || {
-        execute_typed_dag(&dag, PRESSURE_JOBS, None, Instant::now(), 15)
+        execute_typed_dag(&dag, default_jobs(), None, Instant::now(), 15)
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -3988,8 +4151,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     two_repetitions.repetitions = Some(2);
     validate_repetition_selection(&two_repetitions)
         .map_err(|e| format!("two repeated checks were refused: {e}"))?;
-    if CellSelection::default().scheduler_jobs() != PRESSURE_JOBS {
-        return Err("pressure scheduler default is not the documented fixed -j 4".into());
+    if CellSelection::default().scheduler_jobs() != default_jobs() {
+        return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
     }
     let mut jobs_args = vec![
         "--results".to_string(),
@@ -4049,12 +4212,13 @@ fn self_test(root: &Path) -> Result<(), String> {
         .into_iter()
         .filter(|tag| *tag != "build.liteinst_runtime_release")
         .collect();
-    let lean_exact = BTreeSet::from(["build.runtime_release"]);
+    let lean_exact = BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
     let exact_runtime_backends_ok = ["ptrace", "kvm", "dbt", "sabre"]
         .into_iter()
         .all(|backend| required_build_tags(Some(("verify", backend)), false) == lean_exact);
     if !exact_runtime_backends_ok
-        || !required_build_tags(Some(("naked", "native")), false).is_empty()
+        || required_build_tags(Some(("naked", "native")), false)
+            != BTreeSet::from(["setup.manifest_plan"])
         || required_build_tags(Some(("verify", "liteinst")), true)
             != BTreeSet::from(REQUIRED_BUILD_TAGS)
         || required_build_tags(None, false) != batch_without_liteinst
@@ -4075,14 +4239,16 @@ fn self_test(root: &Path) -> Result<(), String> {
         || !liteinst_batch.contains(&"build.liteinst_runtime_release".to_string())
         || exact_repeated
             != [
+                "setup.manifest_plan".to_string(),
                 "prepare.fixture".to_string(),
                 "build.runtime_release".to_string(),
             ]
-        || !selected_cell_dependencies(true, false, "naked", "native", None).is_empty()
+        || selected_cell_dependencies(true, false, "naked", "native", None)
+            != ["setup.manifest_plan".to_string()]
         || selected_cell_dependencies(true, false, "verify", "ptrace", None)
-            != ["build.runtime_release".to_string()]
+            != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
         || selected_cell_dependencies(true, false, "verify", "liteinst", None)
-            != ["build.liteinst_runtime_release".to_string()]
+            != ["setup.manifest_plan".to_string(), "build.liteinst_runtime_release".to_string()]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
@@ -4150,7 +4316,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let exact_cell_command = "printf '125\\n' > harness-status; status=0; \
-        env HERMIT_BIN=\"$PWD/target/release/hermit\" ./ci/test_harness.sh run \
+        env HERMIT_BIN=\"$PWD/target/release/hermit\" target/debug/test-harness run \
         --include-manual --test fixture --mode verify \
         --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; \
         if test -e results.in-progress.jsonl; then \
@@ -4232,7 +4398,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     prepared_fixture.steps[0].cmd = "printf '125\\n' > '/results/cells/fixture/harness-status'; \
          if ! test \"$(cat '/results/prepare/fixture/status' 2>/dev/null)\" = 0; then \
          printf '126\\n' > '/results/cells/fixture/harness-status'; exit 0; fi; \
-         status=0; env ./ci/test_harness.sh run --include-manual --prebuilt \
+         status=0; env target/debug/test-harness run --include-manual --prebuilt \
          --test fixture --mode verify --results results.in-progress.jsonl \
          --junit junit.in-progress.xml || status=$?; \
          mv -- results.in-progress.jsonl results.jsonl || status=$?; \
@@ -4731,7 +4897,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         .filter(|step| step.tag() == "build.runtime_release")
         .collect();
     let recursive_metadata_tags = [
-        "setup.manifest_plan",
         "e2e.metadata",
         "build.workspace",
         "build.e2e_artifact",
@@ -4764,12 +4929,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let preparation_tag = preparation_steps[0].tag();
-    if preparation_steps[0].deps != ["build.runtime_release".to_string()] {
+    if preparation_steps[0].deps
+        != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+    {
         return Err("repeated exact preparation does not depend on its direct Hermit build".into());
     }
     let repeated_tags: BTreeSet<_> = repeated_cell_steps.iter().map(|step| step.tag()).collect();
     for step in &repeated_cell_steps {
         if !step.deps.contains(&preparation_tag)
+            || !step.deps.contains(&"setup.manifest_plan".to_string())
             || !step.deps.contains(&"build.runtime_release".to_string())
             || step.deps.iter().any(|dep| repeated_tags.contains(dep))
             || !step.cmd.contains("--prebuilt")
@@ -4878,6 +5046,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let repeated_build_results = scratch.join("repeated-build-markers");
+    let setup_marker = build_marker(&repeated_build_results, "setup.manifest_plan");
     let runtime_marker = build_marker(&repeated_build_results, "build.runtime_release");
     fs::create_dir_all(runtime_marker.parent().expect("build marker has parent"))
         .map_err(|e| format!("cannot create repeated build-marker fixture: {e}"))?;
@@ -4886,6 +5055,11 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::write(&runtime_marker, "ok\n")
         .map_err(|e| format!("cannot write repeated runtime marker: {e}"))?;
+    if required_builds_complete(&repeated_build_results, &repeated_metadata) {
+        return Err("repeated exact ptrace setup accepted a missing Rust runner build".into());
+    }
+    fs::write(&setup_marker, "ok\n")
+        .map_err(|e| format!("cannot write repeated runner marker: {e}"))?;
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
@@ -5004,14 +5178,14 @@ fn self_test(root: &Path) -> Result<(), String> {
     let actual_green_build_tags: BTreeSet<String> = green_batch_dag
         .steps
         .iter()
-        .filter(|step| step.group == "build")
+        .filter(|step| matches!(step.group.as_str(), "build" | "setup"))
         .map(|step| step.tag())
         .collect();
     if actual_green_build_tags != expected_green_build_tags
         || green_batch_dag
             .steps
             .iter()
-            .any(|step| matches!(step.tag().as_str(), "setup.manifest_plan" | "e2e.metadata"))
+            .any(|step| step.tag() == "e2e.metadata")
     {
         return Err(format!(
             "green batch build set changed or reintroduced the recursive metadata audit: expected={expected_green_build_tags:?} actual={actual_green_build_tags:?}"
@@ -5065,13 +5239,17 @@ fn self_test(root: &Path) -> Result<(), String> {
             .steps
             .iter()
             .filter(|step| step.group == "prepare")
-            .any(|step| step.deps != ["build.e2e_artifact".to_string()])
+            .any(|step| {
+                step.deps
+                    != ["setup.manifest_plan".to_string(), "build.e2e_artifact".to_string()]
+            })
         || green_batch_dag
             .steps
             .iter()
             .filter(|step| step.group == "cell")
             .any(|step| {
                 !step.deps.contains(&"build.e2e_artifact".to_string())
+                    || !step.deps.contains(&"setup.manifest_plan".to_string())
                     || !step.cmd.contains(
                         "./ci/run-with-hermit-e2e-artifact.sh --require-install",
                     )
@@ -5548,12 +5726,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         unavailable_cells: 0,
         repetitions: None,
         green: false,
-        jobs: PRESSURE_JOBS,
+        jobs: default_jobs(),
         eligible_cells: 1,
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
-        schema: 3,
+        schema: CELL_RESULT_SCHEMA,
         run_id: sample_slug.clone(),
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
@@ -5564,6 +5742,23 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(sample_a.backend.clone()),
         classification: "required".into(),
         outcome: "FAIL".into(),
+        argv: vec!["hermit".into(), "run".into()],
+        guest_argv: vec!["fixture".into()],
+        env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+        cwd: "/repo".into(),
+        shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+        attempts: vec![json!({
+            "index":"1",
+            "outcome":"FAIL",
+            "status":1,
+            "signal":null,
+            "timed_out":false,
+            "argv":["hermit","run"],
+            "guest_argv":["fixture"],
+            "env":{"LC_ALL":"C"},
+            "cwd":"/repo",
+            "shell_command":"cd /repo && env LC_ALL=C hermit run"
+        })],
         reason: None,
         error_kind: None,
     };
@@ -5577,6 +5772,33 @@ fn self_test(root: &Path) -> Result<(), String> {
     ) {
         return Err("matching retained result-row identity was refused".into());
     }
+    result_row.attempts[0]["argv"] = json!(["hermit", "run", "--hidden-policy"]);
+    if result_row_matches_cell(
+        &result_row,
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        Some(INCOMPLETE_ATTEMPT_STATUS),
+    ) {
+        return Err("a result row whose published argv differs from execution was accepted".into());
+    }
+    result_row.attempts[0]["argv"] = json!(["hermit", "run"]);
+    result_row.shell_command = "true".into();
+    result_row.attempts[0]["shell_command"] = json!("true");
+    if result_row_matches_cell(
+        &result_row,
+        &sample_slug,
+        &sample_metadata,
+        &sample_a,
+        true,
+        Some(INCOMPLETE_ATTEMPT_STATUS),
+    ) {
+        return Err("a result row whose shell command does not encode argv/env was accepted".into());
+    }
+    result_row.shell_command = "cd /repo && env LC_ALL=C hermit run".into();
+    result_row.attempts[0]["shell_command"] =
+        json!("cd /repo && env LC_ALL=C hermit run");
     result_row.hermit_sha = "foreign".into();
     if result_row_matches_cell(
         &result_row,
@@ -5591,7 +5813,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
     let repeated_result_row = ResultRow {
-        schema: 3,
+        schema: CELL_RESULT_SCHEMA,
         run_id: first_repetition_slug.clone(),
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
@@ -5602,6 +5824,23 @@ fn self_test(root: &Path) -> Result<(), String> {
         backend: Some(green_id.backend.clone()),
         classification: "required".into(),
         outcome: "PASS".into(),
+        argv: vec!["hermit".into(), "run".into()],
+        guest_argv: vec!["fixture".into()],
+        env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+        cwd: "/repo".into(),
+        shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+        attempts: vec![json!({
+            "index":"1",
+            "outcome":"PASS",
+            "status":0,
+            "signal":null,
+            "timed_out":false,
+            "argv":["hermit","run"],
+            "guest_argv":["fixture"],
+            "env":{"LC_ALL":"C"},
+            "cwd":"/repo",
+            "shell_command":"cd /repo && env LC_ALL=C hermit run"
+        })],
         reason: None,
         error_kind: None,
     };

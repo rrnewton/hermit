@@ -20,7 +20,9 @@ use std::process::exit;
 
 use serde_json::Value as JsonValue;
 use serde_json::json;
-use toml::Value;
+
+mod manifest_value;
+use manifest_value::Value;
 
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
@@ -92,13 +94,13 @@ fn main() {
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.extension()
-                .is_some_and(|extension| extension == "toml")
+                .is_some_and(|extension| extension == "yaml")
         })
         .collect();
     manifests.sort();
     if manifests.is_empty() {
         die(format!(
-            "no *.toml manifests found in {}",
+            "no *.yaml manifests found in {}",
             script_dir.display()
         ));
     }
@@ -113,7 +115,7 @@ fn main() {
             .unwrap_or_else(|error| die(format!("cannot read {}: {error}", path.display())));
         let document: Value = text
             .parse()
-            .unwrap_or_else(|error| die(format!("{}: invalid TOML: {error}", path.display())));
+            .unwrap_or_else(|error| die(format!("{}: invalid YAML: {error}", path.display())));
         let location = path.file_name().unwrap().to_string_lossy().to_string();
         ensure_keys(&document, &["schema", "bucket", "test"], &location);
 
@@ -333,7 +335,7 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
     let stale: Vec<_> = baseline.difference(actual).cloned().collect();
     if !unexpected.is_empty() || !stale.is_empty() {
         die(format!(
-            "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 TOML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+            "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 YAML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
         ));
     }
 }
@@ -695,6 +697,28 @@ fn validate_mode(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
     );
+    match (ci, enabled.is_empty(), spec.get("ci_disabled_reason")) {
+        (true, _, Some(_)) => die(format!(
+            "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
+        )),
+        (false, false, Some(reason))
+            if reason
+                .as_str()
+                .is_some_and(|reason| !reason.trim().is_empty()) => {}
+        (false, false, _) => die(format!(
+            "{id}: modes.{mode} enables backend cells while ci=false and must state why in a non-empty ci_disabled_reason"
+        )),
+        (false, true, Some(reason))
+            if reason
+                .as_str()
+                .is_none_or(|reason| reason.trim().is_empty()) =>
+        {
+            die(format!(
+                "{id}: modes.{mode}.ci_disabled_reason must be a non-empty string"
+            ))
+        }
+        _ => {}
+    }
     let disabled = spec
         .get("backends_disabled")
         .and_then(Value::as_table)
@@ -940,7 +964,7 @@ fn validate_mode(
 }
 
 fn optional_positive_integer(
-    table: &toml::map::Map<String, Value>,
+    table: &std::collections::BTreeMap<String, Value>,
     key: &str,
     context: &str,
 ) -> Option<i64> {
@@ -1026,7 +1050,10 @@ mod tests {
     use super::*;
 
     fn parse_mode(text: &str) -> Value {
-        text.parse::<Value>().expect("test mode must be valid TOML")
+        manifest_value::from_toml(
+            text.parse::<toml::Value>()
+                .expect("test mode must be valid TOML"),
+        )
     }
 
     #[test]
@@ -1055,6 +1082,7 @@ mod tests {
         let spec = parse_mode(
             r#"
 ci = false
+ci_disabled_reason = "not selected"
 backends_enabled = ["ptrace"]
 
 [backends_disabled]
@@ -1196,7 +1224,7 @@ liteinst = "unsupported"
                 {
                     "path": "tests/c/shared.c",
                     "disposition": "manifest-test",
-                    "runner": "ci/test_harness.sh"
+                    "runner": "target/debug/test-harness"
                 },
                 {
                     "path": "tests/c/cargo_fixture.c",
@@ -1235,7 +1263,8 @@ backends_enabled = []
 [test.modes.custom]
 backends_enabled = []
 "#
-        .parse::<Value>()
+        .parse::<toml::Value>()
+        .map(manifest_value::from_toml)
         .expect("test manifest must be valid TOML");
         assert_eq!(
             asymmetric_manifest_tests(&[document]),
@@ -1264,7 +1293,8 @@ backends_enabled = []
 [test.modes.custom]
 backends_enabled = []
 "#
-        .parse::<Value>()
+        .parse::<toml::Value>()
+        .map(manifest_value::from_toml)
         .expect("test manifest must be valid TOML");
         assert!(asymmetric_manifest_tests(&[document]).is_empty());
     }
@@ -1285,8 +1315,62 @@ backends_enabled = []
         let spec = parse_mode(
             r#"
 ci = false
+ci_disabled_reason = "not selected"
 backends_enabled = ["ptrace"]
 guest_args = { kvm = ["--kvm"] }
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    fn rejects_enabled_cell_silently_disabled_from_ci() {
+        let spec = parse_mode(
+            r#"
+ci = false
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is CI-enabled, so it must not carry ci_disabled_reason")]
+    fn rejects_stale_ci_disabled_reason_on_selected_cell() {
+        let spec = parse_mode(
+            r#"
+ci = true
+ci_disabled_reason = "stale"
+backends_enabled = ["ptrace"]
 
 [backends_disabled]
 dbt = "unsupported"

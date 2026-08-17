@@ -33,11 +33,15 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! toml = "0.8"
+//! serde = { version = "1", features = ["derive"] }
+//! serde_yaml = "0.9"
 //! ```
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+#[path = "../ci/manifest-plan/src/manifest_value.rs"]
+mod manifest_value;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -46,7 +50,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
-use toml::Value;
+use manifest_value::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -248,15 +252,8 @@ fn hermit_command(
     extra: &[String],
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile: Vec<String> = if portable {
-        vec![
-            "--no-virtualize-cpuid".to_owned(),
-            "--max-timeslice=disabled".to_owned(),
-        ]
-    } else {
-        Vec::new()
-    };
+    let _lane = lane;
+    let profile: Vec<String> = Vec::new();
     let be = shell_quote(backend);
     let run_extra_joined = {
         let mut all: Vec<String> = profile;
@@ -282,13 +279,9 @@ fn hermit_command(
     };
     let command = match mode {
         "verify" => {
-            let strict = if verify_bitwise_parity {
-                " --verify-strict"
-            } else {
-                ""
-            };
+            let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict} --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
             )
         }
         "replay" => format!(
@@ -336,7 +329,7 @@ fn load_manifests(root: &Path) -> Manifests {
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", dir.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -350,7 +343,7 @@ fn load_manifests(root: &Path) -> Manifests {
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
             .parse()
-            .unwrap_or_else(|e| fail(format!("{}: invalid TOML: {e}", path.display())));
+            .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
         if schema != Some(MANIFEST_SCHEMA) {
             fail(format!(
@@ -380,7 +373,10 @@ fn load_manifests(root: &Path) -> Manifests {
     Manifests { tests }
 }
 
-fn modes_table<'a>(test: &'a Value, id: &str) -> &'a toml::map::Map<String, Value> {
+fn modes_table<'a>(
+    test: &'a Value,
+    id: &str,
+) -> &'a std::collections::BTreeMap<String, Value> {
     test.get("modes")
         .and_then(Value::as_table)
         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")))
@@ -718,8 +714,9 @@ fn self_test() -> ExitCode {
     assert!(chaos.contains("--verify --verify-allow=both"));
     assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
     assert!(chaos.contains("--log=info"));
-    assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
-    let seeded_chaos: Value = "seeds = [7, 9]".parse().unwrap();
+    assert!(!chaos.contains("--no-virtualize-cpuid"));
+    assert!(!chaos.contains("--max-timeslice=disabled"));
+    let seeded_chaos: Value = "seeds: [7, 9]".parse().unwrap();
     let no_seed_chaos = Value::Table(Default::default());
     assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
     assert!(
@@ -756,7 +753,11 @@ fn self_test() -> ExitCode {
         &[],
         "guest",
     );
-    assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+    assert!(verify.contains("run --base-env=minimal"));
+    assert!(verify.contains("--strict --verify --verify-json \"$cell/captures/verify.json\""));
+    assert!(!verify.contains("--verify-strict"));
+    assert!(!verify.contains("--no-virtualize-cpuid"));
+    assert!(!verify.contains("--max-timeslice=disabled"));
     let weak_verify = hermit_command(
         "verify",
         "ptrace",

@@ -7,10 +7,14 @@
 //! [dependencies]
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+#[path = "../manifest-plan/src/canonical_verdict.rs"]
+mod canonical_verdict;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -24,11 +28,16 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 3;
+const SCHEMA: u64 = 4;
+const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
+const CELL_RESULT_SCHEMA: u64 = 4;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
@@ -113,8 +122,36 @@ struct Observation {
     detcore_tree: String,
     hermit_shas: BTreeSet<String>,
     results: BTreeSet<ObservedResult>,
+    invocations: BTreeSet<ObservedInvocation>,
     first_divergent_scheduler_turn: Option<ObservedRange>,
     first_divergent_virtual_nanoseconds: Option<ObservedRange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ObservedInvocation {
+    hermit_sha: String,
+    run_id: String,
+    result: ObservedResult,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
+    attempts: Vec<ObservedAttemptInvocation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ObservedAttemptInvocation {
+    index: String,
+    outcome: String,
+    status: Option<i32>,
+    signal: Option<i32>,
+    timed_out: bool,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
 }
 
 #[derive(
@@ -188,6 +225,18 @@ struct PressureSummaryRow {
     verification: Option<PressureVerification>,
     #[serde(default)]
     evidence_errors: Vec<String>,
+    invocation: Option<PressureInvocation>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PressureInvocation {
+    run_id: String,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
+    attempts: Vec<ObservedAttemptInvocation>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -201,6 +250,7 @@ struct PressureVerification {
 #[derive(Clone, Debug, Deserialize)]
 struct ResultRow {
     schema: u64,
+    run_id: String,
     hermit_sha: String,
     source_tree_dirty: bool,
     test: String,
@@ -210,6 +260,12 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
+    argv: Vec<String>,
+    guest_argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: String,
+    shell_command: String,
+    attempts: Vec<JsonValue>,
 }
 
 impl ResultRow {
@@ -226,6 +282,79 @@ impl ResultRow {
             mode: self.mode.clone(),
             backend,
         })
+    }
+
+    fn require_literal_invocation(&self) -> Result<(), String> {
+        if self.run_id.trim().is_empty()
+            || self.argv.is_empty()
+            || self.guest_argv.is_empty()
+            || self.env.is_empty()
+            || self.cwd.trim().is_empty()
+            || self.shell_command.trim().is_empty()
+            || self.shell_command != literal_shell_command(&self.cwd, &self.env, &self.argv)
+            || self.attempts.is_empty()
+            || self.attempts.iter().any(|attempt| {
+                attempt
+                    .get("argv")
+                    .and_then(JsonValue::as_array)
+                    .is_none_or(Vec::is_empty)
+                    || attempt
+                        .get("guest_argv")
+                        .and_then(JsonValue::as_array)
+                        .is_none_or(Vec::is_empty)
+                    || attempt.get("env").and_then(JsonValue::as_object).is_none()
+                    || attempt
+                        .get("cwd")
+                        .and_then(JsonValue::as_str)
+                        .is_none_or(str::is_empty)
+                    || attempt_shell_command_is_invalid(attempt)
+            })
+            || self.attempts.first().and_then(|attempt| attempt.get("argv"))
+                != Some(&serde_json::to_value(&self.argv).unwrap())
+            || self
+                .attempts
+                .first()
+                .and_then(|attempt| attempt.get("guest_argv"))
+                != Some(&serde_json::to_value(&self.guest_argv).unwrap())
+            || self.attempts.first().and_then(|attempt| attempt.get("env"))
+                != Some(&serde_json::to_value(&self.env).unwrap())
+            || self.attempts.first().and_then(|attempt| attempt.get("cwd"))
+                != Some(&JsonValue::String(self.cwd.clone()))
+            || self
+                .attempts
+                .first()
+                .and_then(|attempt| attempt.get("shell_command"))
+                != Some(&JsonValue::String(self.shell_command.clone()))
+        {
+            return Err("does not bind its PASS/FAIL claim to a literal invocation".into());
+        }
+        Ok(())
+    }
+
+    fn require_canonical_pass_evidence(&self) -> Result<(), String> {
+        if self.outcome != "PASS" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
+            return Ok(());
+        }
+        for (index, attempt) in self.attempts.iter().enumerate() {
+            let report = attempt
+                .get("verification_report")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("attempt {} has no embedded verification report", index + 1))?;
+            let recorded_sha = attempt
+                .get("verification_report_sha256")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| format!("attempt {} has no verification-report identity", index + 1))?;
+            let actual_sha = format!("{:x}", Sha256::digest(report.as_bytes()));
+            if recorded_sha != actual_sha {
+                return Err(format!("attempt {} verification-report identity does not match its embedded report", index + 1));
+            }
+            let report: canonical_verdict::VerificationReport = serde_json::from_str(report)
+                .map_err(|error| format!("attempt {} has an incomplete verification report: {error}", index + 1))?;
+            report.require_canonical_match().map_err(|error| {
+                format!("attempt {} cannot support a green result: {error}", index + 1)
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -819,7 +948,7 @@ fn apply_pressure_summary(
     head: &str,
     detcore_tree: &str,
 ) -> Result<usize, String> {
-    if summary.schema != 3 {
+    if summary.schema != PRESSURE_SUMMARY_SCHEMA {
         return Err(format!(
             "unsupported pressure summary schema {}",
             summary.schema
@@ -880,6 +1009,45 @@ fn apply_pressure_summary(
             ));
         }
         let result = ObservedResult::parse(&row.result)?;
+        let invocation = row.invocation.clone().ok_or_else(|| {
+            format!(
+                "pressure summary contains no invocation for {}",
+                display_id(&row.cell)
+            )
+        })?;
+        if invocation.run_id.trim().is_empty()
+            || invocation.argv.is_empty()
+            || invocation.guest_argv.is_empty()
+            || invocation.env.is_empty()
+            || invocation.cwd.trim().is_empty()
+            || invocation.shell_command.trim().is_empty()
+            || invocation.shell_command
+                != literal_shell_command(&invocation.cwd, &invocation.env, &invocation.argv)
+            || invocation.attempts.is_empty()
+            || invocation.attempts.iter().any(|attempt| {
+                attempt.index.trim().is_empty()
+                    || attempt.outcome.trim().is_empty()
+                    || attempt.argv.is_empty()
+                    || attempt.guest_argv.is_empty()
+                    || attempt.env.is_empty()
+                    || attempt.cwd.trim().is_empty()
+                    || attempt.shell_command.trim().is_empty()
+                    || attempt.shell_command
+                        != literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv)
+            })
+            || invocation.attempts.first().is_some_and(|attempt| {
+                attempt.argv != invocation.argv
+                    || attempt.guest_argv != invocation.guest_argv
+                    || attempt.env != invocation.env
+                    || attempt.cwd != invocation.cwd
+                    || attempt.shell_command != invocation.shell_command
+            })
+        {
+            return Err(format!(
+                "pressure summary contains an incomplete invocation for {}",
+                display_id(&row.cell)
+            ));
+        }
         let turn = row
             .verification
             .as_ref()
@@ -896,10 +1064,10 @@ fn apply_pressure_summary(
                 display_id(&row.cell)
             ));
         }
-        prepared.push((index, result, turn, virtual_nanoseconds));
+        prepared.push((index, result, turn, virtual_nanoseconds, invocation));
     }
 
-    for (index, result, turn, virtual_nanoseconds) in prepared {
+    for (index, result, turn, virtual_nanoseconds, invocation) in prepared {
         let observations = &mut tracked.cells[index].observations;
         let position = observations
             .iter()
@@ -911,6 +1079,7 @@ fn apply_pressure_summary(
                     detcore_tree: summary.detcore_tree.clone(),
                     hermit_shas: BTreeSet::new(),
                     results: BTreeSet::new(),
+                    invocations: BTreeSet::new(),
                     first_divergent_scheduler_turn: None,
                     first_divergent_virtual_nanoseconds: None,
                 });
@@ -919,6 +1088,17 @@ fn apply_pressure_summary(
         };
         observation.hermit_shas.insert(summary.hermit_sha.clone());
         observation.results.insert(result);
+        observation.invocations.insert(ObservedInvocation {
+            hermit_sha: summary.hermit_sha.clone(),
+            run_id: invocation.run_id,
+            result,
+            argv: invocation.argv,
+            guest_argv: invocation.guest_argv,
+            env: invocation.env,
+            cwd: invocation.cwd,
+            shell_command: invocation.shell_command,
+            attempts: invocation.attempts,
+        });
         merge_range(&mut observation.first_divergent_scheduler_turn, turn);
         merge_range(
             &mut observation.first_divergent_virtual_nanoseconds,
@@ -1050,12 +1230,13 @@ fn read_result_candidates(
             }
             let row: ResultRow = serde_json::from_str(line)
                 .map_err(|e| format!("invalid JSON at {}:{}: {e}", path.display(), index + 1))?;
-            if row.schema != 3 {
+            if row.schema != CELL_RESULT_SCHEMA {
                 return Err(format!(
-                    "{}:{} has result schema {}, expected 3",
+                    "{}:{} has result schema {}, expected {}",
                     path.display(),
                     index + 1,
-                    row.schema
+                    row.schema,
+                    CELL_RESULT_SCHEMA
                 ));
             }
             if row.hermit_sha != head || row.source_tree_dirty {
@@ -1071,6 +1252,11 @@ fn read_result_candidates(
             if row.classification != "required" {
                 continue;
             }
+            row.require_literal_invocation()
+                .map_err(|error| format!("{}:{} {error}", path.display(), index + 1))?;
+            row.require_canonical_pass_evidence().map_err(|error| {
+                format!("{}:{} {error}", path.display(), index + 1)
+            })?;
             let id = row
                 .id()
                 .ok_or_else(|| format!("{}:{} has no backend", path.display(), index + 1))?;
@@ -1125,6 +1311,20 @@ fn verify_candidate_set(
                 latest.path.display()
             ));
         }
+        latest.row.require_literal_invocation().map_err(|error| {
+            format!(
+                "fresh result for {} in {} {error}",
+                display_id(id),
+                latest.path.display()
+            )
+        })?;
+        latest.row.require_canonical_pass_evidence().map_err(|error| {
+            format!(
+                "fresh result for {} in {} {error}",
+                display_id(id),
+                latest.path.display()
+            )
+        })?;
         if latest.row.outcome != "PASS" {
             failed.push(format!(
                 "{}={} ({})",
@@ -1158,6 +1358,57 @@ fn display_id(id: &CellId) -> String {
     )
 }
 
+fn attempt_shell_command_is_invalid(attempt: &JsonValue) -> bool {
+    let Some(cwd) = attempt.get("cwd").and_then(JsonValue::as_str) else {
+        return true;
+    };
+    let Some(command) = attempt.get("shell_command").and_then(JsonValue::as_str) else {
+        return true;
+    };
+    let Ok(argv) = serde_json::from_value::<Vec<String>>(
+        attempt.get("argv").cloned().unwrap_or(JsonValue::Null),
+    ) else {
+        return true;
+    };
+    let Ok(env) = serde_json::from_value::<BTreeMap<String, String>>(
+        attempt.get("env").cloned().unwrap_or(JsonValue::Null),
+    ) else {
+        return true;
+    };
+    command != literal_shell_command(cwd, &env, &argv)
+}
+
+fn literal_shell_command(
+    cwd: &str,
+    env: &BTreeMap<String, String>,
+    argv: &[String],
+) -> String {
+    let mut words = vec![
+        "cd".into(),
+        recorded_shell_quote(cwd),
+        "&&".into(),
+        "env".into(),
+    ];
+    words.extend(
+        env.iter()
+            .map(|(name, value)| recorded_shell_quote(&format!("{name}={value}"))),
+    );
+    words.extend(argv.iter().map(|arg| recorded_shell_quote(arg)));
+    words.join(" ")
+}
+
+fn recorded_shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        value.into()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
 fn self_test() -> Result<(), String> {
     let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
     let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
@@ -1180,7 +1431,8 @@ fn self_test() -> Result<(), String> {
         modified: SystemTime::UNIX_EPOCH,
         path: PathBuf::from("fixture/results.jsonl"),
         row: ResultRow {
-            schema: 3,
+            schema: CELL_RESULT_SCHEMA,
+            run_id: "fixture-run".into(),
             hermit_sha: "fixture".into(),
             source_tree_dirty: false,
             test: id.test.clone(),
@@ -1190,6 +1442,28 @@ fn self_test() -> Result<(), String> {
             backend: Some(id.backend.clone()),
             classification: "required".into(),
             outcome: outcome.into(),
+            argv: vec!["hermit".into(), "run".into()],
+            guest_argv: vec!["fixture".into()],
+            env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            cwd: "/repo".into(),
+            shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+            attempts: vec![{
+                let report = serde_json::to_string(&canonical_verdict::VerificationReport {
+                    verified: true,
+                    bitwise_parity: true,
+                    verdict: "matched".into(),
+                    comparison: canonical_verdict::ComparisonReport { strictness: "canonical".into(), compare_logs: true },
+                    compared_log_messages: Some(canonical_verdict::ComparedLogMessages { left: 1, right: 1 }),
+                }).unwrap();
+                serde_json::json!({
+                "argv":["hermit","run"],
+                "guest_argv":["fixture"],
+                "env":{"LC_ALL":"C"},
+                "cwd":"/repo",
+                "shell_command":"cd /repo && env LC_ALL=C hermit run",
+                "verification_report": report,
+                "verification_report_sha256": format!("{:x}", Sha256::digest(report.as_bytes()))
+            })}],
         },
     };
     verify_candidate_set(
@@ -1197,6 +1471,17 @@ fn self_test() -> Result<(), String> {
         BTreeMap::from([(id.clone(), vec![candidate("PASS")])]),
     )
     .map_err(|e| format!("positive result bracket failed: {e}"))?;
+    let mut false_command = candidate("PASS");
+    false_command.row.shell_command = "true".into();
+    false_command.row.attempts[0]["shell_command"] = serde_json::json!("true");
+    if verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![false_command])]),
+    )
+    .is_ok()
+    {
+        return Err("result evidence accepted a shell command unrelated to argv/env".into());
+    }
     if verify_candidate_set(&expected, BTreeMap::new()).is_ok() {
         return Err("negative result bracket accepted a missing row".into());
     }
@@ -1207,6 +1492,19 @@ fn self_test() -> Result<(), String> {
     .is_ok()
     {
         return Err("negative result bracket accepted a failing row".into());
+    }
+    let mut weak = candidate("PASS").row;
+    let mut report: JsonValue = serde_json::from_str(
+        weak.attempts[0]["verification_report"].as_str().unwrap(),
+    )
+    .unwrap();
+    report["comparison"]["strictness"] = JsonValue::String("stripped".into());
+    let report = serde_json::to_string(&report).unwrap();
+    weak.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    weak.attempts[0]["verification_report"] = JsonValue::String(report);
+    if weak.require_canonical_pass_evidence().is_ok() {
+        return Err("negative result bracket accepted a stripped PASS receipt".into());
     }
     let chaos_id = CellId {
         mode: "chaos".into(),
@@ -1266,9 +1564,29 @@ fn self_test() -> Result<(), String> {
             first_divergent_virtual_nanoseconds: virtual_nanoseconds,
         }),
         evidence_errors: Vec::new(),
+        invocation: Some(PressureInvocation {
+            run_id: format!("fixture-{result}"),
+            argv: vec!["hermit".into(), "run".into()],
+            guest_argv: vec!["fixture".into()],
+            env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            cwd: "/repo".into(),
+            shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+            attempts: vec![ObservedAttemptInvocation {
+                index: "1".into(),
+                outcome: if result == "pass" { "PASS" } else { "FAIL" }.into(),
+                status: Some(if result == "pass" { 0 } else { 1 }),
+                signal: None,
+                timed_out: result == "timeout",
+                argv: vec!["hermit".into(), "run".into()],
+                guest_argv: vec!["fixture".into()],
+                env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+                cwd: "/repo".into(),
+                shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+            }],
+        }),
     };
     let pressure_summary = |sha: &str, tree: &str, rows| PressureSummary {
-        schema: 3,
+        schema: PRESSURE_SUMMARY_SCHEMA,
         hermit_sha: sha.into(),
         detcore_tree: tree.into(),
         source_tree_dirty: false,
@@ -1320,9 +1638,25 @@ fn self_test() -> Result<(), String> {
                 ObservedResult::Timeout,
             ])
         || observation.hermit_shas != BTreeSet::from(["sha-1".into(), "sha-doc".into()])
+        || observation.invocations.len() != 4
+        || !observation.invocations.iter().any(|invocation| {
+            invocation.hermit_sha == "sha-doc"
+                && invocation.result == ObservedResult::Pass
+                && invocation.run_id == "fixture-pass"
+                && invocation.argv == ["hermit", "run"]
+                && invocation.guest_argv == ["fixture"]
+                && invocation.env == BTreeMap::from([("LC_ALL".into(), "C".into())])
+                && invocation.cwd == "/repo"
+                && invocation.shell_command == "cd /repo && env LC_ALL=C hermit run"
+                && invocation.attempts.len() == 1
+                && invocation.attempts[0].index == "1"
+                && invocation.attempts[0].outcome == "PASS"
+                && invocation.attempts[0].status == Some(0)
+        })
     {
         return Err(
-            "pressure observations did not preserve min/max ranges and all outcomes".into(),
+            "pressure observations did not preserve ranges, outcomes, and literal invocations"
+                .into(),
         );
     }
     let next_source = pressure_summary(
@@ -1351,6 +1685,18 @@ fn self_test() -> Result<(), String> {
     {
         return Err("pressure observations with wrong source identity were accepted".into());
     }
+    let mut missing_invocation = first.clone();
+    missing_invocation.rows[0].invocation = None;
+    if apply_pressure_summary(
+        &mut refusal_target,
+        &missing_invocation,
+        "sha-1",
+        "tree-1",
+    )
+    .is_ok()
+    {
+        return Err("pressure observation without a literal invocation was accepted".into());
+    }
     let infrastructure = pressure_summary(
         "sha-1",
         "tree-1",
@@ -1359,6 +1705,7 @@ fn self_test() -> Result<(), String> {
             result: "infrastructure-error".into(),
             verification: None,
             evidence_errors: vec!["fixture missing".into()],
+            invocation: None,
         }],
     );
     if apply_pressure_summary(&mut refusal_target, &infrastructure, "sha-1", "tree-1").is_ok() {
@@ -1371,7 +1718,8 @@ fn self_test() -> Result<(), String> {
     }
 
     let native = ResultRow {
-        schema: 3,
+        schema: CELL_RESULT_SCHEMA,
+        run_id: "fixture-run".into(),
         hermit_sha: "fixture".into(),
         source_tree_dirty: false,
         test: "fixture/native".into(),
@@ -1381,6 +1729,18 @@ fn self_test() -> Result<(), String> {
         backend: None,
         classification: "required".into(),
         outcome: "PASS".into(),
+        argv: vec!["fixture".into()],
+        guest_argv: vec!["fixture".into()],
+        env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+        cwd: "/repo".into(),
+        shell_command: "cd /repo && env LC_ALL=C fixture".into(),
+        attempts: vec![serde_json::json!({
+            "argv":["fixture"],
+            "guest_argv":["fixture"],
+            "env":{"LC_ALL":"C"},
+            "cwd":"/repo",
+            "shell_command":"cd /repo && env LC_ALL=C fixture"
+        })],
     };
     if native.id().map(|id| id.backend) != Some("native".into()) {
         return Err("native result identity did not map a null backend to `native`".into());

@@ -94,6 +94,7 @@ use std::process::ExitCode;
 use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
+use safe_ci_dag_runner::model::Step;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
@@ -115,6 +116,27 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
+const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationStepIdentity {
+    ManifestAudit,
+    ManifestRun,
+    Other,
+}
+
+fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
+    let manifest_group = step.group == "e2e" || step.group.ends_with("-e2e");
+    if (step.group == "gate" && step.job == "manifest")
+        || (manifest_group && step.job == "metadata")
+    {
+        ValidationStepIdentity::ManifestAudit
+    } else if manifest_group && step.job.starts_with("manifest_") {
+        ValidationStepIdentity::ManifestRun
+    } else {
+        ValidationStepIdentity::Other
+    }
+}
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
@@ -1167,13 +1189,30 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .filter(|s| s.cmd == "./ci/test_harness.sh validate")
+            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestAudit)
             .map(|s| s.tag())
             .collect();
         if manifest_nodes != vec!["gate.manifest"] {
             return Err(format!(
                 "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
             ));
+        }
+        let manifest_audit = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
+            .expect("manifest audit exists")
+            .clone();
+        let mut wrong_invocation = vec![manifest_audit];
+        wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
+        if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
+            || dedupe_identical(&mut wrong_invocation).is_ok()
+        {
+            return Err(
+                "full-plan bracket: manifest-audit identity depended on command text or accepted an unexpected invocation"
+                    .into(),
+            );
         }
         let pin_nodes: Vec<String> = full
             .cfg
@@ -1233,10 +1272,17 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .filter(|s| s.cmd.contains("./ci/test_harness.sh run --lane "))
+            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestRun)
             .collect();
         if manifest_consumers.is_empty() {
             return Err("full-plan bracket: no manifest consumers were inspected".into());
+        }
+        let mut spelling_probe = (*manifest_consumers[0]).clone();
+        spelling_probe.cmd = "changed invocation text".into();
+        if validation_step_identity(&spelling_probe) != ValidationStepIdentity::ManifestRun {
+            return Err(
+                "full-plan bracket: manifest-run identity still depends on command text".into(),
+            );
         }
         for consumer in manifest_consumers {
             if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
@@ -1876,7 +1922,7 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
 
 /// Give every real validate invocation its own durable E2E result directory.
 ///
-/// `ci/test_harness.sh` already emits one schema-3 row per cell, but its local
+/// `target/debug/test-harness` already emits one schema-4 row per cell, but its local
 /// default is under the checkout. A canonical validate may run in a disposable
 /// scratch tree, so those rows disappeared at cleanup. Deriving the fallback
 /// from the durable log puts both artifacts under the same surviving root. A
@@ -2337,10 +2383,7 @@ fn attach_compatibility_scorecard(
 ) -> Result<(), String> {
     let mut deps = Vec::new();
     for step in steps.iter() {
-        if step.job.starts_with("manifest_")
-            && step.cmd.contains("./ci/test_harness.sh run ")
-            && step.cmd.contains("--ci-only")
-        {
+        if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
             deps.push(step.tag());
         }
     }
@@ -2507,8 +2550,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -2637,10 +2680,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     }
     // Fusing lanes can duplicate identical work. In particular, the always-on
     // gate.manifest and both lane e2e.metadata nodes run the exact same
-    // `test_harness.sh validate` tree audit. Drop later duplicates and repoint
+    // `test-harness validate` tree audit. Drop later duplicates and repoint
     // their dependents, so one full run pays that ~75 s audit exactly once. The
-    // dedup is exact-command based for this one audited command and is reported.
-    let removed = dedupe_identical(&mut steps);
+    // dedup is keyed by typed manifest-audit identity; an unexpected command is
+    // refused explicitly instead of silently ceasing to match.
+    let removed = dedupe_identical(&mut steps)?;
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
@@ -3055,17 +3099,23 @@ fn selective_plan(
 /// the manifest audit (different tags, byte-identical command/tree) and the
 /// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
 /// root cwd). The observed preflight node survives in both cases.
-fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<String> {
+fn dedupe_identical(steps: &mut Vec<Step>) -> Result<Vec<String>, String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut keep = Vec::with_capacity(steps.len());
     let mut removed = Vec::new();
     for s in steps.drain(..) {
         let tag = s.tag();
-        let key = if s.cmd == "./ci/test_harness.sh validate" {
+        let key = if validation_step_identity(&s) == ValidationStepIdentity::ManifestAudit {
+            if s.cmd != MANIFEST_AUDIT_COMMAND {
+                return Err(format!(
+                    "manifest-audit node {tag} has unexpected invocation: {}",
+                    s.cmd
+                ));
+            }
             (
                 "exact-tree-manifest-audit".to_string(),
-                "./ci/test_harness.sh validate".to_string(),
+                MANIFEST_AUDIT_COMMAND.to_string(),
             )
         } else if [
             "pre.reverie_pin",
@@ -3107,7 +3157,7 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
         s.deps.dedup();
     }
     *steps = keep;
-    removed
+    Ok(removed)
 }
 
 /// Heavy compatibility preparation is the innermost bound in the validation ladder:

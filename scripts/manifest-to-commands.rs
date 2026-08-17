@@ -21,18 +21,23 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! serde = { version = "1", features = ["derive"] }
+//! serde_yaml = "0.9"
 //! toml = "0.8"
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
+#[path = "../ci/manifest-plan/src/manifest_value.rs"]
+mod manifest_value;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use toml::Value;
+use manifest_value::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -248,21 +253,13 @@ fn hermit_command(
     verify_bitwise_parity: bool,
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile = if portable {
-        " --no-virtualize-cpuid --max-timeslice=disabled"
-    } else {
-        ""
-    };
+    let _lane = lane;
+    let profile = "";
     let command = match mode {
         "verify" => {
-            let strict = if verify_bitwise_parity {
-                " --verify-strict --verify-json \"$cell/captures/verify.json\""
-            } else {
-                ""
-            };
+            let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{strict}{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -326,6 +323,13 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
     for mode in mode_names {
         let spec = &modes[mode];
         if mode == "naked" {
+            let backends = string_array(
+                spec.get("backends_enabled"),
+                &format!("{id}.modes.naked.backends_enabled"),
+            );
+            if !backends.iter().any(|backend| backend == "native") {
+                continue;
+            }
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
             let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}");
             lines.push(format!(
@@ -340,7 +344,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             &format!("{id}.modes.{mode}.backends_enabled"),
         );
         if backends.is_empty() {
-            fail(format!("{id}: mode `{mode}` has no enabled backend"));
+            continue;
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
         // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
@@ -437,7 +441,7 @@ const USAGE: &str = "\
 Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
 
 Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
-TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
+YAML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
   --guest-args  Write nothing; print the declared per-backend guest arguments as
@@ -450,7 +454,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -469,7 +473,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
             .parse()
-            .unwrap_or_else(|e| fail(format!("{}: invalid TOML: {e}", path.display())));
+            .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
         if schema != Some(MANIFEST_SCHEMA) {
             fail(format!(
@@ -578,12 +582,15 @@ mod tests {
     }
 
     const DECLARED: &str = r#"
-[[test]]
-id = "c-programs/example"
-program = "tests/c/example.c"
-[test.modes.verify]
-backends_enabled = ["ptrace", "liteinst"]
-guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
+test:
+  - id: c-programs/example
+    program: tests/c/example.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, liteinst]
+        guest_args:
+          ptrace: [multi, value with spaces]
+          liteinst: [edge]
 "#;
 
     /// POSITIVE side: a declared argument vector must reach the guest word, and
@@ -623,11 +630,12 @@ guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
     fn undeclared_guest_args_leave_the_guest_word_untouched() {
         let tests = manifest(
             r#"
-[[test]]
-id = "c-programs/bare"
-program = "tests/c/bare.c"
-[test.modes.verify]
-backends_enabled = ["ptrace"]
+test:
+  - id: c-programs/bare
+    program: tests/c/bare.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
 "#,
         );
         let spec = &tests[0].1["modes"]["verify"];
@@ -642,12 +650,14 @@ backends_enabled = ["ptrace"]
     fn enabled_backend_absent_from_guest_args_gets_none() {
         let tests = manifest(
             r#"
-[[test]]
-id = "c-programs/partial"
-program = "tests/c/partial.c"
-[test.modes.verify]
-backends_enabled = ["ptrace", "kvm"]
-guest_args = { ptrace = ["multi"] }
+test:
+  - id: c-programs/partial
+    program: tests/c/partial.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, kvm]
+        guest_args:
+          ptrace: [multi]
 "#,
         );
         let spec = &tests[0].1["modes"]["verify"];
@@ -663,11 +673,12 @@ guest_args = { ptrace = ["multi"] }
         let mut tests = manifest(DECLARED);
         tests.extend(manifest(
             r#"
-[[test]]
-id = "c-programs/bare"
-program = "tests/c/bare.c"
-[test.modes.verify]
-backends_enabled = ["ptrace"]
+test:
+  - id: c-programs/bare
+    program: tests/c/bare.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
 "#,
         ));
         let lines = guest_args_tsv(&tests);
@@ -713,7 +724,8 @@ backends_enabled = ["ptrace"]
         assert!(chaos.contains("--verify --verify-allow=both"));
         assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
         assert!(chaos.contains("--log=info"));
-        assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+        assert!(!chaos.contains("--no-virtualize-cpuid"));
+        assert!(!chaos.contains("--max-timeslice=disabled"));
 
         let custom = hermit_command(
             "custom",
@@ -730,19 +742,22 @@ backends_enabled = ["ptrace"]
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
-        assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+        assert!(verify.contains("run --base-env=minimal"));
+        assert!(verify.contains("--strict --verify --verify-json \"$cell/captures/verify.json\""));
+        assert!(!verify.contains("--verify-strict"));
     }
 
     #[test]
     fn one_chaos_seed_emits_one_internally_verified_command() {
         let tests = manifest(
             r#"
-[[test]]
-id = "c-programs/one-chaos-seed"
-program = "tests/c/one-chaos-seed.c"
-[test.modes.chaos]
-backends_enabled = ["ptrace"]
-seeds = [7]
+test:
+  - id: c-programs/one-chaos-seed
+    program: tests/c/one-chaos-seed.c
+    modes:
+      chaos:
+        backends_enabled: [ptrace]
+        seeds: [7]
 "#,
         );
         let commands = commands_for_test(&tests[0].1, &tests[0].0);

@@ -1,6 +1,6 @@
 # backend-parity-c verify measurements
 
-Durable evidence behind the `ci` flags in `tests/e2e/manifests/backend-parity-c.toml`.
+Durable evidence behind the `ci` flags in `tests/e2e/manifests/backend-parity-c.yaml`.
 A flag flip in that manifest should cite a row here.
 
 ## `verify-sweep-6e1b59af0.tsv`
@@ -27,7 +27,7 @@ One harness invocation per cell:
 ```
 LD_LIBRARY_PATH=<libunwind> \
 E2E_RUN_ID=<unique-per-cell> \
-./ci/test_harness.sh run --lane <lane> --test <id> --mode verify --include-manual \
+target/debug/test-harness run --lane <lane> --test <id> --mode verify --include-manual \
     --results <per-cell path> --junit <per-cell path>
 ```
 

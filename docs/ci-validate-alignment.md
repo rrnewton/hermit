@@ -22,7 +22,7 @@ do not belong in the scarce privileged lane.
 
 ## Multi-mode E2E harness
 
-`ci/test_harness.sh` discovers tests from the schema-v2 TOML bucket files under
+`target/debug/test-harness` discovers tests from the schema-v2 YAML bucket files under
 `tests/e2e/manifests/`. The CI-enabled category set is:
 
 - `system-utils`
@@ -30,6 +30,13 @@ do not belong in the scarce privileged lane.
 - `determinism-stress`
 - `language-runtimes`
 - `applications`
+
+The 2026-08-17 Rust cutover deliberately stopped adding
+`--no-virtualize-cpuid` and `--max-timeslice=disabled` to portable cells. At
+base `302a1a9c0fde564db0292d1ea5cabc91343e79bc`, that changes the invocation of
+168 required portable verify/chaos cells (166 verify and 2 chaos). This count
+becomes stale whenever the required plan changes; every result row records the
+literal argv so the policy remains observable rather than inferred.
 
 Eight additional C-corpus buckets are centrally discoverable with `ci=false`
 until each direct guest's standalone build and output contract is calibrated.
@@ -40,7 +47,7 @@ Test programs contain no policy annotations. Each central entry declares its
 program path, lane, observation tuple, timeout, and all five modes. Mode is the
 outer list; each mode partitions its complete backend set between
 `backends-enabled` and `backends-disabled`, with a reason for every disabled
-backend. `ci/test_harness.sh validate` fails on an invalid partition, stale
+backend. `target/debug/test-harness validate` fails on an invalid partition, stale
 inventory, unclassified file under `tests/`, or replay backend other than
 ptrace.
 
@@ -88,9 +95,9 @@ outer bound.
 
 Both `scripts/validate.rs` and GitHub Actions execute these exact DAG files. Use
 `ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the
-dependency layers without running tests. `ci/test_harness.sh audit-ci` hashes
-the ordered step IDs and commands and verifies both callers still delegate to
-the shared plans. It also compares the required cells byte-for-byte with
+dependency layers without running tests. `target/debug/test-harness audit-ci`
+checks unique node IDs, dependency references, Rust harness commands, and the
+typed manifest bucket selectors in both DAGs. It also compares the required cells with
 `ci/expected-e2e-plan.json`, so the blocking denominator cannot silently shrink.
 
 ## Reconciliation checklist
@@ -100,7 +107,7 @@ When adding or changing an E2E test:
 1. Put the workload in a focused shell, C, or Rust source file.
 2. Add it to exactly one bucket manifest and declare all five modes.
 3. Add only locally proven backend combinations to an allowlist.
-4. Run `ci/test_harness.sh validate` and inspect `plan --format json`.
+4. Run `target/debug/test-harness validate` and inspect `plan --format json`.
 5. Run the affected mode/backend cells and retain their JSONL/JUnit results.
 6. Update `tests/e2e/manifests/inventory/test-files.json` with its disposition and runner.
 7. Update the owning DAG only when a category or capability dependency changes.
