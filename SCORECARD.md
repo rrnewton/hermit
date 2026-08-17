@@ -6,6 +6,8 @@ This table is derived from the manifest, not from a separately maintained parent
 
 These are the current Basic Sanity contracts. Every `verify` cell, every `replay` cell, and every seed in a selected `chaos` cell requires a typed canonical verdict. Verification passes on a supported canonical evidence path require non-vacuous INFO-log bitwise parity. Direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor; KVM remains output-only and therefore unqualified for that claim.
 
+Cell-status SHA-256: `ab712f37c6e5173f8a8c5fb996b4db21433212a047b96f6ad172df0be702894b`. This covers every cell identity, enabled flag, and green/red status, so a status change cannot disappear behind unchanged aggregate counts.
+
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
 | `ptrace` | 150 | 858 | 1008 |

@@ -7,6 +7,7 @@
 //! [dependencies]
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -24,6 +25,8 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
@@ -525,6 +528,15 @@ KVM remains output-only and therefore unqualified for that claim.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
     );
+    out.insert_str(
+        out.find("| Backend")
+            .expect("scorecard backend table exists"),
+        &format!(
+            "Cell-status SHA-256: `{}`. This covers every cell identity, enabled flag, and \
+green/red status, so a status change cannot disappear behind unchanged aggregate counts.\n\n",
+            status_digest(derived)
+        ),
+    );
     let mut green_total = 0usize;
     let mut total = 0usize;
     for backend in &ordered {
@@ -667,6 +679,36 @@ selected cell red reports the failure; it does not remove or excuse the cell.\n"
         derived.selected.len(),
     ));
     out
+}
+
+fn status_digest(derived: &Derived) -> String {
+    let mut hasher = Sha256::new();
+    for id in &derived.population {
+        let status = if derived.green.contains(id) {
+            "green"
+        } else {
+            "red"
+        };
+        let enabled = if derived.enabled.contains(id) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        for field in [
+            id.lane.as_str(),
+            id.category.as_str(),
+            id.test.as_str(),
+            id.mode.as_str(),
+            id.backend.as_str(),
+            enabled,
+            status,
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn tracked_from(
@@ -1359,6 +1401,28 @@ fn self_test() -> Result<(), String> {
         return Err("an ERROR validate result did not record red".into());
     }
 
+    let second_id = CellId {
+        test: "fixture/second".into(),
+        ..id.clone()
+    };
+    let digest_base = Derived {
+        population: BTreeSet::from([id.clone(), second_id.clone()]),
+        enabled: BTreeSet::from([id.clone(), second_id.clone()]),
+        selected: BTreeSet::from([id.clone(), second_id.clone()]),
+        green: BTreeSet::from([id.clone()]),
+    };
+    let digest_swapped = Derived {
+        population: BTreeSet::from([id.clone(), second_id.clone()]),
+        enabled: BTreeSet::from([id.clone(), second_id.clone()]),
+        selected: BTreeSet::from([id.clone(), second_id.clone()]),
+        green: BTreeSet::from([second_id]),
+    };
+    if status_digest(&digest_base) == status_digest(&digest_swapped) {
+        return Err(
+            "count-cancelling cell status changes left the scorecard digest unchanged".into(),
+        );
+    }
+
     let write_dir = env::temp_dir().join(format!(
         "hermit-scorecard-write-bracket-{}",
         std::process::id()
@@ -1521,7 +1585,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: result refusal, observed-status, conditional-write, selected-plan preservation, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: result refusal, observed-status, count-cancelling digest, conditional-write, selected-plan preservation, observation-range, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
