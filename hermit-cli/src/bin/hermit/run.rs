@@ -1951,15 +1951,28 @@ impl RunOpts {
             | Backend::E9patch => {}
             Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
+                let retained_log_dir = self.retained_verify_log_dir()?;
+                let verification_stdin = self
+                    .verify
+                    .then(hermit::output_stdin_snapshot)
+                    .transpose()?
+                    .flatten();
                 return super::backends::run_dbt(
                     &self.program,
                     &self.args,
                     self.verify,
+                    self.verify_verbose,
                     self.verify_allow,
+                    self.print_verify_logs,
+                    self.keep_logs,
+                    retained_log_dir.as_deref(),
+                    self.verify_json.as_deref(),
                     self.summary,
                     global.log,
+                    global.log_file.as_deref(),
                     &self.effective_det_config(),
                     environment,
+                    verification_stdin,
                 );
             }
         }

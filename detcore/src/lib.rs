@@ -134,6 +134,14 @@ fn select_thread_exit_detpid(
     }
 }
 
+fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> DetPid {
+    thread_detpid.unwrap_or_else(|| DetPid::from_raw(guest_pid.into()))
+}
+
+fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
+    is_root_process && dettid == detpid
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
 /// Identifies an unsupported syscall that a backend must terminate without unwinding.
@@ -1423,8 +1431,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
-        let detpid = DetPid::from_raw(guest.pid().into());
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
+        assert_eq!(new_dettid, guest.thread_state().dettid);
+        let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
+        let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -1441,11 +1451,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        assert_eq!(new_dettid, guest.thread_state().dettid);
-
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
-        } else if guest.is_root_thread() {
+        } else if is_root_thread {
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -1458,7 +1466,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {
@@ -2829,6 +2837,32 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_start_identity_tests {
+    use super::*;
+
+    #[test]
+    fn backend_process_identity_is_preserved() {
+        let backend_detpid = DetPid::from_raw(3);
+        assert_eq!(
+            select_thread_start_detpid(Some(backend_detpid), Pid::from_raw(42_001)),
+            backend_detpid
+        );
+        assert_eq!(
+            select_thread_start_detpid(None, Pid::from_raw(42_001)),
+            DetPid::from_raw(42_001)
+        );
+    }
+
+    #[test]
+    fn root_thread_requires_root_process_and_matching_process_identity() {
+        let detpid = DetPid::from_raw(3);
+        assert!(is_root_thread_start(true, DetTid::from_raw(3), detpid));
+        assert!(!is_root_thread_start(false, DetTid::from_raw(3), detpid));
+        assert!(!is_root_thread_start(true, DetTid::from_raw(4), detpid));
     }
 }
 
