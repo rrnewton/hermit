@@ -16434,8 +16434,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -17097,8 +17097,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -19740,8 +19740,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -20240,8 +20240,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -21851,8 +21851,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -22502,8 +22502,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -22667,8 +22667,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
@@ -22992,8 +22992,8 @@
       "status": "red",
       "ci_disabled_reason": {
         "result": "infrastructure-error",
-        "evidence": "reverie#459",
-        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+        "evidence": "reverie#459 plus DBT scheduler FINAL-frame lifecycle",
+        "reason": "DBT completes both application runs with matching backend-local memory hashes and exit status, but canonical determinism still cannot be judged for two independent reasons. Hermit requires reverie#459's emit_evidence and evidence_log_level ABI, and the scheduler process created by dr_create_client_thread emits START/DATA under its own SO_PEERCRED PID but returns from runtime_background_init and calls exit(0) without application thread_leave or DynamoRIO event_exit, so its FINAL frame is never constructed. The main DynamoRIO process sends FINAL and receives its acknowledgement, but the collector correctly rejects the incomplete scheduler artifact and run_dbt leaves verdict=no_result and comparison=null."
       },
       "observations": []
     },
