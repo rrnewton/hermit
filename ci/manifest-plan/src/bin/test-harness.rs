@@ -396,6 +396,7 @@ struct DagStep {
     group: String,
     job: String,
     cmd: String,
+    jobs_flag: Option<String>,
     #[serde(default)]
     deps: Vec<String>,
     timeout: Option<u64>,
@@ -541,10 +542,14 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                     .get("manifest_guest")
                     .copied()
                     .unwrap_or(0);
-                if demand != jobs || cap < jobs || hint.preferred_inner_jobs != Some(jobs) {
+                if demand != jobs
+                    || cap < jobs
+                    || hint.preferred_inner_jobs != Some(jobs)
+                    || step.jobs_flag.as_deref() != Some("")
+                {
                     return Err(format!(
-                        "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}",
-                        step.group, step.job, hint.preferred_inner_jobs
+                        "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}, jobs_flag={:?}",
+                        step.group, step.job, hint.preferred_inner_jobs, step.jobs_flag
                     ));
                 }
             }
