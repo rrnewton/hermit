@@ -24,7 +24,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -247,12 +246,14 @@ struct PressureVerification {
     first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ResultRow {
     schema: u64,
     run_id: String,
     hermit_sha: String,
     source_tree_dirty: bool,
+    binary_sha256: Option<String>,
+    test_sha256: String,
     test: String,
     category: String,
     lane: String,
@@ -260,11 +261,14 @@ struct ResultRow {
     backend: Option<String>,
     classification: String,
     outcome: String,
+    log_level: Option<String>,
+    effective_args: Vec<String>,
     argv: Vec<String>,
     guest_argv: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: String,
     shell_command: String,
+    relaxations: Vec<String>,
     attempts: Vec<JsonValue>,
 }
 
@@ -331,6 +335,64 @@ impl ResultRow {
         Ok(())
     }
 
+    fn require_provenance(&self) -> Result<(), String> {
+        self.require_literal_invocation()?;
+        let binary_sha = self
+            .binary_sha256
+            .as_deref()
+            .ok_or("has no Hermit binary identity")?;
+        require_sha256("Hermit binary", binary_sha)?;
+        require_sha256("test", &self.test_sha256)?;
+        if self.effective_args != self.argv.iter().skip(1).cloned().collect::<Vec<_>>() {
+            return Err("effective_args does not match literal argv".into());
+        }
+        if self.mode == "naked" {
+            if self.log_level.is_some() {
+                return Err("naked result unexpectedly records a Hermit log level".into());
+            }
+        } else if self.log_level.as_deref().is_none_or(str::is_empty) {
+            return Err("Hermit result has no log-level identity".into());
+        }
+        if self
+            .relaxations
+            .iter()
+            .any(|relaxation| relaxation.trim().is_empty())
+            || self.relaxations.iter().collect::<BTreeSet<_>>().len()
+                != self.relaxations.len()
+        {
+            return Err("relaxations contain an empty or duplicate identity".into());
+        }
+        Ok(())
+    }
+
+    fn evidence_identity(&self) -> Result<String, String> {
+        let evidence = serde_json::json!({
+            "run_id": self.run_id,
+            "hermit_sha": self.hermit_sha,
+            "binary_sha256": self.binary_sha256,
+            "test_sha256": self.test_sha256,
+            "test": self.test,
+            "category": self.category,
+            "lane": self.lane,
+            "mode": self.mode,
+            "backend": self.backend,
+            "classification": self.classification,
+            "outcome": self.outcome,
+            "log_level": self.log_level,
+            "effective_args": self.effective_args,
+            "argv": self.argv,
+            "guest_argv": self.guest_argv,
+            "env": self.env,
+            "cwd": self.cwd,
+            "shell_command": self.shell_command,
+            "relaxations": self.relaxations,
+            "attempts": self.attempts,
+        });
+        let encoded = serde_json::to_vec(&evidence)
+            .map_err(|error| format!("cannot encode result evidence: {error}"))?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
+
     fn require_canonical_pass_evidence(&self) -> Result<(), String> {
         if self.outcome != "PASS" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(());
@@ -366,7 +428,7 @@ struct Derived {
 }
 
 struct ResultCandidate {
-    modified: SystemTime,
+    evidence_identity: String,
     path: PathBuf,
     row: ResultRow,
 }
@@ -1149,7 +1211,13 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
         return Err("selected lanes contain no regression cells".into());
     }
     let candidates = read_result_candidates(result_root, &head)?;
-    verify_candidate_set(&expected, candidates)?;
+    let admitted = verify_candidate_set(&expected, candidates)?;
+    if admitted != expected.len() {
+        return Err(format!(
+            "result admission counted {admitted} cells, expected {}",
+            expected.len()
+        ));
+    }
 
     print!("{}", render_scorecard(&derived));
     let green_checked = expected
@@ -1219,9 +1287,6 @@ fn read_result_candidates(
     }
     let mut out: BTreeMap<CellId, Vec<ResultCandidate>> = BTreeMap::new();
     for path in files {
-        let modified = fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .map_err(|e| format!("cannot read timestamp for {}: {e}", path.display()))?;
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         for (index, line) in text.lines().enumerate() {
@@ -1252,16 +1317,19 @@ fn read_result_candidates(
             if row.classification != "required" {
                 continue;
             }
-            row.require_literal_invocation()
+            row.require_provenance()
                 .map_err(|error| format!("{}:{} {error}", path.display(), index + 1))?;
             row.require_canonical_pass_evidence().map_err(|error| {
+                format!("{}:{} {error}", path.display(), index + 1)
+            })?;
+            let evidence_identity = row.evidence_identity().map_err(|error| {
                 format!("{}:{} {error}", path.display(), index + 1)
             })?;
             let id = row
                 .id()
                 .ok_or_else(|| format!("{}:{} has no backend", path.display(), index + 1))?;
             out.entry(id).or_default().push(ResultCandidate {
-                modified,
+                evidence_identity,
                 path: path.clone(),
                 row,
             });
@@ -1288,51 +1356,93 @@ fn find_result_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 
 fn verify_candidate_set(
     expected: &BTreeSet<CellId>,
-    mut candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
-) -> Result<(), String> {
+    candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
+) -> Result<usize, String> {
     let mut missing = Vec::new();
     let mut failed = Vec::new();
+    let mut admitted = 0usize;
+    let mut binary_identities = BTreeMap::<String, Vec<String>>::new();
     for id in expected {
-        let Some(rows) = candidates.get_mut(id) else {
+        let Some(rows) = candidates.get(id) else {
             missing.push(display_id(id));
             continue;
         };
-        rows.sort_by(|a, b| {
-            a.modified
-                .cmp(&b.modified)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        let latest = rows.last().expect("nonempty candidate list");
-        if rows.len() >= 2 && rows[rows.len() - 2].modified == latest.modified {
+        let mut distinct = BTreeMap::new();
+        for candidate in rows {
+            distinct
+                .entry(candidate.evidence_identity.as_str())
+                .or_insert(candidate);
+        }
+        if distinct.len() != 1 {
+            let descriptions = distinct
+                .values()
+                .take(4)
+                .map(|candidate| {
+                    format!(
+                        "{} run={} evidence={}",
+                        candidate.path.display(),
+                        candidate.row.run_id,
+                        &candidate.evidence_identity[..12]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(format!(
-                "ambiguous equally-new results for {} in {} and {}",
+                "ambiguous distinct evidence for {}: {}",
                 display_id(id),
-                rows[rows.len() - 2].path.display(),
-                latest.path.display()
+                descriptions
             ));
         }
-        latest.row.require_literal_invocation().map_err(|error| {
+        let candidate = distinct
+            .into_values()
+            .next()
+            .expect("candidate evidence is nonempty");
+        candidate.row.require_provenance().map_err(|error| {
             format!(
                 "fresh result for {} in {} {error}",
                 display_id(id),
-                latest.path.display()
+                candidate.path.display()
             )
         })?;
-        latest.row.require_canonical_pass_evidence().map_err(|error| {
+        candidate.row.require_canonical_pass_evidence().map_err(|error| {
             format!(
                 "fresh result for {} in {} {error}",
                 display_id(id),
-                latest.path.display()
+                candidate.path.display()
             )
         })?;
-        if latest.row.outcome != "PASS" {
+        binary_identities
+            .entry(
+                candidate
+                    .row
+                    .binary_sha256
+                    .clone()
+                    .expect("provenance requires a binary identity"),
+            )
+            .or_default()
+            .push(display_id(id));
+        if candidate.row.outcome != "PASS" {
             failed.push(format!(
                 "{}={} ({})",
                 display_id(id),
-                latest.row.outcome,
-                latest.path.display()
+                candidate.row.outcome,
+                candidate.path.display()
             ));
+        } else {
+            admitted += 1;
         }
+    }
+    if binary_identities.len() > 1 {
+        let details = binary_identities
+            .iter()
+            .take(4)
+            .map(|(sha, ids)| format!("{}: {}", &sha[..12], ids.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "fresh result set mixes {} Hermit binary identities at one source SHA: {details}",
+            binary_identities.len()
+        ));
     }
     if !missing.is_empty() || !failed.is_empty() {
         let mut message = format!(
@@ -1347,6 +1457,13 @@ fn verify_candidate_set(
             message.push_str(&format!("\n  non-passing: {item}"));
         }
         return Err(message);
+    }
+    Ok(admitted)
+}
+
+fn require_sha256(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("has no valid {label} SHA-256 identity"));
     }
     Ok(())
 }
@@ -1427,14 +1544,14 @@ fn self_test() -> Result<(), String> {
         backend: "ptrace".into(),
     };
     let expected = BTreeSet::from([id.clone()]);
-    let candidate = |outcome: &str| ResultCandidate {
-        modified: SystemTime::UNIX_EPOCH,
-        path: PathBuf::from("fixture/results.jsonl"),
-        row: ResultRow {
+    let candidate = |outcome: &str| {
+        let row = ResultRow {
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture-run".into(),
             hermit_sha: "fixture".into(),
             source_tree_dirty: false,
+            binary_sha256: Some("b".repeat(64)),
+            test_sha256: "c".repeat(64),
             test: id.test.clone(),
             category: id.category.clone(),
             lane: id.lane.clone(),
@@ -1442,11 +1559,14 @@ fn self_test() -> Result<(), String> {
             backend: Some(id.backend.clone()),
             classification: "required".into(),
             outcome: outcome.into(),
+            log_level: Some("info".into()),
+            effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
             guest_argv: vec!["fixture".into()],
             env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
             cwd: "/repo".into(),
             shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+            relaxations: Vec::new(),
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
@@ -1464,7 +1584,13 @@ fn self_test() -> Result<(), String> {
                 "verification_report": report,
                 "verification_report_sha256": format!("{:x}", Sha256::digest(report.as_bytes()))
             })}],
-        },
+        };
+        let evidence_identity = row.evidence_identity().unwrap();
+        ResultCandidate {
+            evidence_identity,
+            path: PathBuf::from("fixture/results.jsonl"),
+            row,
+        }
     };
     verify_candidate_set(
         &expected,
@@ -1481,6 +1607,57 @@ fn self_test() -> Result<(), String> {
     .is_ok()
     {
         return Err("result evidence accepted a shell command unrelated to argv/env".into());
+    }
+    let duplicate = candidate("PASS");
+    let mut duplicate_copy = candidate("PASS");
+    duplicate_copy.path = PathBuf::from("fixture/copied-results.jsonl");
+    verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![duplicate, duplicate_copy])]),
+    )
+    .map_err(|e| format!("identical duplicate evidence was not deduplicated: {e}"))?;
+    let first = candidate("PASS");
+    let mut distinct = candidate("PASS");
+    distinct.row.run_id = "different-run".into();
+    distinct.evidence_identity = distinct.row.evidence_identity().unwrap();
+    if verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![first, distinct])]),
+    )
+    .is_ok()
+    {
+        return Err("distinct same-SHA evidence was selected by file ordering".into());
+    }
+    let first = candidate("PASS");
+    let mut distinct_relaxation = candidate("PASS");
+    distinct_relaxation.row.relaxations = vec!["fixture-relaxation".into()];
+    distinct_relaxation.evidence_identity = distinct_relaxation.row.evidence_identity().unwrap();
+    if verify_candidate_set(
+        &expected,
+        BTreeMap::from([(id.clone(), vec![first, distinct_relaxation])]),
+    )
+    .is_ok()
+    {
+        return Err("distinct relaxation evidence was treated as the same receipt".into());
+    }
+    let second_id = CellId {
+        test: "fixture/second".into(),
+        ..id.clone()
+    };
+    let mut second_binary = candidate("PASS");
+    second_binary.row.test = second_id.test.clone();
+    second_binary.row.binary_sha256 = Some("d".repeat(64));
+    second_binary.evidence_identity = second_binary.row.evidence_identity().unwrap();
+    if verify_candidate_set(
+        &BTreeSet::from([id.clone(), second_id.clone()]),
+        BTreeMap::from([
+            (id.clone(), vec![candidate("PASS")]),
+            (second_id, vec![second_binary]),
+        ]),
+    )
+    .is_ok()
+    {
+        return Err("one source SHA admitted multiple Hermit binary identities".into());
     }
     if verify_candidate_set(&expected, BTreeMap::new()).is_ok() {
         return Err("negative result bracket accepted a missing row".into());
@@ -1505,6 +1682,27 @@ fn self_test() -> Result<(), String> {
     weak.attempts[0]["verification_report"] = JsonValue::String(report);
     if weak.require_canonical_pass_evidence().is_ok() {
         return Err("negative result bracket accepted a stripped PASS receipt".into());
+    }
+    let mut missing_report = candidate("PASS").row;
+    missing_report.attempts[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("verification_report");
+    if missing_report.require_canonical_pass_evidence().is_ok() {
+        return Err("result evidence without a canonical report was accepted".into());
+    }
+    let mut missing_hash = candidate("PASS").row;
+    missing_hash.binary_sha256 = None;
+    if missing_hash.require_provenance().is_ok() {
+        return Err("result evidence without an artifact hash was accepted".into());
+    }
+    let mut missing_relaxations = serde_json::to_value(&candidate("PASS").row).unwrap();
+    missing_relaxations
+        .as_object_mut()
+        .unwrap()
+        .remove("relaxations");
+    if serde_json::from_value::<ResultRow>(missing_relaxations).is_ok() {
+        return Err("result row without explicit relaxations was admitted by the schema".into());
     }
     let chaos_id = CellId {
         mode: "chaos".into(),
@@ -1722,6 +1920,8 @@ fn self_test() -> Result<(), String> {
         run_id: "fixture-run".into(),
         hermit_sha: "fixture".into(),
         source_tree_dirty: false,
+        binary_sha256: Some("b".repeat(64)),
+        test_sha256: "c".repeat(64),
         test: "fixture/native".into(),
         category: "fixture".into(),
         lane: "portable".into(),
@@ -1729,11 +1929,14 @@ fn self_test() -> Result<(), String> {
         backend: None,
         classification: "required".into(),
         outcome: "PASS".into(),
+        log_level: None,
+        effective_args: Vec::new(),
         argv: vec!["fixture".into()],
         guest_argv: vec!["fixture".into()],
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C fixture".into(),
+        relaxations: Vec::new(),
         attempts: vec![serde_json::json!({
             "argv":["fixture"],
             "guest_argv":["fixture"],
@@ -1751,7 +1954,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: result, selected-chaos, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
