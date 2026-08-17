@@ -148,8 +148,13 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // during replay.
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
-        panic_on_unsupported_syscalls: false,
-        exit_on_unsupported_syscall: false,
+        // Record and replay are determinism claims, so an unsupported syscall
+        // must invalidate the operation instead of being recorded from or
+        // replayed against the live host.
+        panic_on_unsupported_syscalls: true,
+        // Return a typed error through Reverie rather than unwinding across the
+        // backend callback. The tracer owns process-tree cleanup on that error.
+        exit_on_unsupported_syscall: true,
         shutdown_on_unsupported_syscall: false,
         unsupported_syscall_report_fd: None,
         panic_on_rcb_overshoot: false,
@@ -250,8 +255,12 @@ mod tests {
     }
 
     #[test]
-    fn record_and_replay_preserve_partial_subscriptions() {
-        assert!(record_or_replay_config(Path::new("replay-data")).passthru_opt);
+    fn record_and_replay_preserve_partial_subscriptions_and_fail_closed() {
+        let config = record_or_replay_config(Path::new("replay-data"));
+        assert!(config.passthru_opt);
+        assert!(config.panic_on_unsupported_syscalls);
+        assert!(config.exit_on_unsupported_syscall);
+        assert!(!config.shutdown_on_unsupported_syscall);
     }
 
     #[test]

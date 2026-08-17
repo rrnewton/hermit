@@ -59,9 +59,10 @@ executor cannot reproduce returns deterministic `ENOSYS`.
   diagnostics, and `--panic-on-unsupported-syscalls` do not run.
 
 Debug builds use `Subscription::all()`, so unsupported calls reach Detcore's
-fallback. That makes debug coverage materially different from optimized
-coverage and can hide a missing release subscription. Reverie must always
-allow `restart_syscall` and `rt_sigreturn` for its own signal/syscall protocol.
+fallback. Optimized subscriptions explicitly include every Unsupported syscall,
+so fail-closed policy does not depend on build profile. Reverie always allows
+`rt_sigreturn` for signal-frame restoration; `restart_syscall` follows the Tool
+subscription and is therefore observable when Detcore requests it.
 
 Normal `hermit run` enables serialized scheduling, deterministic I/O, virtual
 time, and virtual metadata. Disabling those options reduces both handling and
