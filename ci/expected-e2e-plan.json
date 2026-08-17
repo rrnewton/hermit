@@ -1440,27 +1440,6 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/socket-cookie-unix"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-cookie-unix"
-    },
-    {
-      "backend": "sabre",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-cookie-unix"
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/socket-ioctl-timestamp"
     },
     {
