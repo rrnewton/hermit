@@ -782,11 +782,6 @@ fn validate_mode(
             "{id}: modes.{mode} is CI-enabled but has no backend"
         ));
     }
-    if mode == "naked" && ci {
-        die(format!(
-            "{id}: naked is opt-in meta-CI and must set ci=false"
-        ));
-    }
     if mode == "replay" && enabled.iter().any(|backend| backend != "ptrace") {
         die(format!("{id}: replay is ptrace-only, got {enabled:?}"));
     }
@@ -1103,8 +1098,7 @@ sabre = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "naked is opt-in meta-CI")]
-    fn rejects_naked_mode_in_regular_ci() {
+    fn accepts_naked_mode_in_regular_ci_when_it_has_an_outcome_oracle() {
         let spec = parse_mode(
             r#"
 ci = true

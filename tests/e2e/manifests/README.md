@@ -125,10 +125,13 @@ test:
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
-`naked` must set `ci = false`; it runs only when explicitly selected. A mode
-with no enabled backend remains visible with `ci = false` and a reason for
-every disabled backend. Regular CI executes only cells with `ci = true`;
-run one enabled manual cell with explicit test and mode filters:
+An enabled `naked` mode may set `ci = true` only with its bounded `runs` and
+`assert.min_distinct` outcome oracle intact. Ordinary validation then executes
+the native process repeatedly and fails the cell when it observes fewer than
+the declared minimum distinct outcomes. A mode with no enabled backend remains
+visible with `ci = false` and a reason for every disabled backend. Regular CI
+executes only cells with `ci = true`; run one enabled manual cell with explicit
+test and mode filters:
 
 ```sh
 target/debug/test-harness run --include-manual --mode verify \

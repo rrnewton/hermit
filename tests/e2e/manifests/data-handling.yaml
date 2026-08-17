@@ -136,14 +136,13 @@ test:
       artifacts: []
     modes:
       naked:
-        ci: false
+        ci: true
         runs: 3
         assert:
           min_distinct: 2
         backends_enabled:
           - native
         backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
         ci: true
         backends_enabled:
@@ -199,14 +198,13 @@ test:
       artifacts: []
     modes:
       naked:
-        ci: false
+        ci: true
         runs: 3
         assert:
           min_distinct: 2
         backends_enabled:
           - native
         backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
         ci: true
         backends_enabled:

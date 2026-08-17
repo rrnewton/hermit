@@ -462,14 +462,13 @@ test:
           sabre: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
       naked:
-        ci: false
+        ci: true
         runs: 5
         assert:
           min_distinct: 2
         backends_enabled:
           - native
         backends_disabled: {}
-        ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       replay:
         ci: false
         backends_enabled: []

@@ -1864,6 +1864,71 @@ mod tests {
     }
 
     #[test]
+    fn naked_control_with_identical_outcomes_fails_its_minimum_distinct_oracle() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-naked-identical-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let mut test = recipe(true);
+        test.modes.clear();
+        test.modes.insert(
+            "naked".into(),
+            ModeRecipe {
+                ci: true,
+                backends_enabled: vec!["native".into()],
+                runs: Some(3),
+                assert: Some(Assertions {
+                    min_distinct: Some(2),
+                    ..Assertions::default()
+                }),
+                ..ModeRecipe::default()
+            },
+        );
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("unused-hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+        };
+
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.attempts.len(), 3);
+        assert!(
+            result
+                .attempts
+                .iter()
+                .all(|attempt| attempt.outcome == "PASS")
+        );
+        assert_eq!(result.outcome, "FAIL");
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("naked observed 1 distinct outcomes, need 2")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn run_spec_records_correct_policy_without_hidden_portable_flags() {
         let test = recipe(true);
         let cell = SelectedCell {
