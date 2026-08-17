@@ -40,6 +40,7 @@ use super::container::IdentityGuard;
 use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
 use super::run::is_elf_file;
+use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
@@ -182,6 +183,12 @@ pub struct StartOpts {
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
 
+    /// Additionally append one or more environment variables to the recorded
+    /// guest environment. If a name is provided without a value, pass that
+    /// variable through from the host.
+    #[clap(short = 'e', long, value_parser = parse_assignment, value_name = "name[=val]")]
+    env: Vec<(String, Option<String>)>,
+
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
     data_dir: Option<PathBuf>,
@@ -256,6 +263,24 @@ impl StartOpts {
     fn record_timeout(&self) -> Option<Duration> {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    fn guest_command(&self) -> Result<Command, Error> {
+        let mut command = Command::new(self.program());
+        command.args(&self.args);
+        for (name, value) in &self.env {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else if let Ok(value) = std::env::var(name) {
+                command.env(name, value);
+            } else {
+                anyhow::bail!(
+                    "Attempt to pass through env var {}, but it is not set in the host environment",
+                    name
+                );
+            }
+        }
+        Ok(command)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -376,8 +401,7 @@ impl StartOpts {
                     let exit_status = container
                         .run(|| {
                             let _guard = global.init_tracing();
-                            let mut command = Command::new(self.program());
-                            command.args(&self.args);
+                            let command = self.guest_command().map_err(SerializableError::from)?;
                             with_recording_deadline(timeout, || {
                                 hermit::record_to(command, &data_path)
                             })
@@ -389,8 +413,7 @@ impl StartOpts {
                 None => container
                     .run(|| {
                         let _guard = global.init_tracing();
-                        let mut command = Command::new(self.program());
-                        command.args(&self.args);
+                        let command = self.guest_command().map_err(SerializableError::from)?;
                         hermit.record(command).map_err(SerializableError::from)
                     })
                     .context("Container exited unexpectedly")??,
@@ -436,8 +459,7 @@ impl StartOpts {
             .run(|| {
                 let _guard = global1.init_tracing();
 
-                let mut command = Command::new(self.program());
-                command.args(&self.args);
+                let command = self.guest_command().map_err(SerializableError::from)?;
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
@@ -504,8 +526,7 @@ impl StartOpts {
             .run(|| {
                 let _guard = global.init_tracing();
 
-                let mut command = Command::new(self.program());
-                command.args(&self.args);
+                let command = self.guest_command().map_err(SerializableError::from)?;
 
                 match record_timeout {
                     Some(timeout) => {
@@ -573,6 +594,48 @@ impl StartOpts {
 mod tests {
     use super::*;
 
+    fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
+        StartOpts {
+            program: Some(PathBuf::from("/bin/true")),
+            _strict: false,
+            args: Vec::new(),
+            env,
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            verify_json: None,
+            verify_strict: false,
+            gdbex: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_guest_command_applies_explicit_environment() {
+        let options = start_options(vec![("RECORD_ENV_FIXTURE".into(), Some("value".into()))]);
+        let command = options.guest_command().unwrap();
+        assert!(
+            command
+                .get_captured_envs()
+                .iter()
+                .any(|(name, value)| name == "RECORD_ENV_FIXTURE" && value == "value")
+        );
+    }
+
+    #[test]
+    fn record_guest_command_refuses_missing_passthrough_environment() {
+        let name = "HERMIT_RECORD_MISSING_ENV_FIXTURE_5E7D2C";
+        assert!(std::env::var_os(name).is_none());
+        let error = match start_options(vec![(name.into(), None)]).guest_command() {
+            Ok(_) => panic!("missing pass-through environment was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not set in the host environment")
+        );
+    }
+
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
     // perpetually pending and silently disable the deadline. Arming must unblock
     // SIGALRM, and dropping must restore the prior blocked state without
@@ -618,6 +681,7 @@ mod tests {
             program: Some(PathBuf::from("/proc/self/exe")),
             _strict: false,
             args: Vec::new(),
+            env: Vec::new(),
             data_dir: None,
             record_timeout: None,
             verify: false,

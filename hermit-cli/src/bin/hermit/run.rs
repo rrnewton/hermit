@@ -427,7 +427,7 @@ pub struct RunOpts {
     e9patch_program: Option<PathBuf>,
 }
 
-fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
+pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
     static ENV_RE: LazyLock<regex::Regex> = LazyLock::new(||
         // Here we are extremely permissive, allowing all charecters in the "Portable Character
         // Set", ISO/IEC 6429:1992 standard:

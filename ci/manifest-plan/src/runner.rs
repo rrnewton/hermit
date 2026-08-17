@@ -767,8 +767,9 @@ pub fn build_spec(
                 dir.join("recording").to_string_lossy().into_owned(),
                 "--record-timeout".into(),
                 cell.test.timeout_seconds.to_string(),
-                "--".into(),
             ]);
+            append_guest_env_args(&mut argv, &env);
+            argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, Some(verdict))
         }
@@ -1878,6 +1879,45 @@ mod tests {
             "E2E_FIXTURE_DIR",
         ] {
             assert!(spec.argv.windows(2).any(|window| {
+                window[0] == "--env" && window[1].starts_with(&format!("{name}="))
+            }));
+        }
+
+        let mut replay_test = recipe(true);
+        let replay_mode = replay_test.modes.remove("verify").unwrap();
+        replay_test.modes.insert("replay".into(), replay_mode);
+        let replay_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: replay_test.id.clone(),
+                mode: "replay".into(),
+                backend: Some("ptrace".into()),
+            },
+            test: replay_test,
+            enabled: true,
+        };
+        let replay = build_spec(
+            &context,
+            &replay_cell,
+            PathBuf::from("/repo/results/replay-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        assert!(replay.argv.iter().any(|arg| arg == "--verify-strict"));
+        assert!(replay.argv.windows(2).any(|window| {
+            window[0] == "--verify-json" && window[1] == "/repo/results/replay-cell/verify-1.json"
+        }));
+        for name in [
+            "LC_ALL",
+            "TZ",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "E2E_TMPDIR",
+            "E2E_FIXTURE_DIR",
+        ] {
+            assert!(replay.argv.windows(2).any(|window| {
                 window[0] == "--env" && window[1].starts_with(&format!("{name}="))
             }));
         }

@@ -42,6 +42,7 @@ use manifest_value::Value;
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-to-commands: {}", message.as_ref());
@@ -266,7 +267,7 @@ fn hermit_command(
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict $record_verify_strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
@@ -711,6 +712,8 @@ test:
         );
         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
         assert!(replay.contains("--strict $record_verify_strict --verify"));
+        assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+        assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
         let chaos = hermit_command(
