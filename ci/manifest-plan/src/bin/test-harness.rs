@@ -567,6 +567,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
 
     let privileged_workflow = fs::read_to_string(root.join(".github/workflows/ci-privileged.yml"))
         .map_err(|e| e.to_string())?;
+    audit_privileged_unboxed_guard(&privileged_workflow)?;
     if privileged_workflow
         .matches("continue-on-error: true")
         .count()
@@ -639,6 +640,45 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             .sum::<usize>(),
         privileged.steps.len()
     );
+    Ok(())
+}
+
+fn audit_privileged_unboxed_guard(workflow: &str) -> Result<(), String> {
+    const ACTIONS_GUARD: &str = "        if [[ ${GITHUB_ACTIONS:-} != true ]]; then";
+    const REFUSAL: &str = "          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2";
+    const FAIL_CLOSED: &str = "          exit 2";
+
+    for (line, description) in [
+        (ACTIONS_GUARD, "exact GitHub Actions context guard"),
+        (REFUSAL, "explicit outside-Actions refusal"),
+        (FAIL_CLOSED, "nonzero outside-Actions exit"),
+    ] {
+        if workflow
+            .lines()
+            .filter(|candidate| *candidate == line)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "privileged workflow must contain exactly one {description}"
+            ));
+        }
+    }
+
+    if workflow.matches("--unsafe-no-cgroups").count() != 1 {
+        return Err(
+            "privileged workflow must select explicit unboxed execution exactly once".into(),
+        );
+    }
+    if workflow
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .any(|line| line.contains("--allow-cgroup-failure"))
+    {
+        return Err(
+            "privileged workflow must not execute with broad --allow-cgroup-failure".into(),
+        );
+    }
     Ok(())
 }
 
@@ -915,5 +955,50 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_privileged_unboxed_guard;
+
+    const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
+        if [[ ${GITHUB_ACTIONS:-} != true ]]; then
+          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
+          exit 2
+        fi
+        timeout 720s ci/run-dag.sh privileged --unsafe-no-cgroups
+"#;
+
+    #[test]
+    fn privileged_unboxed_execution_requires_the_exact_actions_guard() {
+        assert!(audit_privileged_unboxed_guard(GUARDED_WORKFLOW).is_ok());
+    }
+
+    #[test]
+    fn privileged_unboxed_execution_refuses_incomplete_guards() {
+        for required in [
+            "        if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n",
+            "          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n",
+            "          exit 2\n",
+        ] {
+            let incomplete = GUARDED_WORKFLOW.replacen(required, "", 1);
+            assert!(audit_privileged_unboxed_guard(&incomplete).is_err());
+        }
+    }
+
+    #[test]
+    fn privileged_unboxed_execution_requires_one_explicit_opt_out() {
+        let missing = GUARDED_WORKFLOW.replace(" --unsafe-no-cgroups", "");
+        assert!(audit_privileged_unboxed_guard(&missing).is_err());
+
+        let duplicate = format!("{GUARDED_WORKFLOW}# --unsafe-no-cgroups\n");
+        assert!(audit_privileged_unboxed_guard(&duplicate).is_err());
+    }
+
+    #[test]
+    fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
+        let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
+        assert!(audit_privileged_unboxed_guard(&executable).is_err());
     }
 }
