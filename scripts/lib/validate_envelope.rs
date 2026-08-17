@@ -46,6 +46,7 @@ use safe_ci_dag_runner::model::StepOutcome;
 
 use crate::validate_plan::node;
 use crate::validate_plan::shell_join;
+use crate::validate_plan::shell_quote;
 
 /// One end-to-end scenario measured at every assurance level.
 pub struct EnvelopeProbe {
@@ -94,13 +95,43 @@ pub fn json_path(root: &Path) -> std::path::PathBuf {
 
 /// The `hermit` invocation for one level, reproducing `_envelope_level`
 /// (validate.sh:4161). stdin is closed so no probe can block on input.
-fn level_command(hermit_bin: &str, flags: &[&str], argv: &[&str]) -> String {
+fn level_command(
+    hermit_bin: &str,
+    flags: &[&str],
+    argv: &[&str],
+    verify_report: Option<&Path>,
+) -> String {
     let mut v: Vec<String> = vec![hermit_bin.to_string()];
     v.extend(HERMIT_RUN_ARGS.iter().map(|s| s.to_string()));
     v.extend(flags.iter().map(|s| s.to_string()));
+    if let Some(report) = verify_report {
+        v.push("--verify-json".to_string());
+        v.push(report.to_string_lossy().into_owned());
+    }
     v.push("--".to_string());
     v.extend(argv.iter().map(|s| s.to_string()));
-    format!("{} </dev/null", shell_join(&v))
+    let command = format!("{} </dev/null", shell_join(&v));
+    match verify_report {
+        Some(report) => require_canonical_report(command, report),
+        None => command,
+    }
+}
+
+fn require_canonical_report(command: String, report: &Path) -> String {
+    let directory = shell_quote(&report.parent().unwrap_or(Path::new(".")).to_string_lossy());
+    let report = shell_quote(&report.to_string_lossy());
+    format!(
+        "mkdir -p {directory} && rm -f {report} && {command} && \
+         jq -e '(.verified == true) and (.verdict == \"matched\") and \
+         (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+         (.comparison.compare_logs == true) and \
+         ((.compared_log_messages.left // 0) > 0) and \
+         ((.compared_log_messages.right // 0) > 0)' {report} >/dev/null"
+    )
+}
+
+fn timeout_full_operation(duration: &str, command: &str) -> String {
+    format!("timeout {duration} sh -c {}", shell_quote(command))
 }
 
 /// Build every envelope node. `build_dep` is the workspace build the bash gates
@@ -109,11 +140,15 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
     let mut out = Vec::new();
     for p in PROBES {
         let job = |lvl: &str| format!("{}_{lvl}", p.label);
+        let report = |lvl: &str| {
+            Path::new("target/validate-verify")
+                .join(format!("envelope-{}-{lvl}.json", p.label))
+        };
         out.push(node(
             "envelope",
             &job("l1"),
             &format!("envelope {}: L1 hermit run --strict", p.label),
-            level_command(hermit_bin, &["--strict"], p.argv),
+            level_command(hermit_bin, &["--strict"], p.argv, None),
             vec![build_dep.to_string()],
             SMOKE_TIMEOUT_S,
             SMOKE_TIMEOUT_S * 2,
@@ -123,7 +158,12 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             "envelope",
             &job("l2"),
             &format!("envelope {}: L2 --strict --verify", p.label),
-            level_command(hermit_bin, &["--strict", "--verify"], p.argv),
+            level_command(
+                hermit_bin,
+                &["--strict", "--verify"],
+                p.argv,
+                Some(&report("l2")),
+            ),
             vec![build_dep.to_string()],
             SMOKE_TIMEOUT_S,
             SMOKE_TIMEOUT_S * 2,
@@ -137,6 +177,7 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
                 hermit_bin,
                 &["--strict", "--verify", "--detlog-heap", "--detlog-stack"],
                 p.argv,
+                Some(&report("l3")),
             ),
             vec![build_dep.to_string()],
             SMOKE_TIMEOUT_S,
@@ -147,13 +188,20 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
         // dependency edge reproduces that without a second conditional. Each
         // repetition keeps its own 30s bound, and the loop stops at the first
         // divergence exactly as `|| { ok=0; break; }` did.
-        let l2_cmd = level_command(hermit_bin, &["--strict", "--verify"], p.argv);
+        let l2_cmd = level_command(
+            hermit_bin,
+            &["--strict", "--verify"],
+            p.argv,
+            Some(&report("l4")),
+        );
+        let timed_l2_cmd =
+            timeout_full_operation(&format!("{SMOKE_TIMEOUT_S}s"), &l2_cmd);
         out.push(node(
             "envelope",
             &job("l4"),
             &format!("envelope {}: L4 = L2 stress x{reps} (no divergence)", p.label),
             format!(
-                "i=0; while [ $i -lt {reps} ]; do timeout {SMOKE_TIMEOUT_S}s {l2_cmd} || exit 1; \
+                "i=0; while [ $i -lt {reps} ]; do {timed_l2_cmd} || exit 1; \
                  i=$((i+1)); done"
             ),
             vec![format!("envelope.{}", job("l2"))],
@@ -169,13 +217,22 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             .and_then(|v| v.trim_end_matches('s').parse::<i64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(SMOKE_TIMEOUT_S);
-        let mut rr: Vec<String> = vec![hermit_bin.to_string(), "record".into(), "start".into(), "--verify".into(), "--".into()];
+        let rr_report = report("rr");
+        let mut rr: Vec<String> = vec![
+            hermit_bin.to_string(),
+            "record".into(),
+            "start".into(),
+            "--verify".into(),
+            "--verify-json".into(),
+            rr_report.to_string_lossy().into_owned(),
+            "--".into(),
+        ];
         rr.extend(p.argv.iter().map(|s| s.to_string()));
         out.push(node(
             "envelope",
             &job("rr"),
             &format!("envelope {}: rr record/replay end-to-end", p.label),
-            format!("{} </dev/null", shell_join(&rr)),
+            require_canonical_report(format!("{} </dev/null", shell_join(&rr)), &rr_report),
             vec![build_dep.to_string()],
             rr_timeout,
             rr_timeout * 2,
@@ -357,6 +414,49 @@ pub fn self_test() -> Result<String, String> {
                 p.label, l4.deps
             ));
         }
+        if !l4
+            .cmd
+            .contains(&format!("timeout {SMOKE_TIMEOUT_S}s sh -c "))
+            || !l4.cmd.contains("mkdir -p")
+            || !l4.cmd.contains("jq -e")
+        {
+            return Err(format!(
+                "envelope {} l4 repetition must bound its full mkdir/Hermit/jq operation: {}",
+                p.label, l4.cmd
+            ));
+        }
+    }
+    // Execute the same grouping constructor with a short planted timeout. The
+    // operation deliberately has a 31-second tail after mkdir/rm and the guest
+    // placeholder. If timeout governed only the mkdir prefix, this bracket
+    // would run beyond the production 30-second repetition budget and create
+    // the marker after jq. Correct grouping terminates the whole shell quickly.
+    let timeout_dir = std::env::temp_dir().join(format!(
+        "validate-envelope-timeout-selftest-{}",
+        std::process::id()
+    ));
+    let marker = timeout_dir.join("tail-ran");
+    let operation = format!(
+        "mkdir -p {} && rm -f {} && true && sleep 31 && \
+         jq -n -e true >/dev/null && touch {}",
+        shell_quote(&timeout_dir.to_string_lossy()),
+        shell_quote(&marker.to_string_lossy()),
+        shell_quote(&marker.to_string_lossy())
+    );
+    let bounded = timeout_full_operation("0.2s", &operation);
+    let started = std::time::Instant::now();
+    let status = std::process::Command::new("sh")
+        .args(["-c", &bounded])
+        .status()
+        .map_err(|e| format!("envelope timeout self-test could not run: {e}"))?;
+    let elapsed = started.elapsed();
+    let marker_exists = marker.exists();
+    let _ = std::fs::remove_dir_all(&timeout_dir);
+    if status.success() || marker_exists || elapsed > std::time::Duration::from_secs(5) {
+        return Err(format!(
+            "envelope repetition timeout did not govern the full operation: \
+             status={status} marker={marker_exists} elapsed={elapsed:?}"
+        ));
     }
     // Scoring bracket. Positive: a full sweep scores 3/3 everywhere. Negative: a
     // skipped (never-run) node scores 0, and an aborted one does too.
@@ -442,7 +542,7 @@ pub fn self_test() -> Result<String, String> {
     refused += 1;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(format!(
-        "envelope: {} nodes ({} probes x {} levels) all capped, l4->l2 edges present, \
+        "envelope: {} nodes ({} probes x {} levels) all capped, l4->l2 edges and full-operation timeout present, \
          scoring bracketed 1 full / 1 skip-zero, comparison bracketed {accepted} accept / {refused} refuse",
         steps.len(),
         PROBES.len(),

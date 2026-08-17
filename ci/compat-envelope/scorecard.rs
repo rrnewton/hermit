@@ -7,6 +7,7 @@
 //! [dependencies]
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -24,6 +25,8 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
@@ -37,9 +40,13 @@ Commands:
       Print the derived compatibility table.
   check
       Refuse if SCORECARD.md or ci/compat-envelope/cells.json is stale.
-  update [--allow-green-removal] [--allow-cell-removal]
-      Rewrite the two tracked files. Green regressions and cell deletion are
-      refused unless the matching explicit flag is present.
+  update [--allow-cell-removal]
+      Reconcile manifest structure while preserving observed statuses. Cell
+      deletion is refused unless the explicit flag is present.
+  update-results --results DIR
+      Merge clean exact-HEAD validate results into the tracked cell statuses.
+      PASS records green; FAIL or ERROR records red. Files are rewritten only
+      when their bytes change. The selected regression plan is never changed.
   update-observations --summary FILE
       Merge one completed clean pressure-test summary into the red cells'
       checked-in observations. This never changes which cells are green.
@@ -53,9 +60,11 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by ci/expected-e2e-plan.json. Everything
-else in the manifest is red until it is measured, promoted into the selected
-plan, and passes validate.
+Green means that the latest validate result merged for the cell passed. Red
+means that the latest merged result failed or that no passing result has been
+merged. ci/expected-e2e-plan.json separately names the cells that remain
+blocking in ordinary validation; recording a selected cell red never removes
+it from that plan.
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -266,7 +275,7 @@ fn run() -> Result<(), String> {
     match command.as_str() {
         "show" => {
             no_more(&mut args)?;
-            let derived = derive(&root)?;
+            let derived = check_tracked(&root)?;
             print!("{}", render_scorecard(&derived));
         }
         "check" => {
@@ -278,16 +287,14 @@ fn run() -> Result<(), String> {
             );
         }
         "update" => {
-            let mut allow_green_removal = false;
             let mut allow_cell_removal = false;
             for arg in args {
                 match arg.as_str() {
-                    "--allow-green-removal" => allow_green_removal = true,
                     "--allow-cell-removal" => allow_cell_removal = true,
                     _ => return Err(format!("unknown update option `{arg}`\n\n{USAGE}")),
                 }
             }
-            update_tracked(&root, allow_green_removal, allow_cell_removal)?;
+            update_tracked(&root, allow_cell_removal)?;
         }
         "update-observations" => {
             let mut summary = None;
@@ -308,6 +315,23 @@ fn run() -> Result<(), String> {
             update_observations(
                 &root,
                 &summary.ok_or("update-observations requires --summary FILE")?,
+            )?;
+        }
+        "update-results" => {
+            let mut result_root = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--results" => {
+                        result_root = Some(PathBuf::from(
+                            args.next().ok_or("--results requires a directory")?,
+                        ));
+                    }
+                    _ => return Err(format!("unknown update-results option `{arg}`\n\n{USAGE}")),
+                }
+            }
+            update_results(
+                &root,
+                &result_root.ok_or("update-results requires --results DIR")?,
             )?;
         }
         "verify-results" => {
@@ -460,21 +484,12 @@ fn derive(root: &Path) -> Result<Derived, String> {
             ));
         }
     }
-    let green = selected_green(&selected, &population);
     Ok(Derived {
         population,
         enabled,
         selected,
-        green,
+        green: BTreeSet::new(),
     })
-}
-
-fn selected_green(selected: &BTreeSet<CellId>, population: &BTreeSet<CellId>) -> BTreeSet<CellId> {
-    selected
-        .iter()
-        .filter(|id| population.contains(*id))
-        .cloned()
-        .collect()
 }
 
 fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
@@ -501,17 +516,26 @@ fn render_scorecard(derived: &Derived) -> String {
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is in `ci/expected-e2e-plan.json` and is therefore required to pass by \
-ordinary validation. **Red** is every \
-other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
-the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
-not omitted: a cell that cannot run is not green.\n\n\
-These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell, and every seed in a \
-selected `chaos` cell, runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
-same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
-parity.\n\n\
+**Green** means the latest validate result merged for the cell passed. **Red** means the latest \
+merged result failed, or no passing result has been merged. `ci/expected-e2e-plan.json` separately \
+names the cells that ordinary validation must run: a selected red cell remains blocking and is not \
+removed from that plan. Manifest-disabled combinations are red, not omitted: a cell that cannot run \
+is not green.\n\n\
+These are the current Basic Sanity contracts. Every `verify` cell, every `replay` cell, and every seed in a \
+selected `chaos` cell requires a typed canonical verdict. Verification passes on a supported canonical evidence path require non-vacuous \
+INFO-log bitwise parity. Direct DBT verification currently fails closed with `no_result` pending a protected Reverie internal descriptor; \
+KVM remains output-only and therefore unqualified for that claim.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
+    );
+    out.insert_str(
+        out.find("| Backend")
+            .expect("scorecard backend table exists"),
+        &format!(
+            "Cell-status SHA-256: `{}`. This covers every cell identity, enabled flag, and \
+green/red status, so a status change cannot disappear behind unchanged aggregate counts.\n\n",
+            status_digest(derived)
+        ),
     );
     let mut green_total = 0usize;
     let mut total = 0usize;
@@ -629,6 +653,13 @@ denominator.\n\n\
         ));
     }
     out.push('\n');
+    let selected_comparable: BTreeSet<_> = derived
+        .selected
+        .intersection(&derived.population)
+        .cloned()
+        .collect();
+    let selected_green = selected_comparable.intersection(&derived.green).count();
+    let selected_red = selected_comparable.len() - selected_green;
     let chaos = derived
         .selected
         .iter()
@@ -640,19 +671,49 @@ denominator.\n\n\
         .filter(|id| id.mode == "custom")
         .count();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
-explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
-        derived.selected.len()
+        "Ordinary full validation executes {} selected regression cells: {selected_green} currently \
+green comparable cells, {selected_red} currently red comparable cells, and {custom} explicit custom \
+commands outside the comparable denominator (including {chaos} selected chaos-mode race-exposure \
+checks). A passing validate must produce a fresh PASS result for every selected cell. Recording a \
+selected cell red reports the failure; it does not remove or excuse the cell.\n",
+        derived.selected.len(),
     ));
     out
+}
+
+fn status_digest(derived: &Derived) -> String {
+    let mut hasher = Sha256::new();
+    for id in &derived.population {
+        let status = if derived.green.contains(id) {
+            "green"
+        } else {
+            "red"
+        };
+        let enabled = if derived.enabled.contains(id) {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        for field in [
+            id.lane.as_str(),
+            id.category.as_str(),
+            id.test.as_str(),
+            id.mode.as_str(),
+            id.backend.as_str(),
+            enabled,
+            status,
+        ] {
+            hasher.update(field.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn tracked_from(
     derived: &Derived,
     existing: Option<TrackedCells>,
-    allow_green_removal: bool,
     allow_cell_removal: bool,
 ) -> Result<TrackedCells, String> {
     let mut previous = BTreeMap::new();
@@ -683,24 +744,6 @@ fn tracked_from(
             display_id(&removed[0])
         ));
     }
-    let regressed: Vec<_> = previous
-        .values()
-        .filter(|cell| {
-            cell.status == CellStatus::Green
-                && derived.population.contains(&cell.id)
-                && !derived.green.contains(&cell.id)
-        })
-        .map(|cell| cell.id.clone())
-        .collect();
-    if !regressed.is_empty() && !allow_green_removal {
-        return Err(format!(
-            "refusing to move {} green cell(s) to red; first is {}. Fix the regression, or use \
-             --allow-green-removal only at an explicit compatibility-standard transition",
-            regressed.len(),
-            display_id(&regressed[0])
-        ));
-    }
-
     let cells = derived
         .population
         .iter()
@@ -710,11 +753,10 @@ fn tracked_from(
                 .get(&id)
                 .map(|cell| cell.observations.clone())
                 .unwrap_or_default();
-            let status = if derived.green.contains(&id) {
-                CellStatus::Green
-            } else {
-                CellStatus::Red
-            };
+            let status = previous
+                .get(&id)
+                .map(|cell| cell.status)
+                .unwrap_or(CellStatus::Red);
             let enabled = derived.enabled.contains(&id);
             TrackedCell {
                 id,
@@ -746,11 +788,17 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
 }
 
 fn check_tracked(root: &Path) -> Result<Derived, String> {
-    let derived = derive(root)?;
+    let mut derived = derive(root)?;
+    let cells = tracked_from(&derived, load_existing(root)?, false)?;
+    compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
+    derived.green = cells
+        .cells
+        .iter()
+        .filter(|cell| cell.status == CellStatus::Green)
+        .map(|cell| cell.id.clone())
+        .collect();
     let expected_scorecard = render_scorecard(&derived);
     compare_file(&root.join(SCORECARD), &expected_scorecard)?;
-    let cells = tracked_from(&derived, load_existing(root)?, false, false)?;
-    compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     Ok(derived)
 }
 
@@ -770,27 +818,132 @@ fn compare_file(path: &Path, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn update_tracked(
-    root: &Path,
-    allow_green_removal: bool,
-    allow_cell_removal: bool,
-) -> Result<(), String> {
-    let derived = derive(root)?;
-    let cells = tracked_from(
-        &derived,
-        load_existing(root)?,
-        allow_green_removal,
-        allow_cell_removal,
-    )?;
-    fs::write(root.join(SCORECARD), render_scorecard(&derived))
-        .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
-    fs::write(root.join(CELLS), encoded_cells(&cells)?)
-        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+fn update_tracked(root: &Path, allow_cell_removal: bool) -> Result<(), String> {
+    let mut derived = derive(root)?;
+    let cells = tracked_from(&derived, load_existing(root)?, allow_cell_removal)?;
+    derived.green = cells
+        .cells
+        .iter()
+        .filter(|cell| cell.status == CellStatus::Green)
+        .map(|cell| cell.id.clone())
+        .collect();
+    write_if_changed(&root.join(SCORECARD), &render_scorecard(&derived))?;
+    write_if_changed(&root.join(CELLS), &encoded_cells(&cells)?)?;
     println!(
         "compatibility scorecard: wrote {} green / {} red / {} total",
         derived.green.len(),
         derived.population.len() - derived.green.len(),
         derived.population.len()
+    );
+    Ok(())
+}
+
+fn write_if_changed(path: &Path, contents: &str) -> Result<bool, String> {
+    match fs::read(path) {
+        Ok(actual) if actual == contents.as_bytes() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    }
+    fs::write(path, contents).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+fn latest_candidates(
+    mut candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
+) -> Result<BTreeMap<CellId, ResultCandidate>, String> {
+    let mut latest = BTreeMap::new();
+    for (id, rows) in candidates.iter_mut() {
+        rows.sort_by(|a, b| {
+            a.modified
+                .cmp(&b.modified)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let newest = rows.last().expect("candidate vectors are nonempty");
+        if rows.len() >= 2 && rows[rows.len() - 2].modified == newest.modified {
+            return Err(format!(
+                "ambiguous equally-new results for {} in {} and {}",
+                display_id(id),
+                rows[rows.len() - 2].path.display(),
+                newest.path.display()
+            ));
+        }
+    }
+    for (id, mut rows) in candidates {
+        latest.insert(id, rows.pop().expect("candidate vectors are nonempty"));
+    }
+    Ok(latest)
+}
+
+fn apply_result_statuses(
+    tracked: &mut TrackedCells,
+    candidates: BTreeMap<CellId, ResultCandidate>,
+) -> Result<(usize, usize), String> {
+    let mut by_id: BTreeMap<CellId, usize> = tracked
+        .cells
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| (cell.id.clone(), index))
+        .collect();
+    let mut observed = 0usize;
+    let mut changed = 0usize;
+    for (id, candidate) in candidates {
+        let Some(index) = by_id.remove(&id) else {
+            if id.mode == "custom" {
+                continue;
+            }
+            return Err(format!(
+                "validate result names untracked compatibility cell {} ({})",
+                display_id(&id),
+                candidate.path.display()
+            ));
+        };
+        let status = match candidate.row.outcome.as_str() {
+            "PASS" => CellStatus::Green,
+            "FAIL" | "ERROR" => CellStatus::Red,
+            other => {
+                return Err(format!(
+                    "validate result for {} has unknown outcome `{other}` ({})",
+                    display_id(&id),
+                    candidate.path.display()
+                ));
+            }
+        };
+        observed += 1;
+        if tracked.cells[index].status != status {
+            tracked.cells[index].status = status;
+            changed += 1;
+        }
+    }
+    Ok((observed, changed))
+}
+
+fn update_results(root: &Path, result_root: &Path) -> Result<(), String> {
+    let mut derived = derive(root)?;
+    let mut tracked = tracked_from(&derived, load_existing(root)?, false)?;
+    let candidates = latest_candidates(read_result_candidates(result_root, &git_head(root)?)?)?;
+    let (observed, changed) = apply_result_statuses(&mut tracked, candidates)?;
+    derived.green = tracked
+        .cells
+        .iter()
+        .filter(|cell| cell.status == CellStatus::Green)
+        .map(|cell| cell.id.clone())
+        .collect();
+    let cells_changed = write_if_changed(&root.join(CELLS), &encoded_cells(&tracked)?)?;
+    let scorecard_changed = write_if_changed(&root.join(SCORECARD), &render_scorecard(&derived))?;
+    println!(
+        "compatibility scorecard: observed {observed} comparable cell(s), changed {changed}; \
+         {} and {}",
+        if cells_changed {
+            "updated cells.json"
+        } else {
+            "left cells.json untouched"
+        },
+        if scorecard_changed {
+            "updated SCORECARD.md"
+        } else {
+            "left SCORECARD.md untouched"
+        },
     );
     Ok(())
 }
@@ -957,7 +1110,7 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
 }
 
 fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> Result<(), String> {
-    let derived = derive(root)?;
+    let derived = check_tracked(root)?;
     let head = git_head(root)?;
     let expected: BTreeSet<_> = derived
         .selected
@@ -1034,9 +1187,6 @@ fn read_result_candidates(
     }
     let mut files = Vec::new();
     find_result_files(root, &mut files)?;
-    if files.is_empty() {
-        return Err(format!("no results.jsonl files under {}", root.display()));
-    }
     let mut out: BTreeMap<CellId, Vec<ResultCandidate>> = BTreeMap::new();
     for path in files {
         let modified = fs::metadata(&path)
@@ -1102,29 +1252,16 @@ fn find_result_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 
 fn verify_candidate_set(
     expected: &BTreeSet<CellId>,
-    mut candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
+    candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
 ) -> Result<(), String> {
+    let mut candidates = latest_candidates(candidates)?;
     let mut missing = Vec::new();
     let mut failed = Vec::new();
     for id in expected {
-        let Some(rows) = candidates.get_mut(id) else {
+        let Some(latest) = candidates.remove(id) else {
             missing.push(display_id(id));
             continue;
         };
-        rows.sort_by(|a, b| {
-            a.modified
-                .cmp(&b.modified)
-                .then_with(|| a.path.cmp(&b.path))
-        });
-        let latest = rows.last().expect("nonempty candidate list");
-        if rows.len() >= 2 && rows[rows.len() - 2].modified == latest.modified {
-            return Err(format!(
-                "ambiguous equally-new results for {} in {} and {}",
-                display_id(id),
-                rows[rows.len() - 2].path.display(),
-                latest.path.display()
-            ));
-        }
         if latest.row.outcome != "PASS" {
             failed.push(format!(
                 "{}={} ({})",
@@ -1208,17 +1345,13 @@ fn self_test() -> Result<(), String> {
     {
         return Err("negative result bracket accepted a failing row".into());
     }
-    let chaos_id = CellId {
-        mode: "chaos".into(),
-        ..id.clone()
+    let selected = BTreeSet::from([id.clone()]);
+    let regressed = Derived {
+        population: BTreeSet::from([id.clone()]),
+        enabled: BTreeSet::from([id.clone()]),
+        selected,
+        green: BTreeSet::new(),
     };
-    let population = BTreeSet::from([chaos_id.clone()]);
-    if !selected_green(&BTreeSet::from([chaos_id.clone()]), &population).contains(&chaos_id) {
-        return Err("a selected chaos cell was structurally excluded from green".into());
-    }
-    if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
-        return Err("an unselected chaos cell was accepted as green".into());
-    }
     let old_green = TrackedCells {
         schema: SCHEMA,
         cells: vec![TrackedCell {
@@ -1228,26 +1361,87 @@ fn self_test() -> Result<(), String> {
             observations: Vec::new(),
         }],
     };
-    let regressed = Derived {
-        population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
-        selected: BTreeSet::new(),
-        green: BTreeSet::new(),
-    };
-    if tracked_from(&regressed, Some(old_green), false, false).is_ok() {
-        return Err("negative ratchet bracket accepted green-to-red movement".into());
+    let mut result_statuses = tracked_from(&regressed, Some(old_green), false)
+        .map_err(|e| format!("tracked status preservation bracket failed: {e}"))?;
+    if result_statuses.cells[0].status != CellStatus::Green {
+        return Err("plan derivation overwrote the last observed cell status".into());
     }
-    let intentional = TrackedCells {
-        schema: SCHEMA,
-        cells: vec![TrackedCell {
-            id: id.clone(),
-            enabled: true,
-            status: CellStatus::Green,
-            observations: Vec::new(),
-        }],
+    let (observed_count, changed_count) = apply_result_statuses(
+        &mut result_statuses,
+        BTreeMap::from([(id.clone(), candidate("FAIL"))]),
+    )?;
+    if observed_count != 1
+        || changed_count != 1
+        || result_statuses.cells[0].status != CellStatus::Red
+        || !regressed.selected.contains(&id)
+    {
+        return Err(
+            "a failing validate result did not record red while keeping the cell selected".into(),
+        );
+    }
+    let (_, repeated_change) = apply_result_statuses(
+        &mut result_statuses,
+        BTreeMap::from([(id.clone(), candidate("FAIL"))]),
+    )?;
+    if repeated_change != 0 {
+        return Err("an unchanged failing result rewrote the cell status".into());
+    }
+    let (_, passing_change) = apply_result_statuses(
+        &mut result_statuses,
+        BTreeMap::from([(id.clone(), candidate("PASS"))]),
+    )?;
+    if passing_change != 1 || result_statuses.cells[0].status != CellStatus::Green {
+        return Err("a passing validate result did not record green".into());
+    }
+    let (_, error_change) = apply_result_statuses(
+        &mut result_statuses,
+        BTreeMap::from([(id.clone(), candidate("ERROR"))]),
+    )?;
+    if error_change != 1 || result_statuses.cells[0].status != CellStatus::Red {
+        return Err("an ERROR validate result did not record red".into());
+    }
+
+    let second_id = CellId {
+        test: "fixture/second".into(),
+        ..id.clone()
     };
-    tracked_from(&regressed, Some(intentional), true, false)
-        .map_err(|e| format!("explicit compatibility-transition bracket failed: {e}"))?;
+    let digest_base = Derived {
+        population: BTreeSet::from([id.clone(), second_id.clone()]),
+        enabled: BTreeSet::from([id.clone(), second_id.clone()]),
+        selected: BTreeSet::from([id.clone(), second_id.clone()]),
+        green: BTreeSet::from([id.clone()]),
+    };
+    let digest_swapped = Derived {
+        population: BTreeSet::from([id.clone(), second_id.clone()]),
+        enabled: BTreeSet::from([id.clone(), second_id.clone()]),
+        selected: BTreeSet::from([id.clone(), second_id.clone()]),
+        green: BTreeSet::from([second_id]),
+    };
+    if status_digest(&digest_base) == status_digest(&digest_swapped) {
+        return Err(
+            "count-cancelling cell status changes left the scorecard digest unchanged".into(),
+        );
+    }
+
+    let write_dir = env::temp_dir().join(format!(
+        "hermit-scorecard-write-bracket-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&write_dir)
+        .map_err(|e| format!("cannot create write bracket directory: {e}"))?;
+    let write_path = write_dir.join("SCORECARD.md");
+    fs::write(&write_path, "same\n").map_err(|e| format!("cannot seed write bracket: {e}"))?;
+    if write_if_changed(&write_path, "same\n")? {
+        return Err("byte-identical scorecard content was rewritten".into());
+    }
+    if !write_if_changed(&write_path, "changed\n")?
+        || fs::read_to_string(&write_path).ok().as_deref() != Some("changed\n")
+    {
+        return Err("changed scorecard content was not written".into());
+    }
+    fs::remove_file(&write_path)
+        .and_then(|_| fs::remove_dir(&write_dir))
+        .map_err(|e| format!("cannot remove write bracket directory: {e}"))?;
 
     let mut observed = TrackedCells {
         schema: SCHEMA,
@@ -1335,7 +1529,7 @@ fn self_test() -> Result<(), String> {
     if observed.cells[0].observations.len() != 2 {
         return Err("a new Detcore tree was blended into an old observation".into());
     }
-    let preserved = tracked_from(&regressed, Some(observed.clone()), true, false)?;
+    let preserved = tracked_from(&regressed, Some(observed.clone()), false)?;
     if preserved.cells[0].observations != observed.cells[0].observations {
         return Err("ordinary scorecard derivation changed pressure observations".into());
     }
@@ -1391,7 +1585,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: result, selected-chaos, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: result refusal, observed-status, count-cancelling digest, conditional-write, selected-plan preservation, observation-range, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }

@@ -1502,6 +1502,11 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
+    /// Sets the deterministic process identity supplied by an external backend.
+    pub fn set_detpid(&mut self, detpid: DetTid) {
+        self.detpid = Some(detpid);
+    }
+
     pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         self.guest_clock
             .lock()

@@ -186,7 +186,7 @@ fn example_command(
         command.arg("--verify");
         if let Some(directory) = retained_verify_log_dir {
             command
-                .args(["--verify-strict", "--keep-logs", "--verify-log-dir"])
+                .args(["--keep-logs", "--verify-log-dir"])
                 .arg(directory)
                 .arg("--verify-json")
                 .arg(directory.join("verify.json"));

@@ -45,8 +45,8 @@ function assert_native_nondeterminism {
 # from the exit code or a log banner.
 #
 # The previous implementation claimed "every application must exercise strict
-# L2" and then ran bare `--verify`, which compares under the LOSSY Stripped
-# policy and cannot earn L2 at all; it then decided success by grepping stderr
+# L2" and then ran bare `--verify`, which at the time used the removed lossy
+# Stripped policy and could not earn L2; it then decided success by grepping stderr
 # for "Success: deterministic. Determinism verified.". Both halves were proxies.
 # A banner is a printed marker, not a verdict, and an exit code belongs to the
 # GUEST -- a guest that exits nonzero makes a passing verification look failed,
@@ -54,9 +54,8 @@ function assert_native_nondeterminism {
 #
 # So this reads `--verify-json`, whose contract is documented on
 # `RunOpts::verify_json` and is explicit that a parity ratchet "must key on
-# `bitwise_parity`, NOT `verified`" -- `verified` is true for a stripped match
-# too. `bitwise_parity` is true only under the canonical (`--verify-strict`)
-# policy, and `compared_log_messages` is what makes it falsifiable: a strict
+# `bitwise_parity`, NOT `verified`". `bitwise_parity` is true only under the
+# canonical policy, and `compared_log_messages` is what makes it falsifiable: a strict
 # CONFIGURATION is not evidence that the configured comparison had any data.
 #
 # Four outcomes are kept distinct, because collapsing them is how a harness
@@ -159,7 +158,7 @@ function run_hermit_verify {
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
         "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
         --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
-        --verify --verify-strict --verify-json "$verdict_file" -- \
+        --verify --verify-json "$verdict_file" -- \
         "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 
     local failure=""
@@ -169,23 +168,29 @@ function run_hermit_verify {
         # that point: a launch refusal, not a comparison outcome.
         failure="REFUSED: no --verify-json report was written (Hermit exited $status before stamping a verdict)"
     else
-        local parity counts_left counts_right verdict_name
+        local parity counts_left counts_right verdict_name strictness compare_logs
         parity=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bitwise_parity"))' "$verdict_file" 2>/dev/null || echo ERROR)
         verdict_name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict"))' "$verdict_file" 2>/dev/null || echo ERROR)
+        strictness=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("comparison") or {}).get("strictness"))' "$verdict_file" 2>/dev/null || echo ERROR)
+        compare_logs=$(python3 -c 'import json,sys; print((json.load(open(sys.argv[1])).get("comparison") or {}).get("compare_logs"))' "$verdict_file" 2>/dev/null || echo ERROR)
         counts_left=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("compared_log_messages") or {}; print(c.get("left",0))' "$verdict_file" 2>/dev/null || echo ERROR)
         counts_right=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("compared_log_messages") or {}; print(c.get("right",0))' "$verdict_file" 2>/dev/null || echo ERROR)
 
-        if [[ $parity == ERROR || $verdict_name == ERROR ]]; then
+        if [[ $parity == ERROR || $verdict_name == ERROR || $strictness == ERROR || $compare_logs == ERROR ]]; then
             failure="NO-RESULT: --verify-json report is not parseable JSON"
         elif [[ $verdict_name == no_result ]]; then
             failure="NO-RESULT: verification reached no verdict (verdict=no_result)"
+        elif [[ $strictness == None || $compare_logs == None ]]; then
+            failure="NO-RESULT: verification report contains no complete log-comparison description"
+        elif [[ $strictness != canonical || $compare_logs != True ]]; then
+            failure="DIVERGED: comparison strictness=$strictness compare_logs=$compare_logs; canonical log comparison is required"
         elif [[ $counts_left == 0 || $counts_right == 0 ]]; then
             # A strict configuration that compared nothing is not parity. This is
             # the check that keeps a vacuously-matching selection from reading as
             # L2 -- the same rule as "test result: ok with zero executed tests".
             failure="NO-RESULT: compared 0 log messages (left=$counts_left right=$counts_right); a strict configuration is not evidence the comparison had data"
         elif [[ $parity != True ]]; then
-            failure="DIVERGED: bitwise_parity=$parity verdict=$verdict_name (a stripped match does NOT earn L2)"
+            failure="DIVERGED: bitwise_parity=$parity verdict=$verdict_name"
         fi
     fi
 

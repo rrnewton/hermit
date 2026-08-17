@@ -84,8 +84,17 @@ strict_count="$(printf '%s\n' "$strict_out" | sed -n 's/^SIGALRM deliveries: \([
 strict_count="${strict_count:-<none>}"
 
 # --strict --verify for the determinism verdict.
-verify_out="$("$hermit" run --strict --verify -- "$guest" < /dev/null 2>&1 || true)"
-if printf '%s\n' "$verify_out" | grep -q "Determinism verified"; then
+verify_report="$work/verify.json"
+verify_out="$("$hermit" run --strict --verify --verify-json "$verify_report" -- "$guest" < /dev/null 2>&1 || true)"
+if jq -e '
+    (.verified == true)
+    and (.verdict == "matched")
+    and (.bitwise_parity == true)
+    and (.comparison.strictness == "canonical")
+    and (.comparison.compare_logs == true)
+    and ((.compared_log_messages.left // 0) > 0)
+    and ((.compared_log_messages.right // 0) > 0)
+' "$verify_report" >/dev/null 2>&1; then
     deterministic=1
 else
     deterministic=0

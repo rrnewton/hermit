@@ -518,7 +518,63 @@ fn run_dbt_uses_the_requested_guest_environment() {
 }
 
 #[test]
-fn run_dbt_verifies_simple_env_shebang() {
+fn run_dbt_verify_fails_closed_before_guest_execution() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT verification-refusal directory");
+    let marker = directory.path().join("guest-executed");
+    let report = directory.path().join("verify.json");
+    let marker_text = marker.to_str().expect("DBT marker path should be UTF-8");
+    let report_text = report.to_str().expect("DBT report path should be UTF-8");
+    let args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        "--verify-json",
+        report_text,
+        "--",
+        "/bin/sh",
+        "-c",
+        "touch \"$1\"",
+        "sh",
+        marker_text,
+    ];
+    let output = hermit(&args);
+
+    assert!(!output.status.success(), "DBT verification must refuse");
+    assert!(!marker.exists(), "DBT verification executed the guest");
+    assert!(output.stdout.is_empty(), "unexpected stdout: {output:?}");
+    let error = stderr(&output);
+    assert!(
+        error.contains("DBT verification produced no result"),
+        "{error}"
+    );
+    assert!(
+        error.contains("protected Reverie internal descriptor"),
+        "{error}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report).expect("verification JSON should exist"))
+            .expect("verification JSON should parse");
+    assert_eq!(report["verified"], false);
+    assert_eq!(report["bitwise_parity"], false);
+    assert_eq!(report["verdict"], "no_result");
+    assert_eq!(report["comparison"], serde_json::Value::Null);
+    assert_eq!(report["compared_log_messages"], serde_json::Value::Null);
+    for obsolete in [
+        ":: DBT Run1",
+        ":: DBT Run2",
+        "Success: deterministic",
+        "DBT path confirmed",
+        "Comparing DBT",
+    ] {
+        assert!(!error.contains(obsolete), "old comparator ran: {error}");
+    }
+}
+
+#[test]
+fn run_dbt_executes_simple_env_shebang() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create DBT env-shebang test directory");
     let script = directory.path().join("env-echo");
@@ -529,25 +585,12 @@ fn run_dbt_verifies_simple_env_shebang() {
     let program = script
         .to_str()
         .expect("DBT env-shebang test path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
 
     let output = hermit(&args);
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), format!("{}\n", script.display()));
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -583,7 +626,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         .to_str()
         .expect("DBT unsupported-syscall guest path should be UTF-8");
 
-    let normal_args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let normal_args = ["run", "--backend", "dbt", "--", program];
     let normal = hermit(&normal_args);
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbt-unsupported-ok\n");
@@ -639,7 +682,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "strict DBT failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
-    let normal_fork_args = ["run", "--backend", "dbt", "--verify", "--", program, "fork"];
+    let normal_fork_args = ["run", "--backend", "dbt", "--", program, "fork"];
     let normal_fork = hermit(&normal_fork_args);
     assert_success(&normal_fork, &normal_fork_args);
     assert_eq!(stdout(&normal_fork), "dbt-unsupported-fork-ok\n");
@@ -650,15 +693,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&normal_fork)
     );
 
-    let normal_fork_exec_args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--verify",
-        "--",
-        program,
-        "fork-exec",
-    ];
+    let normal_fork_exec_args = ["run", "--backend", "dbt", "--", program, "fork-exec"];
     let normal_fork_exec = hermit(&normal_fork_exec_args);
     assert_success(&normal_fork_exec, &normal_fork_exec_args);
     assert_eq!(
@@ -728,7 +763,6 @@ fn run_liteinst_verifies_detcore_backend() {
         "--backend",
         "liteinst",
         "--strict",
-        "--verify",
         "--",
         "/bin/echo",
         "liteinst-cli-ok",
@@ -829,7 +863,6 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
         "--backend",
         "dbt",
         "--strict",
-        "--verify",
         "--",
         "/bin/bash",
         "-c",
@@ -839,11 +872,6 @@ fn run_dbt_keeps_diagnostics_out_of_guest_stderr() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "isolated=guest-stderr\n");
-    assert!(
-        stderr(&output).contains(":: DBT path confirmed: DynamoRIO client reported tool=Detcore"),
-        "DBT confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 #[test]
@@ -868,64 +896,38 @@ fn run_dbt_forwards_detcore_info_logs() {
     );
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
+// TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal execution.
 #[test]
-fn run_dbt_verifies_queued_self_signals() {
+fn run_dbt_executes_queued_self_signals() {
     let program = dbt_self_sigqueue_guest()
         .to_str()
         .expect("DBT self-sigqueue guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "dbt-self-sigqueue-ok\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#543): validate the explicit application-mmap DBT regression.
 #[test]
-fn run_dbt_verifies_application_mmap() {
+fn run_dbt_executes_application_mmap() {
     let program = dbt_mmap_guest()
         .to_str()
         .expect("DBT mmap guest path should be UTF-8");
-    let args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let args = ["run", "--backend", "dbt", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "dbt-mmap-exec-ok\n");
-    assert!(
-        stderr(&output).contains(":: DBT path confirmed: DynamoRIO client reported tool=Detcore"),
-        "DBT confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 #[test]
-fn run_dbt_verifies_process_wait_lifecycle() {
+fn run_dbt_executes_process_wait_lifecycle() {
     let program = dbt_wait_guest()
         .to_str()
         .expect("DBT wait guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
@@ -933,29 +935,16 @@ fn run_dbt_verifies_process_wait_lifecycle() {
         stdout(&output),
         "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n"
     );
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-723): Review DBT PID virtualization L2 coverage.
+// TODO-HUMAN-REVIEW(PR-723): Review DBT PID virtualization strict coverage.
 #[test]
 fn run_dbt_virtualizes_process_identities() {
     let program = dbt_pid_guest()
         .to_str()
         .expect("DBT PID guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
@@ -977,47 +966,28 @@ fn run_dbt_virtualizes_process_identities() {
             "root vfork-exec=9 waited=9 exit=10 pid=3 tid=3\n",
         )
     );
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
+// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit strict coverage.
 #[test]
-fn run_dbt_verifies_self_prlimit() {
+fn run_dbt_executes_self_prlimit() {
     let program = dbt_prlimit_self_guest()
         .to_str()
         .expect("DBT self-prlimit guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "dbt-prlimit-self-ok\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 #[test]
-fn run_dbt_verifies_shell_process_lifecycle() {
+fn run_dbt_executes_shell_process_lifecycle() {
     let args = [
         "run",
         "--backend",
         "dbt",
-        "--verify",
         "--",
         "/bin/sh",
         "-c",
@@ -1027,23 +997,17 @@ fn run_dbt_verifies_shell_process_lifecycle() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "hello\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#598): Confirm this captures the host-inherited O_NONBLOCK regression.
 // TODO-HUMAN-REVIEW(#689): Confirm the split-write case protects partial-read semantics.
 #[test]
-fn run_dbt_verifies_pipe_backpressure() {
+fn run_dbt_executes_pipe_backpressure() {
     let args = [
         "run",
         "--backend",
         "dbt",
-        "--verify",
         "--",
         "/bin/bash",
         "-c",
@@ -1053,11 +1017,6 @@ fn run_dbt_verifies_pipe_backpressure() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "5467\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 
 #[test]
@@ -1065,50 +1024,24 @@ fn run_dbt_recovers_after_failed_exec() {
     let program = dbt_exec_failure_guest()
         .to_str()
         .expect("DBT exec-failure guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "recovered after failed exec\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
 }
 #[test]
 fn run_dbt_rejects_unfollowed_execveat() {
     let program = dbt_execveat_guest()
         .to_str()
         .expect("DBT execveat guest path should be UTF-8");
-    let args = [
-        "run",
-        "--backend",
-        "dbt",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
+    let args = ["run", "--backend", "dbt", "--strict", "--", program];
     let output = hermit(&args);
 
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
         "execveat unsupported in root and fork child\n"
-    );
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
     );
 }
 

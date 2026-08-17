@@ -286,11 +286,11 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
-     \x20 --portable-strict-compat-only Portable legacy stripped matrix with bounded diagnostics.\n\
+     \x20 --strict-compat-only          Run the blocking canonical app matrix.\n\
+     \x20 --portable-strict-compat-only Portable canonical app matrix with bounded diagnostics.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
-     \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
+     \x20 --e9patch-compat-only         Gate core + installed e9patch canonical apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
@@ -1925,6 +1925,25 @@ fn configure_e2e_result_root(
     Ok(path)
 }
 
+fn update_scorecard_from_results(root: &Path, result_root: &Path) -> Result<String, String> {
+    let output = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
+        .args(["update-results", "--results"])
+        .arg(result_root)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot start compatibility scorecard update: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "compatibility scorecard update failed{}{}",
+            if stdout.is_empty() { String::new() } else { format!("\n{stdout}") },
+            if stderr.is_empty() { String::new() } else { format!("\n{stderr}") },
+        ));
+    }
+    Ok(stdout)
+}
+
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
 /// running without a durable receipt. Must be called AFTER `resolve_cgroups`
 /// (which re-execs), so the tee is set up once, in the final boxed process.
@@ -2501,6 +2520,17 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let hermit = "target/debug/hermit";
         let marker = "hermit-validation-smoke";
         let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let verify_dir = "target/validate-verify";
+        let verify_report = format!("{verify_dir}/quick-verify.json");
+        let replay_report = format!("{verify_dir}/quick-replay.json");
+        let report_check = |path: &str| format!(
+            "jq -e '(.verified == true) and (.verdict == \"matched\") and \
+             (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+             (.comparison.compare_logs == true) and \
+             ((.compared_log_messages.left // 0) > 0) and \
+             ((.compared_log_messages.right // 0) > 0)' {} >/dev/null",
+            validate_plan::shell_quote(path)
+        );
         let mut steps = pre;
         steps.push(nextest_setup_node(root, gate)?);
         let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
@@ -2514,10 +2544,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("verify_smoke", "Hermit verify-mode smoke test",
-            format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
+            format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} {run_args} --verify --verify-json {} -- /bin/echo {marker} && {}",
+                validate_plan::shell_quote(&verify_report), validate_plan::shell_quote(&verify_report), report_check(&verify_report)),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
+            format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} record start --verify --verify-json {} -- /bin/echo {marker} && {}",
+                validate_plan::shell_quote(&replay_report), validate_plan::shell_quote(&replay_report), report_check(&replay_report)),
             vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
@@ -6095,6 +6127,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // like never having started. `SIG_IGN` for the window is what `trap ''
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
+    let scorecard_update_error = if nesting.nested {
+        None
+    } else {
+        match update_scorecard_from_results(&root, &e2e_result_root) {
+            Ok(message) => {
+                if !message.is_empty() {
+                    println!("{message}");
+                }
+                None
+            }
+            Err(message) => {
+                eprintln!("validate: ERROR: {message}");
+                Some(message)
+            }
+        }
+    };
     let interruption = interrupted_by().map(|s| s.to_string());
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
@@ -6335,6 +6383,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
+    if scorecard_update_error.is_some() {
+        exit_code = 1;
+    }
     if !execution_complete {
         eprintln!(
             "validate: ERROR: not every required node completed with a non-aborted outcome; \
@@ -6455,6 +6506,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((_, msg)) = &envelope_error {
         detail.push(format!("envelope comparison could not run: {msg}"));
+    }
+    if let Some(message) = &scorecard_update_error {
+        detail.push(format!(
+            "the compatibility scorecard could not be updated from this run: {message}"
+        ));
     }
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(

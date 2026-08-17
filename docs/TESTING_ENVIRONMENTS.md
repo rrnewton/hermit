@@ -29,7 +29,7 @@ it runs `full` for backward compatibility.
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
 | `portable-only` | About 8 minutes | Executes the same `ci/dag/portable.json` plan as the GitHub-managed portable job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
 | `full` (default) | About 20-70 minutes | Executes the exact portable and privileged DAG manifests used by GitHub CI. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
-| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBT verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
+| `super` | About 30-90 minutes | Builds Hermit and repeats each bounded probe 20 times by default. It reports `passed/total` for every probe and fails if any blocking iteration fails. Available KVM output verification and DBT strict-execution probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
 Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are
 useful in scripts and make the intended capability tier explicit:

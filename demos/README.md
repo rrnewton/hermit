@@ -45,15 +45,15 @@ KERNEL_IMAGE=/path/to/bzImage \
 The higher-level `05-qemu-busybox.sh` uses the same launcher while adding asset
 construction, timeouts, live serial output, log capture, and result checks.
 
-Run Hermit's two-execution Stripped comparison. This is a useful fast
-diagnostic, but it does not establish L2:
+Run Hermit's two-execution canonical INFO comparison with a typed verdict:
 
 ```bash
 VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
 ```
 
-`VERIFY=1` adds `--verify` and requires Hermit's explicit
-`Determinism verified` marker. It can take several minutes because QEMU's host
+`VERIFY=1` adds `--verify --verify-json` and requires `verified=true`,
+`verdict=matched`, `bitwise_parity=true`, canonical log comparison, no
+filtering, and positive compared-message counts. It can take several minutes because QEMU's host
 threads execute under the strict ptrace scheduler. Hermit captures guest output
 internally in this mode so it can compare both executions; the verification
 summary is saved as `hermit-stderr.log` instead of replaying the serial console.
@@ -125,8 +125,8 @@ On the measured AMD EPYC 9D85 host, the repository PMU benchmark observed a
 33,138-RCB maximum skid over 1,000 samples and recommended a 66,276-RCB margin.
 Current Reverie's 1,000-RCB processor default panicked during verification Run 1. The
 measured override passed the prior failure point, but Run 1 had not completed
-after nine minutes and was stopped; current-main Stripped verification therefore
-remains blocked on practical PMU calibration.
+after nine minutes and was stopped. That dated pre-canonical experiment remained
+blocked on practical PMU calibration; it is not a current verification result.
 
 Further diagnostics did not produce an acceptable workaround. Margins of
 10,000 and 40,000 RCBs avoided the assertion but still had not completed Run 1

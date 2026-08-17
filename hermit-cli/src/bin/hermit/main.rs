@@ -440,22 +440,11 @@ mod tests {
         );
     }
 
-    /// TOP-LEVEL EXIT 2 -- the DBT arm of `RunOpts::main` RETURNS `run_dbt(..)`
-    /// and never reaches `verify()`, so a `--verify --verify-json` DBT run
-    /// cannot produce a verdict at all.
-    ///
-    /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbt` takes
-    /// `verify: bool` but no verdict-artifact path, in BOTH cfg arms
-    /// (`backends.rs`), so the bypass is a property of the signature: there is
-    /// no argument through which it could publish one. An earlier version of
-    /// this test drove the arm for real; with the stamp removed it did not fail
-    /// but HUNG (blocking in `reserve_output_stdin_snapshot` on the harness
-    /// stdin), which is a no-result wearing another outcome -- precisely the
-    /// bug class this file exists to prevent, and it would wedge a CI shard for
-    /// its whole timeout. A test that cannot hang is worth more here than one
-    /// that exercises the launch.
+    /// The DBT arm has no protected evidence descriptor in the pinned Reverie
+    /// revision. It must leave the invocation-bound pending report in place and
+    /// refuse instead of publishing a terminal verdict through an old comparator.
     #[test]
-    fn dbt_arm_has_no_channel_to_publish_a_verdict() {
+    fn dbt_arm_fails_closed_without_publishing_a_terminal_verdict() {
         let source = include_str!("backends.rs");
         let signatures: Vec<&str> = source
             .match_indices("fn run_dbt(")
@@ -473,10 +462,55 @@ mod tests {
                 "run_dbt should still receive the verify flag"
             );
             assert!(
-                !signature.contains("verify_json") && !signature.contains("json"),
-                "run_dbt gained a verdict-artifact parameter; the DBT arm can now publish a \
-                 verdict, so it must clear or publish the receipt rather than relying solely on \
-                 the top-level pending stamp:\n{signature}"
+                signature.contains("verify_json"),
+                "each cfg arm of run_dbt must carry the verdict-artifact path:\n{signature}"
+            );
+        }
+        let implementation = source
+            .split_once("pub(super) fn run_dbt(")
+            .expect("feature-enabled run_dbt")
+            .1
+            .split_once("#[allow(clippy::too_many_arguments)]\n#[cfg(not(feature = \"dbt\"))]")
+            .expect("cfg-disabled run_dbt arm")
+            .0;
+        assert!(
+            implementation.contains("write_pending_verification_json(path)"),
+            "DBT verification must stamp an invocation-bound no-result report"
+        );
+        assert!(
+            implementation.contains("DBT verification produced no result"),
+            "DBT verification must explain the held protected-descriptor prerequisite"
+        );
+        assert!(
+            !implementation.contains("write_verification_json"),
+            "DBT must not publish a terminal verdict without protected canonical evidence"
+        );
+    }
+
+    #[test]
+    fn deleted_verify_strict_flag_is_rejected_for_run_and_record() {
+        for argv in [
+            vec![
+                "hermit",
+                "run",
+                "--verify",
+                "--verify-strict",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "hermit",
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--",
+                "/bin/true",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(argv.clone()).is_err(),
+                "the deleted comparator-selection flag must not parse: {argv:?}"
             );
         }
     }

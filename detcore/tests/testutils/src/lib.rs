@@ -733,12 +733,10 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
                 )
             }
             for ix in 0..x.len().min(filtered.len()) {
-                let str_a = detcore::logdiff::strip_log_entry(&x[ix]);
-                let str_b = detcore::logdiff::strip_log_entry(&filtered[ix]);
                 assert_eq!(
-                    str_a, str_b,
+                    x[ix], filtered[ix],
                     "\n  Consecutive runs of test had different COMMITs #{}, run1:\n{:?}\n  Run2:\n{:?}",
-                    ix, str_a, str_b,
+                    ix, x[ix], filtered[ix],
                 )
             }
             if x.len() != filtered.len() {

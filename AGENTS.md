@@ -222,7 +222,7 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
+| L2 | Canonical full-observation repeat parity | On a backend with a supported canonical evidence path, run `hermit run --strict --verify --verify-json <path> -- ...` and require JSON `bitwise_parity: true` with nonzero compared INFO messages |
 | L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
@@ -236,15 +236,18 @@ A claim that a run "passes" is meaningless without a level. Write, for example,
   none. A non-strict result is not a determinism guarantee; label the relaxation
   and do not present it as one.
 
-Default `--verify` uses the lossy `Stripped` comparator and cannot establish
-L2. `--verify-strict` compares exit status/stdout/stderr byte-for-byte and INFO
-events under the repository's `BitwiseInfoV1` policy: it removes only the real
+`--verify` compares exit status/stdout/stderr byte-for-byte and INFO events under
+the repository's `BitwiseInfoV1` policy: it removes only the real
 wall-clock prefix, ordinalizes host addresses while preserving identity/order/
 aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
-must not be stripped. State this canonical envelope rather than calling the raw
-log files literally byte-identical. KVM's output-only fallback reports
-`bitwise_parity: false` and is not L2.
+must match. A comparison with zero INFO messages fails verification. State this
+canonical envelope rather than calling the raw log files literally
+byte-identical. KVM's output-only fallback reports `bitwise_parity: false` and
+is not L2. Direct DBT verification currently fails closed with `no_result`
+before guest execution because the pinned Reverie revision does not provide a
+protected internal descriptor for canonical Detcore evidence. A DBT
+`hermit run --backend dbt --strict` result is L1 evidence only.
 
 ## Debugging
 
@@ -254,11 +257,11 @@ before reading source:
 - Raise the log level to see the event stream and Detcore's decisions:
   `hermit --log info run -- <program>` (or `debug` / `trace` for more detail).
   The `DETLOG` lines record syscalls, scheduling, and virtualized time.
-- Reproduce nondeterminism with `hermit run --strict --verify --verify-strict`,
+- Reproduce nondeterminism with `hermit run --strict --verify`,
   which runs the guest twice under the L2 comparison policy and reports the
   first divergence.
 - For record/replay problems use
-  `hermit record start --verify --verify-strict -- <program>`,
+  `hermit record start --verify -- <program>`,
   which records then replays and diffs the two logs; a divergence names the
   thread and syscall event where the runs parted.
 - Use `hermit-verify` for stress, trace, schedule, and replay checks, and the

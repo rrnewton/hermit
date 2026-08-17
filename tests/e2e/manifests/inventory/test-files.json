@@ -691,10 +691,10 @@
       "why": "tests/backend-parity/fixtures/vectored_io.c is owned by ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "special-driver",
-      "path": "tests/backend-parity/retarget_to_manifest.py",
-      "runner": "backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual)",
-      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and rewrites them into the shared schema-v2 manifest -- appending a symmetric [[test]] block to tests/e2e/manifests/backend-parity-c.toml (ptrace front-door first, every backend x mode cell declared, DBT/KVM enabled only where the row's --verify L2 witness passed) and reclassifying the fixture from guest-fixture to manifest-test. It lives beside and reuses the Python parity harness (run_matrix.py / e9patch_corpus.py) and is run manually to migrate legacy PRs, so it stays a driver rather than a manifest-plan program."
+     "disposition": "special-driver",
+     "path": "tests/backend-parity/retarget_to_manifest.py",
+     "runner": "backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual)",
+      "why": "tests/backend-parity/retarget_to_manifest.py is owned by backend-parity matrix.tsv -> schema-v2 manifest migration tool (manual): Standalone migration driver that reads a source PR's added matrix.tsv rows and fixture .c files and rewrites them into the shared schema-v2 manifest -- appending a symmetric [[test]] block to tests/e2e/manifests/backend-parity-c.toml with a ptrace front door while refusing legacy detlog/guest tokens as current DBT or KVM qualification, and reclassifying the fixture from guest-fixture to manifest-test. It lives beside and reuses the Python parity harness (run_matrix.py / e9patch_corpus.py) and is run manually to migrate legacy PRs, so it stays a driver rather than a manifest-plan program."
     },
     {
       "disposition": "special-driver",
@@ -708,9 +708,15 @@
       "runner": "matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate)",
       "why": "tests/backend-parity/split_asymmetric_pr.py is owned by matrix-symmetry backlog split tool (manual; self-test runs in ci/test_harness.sh validate): Mechanical PR surgery driver that partitions legacy backend-private test hunks from landable code, proves byte-for-byte source-tree losslessness, preserves source authorship, and publishes cross-linked code and deferred-test PRs without executing guest behavior itself."
     },
+   {
+     "disposition": "special-driver",
+      "path": "tests/backend-parity/test_retarget_to_manifest.py",
+      "runner": "tests/backend-parity/retarget_to_manifest.py maintainers",
+      "why": "tests/backend-parity/test_retarget_to_manifest.py is owned by tests/backend-parity/retarget_to_manifest.py maintainers: it is a self-contained focused suite proving that legacy DBT detlog/guest and KVM guest/detlog tokens remain disabled pending fresh typed canonical evidence. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
     {
       "disposition": "special-driver",
-      "path": "tests/backend-parity/test_run_matrix_output_skew.py",
+     "path": "tests/backend-parity/test_run_matrix_output_skew.py",
       "runner": "tests/backend-parity/run_matrix.py maintainers",
       "why": "tests/backend-parity/test_run_matrix_output_skew.py is owned by tests/backend-parity/run_matrix.py maintainers: it is a self-contained focused suite over run_matrix.py's --output TSV writer, asserting that the writer emits every row or refuses and names the offending field, and that a refusal leaves any previous artifact byte-for-byte intact rather than truncated. It runs directly as a script and observes no guest program, so it is a driver-side suite rather than a manifest test."
     },

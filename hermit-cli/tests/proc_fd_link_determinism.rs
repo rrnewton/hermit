@@ -152,7 +152,12 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             .arg(env!("CARGO_BIN_EXE_hermit"))
             .args(["--log", "DEBUG", "run"])
             .arg(format!("--backend={backend}"))
-            .args(["--strict", "--verify", "--"])
+            .arg("--strict")
+            .args(if backend == "dbt" {
+                &["--"][..]
+            } else {
+                &["--verify", "--"][..]
+            })
             .arg(&guest)
             .output()
             .expect("failed to start Hermit");
@@ -160,14 +165,16 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "{} failed {backend} strict verification\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            "{} failed {backend} strict execution\nstdout:\n{stdout}\nstderr:\n{stderr}",
             case.name
         );
-        assert!(
-            stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
-            "{} omitted {backend} verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            case.name
-        );
+        if backend != "dbt" {
+            assert!(
+                stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
+                "{} omitted {backend} verification marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                case.name
+            );
+        }
         assert_eq!(stdout, expected, "{} differed on {backend}", case.name);
     }
 }
