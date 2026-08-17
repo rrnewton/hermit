@@ -198,13 +198,8 @@ assert_stdout_matches() {
 }
 
 pass_test() {
-    if [[ $SYSTEM_UTIL_BACKEND == kvm ]]; then
-        printf 'PASS [%s/kvm]: strict --verify output/exit parity with INFO logging; internal trace comparison unavailable; relaxations=none\n' \
-            "$SYSTEM_UTIL_TEST_NAME"
-    else
-        printf 'PASS [%s/%s]: L2 with INFO logging; relaxations=none\n' \
-            "$SYSTEM_UTIL_TEST_NAME" "$SYSTEM_UTIL_BACKEND"
-    fi
+    printf 'PASS [%s/%s]: L2 with INFO logging; relaxations=none\n' \
+        "$SYSTEM_UTIL_TEST_NAME" "$SYSTEM_UTIL_BACKEND"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

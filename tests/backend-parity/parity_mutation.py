@@ -143,10 +143,9 @@ FIXTURES: dict[str, FixtureSpec] = {
 # is not a substitute for --verify-strict and does not reimplement it -- it
 # applies the same idea across backends.
 #
-# TIER-2 corresponds to what KVM's --verify can currently assert (exit status,
-# stdout, stderr) and TIER-3 to the full-INFO envelope, which is why the repo
-# says KVM "cannot claim full L2 INFO parity until internal log comparison
-# exists".
+# Product `--verify-strict` applies the full-INFO envelope to KVM. This
+# cross-backend harness must therefore derive the tier from the typed verdict,
+# not from the backend name or a success banner.
 #
 # KNOWN GAP, and it is deliberate rather than overlooked: BitwiseInfoV1 both
 # removes the wall-clock prefix AND ordinalizes host addresses marked with the

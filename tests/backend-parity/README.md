@@ -11,7 +11,11 @@ generated TSV here. It does **not** touch the tracked
 publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
 runner prints at the end of the run.
 
-## Current ratchet
+## Last tracked ratchet
+
+These counts predate canonical KVM log comparison. They retain the evidence
+that was actually recorded, but the KVM verification column must be rerun
+before it can describe the current product path.
 
 The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
 Stripped verification ratchet (`--strict --verify`, Hermit's double-run
@@ -38,11 +42,10 @@ The two verification kinds are not interchangeable. **Stripped DETLOG**
 (ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
 streams equal after stripping selected fields; it does not mean the full syscall
 and scheduling traces were bitwise-identical and does not establish L2.
-**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
-declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the verification
-subsection below for the contract that holds at L1 but not under `--verify`.
+**guest-visible** verification is weaker because it compares only guest stdout
+and exit status across the two runs. KVM now compares captured INFO logs too;
+the retained KVM `guest` entries below describe the older measurements, not a
+backend limitation.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
@@ -112,7 +115,7 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 ## Cases
 
 Each cell shows the L1 status and, after `/`, the `--verify` status: `detlog`
-for Stripped DETLOG equality, `guest` for KVM guest-visible equality, and `gap`
+for Stripped DETLOG equality, `guest` for retained output-only evidence, and `gap`
 where verification does not succeed. Neither successful status is an L2 claim.
 
 | Test | ptrace | DBT | KVM |
@@ -188,8 +191,9 @@ temporary logs, this path cannot re-check stdout the way the L1 path does;
 instead it enforces that the guest exit status matches and that Hermit's
 double-run comparison succeeded at *at least* the verification kind expected
 for the backend. The runner keys on two stderr witnesses: `Determinism verified`
-(Stripped DETLOG, ptrace and DBT) and `guest output and exit status matched`
-(KVM guest-visible). A DETLOG result satisfies a `guest` contract because it
+(a log comparison whose exact policy is unavailable without JSON) and
+`guest output and exit status matched` (retained output-only evidence). A
+DETLOG result satisfies a `guest` contract because it
 compares more observations; the reverse fails.
 
 One contract holds at L1 but not under `--verify` and is recorded as a `gap`

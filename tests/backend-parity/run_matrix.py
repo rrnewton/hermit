@@ -169,7 +169,7 @@ def scorecard_fieldnames(actual_header, path):
 # L2 (--verify) assurance kinds, ordered weakest to strongest. "gap" means the
 # contract cannot currently be verified at L2 on that backend. "guest" is
 # guest-visible L2: the two --verify runs produced identical stdout+exit but the
-# internal trace is not compared (KVM concurrent mode). "detlog" is full L2: the
+# internal trace was not compared. "detlog" is full L2: the
 # two runs produced a bitwise-identical DETLOG after normalization (ptrace, DBT).
 #
 # `stripped` is the rung that was missing, and its absence is what made every
@@ -179,12 +179,12 @@ def scorecard_fieldnames(actual_header, path):
 # identical".  `bitwise` is the real thing and is claimable only from a typed
 # verdict (see `verify_tier_from_json`).
 L2_RANK = {"gap": 0, "guest": 1, "stripped": 2, "bitwise": 3}
-# Per-backend L2 values the matrix may record. KVM's concurrent verify path can
-# never emit a DETLOG witness, so it is capped at guest-visible L2.
+# Per-backend L2 values the matrix may record. Typed verdicts, not backend
+# names, determine which value a run earned.
 L2_ALLOWED = {
     "ptrace": {"stripped", "bitwise"},
     "dbt": {"stripped", "bitwise", "gap"},
-    "kvm": {"guest", "gap"},
+    "kvm": {"guest", "stripped", "bitwise", "gap"},
 }
 
 
@@ -1305,11 +1305,6 @@ def append_parent_scorecard(
         # parity boolean is derived solely from the two hashes captured above.
         parity = stdout_evidence.get("stdout_parity", "")
         detail = result["detail"]
-        if verify and result["backend"] == "kvm" and passed:
-            detail = (
-                "L2 guest-visible only (stdout+exit compared; internal trace not "
-                f"compared): {detail}"
-            )
         rows.append(
             {
                 "run_id": run_id,

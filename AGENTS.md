@@ -193,10 +193,10 @@ for example, "e9patch preprocessing with the ptrace backend" rather than
 
 A feature is **done** only when the exact test meets its declared assurance
 level across **all in-scope backends**. A pass on one backend is evidence for
-that backend only, not a project-wide completion claim. KVM currently compares
-only exit status/stdout/stderr during `--verify`; it cannot claim full L2 INFO
-parity until internal log comparison exists. Report that gap explicitly instead
-of weakening the definition of done.
+that backend only, not a project-wide completion claim. KVM `--verify` compares
+the same canonical INFO envelope as the other backends; report the verdict's
+`bitwise_parity` and nonzero INFO counts rather than inferring L2 from exit
+status or the success banner alone.
 
 Start investigations in these locations:
 
@@ -222,7 +222,7 @@ presupposes the ones below it:
 | --- | --- | --- |
 | L0 | Builds and unit/integration tests pass | `cargo test` exits 0 |
 | L1 | Runs deterministically under strict mode | `hermit run --strict` |
-| L2 | Canonical full-observation repeat parity (non-KVM) | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` |
+| L2 | Canonical full-observation repeat parity | `hermit run --strict --verify --verify-strict --verify-json <path> -- ...` and require JSON `bitwise_parity: true` with nonzero compared INFO counts |
 | L3 | Memory determinism | Add `--detlog-heap --detlog-stack` to the L2 command |
 | L4 | Stress-hardened | L2/L3 repeated 20x with no divergence |
 
@@ -243,8 +243,7 @@ wall-clock prefix, ordinalizes host addresses while preserving identity/order/
 aliasing, and compares the full remainder exactly. Virtual time,
 retired-branch counts, syscall values, sizes, flags, and other numeric payloads
 must not be stripped. State this canonical envelope rather than calling the raw
-log files literally byte-identical. KVM's output-only fallback reports
-`bitwise_parity: false` and is not L2.
+log files literally byte-identical.
 
 ## Debugging
 

@@ -1994,6 +1994,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "system-utils/uuidgen-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-shell-environment"
     }
   ],
   "schema": 1

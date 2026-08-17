@@ -60,8 +60,8 @@ impl VerificationReport {
     }
 
     /// Admit a green only when both the canonical comparison and the match
-    /// claim agree. `verified=true` alone is intentionally insufficient: KVM's
-    /// output-only fallback can report it with zero compared INFO messages.
+    /// claim agree. `verified=true` alone is intentionally insufficient: an
+    /// output-only invocation can report it with zero compared INFO messages.
     pub fn require_canonical_match(&self) -> Result<(), String> {
         self.require_canonical_comparison()?;
         if self.verified && self.verdict == "matched" && self.bitwise_parity {
