@@ -55,7 +55,7 @@ use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
-use super::verify::compare_two_runs;
+use super::verify::compare_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
@@ -2868,7 +2868,7 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        let outcome = compare_two_runs(
+        let outcome = compare_runs(
             ComparedRun {
                 output: &out1,
                 log: log1_path,
