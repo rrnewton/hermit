@@ -2022,16 +2022,21 @@ mod tests {
     #[test]
     fn preparation_preserves_toolchain_homes_outside_the_guest_environment() {
         let mut derived = cell_env(Path::new("/cell"), false);
-        add_toolchain_homes(&mut derived, None, None, Some(OsStr::new("/host/home")));
-        assert_eq!(derived["RUSTUP_HOME"], "/host/home/.rustup");
-        assert_eq!(derived["CARGO_HOME"], "/host/home/.cargo");
+        add_toolchain_homes(
+            &mut derived,
+            None,
+            None,
+            Some(OsStr::new("/example/toolchain-root")),
+        );
+        assert_eq!(derived["RUSTUP_HOME"], "/example/toolchain-root/.rustup");
+        assert_eq!(derived["CARGO_HOME"], "/example/toolchain-root/.cargo");
 
         let mut explicit = cell_env(Path::new("/cell"), false);
         add_toolchain_homes(
             &mut explicit,
             Some(OsStr::new("/toolchains/rustup")),
             Some(OsStr::new("/toolchains/cargo")),
-            Some(OsStr::new("/host/home")),
+            Some(OsStr::new("/example/toolchain-root")),
         );
         assert_eq!(explicit["RUSTUP_HOME"], "/toolchains/rustup");
         assert_eq!(explicit["CARGO_HOME"], "/toolchains/cargo");
