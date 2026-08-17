@@ -1607,7 +1607,11 @@ pub fn run_with_backend(
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
     config.discover_live_file_metadata = backend == Backend::Sabre;
-    config.use_thread_local_clock_reads = backend == Backend::Sabre;
+    // Guest-visible wall and monotonic clocks must stay in the same global
+    // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
+    // per-thread execution clock does not advance when the scheduler skips
+    // global time while a thread is blocked.
+    config.use_thread_local_clock_reads = false;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
@@ -2220,11 +2224,11 @@ mod tests {
     }
 
     #[test]
-    fn sabre_backend_config_enables_process_local_capabilities() {
+    fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
         assert!(sabre.discover_live_file_metadata);
-        assert!(sabre.use_thread_local_clock_reads);
+        assert!(!sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
