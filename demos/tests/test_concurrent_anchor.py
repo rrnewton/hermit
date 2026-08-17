@@ -168,5 +168,105 @@ class ConcurrentAnchorTest(unittest.TestCase):
             self.assertTrue((second / "run-metadata.json").is_file())
 
 
+class InfoLogAdmissionTest(unittest.TestCase):
+    def _metadata(self, log_path):
+        return {
+            "qemu_argv": ["qemu-system-x86_64", "-nographic"],
+            "qemu_version": "qemu-test",
+            "qemu_binary_sha256": "b" * 64,
+            "qcow2_sha256": "q" * 64,
+            "serial_sha256": "s" * 64,
+            "info_log": str(log_path),
+        }
+
+    def test_documented_launcher_fields_are_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            anchor_log = root / "anchor.log"
+            current_log = root / "current.log"
+            anchor_log.write_text(
+                "2026-08-17T04:27:14.000000Z INFO detcore: "
+                "launcher read FileContents(123) at 0x7fffffffa210\n"
+            )
+            current_log.write_text(
+                "2026-08-17T04:29:10.000000Z INFO detcore: "
+                "launcher read FileContents(987) at 0x7fffffff9210\n"
+            )
+
+            passed, report = dc.compare_runs(
+                self._metadata(anchor_log), self._metadata(current_log)
+            )
+
+            self.assertTrue(passed, "documented normalized fields should match")
+            self.assertTrue(
+                any(line.startswith("PASS: exact Hermit log") for line in report)
+            )
+
+    def test_info_divergence_fails_even_when_vm_artifacts_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            anchor_log = root / "anchor.log"
+            current_log = root / "current.log"
+            anchor_log.write_text(
+                "INFO detcore::scheduler: COMMIT turn 48 on previously committed "
+                "1_767_225_600.042_170_525s\n"
+            )
+            current_log.write_text(
+                "INFO detcore::scheduler: COMMIT turn 48 on previously committed "
+                "1_767_225_600.042_170_465s\n"
+            )
+
+            passed, report = dc.compare_runs(
+                self._metadata(anchor_log), self._metadata(current_log)
+            )
+
+            self.assertFalse(
+                passed, "a canonical INFO divergence must make the demo red"
+            )
+            self.assertTrue(
+                any("canonical repeat verification failed" in line for line in report)
+            )
+
+    def test_missing_info_log_fails_repeat_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "missing.log"
+            current_log = root / "current.log"
+            current_log.write_text("INFO detcore: identical work\n")
+
+            passed, report = dc.compare_runs(
+                self._metadata(missing), self._metadata(current_log)
+            )
+
+            self.assertFalse(passed, "missing INFO evidence must not produce SUCCESS")
+            self.assertTrue(
+                any(
+                    "canonical repeat verification requires both logs" in line
+                    for line in report
+                )
+            )
+
+    def test_missing_current_info_log_fails_repeat_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            anchor_log = root / "anchor.log"
+            missing = root / "missing.log"
+            anchor_log.write_text("INFO detcore: identical work\n")
+
+            passed, report = dc.compare_runs(
+                self._metadata(anchor_log), self._metadata(missing)
+            )
+
+            self.assertFalse(
+                passed, "missing current INFO evidence must not produce SUCCESS"
+            )
+            self.assertTrue(
+                any(
+                    "canonical repeat verification requires both logs" in line
+                    for line in report
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
