@@ -280,7 +280,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it
-          kvm: KVM compares output only and cannot assert DETLOG identity yet
+          kvm: The source qualification measured ptrace only; KVM has no recorded result for this pid-identity fixture
           sabre: Not yet qualified for the pid-identity fixture
           liteinst: Not yet qualified for the pid-identity fixture
       naked:
