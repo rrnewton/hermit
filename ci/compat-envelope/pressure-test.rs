@@ -2172,7 +2172,8 @@ fn write_plan_after_scorecard_check(
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build = exact_cell.is_some()
+            let direct_backend_build = tag == "build.runtime_release"
+                && exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
@@ -4919,6 +4920,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.tag() == "build.runtime_release")
         .collect();
+    let manifest_plan_steps: Vec<_> = repeated_dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "setup.manifest_plan")
+        .collect();
     let recursive_metadata_tags = [
         "e2e.metadata",
         "build.workspace",
@@ -4935,12 +4941,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         || repeated_jobs != expected_repeated_jobs
         || preparation_steps.len() != 1
         || runtime_build_steps.len() != 1
+        || manifest_plan_steps.len() != 1
         || repeated_dag
             .steps
             .iter()
             .any(|step| recursive_metadata_tags.contains(&step.tag().as_str()))
         || !runtime_build_steps[0].deps.is_empty()
         || !runtime_build_steps[0]
+            .cmd
+            .contains("cargo build --release --locked -p hermit --bin hermit")
+        || !manifest_plan_steps[0]
+            .cmd
+            .contains("cargo build -p hermit-manifest-plan --bins")
+        || manifest_plan_steps[0]
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
