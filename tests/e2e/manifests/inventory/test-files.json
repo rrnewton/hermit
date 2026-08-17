@@ -1694,6 +1694,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/startup_tls_guards.c",
+      "runner": "ci/test_harness.sh via tests/e2e/manifests/system-utils.toml (explicit mode selection; ci=false)",
+      "why": "tests/c/startup_tls_guards.c is owned by ci/test_harness.sh via tests/e2e/manifests/system-utils.toml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary and pointer guard so canonical verification detects a backend that replaces AT_RANDOM only after glibc has consumed it"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/statmount_enosys.c",
       "runner": "ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false)",
       "why": "tests/c/statmount_enosys.c is owned by ci/test_harness.sh via tests/e2e/manifests/c-programs.toml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
