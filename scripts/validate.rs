@@ -47,6 +47,7 @@
 //! [dependencies]
 //! safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! libc = "0.2"
 //! ```
 
@@ -69,6 +70,9 @@ mod validate_envelope;
 
 #[path = "lib/validate_history.rs"]
 mod validate_history;
+
+#[path = "lib/validate_cell_results.rs"]
+mod validate_cell_results;
 
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
@@ -1932,6 +1936,9 @@ fn configure_e2e_result_root(
     log_path: &Path,
     temporary_build_root: &Path,
 ) -> Result<PathBuf, String> {
+    let run = log_path
+        .file_stem()
+        .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
     let path = match std::env::var_os("E2E_RESULT_ROOT") {
         Some(value) if !value.is_empty() => {
             let supplied = PathBuf::from(value);
@@ -1945,15 +1952,19 @@ fn configure_e2e_result_root(
             let log_dir = log_path
                 .parent()
                 .ok_or_else(|| format!("durable log has no parent: {}", log_path.display()))?;
-            let run = log_path
-                .file_stem()
-                .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?;
             log_dir.join("e2e").join(run)
         }
     };
     std::fs::create_dir_all(&path)
         .map_err(|e| format!("cannot create E2E result directory {}: {e}", path.display()))?;
     std::env::set_var("E2E_RESULT_ROOT", &path);
+    // One full validate invokes the harness once per manifest bucket. Bind all
+    // bucket rows to the durable validate identity instead of letting each
+    // harness process mint a local timestamp. Schema-6 evidence is one complete
+    // selected population, not a pool of unrelated bucket attempts.
+    if std::env::var_os("E2E_RUN_ID").is_none() {
+        std::env::set_var("E2E_RUN_ID", run);
+    }
 
     // The harness derives its prebuilt-fixture directory from RESULT_ROOT too,
     // but build products are not evidence and must not accumulate beside every
@@ -4965,8 +4976,10 @@ fn write_ledger(
     log_file: &str,
     suite_complete: bool,
     coverage: serde_json::Value,
+    cell_results: Option<&validate_cell_results::RetainedCellResults>,
 ) {
-    let (ledger_schema, coverage) = ledger_schema_and_coverage(coverage);
+    let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
+    let ledger_schema = if cell_results.is_some() { 6 } else { coverage_schema };
     let gates_run = outcomes.len();
     let failures = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
     // An operator stop learned nothing new about the product. Preserve the raw
@@ -5008,6 +5021,7 @@ fn write_ledger(
         // repeats this shape with `corrects` set to the id it supersedes.
         "record_id": record_id,
         "corrects": serde_json::Value::Null,
+        "run_id": cell_results.map(|results| results.run_id.as_str()),
         "started_at": ctx.started_at,
         "finished_at": utc_now(),
         "host": ctx.host,
@@ -5075,6 +5089,7 @@ fn write_ledger(
         "real_seconds": wall_s,
         "log_file": log_file,
         "coverage": coverage,
+        "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
@@ -5916,8 +5931,10 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             s.ledger = Some(ledger.clone());
             return s;
         }
-        // A prior FAIL does NOT skip: it may be flaky or environmental, and only
-        // a PASS satisfies the landing predicate. Note it and run.
+        // A prior genuine FAIL prevents the PASS cache lookup above from
+        // succeeding. Note it and run so targeted requalification evidence can
+        // be produced; a lucky sibling PASS cannot turn this invocation into a
+        // zero-gate cache hit.
         if let Some(prev) = validate_history::cache_lookup(&ledger_rows, "fail", &cache_key) {
             eprintln!(
                 "# validate: tree {tree} has a prior FAIL record ({}) on this host+toolchain; \
@@ -6249,6 +6266,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &log_path.to_string_lossy(),
                 false,
                 coverage.clone(),
+                None,
             );
         }
         drop(run_record);
@@ -6427,6 +6445,27 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         pin_gate_bypassed = true;
     }
 
+    // A full top-level run must carry the exact per-cell population it just
+    // judged. Older schema-5 rows could say only that buckets passed; they could
+    // not open or satisfy a cell-specific failure obligation. Retain the typed
+    // rows before appending the ledger entry so schema 6 is emitted only when
+    // the artifact has actually been published and bound by checksum.
+    let retained_cell_results = if !nesting.nested && plan.suite_complete && execution_complete {
+        match validate_cell_results::retain(&root, &e2e_result_root, &commit) {
+            Ok(results) => Some(results),
+            Err(error) => {
+                eprintln!(
+                    "validate: ERROR: cannot retain complete per-cell evidence: {error}; \
+                     refusing a schema-6 receipt"
+                );
+                exit_code = 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
@@ -6441,6 +6480,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &log_path.to_string_lossy(),
             plan.suite_complete && execution_complete,
             coverage,
+            retained_cell_results.as_ref(),
         );
     }
 
@@ -6665,7 +6705,18 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &[],
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+        None,
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
