@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -5,6 +6,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::thread;
 
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
@@ -40,6 +45,7 @@ struct Args {
     results: Option<PathBuf>,
     junit: Option<PathBuf>,
     format: String,
+    jobs: Option<usize>,
 }
 
 fn parse(mut values: impl Iterator<Item = String>) -> Args {
@@ -73,6 +79,17 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             }
             "--junit" => args.junit = Some(PathBuf::from(required_value(&mut values, "--junit"))),
             "--format" => args.format = required_value(&mut values, "--format"),
+            "--jobs" => {
+                let value = required_value(&mut values, "--jobs");
+                let jobs = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|jobs| *jobs > 0)
+                    .unwrap_or_else(|| fail("--jobs requires a positive integer"));
+                if args.jobs.replace(jobs).is_some() {
+                    fail("--jobs may be specified only once");
+                }
+            }
             other => fail(format!("unknown option {other}")),
         }
     }
@@ -119,6 +136,9 @@ fn validate_args(command: &str, args: &Args) {
     }
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
+    }
+    if command != "run" && args.jobs.is_some() {
+        fail("--jobs is accepted by run only");
     }
     if args.selection.include_manual
         && (args.selection.test.is_none() || args.selection.mode.is_none())
@@ -244,6 +264,7 @@ fn audit_cli_brackets(root: &Path) {
         "--results",
         "--junit",
         "--format",
+        "--jobs",
     ] {
         let status = Command::new(&executable)
             .args(["plan", option])
@@ -266,7 +287,7 @@ fn audit_cli_brackets(root: &Path) {
             fail(format!("empty value for {option} was accepted"));
         }
     }
-    let output = Command::new(executable)
+    let output = Command::new(&executable)
         .args([
             "plan",
             "--lane",
@@ -281,6 +302,23 @@ fn audit_cli_brackets(root: &Path) {
     let cells = serde_json::from_slice::<Vec<JsonValue>>(&output.stdout).unwrap_or_default();
     if !output.status.success() || cells.is_empty() {
         fail("complete CLI control was refused or selected no cells");
+    }
+    for argv in [
+        vec!["run", "--jobs", "0"],
+        vec!["run", "--jobs", "not-a-number"],
+        vec!["run", "--jobs", "2", "--jobs", "3"],
+        vec!["plan", "--jobs", "2"],
+    ] {
+        let status = Command::new(&executable)
+            .args(argv)
+            .current_dir(root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|error| fail(error));
+        if status.success() {
+            fail("invalid --jobs control was accepted");
+        }
     }
 }
 
@@ -347,6 +385,8 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
 
 #[derive(Deserialize)]
 struct Dag {
+    #[serde(default)]
+    resource_caps: BTreeMap<String, u64>,
     default_step_timeout: Option<u64>,
     steps: Vec<DagStep>,
 }
@@ -368,12 +408,37 @@ struct DagStep {
 #[derive(Deserialize)]
 struct DagHint {
     preferred_inner_jobs: Option<u64>,
+    #[serde(default)]
+    resources: BTreeMap<String, u64>,
 }
 
 #[derive(Deserialize)]
 struct DagManifest {
     lane: String,
     category: String,
+}
+
+fn command_jobs(command: &str) -> Result<Option<u64>, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let mut jobs = None;
+    let mut index = 0;
+    while index < words.len() {
+        if words[index] == "--jobs" {
+            let value = words
+                .get(index + 1)
+                .ok_or_else(|| "manifest command has --jobs without a value".to_string())?
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "manifest command has invalid --jobs value".to_string())?;
+            if jobs.replace(value).is_some() {
+                return Err("manifest command repeats --jobs".into());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    Ok(jobs)
 }
 
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
@@ -462,6 +527,26 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
                     "{}.{} does not execute its typed selector literally",
                     step.group, step.job
                 ));
+            }
+            if let Some(jobs) = command_jobs(&step.cmd)? {
+                let hint = step.hint.as_ref().ok_or_else(|| {
+                    format!(
+                        "{}.{} has --jobs {jobs} without a resource hint",
+                        step.group, step.job
+                    )
+                })?;
+                let demand = hint.resources.get("manifest_guest").copied().unwrap_or(0);
+                let cap = dag
+                    .resource_caps
+                    .get("manifest_guest")
+                    .copied()
+                    .unwrap_or(0);
+                if demand != jobs || cap < jobs || hint.preferred_inner_jobs != Some(jobs) {
+                    return Err(format!(
+                        "{}.{} runs --jobs {jobs} but declares manifest_guest={demand}, cap={cap}, preferred_inner_jobs={:?}",
+                        step.group, step.job, hint.preferred_inner_jobs
+                    ));
+                }
             }
             if !actual.insert(manifest.category.clone()) {
                 return Err(format!(
@@ -896,6 +981,49 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
     }
 }
 
+/// Execute `count` independent items with at most `jobs` workers, delivering
+/// each completed value to `consume` immediately.
+///
+/// The consumer stays on the calling thread so durable publication is
+/// serialized even while the expensive cell executions overlap. This is
+/// deliberately not a collect-then-publish helper: an outer bucket timeout
+/// must not discard rows that completed before the timeout.
+fn for_each_parallel<T: Send>(
+    count: usize,
+    jobs: usize,
+    execute: impl Fn(usize) -> T + Sync,
+    mut consume: impl FnMut(usize, T),
+) {
+    if count == 0 {
+        return;
+    }
+    let workers = jobs.clamp(1, count);
+    let next = AtomicUsize::new(0);
+    let (sender, receiver) = mpsc::channel();
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let execute = &execute;
+            let next = &next;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= count {
+                        break;
+                    }
+                    if sender.send((index, execute(index))).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for (index, value) in receiver {
+            consume(index, value);
+        }
+    });
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -925,24 +1053,67 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(&results_path, b"").unwrap();
-    let mut results = Vec::new();
+    let mut indexed_results = Vec::new();
     let mut failed = false;
-    for cell in cells {
-        match run_cell(&context, &cell) {
-            Ok(result) => {
+    let jobs = args.jobs.unwrap_or(1);
+    let expected = cells.len();
+    for_each_parallel(
+        expected,
+        jobs,
+        |index| {
+            let cell = &cells[index];
+            match run_cell(&context, cell) {
+                Ok(result) => result,
+                Err(error) => infrastructure_error_result(&context, cell, error),
+            }
+        },
+        |index, mut result| {
+            // Publish before announcing the outcome. After a visible PASS line,
+            // the complete typed row is already present even if the containing
+            // bucket is killed before its JUnit/summary epilogue.
+            if let Err(error) = append_result(&results_path, &result) {
+                eprintln!(
+                    "ERROR {}: completed cell result could not be published: {error}",
+                    result.test
+                );
+                result.outcome = "ERROR".into();
+                result.error_kind = Some("result-publication".into());
+                result.reason = Some(format!(
+                    "completed cell result could not be published: {error}"
+                ));
+                failed = true;
+            } else {
+                if result.outcome == "ERROR" {
+                    eprintln!(
+                        "ERROR {}: {}",
+                        result.test,
+                        result.reason.as_deref().unwrap_or("infrastructure error")
+                    );
+                }
                 println!("{} {}", result.outcome, result.test);
                 failed |= result.outcome != "PASS";
-                append_result(&results_path, &result).unwrap();
-                results.push(result);
             }
-            Err(e) => {
-                eprintln!("ERROR {}: {e}", cell.id.test);
-                let result = infrastructure_error_result(&context, &cell, e);
-                append_result(&results_path, &result).unwrap();
-                results.push(result);
-                failed = true;
-            }
-        }
+            indexed_results.push((index, result));
+        },
+    );
+    if indexed_results.len() != expected {
+        eprintln!(
+            "test-harness: only {} of {expected} selected cells returned a result",
+            indexed_results.len()
+        );
+        failed = true;
+    }
+    indexed_results.sort_by_key(|(index, _)| *index);
+    let results = indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    if expected > 0 {
+        println!(
+            "test-harness: completed {} cell(s) with up to {} concurrent worker(s)",
+            results.len(),
+            jobs.min(expected)
+        );
     }
     write_junit(&junit, &results).unwrap();
     let summary = serde_json::json!({"schema":1,"cells":results.len(),"passed":results.iter().filter(|r|r.outcome=="PASS").count(),"failed":results.iter().filter(|r|r.outcome=="FAIL").count(),"errors":results.iter().filter(|r|r.outcome=="ERROR").count()});
@@ -960,7 +1131,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
     use super::audit_privileged_unboxed_guard;
+    use super::command_jobs;
+    use super::for_each_parallel;
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
         if [[ ${GITHUB_ACTIONS:-} != true ]]; then
@@ -1000,5 +1178,45 @@ mod tests {
     fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
         let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
         assert!(audit_privileged_unboxed_guard(&executable).is_err());
+    }
+
+    #[test]
+    fn parallel_runner_delivers_every_completion_before_returning() {
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let consumed = Mutex::new(Vec::new());
+        for_each_parallel(
+            8,
+            4,
+            |index| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                active.fetch_sub(1, Ordering::SeqCst);
+                index
+            },
+            |index, value| consumed.lock().unwrap().push((index, value)),
+        );
+        let mut rows = consumed.into_inner().unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn manifest_jobs_parser_rejects_missing_invalid_and_duplicate_widths() {
+        assert_eq!(
+            command_jobs("test-harness run --jobs 20").unwrap(),
+            Some(20)
+        );
+        assert_eq!(command_jobs("test-harness run").unwrap(), None);
+        for command in [
+            "test-harness run --jobs",
+            "test-harness run --jobs 0",
+            "test-harness run --jobs no",
+            "test-harness run --jobs 2 --jobs 3",
+        ] {
+            assert!(command_jobs(command).is_err(), "accepted {command}");
+        }
     }
 }

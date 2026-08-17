@@ -1504,7 +1504,11 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
         .open(path)
         .map_err(|e| e.to_string())?;
     serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())
+    file.write_all(b"\n").map_err(|e| e.to_string())?;
+    // The bucket runner publishes each completed cell before printing its
+    // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
+    // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
+    file.flush().map_err(|e| e.to_string())
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -1861,6 +1865,52 @@ mod tests {
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
             "required"
         );
+    }
+
+    #[test]
+    fn completed_rows_are_readable_after_each_append() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-durable-row-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+        };
+        let path = root.join("results.jsonl");
+        for expected in 1..=2 {
+            let result = infrastructure_error_result(&context, &cell, "fixture".into());
+            append_result(&path, &result).unwrap();
+            let rows = fs::read_to_string(&path).unwrap();
+            assert_eq!(rows.lines().count(), expected);
+            assert!(
+                rows.lines()
+                    .all(|line| serde_json::from_str::<JsonValue>(line).is_ok())
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

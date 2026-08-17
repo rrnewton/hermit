@@ -45,6 +45,7 @@ use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
@@ -492,8 +493,6 @@ impl StartOpts {
                 log: log2.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "Success: replay matched recording.",
-                failure_message: "Recording output did not match replay output!",
                 verbose: false,
                 strictness,
                 compare_logs: true,
@@ -509,6 +508,11 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_verification_json(path, &outcome)?;
         }
+        announce_verification_outcome(
+            &outcome,
+            "Success: replay matched recording.",
+            "Recording output did not match replay output!",
+        );
 
         outcome.into_exit_status()
     }
@@ -593,6 +597,22 @@ impl StartOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_report_is_published_before_success_is_announced() {
+        let source = include_str!("record_start.rs");
+        let verification = source
+            .split_once("let outcome = compare_two_runs(")
+            .expect("record/replay comparison")
+            .1;
+        let publish = verification
+            .find("write_verification_json(path, &outcome)")
+            .expect("verification report publication");
+        let announce = verification
+            .find("announce_verification_outcome(")
+            .expect("verification announcement");
+        assert!(publish < announce);
+    }
 
     fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
         StartOpts {

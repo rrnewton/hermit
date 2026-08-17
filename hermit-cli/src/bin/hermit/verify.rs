@@ -31,9 +31,7 @@ pub(crate) struct ComparedRun<'a> {
     pub log: TempPath,
 }
 
-pub(crate) struct ComparisonOptions<'a> {
-    pub success_message: &'a str,
-    pub failure_message: &'a str,
+pub(crate) struct ComparisonOptions {
     /// Controls only how much diff *output* is printed (a larger syscall-history
     /// window), NOT the comparison semantics. Comparison strictness is carried
     /// separately in [`Self::strictness`] so a quiet run can still be
@@ -705,7 +703,7 @@ pub(crate) fn retain_verification_logs<const N: usize>(
 pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
-    options: ComparisonOptions<'_>,
+    options: ComparisonOptions,
 ) -> Result<VerificationOutcome, Error> {
     compare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
 }
@@ -713,7 +711,7 @@ pub fn compare_two_runs(
 fn compare_two_runs_with_unsupported_scan(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
-    options: ComparisonOptions<'_>,
+    options: ComparisonOptions,
     scan_unsupported_syscalls: impl Fn(&Path) -> io::Result<BTreeSet<String>>,
 ) -> Result<VerificationOutcome, Error> {
     let ComparedRun {
@@ -851,7 +849,6 @@ fn compare_two_runs_with_unsupported_scan(
     }
 
     if failed {
-        eprintln!(":: {}", options.failure_message.red().bold());
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
@@ -865,7 +862,6 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_virtual_nanoseconds,
         })
     } else {
-        eprintln!(":: {}", options.success_message.green().bold());
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             guest_status: out2.status,
@@ -874,6 +870,24 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
         })
+    }
+}
+
+/// Announce a verification verdict only after its machine-readable report has
+/// been published.
+///
+/// Keeping this outside [`compare_two_runs`] closes the interval in which the
+/// CLI previously printed `Success` and an outer bucket timeout could kill it
+/// before `write_verification_json` replaced the pending `no_result` report.
+pub fn announce_verification_outcome(
+    outcome: &VerificationOutcome,
+    success_message: &str,
+    failure_message: &str,
+) {
+    if outcome.verified() {
+        eprintln!(":: {}", success_message.green().bold());
+    } else {
+        eprintln!(":: {}", failure_message.red().bold());
     }
 }
 
@@ -1021,8 +1035,6 @@ mod tests {
                 log: right_log,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness,
                 compare_logs: true,
@@ -1140,8 +1152,6 @@ mod tests {
                 log: right_log,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Stripped,
                 compare_logs: false,
@@ -1273,8 +1283,6 @@ mod tests {
                 log: right,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: true,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
@@ -1370,8 +1378,6 @@ mod tests {
                     log: right.into_temp_path(),
                 },
                 ComparisonOptions {
-                    success_message: "verified",
-                    failure_message: "failed",
                     verbose: false,
                     strictness: LogCompareStrictness::Canonical,
                     compare_logs: true,
@@ -1410,8 +1416,6 @@ mod tests {
                 log: right.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
@@ -1469,8 +1473,6 @@ mod tests {
                 log: right.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,

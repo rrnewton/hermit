@@ -55,6 +55,7 @@ use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
@@ -2868,6 +2869,12 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
+        let success_message = if kvm_output_only {
+            "Success: KVM guest output and exit status matched."
+        } else {
+            "Success: deterministic. Determinism verified."
+        };
+        let failure_message = "Failure: nondeterministic.";
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -2878,12 +2885,6 @@ impl RunOpts {
                 log: log2_path,
             },
             ComparisonOptions {
-                success_message: if kvm_output_only {
-                    "Success: KVM guest output and exit status matched."
-                } else {
-                    "Success: deterministic. Determinism verified."
-                },
-                failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
                 // --verify-verbose historically implied a bitwise compare (it
                 // flipped strip_lines off + FullTrace on); preserve that, and let
@@ -2906,6 +2907,7 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_verification_json(path, &outcome)?;
         }
+        announce_verification_outcome(&outcome, success_message, failure_message);
 
         // On divergence, preserve the historical behavior: return the error
         // (nonzero process exit) without emitting the guest's output or backend
@@ -3272,6 +3274,22 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn verification_report_is_published_before_success_is_announced() {
+        let source = include_str!("run.rs");
+        let verification = source
+            .split_once("let outcome = compare_two_runs(")
+            .expect("verification comparison")
+            .1;
+        let publish = verification
+            .find("write_verification_json(path, &outcome)")
+            .expect("verification report publication");
+        let announce = verification
+            .find("announce_verification_outcome(&outcome")
+            .expect("verification announcement");
+        assert!(publish < announce);
+    }
 
     #[test]
     fn verification_log_flags_are_discoverable_and_old_print_spelling_still_parses() {
