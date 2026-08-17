@@ -981,6 +981,77 @@ fn run_dbt_virtualizes_process_identities() {
     );
 }
 
+#[test]
+fn run_ptrace_verify_completes_vfork_lifecycle() {
+    const EXPECTED_STDOUT: &str = concat!(
+        "root pid=3 ppid=1 tid=3\n",
+        "grandchild pid=7 ppid=5 tid=7\n",
+        "child pid=5 ppid=3 tid=5\n",
+        "child grandchild=7 waited=7 exit=5\n",
+        "root child=5 waited=5 exit=6\n",
+        "exec-child pid=9 ppid=3 tid=9\n",
+        "exec-proc stat=9/3 status=9/3 tracer=1\n",
+        "root exec=9 waited=9 exit=12\n",
+        "waitid-child pid=11 ppid=3 tid=11\n",
+        "root waitid=11 reported=11 exit=9\n",
+        "root vfork=13 waited=13 exit=5 pid=3 tid=3\n",
+        "vfork-exec-child pid=15 ppid=3 tid=15\n",
+        "root vfork-exec=15 waited=15 exit=10 pid=3 tid=3\n",
+    );
+
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let program = dbt_pid_guest()
+        .to_str()
+        .expect("DBT PID guest path should be UTF-8");
+    for iteration in 1..=5 {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create vfork lifecycle verification directory");
+        let report = directory.path().join("verify.json");
+        let report_text = report
+            .to_str()
+            .expect("vfork lifecycle report path should be UTF-8");
+        let args = [
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-json",
+            report_text,
+            "--",
+            program,
+        ];
+        let output = Command::new("timeout")
+            .args(["--kill-after", "2s", "20s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(args)
+            .output()
+            .expect("failed to run ptrace vfork lifecycle regression");
+
+        assert_ne!(
+            output.status.code(),
+            Some(124),
+            "ptrace vfork lifecycle iteration {iteration} hung"
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), EXPECTED_STDOUT, "iteration {iteration}");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(report).expect("vfork lifecycle verification JSON should exist"),
+        )
+        .expect("vfork lifecycle verification JSON should parse");
+        assert_eq!(report["verdict"], "matched", "iteration {iteration}");
+        assert_eq!(report["bitwise_parity"], true, "iteration {iteration}");
+        let left = report["compared_log_messages"]["left"]
+            .as_u64()
+            .expect("vfork lifecycle report omitted left INFO count");
+        let right = report["compared_log_messages"]["right"]
+            .as_u64()
+            .expect("vfork lifecycle report omitted right INFO count");
+        assert!(left > 0, "iteration {iteration} compared no INFO messages");
+        assert_eq!(left, right, "iteration {iteration} INFO counts differed");
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1065): Review cross-backend self-prlimit identity coverage.
 #[test]

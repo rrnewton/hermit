@@ -535,7 +535,8 @@ pub struct Scheduler {
     /// A child-exit signal is scheduled at the deterministic `Exit` grant, before
     /// the backend necessarily reaches that hook. Delay the signal until this
     /// publication so a woken parent cannot observe the host-timed gap between
-    /// logical exit and kernel waitability.
+    /// logical exit and kernel waitability. An active `vfork` also keeps the
+    /// signal queued until the kernel-blocked parent posts its continuation.
     process_exit_hooks_reported: BTreeSet<DetPid>,
 
     /// Whether the backend will report final physical process exits after logical cleanup.
@@ -2101,16 +2102,22 @@ impl Scheduler {
                     dtid,
                     sig,
                 ) => {
-                    if !self.process_exit_hooks_reported.remove(&child) {
+                    let exit_hook_reported = self.process_exit_hooks_reported.contains(&child);
+                    let vfork_parent_still_blocked =
+                        self.vfork_barriers.values().any(|registered_child| {
+                            registered_child.is_some_and(|dettid| dettid.as_raw() == child.as_raw())
+                        });
+                    if !exit_hook_reported || vfork_parent_still_blocked {
                         self.blocked
                             .timed_waiters
                             .insert_child_exit(time_ns, child, parent, dtid);
                         trace!(
-                            "waiting for process {} exit hook before deterministic child-exit signal",
-                            child
+                            "waiting for process {} exit hook and vfork parent continuation before deterministic child-exit signal",
+                            child,
                         );
                         return Err(SkipTurn);
                     }
+                    assert!(self.process_exit_hooks_reported.remove(&child));
                     // Deterministic child-exit SIGCHLD. If the host-async signal
                     // already arrived and was parked by the InboundSignal deferral
                     // gate, release it now at this logical time. Otherwise synthesize
@@ -5300,9 +5307,10 @@ mod test {
     }
 
     #[test]
-    fn child_exit_signal_waits_for_process_exit_hook() {
+    fn child_exit_signal_waits_for_process_exit_hook_and_vfork_parent() {
         let mut scheduler = Scheduler::new(&Config::default());
         let child = DetPid::from_raw(200);
+        let child_tid = DetTid::from_raw(200);
         let parent = DetPid::from_raw(100);
         let deadline = LogicalTime::from_nanos(1_000);
         scheduler.committed_time = deadline;
@@ -5314,7 +5322,13 @@ mod test {
         assert!(scheduler.step2b_process_timed().is_err());
         assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
 
+        scheduler.vfork_barriers.insert(parent, Some(child_tid));
         assert!(scheduler.report_process_exit_hook(child));
+        assert!(scheduler.step2b_process_timed().is_err());
+        assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+        assert!(scheduler.process_exit_hooks_reported.contains(&child));
+
+        scheduler.vfork_barriers.remove(&parent);
         assert!(scheduler.step2b_process_timed().is_ok());
         assert!(scheduler.blocked.timed_waiters.is_empty());
         assert!(!scheduler.process_exit_hooks_reported.contains(&child));
