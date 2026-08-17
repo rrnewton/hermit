@@ -1081,9 +1081,15 @@ async fn run_sabre(
         .as_ref()
         .map_or(program.as_path(), |staged| staged.path.as_path());
 
+    // This runs after Hermit enters the guest mount namespace, where `/tmp`
+    // names the container-visible temporary filesystem. Do not inherit a
+    // host-side nested TMPDIR: validation commonly sets TMPDIR=/tmp/<run>/tmp,
+    // but that parent path is hidden once the private `/tmp` mount is active.
+    // The SaBRe plugin and coordinator must name the socket through the same
+    // namespace-visible path.
     let socket_dir = tempfile::Builder::new()
         .prefix("hermit-sabre-rpc-")
-        .tempdir()?;
+        .tempdir_in(Path::new("/tmp"))?;
     let socket_path = socket_dir.path().join("coordinator.sock");
     let fallback_ready = Arc::new(AtomicBool::new(false));
     let global = Arc::new(detcore::GlobalState::init_global_state(&config).await);
