@@ -205,6 +205,8 @@ pub fn node(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 

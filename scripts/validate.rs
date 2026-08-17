@@ -1630,6 +1630,8 @@ fn super_plan_bracket() -> Result<(), String> {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -3301,13 +3303,15 @@ fn step_with_caps(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
 // --------------------------------------------------------------------------- reporting
 
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
-fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
+fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String], not_launched: &[String]) {
     println!("\n=== per-node cost (safe-ci-dag-runner) ===");
     println!("{:<44} {:>9}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
     println!("{}", "-".repeat(84));
@@ -3338,6 +3342,9 @@ fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     println!("{:<44} {:>9.2}  (sum of node wall)", "TOTAL", total);
     if !skipped.is_empty() {
         println!("\nskipped (dependency failed, never ran): {}", skipped.join(", "));
+    }
+    if !not_launched.is_empty() {
+        println!("\nnot launched: {}", not_launched.join(", "));
     }
 }
 
@@ -3603,6 +3610,9 @@ fn interrupted_by() -> Option<&'static str> {
 struct LaneResult {
     outcomes: Vec<StepOutcome>,
     skipped: Vec<String>,
+    /// Planned non-intentional nodes that never launched and therefore have no
+    /// terminal outcome. Distinct from dependency-skipped nodes.
+    not_launched: Vec<String>,
     /// Every non-intentional planned node completed with a non-aborted outcome,
     /// and the whole-run clock did not cut the lane short. Dependency-skipped
     /// and aborted nodes are known but unexecuted, so they are incomplete. This
@@ -3783,7 +3793,7 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 }
 
 /// Planned runnable steps absent from both scheduler result collections.
-fn unreported_non_intentional_steps(
+fn not_launched_non_intentional_steps(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
     skipped: &[String],
@@ -3906,8 +3916,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // A genuine failure must not be reclassified or retried. With one worker,
-    // both independent peers remain runnable but unreported after fail-fast.
+    // A genuine failure must not be reclassified or retried. With keep-going,
+    // both independent peers must still launch and report outcomes.
     let failure_log = tmp.join("unclassified.log");
     std::fs::write(
         &failure_log,
@@ -3933,19 +3943,53 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         1,
         false,
     );
-    if failed.complete
+    if !failed.complete
         || failed.ok
         || failed.env_retries != 0
         || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
-            != vec!["fixture.fail"]
-        || exit_code_with_execution_completeness(0, failed.complete) == 0
+            != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
+        || !failed.not_launched.is_empty()
+        || exit_code_with_execution_completeness(1, failed.complete) == 0
     {
         return Err(format!(
-            "scheduler accounting: unclassified failure did not remain an incomplete red without retry: complete={} ok={} retries={} outcomes={:?}",
+            "scheduler accounting: keep-going did not complete independent work while preserving the red: complete={} ok={} retries={} outcomes={:?} not_launched={:?}",
             failed.complete,
             failed.ok,
             failed.env_retries,
-            failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>(),
+            failed.not_launched,
+        ));
+    }
+
+    // Without keep-going, fail-fast may stop before independent peers launch,
+    // but those nodes must be named rather than disappearing from accounting.
+    let fail_fast = run_lane_with_env_retries(
+        &failed_cfg,
+        1,
+        false,
+        0,
+        None,
+        &failure_log,
+        None,
+        1,
+        false,
+    );
+    if fail_fast.complete
+        || fail_fast.ok
+        || fail_fast.env_retries != 0
+        || fail_fast.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            != vec!["fixture.fail"]
+        || fail_fast.not_launched
+            != vec!["fixture.pending_a".to_string(), "fixture.pending_b".to_string()]
+        || exit_code_with_execution_completeness(1, fail_fast.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: fail-fast did not name independent work it omitted: complete={} ok={} retries={} outcomes={:?} not_launched={:?}",
+            fail_fast.complete,
+            fail_fast.ok,
+            fail_fast.env_retries,
+            fail_fast.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>(),
+            fail_fast.not_launched,
         ));
     }
 
@@ -4270,7 +4314,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         .map_err(|e| format!("scheduler accounting: cannot remove {}: {e}", tmp.display()));
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(
-            "scheduler accounting: complete and allowed-failure plans accepted; fail-fast, skipped, aborted, and environmental-retry cases bracketed"
+            "scheduler accounting: keep-going completes independent work; fail-fast names not-launched work; skipped, aborted, allowed-failure, and environmental-retry cases bracketed"
                 .into(),
         ),
         (Err(problem), Ok(())) => Err(problem),
@@ -4323,7 +4367,13 @@ fn run_lane_with_env_retries(
         );
         return LaneResult {
             outcomes: Vec::new(),
-            skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            skipped: Vec::new(),
+            not_launched: cfg
+                .steps
+                .iter()
+                .filter(|step| step.skip_reason.is_none())
+                .map(|step| step.tag())
+                .collect(),
             complete: false,
             ok: false,
             env_retries: 0,
@@ -4348,6 +4398,7 @@ fn run_lane_with_env_retries(
     let mut by_tag: BTreeMap<String, StepOutcome> =
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
+    let mut not_launched = first.not_launched.clone();
     let mut env_retries = 0usize;
 
     while env_retries < max {
@@ -4376,13 +4427,12 @@ fn run_lane_with_env_retries(
             break;
         }
         // The retry set: the blocked nodes, plus everything that never ran (or was
-        // aborted) because of them. The scheduler's fail-fast result reports only
-        // dependency-skipped nodes; an independent runnable node can otherwise be
-        // absent from both outcomes and skipped.
+        // aborted) because of them. Dependency-skipped and not-launched nodes are
+        // distinct scheduler results, and both need another chance when safe.
         let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
         keep.extend(skipped.iter().cloned());
+        keep.extend(not_launched.iter().cloned());
         keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
-        keep.extend(unreported_non_intentional_steps(cfg, &by_tag, &skipped));
         let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
         if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
@@ -4434,6 +4484,7 @@ fn run_lane_with_env_retries(
             by_tag.insert(o.tag.clone(), o.clone());
         }
         skipped = again.skipped.clone();
+        not_launched = again.not_launched.clone();
     }
 
     // Retries exhausted with an environmental block still standing is a RED, but
@@ -4456,24 +4507,32 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
-    let unreported = unreported_non_intentional_steps(cfg, &by_tag, &skipped);
-    if !unreported.is_empty() {
+    let final_not_launched = not_launched_non_intentional_steps(cfg, &by_tag, &skipped);
+    if !final_not_launched.is_empty() {
         eprintln!(
-            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
-             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
-            unreported.len(),
-            unreported.join(", ")
+            "validate: ERROR: {} non-intentional planned node(s) were not launched: {}. \
+             The lane is incomplete and cannot be green.",
+            final_not_launched.len(),
+            final_not_launched.join(", ")
         );
     }
     // Raw failure policy may still treat an aborted peer as neutral, but execution
-    // completeness may not: dependency-skipped, aborted, timed-out, or unreported
+    // completeness may not: dependency-skipped, aborted, timed-out, or not-launched
     // required nodes did not finish and therefore cannot support a green run.
     let complete = !run_timed_out
-        && unreported.is_empty()
+        && final_not_launched.is_empty()
         && skipped.is_empty()
         && outcomes.iter().all(|outcome| !outcome.aborted);
     let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, complete, ok, env_retries, run_timed_out }
+    LaneResult {
+        outcomes,
+        skipped,
+        not_launched: final_not_launched,
+        complete,
+        ok,
+        env_retries,
+        run_timed_out,
+    }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -4960,6 +5019,7 @@ fn write_ledger(
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
     skipped: &[String],
+    not_launched: &[String],
     wall_s: f64,
     exit_code: u8,
     log_file: &str,
@@ -5062,6 +5122,9 @@ fn write_ledger(
         "gates_run": gates_run,
         "gates_expected": gates_expected,
         "skipped_nodes": skipped.len(),
+        // Exact identities matter: a missing field and an observed empty list
+        // are not interchangeable evidence.
+        "not_launched": not_launched,
         // A timeout is a RESULT, so it is recorded rather than dropped, and it is
         // named so a reader can separate "the tree is broken" from "a gate blew
         // its budget". Operator interrupts never reach this function at all.
@@ -5325,6 +5388,7 @@ struct RunSummary {
     nodes_executed: usize,
     nodes_failed: usize,
     nodes_skipped: usize,
+    nodes_not_launched: usize,
     wall_s: Option<f64>,
     jobs: Option<i64>,
     log: Option<PathBuf>,
@@ -5349,6 +5413,7 @@ impl RunSummary {
             nodes_executed: 0,
             nodes_failed: 0,
             nodes_skipped: 0,
+            nodes_not_launched: 0,
             wall_s: None,
             jobs: None,
             log: None,
@@ -5389,10 +5454,11 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
     // rather than an absent line a reader has to interpret.
     match s.wall_s {
         Some(wall) => println!(
-            "   nodes: {} executed, {} failed, {} skipped in {}{}",
+            "   nodes: {} executed, {} failed, {} skipped, {} not launched in {}{}",
             s.nodes_executed,
             s.nodes_failed,
             s.nodes_skipped,
+            s.nodes_not_launched,
             human_duration(wall),
             s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
         ),
@@ -6078,6 +6144,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut not_launched: Vec<String> = Vec::new();
     let mut ok = true;
     let mut execution_complete = true;
     let mut env_retries = 0usize;
@@ -6103,6 +6170,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
+    not_launched.extend(r.not_launched.iter().cloned());
     ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
     env_retries += r.env_retries;
@@ -6113,6 +6181,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             let r2 = lane(second);
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
+            not_launched.extend(r2.not_launched.iter().cloned());
             ok = ok && r2.ok;
             execution_complete = execution_complete && r2.complete;
             env_retries += r2.env_retries;
@@ -6121,6 +6190,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             eprintln!(
                 "validate: first lane failed; the second planned lane was not run (eager exit), \
                  so validation is incomplete."
+            );
+            not_launched.extend(
+                second
+                    .steps
+                    .iter()
+                    .filter(|step| step.skip_reason.is_none())
+                    .map(|step| step.tag()),
             );
             execution_complete = false;
         }
@@ -6135,7 +6211,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             run_timeout.unwrap_or(0)
         );
     }
-    print_cost_table(&outcomes, &skipped);
+    print_cost_table(&outcomes, &skipped, &not_launched);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -6244,6 +6320,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &ctx,
                 &outcomes,
                 &skipped,
+                &not_launched,
                 wall,
                 130,
                 &log_path.to_string_lossy(),
@@ -6267,6 +6344,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
         s.nodes_skipped = skipped.len();
+        s.nodes_not_launched = not_launched.len();
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -6388,7 +6466,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !execution_complete {
         eprintln!(
             "validate: ERROR: not every required node completed with a non-aborted outcome; \
-             dependency-skipped, aborted, timed-out, and unreported work makes validation \
+             dependency-skipped, aborted, timed-out, and not-launched work makes validation \
              incomplete and cannot report PASS."
         );
     }
@@ -6436,6 +6514,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &ctx,
             &outcomes,
             &skipped,
+            &not_launched,
             wall,
             exit_code,
             &log_path.to_string_lossy(),
@@ -6516,10 +6595,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
     }
+    if !not_launched.is_empty() {
+        detail.push(format!(
+            "{} node(s) were not launched: {}",
+            not_launched.len(),
+            not_launched.join(", ")
+        ));
+    }
     if !execution_complete {
         detail.push(
             "not every required node completed with a non-aborted outcome; dependency-skipped, \
-             aborted, timed-out, or unreported work made the run incomplete"
+             aborted, timed-out, or not-launched work made the run incomplete"
                 .into(),
         );
     }
@@ -6559,6 +6645,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
     s.nodes_skipped = skipped.len();
+    s.nodes_not_launched = not_launched.len();
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
@@ -6665,7 +6752,18 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &[],
+        &[],
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
