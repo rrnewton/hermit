@@ -979,6 +979,10 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
+            GlobalRequest::CompleteSigkill(dpid) => {
+                self.sched.lock().unwrap().log_process_exit(dpid);
+                R::CompleteSigkill(())
+            }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -1495,6 +1499,9 @@ impl GlobalState {
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
+        if dettid == detpid {
+            sched.report_process_exit_hook(detpid);
+        }
         drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
@@ -1950,6 +1957,9 @@ pub enum GlobalRequest {
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
 
+    /// Publish the scheduler-ordered logical removal after a successful SIGKILL target exits.
+    CompleteSigkill(DetPid),
+
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
 
@@ -2005,6 +2015,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
+    CompleteSigkill(()),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -2680,6 +2691,17 @@ where
         GlobalResponse::ResolveKillTargets(targets) => targets,
         _ => unreachable!(),
     }
+}
+
+/// Publish the logical-removal INFO event after a successful SIGKILL target has
+/// disappeared from the scheduler's live-thread set.
+pub async fn complete_sigkill<G, T>(guest: &mut G, detpid: DetPid)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::CompleteSigkill(detpid)).await;
+    assert_eq!(response.1, GlobalResponse::CompleteSigkill(()));
 }
 
 /// Signal an unrecoverable error that exits the entire container.

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,6 +28,8 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use safe_ci_dag_runner::cgroup::expected_outer_memory_max_bytes;
+use safe_ci_dag_runner::cgroup::outer_memory_max_bytes;
 use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::io::dag_to_json;
 use safe_ci_dag_runner::model::DagConfig;
@@ -71,6 +74,8 @@ const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
 const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
 const PRESSURE_JOBS: i64 = 4;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
+const RUNNER_LOG_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_DIR";
+const RUNNER_NO_LOGS_ENV: &str = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS";
 
 fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
@@ -115,20 +120,22 @@ Commands:
       [--green --repetitions COUNT] [--jobs COUNT]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
-      labelled exploratory and cannot promote the scorecard. Batch runs require
-      a clean commit and use an isolated checkout. With no filters, this
-      selects all red cells, but refuses a plan whose declared worst-case cell
-      occupancy cannot fit the whole-run wall bound. Use --sample for a bounded
-      random batch, --mode to narrow its population, or give --test, --mode,
-      and --backend together for exactly one cell. The default result directory
-      is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
-      manifest declares no seeds remains red but is unavailable: exact requests
-      refuse it, while batches report and omit it rather than inventing a run.
+      labelled exploratory and cannot promote the scorecard. Batch and repeated
+      runs require a clean commit and execute from that repository root, with
+      HEAD and cleanliness checked before and after execution. With no filters,
+      this selects all red cells, but refuses a plan whose declared worst-case
+      cell occupancy cannot fit the whole-run wall bound. Use --sample for a
+      bounded random batch, --mode to narrow its population, or give --test,
+      --mode, and --backend together for exactly one cell. The default result
+      directory is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos
+      cell whose manifest declares no seeds remains red but is unavailable:
+      exact requests refuse it, while batches report and omit it rather than
+      inventing a run.
       Add --repetitions N to an exact currently green cell to run N independent
       boxed checks against the same clean committed source. Use --green with
       --repetitions to select every enabled green cell in one shared-build DAG;
-      --mode and --sample may narrow that green population. Existing resource
-      caps allow at most four manifest guests at once and at most one KVM guest.
+      --mode and --sample may narrow that green population. Manifest-guest
+      capacity follows --jobs (default four), while KVM remains limited to one.
       This reports per-cell flakiness; it never edits or demotes the scorecard.
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
@@ -152,8 +159,8 @@ Exact-cell options (run and plan):
                            an exact cell or --sample
   --repetitions COUNT      Repeat one exact currently green cell in independent
                            boxed jobs. COUNT must be positive. Plan and run
-                           require a clean commit. At most four manifest guests
-                           run at once, and KVM remains limited to one.
+                           require a clean commit. At most --jobs manifest
+                           guests run at once, and KVM remains limited to one.
 
 Bounded-batch options (run and plan):
   --sample COUNT           Seeded random sample of red cells. Without --mode,
@@ -172,8 +179,10 @@ Bounded-batch options (run and plan):
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
-                           resource caps still limit manifest guests to four
-                           and KVM guests to one.
+                           resource capacity permits COUNT manifest guests;
+                           KVM and cargo writes remain limited to one each.
+                           The plan refuses a width whose declared concurrent
+                           memory caps exceed the outer cgroup bound.
 
 Examples:
   # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
@@ -186,14 +195,17 @@ Examples:
     --sample 10 --seed 42 --cell-timeout 60
 
   # Check one committed green cell 100 times under the same boxed limits.
-  # The DAG admits at most four manifest guests at once (one for KVM).
+  # Choose an explicit width; the plan refuses one that exceeds the outer
+  # cgroup's declared memory allowance.
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
-    --mode verify --backend ptrace --repetitions 100 --cell-timeout 120
+    --mode verify --backend ptrace --repetitions 100 --cell-timeout 120 \
+    --jobs 64
 
-  # Check every enabled green cell once with one shared build.
+  # Check every enabled green cell once with one shared build and an explicit
+  # high-width scheduler pool. Re-run `plan` first on a differently sized host.
   ./ci/compat-envelope/pressure-test.rs run \
-    --green --repetitions 1 --run-timeout 14400
+    --green --repetitions 1 --run-timeout 14400 --jobs 128
 
   # Inspect the bounded plan without executing it.
   ./ci/compat-envelope/pressure-test.rs plan \
@@ -208,11 +220,12 @@ How it runs:
   Plan generation first checks the tracked scorecard and reads selection and
   budgets from the typed manifest tool. The in-memory graph then reuses the
   canonical Hermit/resource build commands from ci/dag/portable.json without
-  recursively running the full validation metadata audit. Fixture preparation
-  is serialized. Every selected red cell, or every selected green-cell
-  repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
-  four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
-  intentionally stop later selected checks.
+  recursively running the full validation metadata audit. One read-only
+  harness manifest is shared by independently prepared fixture directories.
+  Every selected red cell, or every selected green-cell repetition, then runs
+  in its own safe-ci cgroup. --jobs controls both the scheduler pool and
+  manifest-guest capacity; KVM remains limited to one. A failure, timeout, OOM,
+  or missing result does not intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
   including signal-caused crashes when the shell reports a nonzero status; the
   pressure runner does not currently distinguish the originating signal.
@@ -831,6 +844,8 @@ struct RetainedExecution {
 struct ExecutionEvidence {
     outcomes: Vec<StepOutcome>,
     passes: usize,
+    scheduler_wall_s: f64,
+    step_profile_rows: Vec<BTreeMap<String, String>>,
 }
 
 fn outcome_evidence(outcome: &StepOutcome) -> RunnerEvidence {
@@ -856,6 +871,8 @@ fn execute_typed_dag(
     }
     let mut completed = BTreeMap::<String, StepOutcome>::new();
     let mut passes = 0usize;
+    let mut scheduler_wall_s = 0.0_f64;
+    let mut step_profile_rows = Vec::new();
 
     while completed.len() < expected.len() {
         let remaining = run_timeout_seconds.saturating_sub(started.elapsed().as_secs() as i64);
@@ -893,6 +910,9 @@ fn execute_typed_dag(
                 "pressure run reached its {run_timeout_seconds}s whole-run bound during scheduler pass {passes}"
             ));
         }
+
+        scheduler_wall_s += result.wall_s;
+        step_profile_rows.extend(result.step_profile_rows.iter().cloned());
 
         let mut progress = 0usize;
         for outcome in result.outcomes {
@@ -937,13 +957,99 @@ fn execute_typed_dag(
             .filter_map(|tag| completed.remove(tag))
             .collect(),
         passes,
+        scheduler_wall_s,
+        step_profile_rows,
     })
+}
+
+fn with_runner_log_dir<T>(
+    results: &Path,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if env::var(RUNNER_NO_LOGS_ENV).ok().as_deref() == Some("1") {
+        return Err(format!(
+            "{RUNNER_NO_LOGS_ENV}=1 disables the retained runner evidence required by pressure-test"
+        ));
+    }
+    let directory = results.join("runner-profile");
+    let previous = env::var_os(RUNNER_LOG_DIR_ENV);
+    env::set_var(RUNNER_LOG_DIR_ENV, &directory);
+    let result = action();
+    match previous {
+        Some(value) => env::set_var(RUNNER_LOG_DIR_ENV, value),
+        None => env::remove_var(RUNNER_LOG_DIR_ENV),
+    }
+    if result.is_ok() && !directory.join("journal.jsonl").is_file() {
+        return Err(format!(
+            "typed scheduler completed without retained runner journal {}",
+            directory.join("journal.jsonl").display()
+        ));
+    }
+    result
+}
+
+fn validate_step_profile_rows(rows: &[BTreeMap<String, String>]) -> Result<(), String> {
+    for row in rows {
+        let step = row.get("step").map(String::as_str).unwrap_or("<missing>");
+        for required in [
+            "step",
+            "elapsed_s",
+            "returncode",
+            "ok",
+            "timed_out",
+            "cpu_timed_out",
+            "oom_kills",
+            "peak_bytes",
+            "thread_peak",
+        ] {
+            if !row.contains_key(required) {
+                return Err(format!(
+                    "retained scheduler profile row for {step} omitted required field {required}"
+                ));
+            }
+        }
+        if let Some(usage) = row.get("cpu.usage_usec") {
+            usage.parse::<u64>().map_err(|_| {
+                format!("retained scheduler profile row for {step} has invalid cpu.usage_usec")
+            })?;
+            let effective = row
+                .get("effective_cores")
+                .ok_or_else(|| {
+                    format!(
+                        "boxed scheduler profile row for {step} omitted measured effective_cores"
+                    )
+                })?
+                .parse::<f64>()
+                .map_err(|_| {
+                    format!("boxed scheduler profile row for {step} has invalid effective_cores")
+                })?;
+            if !effective.is_finite() || effective < 0.0 {
+                return Err(format!(
+                    "boxed scheduler profile row for {step} has invalid effective_cores"
+                ));
+            }
+            if let Some(utilization) = row.get("quota_utilization_pct") {
+                let utilization = utilization.parse::<f64>().map_err(|_| {
+                    format!(
+                        "boxed scheduler profile row for {step} has invalid quota_utilization_pct"
+                    )
+                })?;
+                if !utilization.is_finite() || utilization < 0.0 {
+                    return Err(format!(
+                        "boxed scheduler profile row for {step} has invalid quota_utilization_pct"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn retain_execution_evidence(
     results: &Path,
     execution: &ExecutionEvidence,
 ) -> Result<BTreeMap<String, RunnerEvidence>, String> {
+    validate_step_profile_rows(&execution.step_profile_rows)?;
     let retained: Vec<RetainedOutcome> = execution
         .outcomes
         .iter()
@@ -959,6 +1065,8 @@ fn retain_execution_evidence(
     let document = json!({
         "schema": 1,
         "scheduler_passes": execution.passes,
+        "scheduler_wall_s": execution.scheduler_wall_s,
+        "step_profile_rows": execution.step_profile_rows,
         "outcomes": retained,
     });
     let mut text = serde_json::to_string_pretty(&document)
@@ -1126,47 +1234,63 @@ fn run() -> Result<(), String> {
                 );
             }
             let exact_cell = selection.is_exact();
-            if !selection.allows_dirty_source() && worktree_dirty(&root)? {
-                return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
-            }
+            let clean_sha = if selection.allows_dirty_source() {
+                eprintln!(
+                    "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
+                );
+                None
+            } else {
+                Some(require_clean_source(&root, None, "before planning")?)
+            };
             let run_timeout_seconds = selection
                 .run_timeout_seconds
                 .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
             let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
             require_empty_result_dir(&results)?;
             let started = Instant::now();
-            let sha = git_output(&root, &["rev-parse", "HEAD"])?;
-            let fresh = if selection.allows_dirty_source() {
-                eprintln!(
-                    "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
-                );
-                None
-            } else {
-                let fresh = FreshCheckout::prepare(&root, &sha)?;
-                println!("Fresh checkout: {}", fresh.path.display());
-                Some(fresh)
-            };
-            let execution_root = fresh
-                .as_ref()
-                .map(|checkout| checkout.path.as_path())
-                .unwrap_or(root.as_path());
             let output = results.join("dag.json");
             let run_result = (|| {
-                let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
+                let (metadata, dag) = write_plan(&root, &results, &output, &selection)?;
+                if let Some(expected_sha) = clean_sha.as_deref() {
+                    if metadata.hermit_sha != expected_sha || metadata.source_tree_dirty {
+                        return Err(format!(
+                            "clean pressure plan lost its source binding: expected HEAD {expected_sha} and source_tree_dirty=false, recorded HEAD {} and source_tree_dirty={}",
+                            metadata.hermit_sha, metadata.source_tree_dirty
+                        ));
+                    }
+                    require_clean_source(&root, Some(expected_sha), "before execution")?;
+                }
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
-                    print_exact_manifest_command(execution_root, &metadata.cells[0], &selection)?;
+                    print_exact_manifest_command(&root, &metadata.cells[0], &selection)?;
                 }
-                let execution = with_execution_root(execution_root, || {
-                    execute_typed_dag(
-                        &dag,
-                        metadata.jobs,
-                        cgroups.clone(),
-                        started,
-                        metadata.run_timeout_seconds,
-                    )
-                })?;
+                let execution_result = with_runner_log_dir(&results, || {
+                    with_execution_root(&root, || {
+                        execute_typed_dag(
+                            &dag,
+                            metadata.jobs,
+                            cgroups.clone(),
+                            started,
+                            metadata.run_timeout_seconds,
+                        )
+                    })
+                });
+                let source_result = match clean_sha.as_deref() {
+                    Some(expected_sha) => {
+                        require_clean_source(&root, Some(expected_sha), "after execution")
+                            .map(|_| ())
+                    }
+                    None => Ok(()),
+                };
+                let execution = match (execution_result, source_result) {
+                    (Ok(execution), Ok(())) => execution,
+                    (Err(execution), Ok(())) => return Err(execution),
+                    (Ok(_), Err(source)) => return Err(source),
+                    (Err(execution), Err(source)) => {
+                        return Err(format!("{execution}; {source}"));
+                    }
+                };
                 let runner_evidence = retain_execution_evidence(&results, &execution)?;
                 let expected_runs = metadata
                     .cells
@@ -1179,30 +1303,17 @@ fn run() -> Result<(), String> {
                     ));
                 }
                 println!(
-                    "Scheduler: {} pass(es), fixed -j {}",
-                    execution.passes, metadata.jobs
+                    "Scheduler: {} pass(es), fixed -j {}, {:.3}s scheduler wall",
+                    execution.passes, metadata.jobs, execution.scheduler_wall_s,
                 );
                 summarize(
-                    execution_root,
+                    &root,
                     &results,
                     selection.allows_dirty_source(),
                     Some(&runner_evidence),
                 )
             })();
-            let cleanup_result = match fresh {
-                Some(fresh) => fresh.cleanup(),
-                None => Ok(()),
-            };
-            match (run_result, cleanup_result) {
-                (Ok(()), Ok(())) => {}
-                (Err(run), Ok(())) => return Err(run),
-                (Ok(()), Err(cleanup)) => return Err(cleanup),
-                (Err(run), Err(cleanup)) => {
-                    return Err(format!(
-                        "{run}; fresh-checkout cleanup also failed: {cleanup}"
-                    ));
-                }
-            }
+            run_result?;
         }
         "summarize" => {
             let (results, output, _) = result_options(&root, &mut args, false, false)?;
@@ -1533,8 +1644,33 @@ fn worktree_dirty(root: &Path) -> Result<bool, String> {
     Ok(output
         .stdout
         .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .any(|entry| entry != b"?? .pressure-test-generated-checkout"))
+        .any(|entry| !entry.is_empty()))
+}
+
+fn require_clean_source(
+    root: &Path,
+    expected_sha: Option<&str>,
+    phase: &str,
+) -> Result<String, String> {
+    let observed_sha = git_output(root, &["rev-parse", "HEAD"])?;
+    if expected_sha.is_some_and(|expected| observed_sha != expected) {
+        return Err(format!(
+            "run refuses source checkout because HEAD changed {phase}: expected {}, observed {observed_sha}",
+            expected_sha.expect("checked expected SHA")
+        ));
+    }
+    if worktree_dirty(root)? {
+        return Err(format!(
+            "run refuses source checkout because it is dirty {phase}; commit first so every row binds to reproducible source"
+        ));
+    }
+    let confirmed_sha = git_output(root, &["rev-parse", "HEAD"])?;
+    if confirmed_sha != observed_sha {
+        return Err(format!(
+            "run refuses source checkout because HEAD changed {phase}: observed {observed_sha}, then {confirmed_sha}"
+        ));
+    }
+    Ok(confirmed_sha)
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -1558,6 +1694,86 @@ fn command_ok(command: &mut Command, purpose: &str) -> Result<(), String> {
     } else {
         Err(format!("cannot {purpose}: {status}"))
     }
+}
+
+fn write_harness_manifest(root: &Path, results: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "hermit-manifest-plan",
+            "--",
+            "--format",
+            "harness-json",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot generate harness JSON: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "hermit-manifest-plan failed while generating harness JSON:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let document: JsonValue = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("manifest-plan emitted invalid harness JSON: {error}"))?;
+    let rows = document
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+        .ok_or("manifest-plan emitted empty or non-array harness JSON")?;
+    if rows.iter().any(|manifest| {
+        let Some(manifest) = manifest.as_object() else {
+            return true;
+        };
+        manifest
+            .get("bucket")
+            .and_then(JsonValue::as_str)
+            .is_none_or(str::is_empty)
+            || manifest
+                .get("test")
+                .and_then(JsonValue::as_array)
+                .filter(|tests| !tests.is_empty())
+                .is_none_or(|tests| {
+                    tests.iter().any(|test| {
+                        test.as_object()
+                            .and_then(|test| test.get("id"))
+                            .and_then(JsonValue::as_str)
+                            .is_none_or(str::is_empty)
+                    })
+                })
+    }) {
+        return Err("manifest-plan emitted malformed harness bucket/test identities".into());
+    }
+
+    let path = results.join("harness-manifest.json");
+    let temporary = results.join("harness-manifest.in-progress.json");
+    if path.exists() || temporary.exists() {
+        return Err(format!(
+            "refusing to replace existing harness manifest under {}",
+            results.display()
+        ));
+    }
+    fs::write(&temporary, &output.stdout)
+        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
+        .map_err(|error| format!("cannot make {} read-only: {error}", temporary.display()))?;
+    fs::rename(&temporary, &path).map_err(|error| {
+        format!(
+            "cannot publish harness manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o222
+        != 0
+    {
+        return Err(format!("harness manifest is writable: {}", path.display()));
+    }
+    Ok(path)
 }
 
 struct CheckedScorecard<'a> {
@@ -1907,17 +2123,17 @@ fn require_cell_occupancy_fits(
             })?;
         }
     }
-    // The generated graph permits at most four manifest guests, and at most one
-    // KVM guest, at a time. If every selected cell consumes its declared cap,
-    // these resource limits impose this minimum wall time even before build and
-    // preparation work. Refuse an impossible public bound instead of printing a
-    // command which cannot satisfy its own contract.
-    let guest_width = jobs.clamp(1, 4);
+    // The generated graph grants one manifest-guest slot per scheduler job and
+    // at most one KVM guest at a time. If every selected cell consumes its
+    // declared cap, these resource limits impose this minimum wall time even
+    // before build and preparation work. Refuse an impossible public bound
+    // instead of printing a command which cannot satisfy its own contract.
+    let guest_width = jobs.max(1);
     let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     let occupancy_floor = guest_floor.max(kvm_seconds);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest=4, and kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={guest_width}, and kvm=1, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -1926,8 +2142,112 @@ fn require_cell_occupancy_fits(
     Ok(())
 }
 
+fn pressure_outer_memory_bound() -> Result<i64, String> {
+    expected_outer_memory_max_bytes()
+        .or_else(outer_memory_max_bytes)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            "cannot establish the outer cgroup memory bound for pressure-test scheduling".into()
+        })
+}
+
+fn checked_memory_sum<'a>(mut caps: impl Iterator<Item = &'a i64>) -> Result<i64, String> {
+    caps.try_fold(0_i64, |sum, cap| {
+        sum.checked_add(*cap).ok_or_else(|| {
+            "declared pressure-test memory caps exceed the supported integer range".into()
+        })
+    })
+}
+
+/// Conservative peak of the generated pressure graph at one scheduler width.
+///
+/// The workspace/runtime/artifact builds precede fixture preparation and cell
+/// execution. The optional LiteInst runtime build is different: after the E2E
+/// artifact is published it can overlap already-unlocked non-LiteInst work, so
+/// account for its cap plus `jobs - 1` later nodes. This stays linearithmic for
+/// a graph with thousands of repeated cells while refusing any width whose
+/// per-step cgroup limits could exceed the outer cgroup.
+fn declared_memory_at_jobs(dag: &DagConfig, jobs: i64) -> Result<i64, String> {
+    if jobs <= 0 {
+        return Err("pressure-test scheduler jobs must be positive".into());
+    }
+    let mut early_build_caps = Vec::new();
+    let mut late_build_caps = Vec::new();
+    let mut later_caps = Vec::new();
+    for step in &dag.steps {
+        let cap = step
+            .hint
+            .hard_mem_max_bytes
+            .ok_or_else(|| format!("{} has no hard memory cap", step.tag()))?;
+        if cap <= 0 {
+            return Err(format!("{} has a non-positive hard memory cap", step.tag()));
+        }
+        if step.tag() == "build.liteinst_runtime_release" {
+            late_build_caps.push(cap);
+        } else if step.group == "build" {
+            early_build_caps.push(cap);
+        } else {
+            later_caps.push(cap);
+        }
+    }
+    later_caps.sort_unstable_by(|left, right| right.cmp(left));
+    let width = usize::try_from(jobs)
+        .unwrap_or(usize::MAX)
+        .min(later_caps.len());
+    let early_builds = checked_memory_sum(early_build_caps.iter())?;
+    let later = checked_memory_sum(later_caps[..width].iter())?;
+    let late_builds = checked_memory_sum(late_build_caps.iter())?;
+    let overlap_width = width.saturating_sub(1);
+    let late_overlap = late_builds
+        .checked_add(checked_memory_sum(later_caps[..overlap_width].iter())?)
+        .ok_or("declared pressure-test memory caps exceed the supported integer range")?;
+    Ok(early_builds.max(later).max(late_overlap))
+}
+
+fn require_declared_memory_fits(
+    dag: &DagConfig,
+    jobs: i64,
+    outer_memory_bytes: i64,
+) -> Result<i64, String> {
+    let requested = declared_memory_at_jobs(dag, jobs)?;
+    if requested <= outer_memory_bytes {
+        return Ok(requested);
+    }
+    let mut largest_safe = 0_i64;
+    let mut first_unsafe = jobs;
+    while largest_safe + 1 < first_unsafe {
+        let candidate = largest_safe + (first_unsafe - largest_safe) / 2;
+        if declared_memory_at_jobs(dag, candidate)? <= outer_memory_bytes {
+            largest_safe = candidate;
+        } else {
+            first_unsafe = candidate;
+        }
+    }
+    Err(format!(
+        "--jobs {jobs} permits {requested} bytes of concurrent declared memory caps, above the {outer_memory_bytes}-byte outer cgroup bound; use --jobs {largest_safe} or lower for this exact population"
+    ))
+}
+
 fn build_marker(results: &Path, tag: &str) -> PathBuf {
     results.join("state").join(format!("{}.ok", sanitize(tag)))
+}
+
+fn checkout_temporary_directory(root: &Path, tag: &str) -> PathBuf {
+    root.join("ignored")
+        .join("compat-envelope")
+        .join("tmp")
+        .join(sanitize(tag))
+}
+
+fn checkout_temporary_environment(root: &Path, tag: &str) -> BTreeMap<String, String> {
+    let path = checkout_temporary_directory(root, tag)
+        .to_string_lossy()
+        .into_owned();
+    BTreeMap::from([
+        ("TEMP".into(), path.clone()),
+        ("TMP".into(), path.clone()),
+        ("TMPDIR".into(), path),
+    ])
 }
 
 fn required_build_tags(
@@ -2102,6 +2422,7 @@ fn write_plan_after_scorecard_check(
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
+    let harness_manifest = write_harness_manifest(root, results)?;
 
     let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
@@ -2123,6 +2444,8 @@ fn write_plan_after_scorecard_check(
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
+            let temporary_directory = checkout_temporary_directory(root, &tag);
+            step.env.extend(checkout_temporary_environment(root, &tag));
             let direct_backend_build = exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
@@ -2131,8 +2454,9 @@ fn write_plan_after_scorecard_check(
                 step.cmd.clone()
             };
             step.cmd = format!(
-                "mkdir -p {state}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
+                "mkdir -p {state} {temporary_directory}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
+                temporary_directory = shell_quote(&temporary_directory.to_string_lossy()),
                 marker = shell_quote(&marker.to_string_lossy()),
             );
             // Preserve every dependency between selected build nodes. Only the
@@ -2177,6 +2501,7 @@ fn write_plan_after_scorecard_check(
         let job = sanitize(&test);
         let tag = format!("prepare.{job}");
         let status_path = results.join("prepare").join(&job).join("status");
+        let temporary_directory = checkout_temporary_directory(root, &tag);
         let backend = if cell.backend == "native" {
             String::new()
         } else {
@@ -2184,7 +2509,7 @@ fn write_plan_after_scorecard_check(
         };
         let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds)?;
         let cmd = format!(
-            "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
+            "mkdir -p {status_dir} {temporary_directory}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
@@ -2192,6 +2517,7 @@ fn write_plan_after_scorecard_check(
              --test {test} --mode {mode}{backend} || status=$?; \
              printf '%s\\n' \"$status\" > {status}; exit 0",
             status_dir = shell_quote(&status_path.parent().unwrap().to_string_lossy()),
+            temporary_directory = shell_quote(&temporary_directory.to_string_lossy()),
             results = shell_quote(&results.to_string_lossy()),
             build_root = shell_quote(&build_root.to_string_lossy()),
             test = shell_quote(&test),
@@ -2213,9 +2539,15 @@ fn write_plan_after_scorecard_check(
             description: String::new(),
             cmd,
             deps: preparation_deps,
-            env: BTreeMap::new(),
+            env: {
+                let mut environment = checkout_temporary_environment(root, &tag);
+                environment.insert(
+                    "E2E_HARNESS_MANIFEST_JSON".into(),
+                    harness_manifest.to_string_lossy().into_owned(),
+                );
+                environment
+            },
             hint: ResourceHint {
-                resources: BTreeMap::from([("cargo_writer".into(), 1)]),
                 rss_baseline_bytes: Some(1_073_741_824),
                 hard_mem_max_bytes: Some(3_221_225_472),
                 classification: StepClass::CpuBound,
@@ -2367,7 +2699,10 @@ fn write_plan_after_scorecard_check(
                 description: String::new(),
                 cmd,
                 deps,
-                env: BTreeMap::new(),
+                env: BTreeMap::from([(
+                    "E2E_HARNESS_MANIFEST_JSON".into(),
+                    harness_manifest.to_string_lossy().into_owned(),
+                )]),
                 hint: ResourceHint {
                     resources,
                     rss_baseline_bytes: Some(memory / 3),
@@ -2417,12 +2752,17 @@ fn write_plan_after_scorecard_check(
     let mut dag = canonical;
     dag.resource_caps = BTreeMap::from([
         ("cargo_writer".into(), 1),
-        ("manifest_guest".into(), 4),
+        ("manifest_guest".into(), selection.scheduler_jobs()),
         ("kvm".into(), 1),
     ]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
+    require_declared_memory_fits(
+        &dag,
+        selection.scheduler_jobs(),
+        pressure_outer_memory_bound()?,
+    )?;
     let expected_runs = cells.len().saturating_mul(selection.run_count());
     audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts)?;
     let mut dag_text = dag_to_json(&dag);
@@ -2904,9 +3244,7 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
         && !runner.ok
         && runner.oom
         && !runner.timed_out
-        && harness_status.is_some_and(|status| {
-            !matches!(status, 0 | PREPARATION_FAILED_STATUS)
-        })
+        && harness_status.is_some_and(|status| !matches!(status, 0 | PREPARATION_FAILED_STATUS))
 }
 
 fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -2917,8 +3255,7 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
             !matches!(
                 status,
                 INCOMPLETE_ATTEMPT_STATUS | PREPARATION_FAILED_STATUS
-            )
-                && runner.ok == (status == 0)
+            ) && runner.ok == (status == 0)
         })
 }
 
@@ -3542,7 +3879,7 @@ fn summarize(
     }
     println!();
     println!(
-        "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
+        "Metric: current manifest contract. Verify, replay, and same-seed chaos require canonical typed evidence; passes on a supported canonical evidence path require bitwise_parity=true with nonzero compared INFO messages."
     );
     println!();
     if metadata.source_tree_dirty {
@@ -3789,8 +4126,10 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     )
     .map_err(|error| format!("cannot parse direct-scheduler fixture: {error}"))?;
 
-    let execution = with_execution_root(scratch, || {
-        execute_typed_dag(&dag, PRESSURE_JOBS, None, Instant::now(), 15)
+    let execution = with_runner_log_dir(&direct, || {
+        with_execution_root(scratch, || {
+            execute_typed_dag(&dag, PRESSURE_JOBS, None, Instant::now(), 15)
+        })
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -3800,13 +4139,29 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     if cell_outcomes.len() != 20
         || cell_outcomes.iter().filter(|outcome| outcome.ok).count() != 18
         || execution.passes < 2
+        || execution.scheduler_wall_s <= 0.0
     {
         return Err(format!(
-            "direct scheduler did not retain all terminal cells across failures: cells={} passes={} ok={}",
+            "direct scheduler did not retain all terminal cells and measured wall time across failures: cells={} passes={} ok={} wall={:.3}",
             cell_outcomes.len(),
             execution.passes,
-            cell_outcomes.iter().filter(|outcome| outcome.ok).count()
+            cell_outcomes.iter().filter(|outcome| outcome.ok).count(),
+            execution.scheduler_wall_s,
         ));
+    }
+    let runner_profile = direct.join("runner-profile");
+    if !runner_profile.join("journal.jsonl").is_file()
+        || fs::read_dir(&runner_profile)
+            .map_err(|error| format!("cannot inspect retained runner profile: {error}"))?
+            .filter_map(Result::ok)
+            .all(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "log")
+            })
+    {
+        return Err("direct scheduler did not retain its journal and per-step logs".into());
     }
     let executed_count = fs::read_dir(&executed)
         .map_err(|error| format!("cannot read direct-scheduler outputs: {error}"))?
@@ -3826,6 +4181,58 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     fs::create_dir_all(&retained_results)
         .map_err(|error| format!("cannot create retained-outcome fixture: {error}"))?;
     let evidence = retain_execution_evidence(&retained_results, &execution)?;
+    let retained_document: JsonValue = serde_json::from_str(
+        &fs::read_to_string(retained_results.join("runner-outcomes.json"))
+            .map_err(|error| format!("cannot read retained scheduler document: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse retained scheduler document: {error}"))?;
+    let profile_rows = retained_document["step_profile_rows"]
+        .as_array()
+        .ok_or("retained scheduler document omitted step profile rows")?;
+    for required in [
+        "step",
+        "elapsed_s",
+        "returncode",
+        "ok",
+        "timed_out",
+        "cpu_timed_out",
+        "oom_kills",
+        "peak_bytes",
+        "thread_peak",
+    ] {
+        if profile_rows.iter().any(|row| {
+            row.as_object()
+                .is_none_or(|row| !row.contains_key(required))
+        }) {
+            return Err(format!(
+                "retained scheduler profile rows omitted required field {required}"
+            ));
+        }
+    }
+    let boxed_profile = BTreeMap::from([
+        ("step".into(), "cell.boxed".into()),
+        ("elapsed_s".into(), "1.000".into()),
+        ("returncode".into(), "0".into()),
+        ("ok".into(), "true".into()),
+        ("timed_out".into(), "false".into()),
+        ("cpu_timed_out".into(), "false".into()),
+        ("oom_kills".into(), "0".into()),
+        ("peak_bytes".into(), "1024".into()),
+        ("thread_peak".into(), "1".into()),
+        ("cpu.usage_usec".into(), "750000".into()),
+        ("effective_cores".into(), "0.7500".into()),
+        ("quota_utilization_pct".into(), "75.00".into()),
+    ]);
+    validate_step_profile_rows(std::slice::from_ref(&boxed_profile))
+        .map_err(|error| format!("valid boxed profile was refused: {error}"))?;
+    let mut malformed_profile = boxed_profile;
+    malformed_profile.insert("cpu.usage_usec".into(), "not-a-number".into());
+    if validate_step_profile_rows(&[malformed_profile]).is_ok() {
+        return Err("malformed boxed CPU utilization evidence was accepted".into());
+    }
+    if retained_document["scheduler_wall_s"].as_f64() != Some(execution.scheduler_wall_s) {
+        return Err("retained scheduler utilization summary changed its measured values".into());
+    }
     let loaded = load_retained_runner_evidence(&retained_results)?
         .ok_or("typed scheduler outcome file was not loadable")?;
     if evidence.len() != 20
@@ -4001,6 +4408,96 @@ fn self_test(root: &Path) -> Result<(), String> {
     let (_, _, jobs_selection) = result_options(root, &mut jobs_args, false, true)?;
     if jobs_selection.scheduler_jobs() != 7 {
         return Err("--jobs did not reach the typed scheduler selection".into());
+    }
+    let occupancy_cell = TrackedCell {
+        id: CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/test".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        },
+        enabled: true,
+        status: "green".into(),
+    };
+    let occupancy_budgets = BTreeMap::from([(
+        ("fixture/test".into(), "verify".into()),
+        CellBudget {
+            timeout_seconds: 1,
+            attempts: Some(1),
+        },
+    )]);
+    let occupancy_error =
+        require_cell_occupancy_fits(&[occupancy_cell], &occupancy_budgets, None, 52, 7, 7)
+            .expect_err("seven-way occupancy equal to the run bound was accepted");
+    if !occupancy_error.contains("-j 7, manifest_guest=7, and kvm=1") {
+        return Err(format!(
+            "occupancy refusal did not report the actual manifest-guest capacity: {occupancy_error}"
+        ));
+    }
+    let memory_fixture_steps = (0..6)
+        .map(|number| {
+            let cap = if number == 0 {
+                16_i64 * 1024 * 1024 * 1024
+            } else {
+                3_i64 * 1024 * 1024 * 1024
+            };
+            json!({
+                "group": "cell",
+                "job": format!("memory-{number}"),
+                "cmd": "true",
+                "timeout": 5,
+                "cpu_timeout": 5,
+                "hint": {"hard_mem_max_bytes": cap}
+            })
+        })
+        .collect::<Vec<_>>();
+    let memory_fixture = dag_from_json(
+        &serde_json::to_string(&json!({"steps": memory_fixture_steps}))
+            .map_err(|error| format!("cannot serialize memory-width fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse memory-width fixture: {error}"))?;
+    let memory_budget = 25_i64 * 1024 * 1024 * 1024;
+    require_declared_memory_fits(&memory_fixture, 4, memory_budget)
+        .map_err(|error| format!("safe four-way memory fixture was refused: {error}"))?;
+    let memory_error = require_declared_memory_fits(&memory_fixture, 5, memory_budget)
+        .expect_err("unsafe five-way memory fixture was accepted");
+    if !memory_error.contains("use --jobs 4 or lower") {
+        return Err(format!(
+            "memory-width refusal did not report the exact safe width: {memory_error}"
+        ));
+    }
+    let mut overlap_steps = vec![json!({
+        "group": "build",
+        "job": "liteinst_runtime_release",
+        "cmd": "true",
+        "timeout": 5,
+        "cpu_timeout": 5,
+        "hint": {"hard_mem_max_bytes": 16_i64 * 1024 * 1024 * 1024}
+    })];
+    overlap_steps.extend((0..5).map(|number| {
+        json!({
+            "group": "cell",
+            "job": format!("late-overlap-{number}"),
+            "cmd": "true",
+            "timeout": 5,
+            "cpu_timeout": 5,
+            "hint": {"hard_mem_max_bytes": 3_i64 * 1024 * 1024 * 1024}
+        })
+    }));
+    let overlap_fixture = dag_from_json(
+        &serde_json::to_string(&json!({"steps": overlap_steps}))
+            .map_err(|error| format!("cannot serialize late-build overlap fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot parse late-build overlap fixture: {error}"))?;
+    require_declared_memory_fits(&overlap_fixture, 4, memory_budget)
+        .map_err(|error| format!("safe late-build overlap fixture was refused: {error}"))?;
+    let overlap_error = require_declared_memory_fits(&overlap_fixture, 5, memory_budget)
+        .expect_err("unsafe late-build overlap fixture was accepted");
+    if !overlap_error.contains("use --jobs 4 or lower") {
+        return Err(format!(
+            "late-build overlap refusal did not report the exact safe width: {overlap_error}"
+        ));
     }
     for invalid in ["0", "not-a-number"] {
         let mut invalid_args = vec![
@@ -4519,6 +5016,51 @@ fn self_test(root: &Path) -> Result<(), String> {
     if worktree_dirty(&clone_source)? {
         return Err("generated-checkout cleanup left its source fixture dirty".into());
     }
+
+    // Clean batch and repeated execution uses the selected repository root
+    // directly. Bracket the source check with an inert repository so a clean,
+    // unchanged root is accepted while either post-run mutation is refused.
+    let bound_sha = require_clean_source(&clone_source, None, "before execution")?;
+    if bound_sha != clone_sha {
+        return Err("clean-root source check bound the wrong commit".into());
+    }
+    let planted_dirty = clone_source.join("post-run-dirty");
+    fs::write(&planted_dirty, "changed during execution\n")
+        .map_err(|e| format!("cannot plant post-run dirty source: {e}"))?;
+    let dirty_refusal = require_clean_source(&clone_source, Some(&bound_sha), "after execution")
+        .err()
+        .ok_or("post-run source check accepted a dirty worktree")?;
+    if !dirty_refusal.contains("dirty after execution") {
+        return Err(format!(
+            "post-run dirty refusal lost its phase and cause: {dirty_refusal}"
+        ));
+    }
+    fs::remove_file(&planted_dirty)
+        .map_err(|e| format!("cannot remove planted post-run dirty source: {e}"))?;
+    command_ok(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=pressure-test self-test",
+                "-c",
+                "user.email=pressure-test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "change HEAD",
+            ])
+            .current_dir(&clone_source),
+        "plant post-run HEAD change",
+    )?;
+    let head_refusal = require_clean_source(&clone_source, Some(&bound_sha), "after execution")
+        .err()
+        .ok_or("post-run source check accepted a changed HEAD")?;
+    if !head_refusal.contains("HEAD changed after execution") {
+        return Err(format!(
+            "post-run HEAD refusal lost its phase and cause: {head_refusal}"
+        ));
+    }
+
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
@@ -4567,9 +5109,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         "owned marker\n",
     )
     .map_err(|e| format!("cannot write generated-checkout marker fixture: {e}"))?;
-    if worktree_dirty(&dirty_fixture)? {
-        return Err("the tool-owned generated-checkout marker made clean source dirty".into());
+    if !worktree_dirty(&dirty_fixture)? {
+        return Err("an untracked generated-checkout marker was treated as clean".into());
     }
+    fs::remove_file(dirty_fixture.join(".pressure-test-generated-checkout"))
+        .map_err(|e| format!("cannot remove generated-checkout marker fixture: {e}"))?;
     fs::write(dirty_fixture.join("arbitrary-source"), "untracked\n")
         .map_err(|e| format!("cannot write arbitrary untracked-source fixture: {e}"))?;
     if !worktree_dirty(&dirty_fixture)? {
@@ -4715,6 +5259,27 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read repeated-plan DAG: {e}"))?;
     let repeated_dag = dag_from_json(&repeated_dag_text)
         .map_err(|e| format!("cannot parse repeated-plan DAG: {e}"))?;
+    let valid_manifest = repeated_results.join("harness-manifest.json");
+    let valid_manifest_text = valid_manifest.to_string_lossy().into_owned();
+    let mut jobs_seven_selection = repeated_selection.clone();
+    jobs_seven_selection.jobs = Some(7);
+    let jobs_seven_results = scratch.join("jobs-seven-plan");
+    let (jobs_seven_metadata, jobs_seven_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &jobs_seven_results,
+        &jobs_seven_results.join("dag.json"),
+        &jobs_seven_selection,
+    )?;
+    if jobs_seven_metadata.jobs != 7
+        || jobs_seven_dag.resource_caps.get("manifest_guest") != Some(&7)
+        || jobs_seven_dag.resource_caps.get("kvm") != Some(&1)
+        || jobs_seven_dag.resource_caps.get("cargo_writer") != Some(&1)
+    {
+        return Err(
+            "explicit --jobs 7 did not raise the scheduler and manifest-guest capacity together"
+                .into(),
+        );
+    }
     let repeated_cell_steps: Vec<_> = repeated_dag
         .steps
         .iter()
@@ -4755,6 +5320,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         || !runtime_build_steps[0]
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
+        || preparation_steps[0]
+            .hint
+            .resources
+            .contains_key("cargo_writer")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
         || repeated_dag.resource_caps.get("kvm") != Some(&1)
     {
@@ -4762,6 +5331,40 @@ fn self_test(root: &Path) -> Result<(), String> {
             "repeated exact plan lost its shared direct build, preparation, cells, or resource caps, or reintroduced the recursive metadata audit"
                 .into(),
         );
+    }
+    for step in runtime_build_steps
+        .iter()
+        .copied()
+        .chain(preparation_steps.iter().copied())
+    {
+        let expected = checkout_temporary_environment(root, &step.tag());
+        for variable in ["TMPDIR", "TMP", "TEMP"] {
+            if step.env.get(variable) != expected.get(variable) {
+                return Err(format!(
+                    "{} did not bind {variable} to its checkout-local ignored directory",
+                    step.tag()
+                ));
+            }
+        }
+        let temporary_directory = checkout_temporary_directory(root, &step.tag());
+        if !temporary_directory.starts_with(root.join("ignored"))
+            || !step
+                .cmd
+                .contains(&shell_quote(&temporary_directory.to_string_lossy()))
+        {
+            return Err(format!(
+                "{} temporary directory escaped the checkout or is not created by its command",
+                step.tag()
+            ));
+        }
+    }
+    if preparation_steps[0].env.get("E2E_HARNESS_MANIFEST_JSON") != Some(&valid_manifest_text) {
+        return Err("preparation did not receive the exact retained harness manifest".into());
+    }
+    if !checkout_temporary_directory(root, "../../escape")
+        .starts_with(root.join("ignored/compat-envelope/tmp"))
+    {
+        return Err("sanitized step identity escaped the checkout-local temporary root".into());
     }
     let preparation_tag = preparation_steps[0].tag();
     if preparation_steps[0].deps != ["build.runtime_release".to_string()] {
@@ -4779,6 +5382,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             || step.cmd.contains("run-with-hermit-e2e-artifact.sh")
             || !step.cmd.contains(&format!("E2E_RUN_ID='{}'", step.job))
             || !step.cmd.contains(&format!("/cells/{}/", step.job))
+            || step.env.get("E2E_HARNESS_MANIFEST_JSON") != Some(&valid_manifest_text)
         {
             return Err(format!(
                 "{} does not share preparation while retaining a unique run ID and result path",
@@ -4925,28 +5529,25 @@ fn self_test(root: &Path) -> Result<(), String> {
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
         );
     }
-    let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
-    let one_cell_mode_selection = CellSelection {
+    let mode_filtered_results = scratch.join("mode-filtered-green-plan");
+    let mode_filtered_selection = CellSelection {
         green: true,
         mode: Some("replay".into()),
         repetitions: Some(2),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_mode_metadata, _) = write_plan_after_scorecard_check(
+    let (mode_filtered_metadata, _) = write_plan_after_scorecard_check(
         &checked_scorecard,
-        &one_cell_mode_results,
-        &one_cell_mode_results.join("dag.json"),
-        &one_cell_mode_selection,
+        &mode_filtered_results,
+        &mode_filtered_results.join("dag.json"),
+        &mode_filtered_selection,
     )?;
-    if !one_cell_mode_metadata.green
-        || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
+    if !mode_filtered_metadata.green
+        || top_level_repeated_result_description(&mode_filtered_metadata, 1, 0, 2)
             != "one or more repeated checks failed"
     {
-        return Err(
-            "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
-        );
+        return Err("a mode-filtered green batch was described as an exact flaky cell".into());
     }
     let one_cell_sample_results = scratch.join("one-cell-sample-green-plan");
     let one_cell_sample_selection = CellSelection {
@@ -5026,9 +5627,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
-                BTreeSet::from(["build.workspace", "build.runtime_release"])
-            }
+            "build.e2e_artifact" => BTreeSet::from(["build.workspace", "build.runtime_release"]),
             "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
@@ -5038,8 +5637,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 tag
             ));
         }
-        if tag == "build.e2e_artifact"
-            && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
+        if tag == "build.e2e_artifact" && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
         {
             return Err("green batch replaced the canonical prebuilt artifact publisher".into());
         }
@@ -5072,9 +5670,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             .filter(|step| step.group == "cell")
             .any(|step| {
                 !step.deps.contains(&"build.e2e_artifact".to_string())
-                    || !step.cmd.contains(
-                        "./ci/run-with-hermit-e2e-artifact.sh --require-install",
-                    )
+                    || !step
+                        .cmd
+                        .contains("./ci/run-with-hermit-e2e-artifact.sh --require-install")
             })
     {
         return Err(
@@ -5708,7 +6306,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: clean-root source binding, no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }

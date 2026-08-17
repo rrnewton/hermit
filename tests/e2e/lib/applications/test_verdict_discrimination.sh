@@ -9,8 +9,8 @@
 #
 # The bug this guards against is not "verification fails"; it is verification
 # reporting PASS for work it never did. The previous helper decided success by
-# grepping stderr for a banner while running bare `--verify` (the lossy Stripped
-# policy), so a stripped match, and anything that merely printed the banner,
+# grepping stderr for a banner while bare `--verify` still used the removed
+# lossy Stripped policy, so a stripped match, and anything that merely printed the banner,
 # read as strict L2.
 #
 # These cases drive the reader with SYNTHETIC `--verify-json` reports via a fake
@@ -88,7 +88,7 @@ function expect {
     fi
 }
 
-parity_report='{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":1200,"right":1200},"guest_exit_code":0,"guest_signal":null}'
+parity_report='{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":1200,"right":1200},"guest_exit_code":0,"guest_signal":null}'
 
 printf 'run_hermit_verify verdict discrimination\n'
 
@@ -112,12 +112,12 @@ EXPECT_CWD=$WORK expect nonexistent-relative-path PATH-CONTRACT "$parity_report"
 # the fake still prints the old success banner, so the previous banner-grep
 # implementation accepted this. It is NOT L2.
 expect stripped-match DIVERGED \
-    '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped"},"compared_log_messages":{"left":1200,"right":1200},"guest_exit_code":0,"guest_signal":null}' 0
+    '{"verified":true,"bitwise_parity":false,"verdict":"matched","comparison":{"strictness":"stripped","compare_logs":true},"compared_log_messages":{"left":1200,"right":1200},"guest_exit_code":0,"guest_signal":null}' 0
 
 # A strict CONFIGURATION that compared nothing. Parity over an empty selection
 # is vacuous; this is the "ok with zero executed tests" failure.
 expect zero-compared NO-RESULT \
-    '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}' 0
+    '{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":0,"right":0},"guest_exit_code":0,"guest_signal":null}' 0
 
 # Log comparison never ran at all (output-only fallback): null, not zero.
 expect null-compared NO-RESULT \
@@ -129,7 +129,7 @@ expect no-result-stamp NO-RESULT \
 
 # A real comparison that failed.
 expect diverged DIVERGED \
-    '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":1200,"right":1199},"guest_exit_code":0,"guest_signal":null}' 1
+    '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":1200,"right":1199},"guest_exit_code":0,"guest_signal":null}' 1
 
 # Launch refusal: no report written at all. Distinct from a no-result report.
 expect launch-refusal REFUSED '' 1

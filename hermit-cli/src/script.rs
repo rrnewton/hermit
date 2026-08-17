@@ -40,13 +40,21 @@ impl Shebang {
             }
         }
 
-        let mut j = 1 + i;
+        if i >= buf.len() || b"\r\n".contains(&buf[i]) {
+            return None;
+        }
+
+        let mut j = i;
         while j < buf.len() {
             if b" \t\r\n".contains(&buf[j]) {
                 break;
             } else {
                 j += 1;
             }
+        }
+
+        if j == i {
+            return None;
         }
 
         let program = PathBuf::from(OsStr::from_bytes(&buf[i..j]));
@@ -111,6 +119,9 @@ mod test {
     #[test]
     fn shebang_invalid_shebang() {
         assert_eq!(Shebang::from_buf(b"! /bin/bash"), None);
+        assert_eq!(Shebang::from_buf(b"#!"), None);
+        assert_eq!(Shebang::from_buf(b"#!   "), None);
+        assert_eq!(Shebang::from_buf(b"#!\n"), None);
     }
 
     #[test]

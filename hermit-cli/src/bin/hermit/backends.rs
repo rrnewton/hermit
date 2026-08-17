@@ -32,7 +32,7 @@ use std::io::IsTerminal as _;
 #[cfg(feature = "dbt")]
 use std::io::Read;
 #[cfg(feature = "dbt")]
-use std::io::Seek as _;
+use std::io::Seek;
 #[cfg(feature = "dbt")]
 use std::io::SeekFrom;
 #[cfg(feature = "dbt")]
@@ -42,6 +42,8 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "dbt")]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
@@ -53,10 +55,28 @@ use detcore::Config;
 use hermit::Error;
 use hermit::ExitStatus;
 #[cfg(feature = "dbt")]
+use reverie_dbt::DbtEvidenceLogLevel;
+#[cfg(feature = "dbt")]
 use reverie_dbt::DbtRunner;
 use tracing::metadata::LevelFilter;
 
 use super::run::VerifyAllow;
+#[cfg(feature = "dbt")]
+use super::verify::ComparedRun;
+#[cfg(feature = "dbt")]
+use super::verify::ComparisonOptions;
+#[cfg(feature = "dbt")]
+use super::verify::compare_two_runs;
+#[cfg(feature = "dbt")]
+use super::verify::retain_verification_logs;
+#[cfg(feature = "dbt")]
+use super::verify::temp_log_files_in;
+#[cfg(feature = "dbt")]
+use super::verify::verification_log_level;
+#[cfg(feature = "dbt")]
+use super::verify::write_pending_verification_json;
+#[cfg(feature = "dbt")]
+use super::verify::write_verification_json;
 
 #[derive(Debug)]
 #[cfg(feature = "dbt")]
@@ -66,18 +86,6 @@ struct DbtSummary {
     rewritten: u64,
     stdin_reads: u64,
     memory_hash: String,
-}
-
-#[cfg(feature = "dbt")]
-impl DbtSummary {
-    fn same_observable_behavior(&self, other: &Self) -> bool {
-        // `branches` is the count at the last intercepted syscall, not an execution digest.
-        // Keep it as callback-health telemetry without rejecting otherwise identical runs.
-        self.syscalls == other.syscalls
-            && self.rewritten == other.rewritten
-            && self.stdin_reads == other.stdin_reads
-            && self.memory_hash == other.memory_hash
-    }
 }
 
 /// Render the native DBT counters as a labeled `--summary` block.
@@ -361,18 +369,92 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
     }
 }
 
+#[cfg(feature = "dbt")]
+fn dbt_evidence_log_level(
+    requested: Option<LevelFilter>,
+    diagnostic_full_trace: bool,
+) -> DbtEvidenceLogLevel {
+    let level = verification_log_level(requested, diagnostic_full_trace);
+    if level >= LevelFilter::TRACE {
+        DbtEvidenceLogLevel::Trace
+    } else if level >= LevelFilter::DEBUG {
+        DbtEvidenceLogLevel::Debug
+    } else {
+        DbtEvidenceLogLevel::Info
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<Vec<Vec<u8>>, Error> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut encoded = Vec::new();
+    file.read_to_end(&mut encoded)?;
+    if encoded.is_empty() {
+        return Err(Error::msg("DBT canonical evidence was empty"));
+    }
+    reverie_dbt::decode_evidence(&encoded)
+        .map(reverie_dbt::DbtEvidence::into_records)
+        .map_err(|error| {
+            Error::msg(format!(
+                "DBT canonical evidence was malformed or truncated: {error}"
+            ))
+        })
+}
+
+#[cfg(feature = "dbt")]
+fn materialize_dbt_comparison_log(
+    records: &[Vec<u8>],
+    mut log: std::fs::File,
+    path: &Path,
+) -> Result<usize, Error> {
+    if records.is_empty() {
+        return Err(Error::msg("DBT canonical evidence contained no records"));
+    }
+    log.set_len(0)?;
+    log.seek(SeekFrom::Start(0))?;
+    for record in records {
+        let Some(payload) = record.strip_suffix(b"\n") else {
+            return Err(Error::msg(
+                "DBT canonical evidence record was missing its terminal newline",
+            ));
+        };
+        if payload.contains(&b'\n') || payload.contains(&b'\r') {
+            return Err(Error::msg(
+                "DBT canonical evidence record contained an embedded line boundary",
+            ));
+        }
+        log.write_all(record)?;
+    }
+    log.flush()?;
+
+    let compared = detcore::logdiff::canonical_info_count(path).map_err(|error| {
+        Error::msg(format!(
+            "DBT canonical evidence did not contain a valid log stream: {error}"
+        ))
+    })?;
+    if compared == 0 {
+        return Err(Error::msg(
+            "DBT canonical evidence contained no INFO records",
+        ));
+    }
+    Ok(compared)
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_verification_output(output: Output) -> reverie::process::Output {
+    reverie::process::Output {
+        status: process_status(output.status),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    }
+}
+
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
 ///
-/// `config` is the CLI-derived Detcore configuration (the same value the ptrace
-/// backend receives). It is serialized into [`detcore_dbt::DETCONFIG_ENV`] so
-/// flags such as `--strict`, `--seed`, and the time/CPUID virtualization
-/// switches actually reach the in-guest Detcore Tool instead of being ignored.
-///
-/// When `verify` is true, the guest is executed twice. Both runs must exit in a
-/// way `verify_allow` permits (by default success; `--verify-allow {failure,both}`
-/// admits a deliberate non-zero exit), agree on their exit status, produce
-/// byte-identical stdout, report `tool=Detcore`, and produce the same observed
-/// guest-memory hash from the native DBT runtime.
+/// Verification obtains structured tracing records through Reverie's
+/// authenticated per-run evidence channel, decodes the finalized framed
+/// artifact after the complete process tree is reaped, and hands the resulting
+/// log plus exact stdout/stderr/status to Hermit's ordinary typed comparator.
 // This mirrors the option surface of `hermit run`, so its parameters track the
 // CLI run flags rather than a cohesive value object; bundling them would not
 // clarify the dispatch shim.
@@ -382,12 +464,27 @@ pub(super) fn run_dbt(
     program: &Path,
     args: &[String],
     verify: bool,
+    verify_verbose: bool,
     verify_allow: VerifyAllow,
+    print_verify_logs: bool,
+    keep_logs: bool,
+    verify_log_dir: Option<&Path>,
+    verify_json: Option<&Path>,
     summary: bool,
     log: Option<LevelFilter>,
+    log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
+    verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
+    if let Some(path) = verify_json.filter(|_| verify) {
+        write_pending_verification_json(path)?;
+    }
+    if log_file.is_some() && !verify {
+        return Err(Error::msg(
+            "DBT --log-file is unavailable on the ordinary single-run adapter",
+        ));
+    }
     // The DBT backend drives a single Detcore external scheduler, so it cannot
     // honor a request to relax thread sequentialization. Fail loudly rather
     // than silently ignoring the flag.
@@ -422,7 +519,7 @@ pub(super) fn run_dbt(
                 client.display()
             ))
         })?
-        .summary(true)
+        .summary(summary && !verify)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -440,9 +537,10 @@ pub(super) fn run_dbt(
         environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
     );
     let mut guest = StdCommand::new(&prepared.program);
-    if let Some(level) = log {
+    if !verify && let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
+    environment.remove(OsStr::new("HERMIT_LOG_FILE"));
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
@@ -453,9 +551,6 @@ pub(super) fn run_dbt(
                 .status(&guest)
                 .map_err(|error| launch_error(&drrun, error))?;
             if summary {
-                // stdout/stderr are inherited on the terminal path, so the
-                // client's raw `reverie-dbt:` counter line has already been
-                // printed above; we cannot re-parse it here.
                 eprintln!(
                     ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
                      (run without a terminal on stdin for the labeled block)"
@@ -463,120 +558,158 @@ pub(super) fn run_dbt(
             }
             return Ok(process_status(status));
         }
+
         let output = run_once(&runner, &guest, &drrun, std::io::stdin())?;
         write_output(&output)?;
         if summary {
-            // Best-effort: surface the native DBT counters the client already
-            // emitted. A parse failure here is non-fatal — the run itself
-            // succeeded and the raw `reverie-dbt:` line is still on stderr.
             match detcore_summary(&output) {
                 Ok(stats) => eprint!("{}", format_dbt_stats(&stats)),
-                Err(error) => {
-                    eprintln!(":: DBT summary unavailable: {error}");
-                }
+                Err(error) => eprintln!(":: DBT summary unavailable: {error}"),
             }
         }
         return Ok(output_status(&output));
     }
 
-    let mut replay = if stdin_is_terminal {
-        None
-    } else {
-        Some(tempfile::tempfile()?)
-    };
+    let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
+        .map_err(|error| Error::msg(format!("failed to create DBT verification logs: {error}")))?;
+    let (log1_file, log1_path) = log1.into_parts();
+    let (log2_file, log2_path) = log2.into_parts();
+    let evidence_level = dbt_evidence_log_level(log, verify_verbose);
+    let mut evidence1 = tempfile::tempfile()?;
+    let runner1 = runner
+        .clone()
+        .evidence_file(&evidence1)
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to configure protected DBT run-1 evidence: {error}"
+            ))
+        })?
+        .evidence_log_level(evidence_level);
+    let mut evidence2 = tempfile::tempfile()?;
+    let runner2 = runner
+        .evidence_file(&evidence2)
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to configure protected DBT run-2 evidence: {error}"
+            ))
+        })?
+        .evidence_log_level(evidence_level);
+
+    let mut replay = tempfile::tempfile()?;
+    let replayable_stdin = verification_stdin.filter(|file| {
+        // SAFETY: `as_raw_fd` borrows a live descriptor for this check.
+        (unsafe { libc::isatty(file.as_raw_fd()) }) != 1
+    });
 
     eprintln!(":: DBT Run1...");
-    let first = match replay.as_mut() {
-        Some(replay) => {
-            let first_input = TeeReader {
-                input: std::io::stdin(),
+    let first_raw = match replayable_stdin {
+        Some(input) => run_once(
+            &runner1,
+            &guest,
+            &drrun,
+            TeeReader {
+                input,
                 replay: replay.try_clone()?,
-            };
-            run_once(&runner, &guest, &drrun, first_input)?
-        }
-        None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
+            },
+        ),
+        None => run_once(&runner1, &guest, &drrun, std::io::empty()),
     };
-    if !verify_allow.satisfies(process_status(first.status)) {
-        // The first run exited in a way `--verify-allow` does not permit, so a
-        // second run cannot establish determinism for the intended contract.
-        // This mirrors the ptrace `--verify` path (see `verify` in run.rs).
-        // With `--verify-allow {failure,both}` a deliberate non-zero exit *is*
-        // permitted, so the double-run comparison below still executes — that is
-        // what lets the `exit_status` backend-parity contract reach L2 on DBT.
-        write_output(&first)?;
-        return Ok(output_status(&first));
-    }
-    let first_summary = detcore_summary(&first)?;
-    if stdin_is_terminal && first_summary.stdin_reads != 0 {
-        write_output(&first)?;
-        return Err(Error::msg(format!(
-            "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read syscall(s)",
-            first_summary.stdin_reads
-        )));
-    }
-
-    eprintln!(":: DBT Run2...");
-    let second = match replay.as_mut() {
-        Some(replay) => {
-            replay.seek(SeekFrom::Start(0))?;
-            run_once(&runner, &guest, &drrun, replay.try_clone()?)?
+    let first_raw = match first_raw {
+        Ok(output) => output,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
         }
-        None => run_once_with_terminal_input(&runner, &guest, &drrun)?,
     };
-    if !verify_allow.satisfies(process_status(second.status)) {
-        write_output(&second)?;
-        return Ok(output_status(&second));
+    let first_records = match decode_dbt_evidence(&mut evidence1) {
+        Ok(records) => records,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = materialize_dbt_comparison_log(&first_records, log1_file, &log1_path) {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(error);
     }
-    let second_summary = detcore_summary(&second)?;
-
-    // Determinism requires both runs to agree on their exit status, not merely
-    // that each is permitted by `--verify-allow`. This guards the non-zero-exit
-    // contract (e.g. a guest that must exit 23 on both runs); without it, two
-    // differing permitted failures would be accepted as "deterministic".
-    if first.status != second.status {
-        write_output(&first)?;
-        return Err(Error::msg(format!(
-            "DBT verification failed: guest exit status differed between runs ({:?} != {:?})",
-            first.status, second.status
-        )));
+    if print_verify_logs {
+        std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
-
-    if first.stdout != second.stdout {
-        return Err(Error::msg(dbt_stdout_mismatch(
-            &first.stdout,
-            &second.stdout,
-        )));
-    }
-    if !first_summary.same_observable_behavior(&second_summary) {
-        return Err(Error::msg(format!(
-            "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
-        )));
-    }
-    if first_summary.branches != second_summary.branches {
+    let first = dbt_verification_output(first_raw);
+    if !verify_allow.satisfies(first.status) {
         eprintln!(
-            ":: DBT diagnostic branch counts differed at the last syscall: {} | {}",
-            first_summary.branches, second_summary.branches
+            "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr),
         );
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(Error::msg("First run during --verify exited in error"));
     }
 
-    write_output(&first)?;
-    eprintln!(
-        ":: Comparing DBT observed guest-memory hashes... {} | {}",
-        first_summary.memory_hash, second_summary.memory_hash
-    );
-    eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
-    eprintln!(":: Success: deterministic. Determinism verified.");
-    if summary {
-        eprint!("{}", format_dbt_stats(&first_summary));
+    replay.seek(SeekFrom::Start(0))?;
+    eprintln!(":: DBT Run2...");
+    let second_raw = match run_once(&runner2, &guest, &drrun, replay.try_clone()?) {
+        Ok(output) => output,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    let second_records = match decode_dbt_evidence(&mut evidence2) {
+        Ok(records) => records,
+        Err(error) => {
+            if keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = materialize_dbt_comparison_log(&second_records, log2_file, &log2_path) {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+        }
+        return Err(error);
     }
-    // Propagate the guest's own (verified-identical) exit status rather than a
-    // hardcoded 0. Before `--verify-allow` was threaded through, this line was
-    // only reachable when both runs exited 0, so `Exited(0)` was equivalent; now
-    // a deliberately non-zero guest (e.g. the `exit_status` parity contract with
-    // `--verify-allow both`) can verify deterministically, and the DBT backend
-    // must surface that status to match the ptrace `--verify` path
-    // (`compare_two_runs` returns `out2.status`).
-    Ok(output_status(&first))
+    let second = dbt_verification_output(second_raw);
+
+    let outcome = compare_two_runs(
+        ComparedRun {
+            output: &first,
+            log: log1_path,
+        },
+        ComparedRun {
+            output: &second,
+            log: log2_path,
+        },
+        ComparisonOptions {
+            success_message: "Success: deterministic. Determinism verified.",
+            failure_message: "Failure: nondeterministic.",
+            verbose: verify_verbose,
+            compare_logs: true,
+            diagnostic_full_trace: verify_verbose,
+            keep_logs,
+        },
+    )?;
+    if let Some(path) = verify_json {
+        write_verification_json(path, &outcome)?;
+    }
+    if !outcome.verified() {
+        return outcome.into_exit_status();
+    }
+
+    std::io::stdout().write_all(&first.stdout)?;
+    std::io::stderr().write_all(&first.stderr)?;
+    Ok(outcome.guest_status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -585,44 +718,20 @@ pub(super) fn run_dbt(
     _program: &Path,
     _args: &[String],
     _verify: bool,
+    _verify_verbose: bool,
     _verify_allow: VerifyAllow,
+    _print_verify_logs: bool,
+    _keep_logs: bool,
+    _verify_log_dir: Option<&Path>,
+    _verify_json: Option<&Path>,
     _summary: bool,
     _log: Option<LevelFilter>,
+    _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
+    _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
-}
-
-#[cfg(feature = "dbt")]
-fn dbt_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
-    const CONTEXT_BEFORE: usize = 40;
-    const CONTEXT_AFTER: usize = 120;
-
-    let offset = first
-        .iter()
-        .zip(second)
-        .position(|(left, right)| left != right)
-        .unwrap_or_else(|| first.len().min(second.len()));
-    let start = offset.saturating_sub(CONTEXT_BEFORE);
-    let first_end = first.len().min(offset.saturating_add(CONTEXT_AFTER));
-    let second_end = second.len().min(offset.saturating_add(CONTEXT_AFTER));
-
-    format!(
-        concat!(
-            "DBT verification failed: guest stdout differed at byte {offset} ",
-            "(run1_len={}, run2_len={}); run1[{start}..{first_end}]={:?}; ",
-            "run2[{start}..{second_end}]={:?}"
-        ),
-        first.len(),
-        second.len(),
-        String::from_utf8_lossy(&first[start..first_end]),
-        String::from_utf8_lossy(&second[start..second_end]),
-        offset = offset,
-        start = start,
-        first_end = first_end,
-        second_end = second_end,
-    )
 }
 
 #[cfg(feature = "dbt")]
@@ -638,17 +747,6 @@ fn run_once<R: Read + Send + 'static>(
 }
 
 #[cfg(feature = "dbt")]
-fn run_once_with_terminal_input(
-    runner: &DbtRunner,
-    guest: &StdCommand,
-    drrun: &Path,
-) -> Result<Output, Error> {
-    runner
-        .output_with_inherited_stdin(guest)
-        .map_err(|error| launch_error(drrun, error))
-}
-
-#[cfg(feature = "dbt")]
 fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     Error::msg(format!(
         "failed to launch drrun ({}): {error}",
@@ -658,7 +756,7 @@ fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
 
 #[cfg(feature = "dbt")]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
-    ExitStatus::Exited(status.code().unwrap_or(1))
+    ExitStatus::from_raw(status.into_raw())
 }
 
 #[cfg(feature = "dbt")]
@@ -668,44 +766,38 @@ fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
         .lines()
         .rev()
         .find(|line| line.starts_with("reverie-dbt: tool=Detcore "))
-        .ok_or_else(|| {
-            Error::msg(
-                "DBT verification failed: native DynamoRIO summary did not report tool=Detcore",
-            )
-        })?;
-
+        .ok_or_else(|| Error::msg("native DynamoRIO summary did not report tool=Detcore"))?;
     let field = |name: &str| {
         summary
             .split_ascii_whitespace()
             .find_map(|value| value.strip_prefix(name))
-            .ok_or_else(|| Error::msg(format!("DBT verification failed: summary omitted {name}")))
+            .ok_or_else(|| Error::msg(format!("native DynamoRIO summary omitted {name}")))
     };
     let branches = field("branches=")?
         .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid branch count"))?;
+        .map_err(|_| Error::msg("native DynamoRIO summary has an invalid branch count"))?;
     let syscalls = field("syscalls=")?
         .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid syscall count"))?;
+        .map_err(|_| Error::msg("native DynamoRIO summary has an invalid syscall count"))?;
     let rewritten = field("rewritten=")?
         .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid rewritten count"))?;
+        .map_err(|_| Error::msg("native DynamoRIO summary has an invalid rewritten count"))?;
     let stdin_reads = field("stdin_reads=")?
         .parse::<u64>()
-        .map_err(|_| Error::msg("DBT verification failed: invalid stdin read count"))?;
+        .map_err(|_| Error::msg("native DynamoRIO summary has an invalid stdin read count"))?;
     // A guest can reach the native callback without asking Detcore to suppress
     // a syscall. For example, a raw program whose only syscall is the native
     // lifecycle `exit` reports `rewritten=0`. The callback is still healthy as
     // long as it observed work and did not report more rewrites than syscalls.
     if branches == 0 || syscalls == 0 || rewritten > syscalls {
         return Err(Error::msg(
-            "DBT verification failed: native callback counters are inconsistent",
+            "native DynamoRIO summary counters are inconsistent",
         ));
     }
-
-    let hash = field("memory_hash=")?;
-    if hash.len() != 16 || u64::from_str_radix(hash, 16).is_err() {
+    let memory_hash = field("memory_hash=")?;
+    if memory_hash.len() != 16 || u64::from_str_radix(memory_hash, 16).is_err() {
         return Err(Error::msg(
-            "DBT verification failed: invalid observed-memory hash",
+            "native DynamoRIO summary has an invalid observed-memory hash",
         ));
     }
     Ok(DbtSummary {
@@ -713,7 +805,7 @@ fn detcore_summary(output: &Output) -> Result<DbtSummary, Error> {
         syscalls,
         rewritten,
         stdin_reads,
-        memory_hash: hash.to_owned(),
+        memory_hash: memory_hash.to_owned(),
     })
 }
 
@@ -726,7 +818,7 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 #[cfg(feature = "dbt")]
 fn output_status(output: &Output) -> ExitStatus {
-    ExitStatus::Exited(output.status.code().unwrap_or(1))
+    process_status(output.status)
 }
 
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
@@ -841,9 +933,6 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "dbt")]
-    use std::os::unix::process::ExitStatusExt as _;
-
     use super::*;
 
     #[cfg(feature = "dbt")]
@@ -855,26 +944,117 @@ mod tests {
     }
 
     #[cfg(feature = "dbt")]
-    fn dbt_summary(branches: u64) -> DbtSummary {
-        DbtSummary {
-            branches,
-            syscalls: 169,
-            rewritten: 168,
-            stdin_reads: 0,
-            memory_hash: "4b5e0e70f3050157".to_owned(),
+    fn dbt_summary_output(
+        branches: u64,
+        syscalls: u64,
+        rewritten: u64,
+        stdin_reads: u64,
+        memory_hash: &str,
+    ) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: format!(
+                "reverie-dbt: tool=Detcore branches={branches} syscalls={syscalls} \
+                 rewritten={rewritten} stdin_reads={stdin_reads} memory_hash={memory_hash}\n"
+            )
+            .into_bytes(),
         }
     }
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_summary_treats_last_syscall_branch_count_as_telemetry() {
-        assert!(dbt_summary(563_145).same_observable_behavior(&dbt_summary(563_103)));
+    fn dbt_evidence_materialization_preserves_records_and_requires_info() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = log.into_parts();
+        let records = vec![
+            b"1970-01-01T00:00:00.000000Z DEBUG detcore: diagnostic\n".to_vec(),
+            b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG stable\n".to_vec(),
+        ];
+
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
+
+        assert_eq!(compared, 1);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            concat!(
+                "1970-01-01T00:00:00.000000Z DEBUG detcore: diagnostic\n",
+                "1970-01-01T00:00:00.000000Z INFO detcore: DETLOG stable\n",
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_evidence_materialization_rejects_empty_or_injected_records() {
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let (empty_file, empty_path) = empty.into_parts();
+        assert!(
+            materialize_dbt_comparison_log(&[], empty_file, &empty_path)
+                .unwrap_err()
+                .to_string()
+                .contains("no records")
+        );
+
+        let no_info = tempfile::NamedTempFile::new().unwrap();
+        let (no_info_file, no_info_path) = no_info.into_parts();
+        let error = materialize_dbt_comparison_log(
+            &[b"1970-01-01T00:00:00.000000Z DEBUG detcore: only diagnostic\n".to_vec()],
+            no_info_file,
+            &no_info_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no INFO records"), "{error}");
+
+        for (record, expected) in [
+            (
+                b"1970-01-01T00:00:00.000000Z INFO detcore: truncated".to_vec(),
+                "terminal newline",
+            ),
+            (
+                b"1970-01-01T00:00:00.000000Z INFO detcore: forged\nINFO fake\n".to_vec(),
+                "embedded line boundary",
+            ),
+        ] {
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let (file, path) = log.into_parts();
+            let error = materialize_dbt_comparison_log(&[record], file, &path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_evidence_decoder_rejects_missing_and_truncated_artifacts() {
+        let mut missing = tempfile::tempfile().unwrap();
+        assert!(
+            decode_dbt_evidence(&mut missing)
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
+
+        let mut truncated = tempfile::tempfile().unwrap();
+        truncated.write_all(b"RVDBTEF1\x01").unwrap();
+        let error = decode_dbt_evidence(&mut truncated).unwrap_err().to_string();
+        assert!(error.contains("malformed or truncated"), "{error}");
     }
 
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_stats_block_labels_counters_honestly() {
-        let rendered = format_dbt_stats(&dbt_summary(563_145));
+        let summary = detcore_summary(&dbt_summary_output(
+            563_145,
+            169,
+            168,
+            0,
+            "4b5e0e70f3050157",
+        ))
+        .unwrap();
+        let rendered = format_dbt_stats(&summary);
         // The branch counter must be labeled as a branch clock, never as
         // "basic blocks translated" — the client counts retired branches.
         assert!(rendered.contains("counted branches (deterministic branch clock): 563145"));
@@ -889,12 +1069,8 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_stats_block_round_trips_from_a_client_summary_line() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=42 syscalls=7 rewritten=6 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-        let parsed = detcore_summary(&output).unwrap();
+    fn dbt_stats_block_round_trips_from_native_diagnostic_summary() {
+        let parsed = detcore_summary(&dbt_summary_output(42, 7, 6, 0, "cbf29ce484222325")).unwrap();
         let rendered = format_dbt_stats(&parsed);
         assert!(rendered.contains("counted branches (deterministic branch clock): 42"));
         assert!(rendered.contains("syscalls intercepted:                          7"));
@@ -905,44 +1081,9 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_summary_compares_observable_counters_and_hash() {
-        let expected = dbt_summary(100);
-
-        let mut actual = dbt_summary(100);
-        actual.syscalls += 1;
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let mut actual = dbt_summary(100);
-        actual.rewritten -= 1;
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let mut actual = dbt_summary(100);
-        actual.stdin_reads += 1;
-        assert!(!expected.same_observable_behavior(&actual));
-
-        let mut actual = dbt_summary(100);
-        actual.memory_hash = "0000000000000000".to_owned();
-        assert!(!expected.same_observable_behavior(&actual));
-    }
-
-    #[cfg(feature = "dbt")]
-    fn dbt_output(summary: &str) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: Vec::new(),
-            stderr: summary.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
     fn dbt_summary_accepts_a_callback_without_rewritten_syscalls() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=18 syscalls=1 rewritten=0 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-
-        let summary = detcore_summary(&output).unwrap();
+        let summary =
+            detcore_summary(&dbt_summary_output(18, 1, 0, 0, "cbf29ce484222325")).unwrap();
 
         assert_eq!(summary.syscalls, 1);
         assert_eq!(summary.rewritten, 0);
@@ -951,43 +1092,22 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_summary_rejects_more_rewrites_than_syscalls() {
-        let output = dbt_output(
-            "reverie-dbt: tool=Detcore branches=18 syscalls=1 rewritten=2 \
-             stdin_reads=0 memory_hash=cbf29ce484222325\n",
-        );
-
-        let error = detcore_summary(&output).unwrap_err();
+        let error =
+            detcore_summary(&dbt_summary_output(18, 1, 2, 0, "cbf29ce484222325")).unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("native callback counters are inconsistent"),
+                .contains("native DynamoRIO summary counters are inconsistent"),
             "{error}"
         );
     }
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_stdout_mismatch_reports_offset_lengths_and_bounded_context() {
-        let first = [vec![b'a'; 80], b"left-tail".to_vec()].concat();
-        let second = [vec![b'a'; 80], b"right-tail-extra".to_vec()].concat();
-
-        let detail = dbt_stdout_mismatch(&first, &second);
-
-        assert!(detail.contains("differed at byte 80"), "{detail}");
-        assert!(detail.contains("run1_len=89, run2_len=96"), "{detail}");
-        assert!(detail.contains("run1[40..89]"), "{detail}");
-        assert!(detail.contains("left-tail"), "{detail}");
-        assert!(detail.contains("right-tail-extra"), "{detail}");
-    }
-
-    #[test]
-    #[cfg(feature = "dbt")]
-    fn dbt_stdout_mismatch_reports_prefix_length_difference() {
-        let detail = dbt_stdout_mismatch(b"same", b"same suffix");
-
-        assert!(detail.contains("differed at byte 4"), "{detail}");
-        assert!(detail.contains("run1_len=4, run2_len=11"), "{detail}");
+    fn dbt_process_status_preserves_signal_identity() {
+        let status = std::process::ExitStatus::from_raw(libc::SIGKILL);
+        assert_eq!(process_status(status).signal(), Some(libc::SIGKILL));
     }
 
     #[test]

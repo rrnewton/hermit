@@ -29,6 +29,7 @@ use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::complete_sigkill;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
@@ -348,19 +349,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         if tgid <= 0 {
             return Err(Errno::ENOSYS.into());
         }
-        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        let detpid = DetPid::from_raw(tgid);
+        let targets = resolve_kill_targets(guest, detpid).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
-        if !guest
+        let sig = call.sig();
+        let result = if guest
             .config()
             .backend_requires_thread_directed_process_signals
         {
-            return Ok(self.record_or_replay(guest, call).await?);
+            let targeted = syscalls::Tgkill::new()
+                .with_tgid(tgid)
+                .with_tid(tid.as_raw())
+                .with_sig(sig);
+            self.record_or_replay(guest, targeted).await?
+        } else {
+            self.record_or_replay(guest, call).await?
+        };
+        if sig == libc::SIGKILL && result == 0 {
+            while !resolve_kill_targets(guest, detpid).await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            complete_sigkill(guest, detpid).await;
         }
-        let targeted = syscalls::Tgkill::new()
-            .with_tgid(tgid)
-            .with_tid(tid.as_raw())
-            .with_sig(call.sig());
-        Ok(self.record_or_replay(guest, targeted).await?)
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

@@ -43,7 +43,6 @@ use super::run::is_elf_file;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
-use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
@@ -201,8 +200,8 @@ pub struct StartOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
-    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
+    /// "canonical","compare_logs":bool,"log_scope":"info"|"full_trace",
+    /// "strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
@@ -216,25 +215,9 @@ pub struct StartOpts {
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
     /// comparison that strips only the real wall-clock prefix, canonicalizes host
     /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — rather than a stripped match.
+    /// exactly.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
-
-    /// With --verify, compare the record and replay logs under the CANONICAL
-    /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
-    /// host memory addresses to first-appearance ordinals (tolerating an ASLR
-    /// shift while still diverging on allocation-order or aliasing changes), and
-    /// compare every INFO message's remaining bytes — virtual-time timestamps,
-    /// raw syscall argument/result values, counts, sizes, flags — exactly. An
-    /// explicit DEBUG/TRACE level remains captured for diagnostics but does not
-    /// change the INFO verdict. Without this the
-    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
-    /// timestamps before comparing, so a "verified" result asserts only stripped
-    /// parity, not bitwise identity. A record/replay determinism ratchet keying on
-    /// the verdict should set this so it cannot be silently weakened to a stripped
-    /// comparison.
-    #[clap(long, requires = "verify")]
-    verify_strict: bool,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -416,13 +399,7 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
-        let strictness = if self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        };
-        let ((global1, log1), (global2, log2)) =
-            setup_double_run(global, "record", "replay", strictness);
+        let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
         let (mut recording_container, _record_identity_guard) = self.recording_container(global)?;
 
@@ -473,7 +450,6 @@ impl StartOpts {
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
-                strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
                 keep_logs: false,
@@ -622,7 +598,6 @@ mod tests {
             record_timeout: None,
             verify: false,
             verify_json: None,
-            verify_strict: false,
             gdbex: Vec::new(),
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();

@@ -286,11 +286,11 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
-     \x20 --portable-strict-compat-only Portable legacy stripped matrix with bounded diagnostics.\n\
+     \x20 --strict-compat-only          Run the blocking canonical app matrix.\n\
+     \x20 --portable-strict-compat-only Portable canonical app matrix with bounded diagnostics.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
-     \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
+     \x20 --e9patch-compat-only         Gate core + installed e9patch canonical apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
@@ -2501,6 +2501,17 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let hermit = "target/debug/hermit";
         let marker = "hermit-validation-smoke";
         let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let verify_dir = "target/validate-verify";
+        let verify_report = format!("{verify_dir}/quick-verify.json");
+        let replay_report = format!("{verify_dir}/quick-replay.json");
+        let report_check = |path: &str| format!(
+            "jq -e '(.verified == true) and (.verdict == \"matched\") and \
+             (.bitwise_parity == true) and (.comparison.strictness == \"canonical\") and \
+             (.comparison.compare_logs == true) and \
+             ((.compared_log_messages.left // 0) > 0) and \
+             ((.compared_log_messages.right // 0) > 0)' {} >/dev/null",
+            validate_plan::shell_quote(path)
+        );
         let mut steps = pre;
         steps.push(nextest_setup_node(root, gate)?);
         let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
@@ -2514,10 +2525,12 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("verify_smoke", "Hermit verify-mode smoke test",
-            format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
+            format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} {run_args} --verify --verify-json {} -- /bin/echo {marker} && {}",
+                validate_plan::shell_quote(&verify_report), validate_plan::shell_quote(&verify_report), report_check(&verify_report)),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
+            format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} record start --verify --verify-json {} -- /bin/echo {marker} && {}",
+                validate_plan::shell_quote(&replay_report), validate_plan::shell_quote(&replay_report), report_check(&replay_report)),
             vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,

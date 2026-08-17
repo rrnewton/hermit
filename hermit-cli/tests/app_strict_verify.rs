@@ -429,13 +429,7 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=info",
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-        ])
+        .args(["--log=info", "run", "--strict", "--verify"])
         .arg(format!("--verify-json={}", report_path.display()))
         .arg("--base-env=minimal")
         .arg(format!("--env=HOME={}", positive_home.path().display()))

@@ -79,6 +79,8 @@ fi
 
 # Host-matched run flags shared by every assurance level (see header).
 declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled)
+verify_report_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-compat-map-verify.XXXXXX")
+trap 'rm -r -- "$verify_report_dir"' EXIT
 
 # System binaries probed on the ptrace backend, each with a stable,
 # side-effect-free, exit-0 invocation (filter tools use a version probe, matching
@@ -176,13 +178,32 @@ run_level() {
     local level=$1 prog=$2
     shift 2
     local -a extra=()
+    local report=
     case "$level" in
         L1) extra=() ;;
-        L2) extra=(--verify) ;;
-        L3) extra=(--verify --detlog-heap --detlog-stack) ;;
+        L2)
+            report="$verify_report_dir/l2.json"
+            extra=(--verify --verify-json "$report")
+            ;;
+        L3)
+            report="$verify_report_dir/l3.json"
+            extra=(--verify --verify-json "$report" --detlog-heap --detlog-stack)
+            ;;
     esac
-    timeout "$CASE_TIMEOUT" "$HERMIT_BIN" "${RUN_FLAGS[@]}" "${extra[@]}" -- "$prog" "$@" \
-        </dev/null >/dev/null 2>&1
+    [[ -z $report ]] || rm -f -- "$report"
+    if ! timeout "$CASE_TIMEOUT" "$HERMIT_BIN" "${RUN_FLAGS[@]}" "${extra[@]}" -- "$prog" "$@" \
+        </dev/null >/dev/null 2>&1; then
+        return 1
+    fi
+    [[ -z $report ]] || jq -e '
+        (.verified == true)
+        and (.verdict == "matched")
+        and (.bitwise_parity == true)
+        and (.comparison.strictness == "canonical")
+        and (.comparison.compare_logs == true)
+        and ((.compared_log_messages.left // 0) > 0)
+        and ((.compared_log_messages.right // 0) > 0)
+    ' "$report" >/dev/null 2>&1
 }
 
 declare -A pass=([L1]=0 [L2]=0 [L3]=0)

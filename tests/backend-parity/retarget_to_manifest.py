@@ -25,9 +25,9 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
      exists for the lint) if it is not already present;
   3. appends a symmetric ``[[test]]`` block to
      ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
-     every backend x mode cell declared, DBT/KVM enabled only where the source
-     row's ``--verify`` (L2) witness actually passed, everything else disabled
-     with a concrete reason carried over from the matrix row;
+     every backend x mode cell declared, and DBT/KVM left disabled because the
+     legacy ``detlog``/``guest`` tokens do not contain a fresh typed canonical
+     verdict; concrete source gap reasons are preserved where available;
   4. reclassifies the fixture in
      ``tests/e2e/manifests/inventory/test-files.json`` from the private
      ``guest-fixture`` disposition to ``manifest-test`` so it leaves the
@@ -57,6 +57,10 @@ Usage
     tests/backend-parity/retarget_to_manifest.py \
         --row $'getpriority_identity\tpass\tpass\tpass\t-\t-\tdetlog\tdetlog\tguest\t-\t-' \
         --fixture tests/c/getpriority_identity.c
+
+The legacy L2 tokens are accepted only so their historical meaning can be
+recorded in disabled reasons. They never enable DBT or KVM; those backends
+require fresh evidence from the current verifier.
 
 Idempotent: re-running is a no-op once a test id is present in the manifest and
 its fixture is classified ``manifest-test``.
@@ -95,7 +99,7 @@ REPO = "rrnewton/hermit"
 # / /dev/kvm). Everything else is a portable syscall probe.
 PRIVILEGED_HINTS = ("cpuid", "rdtsc", "rdseed", "rdrand")
 
-L2_PASS = {"detlog", "guest"}  # a real --verify witness; "gap" means no witness
+LEGACY_L2_VALUES = {"detlog", "guest", "gap"}
 
 
 class ConvertError(Exception):
@@ -190,23 +194,39 @@ def build_plan(
 
     def classify(backend: str, l1: str, l1_reason: str, l2: str, l2_reason: str):
         if row.has_l2:
-            if l2 in L2_PASS:
-                enabled.append(backend)
-            elif l2 == "gap":
+            if l2 not in LEGACY_L2_VALUES:
+                raise ConvertError(f"{row.name}/{backend}_l2: expected detlog|guest|gap")
+            if l2 == "gap":
                 disabled[backend] = (
                     l2_reason
                     if l2_reason not in ("", "-")
                     else f"{backend.upper()} has no recorded --verify witness in the source matrix row"
                 )
+            elif backend == "dbt":
+                disabled[backend] = (
+                    f"Legacy DBT {l2} evidence is not a fresh typed canonical verdict; "
+                    "the current protected canonical evidence path must re-run this "
+                    "workload before DBT can be enabled"
+                )
             else:
-                raise ConvertError(f"{row.name}/{backend}_l2: expected detlog|guest|gap")
+                disabled[backend] = (
+                    f"KVM remains unqualified: legacy {l2} evidence is output-only or "
+                    "otherwise lacks canonical INFO comparison"
+                )
         else:
             # 6-col source: only L1 evidence, no --verify witness -> stay ptrace-first.
             if l1 == "pass":
-                disabled[backend] = (
-                    f"L1 parity established in the source matrix row; the L2 --verify "
-                    f"witness was not recorded, so qualify {backend.upper()} separately"
-                )
+                if backend == "dbt":
+                    disabled[backend] = (
+                        "L1 parity established in the source matrix row; DBT now has a "
+                        "protected canonical evidence path, but this workload has no fresh "
+                        "typed, non-vacuous L2 verdict"
+                    )
+                else:
+                    disabled[backend] = (
+                        f"L1 parity established in the source matrix row; the L2 --verify "
+                        f"witness was not recorded, so qualify {backend.upper()} separately"
+                    )
             else:
                 disabled[backend] = (
                     l1_reason

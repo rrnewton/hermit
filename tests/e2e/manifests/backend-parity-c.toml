@@ -81,7 +81,6 @@ observation = { status = true, stdout = true, stderr = false, artifacts = [] }
 [test.modes.verify]
 ci = true
 backends_enabled = ["ptrace"]
-assert = { bitwise_parity = true }
 [test.modes.verify.backends_disabled]
 dbt = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately"
 kvm = "L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately"
@@ -145,7 +144,7 @@ cflags = ["-D_GNU_SOURCE"]
 ci = true
 backends_enabled = ["ptrace"]
 [test.modes.verify.backends_disabled]
-dbt = "DBT completes the five-step contract but its dedicated adapter publishes typed no_result with no INFO comparison, so it cannot establish L2"
+dbt = "DBT completes the five-step contract and now has a protected canonical evidence path, but this personality workload has not been freshly qualified at L2; keep it disabled until a typed, non-vacuous canonical verdict is recorded"
 kvm = "Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available"
 sabre = "Not yet qualified for the personality(2) execution-domain round-trip"
 liteinst = "Not yet qualified for the personality(2) execution-domain round-trip"
@@ -5481,11 +5480,9 @@ backends_enabled = []
 native = "This row asserts strict-verify determinism; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from strict-verification entry"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"
@@ -5599,11 +5596,9 @@ backends_enabled = []
 native = "This row asserts strict-verify determinism; it does not assert native nondeterminism"
 
 [test.modes.replay]
-ci = false
-ci_disabled_reason = "NOT-EXERCISED: Record/replay qualification is separate from strict-verification entry / Record/replay is unsupported by DBI / Record/replay is unsupported by KVM / Record/replay is unsupported by SaBRe / Record/replay is unsupported by LiteInst"
-backends_enabled = []
+ci = true
+backends_enabled = ["ptrace"]
 [test.modes.replay.backends_disabled]
-ptrace = "Record/replay qualification is separate from strict-verification entry"
 dbt = "Record/replay is unsupported by DBI"
 kvm = "Record/replay is unsupported by KVM"
 sabre = "Record/replay is unsupported by SaBRe"

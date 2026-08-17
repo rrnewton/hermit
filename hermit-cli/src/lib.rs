@@ -26,6 +26,7 @@ pub mod instruction_map;
 mod interp;
 mod metadata;
 mod record;
+mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
@@ -1059,7 +1060,7 @@ async fn run_sabre(
     // the absolute path differs on every launch by design -- that is what keeps
     // concurrent hermit invocations on a shared host from binding the same
     // coordinator socket. Emitting it at INFO put per-launch randomness into the
-    // INFO stream, which `--verify-strict` compares:
+    // INFO stream, which `--verify` compares:
     //
     //   Mismatch at log messages 2 (run 1) and 2 (run 2):
     //   < socket=/tmp/hermit-sabre-rpc-Gw6tUi/coordinator.sock
@@ -1442,7 +1443,7 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
 
-    tracing::info!(
+    tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
         setup_us = execution_started.duration_since(setup_started).as_micros() as u64,

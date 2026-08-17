@@ -101,6 +101,7 @@ initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
 console_log=$output_dir/console.log
 info_log=$output_dir/hermit-info.log
 stderr_log=$output_dir/hermit-stderr.log
+verify_json=$output_dir/verify.json
 
 if [[ -z ${INITRAMFS_IMAGE:-} ]]; then
   "$script_dir/qemu-busybox/build-initramfs.sh" "$initramfs_image"
@@ -120,16 +121,16 @@ if [[ -n $skid_margin ]]; then
   hermit_args+=(--skid-margin="$skid_margin")
 fi
 if [[ $verify == 1 ]]; then
-  hermit_args+=(--verify)
+  hermit_args+=(--verify --verify-json "$verify_json")
 fi
 hermit_args+=(--)
 
 printf 'backend=ptrace level=%s log=info relaxations=none\n' \
   "$([[ $verify == 1 ]] && printf L2 || printf L1)"
 printf 'pmu_skid_margin=%s\n' "${skid_margin:-auto}"
-printf 'hermit=%s\nqemu=%s\nkernel=%s\ninitramfs=%s\nconsole=%s\ninfo=%s\nstderr=%s\n' \
+printf 'hermit=%s\nqemu=%s\nkernel=%s\ninitramfs=%s\nconsole=%s\ninfo=%s\nstderr=%s\nverify_json=%s\n' \
   "$hermit_bin" "$qemu_bin" "$kernel_image" "$initramfs_image" \
-  "$console_log" "$info_log" "$stderr_log"
+  "$console_log" "$info_log" "$stderr_log" "$verify_json"
 printf 'kernel_sha256=%s\ninitramfs_sha256=%s\n' \
   "$(sha256sum "$kernel_image" | cut -d' ' -f1)" \
   "$(sha256sum "$initramfs_image" | cut -d' ' -f1)"
@@ -137,6 +138,9 @@ printf 'kernel_sha256=%s\ninitramfs_sha256=%s\n' \
 : >"$console_log"
 : >"$info_log"
 : >"$stderr_log"
+if [[ $verify == 1 ]]; then
+  : >"$verify_json"
+fi
 set +e
 timeout --signal=TERM --kill-after=10 "${timeout_seconds}s" \
   "$hermit_bin" "${hermit_args[@]}" "${guest_command[@]}" \
@@ -159,8 +163,20 @@ if [[ $verify == 0 ]]; then
   fi
   printf 'console_sha256=%s\n' \
     "$(sha256sum "$console_log" | cut -d' ' -f1)"
-elif ! grep -Fq 'Determinism verified' "$stderr_log"; then
-  fail "Hermit exited without the L2 verification marker; inspect $stderr_log"
+elif ! jq -e '
+  .verified == true and
+  .verdict == "matched" and
+  .bitwise_parity == true and
+  .comparison.strictness == "canonical" and
+  .comparison.compare_logs == true and
+  .comparison.strip_lines == false and
+  .comparison.ignore_lines == false and
+  .comparison.skip_commit == false and
+  .comparison.skip_detlog == false and
+  (.compared_log_messages.left | type == "number" and . > 0) and
+  (.compared_log_messages.right | type == "number" and . > 0)
+' "$verify_json" >/dev/null; then
+  fail "Hermit did not emit a matched non-vacuous canonical verdict; inspect $verify_json and $stderr_log"
 fi
 
 printf 'PASS: BusyBox userspace completed under Hermit/QEMU (%s, ptrace backend)\n' \

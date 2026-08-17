@@ -54,23 +54,6 @@ impl TempChroot {
         unix::fs::symlink(original, link)
     }
 
-    /// Copies a file into the chroot.
-    pub fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let to = self.relpath(to);
-
-        if let Some(dir) = to.parent() {
-            fs::create_dir_all(dir)?;
-        }
-
-        fs::copy(from, to)?;
-        Ok(())
-    }
-
-    /// Like `copy`, but copies `path` to `{chroot}/{path}`.
-    pub fn copy_same(&self, path: &Path) -> io::Result<()> {
-        self.copy(path, path)
-    }
-
     /// Creates a directory in the chroot.
     pub fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         fs::create_dir_all(self.relpath(path))

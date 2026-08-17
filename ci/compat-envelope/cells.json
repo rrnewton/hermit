@@ -4257,8 +4257,8 @@
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4267,16 +4267,6 @@
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/file-io-roundtrip",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4286,6 +4276,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/file-io-roundtrip",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/file-io-roundtrip",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -4577,8 +4577,8 @@
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -4587,16 +4587,6 @@
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/fork-exec-pipeline",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -4606,6 +4596,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/fork-exec-pipeline",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/fork-exec-pipeline",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -32308,7 +32308,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
+      "status": "green",
       "observations": []
     },
     {
@@ -46017,8 +46017,8 @@
       "test": "language-runtimes/example-python-random",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -46708,7 +46708,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
       "observations": []
     },
     {
@@ -49217,8 +49217,8 @@
       "test": "system-utils/clock-determinism",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -49227,16 +49227,6 @@
       "test": "system-utils/clock-determinism",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/clock-determinism",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -49246,6 +49236,16 @@
       "category": "system-utils",
       "test": "system-utils/clock-determinism",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/clock-determinism",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -49537,8 +49537,8 @@
       "test": "system-utils/date-nanoseconds",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {
@@ -49547,16 +49547,6 @@
       "test": "system-utils/date-nanoseconds",
       "mode": "replay",
       "backend": "sabre",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "system-utils",
-      "test": "system-utils/date-nanoseconds",
-      "mode": "verify",
-      "backend": "dbt",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -49566,6 +49556,16 @@
       "category": "system-utils",
       "test": "system-utils/date-nanoseconds",
       "mode": "verify",
+      "backend": "dbt",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "system-utils",
+      "test": "system-utils/date-nanoseconds",
+      "mode": "verify",
       "backend": "kvm",
       "enabled": false,
       "status": "red",
@@ -51937,8 +51937,8 @@
       "test": "system-utils/random-device",
       "mode": "replay",
       "backend": "ptrace",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

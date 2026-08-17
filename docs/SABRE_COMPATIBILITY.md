@@ -10,8 +10,8 @@ drop-in replacement for the ptrace backend.
 
 This document describes the post-0.2 work-ahead envelope. The executable test
 manifests are the source of truth: a SaBRe entry in `backends_enabled` means the
-named cell matched under SaBRe's `Stripped` comparison and passed its stated
-semantic oracle. An exclusion remains a support gap, not an implied fallback
+named cell passed its semantic oracle and emitted a matched, non-vacuous
+canonical typed verdict. An exclusion remains a support gap, not an implied fallback
 to ptrace.
 
 ## Build and run
@@ -25,7 +25,10 @@ cargo build --release --locked -p hermit \
 HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
   cargo build --release --locked -p hermit-install
 
-target/release/hermit run --backend sabre --strict --verify -- /bin/echo hello
+REPORT=target/sabre-verify.json
+target/release/hermit run --backend sabre --strict --verify \
+  --verify-json "$REPORT" -- /bin/echo hello
+jq . "$REPORT"
 ```
 
 An explicit SaBRe request fails closed if the feature or artifacts are absent.
@@ -50,8 +53,10 @@ This path is visible in INFO logs as
 than a generic `impl reverie::Backend`; the architectural difference does not
 create a second determinism engine.
 
-## Measured `Stripped` envelope
+## Historical measured `Stripped` envelope
 
+The results in this section were produced by the deleted comparator at the
+revisions below; they are historical and do not qualify the current gate.
 Baseline sweep provenance:
 
 - Runtime implementation base: Hermit

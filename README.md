@@ -137,11 +137,10 @@ invocation of each eligible syscall site and installs an instruction-punning
 hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.
 
-`--verify` compares captured status and output and applies the `Stripped`
-comparison to selected Detcore scheduler messages. A successful result is a
-useful diagnostic, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts.
+`--verify` compares captured status and output exactly and applies canonical INFO
+comparison to Detcore events. A qualifying result requires
+`--verify-json REPORT.json`, `bitwise_parity: true`, and nonzero compared-message
+counts. KVM remains output-only and does not qualify for that claim.
 Current support is limited to single-threaded, single-process guests. Thread
 clone, `fork`, and `vfork` fail closed with `EOPNOTSUPP`; `exec` is also
 unsupported because runtime rebootstrap after image replacement is not yet
@@ -155,7 +154,7 @@ e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
 
 SaBRe is built only with the non-default `third-party-backends` feature. Its
-measured post-0.2 `Stripped` envelope, build instructions, and explicit
+historical post-0.2 `Stripped` measurements, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
 
@@ -206,11 +205,16 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not strict determinism |
+| Verify two executions | `hermit run --verify --verify-json REPORT.json -- PROGRAM` | Bare `--verify --verify-json` is canonical on non-KVM backends. DBT additionally requires protected framed evidence that is present, nonempty, authenticated, and validated; require nonzero INFO counts and JSON `bitwise_parity: true`. KVM remains output/status-only and is not L2. |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |
 | Diagnose a concurrency failure | `hermit analyze --search -- PROGRAM` | Advanced, may run the guest many times |
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Workloads requiring
+those operations are outside the selected M2 DBT L2 scope; selected-cell
+results do not establish whole-corpus or arbitrary process-tree parity.
 
 A minimal record/replay session is:
 

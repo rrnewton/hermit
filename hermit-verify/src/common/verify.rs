@@ -25,47 +25,11 @@ pub struct Verify<P: AsRef<OsStr>> {
 pub struct LogDiffOptions {
     /// Number of syscalls to display when failure
     pub syscall_history: usize,
-    /// Whether to skip commits for determinism check
-    pub skip_commits: bool,
-    /// Whether to skip syscalls for determinism check
-    pub skip_detlog_syscalls: bool,
-    /// Whether to skip syscall results for determinism check
-    pub skip_detlog_syscall_results: bool,
-    /// Whether to skip the rest of DETLOGs for determinism check
-    pub skip_detlog_others: bool,
-    /// Which lines to ignore for DETLOGs
-    pub ignore_lines: Vec<String>,
 }
 
 impl LogDiffOptions {
     fn into_args(self) -> Vec<String> {
-        let mut result = Vec::new();
-        if self.skip_detlog_others && self.skip_detlog_syscalls && self.skip_detlog_syscall_results
-        {
-            result.push("--skip-detlog".to_owned());
-        } else {
-            if !self.skip_detlog_others {
-                result.push("--include-detlogs=other".to_owned());
-            }
-            if !self.skip_detlog_syscall_results {
-                result.push("--include-detlogs=syscallresult".to_owned());
-            }
-            if !self.skip_detlog_syscalls {
-                result.push("--include-detlogs=syscall".to_owned());
-            }
-        }
-
-        if self.skip_commits {
-            result.push("--skip-commit".to_owned())
-        }
-
-        result.push(format!("--syscall-history={}", self.syscall_history));
-
-        for ignore_lines in self.ignore_lines {
-            result.push(format!("--ignore-lines={}", ignore_lines));
-        }
-
-        result
+        vec![format!("--syscall-history={}", self.syscall_history)]
     }
 }
 
@@ -226,39 +190,23 @@ mod test {
     use crate::common::TemporaryEnvironmentBuilder;
 
     #[test]
-    fn test_build_command_args_ignore_lines_provided() -> anyhow::Result<()> {
+    fn log_diff_command_has_no_comparison_relaxations() -> anyhow::Result<()> {
         let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
         let verify = Verify::new(PathBuf::from("hermit"));
         let args = verify.build_command_args(
             &env.runs()[0],
             &env.runs()[1],
-            LogDiffOptions {
-                ignore_lines: vec![String::from("test")],
-                ..Default::default()
-            },
+            LogDiffOptions { syscall_history: 5 },
         );
 
-        assert_eq!(args.into_iter().any(|x| x == "--ignore-lines=test"), true);
-        Ok(())
-    }
-
-    #[test]
-    fn test_build_command_args_ignore_lines_not_provided() -> anyhow::Result<()> {
-        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
-        let verify = Verify::new(PathBuf::from("hermit"));
-        let args = verify.build_command_args(
-            &env.runs()[0],
-            &env.runs()[1],
-            LogDiffOptions {
-                ignore_lines: Vec::new(),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            args.into_iter().any(|x| x.contains("--ignore-lines")),
-            false
-        );
+        assert_eq!(args[0], "log-diff");
+        assert_eq!(args[1], "--syscall-history=5");
+        assert!(args.iter().all(|arg| !matches!(
+            arg.as_str(),
+            "--unsafe-strip-lines" | "--skip-commit" | "--skip-detlog" | "--git-diff"
+        )));
+        assert!(args.iter().all(|arg| !arg.starts_with("--ignore-lines")));
+        assert!(args.iter().all(|arg| !arg.starts_with("--include-detlogs")));
         Ok(())
     }
 

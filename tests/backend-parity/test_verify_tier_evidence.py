@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
 """Bracket the tier a `--verify` run is allowed to claim.
 
-The bug this guards: `run_matrix.py` decided the assurance kind by scraping
-hermit's stderr for `"Determinism verified"` and then labelled the row
-`"L2 DETLOG-bitwise"`.  That banner is printed by a plain `--verify` run whose
-own `--verify-json` reports `bitwise_parity: false`, so the label asserted
-bitwise identity for a comparison that had merely normalised-and-compared.
-Mutation testing measured the consequence: 3 of 5 planted defects (a differing
-read() return length, a differing pointer argument, a differing openat path) pass
-that comparison undetected.
-
-So the acceptance rule under test is narrow and one-directional: `bitwise` is
-claimable ONLY from a typed verdict that says `bitwise_parity` AND carries a
-nonzero compared-message count on both sides.  Everything else must degrade to
-`stripped`, `guest` or `gap` -- never upward.
+The acceptance rule under test is narrow and one-directional: `bitwise` is
+claimable ONLY from a typed matched canonical verdict with `verified=true`,
+`bitwise_parity=true`, log comparison, and equal positive integer counts on
+both sides. Everything else must remain a
+`gap` -- never move upward.
 
 Both sides are bracketed: each positive plants a record that MUST reach its tier,
 and each negative plants a record that MUST NOT reach `bitwise`.
@@ -28,8 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import run_matrix as matrix  # noqa: E402
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
+    L2_ALLOWED,
     L2_RANK,
     SCORECARD_HEADER,
     expectation,
@@ -56,20 +50,20 @@ def tier_of(record) -> dict[str, str] | None:
         return verify_tier_from_json(path)
 
 
-def spec(strictness, compare_logs=True, **over):
+def spec(strictness="canonical", compare_logs=True, **over):
     base = {
         "strictness": strictness,
         "compare_logs": compare_logs,
-        "strip_lines": strictness == "stripped",
-        "full_trace": strictness == "canonical",
-        "canonicalize_addresses": strictness == "canonical",
-        "exact_remainder": strictness == "canonical",
+        "strip_lines": False,
+        "full_trace": True,
+        "canonicalize_addresses": True,
+        "exact_remainder": True,
     }
     base.update(over)
     return base
 
 
-def record(verified=True, bitwise=False, left=239, right=239, strictness="stripped",
+def record(verified=True, bitwise=True, left=239, right=239, strictness="canonical",
            verdict="matched", compare_logs=True):
     counts = None if left is None else {"left": left, "right": right}
     return {
@@ -84,11 +78,9 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
 
 
 # --------------------------------------------------------------------------
-print("case STRIPPED — the exact shape the scorecard producer emits today")
-# Verbatim from a live probe run: rc=0, banner ":: Success: deterministic.
-# Determinism verified.", and bitwise_parity false in the same record.
-got = tier_of(record(bitwise=False, strictness="stripped"))
-check("tier is 'stripped', NOT 'bitwise'", got and got["tier"] == "stripped", repr(got))
+print("case LEGACY — a stale stripped verdict is below the current contract")
+got = tier_of(record(bitwise=True, strictness="stripped"))
+check("tier is 'gap', NOT 'bitwise'", got and got["tier"] == "gap", repr(got))
 check("bitwise_parity records 0", got and got["bitwise_parity"] == "0", repr(got))
 check("strictness is carried", got and got["verify_compare"] == "stripped", repr(got))
 check("counts travel with the verdict (#319)",
@@ -109,13 +101,34 @@ for left, right, why in ((0, 0, "0|0"), (0, 239, "left 0"), (239, 0, "right 0"))
     check(f"zero-count record ({why}) reports bitwise_parity 0",
           got and got["bitwise_parity"] == "0", repr(got))
 
-print("case GUEST — verified without comparing the log stream is guest-visible")
+print("case OUTPUT-ONLY — verified without comparing the log stream is unqualified")
 got = tier_of(record(bitwise=False, compare_logs=False, left=None))
-check("tier is 'guest'", got and got["tier"] == "guest", repr(got))
+check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
 
 print("case DIVERGED — an unverified record never claims a positive tier")
 got = tier_of(record(verified=False, verdict="diverged"))
 check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
+
+print("case CONTRADICTIONS — no boolean pair can overrule the terminal verdict")
+got = tier_of(record(verified=True, bitwise=True, verdict="diverged"))
+check("verified+bitwise with diverged remains a gap",
+      got and got["tier"] == "gap", repr(got))
+check("contradictory diverged record reports bitwise_parity 0",
+      got and got["bitwise_parity"] == "0", repr(got))
+got = tier_of(record(verified=False, bitwise=True, verdict="matched"))
+check("matched with verified=false remains a gap",
+      got and got["tier"] == "gap", repr(got))
+
+print("case COUNTS — only equal positive integer counts are non-vacuous")
+for left, right, why in (
+    (-1, -1, "negative"),
+    ("239", "239", "strings"),
+    (True, True, "booleans"),
+    (239, 240, "unequal"),
+):
+    got = tier_of(record(left=left, right=right))
+    check(f"{why} counts remain a gap",
+          got and got["tier"] == "gap", repr(got))
 
 print("case NO-RECORD — absent / no_result / malformed fall back, never upward")
 check("absent file yields None", tier_of(None) is None)
@@ -127,33 +140,120 @@ with tempfile.TemporaryDirectory(prefix="verify-tier-") as tmp:
     check("malformed JSON yields None", verify_tier_from_json(bad) is None)
 
 print("case RANK — the ladder orders the tiers and 'bitwise' is the ceiling")
-check("guest < stripped < bitwise",
-      L2_RANK["guest"] < L2_RANK["stripped"] < L2_RANK["bitwise"], repr(L2_RANK))
+check("gap < bitwise", L2_RANK["gap"] < L2_RANK["bitwise"], repr(L2_RANK))
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
+check("'stripped' is no longer a tier name", "stripped" not in L2_RANK, repr(L2_RANK))
 
-print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
-# Asserting bitwise before an INFO-tier comparator exists would red every
-# ptrace/DBT cell for a comparator limitation, not a guest defect.
-check("ptrace verify contract is 'stripped'",
-      expectation("ptrace", "exit_status", True)[0] == "stripped")
-# `exit_status` is a declared dbt L2 gap, so it would report "gap" regardless of
-# tiering; use a case dbt is actually contracted for.
-check("dbt verify contract is 'stripped'",
-      expectation("dbt", "hello_stdout", True)[0] == "stripped")
-check("a declared dbt L2 gap still reports 'gap'",
-      expectation("dbt", "exit_status", True)[0] == "gap")
-check("kvm verify contract stays 'guest'",
-      expectation("kvm", "exit_status", True)[0] == "guest")
+print("case CONTRACT — non-KVM canonical verify paths demand bitwise evidence")
+check("ptrace verify contract is 'bitwise'",
+      expectation("ptrace", "exit_status", True)[0] == "bitwise")
+check("dbt verify contract is 'bitwise'",
+      expectation("dbt", "hello_stdout", True)[0] == "bitwise")
+check("dbt nonzero exit verify contract is 'bitwise'",
+      expectation("dbt", "exit_status", True)[0] == "bitwise")
+check("dbt file-metadata gap remains explicit",
+      expectation("dbt", "file_metadata", True)[0] == "gap")
+check("dbt pthread gap remains explicit",
+      expectation("dbt", "pthread_lifecycle", True)[0] == "gap")
+check("kvm output-only verify contract stays a 'gap'",
+      expectation("kvm", "exit_status", True)[0] == "gap")
+check("dbt allows both explicit gaps and canonical bitwise contracts",
+      L2_ALLOWED["dbt"] == {"gap", "bitwise"}, repr(L2_ALLOWED["dbt"]))
 
-print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
-# DBT accepts --verify-json and writes nothing (measured: rc=0, no file). The old
-# behaviour emitted deterministic=1 beside a blank comparator and blank counts --
-# a positive whose required fields are empty, which a wired verifier must refuse.
-# Producing rows designed to be refused is not a contract, so the row is published
-# UNMEASURED instead.
+print("case DBT COMMAND — bare --verify consumes typed canonical evidence")
+seen_commands: list[list[str]] = []
+original_run_with_timeout = matrix.run_with_timeout
+
+
+def verdict_path(command: list[str]) -> Path:
+    argument = next(arg for arg in command if arg.startswith("--verify-json="))
+    return Path(argument.split("=", 1)[1])
+
+
+def planted_dbt_match(command: list[str]):
+    seen_commands.append(command)
+    verdict_path(command).write_text(json.dumps(record(left=348, right=348)), encoding="utf-8")
+    return matrix.subprocess.CompletedProcess(command, 0, b"", b"")
+
+
+matrix.run_with_timeout = planted_dbt_match
+try:
+    dbt_evidence: dict[str, str] = {}
+    dbt_status, dbt_detail, _ = matrix.run_case_verify(
+        Path("/hermit"),
+        "dbt",
+        "hello_stdout",
+        ["/bin/true"],
+        0,
+        "bitwise",
+        dbt_evidence,
+    )
+finally:
+    matrix.run_with_timeout = original_run_with_timeout
+
+check("typed DBT canonical evidence passes", dbt_status == "PASS", dbt_detail)
+check("DBT evidence records the bitwise tier",
+      dbt_evidence.get("tier") == "bitwise", repr(dbt_evidence))
+dbt_command = seen_commands[-1]
+check("command emits exactly one bare --verify", dbt_command.count("--verify") == 1,
+      repr(dbt_command))
+check("deleted --verify-strict is never emitted", "--verify-strict" not in dbt_command,
+      repr(dbt_command))
+check("successful probes do not add a status relaxation",
+      not any(arg.startswith("--verify-allow") for arg in dbt_command), repr(dbt_command))
+check("command requests a typed verdict",
+      any(arg.startswith("--verify-json=") for arg in dbt_command), repr(dbt_command))
+
+failure_command = matrix.hermit_command(
+    Path("/hermit"),
+    "dbt",
+    ["/bin/sh", "-c", "exit 23"],
+    "exit_status",
+    strict=True,
+    verify=True,
+    verify_json=Path("/tmp/dbt-failure.json"),
+    verify_allow_failure=True,
+)
+check("nonzero guest probe admits only failed statuses",
+      "--verify-allow=failure" in failure_command, repr(failure_command))
+check("nonzero guest probe never uses the broad 'both' allowance",
+      "both" not in failure_command, repr(failure_command))
+
+print("case DBT NO-RESULT — missing canonical evidence is a failure, not a gap")
+
+
+def planted_dbt_no_result(command: list[str]):
+    verdict_path(command).write_text(
+        json.dumps({"verdict": "no_result", "verified": False}),
+        encoding="utf-8",
+    )
+    return matrix.subprocess.CompletedProcess(
+        command,
+        1,
+        b"",
+        b"DBT canonical evidence was empty",
+    )
+
+
+matrix.run_with_timeout = planted_dbt_no_result
+try:
+    no_result_status, no_result_detail, _ = matrix.run_case_verify(
+        Path("/hermit"),
+        "dbt",
+        "hello_stdout",
+        ["/bin/true"],
+        0,
+        "bitwise",
+    )
+finally:
+    matrix.run_with_timeout = original_run_with_timeout
+
+check("DBT no_result is red", no_result_status == "FAIL", no_result_detail)
+
+print("case SCORECARD — only typed canonical evidence may issue a positive")
 import tempfile as _tf, csv as _csv  # noqa: E402
 from run_matrix import (  # noqa: E402
-    VERIFY_COMPARE_UNAVAILABLE, BITWISE_CAPABLE_COMPARATORS, append_parent_scorecard,
+    BITWISE_CAPABLE_COMPARATORS, append_parent_scorecard,
 )
 
 
@@ -163,23 +263,11 @@ def emitted_row(evidence):
         path.write_text(",".join(SCORECARD_HEADER) + "\n", encoding="utf-8")
         append_parent_scorecard(
             path,
-            [{"test_name": "t", "backend": "dbt", "expectation": "stripped",
+            [{"test_name": "t", "backend": "ptrace", "expectation": "bitwise",
               "result": "PASS", "seconds": "1.0", "detail": "d", "evidence": evidence}],
             strict=True, verify=True, probe_gaps=False)
         return list(_csv.DictReader(path.open(encoding="utf-8")))[-1]
 
-
-fallback = emitted_row({"tier": "stripped", "verify_compare": VERIFY_COMPARE_UNAVAILABLE,
-                        "bitwise_parity": "0", "compared_log_messages": "",
-                        "determinism_unmeasured": "1"})
-check("fallback row does NOT claim deterministic=1",
-      fallback["deterministic"] == "", repr(fallback["deterministic"]))
-check("fallback row names why no verdict exists, rather than leaving it blank",
-      fallback["verify_compare"] == VERIFY_COMPARE_UNAVAILABLE, repr(fallback["verify_compare"]))
-check("fallback outcome is still a PASS (the guest ran and the compare succeeded)",
-      fallback["outcome"] == "pass", repr(fallback["outcome"]))
-check("the no-verdict sentinel is not a bitwise-capable comparator",
-      VERIFY_COMPARE_UNAVAILABLE not in BITWISE_CAPABLE_COMPARATORS)
 
 typed = emitted_row({"tier": "bitwise", "verify_compare": "canonical",
                      "bitwise_parity": "1", "compared_log_messages": "348|348"})
@@ -187,6 +275,8 @@ check("a typed verdict DOES still claim deterministic=1 (not inert)",
       typed["deterministic"] == "1", repr(typed["deterministic"]))
 check("typed row carries its counts into the row",
       typed["compared_log_messages"] == "348|348", repr(typed["compared_log_messages"]))
+check("canonical is the only bitwise-capable comparator",
+      BITWISE_CAPABLE_COMPARATORS == ("canonical",), repr(BITWISE_CAPABLE_COMPARATORS))
 
 print("case SCHEMA — the evidence columns exist and sit in the canonical header")
 for column in EVIDENCE_COLUMNS:

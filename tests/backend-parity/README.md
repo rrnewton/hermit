@@ -11,12 +11,19 @@ generated TSV here. It does **not** touch the tracked
 publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
 runner prints at the end of the run.
 
-## Current ratchet
+## Current contract and historical baseline
 
 The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
-Stripped verification ratchet (`--strict --verify`, Hermit's double-run
-comparison after selected numeric, address, path, and time fields are stripped)
-are tracked separately. Stripped verification is not L2.
+verification ratchet (`--strict --verify`, Hermit's double-run canonical INFO
+comparison) are tracked separately. A verification pass requires a typed JSON
+verdict with `bitwise_parity: true` and nonzero compared INFO-message counts.
+KVM's output-only verifier remains unqualified because it does not compare the
+canonical INFO stream.
+
+The counts below are the historical baseline measured before canonical
+verification became the default. The Stripped comparator that produced them
+has been removed; these counts are not current verification results and need a
+fresh run under the current contract.
 
 L1 (`hermit run --strict`):
 
@@ -26,7 +33,7 @@ L1 (`hermit run --strict`):
 | DBT | 26/28 | 93% |
 | KVM | 23/28 | 82% |
 
-Stripped verification (`hermit run --strict --verify`):
+Historical Stripped verification (`hermit run --strict --verify` at the time):
 
 | Backend | Verified pairs | Verification kind | Parity vs ptrace |
 | --- | ---: | --- | ---: |
@@ -34,15 +41,15 @@ Stripped verification (`hermit run --strict --verify`):
 | DBT | 26/28 | Stripped DETLOG | 93% |
 | KVM | 22/28 | guest-visible only | 79% |
 
-The two verification kinds are not interchangeable. **Stripped DETLOG**
+The two historical verification kinds were not interchangeable. **Stripped DETLOG**
 (ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
 streams equal after stripping selected fields; it does not mean the full syscall
 and scheduling traces were bitwise-identical and does not establish L2.
-**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
+**guest-visible** verification (KVM) was weaker: reverie-kvm runs concurrently and
 declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the verification
-subsection below for the contract that holds at L1 but not under `--verify`.
+`--verify` compares only guest stdout and exit status across the two runs. That
+output-only result does not qualify under the current contract. See the
+verification subsection below.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
@@ -111,9 +118,10 @@ exit but does not yet synthesize an x86-64 signal frame to run the handler.
 
 ## Cases
 
-Each cell shows the L1 status and, after `/`, the `--verify` status: `detlog`
-for Stripped DETLOG equality, `guest` for KVM guest-visible equality, and `gap`
-where verification does not succeed. Neither successful status is an L2 claim.
+This table records the historical pre-change measurement. Each cell shows the
+L1 status and, after `/`, the former `--verify` status: `detlog` for Stripped
+DETLOG equality, `guest` for KVM output-only equality, and `gap` where that
+verification did not succeed. These are not current verification results.
 
 | Test | ptrace | DBT | KVM |
 | --- | --- | --- | --- |
@@ -178,19 +186,23 @@ Without `--strict`, repeat-run results are compatibility evidence rather than
 an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
 three byte-identical runs. The runner disables PMU timeslicing for portability.
 
-### Stripped verification (`--verify`)
+### Canonical verification (`--verify`)
 
 Passing `--verify` adds a two-run comparison: the runner invokes
-`hermit run --strict --verify --verify-allow both`. For ptrace and DBT, Hermit
-compares DETLOG streams after Stripped normalization; this is not bitwise parity
-and not L2. Because `--verify` diverts the guest's own stdout into per-run
-temporary logs, this path cannot re-check stdout the way the L1 path does;
-instead it enforces that the guest exit status matches and that Hermit's
-double-run comparison succeeded at *at least* the verification kind expected
-for the backend. The runner keys on two stderr witnesses: `Determinism verified`
-(Stripped DETLOG, ptrace and DBT) and `guest output and exit status matched`
-(KVM guest-visible). A DETLOG result satisfies a `guest` contract because it
-compares more observations; the reverse fails.
+`hermit run --strict --verify` and supplies a per-row `--verify-json` path. On
+non-KVM backends, bare `--verify --verify-json` is the canonical path. Hermit
+compares canonical INFO streams and the runner requires
+`bitwise_parity: true`, `comparison.strictness: "canonical"`, log comparison
+enabled, and nonzero compared-message counts. It does not infer a pass from a
+command-line flag or success banner. A DBT result may claim L2 only when its
+protected framed evidence is present and nonempty and the frame authenticates
+and validates successfully; missing, empty, or invalid evidence fails closed.
+KVM's output/status-only result stays a `gap`.
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Rows requiring those
+operations are outside the selected M2 DBT L2 scope; selected-row results do
+not establish whole-corpus or arbitrary process-tree parity.
 
 One contract holds at L1 but not under `--verify` and is recorded as a `gap`
 with its reason in the runner:
@@ -256,9 +268,10 @@ rewrite path — which is why e9patch is not a column here. Its parity is instea
 ratcheted by `e9patch_corpus.py` over a freestanding, statically linked,
 raw-`syscall` corpus under `e9patch_corpus/`, where `candidate_sites > 0`.
 
-For each guest that harness enforces exit-status parity, stdout parity, golden
-Stripped verification (`hermit run --strict --verify`), e9patch Stripped
-verification (`hermit --backend e9patch run --strict --verify`), full direct-AOT
+The following is the historical pre-change e9patch measurement. For each guest
+that harness enforced exit-status parity, stdout parity, golden Stripped
+verification (`hermit run --strict --verify` at the time), e9patch Stripped
+verification (`hermit --backend e9patch run --strict --verify` at the time), full direct-AOT
 coverage
 (`mapped_sites == candidate_sites > 0`), no signal fallback (`b0_sites == 0`),
 and guest-syscall DETLOG **tail-match**: the golden guest-syscall sequence
@@ -344,9 +357,11 @@ Run KVM on a host with read-write `/dev/kvm` access:
 python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
-Enforce the Stripped verification ratchet on any backend by adding `--verify`
-(it implies `--strict`); Hermit's double-run then asserts the recorded
-verification kind per contract:
+Probe verification by adding `--verify` (it implies `--strict`). The runner
+requires a typed non-vacuous canonical verdict for a positive result. DBT can
+produce that verdict only from present, nonempty, authenticated and validated
+protected framed evidence with JSON `bitwise_parity: true`. KVM remains a gap
+because it cannot provide canonical INFO evidence:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend
@@ -356,7 +371,7 @@ python3 tests/backend-parity/run_matrix.py --backend kvm --verify --require-back
 ```
 
 Use `--probe-gaps` to execute documented gaps and report `XPASS` candidates
-(in `--verify` mode the probe reports which verification kind a gap reached).
+(in `--verify` mode only canonical non-vacuous evidence can become a candidate).
 Every non-check run auto-discovers an outer dev-hermit checkout and writes its
 observation rows to one ignored per-run file,
 `compat-envelope/ignored/backend-parity/<run-id>.csv`; the tracked

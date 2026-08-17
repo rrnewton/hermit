@@ -58,12 +58,11 @@ The path is deliberately direct:
 commands remain required validation checks even though they are outside this
 uniform comparable denominator.
 
-The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
-itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
-therefore measure same-backend repeatability under the current contract; they
-do not establish strict INFO-log determinism or cross-backend parity. The
-scorecard says this directly and reports no cross-backend parity count until
-the manifest has cells that really compare fresh ptrace and non-ptrace logs.
+The Basic Sanity `verify`, `replay`, and same-seed `chaos` cells publish typed
+verification reports. Passes on a supported canonical evidence path require canonical INFO parity with nonzero
+compared-message counts. KVM remains output-only and therefore does not qualify
+for that claim. These are same-backend checks; cross-backend parity still needs
+fresh ptrace and non-ptrace observations of the same workload.
 
 A green cell turning red makes validate fail. The normal response is to fix the
 regression. Moving the cell out of the selected plan is not a fix, and

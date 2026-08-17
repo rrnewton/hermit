@@ -530,6 +530,15 @@ pub struct Scheduler {
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
     deregistration_accounted: BTreeSet<DetTid>,
 
+    /// Process leaders whose exit hook has published the process's final state.
+    ///
+    /// A child-exit signal is scheduled at the deterministic `Exit` grant, before
+    /// the backend necessarily reaches that hook. Delay the signal until this
+    /// publication so a woken parent cannot observe the host-timed gap between
+    /// logical exit and kernel waitability. An active `vfork` also keeps the
+    /// signal queued until the kernel-blocked parent posts its continuation.
+    process_exit_hooks_reported: BTreeSet<DetPid>,
+
     /// Whether the backend will report final physical process exits after logical cleanup.
     backend_reports_physical_process_exits: bool,
 
@@ -537,6 +546,10 @@ pub struct Scheduler {
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
     /// overtaking a child exit that is not physically waitable yet.
     pending_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Threads whose logical-removal INFO diagnostic has already been emitted
+    /// at a scheduler-controlled exit point.
+    logical_kill_logged: BTreeSet<DetTid>,
 
     /// Whether the backend defers spawning a vfork child until after the parent posts its
     /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
@@ -960,6 +973,12 @@ async fn sched_loop_inner(
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
             {
+                // Publish the empty-scheduler diagnostic only at this terminal
+                // observation. Emitting it from step2 made the INFO stream depend
+                // on how many host-side loop iterations happened before teardown
+                // finished, so record and replay could differ by one copy while
+                // their turns, syscalls, and guest results were identical.
+                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
@@ -1224,8 +1243,10 @@ impl Scheduler {
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
+            process_exit_hooks_reported: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
+            logical_kill_logged: Default::default(),
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
@@ -1539,8 +1560,8 @@ impl Scheduler {
                 );
             }
             Some(nextturn) => {
-                info!(
-                    "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
+                trace!(
+                    "logically_kill: backend removed [det]tid {} in pid {}",
                     dtid, detpid
                 );
                 // Put in a dummy request to unblock the scheduler that might be
@@ -1627,6 +1648,7 @@ impl Scheduler {
         // raw-TID tombstones: the pending exec record proves why Linux reused it.
         self.logically_killed_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
+        self.process_exit_hooks_reported.remove(&detpid);
         self.pending_physical_process_exits.remove(&detpid);
         assert!(
             self.next_turns
@@ -1721,6 +1743,11 @@ impl Scheduler {
         !self.cancel_killed_thread_rpcs || self.deregistration_accounted.insert(dettid)
     }
 
+    /// Publish that the process leader's exit hook has recorded final process state.
+    pub(crate) fn report_process_exit_hook(&mut self, detpid: DetPid) -> bool {
+        self.process_exit_hooks_reported.insert(detpid)
+    }
+
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
     /// wait status. Other backends retain their existing lifecycle behavior.
     pub(crate) fn begin_physical_process_exit(&mut self, detpid: DetPid) -> bool {
@@ -1735,6 +1762,21 @@ impl Scheduler {
             inserted
         } else {
             false
+        }
+    }
+
+    fn log_logical_kill(&mut self, dettid: DetTid, detpid: DetPid) {
+        if self.logical_kill_logged.insert(dettid) {
+            info!(
+                "logically_kill: Scheduler removing all knowledge of [det]tid {} in pid {}..",
+                dettid, detpid
+            );
+        }
+    }
+
+    pub(crate) fn log_process_exit(&mut self, detpid: DetPid) {
+        for dettid in self.thread_tree.my_thread_group(&detpid) {
+            self.log_logical_kill(dettid, detpid);
         }
     }
 
@@ -1945,7 +1987,7 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_run_queue_admissions();
         self.step2a_wait_for_vfork_barrier()?;
-        self.step2b_process_timed(); // May populate run_queue.
+        self.step2b_process_timed()?; // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred(); // May populate run_queue.
         self.step2d_handle_empty_queue(global_time)?;
@@ -2047,7 +2089,7 @@ impl Scheduler {
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
     /// dispatching from the normal run queue.  Manipulates scheduler data structures
     /// accordingly.
-    fn step2b_process_timed(&mut self) {
+    fn step2b_process_timed(&mut self) -> Result<(), SkipTurn> {
         if let Some((time_ns, evt)) = self
             .blocked
             .timed_waiters
@@ -2056,22 +2098,30 @@ impl Scheduler {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
                 TimedEvent::SignalEvt(
-                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
+                    timed_waiters::SignalTimerId::ChildExit { child, parent },
                     dtid,
                     sig,
                 ) => {
+                    let exit_hook_reported = self.process_exit_hooks_reported.contains(&child);
+                    let vfork_parent_still_blocked =
+                        self.vfork_barriers.values().any(|registered_child| {
+                            registered_child.is_some_and(|dettid| dettid.as_raw() == child.as_raw())
+                        });
+                    if !exit_hook_reported || vfork_parent_still_blocked {
+                        self.blocked
+                            .timed_waiters
+                            .insert_child_exit(time_ns, child, parent, dtid);
+                        trace!(
+                            "waiting for process {} exit hook and vfork parent continuation before deterministic child-exit signal",
+                            child,
+                        );
+                        return Err(SkipTurn);
+                    }
+                    assert!(self.process_exit_hooks_reported.remove(&child));
                     // Deterministic child-exit SIGCHLD. If the host-async signal
                     // already arrived and was parked by the InboundSignal deferral
-                    // gate, release it now at this logical time — that real signal
-                    // is sufficient, so do not also synthesize one (avoids a
-                    // duplicate delivery). Otherwise synthesize the delivery so the
-                    // parent is notified deterministically regardless of host
-                    // signal latency. Either way mark the parent `sigchld_ready` so
-                    // its InboundSignal turn is granted here rather than deferred a
-                    // second time. Releasing the deferred signal at a logical
-                    // deadline (rather than only at run-queue quiescence, as
-                    // step2e does) is what breaks the redis_deep starvation
-                    // deadlock: a busy sibling can no longer starve the reaper.
+                    // gate, release it now at this logical time. Otherwise synthesize
+                    // delivery so the parent cannot be starved by host signal latency.
                     self.blocked.sigchld_ready.insert(parent);
                     if self.blocked.sigchld_deferred.remove(&parent) {
                         self.run_queue.push_eager_io_repoll(parent);
@@ -2082,6 +2132,7 @@ impl Scheduler {
                 TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2681,7 +2732,9 @@ impl Scheduler {
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
-                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                trace!(
+                    "scheduler (step2_process_blocked): zero threads left anywhere, awaiting terminal observation."
+                );
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
                 return Err(self.report_terminal_deadlock());
@@ -3022,14 +3075,19 @@ impl Scheduler {
             // host-async kernel `SIGCHLD` whose arrival time is host-timed (the
             // `make -jN` / redis `--strict --verify` nondeterminism source).
             ResourceID::Exit { group, process, .. } => {
-                if *group && let Some(parent) = self.thread_tree.parent_process(process) {
-                    // Fire strictly after the current committed time so the event
-                    // is dispatched on a subsequent scheduler pass (DetTid == DetPid
-                    // for a group leader, so `parent` is also the parent thread id).
-                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
-                    self.blocked
-                        .timed_waiters
-                        .insert_child_exit(deadline, *process, parent, parent);
+                if *group {
+                    self.log_process_exit(*process);
+                    if let Some(parent) = self.thread_tree.parent_process(process) {
+                        // Fire strictly after the current committed time so the event
+                        // is dispatched on a subsequent scheduler pass (DetTid == DetPid
+                        // for a group leader, so `parent` is also the parent thread id).
+                        let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                        self.blocked
+                            .timed_waiters
+                            .insert_child_exit(deadline, *process, parent, parent);
+                    }
+                } else {
+                    self.log_logical_kill(dettid, *process);
                 }
                 Ok(())
             }
@@ -5246,6 +5304,34 @@ mod test {
             (LogicalTime::from_nanos(150), LogicalTime::ZERO)
         );
         assert!(scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn child_exit_signal_waits_for_process_exit_hook_and_vfork_parent() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let child = DetPid::from_raw(200);
+        let child_tid = DetTid::from_raw(200);
+        let parent = DetPid::from_raw(100);
+        let deadline = LogicalTime::from_nanos(1_000);
+        scheduler.committed_time = deadline;
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert_child_exit(deadline, child, parent, parent);
+
+        assert!(scheduler.step2b_process_timed().is_err());
+        assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+
+        scheduler.vfork_barriers.insert(parent, Some(child_tid));
+        assert!(scheduler.report_process_exit_hook(child));
+        assert!(scheduler.step2b_process_timed().is_err());
+        assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+        assert!(scheduler.process_exit_hooks_reported.contains(&child));
+
+        scheduler.vfork_barriers.remove(&parent);
+        assert!(scheduler.step2b_process_timed().is_ok());
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert!(!scheduler.process_exit_hooks_reported.contains(&child));
     }
 
     #[test]

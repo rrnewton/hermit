@@ -181,11 +181,10 @@ before activation; an arbitrary shared object or constructor-free runtime is
 rejected rather than silently falling back.
 
 LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares status/stdout/stderr exactly and applies the
-`Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification snapshots guest stdin once and supplies
+`--strict --verify` run compares status/stdout/stderr exactly and requires
+canonical INFO parity. Qualification requires `--verify-json REPORT.json`,
+`bitwise_parity: true`, and nonzero compared-message counts. Verification
+snapshots guest stdin once and supplies
 the identical bytes to both runs. The supported execution scope is dynamically
 linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
 `fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
@@ -205,7 +204,7 @@ guest-kernel ABI.
 SaBRe is available only in builds using the non-default
 `third-party-backends` feature. See
 [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
-`Stripped` allowlist, build commands, and known gaps. An enabled probe is
+historical `Stripped` allowlist, build commands, and known gaps. An enabled probe is
 not a blanket support claim for every workload in its subsystem.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
@@ -289,11 +288,19 @@ Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
 the compared observations differ or if the guest exit status is not allowed.
 
-The default log comparison is `Stripped`: it can erase numbers, addresses,
-temporary paths, and time values from selected messages. It is a fast
-diagnostic, not strict determinism. Use
-`--verify-strict --verify-json REPORT.json` when a canonical strict result is
-required.
+On non-KVM backends, bare `--verify --verify-json REPORT.json` selects canonical
+INFO parity; no `--verify-strict` flag is required. The comparison removes only
+the real wall-clock prefix, canonicalizes host addresses to first-appearance
+ordinals, and compares the remainder exactly. Require `bitwise_parity: true`
+with nonzero compared-message counts. DBT may claim L2 only when its protected
+framed evidence is present and nonempty and the frame authenticates and
+validates successfully. Missing, empty, or invalid DBT evidence is not L2.
+KVM's output/status-only result remains unqualified.
+
+Protected DBT verification runs in an isolated process group and currently
+rejects guest `setsid(2)` and `setpgid(2)` with `EPERM`. Workloads requiring
+those operations are outside the selected M2 DBT L2 scope; selected-cell
+results do not establish whole-corpus or arbitrary process-tree parity.
 
 Matching verification logs are temporary by default; divergent comparisons
 retain both. Keep both runs regardless of verdict with `--keep-logs`; Hermit

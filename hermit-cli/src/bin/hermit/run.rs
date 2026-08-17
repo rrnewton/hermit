@@ -54,7 +54,6 @@ use super::global_opts::GlobalOpts;
 use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
-use super::verify::LogCompareStrictness;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
@@ -310,31 +309,14 @@ pub struct RunOpts {
     #[clap(long)]
     verify: bool,
 
-    /// Compare complete, unnormalized TRACE logs and show detailed differences.
-    /// This detects internal timing and other trace-only divergence at the cost
-    /// of substantially larger logs and stricter comparison. Implies the strict,
-    /// bitwise comparison of --verify-strict, and additionally raises the diff
-    /// verbosity (larger logs, more syscall history).
+    /// Compare complete TRACE logs under the same canonical address policy and
+    /// show detailed differences. This detects internal timing and other
+    /// trace-only divergence at the cost of substantially larger logs. The
+    /// default comparison already requires canonical INFO parity; this option
+    /// adds DEBUG/TRACE diagnostics and raises the diff verbosity (larger logs,
+    /// more syscall history).
     #[clap(long, requires = "verify")]
     verify_verbose: bool,
-
-    /// Compare the internal logs under the CANONICAL parity policy: strip only
-    /// the real wall-clock timestamp prefix (genuinely irreproducible),
-    /// canonicalize host memory addresses to first-appearance ordinals (so an
-    /// ASLR shift is tolerated but allocation-order and aliasing changes still
-    /// diverge), and compare every INFO message's remaining bytes — virtual-time
-    /// timestamps, raw syscall argument/result values, counts, sizes, flags —
-    /// exactly. An explicit `--log=debug` or `--log=trace` remains captured for
-    /// `--print-verify-logs` diagnostics but does not change this INFO verdict; use
-    /// `--verify-verbose` to request an all-level diagnostic comparison. Without
-    /// this (and without --verify-verbose) the default `--verify` normalizes away
-    /// numbers, addresses, tmp paths, and timestamps before comparing, so a
-    /// "verified" result asserts only stripped parity, not bitwise identity.
-    /// Unlike --verify-verbose this stays quiet: it changes only the comparison,
-    /// not the diff output volume, so a determinism ratchet can require parity
-    /// without drowning in trace logs.
-    #[clap(long, requires = "verify")]
-    verify_strict: bool,
 
     /// If --verify is specified, indicates what guest exit status is required for
     /// hermit to consider the verification successful.  Both runs must satisfy this criteria,
@@ -364,8 +346,8 @@ pub struct RunOpts {
     /// With --verify, write the verification verdict as a single JSON line to
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
-    /// "stripped"|"canonical","compare_logs":bool,"log_scope":
-    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
+    /// "canonical","compare_logs":bool,"log_scope":"info"|"full_trace",
+    /// "strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
@@ -379,8 +361,7 @@ pub struct RunOpts {
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
     /// comparison that strips only the real wall-clock prefix, canonicalizes host
     /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — so it cannot be silently weakened to a
-    /// stripped compare.
+    /// exactly — so it cannot be silently weakened.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -618,9 +599,6 @@ impl fmt::Display for RunOpts {
         }
         if self.verify_verbose {
             write!(f, " --verify-verbose")?;
-        }
-        if self.verify_strict {
-            write!(f, " --verify-strict")?;
         }
         if self.print_verify_logs {
             write!(f, " --print-verify-logs")?;
@@ -1885,12 +1863,14 @@ impl RunOpts {
         }
         if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
-        } else if self.verify {
+        } else if self.verify && self.selected_backend() != Backend::Dbt {
             // `--verify` runs the guest twice through the output-capturing
             // backend, which otherwise feeds the guest an empty stdin. Snapshot
             // the real stdin now so both runs replay identical input; without
             // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
             // -x c -`) is dropped and hermit reports a false deterministic pass.
+            // The dedicated DBT adapter owns an equivalent tee-and-replay
+            // snapshot because it launches outside this container path.
             hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
         }
 
@@ -1950,15 +1930,28 @@ impl RunOpts {
             | Backend::E9patch => {}
             Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
+                let retained_log_dir = self.retained_verify_log_dir()?;
+                let verification_stdin = self
+                    .verify
+                    .then(super::startup_stdin)
+                    .transpose()?
+                    .flatten();
                 return super::backends::run_dbt(
                     &self.program,
                     &self.args,
                     self.verify,
+                    self.verify_verbose,
                     self.verify_allow,
+                    self.print_verify_logs,
+                    self.keep_logs,
+                    retained_log_dir.as_deref(),
+                    self.verify_json.as_deref(),
                     self.summary,
                     global.log,
+                    global.log_file.as_deref(),
                     &self.effective_det_config(),
                     environment,
+                    verification_stdin,
                 );
             }
         }
@@ -2885,14 +2878,6 @@ impl RunOpts {
                 },
                 failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
-                // --verify-verbose historically implied a bitwise compare (it
-                // flipped strip_lines off + FullTrace on); preserve that, and let
-                // --verify-strict select the same bitwise comparison quietly.
-                strictness: if self.verify_verbose || self.verify_strict {
-                    LogCompareStrictness::Canonical
-                } else {
-                    LogCompareStrictness::Stripped
-                },
                 compare_logs: !kvm_output_only,
                 diagnostic_full_trace: self.verify_verbose,
                 keep_logs: self.keep_logs,
@@ -3223,12 +3208,7 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        let strictness = if self.verify_verbose || self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        };
-        let level = verification_log_level(global.log, strictness, self.verify_verbose);
+        let level = verification_log_level(global.log, self.verify_verbose);
 
         let _guard = init_file_tracing(Some(level), log_file);
 
@@ -3300,6 +3280,11 @@ mod tests {
         assert!(help.contains("--keep-logs"));
         assert!(help.contains("--verify-log-dir"));
         assert!(!help.contains("--verify-logs"));
+        assert!(!help.contains("--verify-strict"));
+        assert!(
+            RunOpts::try_parse_from(["run", "--verify", "--verify-strict", "/bin/true"]).is_err(),
+            "the deleted comparator-selection flag must not parse"
+        );
 
         assert!(
             RunOpts::try_parse_from([
