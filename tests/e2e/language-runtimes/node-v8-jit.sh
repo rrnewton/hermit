@@ -42,11 +42,17 @@
 # isolates the guest /tmp per repeat).
 set -euo pipefail
 
-node_bin() {
-    if command -v node >/dev/null 2>&1; then
-        echo node
-    elif command -v nodejs >/dev/null 2>&1; then
-        echo nodejs
+select_node_bin() {
+    # Use the real runtime rather than a PATH-installed wrapper.  On some
+    # hosts /usr/local/bin/node runs usage telemetry (including scribe_cat)
+    # before it execs /bin/node.  That host-only process tree is unrelated to
+    # the JIT, entropy, and checksum properties this fixture verifies.
+    if [[ -x /bin/node ]]; then
+        NODE_BIN=/bin/node
+    elif [[ -x /usr/bin/node ]]; then
+        NODE_BIN=/usr/bin/node
+    elif [[ -x /usr/bin/nodejs ]]; then
+        NODE_BIN=/usr/bin/nodejs
     else
         return 1
     fi
@@ -62,14 +68,18 @@ console.log("jit-checksum="+acc+" random="+Math.random().toFixed(12)+" sorted="+
 
 case ${1:-} in
     --prepare)
-        node_bin >/dev/null 2>&1 || {
+        select_node_bin || {
             echo "node not found" >&2
             exit 1
         }
         exit 0
         ;;
     --run)
-        exec "$(node_bin)" -e "$prog"
+        select_node_bin || {
+            echo "node not found" >&2
+            exit 1
+        }
+        exec "$NODE_BIN" -e "$prog"
         ;;
     *)
         echo "usage: $0 --prepare|--run" >&2
