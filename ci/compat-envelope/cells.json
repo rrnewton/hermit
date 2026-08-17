@@ -43768,6 +43768,9 @@
       "backend": "ptrace",
       "enabled": true,
       "status": "red",
+      "ci_disabled_reason": {
+        "reason": "Canonical chaos verification diverged independently at seed 15 turn 9 with 185/186 INFO messages and at seed 9 turn 8 with 173/174 INFO messages; this cell was never reliably passing."
+      },
       "observations": []
     },
     {
