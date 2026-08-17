@@ -59,6 +59,9 @@ SOURCE_TREE_SHA=$(git -C "$ROOT_DIR" rev-parse HEAD)
 BUILD_ROOT=${E2E_BUILD_ROOT:-$RESULT_ROOT/build/$SOURCE_TREE_SHA}
 DAG_ROOT=${E2E_DAG_ROOT:-$ROOT_DIR/ci/dag}
 HARNESS_MANIFEST_JSON=${E2E_HARNESS_MANIFEST_JSON:-}
+HOST_HOME=${HOME:?ci/test_harness.sh requires HOME to derive Rust tool roots}
+HOST_RUSTUP_HOME=${RUSTUP_HOME:-$HOST_HOME/.rustup}
+HOST_CARGO_HOME=${CARGO_HOME:-$HOST_HOME/.cargo}
 if [[ -n $(git -C "$ROOT_DIR" status --porcelain --untracked-files=no) ]]; then
     SOURCE_TREE_DIRTY=true
 else
@@ -66,9 +69,18 @@ else
 fi
 
 readonly ROOT_DIR TEST_ROOT MANIFEST_ROOT INVENTORY EXPECTED_PLAN HERMIT_BIN RESULT_ROOT RUN_ID SOURCE_TREE_SHA SOURCE_TREE_DIRTY BUILD_ROOT DAG_ROOT HARNESS_MANIFEST_JSON
+readonly HOST_HOME HOST_RUSTUP_HOME HOST_CARGO_HOME
 readonly -a MODES=(verify chaos replay naked custom)
 readonly -a BACKENDS=(ptrace dbt kvm sabre liteinst)
 readonly -a LANES=(portable privileged)
+readonly -a MINIMAL_GUEST_ENV_ARGS=(
+    --env=LC_ALL
+    --env=TZ
+    --env=HOME
+    --env=XDG_CONFIG_HOME
+    --env=E2E_TMPDIR
+    --env=E2E_FIXTURE_DIR
+)
 DAG_DIR="$ROOT_DIR/ci/dag"
 readonly DAG_DIR
 
@@ -110,6 +122,59 @@ USAGE
 function die {
     echo "test_harness.sh: $*" >&2
     exit 2
+}
+
+# The outer harness and the Hermit guest need the same six controlled values,
+# but only fixture preparation needs the host Rust installation. Keep those
+# boundaries explicit: `--base-env=minimal` admits only MINIMAL_GUEST_ENV_ARGS,
+# while RUSTUP_HOME/CARGO_HOME repair tool discovery after HOME is replaced for
+# a prepare process and never enter guest argv.
+function cell_environment_args {
+    local output_name=$1 cell_dir=$2 tmpdir=$3
+    local -n output=$output_name
+    output=(
+        env
+        LC_ALL=C
+        TZ=UTC
+        HOME="$cell_dir/home"
+        XDG_CONFIG_HOME="$cell_dir/xdg-config"
+        E2E_TMPDIR="$tmpdir"
+        E2E_FIXTURE_DIR="$cell_dir/fixtures"
+    )
+}
+
+function prepare_environment_args {
+    local output_name=$1 cell_dir=$2
+    local -n output=$output_name
+    cell_environment_args "$output_name" "$cell_dir" "$cell_dir/tmp"
+    output+=(
+        RUSTUP_HOME="$HOST_RUSTUP_HOME"
+        CARGO_HOME="$HOST_CARGO_HOME"
+    )
+}
+
+function minimal_guest_env_args_json {
+    printf '%s\n' "${MINIMAL_GUEST_ENV_ARGS[@]}" |
+        jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+function audit_minimal_guest_environment_contract {
+    local -a prepare_args=()
+    local guest_json expected_guest_json
+    prepare_environment_args prepare_args /controlled/cell
+    guest_json=$(minimal_guest_env_args_json)
+    expected_guest_json='["--env=LC_ALL","--env=TZ","--env=HOME","--env=XDG_CONFIG_HOME","--env=E2E_TMPDIR","--env=E2E_FIXTURE_DIR"]'
+    [[ $guest_json == "$expected_guest_json" ]] ||
+        die "minimal guest environment drifted: $guest_json"
+    [[ " ${prepare_args[*]} " == *" RUSTUP_HOME=$HOST_RUSTUP_HOME "* ]] ||
+        die "fixture preparation lost the host RUSTUP_HOME"
+    [[ " ${prepare_args[*]} " == *" CARGO_HOME=$HOST_CARGO_HOME "* ]] ||
+        die "fixture preparation lost the host CARGO_HOME"
+    if [[ $guest_json == *RUSTUP_HOME* || $guest_json == *CARGO_HOME* ||
+          $guest_json == *VALIDATION_AMBIENT_EXTRA* ]]; then
+        die "prepare-only or ambient variables leaked into the minimal guest environment"
+    fi
+    echo "minimal guest environment: PASS (6 forwarded, Rust tool roots prepare-only)"
 }
 
 # Run one audit probe without letting `set -e` discard the command substitution's
@@ -2940,6 +3005,7 @@ if [[ $# == 12 && $1 == --log=info && $2 == run && $3 == --backend &&
     exit 0
 fi
 verdict= seed= seen_log=0 seen_verify=0 seen_allow=0 seen_chaos=0
+declare -A seen_guest_env=()
 while (($#)); do
     case "$1" in
         --log=info) seen_log=1; shift ;;
@@ -2948,11 +3014,19 @@ while (($#)); do
         --verify-json) verdict=${2:?missing verify path}; shift 2 ;;
         --chaos) seen_chaos=1; shift ;;
         --seed=*) seed=${1#--seed=}; shift ;;
+        --env=*) seen_guest_env[${1#--env=}]=1; shift ;;
         *) shift ;;
     esac
 done
+for required_env in LC_ALL TZ HOME XDG_CONFIG_HOME E2E_TMPDIR E2E_FIXTURE_DIR; do
+    [[ ${seen_guest_env[$required_env]:-0} == 1 ]] || exit 96
+done
 if [[ -z $verdict || -z $seed || $seen_log != 1 || $seen_verify != 1 ||
-      $seen_allow != 1 || $seen_chaos != 1 ]]; then
+      $seen_allow != 1 || $seen_chaos != 1 || ${#seen_guest_env[@]} != 6 ||
+      ${LC_ALL:-} != C || ${TZ:-} != UTC || -z ${HOME:-} ||
+      -z ${XDG_CONFIG_HOME:-} || -z ${E2E_TMPDIR:-} || -z ${E2E_FIXTURE_DIR:-} ||
+      -n ${seen_guest_env[VALIDATION_AMBIENT_EXTRA]:-} ||
+      -n ${seen_guest_env[RUSTUP_HOME]:-} || -n ${seen_guest_env[CARGO_HOME]:-} ]]; then
     printf 'BAD log=%s verify=%s allow=%s chaos=%s seed=%s verdict=%s\n' \
         "$seen_log" "$seen_verify" "$seen_allow" "$seen_chaos" "$seed" "$verdict" \
         >>"${FAKE_HERMIT_INVOCATIONS:?}"
@@ -2988,7 +3062,7 @@ printf 'ERROR! global_str is null at use.\n'
 exit 1
 FAKE_HERMIT
     chmod 755 "$fake" "$scratch/bin/timeout"
-    if output=$(env PATH="$scratch/bin:$PATH" \
+    if output=$(env PATH="$scratch/bin:$PATH" VALIDATION_AMBIENT_EXTRA=must-not-forward \
         HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=one-false \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=negative-chaos-verdict \
@@ -3030,7 +3104,7 @@ FAKE_HERMIT
     fi
 
     : >"$invocation_log"
-    if ! output=$(env PATH="$scratch/bin:$PATH" \
+    if ! output=$(env PATH="$scratch/bin:$PATH" VALIDATION_AMBIENT_EXTRA=must-not-forward \
         HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=pass \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
@@ -3042,7 +3116,7 @@ FAKE_HERMIT
         die "the controlled affirmative chaos verdict must pass before the stale-report bracket"
     fi
     : >"$invocation_log"
-    if output=$(env PATH="$scratch/bin:$PATH" \
+    if output=$(env PATH="$scratch/bin:$PATH" VALIDATION_AMBIENT_EXTRA=must-not-forward \
         HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=none \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
@@ -3255,15 +3329,8 @@ function prepare_test {
     local timeout_seconds=$3
     local stdout_file="$cell_dir/captures/prepare.stdout"
     local stderr_file="$cell_dir/captures/prepare.stderr"
-    local -a env_args=(
-        env
-        LC_ALL=C
-        TZ=UTC
-        HOME="$cell_dir/home"
-        XDG_CONFIG_HOME="$cell_dir/xdg-config"
-        E2E_TMPDIR="$cell_dir/tmp"
-        E2E_FIXTURE_DIR="$cell_dir/fixtures"
-    )
+    local -a env_args=()
+    prepare_environment_args env_args "$cell_dir"
     local metadata kind id prebuilt_fixtures
     metadata=$(metadata_json "$test")
     kind=$(jq -r .program_kind <<<"$metadata")
@@ -3445,15 +3512,8 @@ function execute_attempt {
         guest_tmpdir=/tmp/hermit-e2e
     fi
 
-    local -a env_args=(
-        env
-        LC_ALL=C
-        TZ=UTC
-        HOME="$cell_dir/home"
-        XDG_CONFIG_HOME="$cell_dir/xdg-config"
-        E2E_TMPDIR="$guest_tmpdir"
-        E2E_FIXTURE_DIR="$cell_dir/fixtures"
-    )
+    local -a env_args=()
+    cell_environment_args env_args "$cell_dir" "$guest_tmpdir"
     if [[ $backend == sabre ]]; then
         path_evidence_file="$cell_dir/captures/${mode}-${attempt}.sabre-path.jsonl"
         : >"$path_evidence_file"
@@ -3513,7 +3573,9 @@ function execute_attempt {
             # Every verify cell uses the canonical INFO comparison and publishes
             # the typed verdict that run_cell requires below.
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                --verify-json "$verify_report" "${verify_log_flags[@]}" "${verify_profile[@]}" -- "${guest_command[@]}")
+                --verify-json "$verify_report" "${verify_log_flags[@]}" "${verify_profile[@]}"
+                "${MINIMAL_GUEST_ENV_ARGS[@]}" --
+                "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -3529,7 +3591,8 @@ function execute_attempt {
             # it from a failed comparison.
             command=("$HERMIT_BIN" --log=info run --base-env=minimal --backend "$backend" --strict
                 --verify --verify-allow=both --verify-json "$verify_report"
-                --chaos --sched-heuristic=random "--seed=$seed" -- "${guest_command[@]}")
+                --chaos --sched-heuristic=random "--seed=$seed"
+                "${MINIMAL_GUEST_ENV_ARGS[@]}" -- "${guest_command[@]}")
             ;;
         custom)
             mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
@@ -3587,7 +3650,7 @@ function append_result {
     local path_evidence=$9
     local error_kind=${10}
     local diversity=${11:-null}
-    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind timeout_seconds custom_effective_args
+    local test_file test_sha256 binary_sha256 effective_args guest_args guest_backend relaxations log_level classification kind timeout_seconds custom_effective_args minimal_guest_env
     test_file=${TEST_BY_ID[$test_id]}
     if [[ -f $test_file ]]; then
         test_sha256=$(sha256sum "$test_file" | cut -d' ' -f1)
@@ -3610,6 +3673,7 @@ function append_result {
     relaxations='[]'
     classification=required
     ((PROBE_DISABLED)) && classification=disabled
+    minimal_guest_env=$(minimal_guest_env_args_json)
     case "$mode" in
         naked)
             effective_args='[]'
@@ -3620,10 +3684,11 @@ function append_result {
             [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 ]] && keep_verify_logs=true
             effective_args=$(jq -cn --arg backend "$backend" \
                 --argjson keep "$keep_verify_logs" \
+                --argjson guest_env "$minimal_guest_env" \
                 '["--log=info","run","--backend",$backend,"--strict","--verify"]
                  + ["--verify-json","<cell-verify-report>"]
                  + (if $keep then ["--keep-logs","--verify-log-dir","<cell-verify-log-dir>"] else [] end)
-                 + ["--base-env=minimal"]')
+                 + ["--base-env=minimal"] + $guest_env')
             log_level=info
             ;;
         replay)
@@ -3635,10 +3700,11 @@ function append_result {
             ;;
         chaos)
             effective_args=$(jq -cn --arg backend "$backend" \
+                --argjson guest_env "$minimal_guest_env" \
                 '["--log=info","run","--base-env=minimal","--backend",$backend,
                   "--strict","--verify","--verify-allow=both","--verify-json",
                   "<per-seed-verify-report>","--chaos","--sched-heuristic=random",
-                  "--seed=<manifest-seed>"]')
+                  "--seed=<manifest-seed>"] + $guest_env')
             log_level=info
             ;;
         custom)
@@ -4202,6 +4268,7 @@ case "$subcommand" in
         audit_executable_guest_program_contract
         audit_test_binary_registration
         audit_guest_launch_classification_contract
+        audit_minimal_guest_environment_contract
         audit_chaos_seed_contract
         audit_sabre_path_evidence_contract
         audit_validation_capability_selection_contract

@@ -55,7 +55,12 @@ The modes have distinct contracts:
 | `custom` | Run Hermit with manifest-declared edge-case arguments |
 
 Portable verify cells add `--base-env=minimal`; chaos already uses the same
-controlled environment. Neither mode disables CPUID virtualization or the
+controlled environment. Both modes explicitly forward only `LC_ALL`, `TZ`, the
+per-cell `HOME` and `XDG_CONFIG_HOME`, `E2E_TMPDIR`, and `E2E_FIXTURE_DIR` from
+the harness into the guest. Other ambient variables remain absent. Fixture
+preparation separately preserves the host `RUSTUP_HOME` and `CARGO_HOME` after
+replacing `HOME`; those tool roots are not guest variables. Neither mode
+disables CPUID virtualization or the
 default PMU-backed maximum timeslice. Replay keeps its separate record/replay
 arguments. Before dependent portable nodes run, a suite-level ptrace check
 requires four delivered retired-branch PMU overflows and proves that a guest
@@ -71,7 +76,8 @@ Each cell receives repo-local `HOME`, `XDG_CONFIG_HOME`, fixtures, captures,
 and recording directories. Hermit guests use the isolated `/tmp/hermit-e2e`
 logical work path so built-in verification cannot leak run-one mutations into
 run two. The checked-in XDG seed is under `tests/e2e/xdg-config/`; developer
-configuration is never read.
+configuration is never read. The result row's `effective_args` records the same
+six `--env=NAME` arguments used by the real invocation.
 
 ## DAG wiring
 

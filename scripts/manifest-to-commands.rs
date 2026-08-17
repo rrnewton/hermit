@@ -36,7 +36,16 @@ use toml::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const PREPARE_ENV: &str = "env LC_ALL=C TZ=UTC RUSTUP_HOME=\"$prepare_rustup_home\" CARGO_HOME=\"$prepare_cargo_home\" HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const MINIMAL_GUEST_ENV_NAMES: &[&str] = &[
+    "LC_ALL",
+    "TZ",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "E2E_TMPDIR",
+    "E2E_FIXTURE_DIR",
+];
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-to-commands: {}", message.as_ref());
@@ -143,7 +152,17 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
         (Some(program), None) => match Path::new(program).extension().and_then(|x| x.to_str()) {
             Some("sh") => {
                 let script = shell_quote(program);
-                commands.push(format!("{RUN_ENV} {script} --prepare"));
+                commands.push(
+                    "original_home=${HOME:?HOME must be set before preparing a shell fixture}"
+                        .to_owned(),
+                );
+                commands.push(
+                    "prepare_rustup_home=${RUSTUP_HOME:-$original_home/.rustup}".to_owned(),
+                );
+                commands.push(
+                    "prepare_cargo_home=${CARGO_HOME:-$original_home/.cargo}".to_owned(),
+                );
+                commands.push(format!("{PREPARE_ENV} {script} --prepare"));
                 format!("{script} --run")
             }
             Some("c") => {
@@ -238,6 +257,13 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
     format!("{guest} {rendered}")
 }
 
+fn minimal_guest_env_flags() -> String {
+    MINIMAL_GUEST_ENV_NAMES
+        .iter()
+        .map(|name| format!(" --env={name}"))
+        .collect()
+}
+
 fn hermit_command(
     mode: &str,
     backend: &str,
@@ -247,7 +273,8 @@ fn hermit_command(
     extra: &[String],
     guest: &str,
 ) -> String {
-    let verify_profile = " --base-env=minimal";
+    let minimal_guest_env = minimal_guest_env_flags();
+    let verify_profile = format!(" --base-env=minimal{minimal_guest_env}");
     let (command, report) = match mode {
         "verify" => (
             format!(
@@ -268,7 +295,7 @@ fn hermit_command(
             let report = format!("\"$cell/captures/verify-seed-{seed}.json\"");
             (
                 format!(
-                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json {report} --chaos --sched-heuristic=random --seed={seed} -- {guest}",
+                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json {report} --chaos --sched-heuristic=random --seed={seed}{minimal_guest_env} -- {guest}",
                     shell_quote(backend),
                 ),
                 Some(report),
@@ -718,7 +745,43 @@ backends_enabled = ["ptrace"]
     }
 
     #[test]
+    fn shell_preparation_preserves_rust_roots_without_guest_leakage() {
+        let tests = manifest(
+            r#"
+[[test]]
+id = "c-programs/shell-fixture"
+program = "tests/e2e/fixture.sh"
+"#,
+        );
+        let (setup, guest) = setup_prefix(&tests[0].1, "c-programs/shell-fixture");
+        assert!(setup.contains(
+            "original_home=${HOME:?HOME must be set before preparing a shell fixture}"
+        ));
+        assert!(setup.contains(
+            "prepare_rustup_home=${RUSTUP_HOME:-$original_home/.rustup}"
+        ));
+        assert!(setup.contains(
+            "prepare_cargo_home=${CARGO_HOME:-$original_home/.cargo}"
+        ));
+        assert!(setup.contains(PREPARE_ENV));
+        assert!(PREPARE_ENV.contains("RUSTUP_HOME=\"$prepare_rustup_home\""));
+        assert!(PREPARE_ENV.contains("CARGO_HOME=\"$prepare_cargo_home\""));
+        for guest_side in [RUN_ENV, HERMIT_RUN_ENV, guest.as_str()] {
+            assert!(!guest_side.contains("RUSTUP_HOME"));
+            assert!(!guest_side.contains("CARGO_HOME"));
+        }
+    }
+
+    #[test]
     fn generated_mode_commands_match_the_harness_contract() {
+        let guest_env = minimal_guest_env_flags();
+        for name in MINIMAL_GUEST_ENV_NAMES {
+            assert!(guest_env.contains(&format!(" --env={name}")));
+        }
+        assert!(!guest_env.contains("RUSTUP_HOME"));
+        assert!(!guest_env.contains("CARGO_HOME"));
+        assert!(!guest_env.contains("VALIDATION_AMBIENT_EXTRA"));
+
         let replay = hermit_command(
             "replay",
             "ptrace",
@@ -750,6 +813,7 @@ backends_enabled = ["ptrace"]
         assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
         assert!(chaos.contains("(.comparison.strictness == \"canonical\")"));
         assert!(chaos.contains("--log=info"));
+        assert!(chaos.contains(&guest_env));
         assert!(!chaos.contains("--no-virtualize-cpuid"));
         assert!(!chaos.contains("--max-timeslice=disabled"));
 
@@ -769,6 +833,7 @@ backends_enabled = ["ptrace"]
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], "guest");
         assert!(verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
         assert!(verify.contains("--base-env=minimal"));
+        assert!(verify.contains(&guest_env));
         assert!(!verify.contains("--no-virtualize-cpuid"));
         assert!(!verify.contains("--max-timeslice=disabled"));
         assert!(verify.contains("(.bitwise_parity == true)"));

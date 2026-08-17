@@ -109,6 +109,13 @@ compression packages). The OS name printed at startup must accompany results;
 install missing utilities rather than interpreting `command not found` as a
 Hermit determinism regression.
 
+Manifest verify and chaos guests use `--base-env=minimal` plus an explicit
+six-variable harness contract: `LC_ALL`, `TZ`, per-cell `HOME`,
+`XDG_CONFIG_HOME`, `E2E_TMPDIR`, and `E2E_FIXTURE_DIR`. No other ambient host
+variable is forwarded. Fixture preparation is a separate boundary: it keeps
+the host `RUSTUP_HOME` and `CARGO_HOME` so replacing `HOME` does not hide the
+selected Rust toolchain, but those paths are not passed to the guest.
+
 ## Capability axes
 
 These axes are orthogonal. A host can satisfy some and not others, and each

@@ -8,6 +8,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -908,6 +909,58 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
             "LSAN_OPTIONS not set for backend {backend}"
         );
     }
+}
+
+#[test]
+fn minimal_validation_environment_is_explicit_and_fail_closed() {
+    let opts = RunOpts::parse_from([
+        "fakehermit",
+        "--base-env=minimal",
+        "--env=LC_ALL=C",
+        "--env=TZ=UTC",
+        "--env=HOME=/controlled/home",
+        "--env=XDG_CONFIG_HOME=/controlled/xdg",
+        "--env=E2E_TMPDIR=/tmp/hermit-e2e",
+        "--env=E2E_FIXTURE_DIR=/controlled/fixtures",
+        "/usr/bin/env",
+    ]);
+    let envs = opts.guest_command().unwrap().get_captured_envs();
+    for (name, value) in [
+        ("LC_ALL", "C"),
+        ("TZ", "UTC"),
+        ("HOME", "/controlled/home"),
+        ("XDG_CONFIG_HOME", "/controlled/xdg"),
+        ("E2E_TMPDIR", "/tmp/hermit-e2e"),
+        ("E2E_FIXTURE_DIR", "/controlled/fixtures"),
+    ] {
+        assert_eq!(
+            envs.get(OsStr::new(name)),
+            Some(&OsString::from(value)),
+            "minimal validation environment lost {name}",
+        );
+    }
+    for excluded in ["VALIDATION_AMBIENT_EXTRA", "RUSTUP_HOME", "CARGO_HOME"] {
+        assert!(
+            !envs.contains_key(OsStr::new(excluded)),
+            "minimal validation environment leaked {excluded}",
+        );
+    }
+
+    let missing = format!("HERMIT_VALIDATION_MISSING_{}", std::process::id());
+    assert!(std::env::var_os(&missing).is_none());
+    let missing_arg = format!("--env={missing}");
+    let opts = RunOpts::parse_from([
+        "fakehermit",
+        "--base-env=minimal",
+        &missing_arg,
+        "/usr/bin/env",
+    ]);
+    let error = match opts.guest_command() {
+        Ok(_) => panic!("an unset pass-through variable was accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains(&missing), "unexpected refusal: {error}");
+    assert!(error.contains("not set"), "unexpected refusal: {error}");
 }
 
 #[test]
