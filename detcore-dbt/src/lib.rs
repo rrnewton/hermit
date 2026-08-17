@@ -1360,6 +1360,25 @@ fn resume_paused_runtime() {
     READY_IMAGE.store(image_generation, Ordering::Release);
 }
 
+fn prepare_runtime_after_failed_exec() {
+    if !RUNTIME_SHUTDOWN.load(Ordering::Acquire) {
+        resume_paused_runtime();
+        return;
+    }
+
+    // The native client stops the distinct scheduler process before exec so
+    // that process can publish its protected-evidence FINAL. A failed exec
+    // keeps the application image alive, so a replacement scheduler process
+    // will be started for the same image. Preserve the already-initialized
+    // local thread state, but do not advertise global readiness until that new
+    // scheduler has entered reverie_dbt_runtime_background_init_v2.
+    let image_generation = IMAGE_GENERATION.load(Ordering::Acquire);
+    READY_IMAGE.store(0, Ordering::Release);
+    RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
+    RUNTIME_PAUSED.store(false, Ordering::Release);
+    ROOT_LOCAL_READY_IMAGE.store(image_generation, Ordering::Release);
+}
+
 /// Restarts the existing scheduler after the kernel rejects a native exec.
 ///
 /// # Safety
@@ -1376,7 +1395,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, 
             .is_some(),
         "failed exec had no Detcore runtime"
     );
-    resume_paused_runtime();
+    prepare_runtime_after_failed_exec();
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1801,6 +1820,42 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RUNTIME_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn failed_exec_restarts_a_stopped_scheduler_without_publishing_global_readiness() {
+        let _guard = RUNTIME_STATE_TEST_LOCK.lock().unwrap();
+        let saved = (
+            IMAGE_GENERATION.load(Ordering::Acquire),
+            READY_IMAGE.load(Ordering::Acquire),
+            ROOT_LOCAL_READY_IMAGE.load(Ordering::Acquire),
+            RUNTIME_SHUTDOWN.load(Ordering::Acquire),
+            RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire),
+            RUNTIME_PAUSED.load(Ordering::Acquire),
+        );
+
+        IMAGE_GENERATION.store(23, Ordering::Release);
+        READY_IMAGE.store(23, Ordering::Release);
+        ROOT_LOCAL_READY_IMAGE.store(0, Ordering::Release);
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+        RUNTIME_PAUSED.store(true, Ordering::Release);
+        prepare_runtime_after_failed_exec();
+
+        assert_eq!(READY_IMAGE.load(Ordering::Acquire), 0);
+        assert_eq!(ROOT_LOCAL_READY_IMAGE.load(Ordering::Acquire), 23);
+        assert!(RUNTIME_SHUTDOWN.load(Ordering::Acquire));
+        assert!(!RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire));
+        assert!(!RUNTIME_PAUSED.load(Ordering::Acquire));
+
+        IMAGE_GENERATION.store(saved.0, Ordering::Release);
+        READY_IMAGE.store(saved.1, Ordering::Release);
+        ROOT_LOCAL_READY_IMAGE.store(saved.2, Ordering::Release);
+        RUNTIME_SHUTDOWN.store(saved.3, Ordering::Release);
+        RUNTIME_PAUSE_REQUESTED.store(saved.4, Ordering::Release);
+        RUNTIME_PAUSED.store(saved.5, Ordering::Release);
+    }
 
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {
