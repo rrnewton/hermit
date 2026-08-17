@@ -5425,8 +5425,8 @@ test:
         backends_enabled:
           - ptrace
         backends_disabled:
+          kvm: 'Measured at hermit 146756f096, binary sha256 48a648c8d3706b7f. KVM passes same-backend --verify 3/3 canonically, but its guest output differs from the ptrace reference on one of fifteen lines: EV pipe ino=7 dev=4 under KVM against EV pipe ino=7 dev=3 under ptrace. A verify cell compares a run against itself and therefore cannot see this; this category asserts backend parity, so the cell is held out. Removal condition: KVM assigns a pipe the same virtual device number as the ptrace reference, or this fixture is re-scoped to accept a backend-specific device number.'
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
-          kvm: KVM does not complete a guest on the authoring host; qualify KVM separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
           liteinst: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately
       naked:
@@ -5491,8 +5491,8 @@ test:
         backends_enabled:
           - ptrace
         backends_disabled:
+          kvm: 'Measured at hermit 146756f096, binary sha256 48a648c8d3706b7f. KVM passes same-backend --verify 3/3 canonically, but produces the opposite anonymous-mmap allocation order from the ptrace reference: cmp=111111010001 d01=1 d12=2 d23=529 under KVM against cmp=000000111101 d01=-2 d12=-3 d23=-8 under ptrace, that is, ptrace placements descend while KVM placements ascend. Allocation order is the entire subject of this fixture, and a verify cell compares a run against itself and cannot see it. Removal condition: KVM anonymous-mmap placement order matches the reference, or this fixture is re-scoped.'
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
-          kvm: KVM livelocks at guest startup on the current host; qualify KVM separately -- also a priority for this guest
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
           liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately
       naked:
