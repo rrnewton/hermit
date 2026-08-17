@@ -91,10 +91,11 @@ pub enum LogCompareStrictness {
     Stripped,
     /// The parity mode (`BitwiseInfoV1`): `strip_lines = false` and
     /// `canonicalize_addresses = true`, comparing the full captured INFO trace.
-    /// Only the real wall-clock timestamp prefix is stripped and host addresses
-    /// are canonicalized to first-appearance ordinals; every other byte —
-    /// virtual-time timestamps, raw syscall argument/result values, counts,
-    /// sizes, flags — must match exactly.
+    /// Only the real wall-clock timestamp prefix is stripped; host addresses are
+    /// canonicalized to first-appearance ordinals; and the scheduler COMMIT
+    /// line's documented host-perturbed `committed_time` echo is replaced. Every
+    /// other byte — other virtual-time timestamps, raw syscall argument/result
+    /// values, counts, sizes, flags — must match exactly.
     Canonical,
 }
 
@@ -109,7 +110,8 @@ pub enum LogCompareStrictness {
 pub enum ComparedLogScope {
     /// The legacy selected DETLOG/scheduler subset used by stripped verification.
     Deterministic,
-    /// Every INFO message, exactly; DEBUG/TRACE captures remain diagnostic.
+    /// Every INFO message under the declared canonicalization policy;
+    /// DEBUG/TRACE captures remain diagnostic.
     Info,
     /// Every captured message, selected only by explicit diagnostic verification.
     FullTrace,
@@ -125,6 +127,11 @@ pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
 /// [`ComparisonSpec::canonicalizations`].
 pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
 
+/// Versioned policy token: replace only the scheduler COMMIT line's
+/// host-timing-perturbed `committed_time` echo. Turn, dettid, resources, and
+/// markers remain exact.
+pub const CANON_SCHEDULER_COMMITTED_TIME_V1: &str = "scheduler-host-perturbed-committed-time/v1";
+
 /// Versioned policy token marking the lossy wholesale normalization the
 /// [`LogCompareStrictness::Stripped`] mode applies (numbers, addresses, tmp
 /// paths, and timestamps erased). Its presence in a spec is disqualifying for
@@ -139,10 +146,12 @@ pub const STRIP_UNSAFE_NORMALIZATION_V1: &str = "unsafe-numeric-address-and-path
 const PARITY_STRIPPED_PREFIXES: &[&str] = &[STRIP_WALL_CLOCK_PREFIX_V1];
 
 /// The exact set of canonicalization tokens the parity ([`Canonical`]) policy
-/// requires: address-to-ordinal, and nothing else.
+/// requires: address-to-ordinal plus the documented scheduler committed-time
+/// field replacement, and nothing else.
 ///
 /// [`Canonical`]: LogCompareStrictness::Canonical
-const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
+const PARITY_CANONICALIZATIONS: &[&str] =
+    &[CANON_ADDRESS_ORDINAL_V1, CANON_SCHEDULER_COMMITTED_TIME_V1];
 
 /// The exact comparison that produced a [`Verdict`], carried beside it so a bare
 /// "verified" can always say *which* comparison certified it.
@@ -179,10 +188,11 @@ pub struct ComparisonSpec {
     /// is INFO and [`Self::log_scope`] records whether the explicit diagnostic
     /// full-trace superset was requested.
     pub full_trace: bool,
-    /// Concrete: was everything OTHER than the stripped prefix and the
-    /// canonicalized addresses compared exactly (virtual-time timestamps,
-    /// syscall inputs/results, counts, sizes, flags)? True for the parity policy;
-    /// false whenever a lossy normalization (e.g. [`Self::strip_lines`]) ran.
+    /// Concrete: was everything OTHER than the stripped prefix and the two
+    /// declared canonicalizations compared exactly (other virtual-time
+    /// timestamps, syscall inputs/results, counts, sizes, flags)? True for the
+    /// parity policy; false whenever a lossy normalization (e.g.
+    /// [`Self::strip_lines`]) ran.
     pub exact_remainder: bool,
     /// Versioned tokens for every prefix STRIPPED before comparison. The parity
     /// policy permits exactly `["real-wall-clock-prefix/v1"]`; a lossy stripped
@@ -190,8 +200,8 @@ pub struct ComparisonSpec {
     /// (not inferred) so a consumer can see precisely what was discarded.
     pub stripped_prefixes: &'static [&'static str],
     /// Versioned tokens for every CANONICALIZATION applied before comparison. The
-    /// parity policy requires exactly
-    /// `["host-address-to-first-appearance-ordinal/v1"]`.
+    /// parity policy requires exactly the host-address ordinal token and the
+    /// scheduler committed-time field token.
     pub canonicalizations: &'static [&'static str],
     /// Concrete: were any `--ignore-lines` substring filters applied, dropping
     /// matching log lines before the comparison? Bitwise parity requires none.
@@ -227,7 +237,8 @@ impl ComparisonSpec {
                     (true, false, false, false, ComparedLogScope::Deterministic)
                 }
                 // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
-                // canonicalize addresses, and compare every INFO message exactly.
+                // apply the two declared field canonicalizations, and compare
+                // every INFO message exactly otherwise.
                 // The explicit verbose diagnostic mode compares the all-level
                 // superset without changing the canonicalization policy.
                 LogCompareStrictness::Canonical => (
@@ -301,8 +312,9 @@ impl ComparisonSpec {
     /// - addresses were CANONICALIZED, not erased ([`Self::canonicalize_addresses`]),
     ///   so allocation-order and aliasing differences are still detectable;
     /// - the versioned policy tokens are exactly the parity set — only the
-    ///   wall-clock prefix stripped, only address-ordinal canonicalization
-    ///   applied — so a future extra strip/canonicalization cannot silently pass;
+    ///   wall-clock prefix stripped, only the address-ordinal and scheduler
+    ///   committed-time canonicalizations applied — so a future extra
+    ///   strip/canonicalization cannot silently pass;
     /// - no ignore/skip filter dropped any line or event class
     ///   (`!ignore_lines && !skip_commit && !skip_detlog`);
     /// - the internal log stream was actually compared, not skipped for an
@@ -1198,6 +1210,10 @@ mod tests {
         assert!(canonical.canonicalize_addresses);
         assert!(canonical.exact_remainder);
         assert!(canonical.full_trace);
+        assert_eq!(
+            canonical.canonicalizations,
+            &[CANON_ADDRESS_ORDINAL_V1, CANON_SCHEDULER_COMMITTED_TIME_V1,]
+        );
         assert_eq!(canonical.log_scope, ComparedLogScope::Info);
         assert_eq!(canonical.log_comparison_mode(), LogComparisonMode::Info);
 

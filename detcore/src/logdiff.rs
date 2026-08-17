@@ -49,7 +49,8 @@ pub struct LogDiffOpts {
     #[clap(long = "unsafe-strip-lines")]
     pub strip_lines: bool,
 
-    /// Canonicalize host memory addresses before comparison WITHOUT erasing them.
+    /// Canonicalize explicitly documented host-perturbed fields before comparison
+    /// WITHOUT erasing their surrounding event.
     ///
     /// Only addresses a producer has explicitly marked with the
     /// `<hostaddr 0x...>` wrapper (see [`host_addr`]) are canonicalized; each
@@ -59,11 +60,13 @@ pub struct LogDiffOpts {
     /// this discards ONLY the host-specific raw pointer value: it preserves
     /// identity (same address -> same ordinal), ordering (introduction
     /// sequence), and aliasing (two names for one address collapse to one
-    /// ordinal), and it leaves every other byte -- virtual-time timestamps,
-    /// syscall argument/result values, counts, sizes, flags -- untouched for an
-    /// exact comparison. In canonical parity, this preserves the ability to DETECT a
-    /// difference (allocation-order or aliasing changes still diverge), which
-    /// wholesale stripping throws away.
+    /// ordinal). The scheduler's `committed_time` echo on a COMMIT line is also
+    /// replaced, because that field includes host-timing-dependent
+    /// `InternalIOPolling` retry advances. The turn, dettid, resources, markers,
+    /// and every other byte -- including other virtual-time timestamps, syscall
+    /// argument/result values, counts, sizes, and flags -- remain exact. In
+    /// canonical parity, this preserves the ability to DETECT a difference,
+    /// which wholesale stripping throws away.
     ///
     /// The marker is REQUIRED (a bare `0x...` literal is left exact) because
     /// nothing in the compared DETLOG stream can otherwise distinguish a varying
@@ -314,6 +317,40 @@ fn canonicalize_addresses_in_line(
         .into_owned()
 }
 
+/// Replace only the scheduler COMMIT line's echoed `committed_time` value.
+///
+/// `Scheduler::bump_global_time` documents why this one field is not reproducible:
+/// `committed_time` includes time advanced by `InternalIOPolling` retries, whose
+/// count depends on when a live host fd becomes ready. The rest of the COMMIT
+/// event remains comparison evidence, so a different turn, dettid, resource set,
+/// or normalization marker still diverges.
+fn canonicalize_scheduler_committed_time_in_line(line: &str) -> String {
+    static RE_SCHEDULER_COMMIT_TIME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?s)^(?P<prefix>INFO detcore::scheduler: \[sched-step5\].* COMMIT turn [0-9_]+, dettid [^\s]+ using resources \{.*\}, on previously committed )[0-9][0-9_]*(?:\.[0-9_]+)?(?:ns|s)?(?P<suffix>(?: \[[^\n]*\])?)$",
+        )
+        .unwrap()
+    });
+
+    RE_SCHEDULER_COMMIT_TIME
+        .replace(line, |captures: &regex::Captures| {
+            format!(
+                "{}<committed_time>{}",
+                &captures["prefix"], &captures["suffix"]
+            )
+        })
+        .into_owned()
+}
+
+fn canonicalize_info_line(
+    line: &str,
+    addresses: &mut HashMap<String, usize>,
+    next_address: &mut usize,
+) -> String {
+    let line = canonicalize_scheduler_committed_time_in_line(line);
+    canonicalize_addresses_in_line(&line, addresses, next_address)
+}
+
 fn messages_for_comparison(messages: &[(usize, &str)], opts: &LogDiffOpts) -> Vec<String> {
     if opts.strip_lines {
         messages
@@ -325,9 +362,7 @@ fn messages_for_comparison(messages: &[(usize, &str)], opts: &LogDiffOpts) -> Ve
         let mut next_address = 1usize;
         messages
             .iter()
-            .map(|(_, message)| {
-                canonicalize_addresses_in_line(message, &mut addresses, &mut next_address)
-            })
+            .map(|(_, message)| canonicalize_info_line(message, &mut addresses, &mut next_address))
             .collect()
     } else {
         messages
@@ -350,10 +385,12 @@ fn canonical_info_from_str(contents: &str) -> Vec<String> {
 /// Print the canonical INFO messages that strict verification would compare for
 /// one captured log.
 ///
-/// This removes the real wall-clock prefix and rewrites only explicitly marked
-/// host addresses to first-appearance ordinals. It does not run the lossy
-/// `--unsafe-strip-lines` transformation: scheduler turns, virtual time, syscall
-/// values, counts, flags, and every other substantive byte are preserved.
+/// This removes the real wall-clock prefix, rewrites explicitly marked host
+/// addresses to first-appearance ordinals, and replaces only the documented
+/// host-perturbed `committed_time` field on scheduler COMMIT lines. It does not
+/// run the lossy `--unsafe-strip-lines` transformation: the rest of each COMMIT
+/// event, other virtual time, syscall values, counts, flags, and every other
+/// substantive byte are preserved.
 pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
     let bytes = std::fs::read(file)?;
     let contents = String::from_utf8_lossy(&bytes);
@@ -433,8 +470,9 @@ fn is_internal_io_poll_commit(line: &str) -> bool {
 /// host-timing nondeterministic. That makes the *presence* of this line on a given turn
 /// retry-count sensitive, so we exclude it from the deterministic comparison. No
 /// guest-observable signal is lost: the value is redundant with the (retained,
-/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
-/// the per-turn committed time echoed on each COMMIT line.
+/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line. Canonical
+/// comparison separately retains each COMMIT event while replacing only the same
+/// host-perturbed field; see [`canonicalize_scheduler_committed_time_in_line`].
 fn is_scheduler_committed_time(line: &str) -> bool {
     line.contains("advancing committed_time from ")
 }
@@ -948,7 +986,7 @@ fn log_diff_summary_from_strs(
     } else if opts.canonicalize_addresses {
         writeln!(
             w,
-            "Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly..."
+            "Canonicalizing host addresses and scheduler committed_time; comparing everything else exactly..."
         )?;
     }
 
@@ -1499,6 +1537,53 @@ mod test {
             super::log_diff_from_strs(run_a, run_b, &raw, &mut Vec::new())?,
             "raw comparison must still see the differing addresses"
         );
+        Ok(())
+    }
+
+    /// Canonical parity positive control: the scheduler documents the
+    /// `committed_time` echo as host-timing perturbed by `InternalIOPolling`
+    /// retry count. A difference in only that field must compare equal while
+    /// retaining one nonempty INFO event on each side.
+    #[test]
+    fn canonical_scheduler_committed_time_only_difference_compares_equal() -> std::io::Result<()> {
+        let run_a = "2026-08-17T01:02:03.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 10, dettid 2 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 946684799.001_000_000s";
+        let run_b = "2026-08-17T01:02:04.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 10, dettid 2 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 946684799.001_000_240s";
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let summary = super::log_diff_summary_from_strs(run_a, run_b, &canonical, &mut Vec::new())?;
+        assert!(summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert_eq!(
+            super::canonical_info_from_str(run_a),
+            vec![
+                "INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 10, dettid 2 using resources {Path(\"/proc/self/maps\"): R}, on previously committed <committed_time>"
+            ]
+        );
+        Ok(())
+    }
+
+    /// Canonical parity negative control: canonicalizing the documented clock
+    /// field must not hide a real scheduler-resource divergence on the same
+    /// COMMIT line.
+    #[test]
+    fn canonical_scheduler_resource_difference_still_diverges() -> std::io::Result<()> {
+        let run_a = "2026-08-17T01:02:03.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 10, dettid 2 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 946684799.001_000_000s";
+        let run_b = "2026-08-17T01:02:04.000000Z INFO detcore::scheduler: [sched-step5] >>>>>>>\n\n COMMIT turn 10, dettid 2 using resources {InternalIOPolling: W}, on previously committed 946684799.001_000_240s";
+        let canonical = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        };
+
+        let summary = super::log_diff_summary_from_strs(run_a, run_b, &canonical, &mut Vec::new())?;
+        assert!(summary.diff_found);
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
         Ok(())
     }
 

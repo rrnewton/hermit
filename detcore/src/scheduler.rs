@@ -3335,8 +3335,11 @@ impl Scheduler {
             }
             Some(nxt) => {
                 assert_eq!(resp, &nxt.resp);
-                // N.B.: these prints themselves should be deterministic between
-                // runs.  They are part of the "detlog".
+                // The turn, dettid, resources, and marker are deterministic and
+                // remain part of the compared log. `committed_time` is the one
+                // documented exception: it includes host-timing-dependent
+                // InternalIOPolling retry advances, so canonical comparison
+                // replaces only that field and retains the rest of this event.
                 let normalization_marker = if self.is_sabre_internal_pipe_io_turn(rsrcs) {
                     " [sabre-internal-pipe-io]"
                 } else if self.is_sabre_loopback_poll_yield_turn(rsrcs) {
