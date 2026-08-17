@@ -7,13 +7,63 @@
  */
 
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
 use std::sync::Mutex;
 
+#[path = "common/kvm.rs"]
+mod kvm;
+
+use kvm::KvmAccessErrorKind;
+use kvm::kvm_available;
+use kvm::kvm_open_error;
+use kvm::probe_kvm;
+
 static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn missing_kvm_device_is_reported_as_absent() {
+    let temp = tempfile::tempdir().expect("create KVM probe fixture");
+    let path = temp.path().join("missing-kvm");
+
+    let error = probe_kvm(&path).expect_err("missing path must fail the KVM probe");
+
+    assert_eq!(error.kind, KvmAccessErrorKind::Absent);
+    assert!(error.message.contains("open("));
+    assert!(error.message.contains("O_RDWR"));
+    assert!(error.message.contains("errno ENOENT"));
+    assert!(error.message.contains("device node does not exist"));
+}
+
+#[test]
+fn kvm_permission_denial_is_not_reported_as_absence() {
+    for errno in [libc::EACCES, libc::EPERM] {
+        let error = kvm_open_error(Path::new("/dev/kvm"), io::Error::from_raw_os_error(errno));
+
+        assert_eq!(error.kind, KvmAccessErrorKind::Denied);
+        assert!(error.message.contains("open(/dev/kvm, O_RDWR)"));
+        assert!(error.message.contains(&format!("({errno})")));
+        assert!(error.message.contains("denied read-write access"));
+        assert!(!error.message.contains("device node does not exist"));
+    }
+}
+
+#[test]
+fn unsupported_kvm_device_operation_is_distinct_from_absence_and_denial() {
+    let error = kvm_open_error(
+        Path::new("/dev/kvm"),
+        io::Error::from_raw_os_error(libc::ENODEV),
+    );
+
+    assert_eq!(error.kind, KvmAccessErrorKind::Unsupported);
+    assert!(error.message.contains("errno ENODEV"));
+    assert!(error.message.contains("device operation is unsupported"));
+    assert!(!error.message.contains("device node does not exist"));
+    assert!(!error.message.contains("denied read-write access"));
+}
 
 fn compile_guest(name: &str, source: &str, extra_args: &[&str]) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -54,7 +104,7 @@ fn run_guest(backend: &str, binary: &Path, verify: bool) -> Output {
 }
 
 fn assert_ptrace_kvm_parity(name: &str, source: &str, extra_args: &[&str], expected_stdout: &str) {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
     let _guard = KVM_RUN_LOCK

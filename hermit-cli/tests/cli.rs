@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/kvm.rs"]
+mod kvm;
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
@@ -20,6 +22,8 @@ use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+
+use kvm::kvm_available;
 
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1104,7 +1108,7 @@ fn run_dbt_rejects_unfollowed_execveat() {
 
 #[test]
 fn run_kvm_executes_dynamic_guest() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1130,7 +1134,7 @@ fn run_kvm_executes_dynamic_guest() {
 
 #[test]
 fn run_kvm_awk_mincore_probe_terminates() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/awk").exists() {
+    if !kvm_available() || !Path::new("/usr/bin/awk").exists() {
         return;
     }
 
@@ -1167,7 +1171,7 @@ fn run_kvm_awk_mincore_probe_terminates() {
 
 #[test]
 fn run_kvm_resolves_bare_program_from_guest_path() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1190,7 +1194,7 @@ fn run_kvm_resolves_bare_program_from_guest_path() {
 
 #[test]
 fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
+    if !kvm_available()
         || !Path::new("/usr/bin/setpriv").exists()
         || !Path::new("/bin/date").exists()
     {
@@ -1220,7 +1224,7 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
 
 #[test]
 fn run_kvm_propagates_explicit_environment() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1243,7 +1247,7 @@ fn run_kvm_propagates_explicit_environment() {
 
 #[test]
 fn run_kvm_bash_process_substitution_is_deterministic() {
-    if !Path::new("/dev/kvm").exists()
+    if !kvm_available()
         || !Path::new("/bin/bash").exists()
         || !Path::new("/usr/bin/paste").exists()
         || !Path::new("/usr/bin/diff").exists()
@@ -1272,7 +1276,7 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 
 #[test]
 fn run_kvm_cpuid_policy_is_deterministic() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
     let compiler = ["cc", "gcc", "clang"]
@@ -1328,7 +1332,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
 
 #[test]
 fn run_kvm_respects_workdir_for_relative_paths() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1360,7 +1364,7 @@ fn run_kvm_respects_workdir_for_relative_paths() {
 
 #[test]
 fn run_kvm_lists_host_directory_metadata() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1413,7 +1417,7 @@ fn run_kvm_lists_host_directory_metadata() {
 
 #[test]
 fn run_kvm_reads_host_file() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1437,7 +1441,7 @@ fn run_kvm_reads_host_file() {
 
 #[test]
 fn run_kvm_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1458,7 +1462,7 @@ fn run_kvm_reads_standard_input() {
 
 #[test]
 fn run_kvm_f_getfl_and_reads_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !kvm_available() || !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1482,7 +1486,7 @@ fn run_kvm_f_getfl_and_reads_standard_input() {
 
 #[test]
 fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !kvm_available() || !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1508,7 +1512,7 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 
 #[test]
 fn run_kvm_verify_isolates_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1530,7 +1534,7 @@ fn run_kvm_verify_isolates_standard_input() {
 
 #[test]
 fn run_kvm_preserves_closed_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1560,7 +1564,7 @@ fn run_kvm_preserves_closed_standard_input() {
 
 #[test]
 fn run_kvm_verify_does_not_write_to_standard_input() {
-    if !Path::new("/dev/kvm").exists() || !Path::new("/usr/bin/perl").exists() {
+    if !kvm_available() || !Path::new("/usr/bin/perl").exists() {
         return;
     }
 
@@ -1597,7 +1601,7 @@ fn run_kvm_verify_does_not_write_to_standard_input() {
 
 #[test]
 fn run_kvm_counts_standard_input() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1621,7 +1625,7 @@ fn run_kvm_counts_standard_input() {
 
 #[test]
 fn run_kvm_reports_hostname() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1645,7 +1649,7 @@ fn run_kvm_reports_hostname() {
 // TODO-HUMAN-REVIEW(#544): Confirm the host C compiler is acceptable for this KVM smoke guest.
 #[test]
 fn run_kvm_pipe_pipe2_and_getgroups_round_trip() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
     let compiler = ["cc", "gcc", "clang"]
@@ -1726,7 +1730,7 @@ int main(void) {
 // TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
 #[test]
 fn run_kvm_reports_fixed_supplementary_groups() {
-    if !Path::new("/dev/kvm").exists() {
+    if !kvm_available() {
         return;
     }
 
@@ -1784,7 +1788,7 @@ fn backend_accepted_in_global_position() {
 
     assert_success(&dbt, &dbt_args);
 
-    if Path::new("/dev/kvm").exists() {
+    if kvm_available() {
         let args = ["--backend", "kvm", "run", "--", "/bin/true"];
         let kvm = hermit(&args);
         assert_success(&kvm, &args);
@@ -2141,12 +2145,62 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
             ][..],
         ),
         (
+            libc::SYS_unshare,
+            libc::EPERM,
+            &[
+                "cannot create its required user and PID namespaces",
+                "unshare(CLONE_NEWUSER | CLONE_NEWPID)",
+                "EPERM",
+                "errno 1",
+                "namespace support may be present",
+                "denied permission",
+            ][..],
+        ),
+        (
+            libc::SYS_unshare,
+            libc::ENOSYS,
+            &[
+                "unshare(CLONE_NEWUSER | CLONE_NEWPID)",
+                "ENOSYS",
+                "errno 38",
+                "appears unsupported",
+                "cannot distinguish kernel absence from a policy-emulated ENOSYS",
+            ][..],
+        ),
+        (
+            libc::SYS_prctl,
+            libc::EPERM,
+            &[
+                "cannot install its tracee seccomp filter",
+                "prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)",
+                "EPERM",
+                "errno 1",
+                "tracee seccomp support may be present",
+                "denied permission",
+            ][..],
+        ),
+        (
             libc::SYS_seccomp,
             libc::EPERM,
             &[
                 "cannot install",
-                "SECCOMP_SET_MODE_FILTER",
+                "seccomp(SECCOMP_SET_MODE_FILTER, 0, &program)",
+                "EPERM",
+                "errno 1",
+                "tracee seccomp support may be present",
+                "denied permission",
                 "--namespace-only",
+            ][..],
+        ),
+        (
+            libc::SYS_seccomp,
+            libc::ENOSYS,
+            &[
+                "seccomp(SECCOMP_SET_MODE_FILTER, 0, &program)",
+                "ENOSYS",
+                "errno 38",
+                "appears unsupported",
+                "cannot distinguish kernel absence from a policy-emulated ENOSYS",
             ][..],
         ),
     ] {
@@ -2161,8 +2215,8 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         deny_syscall(&mut command, syscall, errno);
         let output = command.output().expect("failed to run restricted hermit");
         assert_failure_contains(&output, expected);
-        if syscall == libc::SYS_ptrace && errno == libc::ENOSYS {
-            assert!(!stderr(&output).contains("the ptrace backend is absent"));
+        if errno == libc::ENOSYS {
+            assert!(!stderr(&output).contains("is absent"));
         }
     }
 }

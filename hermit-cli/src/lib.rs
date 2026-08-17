@@ -278,22 +278,89 @@ enum CapabilityProbe {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CapabilityProbeOperation {
+    UnshareNamespaces = 1,
+    SetNoNewPrivileges = 2,
+    InstallSeccompFilter = 3,
+}
+
+impl CapabilityProbeOperation {
+    fn from_raw(value: i32) -> Option<Self> {
+        match value {
+            1 => Some(Self::UnshareNamespaces),
+            2 => Some(Self::SetNoNewPrivileges),
+            3 => Some(Self::InstallSeccompFilter),
+            _ => None,
+        }
+    }
+
+    fn syscall(self) -> &'static str {
+        match self {
+            Self::UnshareNamespaces => "unshare(CLONE_NEWUSER | CLONE_NEWPID)",
+            Self::SetNoNewPrivileges => "prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)",
+            Self::InstallSeccompFilter => "seccomp(SECCOMP_SET_MODE_FILTER, 0, &program)",
+        }
+    }
+
+    fn capability(self) -> &'static str {
+        match self {
+            Self::UnshareNamespaces => "required user and PID namespace support",
+            Self::SetNoNewPrivileges | Self::InstallSeccompFilter => {
+                "required tracee seccomp support"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CapabilityProbeResult {
+    Available,
+    Unavailable {
+        operation: CapabilityProbeOperation,
+        errno: i32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PtraceProbeResult {
     Available,
     Unavailable(i32),
 }
 
-fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
+fn run_capability_probe(probe: CapabilityProbe) -> Result<CapabilityProbeResult, Error> {
+    let mut pipe_fds = [-1; 2];
+    // SAFETY: pipe_fds points to storage for both descriptors.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error()).context("Failed to create capability probe pipe");
+    }
+
     // SAFETY: The child calls only async-signal-safe syscalls and exits immediately.
     let pid = unsafe { libc::fork() };
     if pid == -1 {
-        return Err(std::io::Error::last_os_error()).context("Failed to fork capability probe");
+        let error = io::Error::last_os_error();
+        // SAFETY: Both descriptors were returned by pipe2 and remain owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+        return Err(error).context("Failed to fork capability probe");
     }
     if pid == 0 {
-        let supported = match probe {
-            CapabilityProbe::Namespaces => unsafe {
-                libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
-            },
+        // SAFETY: The child owns both inherited descriptors and does not use the read end.
+        unsafe { libc::close(pipe_fds[0]) };
+        let (operation, errno) = match probe {
+            CapabilityProbe::Namespaces => {
+                // SAFETY: The child exits immediately, so creating these namespaces cannot affect
+                // the parent or later Rust code.
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) } == -1 {
+                    // Read errno before making another libc call.
+                    (CapabilityProbeOperation::UnshareNamespaces as i32, unsafe {
+                        *libc::__errno_location()
+                    })
+                } else {
+                    (0, 0)
+                }
+            }
             CapabilityProbe::Seccomp => {
                 let mut filter = libc::sock_filter {
                     code: 0x06, // BPF_RET | BPF_K
@@ -306,27 +373,72 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
                     filter: &mut filter,
                 };
                 // SAFETY: The filter is an allow-all program with a valid one-element lifetime.
-                unsafe {
-                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-                        && libc::syscall(
-                            libc::SYS_seccomp,
-                            1, // SECCOMP_SET_MODE_FILTER
-                            0,
-                            &program,
-                        ) == 0
+                if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+                    (
+                        CapabilityProbeOperation::SetNoNewPrivileges as i32,
+                        unsafe { *libc::__errno_location() },
+                    )
+                } else if unsafe {
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        1, // SECCOMP_SET_MODE_FILTER
+                        0,
+                        &program,
+                    )
+                } == -1
+                {
+                    (
+                        CapabilityProbeOperation::InstallSeccompFilter as i32,
+                        unsafe { *libc::__errno_location() },
+                    )
+                } else {
+                    (0, 0)
                 }
             }
         };
+        let mut bytes = [0; 2 * std::mem::size_of::<i32>()];
+        bytes[..4].copy_from_slice(&operation.to_ne_bytes());
+        bytes[4..].copy_from_slice(&errno.to_ne_bytes());
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: bytes remains valid and the unwritten suffix is within its bounds.
+            let result = unsafe {
+                libc::write(
+                    pipe_fds[1],
+                    bytes[written..].as_ptr().cast(),
+                    bytes.len() - written,
+                )
+            };
+            if result == -1 {
+                // SAFETY: errno is thread-local storage provided by libc.
+                if unsafe { *libc::__errno_location() } == libc::EINTR {
+                    continue;
+                }
+                // SAFETY: Avoid running Rust destructors after fork.
+                unsafe { libc::_exit(2) }
+            }
+            if result == 0 {
+                // SAFETY: Avoid running Rust destructors after fork.
+                unsafe { libc::_exit(2) }
+            }
+            written += result as usize;
+        }
+        // SAFETY: The child owns this descriptor and has finished writing.
+        unsafe { libc::close(pipe_fds[1]) };
         // SAFETY: Avoid running Rust destructors after fork.
-        unsafe { libc::_exit(i32::from(!supported)) }
+        unsafe { libc::_exit(0) }
     }
 
+    // SAFETY: The parent does not use the inherited write end.
+    unsafe { libc::close(pipe_fds[1]) };
+    // SAFETY: The read end is uniquely owned here and transferred to File.
+    let mut read_end = unsafe { fs::File::from_raw_fd(pipe_fds[0]) };
     let mut status = 0;
     loop {
         // SAFETY: pid is the child created above and status points to valid storage.
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
         if result == pid {
-            return Ok(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+            break;
         }
         if result == -1 {
             let error = std::io::Error::last_os_error();
@@ -336,6 +448,24 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
             return Err(error).context("Failed to wait for capability probe");
         }
     }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        anyhow::bail!("capability probe child failed before reporting its result");
+    }
+
+    let mut bytes = [0; 2 * std::mem::size_of::<i32>()];
+    std::io::Read::read_exact(&mut read_end, &mut bytes)
+        .context("Failed to read capability probe result")?;
+    let operation = i32::from_ne_bytes(bytes[..4].try_into().unwrap());
+    let errno = i32::from_ne_bytes(bytes[4..].try_into().unwrap());
+    if operation == 0 && errno == 0 {
+        return Ok(CapabilityProbeResult::Available);
+    }
+    let operation = CapabilityProbeOperation::from_raw(operation)
+        .ok_or_else(|| anyhow!("capability probe reported unknown operation {operation}"))?;
+    if errno == 0 {
+        anyhow::bail!("capability probe reported {operation:?} failure without errno");
+    }
+    Ok(CapabilityProbeResult::Unavailable { operation, errno })
 }
 
 fn run_ptrace_traceme_probe() -> Result<PtraceProbeResult, Error> {
@@ -466,12 +596,37 @@ fn ptrace_probe_unavailable_reason(result: PtraceProbeResult) -> Option<String> 
     ))
 }
 
+fn capability_probe_unavailable_reason(result: CapabilityProbeResult) -> Option<String> {
+    let CapabilityProbeResult::Unavailable { operation, errno } = result else {
+        return None;
+    };
+    let errno_name = format!("{:?}", nix::errno::Errno::from_raw(errno));
+    let os_error = io::Error::from_raw_os_error(errno);
+    let capability = operation.capability();
+    let meaning = match errno {
+        libc::EPERM | libc::EACCES => format!(
+            "{capability} may be present, but this process was denied permission to perform the probe"
+        ),
+        libc::ENOSYS => format!(
+            "{capability} appears unsupported; this probe cannot distinguish kernel absence from a policy-emulated ENOSYS"
+        ),
+        _ => format!(
+            "Hermit could not establish whether {capability} is available; resolve the reported syscall error"
+        ),
+    };
+    Some(format!(
+        "{} failed with {errno_name} (errno {errno}: {os_error}); {meaning}",
+        operation.syscall()
+    ))
+}
+
 fn validate_tracing_environment() -> Result<(), Error> {
-    if !run_capability_probe(CapabilityProbe::Namespaces)? {
+    if let Some(reason) =
+        capability_probe_unavailable_reason(run_capability_probe(CapabilityProbe::Namespaces)?)
+    {
         anyhow::bail!(
-            "Hermit cannot create its required user and PID namespaces: \
-             unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied. Allow unprivileged user namespaces \
-             and the unshare syscall in the host/container policy."
+            "Hermit cannot create its required user and PID namespaces: {reason}. Allow \
+             unprivileged user namespaces and the unshare syscall in the host/container policy."
         );
     }
     if let Some(reason) = ptrace_probe_unavailable_reason(run_ptrace_traceme_probe()?) {
@@ -480,10 +635,11 @@ fn validate_tracing_environment() -> Result<(), Error> {
              sandbox smoke test without syscall interception."
         );
     }
-    if !run_capability_probe(CapabilityProbe::Seccomp)? {
+    if let Some(reason) =
+        capability_probe_unavailable_reason(run_capability_probe(CapabilityProbe::Seccomp)?)
+    {
         anyhow::bail!(
-            "Hermit cannot install its tracee seccomp filter: \
-             seccomp(SECCOMP_SET_MODE_FILTER) was denied. Allow seccomp and \
+            "Hermit cannot install its tracee seccomp filter: {reason}. Allow seccomp and \
              prctl(PR_SET_NO_NEW_PRIVS) in the container policy, or use --namespace-only for a \
              sandbox smoke test without syscall interception."
         );
@@ -492,21 +648,51 @@ fn validate_tracing_environment() -> Result<(), Error> {
 }
 
 #[cfg(feature = "dbt")]
-fn is_dynamorio_sdk(path: &Path) -> bool {
-    path.join("include/dr_api.h").is_file()
-        || path.join("DynamoRIOConfig.cmake").is_file()
-        || path.join("cmake/DynamoRIOConfig.cmake").is_file()
+fn is_dynamorio_sdk(path: &Path) -> Result<bool, FilesystemProbeFailure> {
+    find_regular_file(
+        [
+            path.join("include/dr_api.h"),
+            path.join("DynamoRIOConfig.cmake"),
+            path.join("cmake/DynamoRIOConfig.cmake"),
+        ],
+        "the DynamoRIO SDK",
+    )
+    .map(|path| path.is_some())
 }
 
 #[cfg(feature = "dbt")]
-fn dynamorio_sdk_available() -> bool {
-    if hermit_resources::resource("dynamorio/bin64/drrun")
-        .is_ok_and(|path| path.is_some_and(|path| path.is_file()))
-    {
-        return true;
+fn dynamorio_sdk_available() -> Result<bool, FilesystemProbeFailure> {
+    let mut first_error = None;
+    match hermit_resources::resource("dynamorio/bin64/drrun") {
+        Ok(Some(path)) => match metadata_file_probe(&path, "the DynamoRIO runtime") {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                FilesystemProbeFailure::record_prefer_non_absence(&mut first_error, error);
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            FilesystemProbeFailure::record_prefer_non_absence(
+                &mut first_error,
+                FilesystemProbeFailure {
+                    errno: error.raw_os_error(),
+                    message: format!(
+                        "resource(dynamorio/bin64/drrun) failed: {error}; Hermit could not determine whether the packaged DynamoRIO runtime is available"
+                    ),
+                },
+            );
+        }
     }
-    if reverie_dbt::bundled_drrun_path().is_file() {
-        return true;
+    match metadata_file_probe(
+        &reverie_dbt::bundled_drrun_path(),
+        "the bundled DynamoRIO runtime",
+    ) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {}
+        Err(error) => {
+            FilesystemProbeFailure::record_prefer_non_absence(&mut first_error, error);
+        }
     }
     const DEFAULT_ROOTS: [&str; 3] = [
         "/usr/lib/cmake/DynamoRIO",
@@ -514,12 +700,24 @@ fn dynamorio_sdk_available() -> bool {
         "/opt/dynamorio",
     ];
 
-    ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
+    for path in ["DYNAMORIO_HOME", "DynamoRIO_DIR"]
         .into_iter()
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .chain(DEFAULT_ROOTS.into_iter().map(PathBuf::from))
-        .any(|path| is_dynamorio_sdk(&path))
+    {
+        match is_dynamorio_sdk(&path) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                FilesystemProbeFailure::record_prefer_non_absence(&mut first_error, error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
 }
 
 #[cfg(feature = "dbt")]
@@ -696,6 +894,125 @@ fn liteinst_runtime_unavailable_reason() -> Option<String> {
     })
 }
 
+#[derive(Debug)]
+struct FilesystemProbeFailure {
+    errno: Option<i32>,
+    message: String,
+}
+
+impl std::fmt::Display for FilesystemProbeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FilesystemProbeFailure {}
+
+impl FilesystemProbeFailure {
+    fn priority(&self) -> u8 {
+        match self.errno {
+            Some(libc::EACCES | libc::EPERM) => 3,
+            Some(libc::ENOENT) => 1,
+            _ => 2,
+        }
+    }
+
+    fn record_prefer_non_absence(slot: &mut Option<Self>, error: Self) {
+        if slot
+            .as_ref()
+            .is_none_or(|previous| error.priority() > previous.priority())
+        {
+            *slot = Some(error);
+        }
+    }
+}
+
+fn filesystem_probe_failure(
+    operation: &str,
+    error: &io::Error,
+    subject: &str,
+) -> FilesystemProbeFailure {
+    let raw_errno = error.raw_os_error();
+    let errno = raw_errno
+        .map(|code| format!("{:?} (errno {code})", nix::errno::Errno::from_raw(code)))
+        .unwrap_or_else(|| "unknown errno".to_owned());
+    let meaning = match raw_errno {
+        Some(libc::ENOENT) => {
+            format!("{subject} is absent because the probed path does not exist")
+        }
+        Some(libc::EACCES | libc::EPERM) => {
+            format!("{subject} may be present, but this process was denied access")
+        }
+        Some(libc::ENODEV | libc::ENXIO | libc::ENOSYS | libc::EOPNOTSUPP) => {
+            format!("{subject} appears unsupported because the operation is not supported")
+        }
+        _ => format!("Hermit could not determine whether {subject} is available"),
+    };
+    FilesystemProbeFailure {
+        errno: raw_errno,
+        message: format!("{operation} failed with {errno}: {error}; {meaning}"),
+    }
+}
+
+fn metadata_file_probe(path: &Path, subject: &str) -> Result<bool, FilesystemProbeFailure> {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file())
+        .map_err(|error| {
+            filesystem_probe_failure(&format!("metadata({})", path.display()), &error, subject)
+        })
+}
+
+fn metadata_executable_probe(path: &Path, subject: &str) -> Result<bool, FilesystemProbeFailure> {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .map_err(|error| {
+            filesystem_probe_failure(&format!("metadata({})", path.display()), &error, subject)
+        })
+}
+
+fn find_regular_file<I>(paths: I, subject: &str) -> Result<Option<PathBuf>, FilesystemProbeFailure>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut first_error = None;
+    for path in paths {
+        match metadata_file_probe(&path, subject) {
+            Ok(true) => return Ok(Some(path)),
+            Ok(false) => {}
+            Err(error) => {
+                FilesystemProbeFailure::record_prefer_non_absence(&mut first_error, error);
+            }
+        };
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+fn find_executable_file<I>(
+    paths: I,
+    subject: &str,
+) -> Result<Option<PathBuf>, FilesystemProbeFailure>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut first_error = None;
+    for path in paths {
+        match metadata_executable_probe(&path, subject) {
+            Ok(true) => return Ok(Some(path)),
+            Ok(false) => {}
+            Err(error) => {
+                FilesystemProbeFailure::record_prefer_non_absence(&mut first_error, error);
+            }
+        };
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
     fs::OpenOptions::new()
         .read(true)
@@ -703,11 +1020,12 @@ fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
         .open(path)
         .err()
         .map(|error| {
-            format!(
-                "cannot open {} read-write: {error}; grant access through the device owner/group \
-                 or root",
-                path.display()
+            filesystem_probe_failure(
+                &format!("open({}, O_RDWR)", path.display()),
+                &error,
+                "the KVM backend",
             )
+            .to_string()
         })
 }
 
@@ -826,11 +1144,19 @@ fn e9patch_unavailable_reason() -> Option<String> {
 
 #[cfg(feature = "dbt")]
 fn dbt_unavailable_reason() -> Option<String> {
-    if !dynamorio_sdk_available() {
-        return Some(
-            "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
-                .to_owned(),
-        );
+    match dynamorio_sdk_available() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some(
+                "the DynamoRIO runtime was not found; build target/install_pkg, set HERMIT_INSTALL_DIR, or set DYNAMORIO_HOME/DynamoRIO_DIR to a valid SDK"
+                    .to_owned(),
+            );
+        }
+        Err(error) => {
+            return Some(format!(
+                "the DynamoRIO runtime could not be checked: {error}; correct the reported access error, or set DYNAMORIO_HOME/DynamoRIO_DIR to an accessible SDK"
+            ));
+        }
     }
     dbt_runtime_unavailable_reason()
 }
@@ -842,11 +1168,6 @@ fn dbt_unavailable_reason() -> Option<String> {
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
-
-fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
 fn resolve_sabre_binary_from(
@@ -860,20 +1181,17 @@ fn resolve_sabre_binary_from(
             return Err(anyhow!("{SABRE_BINARY_ENV} is empty"));
         }
         let path = PathBuf::from(requested);
-        return is_executable_file(&path)
-            .then_some(path.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "{SABRE_BINARY_ENV}={} is not an executable file",
-                    path.display()
-                )
-            });
-    }
-
-    if let Some(path) = packaged_path
-        && is_executable_file(path)
-    {
-        return Ok(path.to_path_buf());
+        return match metadata_executable_probe(&path, "the requested SaBRe executable") {
+            Ok(true) => Ok(path),
+            Ok(false) => Err(anyhow!(
+                "{SABRE_BINARY_ENV}={} is not an executable file",
+                path.display()
+            )),
+            Err(error) => Err(anyhow!(
+                "failed to check {SABRE_BINARY_ENV}={}: {error}",
+                path.display()
+            )),
+        };
     }
 
     let directory = executable
@@ -881,21 +1199,25 @@ fn resolve_sabre_binary_from(
         .ok_or_else(|| anyhow!("Hermit executable has no parent directory"))?;
     let sibling = directory.join("sabre");
     let target_build = directory.parent().map(|target| target.join("sabre/sabre"));
-
-    if is_executable_file(&sibling) {
-        return Ok(sibling);
-    }
-    if let Some(candidate) = &target_build
-        && is_executable_file(candidate)
-    {
-        return Ok(candidate.clone());
-    }
-    if !path_env.is_empty()
-        && let Some(candidate) = std::env::split_paths(path_env)
-            .map(|directory| directory.join("sabre"))
-            .find(|candidate| is_executable_file(candidate))
-    {
-        return Ok(candidate);
+    let candidates = packaged_path
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(std::iter::once(sibling))
+        .chain(target_build)
+        .chain(
+            (!path_env.is_empty())
+                .then(|| std::env::split_paths(path_env).map(|directory| directory.join("sabre")))
+                .into_iter()
+                .flatten(),
+        );
+    match find_executable_file(candidates, "the SaBRe executable") {
+        Ok(Some(path)) => return Ok(path),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(anyhow!(
+                "SaBRe executable discovery could not establish availability: {error}; set {SABRE_BINARY_ENV} to an accessible executable"
+            ));
+        }
     }
 
     Err(anyhow!(
@@ -984,12 +1306,7 @@ fn stage_sabre_program_in(
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
-    if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
-        && path.is_file()
-    {
-        return Ok(path);
-    }
-
+    let packaged = hermit_resources::resource("libdetcore_sabre.so")?;
     let executable = std::env::current_exe()?;
     let directory = executable.parent().ok_or_else(|| {
         io::Error::new(
@@ -997,21 +1314,21 @@ fn sabre_runtime_library_path() -> io::Result<PathBuf> {
             "Hermit executable has no parent directory",
         )
     })?;
-    [
+    let candidates = packaged.into_iter().chain([
         directory.join("libdetcore_sabre.so"),
         directory.join("deps/libdetcore_sabre.so"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .ok_or_else(|| {
-        io::Error::new(
+    ]);
+    match find_regular_file(candidates, "the Detcore SaBRe plugin") {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "libdetcore_sabre.so was not built beside {}",
                 executable.display()
             ),
-        )
-    })
+        )),
+        Err(error) => Err(io::Error::other(error)),
+    }
 }
 
 #[cfg(feature = "sabre")]
@@ -2164,14 +2481,19 @@ mod tests {
     use std::time::Duration;
 
     use super::Backend;
+    use super::CapabilityProbeOperation;
+    use super::CapabilityProbeResult;
     use super::ExitStatus;
+    use super::FilesystemProbeFailure;
     use super::PtraceProbeResult;
     use super::SABRE_RPC_SOCKET_ENV;
+    use super::capability_probe_unavailable_reason;
     #[cfg(feature = "dbt")]
     use super::dbt_runtime_unavailable_reason;
     #[cfg(feature = "dbt")]
     use super::dynamorio_sdk_available;
     use super::ensure_backend_dispatch;
+    use super::filesystem_probe_failure;
     #[cfg(feature = "dbt")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
@@ -2228,6 +2550,46 @@ mod tests {
             "this probe cannot distinguish kernel absence from a policy-emulated ENOSYS"
         ));
         assert!(!reason.contains("the ptrace backend is absent"));
+        assert!(!reason.contains("denied permission"));
+    }
+
+    #[test]
+    fn successful_namespace_or_seccomp_probe_has_no_unavailable_reason() {
+        assert_eq!(
+            capability_probe_unavailable_reason(CapabilityProbeResult::Available),
+            None
+        );
+    }
+
+    #[test]
+    fn denied_capability_probe_reports_exact_operation_errno_and_meaning() {
+        let reason = capability_probe_unavailable_reason(CapabilityProbeResult::Unavailable {
+            operation: CapabilityProbeOperation::SetNoNewPrivileges,
+            errno: libc::EPERM,
+        })
+        .unwrap();
+
+        assert!(reason.contains("prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)"));
+        assert!(reason.contains("EPERM"));
+        assert!(reason.contains("errno 1"));
+        assert!(reason.contains("tracee seccomp support may be present"));
+        assert!(reason.contains("denied permission"));
+        assert!(!reason.contains("is absent"));
+    }
+
+    #[test]
+    fn enosys_capability_probe_reports_uncertain_availability() {
+        let reason = capability_probe_unavailable_reason(CapabilityProbeResult::Unavailable {
+            operation: CapabilityProbeOperation::InstallSeccompFilter,
+            errno: libc::ENOSYS,
+        })
+        .unwrap();
+
+        assert!(reason.contains("seccomp(SECCOMP_SET_MODE_FILTER, 0, &program)"));
+        assert!(reason.contains("ENOSYS"));
+        assert!(reason.contains("errno 38"));
+        assert!(reason.contains("appears unsupported"));
+        assert!(reason.contains("cannot distinguish kernel absence from a policy-emulated ENOSYS"));
         assert!(!reason.contains("denied permission"));
     }
 
@@ -2468,7 +2830,8 @@ mod tests {
         );
         assert_eq!(
             available.contains(&Backend::Dbt),
-            dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none()
+            dynamorio_sdk_available().is_ok_and(|available| available)
+                && dbt_runtime_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Liteinst),
@@ -2492,10 +2855,13 @@ mod tests {
     #[cfg(feature = "dbt")]
     fn dependency_probes_require_usable_paths() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(!is_dynamorio_sdk(temp.path()));
+        let missing = is_dynamorio_sdk(temp.path()).unwrap_err().to_string();
+        assert!(missing.contains("metadata("));
+        assert!(missing.contains("ENOENT"));
+        assert!(missing.contains("is absent"));
         fs::create_dir(temp.path().join("include")).unwrap();
         fs::write(temp.path().join("include/dr_api.h"), b"/* marker */").unwrap();
-        assert!(is_dynamorio_sdk(temp.path()));
+        assert!(is_dynamorio_sdk(temp.path()).unwrap());
 
         let reason = kvm_device_unavailable_reason(temp.path())
             .expect("a directory must not pass the read-write KVM device probe");
@@ -2675,11 +3041,98 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_availability_errors_distinguish_absent_denied_and_unsupported() {
+        let operation = "metadata(/opt/backend/runtime)";
+        let absent = filesystem_probe_failure(
+            operation,
+            &std::io::Error::from_raw_os_error(libc::ENOENT),
+            "the backend runtime",
+        )
+        .to_string();
+        assert!(absent.contains(operation));
+        assert!(absent.contains("ENOENT"));
+        assert!(absent.contains("errno 2"));
+        assert!(absent.contains("is absent"));
+        assert!(!absent.contains("denied access"));
+
+        for errno in [libc::EACCES, libc::EPERM] {
+            let denied = filesystem_probe_failure(
+                operation,
+                &std::io::Error::from_raw_os_error(errno),
+                "the backend runtime",
+            )
+            .to_string();
+            assert!(denied.contains(operation));
+            assert!(denied.contains(&format!("errno {errno}")));
+            assert!(denied.contains("may be present"));
+            assert!(denied.contains("denied access"));
+            assert!(!denied.contains("is absent"));
+        }
+
+        let unsupported = filesystem_probe_failure(
+            operation,
+            &std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            "the backend runtime",
+        )
+        .to_string();
+        assert!(unsupported.contains(operation));
+        assert!(unsupported.contains("EOPNOTSUPP"));
+        assert!(unsupported.contains("not supported"));
+        assert!(!unsupported.contains("is absent"));
+        assert!(!unsupported.contains("denied access"));
+
+        let mut discovered = None;
+        FilesystemProbeFailure::record_prefer_non_absence(
+            &mut discovered,
+            filesystem_probe_failure(
+                "metadata(/missing/runtime)",
+                &std::io::Error::from_raw_os_error(libc::ENOENT),
+                "the backend runtime",
+            ),
+        );
+        FilesystemProbeFailure::record_prefer_non_absence(
+            &mut discovered,
+            filesystem_probe_failure(
+                "metadata(/denied/runtime)",
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+                "the backend runtime",
+            ),
+        );
+        let discovered = discovered.unwrap().to_string();
+        assert!(discovered.contains("metadata(/denied/runtime)"));
+        assert!(discovered.contains("EACCES"));
+        assert!(discovered.contains("denied access"));
+    }
+
+    #[test]
+    fn missing_sabre_override_reports_metadata_errno_instead_of_not_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("target/release/hermit");
+        let requested = temp.path().join("missing-sabre");
+
+        let error = resolve_sabre_binary_from(
+            Some(requested.as_os_str()),
+            None,
+            &executable,
+            OsStr::new(""),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(&format!("metadata({})", requested.display())));
+        assert!(error.contains("ENOENT"));
+        assert!(error.contains("errno 2"));
+        assert!(error.contains("is absent"));
+        assert!(!error.contains("is not an executable file"));
+    }
+
+    #[test]
     #[cfg(feature = "dbt")]
     fn optional_backends_report_accurate_availability() {
         match Backend::Dbt.ensure_available() {
             Ok(()) => assert!(
-                dynamorio_sdk_available() && dbt_runtime_unavailable_reason().is_none(),
+                dynamorio_sdk_available().is_ok_and(|available| available)
+                    && dbt_runtime_unavailable_reason().is_none(),
                 "DBT reported available without its SDK and runtime"
             ),
             Err(dbt_error) => {

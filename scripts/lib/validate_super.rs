@@ -364,7 +364,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             "DBT backend availability (gates the DBT stress rows)",
             format!(
                 "{dbg} --log=info run --backend dbt --strict -- \
-                 /bin/echo hermit-dbt-probe </dev/null >/dev/null 2>&1"
+                 /bin/echo hermit-dbt-probe </dev/null >/dev/null"
             ),
             vec![build_dep.to_string()],
             60,
@@ -697,9 +697,12 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         .into_iter()
         .find(|step| step.tag() == "superstress.dbt_available")
         .ok_or("DBT availability node missing")?;
-    if dbt_available.cmd.contains("--verify") {
+    if dbt_available.cmd.contains("--verify")
+        || dbt_available.cmd.contains("2>")
+        || dbt_available.cmd.contains("&>")
+    {
         return Err(format!(
-            "DBT availability must not depend on unavailable verification: {}",
+            "DBT availability must not depend on unavailable verification or suppress diagnostic stderr: {}",
             dbt_available.cmd
         ));
     }

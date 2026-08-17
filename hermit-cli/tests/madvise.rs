@@ -11,6 +11,11 @@ use std::path::Path;
 use std::process::Command;
 use std::process::Output;
 
+#[path = "common/kvm.rs"]
+mod kvm;
+
+use kvm::kvm_available;
+
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
     let output = command
@@ -82,7 +87,7 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         assert_marker(&output, "Determinism verified", label);
     }
 
-    if Path::new("/dev/kvm").exists() {
+    if kvm_available() {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "30s"])
