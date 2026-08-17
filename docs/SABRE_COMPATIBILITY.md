@@ -53,6 +53,34 @@ This path is visible in INFO logs as
 than a generic `impl reverie::Backend`; the architectural difference does not
 create a second determinism engine.
 
+## Trusted shared-object path evidence
+
+The E2E SaBRe contract requires two complete path-evidence records for a verify
+cell, with coordinator RPC observed and both `ptrace_fallback_sites` and
+`trusted_shared_object_sites` equal to zero. A canonical comparator match does
+not override that execution-path requirement.
+
+The disabled `language-runtimes/perl-io-subprocess-time` probe demonstrates
+why. On 2026-08-17 its no-relaxation comparison matched, but each verify pair
+recorded 132 trusted shared-object sites: 33 distinct raw syscall instructions
+in `libc` and `ld-linux`, in both the Perl process and its `/usr/bin/tr` child,
+across both verify runs. The sites included `clock_gettime`, `getrandom`, file
+I/O, memory mapping, and signal operations. Those instructions executed
+outside the measured SaBRe interception path.
+
+Forcing ordinary shared-object sites through the existing SaBRe marker did not
+turn that result into complete evidence. Three attempts all produced
+`no_result`: the first `ld-linux` site terminated with `SIGILL`. The cell can be
+qualified only after shared-object rewriting or marker handling lets the exact
+guest complete canonical verification with zero trusted and zero fallback
+sites.
+
+This probe was never among the preserved 53 published-green SaBRe cells. A
+separate audit of that exact 53-cell population, using Hermit binary SHA-256
+`9b06079a7f869951b1d1c3aa9ec8d2c187e2408d730cc7cb2879a71150fac118`,
+found zero trusted and zero fallback sites in every complete verify pair. The
+Perl finding therefore does not widen to those 53 cells.
+
 ## Historical measured `Stripped` envelope
 
 The results in this section were produced by the deleted comparator at the
