@@ -553,6 +553,13 @@ pub struct Scheduler {
     /// Invariant: at the moment this becomes full, the queue is nonempty.
     pub started_up: Ivar<()>,
 
+    /// Filled after the scheduler daemon emits its startup diagnostic.
+    ///
+    /// Root-thread state is constructed after global-state initialization.
+    /// Awaiting this acknowledgement keeps scheduler startup evidence ordered
+    /// before the root thread emits its deterministic seed evidence.
+    pub(crate) daemon_started: Ivar<()>,
+
     /// A model of the the raw ancestry tree of threads, based on parentage at the point
     /// of thread creation.  This establishes a mapping from each thread to the child
     /// threads it has spawned.
@@ -909,10 +916,15 @@ async fn sched_loop_inner(
     blocking_backoff: bool,
     observer: Option<SchedulerObserver>,
 ) {
+    let daemon_started = {
+        let sched = sched.lock().unwrap();
+        sched.daemon_started.clone()
+    };
     info!("[scheduler] daemon task starting up, waiting for guest thread start..");
     if let Some(observer) = &observer {
         observer("daemon task starting; waiting for guest thread");
     }
+    daemon_started.put(());
     let (iv, stop_after_iter) = {
         // Block until queue is populated.
         let sched = sched.lock().unwrap();
@@ -1236,6 +1248,7 @@ impl Scheduler {
             backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             resources: Default::default(),
             started_up: Default::default(),
+            daemon_started: Default::default(),
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
