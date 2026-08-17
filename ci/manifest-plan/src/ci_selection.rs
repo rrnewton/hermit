@@ -245,6 +245,20 @@ fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> R
             "ci_disabled_reason for {backend} must explain the result in at least three words"
         ));
     }
+    let normalized = detail.to_ascii_lowercase();
+    if [
+        "not yet validated",
+        "not yet qualified",
+        "not selected yet",
+        "temporarily disabled",
+    ]
+    .iter()
+    .any(|placeholder| normalized.contains(placeholder))
+    {
+        return Err(format!(
+            "ci_disabled_reason for {backend} must state the measured result, not placeholder text"
+        ));
+    }
     let evidence = reason.evidence.trim();
     let evidence_is_locator = evidence.len() >= 8
         && (evidence.contains('/')
@@ -375,8 +389,8 @@ mod tests {
     #[test]
     fn rejects_placeholder_backend_reason() {
         let mut placeholder = reason();
-        placeholder.evidence = "x".into();
-        placeholder.reason = "x".into();
+        placeholder.evidence = "ignored/results/liteinst.jsonl".into();
+        placeholder.reason = "not yet validated for ci".into();
         let error = CiSelection::validate(
             &enabled(),
             &disabled(),
@@ -390,6 +404,6 @@ mod tests {
             )]))),
         )
         .unwrap_err();
-        assert!(error.contains("at least three words"));
+        assert!(error.contains("not placeholder text"));
     }
 }

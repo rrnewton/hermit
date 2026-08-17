@@ -16431,7 +16431,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -17089,7 +17094,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -19727,7 +19737,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -20222,7 +20237,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -21828,7 +21848,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -22474,7 +22499,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -22634,7 +22664,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
@@ -22954,7 +22989,12 @@
       "mode": "verify",
       "backend": "dbt",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "reverie#459",
+        "reason": "DBT completes both runs with matching backend-local memory hashes and exit status, but run_dbt leaves verdict=no_result and comparison=null because it does not write canonical verification evidence; canonical determinism cannot be judged until reverie#459 provides emit_evidence."
+      },
       "observations": []
     },
     {
