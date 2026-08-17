@@ -49,7 +49,7 @@ use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
-const TRACKED_CELLS_SCHEMA: u64 = 4;
+const TRACKED_CELLS_SCHEMA: u64 = 5;
 const RUN_SCHEMA: u64 = 3;
 const CELL_RESULT_SCHEMA: u64 = 4;
 const SUMMARY_SCHEMA: u64 = 4;
