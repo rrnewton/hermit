@@ -28,7 +28,7 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason: 'KVM canonical verification passed one of three repetitions and diverged in the other two. The first mismatch was scheduler turn 4 of 13 after clone3, where COMMIT virtual time was 2848750 versus 3697500 ns. The ptrace cell is unchanged by this KVM result.'
       naked:
         ci: false
         backends_enabled: []

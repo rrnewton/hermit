@@ -1169,7 +1169,7 @@ fn run_kvm_awk_mincore_probe_terminates() {
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "42\n");
     assert!(
-        stderr(&output).contains("Success: KVM guest output and exit status matched."),
+        stderr(&output).contains("Success: deterministic. Determinism verified."),
         "KVM determinism confirmation missing:\n{}",
         stderr(&output),
     );
@@ -1225,7 +1225,7 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "1767225600\n");
-    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
+    assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
 }
 
 #[test]
@@ -1277,7 +1277,7 @@ fn run_kvm_bash_process_substitution_is_deterministic() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "paste-ok\n");
-    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
+    assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
 }
 
 #[test]
@@ -1333,7 +1333,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
         stdout(&output),
         "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
     );
-    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
+    assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
 }
 
 #[test]
@@ -1513,7 +1513,7 @@ fn run_kvm_verify_f_getfl_with_isolated_standard_input() {
 
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "fcntl-verify-ok\n");
-    assert!(stderr(&output).contains("Success: KVM guest output and exit status matched."));
+    assert!(stderr(&output).contains("Success: deterministic. Determinism verified."));
 }
 
 #[test]
