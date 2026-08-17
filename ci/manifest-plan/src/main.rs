@@ -18,6 +18,11 @@ use std::path::PathBuf;
 #[cfg(not(test))]
 use std::process::exit;
 
+use hermit_manifest_plan::ci_selection::CiDisabledReasonData;
+use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
+use hermit_manifest_plan::ci_selection::CiSelection;
+use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
@@ -37,6 +42,7 @@ struct PlanRow {
     mode: String,
     backend: String,
     ci: bool,
+    ci_disabled_reason: Option<CiDisabledReasonData>,
     enabled: bool,
     timeout_seconds: i64,
     attempts: Option<i64>,
@@ -179,6 +185,7 @@ fn main() {
                         "mode": row.mode,
                         "backend": row.backend,
                         "ci": row.ci,
+                        "ci_disabled_reason": row.ci_disabled_reason,
                     })
                 })
                 .collect();
@@ -199,6 +206,7 @@ fn main() {
                         "mode": row.mode,
                         "backend": row.backend,
                         "ci": row.ci,
+                        "ci_disabled_reason": row.ci_disabled_reason,
                         "enabled": row.enabled,
                         "timeout_seconds": row.timeout_seconds,
                         "attempts": row.attempts,
@@ -424,6 +432,13 @@ fn string_array(value: Option<&Value>, location: &str) -> Vec<String> {
                 .unwrap_or_else(|| die(format!("{location}: array values must be strings")))
         })
         .collect()
+}
+
+fn parse_schema_value<T: DeserializeOwned>(value: &Value, location: &str) -> T {
+    let value = serde_json::to_value(value)
+        .unwrap_or_else(|error| die(format!("{location} cannot be encoded: {error}")));
+    serde_json::from_value(value)
+        .unwrap_or_else(|error| die(format!("{location} has invalid shape: {error}")))
 }
 
 fn validate_direct(value: &Value, id: &str) {
@@ -689,36 +704,18 @@ fn validate_mode(
             }
         }
     }
-    let ci = spec
-        .get("ci")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci must be a boolean")));
+    let ci_spec: CiSelectionSpec = parse_schema_value(
+        spec.get("ci")
+            .unwrap_or_else(|| die(format!("{id}: modes.{mode}.ci is required"))),
+        &format!("{id}: modes.{mode}.ci"),
+    );
+    let ci_disabled_reason: Option<CiDisabledReasonSpec> = spec
+        .get("ci_disabled_reason")
+        .map(|value| parse_schema_value(value, &format!("{id}: modes.{mode}.ci_disabled_reason")));
     let enabled = string_array(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
     );
-    match (ci, enabled.is_empty(), spec.get("ci_disabled_reason")) {
-        (true, _, Some(_)) => die(format!(
-            "{id}: modes.{mode} is CI-enabled, so it must not carry ci_disabled_reason"
-        )),
-        (false, false, Some(reason))
-            if reason
-                .as_str()
-                .is_some_and(|reason| !reason.trim().is_empty()) => {}
-        (false, false, _) => die(format!(
-            "{id}: modes.{mode} enables backend cells while ci=false and must state why in a non-empty ci_disabled_reason"
-        )),
-        (false, true, Some(reason))
-            if reason
-                .as_str()
-                .is_none_or(|reason| reason.trim().is_empty()) =>
-        {
-            die(format!(
-                "{id}: modes.{mode}.ci_disabled_reason must be a non-empty string"
-            ))
-        }
-        _ => {}
-    }
     let disabled = spec
         .get("backends_disabled")
         .and_then(Value::as_table)
@@ -755,6 +752,13 @@ fn validate_mode(
             expected
         ));
     }
+    let ci = CiSelection::validate(
+        &enabled.iter().cloned().collect(),
+        &disabled.keys().cloned().collect(),
+        &ci_spec,
+        ci_disabled_reason.as_ref(),
+    )
+    .unwrap_or_else(|error| die(format!("{id}: modes.{mode} {error}")));
     if let Some(guest_args) = spec.get("guest_args") {
         let guest_args = guest_args
             .as_table()
@@ -777,12 +781,7 @@ fn validate_mode(
             }
         }
     }
-    if ci && enabled.is_empty() {
-        die(format!(
-            "{id}: modes.{mode} is CI-enabled but has no backend"
-        ));
-    }
-    if mode == "naked" && ci {
+    if mode == "naked" && ci.any_selected() {
         die(format!(
             "{id}: naked is opt-in meta-CI and must set ci=false"
         ));
@@ -936,13 +935,16 @@ fn validate_mode(
 
     let attempts = mode_attempts(id, mode, spec_value);
     for backend in enabled {
+        let selected = ci.selected(&backend);
+        let ci_disabled_reason = ci.reason(&backend).cloned();
         rows.push(PlanRow {
             bucket: bucket.to_string(),
             id: id.to_string(),
             lane: lane.to_string(),
             mode: mode.to_string(),
             backend,
-            ci,
+            ci: selected,
+            ci_disabled_reason,
             enabled: true,
             timeout_seconds,
             attempts,
@@ -955,7 +957,8 @@ fn validate_mode(
             lane: lane.to_string(),
             mode: mode.to_string(),
             backend: backend.to_string(),
-            ci,
+            ci: false,
+            ci_disabled_reason: None,
             enabled: false,
             timeout_seconds,
             attempts,
@@ -1168,6 +1171,80 @@ liteinst = "unsupported"
     }
 
     #[test]
+    fn expands_per_backend_ci_and_emits_the_unselected_backend_reason() {
+        let spec = parse_mode(
+            r#"
+ci = { ptrace = true, liteinst = false }
+backends_enabled = ["ptrace", "liteinst"]
+
+[ci_disabled_reason.liteinst]
+result = "determinism-failure"
+evidence = "ignored/results/liteinst.jsonl"
+reason = "canonical comparison diverged at scheduler turn 10"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+"#,
+        );
+        let mut rows = Vec::new();
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut rows,
+        );
+        let ptrace = rows.iter().find(|row| row.backend == "ptrace").unwrap();
+        assert!(ptrace.ci);
+        assert!(ptrace.ci_disabled_reason.is_none());
+        let liteinst = rows.iter().find(|row| row.backend == "liteinst").unwrap();
+        assert!(!liteinst.ci);
+        assert_eq!(
+            liteinst.ci_disabled_reason.as_ref().unwrap().reason,
+            "canonical comparison diverged at scheduler turn 10"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| !row.enabled)
+                .all(|row| !row.ci && row.ci_disabled_reason.is_none())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must explain the result in at least three words")]
+    fn rejects_placeholder_per_backend_reason() {
+        let spec = parse_mode(
+            r#"
+ci = { ptrace = true, liteinst = false }
+backends_enabled = ["ptrace", "liteinst"]
+
+[ci_disabled_reason.liteinst]
+result = "determinism-failure"
+evidence = "ignored/results/liteinst.jsonl"
+reason = "x"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
     fn derives_existing_harness_attempt_counts() {
         let absent = parse_mode("");
         assert_eq!(mode_attempts("bucket/test", "verify", &absent), Some(1));
@@ -1338,7 +1415,7 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "must state why in a non-empty ci_disabled_reason")]
+    #[should_panic(expected = "ci=false with enabled backends requires ci_disabled_reason")]
     fn rejects_enabled_cell_silently_disabled_from_ci() {
         let spec = parse_mode(
             r#"
@@ -1364,7 +1441,7 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "is CI-enabled, so it must not carry ci_disabled_reason")]
+    #[should_panic(expected = "ci=true must not carry ci_disabled_reason")]
     fn rejects_stale_ci_disabled_reason_on_selected_cell() {
         let spec = parse_mode(
             r#"
