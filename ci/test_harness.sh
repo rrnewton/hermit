@@ -1165,6 +1165,17 @@ function assert_parallel_portable_workflow {
 
 function assert_privileged_diagnostics {
     local workflow=$1
+    [[ $(grep -Fxc '        if [[ ${GITHUB_ACTIONS:-} != true ]]; then' "$workflow") == 1 ]] ||
+        die "GitHub privileged unboxed execution must be guarded by the exact Actions context"
+    [[ $(grep -Fxc "          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2" "$workflow") == 1 ]] ||
+        die "GitHub privileged unboxed guard must explain its refusal"
+    [[ $(grep -Fxc '          exit 2' "$workflow") == 1 ]] ||
+        die "GitHub privileged unboxed guard must fail outside Actions"
+    [[ $(grep -Fc -- '--unsafe-no-cgroups' "$workflow") == 1 ]] ||
+        die "GitHub privileged workflow must select explicit unboxed execution exactly once"
+    if grep -Ev '^[[:space:]]*#' "$workflow" | grep -Fq -- '--allow-cgroup-failure'; then
+        die "GitHub privileged workflow must not execute with broad --allow-cgroup-failure"
+    fi
     [[ $(grep -Fxc '    - name: Run non-gating occasional KVM probes' "$workflow") == 1 ]] ||
         die "GitHub privileged workflow must run the occasional KVM diagnostics"
     [[ $(grep -Fc -- '--ci-only --include-occasional' "$workflow") == 2 ]] ||
@@ -1984,7 +1995,7 @@ EOF
     # This is a literal workflow expression, not a local expansion.
     # shellcheck disable=SC2016
     assert_workflow_entrypoint privileged "$ROOT_DIR/.github/workflows/ci-privileged.yml" \
-        'timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
+        'timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v'
     assert_privileged_diagnostics "$ROOT_DIR/.github/workflows/ci-privileged.yml"
     assert_validate_driver_entrypoint
     assert_node_budgets_fit_their_job_kill
