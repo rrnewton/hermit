@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e7972364634aae3ef62705527c70a1c0556c5784 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie e7972364634aae3ef62705527c70a1c0556c5784" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af82f1b92a2762840dc5894984be5e1f5bfc5cb9 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie af82f1b92a2762840dc5894984be5e1f5bfc5cb9" >&2
     return 2
 fi
 
@@ -143,6 +143,16 @@ fi
 # reverie-ptrace/src/tracer.rs. reverie-dbt/build.rs and the vendored
 # DynamoRIO tree are byte-identical at both pins, so this does not change the
 # calibrated native-build inputs or their content key.
+#
+# CARRY TO af82f1b (2026-08-17). e797236 and af82f1b contain the same
+# restart_syscall-subscription patch, but af82f1b is the landed commit on
+# Reverie main after the DBT evidence changes at 268a25b. Those changes touch
+# reverie-dbt/native/client.c, Rust evidence/launcher code, and evidence tests;
+# they do not change the timed DynamoRIO content-key MISS. Its two repository
+# inputs remain byte-identical: reverie-dbt/build.rs is 0ff8ae24b974 at both
+# pins and reverie-dbt/vendor/dynamorio is de352475846e at both pins. With
+# CMAKE and CMAKE_GENERATOR unchanged, source_recipe_key() and the measured
+# 1050 effective-job-second budget therefore carry unchanged.
 #
 # CARRY TO e159d6c (2026-08-06). The only 9470712..e159d6c change is a
 # hostname-neutral wording edit in reverie-dbt/build.rs. The vendored
