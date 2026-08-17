@@ -2550,16 +2550,39 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
         let selected: BTreeSet<String> =
             requested.iter().filter(|t| available.contains(*t)).cloned().collect();
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
         for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
             // Same selection semantics run-node.sh documented for `run --only`:
             // edges to steps OUTSIDE the selection are dropped (their outputs are
             // assumed already built), edges AMONG the selection are preserved so a
             // selected sub-graph still runs in order.
+            dropped.extend(step.deps.iter().filter(|d| !selected.contains(*d)).cloned());
             step.deps.retain(|d| selected.contains(d));
             if step.deps.is_empty() {
                 step.deps.push(gate.to_string());
             }
             steps.push(step);
+        }
+        // SAY that this mode assumes an already-built tree, and name the build
+        // edges it just dropped. Without this the mode is silent about its own
+        // precondition: a selected node whose artifact was never built dies with
+        // a 0-second exit 127 (the shell's "command not found"), which reads as a
+        // crash rather than as "you have not built this yet".
+        dropped.remove(gate);
+        if dropped.is_empty() {
+            eprintln!(
+                "validate: --only runs the selected node(s) against the CURRENT tree; \
+                 nothing they depend on is rebuilt first."
+            );
+        } else {
+            eprintln!(
+                "validate: --only assumes an already-built tree. Dropped {} dependency edge(s) \
+                 whose outputs must ALREADY exist: {}. Build them first (or name them in the \
+                 selection); a selected node exiting 127 in ~0s means its artifact is missing, \
+                 not that it crashed.",
+                dropped.len(),
+                dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
         let cfg = validate_plan::config_from_base(&base, steps, "selected DAG node(s)");
         return Ok(Plan {
@@ -6484,6 +6507,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
         exit_code = 1;
         pin_gate_bypassed = true;
+    }
+
+    // Exit 127 is the shell's "command not found", so a node that dies with it in
+    // roughly no time did not run and fail — its executable was never built. Say
+    // that, because a bare 0-second 127 in the table is indistinguishable from a
+    // crash, and a misread there costs far more than the line costs to print.
+    let missing_artifact: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.ok && o.returncode == Some(127) && o.duration_s < 5.0)
+        .map(|o| o.tag.as_str())
+        .collect();
+    if !missing_artifact.is_empty() {
+        eprintln!(
+            "validate: NOTE: {} node(s) exited 127 (command not found) in under 5s: {}. \
+             That is a MISSING BUILD ARTIFACT, not a test failure — the node's executable does \
+             not exist in this checkout. Build it, then re-run.",
+            missing_artifact.len(),
+            missing_artifact.join(", ")
+        );
     }
 
     // A NESTED payload writes nothing: the outer run owns the ledger and the
