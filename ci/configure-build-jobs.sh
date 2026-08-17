@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 18ab6a76c84182a5a522223ed6cfd3c10794db33 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 18ab6a76c84182a5a522223ed6cfd3c10794db33" >&2
     return 2
 fi
 
@@ -512,6 +512,20 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
+
+# CARRY TO 18ab6a7 (2026-08-16). c261050..18ab6a7 changes only
+# reverie-process container error propagation and tests; `git diff --name-status
+# c261050..18ab6a7 -- reverie-dbt` is empty. The complete DBT build inputs are
+# object-identical at both pins:
+#
+#   reverie-dbt/build.rs              0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   reverie-dbt/vendor/dynamorio      de352475846e385002c1e4e54604fa0a7647b2de
+#
+# source_recipe_key() therefore remains
+# sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d,
+# and MAX_PARALLEL_JOBS=16 plus the measured 1050 effective-job-second budget
+# (263s at 4 jobs; 66s at 16) carry unchanged. Fresh exact-head validation is
+# still required; this identity-based carry does not authorize receipt reuse.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS

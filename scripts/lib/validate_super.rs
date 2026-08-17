@@ -343,9 +343,8 @@ pub const STRESS_PROBES: &[StressProbe] = &[
 
 /// The two backend-availability nodes.
 ///
-/// `kvm_backend_available` (validate.sh:2272) is a readable+writable `/dev/kvm`;
-/// `dbt_backend_available` (validate.sh:2276) is a real probe run, which is why
-/// it must be a node — at plan time the debug binary does not exist yet.
+/// Both availability checks are real probe runs, which is why they must be
+/// nodes — at plan time the debug binary does not exist yet.
 fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
     let dbg = shell_quote(debug_bin);
     vec![
@@ -353,7 +352,7 @@ fn availability_nodes(debug_bin: &str, build_dep: &str) -> Vec<Step> {
             "superstress",
             "kvm_available",
             "KVM backend availability (gates the KVM stress rows)",
-            "test -r /dev/kvm && test -w /dev/kvm".to_string(),
+            format!("{dbg} run --backend kvm -- /bin/true </dev/null"),
             vec![build_dep.to_string()],
             30,
             30,
@@ -677,7 +676,24 @@ pub fn self_test(root: &Path) -> Result<String, String> {
             "DBT super probe must measure strict execution without claiming verification: {dbt_command}"
         ));
     }
-    let dbt_available = availability_nodes("target/debug/hermit", "build.debug")
+    let availability = availability_nodes("target/debug/hermit", "build.debug");
+    let kvm_available = availability
+        .iter()
+        .find(|step| step.tag() == "superstress.kvm_available")
+        .ok_or("KVM availability node missing")?;
+    if !kvm_available.cmd.contains("run --backend kvm --")
+        || !kvm_available.cmd.contains("/bin/true")
+        || kvm_available.cmd.contains("test -r /dev/kvm")
+        || kvm_available.cmd.contains("test -w /dev/kvm")
+        || kvm_available.cmd.contains("2>")
+        || kvm_available.cmd.contains("&>")
+    {
+        return Err(format!(
+            "KVM availability must run the backend and preserve diagnostic stderr: {}",
+            kvm_available.cmd
+        ));
+    }
+    let dbt_available = availability
         .into_iter()
         .find(|step| step.tag() == "superstress.dbt_available")
         .ok_or("DBT availability node missing")?;

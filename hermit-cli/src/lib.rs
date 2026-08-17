@@ -274,8 +274,13 @@ pub struct Recording {
 #[derive(Clone, Copy)]
 enum CapabilityProbe {
     Namespaces,
-    Ptrace,
     Seccomp,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PtraceProbeResult {
+    Available,
+    Unavailable(i32),
 }
 
 fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
@@ -289,17 +294,6 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
             CapabilityProbe::Namespaces => unsafe {
                 libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) == 0
             },
-            CapabilityProbe::Ptrace => {
-                // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
-                unsafe {
-                    libc::ptrace(
-                        libc::PTRACE_TRACEME,
-                        0,
-                        std::ptr::null_mut::<libc::c_void>(),
-                        std::ptr::null_mut::<libc::c_void>(),
-                    ) != -1
-                }
-            }
             CapabilityProbe::Seccomp => {
                 let mut filter = libc::sock_filter {
                     code: 0x06, // BPF_RET | BPF_K
@@ -344,6 +338,134 @@ fn run_capability_probe(probe: CapabilityProbe) -> Result<bool, Error> {
     }
 }
 
+fn run_ptrace_traceme_probe() -> Result<PtraceProbeResult, Error> {
+    let mut pipe_fds = [-1; 2];
+    // SAFETY: pipe_fds points to storage for both descriptors.
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error()).context("Failed to create ptrace capability pipe");
+    }
+
+    // SAFETY: The child calls only async-signal-safe syscalls and exits immediately.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        let error = io::Error::last_os_error();
+        // SAFETY: Both descriptors were returned by pipe2 and remain owned here.
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+        return Err(error).context("Failed to fork ptrace capability probe");
+    }
+    if pid == 0 {
+        // SAFETY: The child owns both inherited descriptors and does not use the read end.
+        unsafe { libc::close(pipe_fds[0]) };
+        // SAFETY: PTRACE_TRACEME ignores the pid and address arguments.
+        let result = unsafe {
+            libc::ptrace(
+                libc::PTRACE_TRACEME,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        // Read errno before making another libc call. Zero means the probe succeeded.
+        let errno = if result == -1 {
+            // SAFETY: errno is thread-local storage provided by libc.
+            unsafe { *libc::__errno_location() }
+        } else {
+            0
+        };
+        let bytes = errno.to_ne_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            // SAFETY: bytes remains valid and the unwritten suffix is within its bounds.
+            let result = unsafe {
+                libc::write(
+                    pipe_fds[1],
+                    bytes[written..].as_ptr().cast(),
+                    bytes.len() - written,
+                )
+            };
+            if result == -1 {
+                // SAFETY: errno is thread-local storage provided by libc.
+                if unsafe { *libc::__errno_location() } == libc::EINTR {
+                    continue;
+                }
+                // SAFETY: Avoid running Rust destructors after fork.
+                unsafe { libc::_exit(2) }
+            }
+            if result == 0 {
+                // SAFETY: Avoid running Rust destructors after fork.
+                unsafe { libc::_exit(2) }
+            }
+            written += result as usize;
+        }
+        // SAFETY: The child owns this descriptor and has finished writing.
+        unsafe { libc::close(pipe_fds[1]) };
+        // SAFETY: Avoid running Rust destructors after fork.
+        unsafe { libc::_exit(0) }
+    }
+
+    // SAFETY: The parent does not use the inherited write end.
+    unsafe { libc::close(pipe_fds[1]) };
+    // SAFETY: The read end is uniquely owned here and transferred to File.
+    let mut read_end = unsafe { fs::File::from_raw_fd(pipe_fds[0]) };
+    let mut status = 0;
+    loop {
+        // SAFETY: pid is the child created above and status points to valid storage.
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            break;
+        }
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("Failed to wait for ptrace capability probe");
+        }
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        anyhow::bail!("ptrace capability probe child failed before reporting its result");
+    }
+
+    let mut bytes = [0; std::mem::size_of::<i32>()];
+    std::io::Read::read_exact(&mut read_end, &mut bytes)
+        .context("Failed to read ptrace capability probe result")?;
+    let errno = i32::from_ne_bytes(bytes);
+    if errno == 0 {
+        Ok(PtraceProbeResult::Available)
+    } else {
+        Ok(PtraceProbeResult::Unavailable(errno))
+    }
+}
+
+fn ptrace_probe_unavailable_reason(result: PtraceProbeResult) -> Option<String> {
+    let PtraceProbeResult::Unavailable(errno) = result else {
+        return None;
+    };
+    let errno_name = format!("{:?}", nix::errno::Errno::from_raw(errno));
+    let os_error = io::Error::from_raw_os_error(errno);
+    let meaning = match errno {
+        libc::EPERM | libc::EACCES => concat!(
+            "the ptrace backend may be present, but this process was denied permission to request ",
+            "tracing. Allow same-UID parent-child ptrace in the container seccomp and host ",
+            "Yama/LSM policy; CAP_SYS_PTRACE is normally not required"
+        ),
+        libc::ENOSYS => concat!(
+            "the ptrace backend appears unavailable; this probe cannot distinguish kernel absence ",
+            "from a policy-emulated ENOSYS"
+        ),
+        _ => concat!(
+            "Hermit could not establish that the ptrace backend is available; resolve the reported ",
+            "syscall error or select another backend"
+        ),
+    };
+    Some(format!(
+        "ptrace(PTRACE_TRACEME, 0, NULL, NULL) failed with {errno_name} (errno {errno}: {os_error}); {meaning}"
+    ))
+}
+
 fn validate_tracing_environment() -> Result<(), Error> {
     if !run_capability_probe(CapabilityProbe::Namespaces)? {
         anyhow::bail!(
@@ -352,12 +474,10 @@ fn validate_tracing_environment() -> Result<(), Error> {
              and the unshare syscall in the host/container policy."
         );
     }
-    if !run_capability_probe(CapabilityProbe::Ptrace)? {
+    if let Some(reason) = ptrace_probe_unavailable_reason(run_ptrace_traceme_probe()?) {
         anyhow::bail!(
-            "Hermit cannot use ptrace in this environment: a child PTRACE_TRACEME probe was \
-             denied. Allow same-UID parent-child ptrace in the container seccomp and host \
-             Yama/LSM policy; CAP_SYS_PTRACE is normally not required. Use --namespace-only for \
-             a sandbox smoke test without syscall interception."
+            "Hermit cannot use ptrace in this environment: {reason}. Use --namespace-only for a \
+             sandbox smoke test without syscall interception."
         );
     }
     if !run_capability_probe(CapabilityProbe::Seccomp)? {
@@ -2045,6 +2165,7 @@ mod tests {
 
     use super::Backend;
     use super::ExitStatus;
+    use super::PtraceProbeResult;
     use super::SABRE_RPC_SOCKET_ENV;
     #[cfg(feature = "dbt")]
     use super::dbt_runtime_unavailable_reason;
@@ -2059,6 +2180,7 @@ mod tests {
     use super::liteinst_runtime_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
+    use super::ptrace_probe_unavailable_reason;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
@@ -2070,6 +2192,44 @@ mod tests {
     use super::stage_sabre_program_in;
     use super::stop_sabre_rpc_server;
     use super::wait_for_sabre_rpc_disconnects;
+
+    #[test]
+    fn successful_ptrace_probe_has_no_unavailable_reason() {
+        assert_eq!(
+            ptrace_probe_unavailable_reason(PtraceProbeResult::Available),
+            None
+        );
+    }
+
+    #[test]
+    fn denied_ptrace_probe_reports_syscall_errno_and_availability_meaning() {
+        let reason =
+            ptrace_probe_unavailable_reason(PtraceProbeResult::Unavailable(libc::EPERM)).unwrap();
+
+        assert!(reason.contains("ptrace(PTRACE_TRACEME, 0, NULL, NULL)"));
+        assert!(reason.contains("EPERM"));
+        assert!(reason.contains("errno 1"));
+        assert!(reason.contains(
+            "the ptrace backend may be present, but this process was denied permission to request tracing"
+        ));
+        assert!(reason.contains("Allow same-UID parent-child ptrace"));
+        assert!(!reason.contains("does not implement"));
+    }
+
+    #[test]
+    fn enosys_ptrace_probe_reports_uncertain_availability() {
+        let reason =
+            ptrace_probe_unavailable_reason(PtraceProbeResult::Unavailable(libc::ENOSYS)).unwrap();
+
+        assert!(reason.contains("ENOSYS"));
+        assert!(reason.contains("errno 38"));
+        assert!(reason.contains("the ptrace backend appears unavailable"));
+        assert!(reason.contains(
+            "this probe cannot distinguish kernel absence from a policy-emulated ENOSYS"
+        ));
+        assert!(!reason.contains("the ptrace backend is absent"));
+        assert!(!reason.contains("denied permission"));
+    }
 
     /// Regression test for the `hermit run --verify` empty-stdin bug: a pipe
     /// (non-seekable) fed to hermit must be buffered and replayed *identically*

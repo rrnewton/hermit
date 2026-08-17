@@ -373,7 +373,7 @@ fn assert_failure_contains(output: &Output, expected: &[&str]) {
     assert!(!stderr.contains("panicked"), "unexpected panic:\n{stderr}");
 }
 
-fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
+fn deny_syscall(command: &mut Command, syscall: libc::c_long, errno: i32) {
     // SAFETY: The callback makes only async-signal-safe syscalls before exec. The filter is an
     // allow-all policy except for the single syscall used by each capability-probe test.
     unsafe {
@@ -395,7 +395,7 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
                     code: 0x06, // BPF_RET | BPF_K
                     jt: 0,
                     jf: 0,
-                    k: 0x0005_0000 | libc::EPERM as u32, // SECCOMP_RET_ERRNO
+                    k: 0x0005_0000 | errno as u32, // SECCOMP_RET_ERRNO
                 },
                 libc::sock_filter {
                     code: 0x06,
@@ -2113,18 +2113,41 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
 
 #[test]
 fn run_reports_denied_ptrace_and_seccomp_capabilities() {
-    for (syscall, expected) in [
+    for (syscall, errno, expected) in [
         (
             libc::SYS_ptrace,
-            ["cannot use ptrace", "PTRACE_TRACEME", "--namespace-only"],
+            libc::EPERM,
+            &[
+                "cannot use ptrace",
+                "ptrace(PTRACE_TRACEME, 0, NULL, NULL)",
+                "EPERM",
+                "errno 1",
+                "ptrace backend may be present",
+                "denied permission to request tracing",
+                "--namespace-only",
+            ][..],
+        ),
+        (
+            libc::SYS_ptrace,
+            libc::ENOSYS,
+            &[
+                "cannot use ptrace",
+                "ptrace(PTRACE_TRACEME, 0, NULL, NULL)",
+                "ENOSYS",
+                "errno 38",
+                "ptrace backend appears unavailable",
+                "cannot distinguish kernel absence from a policy-emulated ENOSYS",
+                "--namespace-only",
+            ][..],
         ),
         (
             libc::SYS_seccomp,
-            [
+            libc::EPERM,
+            &[
                 "cannot install",
                 "SECCOMP_SET_MODE_FILTER",
                 "--namespace-only",
-            ],
+            ][..],
         ),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
@@ -2135,9 +2158,12 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
             "--",
             "/bin/true",
         ]);
-        deny_syscall(&mut command, syscall);
+        deny_syscall(&mut command, syscall, errno);
         let output = command.output().expect("failed to run restricted hermit");
-        assert_failure_contains(&output, &expected);
+        assert_failure_contains(&output, expected);
+        if syscall == libc::SYS_ptrace && errno == libc::ENOSYS {
+            assert!(!stderr(&output).contains("the ptrace backend is absent"));
+        }
     }
 }
 
