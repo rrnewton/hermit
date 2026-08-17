@@ -2910,9 +2910,35 @@ function audit_chaos_seed_contract {
     fake="$scratch/hermit"
     results="$scratch/results"
     invocation_log="$scratch/invocations"
+    mkdir -p "$scratch/bin"
+    cat >"$scratch/bin/timeout" <<'FAKE_TIMEOUT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == --kill-after=2s && ${2:-} == 20s && ${4:-} == --iterations &&
+      ${5:-} == 4 && ${6:-} == --period && ${7:-} == 100000 ]]; then
+    cat <<'OUT'
+Iterations: 4, programmed period: 100000 RCB
+Skid (RCB): min=1 max=4 mean=2.50 p99=4
+Recommended margin: 100 RCB (2x observed max, minimum 100; empirical, not a hard bound)
+OUT
+    exit 0
+fi
+exec /usr/bin/timeout "$@"
+FAKE_TIMEOUT
     cat >"$fake" <<'FAKE_HERMIT'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ $# == 12 && $1 == --log=info && $2 == run && $3 == --backend &&
+      $4 == ptrace && $5 == --strict && $6 == --verify &&
+      $7 == --base-env=minimal && $8 == --verify-json &&
+      $9 == "$VALIDATION_EXPECTED_REPORT" && ${10} == --tmp=/tmp &&
+      ${11} == -- && ${12} == "$VALIDATION_EXPECTED_GUEST" ]]; then
+    echo 'CPUID-SUCCESS vendor=GenuineIntel signature=00000663'
+    printf '%s\n' \
+        '{"verified":true,"verdict":"matched","bitwise_parity":true,"comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":2,"right":2}}' \
+        >"$VALIDATION_EXPECTED_REPORT"
+    exit 0
+fi
 verdict= seed= seen_log=0 seen_verify=0 seen_allow=0 seen_chaos=0
 while (($#)); do
     case "$1" in
@@ -2961,8 +2987,9 @@ fi
 printf 'ERROR! global_str is null at use.\n'
 exit 1
 FAKE_HERMIT
-    chmod 755 "$fake"
-    if output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+    chmod 755 "$fake" "$scratch/bin/timeout"
+    if output=$(env PATH="$scratch/bin:$PATH" \
+        HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=one-false \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=negative-chaos-verdict \
         "$ROOT_DIR/ci/test_harness.sh" run \
@@ -3003,7 +3030,8 @@ FAKE_HERMIT
     fi
 
     : >"$invocation_log"
-    if ! output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+    if ! output=$(env PATH="$scratch/bin:$PATH" \
+        HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=pass \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
         "$ROOT_DIR/ci/test_harness.sh" run \
@@ -3014,7 +3042,8 @@ FAKE_HERMIT
         die "the controlled affirmative chaos verdict must pass before the stale-report bracket"
     fi
     : >"$invocation_log"
-    if output=$(env HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
+    if output=$(env PATH="$scratch/bin:$PATH" \
+        HERMIT_BIN="$fake" FAKE_HERMIT_INVOCATIONS="$invocation_log" \
         FAKE_HERMIT_VERDICT_BEHAVIOR=none \
         E2E_RESULT_ROOT="$results" E2E_RUN_ID=reused-chaos-verdict \
         "$ROOT_DIR/ci/test_harness.sh" run \
@@ -3430,7 +3459,7 @@ function execute_attempt {
         : >"$path_evidence_file"
         env_args+=(HERMIT_SABRE_PATH_EVIDENCE="$path_evidence_file")
     fi
-    local -a command guest_command profile run_args guest_args custom_args verify_log_flags
+    local -a command guest_command verify_profile run_args guest_args custom_args verify_log_flags
     local verify_report=''
     mapfile -t run_args < <(jq -r '.run_args[]' <<<"$metadata")
     mapfile -t guest_args < <(
@@ -3456,9 +3485,9 @@ function execute_attempt {
             ;;
         *) die "internal error: unsupported program kind $kind" ;;
     esac
-    profile=()
-    if [[ $(jq -r .lane <<<"$metadata") == portable && $mode != naked ]]; then
-        profile=(--no-virtualize-cpuid --max-timeslice=disabled)
+    verify_profile=()
+    if [[ $mode == verify ]]; then
+        verify_profile=(--base-env=minimal)
     fi
     verify_log_flags=()
     if [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 && $mode == verify ]]; then
@@ -3484,7 +3513,7 @@ function execute_attempt {
             # Every verify cell uses the canonical INFO comparison and publishes
             # the typed verdict that run_cell requires below.
             command=("$HERMIT_BIN" --log=info run --backend "$backend" --strict --verify
-                --verify-json "$verify_report" "${verify_log_flags[@]}" "${profile[@]}" -- "${guest_command[@]}")
+                --verify-json "$verify_report" "${verify_log_flags[@]}" "${verify_profile[@]}" -- "${guest_command[@]}")
             ;;
         replay)
             command=("$HERMIT_BIN" --log=info --backend "$backend" record start --strict --verify
@@ -3500,7 +3529,7 @@ function execute_attempt {
             # it from a failed comparison.
             command=("$HERMIT_BIN" --log=info run --base-env=minimal --backend "$backend" --strict
                 --verify --verify-allow=both --verify-json "$verify_report"
-                --chaos --sched-heuristic=random "--seed=$seed" "${profile[@]}" -- "${guest_command[@]}")
+                --chaos --sched-heuristic=random "--seed=$seed" -- "${guest_command[@]}")
             ;;
         custom)
             mapfile -t custom_args < <(jq -r '.modes.custom.args[]' <<<"$metadata")
@@ -3591,21 +3620,22 @@ function append_result {
             [[ ${E2E_KEEP_VERIFY_LOGS:-0} == 1 ]] && keep_verify_logs=true
             effective_args=$(jq -cn --arg backend "$backend" \
                 --argjson keep "$keep_verify_logs" \
-                '["--log=info","run",("--backend=" + $backend),"--strict","--verify"]
+                '["--log=info","run","--backend",$backend,"--strict","--verify"]
                  + ["--verify-json","<cell-verify-report>"]
-                 + (if $keep then ["--keep-logs","--verify-log-dir","<cell-verify-log-dir>"] else [] end)')
+                 + (if $keep then ["--keep-logs","--verify-log-dir","<cell-verify-log-dir>"] else [] end)
+                 + ["--base-env=minimal"]')
             log_level=info
             ;;
         replay)
             timeout_seconds=$(jq -r .timeout_seconds <<<"${METADATA_BY_ID[$test_id]}")
             effective_args=$(jq -cn --arg backend "$backend" --arg timeout "$timeout_seconds" \
-                '["--log=info",("--backend=" + $backend),"record","start","--strict","--verify",
+                '["--log=info","--backend",$backend,"record","start","--strict","--verify",
                   "--verify-json","<cell-verify-report>","--data-dir","<cell-recording-dir>","--record-timeout",$timeout]')
             log_level=info
             ;;
         chaos)
             effective_args=$(jq -cn --arg backend "$backend" \
-                '["--log=info","run","--base-env=minimal",("--backend=" + $backend),
+                '["--log=info","run","--base-env=minimal","--backend",$backend,
                   "--strict","--verify","--verify-allow=both","--verify-json",
                   "<per-seed-verify-report>","--chaos","--sched-heuristic=random",
                   "--seed=<manifest-seed>"]')
@@ -3616,13 +3646,11 @@ function append_result {
                 <<<"${METADATA_BY_ID[$test_id]}")
             effective_args=$(jq -cn --arg backend "$backend" \
                 --argjson args "$custom_effective_args" \
-                '["--log=info","run",("--backend=" + $backend)] + $args')
+                '["--log=info","run","--backend",$backend] + $args')
             log_level=info
             ;;
     esac
-    if [[ $lane == portable && ( $mode == verify || $mode == chaos ) ]]; then
-        relaxations='["no-virtualize-cpuid","max-timeslice=disabled"]'
-    elif [[ $mode == custom ]]; then
+    if [[ $mode == custom ]]; then
         relaxations=$(jq -c \
             '[.modes.custom.args[]? |
               select(. == "--no-virtualize-cpuid" or startswith("--max-timeslice=")) |
@@ -4008,6 +4036,72 @@ function build_required {
     ((failures == 0))
 }
 
+function plan_requires_validation_capabilities {
+    local planned=$1 test lane mode backend metadata
+    while IFS=$'\t' read -r test lane mode backend; do
+        [[ $lane == portable ]] || continue
+        [[ $backend == ptrace || $backend == liteinst ]] || continue
+        case "$mode" in
+            verify | chaos) return 0 ;;
+            custom)
+                metadata=${METADATA_BY_ID[$test]:-}
+                [[ -n $metadata ]] || return 0
+                if ! jq -e '
+                    [.modes.custom.args[]? |
+                     select(. == "--no-virtualize-cpuid" or
+                            . == "--max-timeslice=disabled")] |
+                    length > 0
+                ' <<<"$metadata" >/dev/null; then
+                    return 0
+                fi
+                ;;
+        esac
+    done < <(jq -r '[.test,.lane,.mode,(.backend // "")] | @tsv' <<<"$planned")
+    return 1
+}
+
+function audit_validation_capability_selection_contract {
+    local default_id=capability-self-test-default
+    local no_cpuid_id=capability-self-test-no-cpuid
+    local no_pmu_id=capability-self-test-no-pmu
+    METADATA_BY_ID[$default_id]='{"modes":{"custom":{"args":["--base-env=minimal"]}}}'
+    METADATA_BY_ID[$no_cpuid_id]='{"modes":{"custom":{"args":["--no-virtualize-cpuid"]}}}'
+    METADATA_BY_ID[$no_pmu_id]='{"modes":{"custom":{"args":["--max-timeslice=disabled"]}}}'
+
+    plan_requires_validation_capabilities \
+        '{"test":"x","lane":"portable","mode":"verify","backend":"ptrace"}' ||
+        die "portable ptrace verify must require validation capabilities"
+    plan_requires_validation_capabilities \
+        '{"test":"x","lane":"portable","mode":"chaos","backend":"liteinst"}' ||
+        die "portable LiteInst chaos must require ptrace-host validation capabilities"
+    plan_requires_validation_capabilities \
+        "{\"test\":\"$default_id\",\"lane\":\"portable\",\"mode\":\"custom\",\"backend\":\"ptrace\"}" ||
+        die "portable custom cells using default PMU/CPUID policy must require capabilities"
+    if plan_requires_validation_capabilities \
+        "{\"test\":\"$no_cpuid_id\",\"lane\":\"portable\",\"mode\":\"custom\",\"backend\":\"ptrace\"}"; then
+        die "custom --no-virtualize-cpuid scenario must remain exempt from the CPUID prerequisite"
+    fi
+    if plan_requires_validation_capabilities \
+        "{\"test\":\"$no_pmu_id\",\"lane\":\"portable\",\"mode\":\"custom\",\"backend\":\"liteinst\"}"; then
+        die "custom --max-timeslice=disabled scenario must remain exempt from the PMU prerequisite"
+    fi
+    if plan_requires_validation_capabilities \
+        '{"test":"x","lane":"portable","mode":"replay","backend":"ptrace"}'; then
+        die "replay must not acquire verify/chaos capability policy"
+    fi
+    if plan_requires_validation_capabilities \
+        '{"test":"x","lane":"portable","mode":"verify","backend":"dbt"}'; then
+        die "DBT verification must not claim ptrace-host capabilities"
+    fi
+    if plan_requires_validation_capabilities \
+        '{"test":"x","lane":"privileged","mode":"verify","backend":"ptrace"}'; then
+        die "the portable suite prerequisite must not relabel privileged verification"
+    fi
+    unset "METADATA_BY_ID[$default_id]" "METADATA_BY_ID[$no_cpuid_id]" \
+        "METADATA_BY_ID[$no_pmu_id]"
+    echo "validation capability selection: PASS (3 required, 5 exempt)"
+}
+
 function run_required {
     RESULTS=${RESULTS:-$RESULT_ROOT/$RUN_ID/results.jsonl}
     JUNIT=${JUNIT:-$RESULT_ROOT/$RUN_ID/junit.xml}
@@ -4019,6 +4113,10 @@ function run_required {
         planned=$(emit_gap_plan)
     else
         planned=$(emit_required_plan)
+    fi
+    if plan_requires_validation_capabilities "$planned"; then
+        "$ROOT_DIR/ci/check-validation-capabilities.sh" "$HERMIT_BIN" ||
+            die "portable validation using default PMU/CPUID policy requires usable PMU preemption and intercepted CPUID"
     fi
     while IFS=$'\t' read -r test_id mode backend; do
         [[ -n $test_id ]] || continue
@@ -4106,6 +4204,8 @@ case "$subcommand" in
         audit_guest_launch_classification_contract
         audit_chaos_seed_contract
         audit_sabre_path_evidence_contract
+        audit_validation_capability_selection_contract
+        "$ROOT_DIR/ci/check-validation-capabilities.sh" --self-test
         audit_test_footprints
         python3 "$ROOT_DIR/tests/backend-parity/split_asymmetric_pr.py" --self-test
         audit_inventory

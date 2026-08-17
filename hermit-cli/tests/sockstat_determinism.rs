@@ -53,8 +53,7 @@ fn assert_l2(case: &ProgramCase) {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(&program)
@@ -87,8 +86,7 @@ fn read_sockstat() -> String {
         "ERROR",
         "run",
         "--strict",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
+        "--base-env=minimal",
         "--",
         "/bin/cat",
         "/proc/net/sockstat",

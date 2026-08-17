@@ -335,13 +335,7 @@ fn run_case(case: &Case, fixture: &Fixture) -> TimedRun {
         .expect("run_case requires an available program");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args([
-            "--log=off",
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-        ])
+        .args(["--log=off", "run", "--base-env=minimal"])
         .arg(format!("--bind={}:{GUEST_FIXTURE}", fixture.root.display()))
         .arg("--")
         .arg(program)

@@ -10,7 +10,13 @@ can also box each node for memory limits and full process-subtree teardown.
 - [`portable.json`](portable.json) — drives `scripts/validate.rs`'s **`--portable-only`**
   lane and the GitHub-managed portable `regular` job in
   [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
-  No PMU / CPUID interception required.
+  No KVM required. Hermit verify/chaos nodes request CPUID virtualization and
+  the default PMU-backed maximum timeslice. A distinct node runs the existing
+  PMU skid program and requires four delivered overflows, then runs a real
+  ptrace CPUID guest before any dependent validation node; a host that cannot
+  supply either mechanism fails closed. The workflow still names
+  `ubuntu-latest`; no capable replacement label was owner-provided, so that
+  hosted job is expected to fail this hard requirement.
 - [`privileged.json`](privileged.json) — implements the focused capability
   contract for the privileged job in
   [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).

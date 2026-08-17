@@ -34,12 +34,7 @@ fn compile_guest(output: &Path) {
 
 fn run_guest(guest: &Path, seed: u64) -> Vec<u8> {
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-        ])
+        .args(["run", "--base-env=minimal"])
         .arg(format!("--rng-seed={seed}"))
         .arg(guest)
         .output()
@@ -64,14 +59,10 @@ fn assert_guest_strict(guest: &Path, backend: Option<&str>, verify: bool) {
     }
     command.arg("--strict");
     if verify {
-        command.arg("--verify");
+        command.args(["--verify", "--base-env=minimal"]);
     }
     let output = command
-        .args([
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
-            "--",
-        ])
+        .arg("--")
         .arg(guest)
         .output()
         .expect("failed to run random guest under strict verification");

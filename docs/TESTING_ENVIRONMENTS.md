@@ -10,9 +10,10 @@ which capabilities, where each test tier is expected to run, what an
 environment-related failure looks like, and how to tell an environment problem
 apart from a genuine Hermit or Reverie bug.
 
-This document is **documentation only**. It does not add capability detection or
-conditional test execution; if those are wanted, track them in a separate
-implementation issue and link it here.
+This document describes the policy implemented by validation. The portable
+suite's fail-closed capability check is implemented in
+`ci/check-validation-capabilities.sh`; individual tests remain the source of
+truth for any additional capability checks or conditional execution.
 
 > The headline rule: **not every x86-64 Linux machine can run every Hermit
 > test.** A green `cargo test --workspace` on a portable VM demonstrates the
@@ -27,7 +28,7 @@ it runs `full` for backward compatibility.
 | Level | Typical estimate | Coverage |
 | --- | --- | --- |
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
-| `portable-only` | About 8 minutes | Executes the same `ci/dag/portable.json` plan as the GitHub-managed portable job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
+| `portable-only` | About 8 minutes | Executes the same `ci/dag/portable.json` plan as the GitHub-managed portable job: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. Manifest verify/chaos requests CPUID virtualization and the default PMU-backed maximum timeslice; KVM is not required. |
 | `full` (default) | About 20-70 minutes | Executes the exact portable and privileged DAG manifests used by GitHub CI. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
 | `super` | About 30-90 minutes | Builds Hermit and repeats each bounded probe 20 times by default. It reports `passed/total` for every probe and fails if any blocking iteration fails. Available KVM output verification and DBT strict-execution probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
@@ -153,7 +154,9 @@ Notes:
 ## CI tiers: what runs where
 
 The portable and privileged workflows are the reference for which tests run on
-ordinary GitHub Actions versus a capability-bearing runner:
+ordinary GitHub Actions versus a capability-bearing runner. Portable manifest
+verification now requests deterministic CPUID handling and PMU-backed
+preemption even though the hosted runner may not supply those mechanisms:
 
 ### `regular` — GitHub-managed portable (`ubuntu-latest`)
 
@@ -167,8 +170,15 @@ subset**:
 - `cargo test -p hermit-detcore --lib --bins`
 - doc tests (`cargo test --workspace --doc`), `cargo doc`, Clippy, rustfmt
 
-GitHub-managed portable runners have **no usable PMU and no CPUID faulting**, so the
-detcore and hermit integration suites are deliberately excluded here.
+GitHub-managed portable runners have historically had **no usable PMU and no
+CPUID faulting**. Hermit itself reports a missing PMU and can continue with
+timer preemption disabled, but portable validation now refuses that fallback:
+the suite-level ptrace capability check requires four delivered retired-branch
+PMU overflows and the synthetic CPUID identity before dependent validation
+nodes run. That check proves host support; it is not a per-backend typed
+verification verdict. The workflow still selects `ubuntu-latest`; until the
+owner supplies a capable runner label, the hosted job is expected to fail this
+hard requirement.
 
 ### `privileged` — capability runner (`[Linux, X64, hermit, pmu]`)
 

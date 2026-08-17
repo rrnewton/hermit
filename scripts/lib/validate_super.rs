@@ -284,7 +284,7 @@ impl StressProbe {
         match self {
             StressProbe::PtraceStrictVerify => require_verification_report(
                 format!(
-                    "{rel} run --strict --verify --verify-json {report_arg} -- \
+                    "{rel} run --strict --verify --verify-json {report_arg} --base-env=minimal -- \
                      /bin/echo hermit-super-{iteration} </dev/null"
                 ),
                 &report,
@@ -292,7 +292,7 @@ impl StressProbe {
             ),
             StressProbe::PtracePipeline => require_verification_report(
                 format!(
-                    "{rel} run --strict --verify --verify-json {report_arg} -- \
+                    "{rel} run --strict --verify --verify-json {report_arg} --base-env=minimal -- \
                      bash -c 'yes hermit | head -n 64 | sha256sum' </dev/null"
                 ),
                 &report,
@@ -319,7 +319,7 @@ impl StressProbe {
             }
             StressProbe::KvmVerify => require_verification_report(
                 format!(
-                    "{dbg} run --backend kvm --verify --verify-json {report_arg} -- \
+                    "{dbg} run --backend kvm --verify --verify-json {report_arg} --base-env=minimal -- \
                      /bin/echo hermit-super-kvm-{iteration} </dev/null"
                 ),
                 &report,
@@ -384,6 +384,7 @@ pub fn stress_nodes(
     reps: i64,
     release_dep: &str,
     debug_dep: &str,
+    ptrace_capability_dep: &str,
 ) -> Vec<Step> {
     let mut out = availability_nodes(debug_bin, debug_dep);
     for probe in STRESS_PROBES {
@@ -393,6 +394,12 @@ pub fn stress_nodes(
             _ => release_dep,
         };
         let mut deps = vec![base_dep.to_string()];
+        if matches!(
+            probe,
+            StressProbe::PtraceStrictVerify | StressProbe::PtracePipeline
+        ) {
+            deps.push(ptrace_capability_dep.to_string());
+        }
         if let Some(av) = probe.availability_job() {
             deps.push(format!("superstress.{av}"));
         }
@@ -676,6 +683,63 @@ pub fn self_test(root: &Path) -> Result<String, String> {
         return Err(format!(
             "DBT super probe must measure strict execution without claiming verification: {dbt_command}"
         ));
+    }
+    for probe in [
+        StressProbe::PtraceStrictVerify,
+        StressProbe::PtracePipeline,
+        StressProbe::KvmVerify,
+    ] {
+        let command = probe.command(
+            1,
+            "target/release/hermit",
+            "target/debug/hermit",
+            Path::new("target/validate-verify"),
+        );
+        if !command.contains("--base-env=minimal")
+            || command.contains("--no-virtualize-cpuid")
+            || command.contains("--max-timeslice=disabled")
+        {
+            return Err(format!(
+                "{probe:?} super verification violates mode policy: {command}"
+            ));
+        }
+    }
+    let stress = stress_nodes(
+        "target/release/hermit",
+        "target/debug/hermit",
+        Path::new("target/validate-verify"),
+        1,
+        "build.release",
+        "build.debug",
+        "super.validation_capabilities",
+    );
+    for probe in [
+        StressProbe::PtraceStrictVerify,
+        StressProbe::PtracePipeline,
+    ] {
+        let tag = format!("superstress.{}_01", probe.job_stem());
+        let step = stress
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("super stress bracket lost {tag}"))?;
+        if !step
+            .deps
+            .iter()
+            .any(|dep| dep == "super.validation_capabilities")
+        {
+            return Err(format!("{tag} can run without validation capabilities"));
+        }
+    }
+    let replay = stress
+        .iter()
+        .find(|step| step.tag() == "superstress.ptrace_record_replay_01")
+        .ok_or("super stress bracket lost ptrace record/replay")?;
+    if replay
+        .deps
+        .iter()
+        .any(|dep| dep == "super.validation_capabilities")
+    {
+        return Err("ptrace record/replay inherited verify/chaos capabilities".into());
     }
     let dbt_available = availability_nodes("target/debug/hermit", "build.debug")
         .into_iter()

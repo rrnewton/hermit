@@ -129,6 +129,7 @@ impl CompatMode {
                 s("--verify"),
                 s("--verify-json"),
                 s(verify_json),
+                s("--base-env=minimal"),
                 s("--"),
             ],
             CompatMode::PortableStrict => vec![
@@ -137,8 +138,7 @@ impl CompatMode {
                 s("--verify"),
                 s("--verify-json"),
                 s(verify_json),
-                s("--no-virtualize-cpuid"),
-                s("--max-timeslice=disabled"),
+                s("--base-env=minimal"),
                 s("--"),
             ],
             CompatMode::Sabre => {
@@ -150,6 +150,7 @@ impl CompatMode {
                     s("--verify"),
                     s("--verify-json"),
                     s(verify_json),
+                    s("--base-env=minimal"),
                     s("--"),
                 ]
             }
@@ -167,6 +168,7 @@ impl CompatMode {
                 v.push(s("--verify"));
                 v.push(s("--verify-json"));
                 v.push(s(verify_json));
+                v.push(s("--base-env=minimal"));
                 v.push(s("--"));
                 v
             }

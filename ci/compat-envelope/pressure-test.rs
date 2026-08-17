@@ -51,9 +51,10 @@ const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
 const TRACKED_CELLS_SCHEMA: u64 = 3;
 const RUN_SCHEMA: u64 = 3;
-const REQUIRED_BUILD_TAGS: [&str; 4] = [
+const REQUIRED_BUILD_TAGS: [&str; 5] = [
     "build.workspace",
     "build.runtime_release",
+    "check.validation_capabilities",
     "build.e2e_artifact",
     "build.liteinst_runtime_release",
 ];
@@ -1585,6 +1586,58 @@ fn print_exact_manifest_command(
     Ok(())
 }
 
+fn custom_command_requires_validation_capabilities(command: &str) -> bool {
+    !command.split_ascii_whitespace().any(|arg| {
+        matches!(
+            arg,
+            "--no-virtualize-cpuid" | "--max-timeslice=disabled"
+        )
+    })
+}
+
+fn cell_requires_validation_capabilities(root: &Path, cell: &CellId) -> Result<bool, String> {
+    if !matches!(cell.backend.as_str(), "ptrace" | "liteinst") {
+        return Ok(false);
+    }
+    match cell.mode.as_str() {
+        "verify" | "chaos" => Ok(true),
+        "replay" | "naked" => Ok(false),
+        "custom" => {
+            let output = Command::new(root.join("tests/manifest-cli.rs"))
+                .args([
+                    "get",
+                    &cell.test,
+                    "--mode",
+                    "custom",
+                    "--backend",
+                    &cell.backend,
+                ])
+                .current_dir(root)
+                .output()
+                .map_err(|e| {
+                    format!(
+                        "cannot inspect custom validation arguments for {}/{}/{}: {e}",
+                        cell.test, cell.mode, cell.backend
+                    )
+                })?;
+            if !output.status.success() {
+                return Err(format!(
+                    "manifest-cli refused custom validation arguments for {}/{}/{}: {}",
+                    cell.test,
+                    cell.mode,
+                    cell.backend,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let command = String::from_utf8_lossy(&output.stdout);
+            Ok(custom_command_requires_validation_capabilities(&command))
+        }
+        other => Err(format!(
+            "unknown compatibility mode {other} while deriving validation capabilities"
+        )),
+    }
+}
+
 fn require_empty_result_dir(results: &Path) -> Result<(), String> {
     if !results.exists() {
         return Ok(());
@@ -2253,6 +2306,7 @@ fn checkout_temporary_environment(root: &Path, tag: &str) -> BTreeMap<String, St
 fn required_build_tags(
     exact_cell: Option<(&str, &str)>,
     includes_liteinst: bool,
+    includes_capability_backend: bool,
 ) -> BTreeSet<&'static str> {
     // Batch cells consume the canonical prebuilt artifact, so retain the build
     // nodes that produce it. The complete metadata audit is not a product-build
@@ -2261,18 +2315,34 @@ fn required_build_tags(
     // runtime build is retained only when a selected cell uses it. Exact
     // ptrace/KVM cells use a direct Hermit build, DBT/SaBRe retain the canonical
     // third-party runtime build, LiteInst retains its build chain, and a naked
-    // native command needs no Hermit build.
+    // native command needs no Hermit build. The suite-level capability check is
+    // ptrace-host evidence used by ptrace and the LiteInst/ptrace hybrid; exact
+    // DBT, SaBRe, KVM, and native cells do not claim it as evidence for their
+    // backend. Batches retain it only when they contain ptrace or LiteInst.
     if let Some((mode, backend)) = exact_cell {
         if mode == "naked" && backend == "native" {
             return BTreeSet::new();
         }
+        if backend == "ptrace" && includes_capability_backend {
+            return BTreeSet::from([
+                "build.runtime_release",
+                "check.validation_capabilities",
+            ]);
+        }
         if backend != "liteinst" {
             return BTreeSet::from(["build.runtime_release"]);
         }
+        return REQUIRED_BUILD_TAGS
+            .into_iter()
+            .filter(|tag| includes_capability_backend || *tag != "check.validation_capabilities")
+            .collect();
     }
     REQUIRED_BUILD_TAGS
         .into_iter()
-        .filter(|tag| includes_liteinst || *tag != "build.liteinst_runtime_release")
+        .filter(|tag| {
+            (includes_liteinst || *tag != "build.liteinst_runtime_release")
+                && (includes_capability_backend || *tag != "check.validation_capabilities")
+        })
         .collect()
 }
 
@@ -2288,7 +2358,11 @@ fn required_builds_complete(results: &Path, metadata: &RunMetadata) -> bool {
             )
         });
     let includes_liteinst = metadata.cells.iter().any(|cell| cell.backend == "liteinst");
-    required_build_tags(exact_cell, includes_liteinst)
+    let includes_capability_backend = metadata.cells.iter().any(|cell| {
+        matches!(cell.backend.as_str(), "ptrace" | "liteinst")
+            && matches!(cell.mode.as_str(), "verify" | "chaos" | "custom")
+    });
+    required_build_tags(exact_cell, includes_liteinst, includes_capability_backend)
         .iter()
         .all(|tag| build_marker(results, tag).is_file())
 }
@@ -2298,6 +2372,7 @@ fn selected_cell_dependencies(
     shared_preparation: bool,
     mode: &str,
     backend: &str,
+    requires_validation_capabilities: bool,
     preparation_tag: Option<&str>,
 ) -> Vec<String> {
     if exact_cell {
@@ -2310,11 +2385,16 @@ fn selected_cell_dependencies(
             );
         }
         if !(mode == "naked" && backend == "native") {
-            deps.push(if backend == "liteinst" {
-                "build.liteinst_runtime_release".into()
+            if backend == "liteinst" {
+                if requires_validation_capabilities {
+                    deps.push("check.validation_capabilities".into());
+                }
+                deps.push("build.liteinst_runtime_release".into());
+            } else if backend == "ptrace" && requires_validation_capabilities {
+                deps.push("check.validation_capabilities".into());
             } else {
-                "build.runtime_release".into()
-            });
+                deps.push("build.runtime_release".into());
+            }
         }
         return deps;
     }
@@ -2429,6 +2509,13 @@ fn write_plan_after_scorecard_check(
     let canonical =
         dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
     let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
+    let mut capability_cells = BTreeSet::new();
+    for tracked in &cells {
+        if cell_requires_validation_capabilities(root, &tracked.id)? {
+            capability_cells.insert(tracked.id.clone());
+        }
+    }
+    let includes_capability_backend = !capability_cells.is_empty();
     let exact_cell = selection.is_exact().then(|| {
         (
             selection.mode.as_deref().expect("exact selection has mode"),
@@ -2438,7 +2525,11 @@ fn write_plan_after_scorecard_check(
                 .expect("exact selection has backend"),
         )
     });
-    let required_builds = required_build_tags(exact_cell, includes_liteinst);
+    let required_builds = required_build_tags(
+        exact_cell,
+        includes_liteinst,
+        includes_capability_backend,
+    );
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
@@ -2448,7 +2539,17 @@ fn write_plan_after_scorecard_check(
             step.env.extend(checkout_temporary_environment(root, &tag));
             let direct_backend_build = exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
-            let command = if direct_backend_build {
+            if (!includes_capability_backend && tag == "build.e2e_artifact")
+                || (exact_cell.is_some()
+                    && !matches!(selection.backend.as_deref(), Some("ptrace" | "liteinst")))
+            {
+                step.deps
+                    .retain(|dependency| dependency != "check.validation_capabilities");
+            }
+            let command = if exact_cell.is_some() && tag == "check.validation_capabilities" {
+                step.deps = vec!["build.runtime_release".into()];
+                "./ci/check-validation-capabilities.sh target/release/hermit".into()
+            } else if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
             } else {
                 step.cmd.clone()
@@ -2528,7 +2629,14 @@ fn write_plan_after_scorecard_check(
         );
         let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds)?;
         let preparation_deps = if selection.is_exact() {
-            selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
+            selected_cell_dependencies(
+                true,
+                false,
+                &cell.mode,
+                &cell.backend,
+                capability_cells.contains(&cell),
+                None,
+            )
         } else {
             vec!["build.e2e_artifact".into()]
         };
@@ -2676,6 +2784,7 @@ fn write_plan_after_scorecard_check(
                 selection.uses_shared_preparation(),
                 &cell.mode,
                 &cell.backend,
+                capability_cells.contains(cell),
                 preparation_tags.get(&cell.test).map(String::as_str),
             );
             steps.push(Step {
@@ -2752,6 +2861,7 @@ fn write_plan_after_scorecard_check(
     let mut dag = canonical;
     dag.resource_caps = BTreeMap::from([
         ("cargo_writer".into(), 1),
+        ("hermit_guest".into(), 1),
         ("manifest_guest".into(), selection.scheduler_jobs()),
         ("kvm".into(), 1),
     ]);
@@ -4546,16 +4656,38 @@ fn self_test(root: &Path) -> Result<(), String> {
         .into_iter()
         .filter(|tag| *tag != "build.liteinst_runtime_release")
         .collect();
-    let lean_exact = BTreeSet::from(["build.runtime_release"]);
-    let exact_runtime_backends_ok = ["ptrace", "kvm", "dbt", "sabre"]
+    let ptrace_exact = BTreeSet::from([
+        "build.runtime_release",
+        "check.validation_capabilities",
+    ]);
+    if !custom_command_requires_validation_capabilities(
+        "hermit run --backend ptrace --base-env=minimal -- guest",
+    ) || custom_command_requires_validation_capabilities(
+        "hermit run --backend ptrace --no-virtualize-cpuid -- guest",
+    ) || custom_command_requires_validation_capabilities(
+        "hermit run --backend liteinst --max-timeslice=disabled -- guest",
+    ) {
+        return Err(
+            "custom pressure capability policy lost its default/explicit-relaxation bracket"
+                .into(),
+        );
+    }
+    let other_exact = BTreeSet::from(["build.runtime_release"]);
+    let exact_runtime_backends_ok = ["kvm", "dbt", "sabre"]
         .into_iter()
-        .all(|backend| required_build_tags(Some(("verify", backend)), false) == lean_exact);
-    if !exact_runtime_backends_ok
-        || !required_build_tags(Some(("naked", "native")), false).is_empty()
-        || required_build_tags(Some(("verify", "liteinst")), true)
-            != BTreeSet::from(REQUIRED_BUILD_TAGS)
-        || required_build_tags(None, false) != batch_without_liteinst
-        || required_build_tags(None, true) != BTreeSet::from(REQUIRED_BUILD_TAGS)
+        .all(|backend| {
+            required_build_tags(Some(("verify", backend)), false, false) == other_exact
+        });
+    let liteinst_exact = BTreeSet::from(REQUIRED_BUILD_TAGS);
+    if required_build_tags(Some(("verify", "ptrace")), false, true) != ptrace_exact
+        || required_build_tags(Some(("replay", "ptrace")), false, false) != other_exact
+        || !exact_runtime_backends_ok
+        || !required_build_tags(Some(("naked", "native")), false, false).is_empty()
+        || required_build_tags(Some(("verify", "liteinst")), true, true) != liteinst_exact
+        || required_build_tags(None, false, true) != batch_without_liteinst
+        || required_build_tags(None, false, false)
+            != BTreeSet::from(["build.workspace", "build.runtime_release", "build.e2e_artifact"])
+        || required_build_tags(None, true, true) != BTreeSet::from(REQUIRED_BUILD_TAGS)
     {
         return Err(
             "selected-cell build closure lost a required node or built LiteInst for a sample without LiteInst"
@@ -4563,23 +4695,30 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let non_liteinst_batch =
-        selected_cell_dependencies(false, true, "verify", "ptrace", Some("prepare.fixture"));
+        selected_cell_dependencies(false, true, "verify", "ptrace", true, Some("prepare.fixture"));
     let liteinst_batch =
-        selected_cell_dependencies(false, true, "verify", "liteinst", Some("prepare.fixture"));
+        selected_cell_dependencies(false, true, "verify", "liteinst", true, Some("prepare.fixture"));
     let exact_repeated =
-        selected_cell_dependencies(true, true, "verify", "ptrace", Some("prepare.fixture"));
+        selected_cell_dependencies(true, true, "verify", "ptrace", true, Some("prepare.fixture"));
     if non_liteinst_batch.contains(&"build.liteinst_runtime_release".to_string())
         || !liteinst_batch.contains(&"build.liteinst_runtime_release".to_string())
         || exact_repeated
             != [
                 "prepare.fixture".to_string(),
-                "build.runtime_release".to_string(),
+                "check.validation_capabilities".to_string(),
             ]
-        || !selected_cell_dependencies(true, false, "naked", "native", None).is_empty()
-        || selected_cell_dependencies(true, false, "verify", "ptrace", None)
+        || !selected_cell_dependencies(true, false, "naked", "native", false, None).is_empty()
+        || selected_cell_dependencies(true, false, "verify", "ptrace", true, None)
+            != ["check.validation_capabilities".to_string()]
+        || selected_cell_dependencies(true, false, "replay", "ptrace", false, None)
             != ["build.runtime_release".to_string()]
-        || selected_cell_dependencies(true, false, "verify", "liteinst", None)
-            != ["build.liteinst_runtime_release".to_string()]
+        || selected_cell_dependencies(true, false, "verify", "dbt", false, None)
+            != ["build.runtime_release".to_string()]
+        || selected_cell_dependencies(true, false, "verify", "liteinst", true, None)
+            != [
+                "check.validation_capabilities".to_string(),
+                "build.liteinst_runtime_release".to_string(),
+            ]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
@@ -4589,7 +4728,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read canonical build-dependency fixture: {e}"))?;
     let canonical_build_dag = dag_from_json(&canonical_build_text)
         .map_err(|e| format!("cannot parse canonical build-dependency fixture: {e}"))?;
-    let all_required_builds = required_build_tags(None, true);
+    let all_required_builds = required_build_tags(None, true, true);
     let mut checked_current_builds = 0usize;
     for canonical_step in canonical_build_dag
         .steps
@@ -5272,6 +5411,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if jobs_seven_metadata.jobs != 7
         || jobs_seven_dag.resource_caps.get("manifest_guest") != Some(&7)
+        || jobs_seven_dag.resource_caps.get("hermit_guest") != Some(&1)
         || jobs_seven_dag.resource_caps.get("kvm") != Some(&1)
         || jobs_seven_dag.resource_caps.get("cargo_writer") != Some(&1)
     {
@@ -5325,6 +5465,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             .resources
             .contains_key("cargo_writer")
         || repeated_dag.resource_caps.get("manifest_guest") != Some(&4)
+        || repeated_dag.resource_caps.get("hermit_guest") != Some(&1)
         || repeated_dag.resource_caps.get("kvm") != Some(&1)
     {
         return Err(
@@ -5367,13 +5508,17 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("sanitized step identity escaped the checkout-local temporary root".into());
     }
     let preparation_tag = preparation_steps[0].tag();
-    if preparation_steps[0].deps != ["build.runtime_release".to_string()] {
-        return Err("repeated exact preparation does not depend on its direct Hermit build".into());
+    if preparation_steps[0].deps != ["check.validation_capabilities".to_string()] {
+        return Err(
+            "repeated exact preparation does not depend on validation capabilities".into(),
+        );
     }
     let repeated_tags: BTreeSet<_> = repeated_cell_steps.iter().map(|step| step.tag()).collect();
     for step in &repeated_cell_steps {
         if !step.deps.contains(&preparation_tag)
-            || !step.deps.contains(&"build.runtime_release".to_string())
+            || !step
+                .deps
+                .contains(&"check.validation_capabilities".to_string())
             || step.deps.iter().any(|dep| repeated_tags.contains(dep))
             || !step.cmd.contains("--prebuilt")
             || !step
@@ -5490,8 +5635,17 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::write(&runtime_marker, "ok\n")
         .map_err(|e| format!("cannot write repeated runtime marker: {e}"))?;
+    if required_builds_complete(&repeated_build_results, &repeated_metadata) {
+        return Err("repeated exact ptrace setup accepted missing capability evidence".into());
+    }
+    let capability_marker =
+        build_marker(&repeated_build_results, "check.validation_capabilities");
+    fs::create_dir_all(capability_marker.parent().expect("capability marker has parent"))
+        .map_err(|e| format!("cannot create capability-marker fixture: {e}"))?;
+    fs::write(&capability_marker, "ok\n")
+        .map_err(|e| format!("cannot write repeated capability marker: {e}"))?;
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
-        return Err("repeated exact ptrace setup refused its direct Hermit build".into());
+        return Err("repeated exact ptrace setup refused complete capability evidence".into());
     }
 
     let green_batch_selection = CellSelection {
@@ -5527,6 +5681,87 @@ fn self_test(root: &Path) -> Result<(), String> {
     if green_sample.selected.len() != 2 || green_sample.eligible_cells != expected_green_ids.len() {
         return Err(
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
+        );
+    }
+    let replay_cell = tracked
+        .cells
+        .iter()
+        .find(|cell| {
+            cell.id.mode == "replay"
+                && cell.id.backend == "ptrace"
+                && (!cell.enabled || cell.status != "green")
+        })
+        .ok_or("pressure self-test needs one red ptrace replay cell")?;
+    let exact_replay_results = scratch.join("exact-ptrace-replay-plan");
+    let exact_replay_selection = CellSelection {
+        test: Some(replay_cell.id.test.clone()),
+        mode: Some("replay".into()),
+        backend: Some("ptrace".into()),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let (_, exact_replay_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &exact_replay_results,
+        &exact_replay_results.join("dag.json"),
+        &exact_replay_selection,
+    )?;
+    if exact_replay_dag
+        .steps
+        .iter()
+        .any(|step| step.tag() == "check.validation_capabilities")
+        || exact_replay_dag.steps.iter().any(|step| {
+            step.deps
+                .iter()
+                .any(|dep| dep == "check.validation_capabilities")
+        })
+    {
+        return Err("exact ptrace replay retained verify/chaos capabilities".into());
+    }
+    let reduced_kvm_results = scratch.join("reduced-kvm-batch-plan");
+    let reduced_kvm_selection = CellSelection {
+        backend: Some("kvm".into()),
+        sample: Some(2),
+        seed: Some(7),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let (reduced_kvm_metadata, reduced_kvm_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &reduced_kvm_results,
+        &reduced_kvm_results.join("dag.json"),
+        &reduced_kvm_selection,
+    )?;
+    if reduced_kvm_metadata.cells.len() != 2
+        || reduced_kvm_metadata
+            .cells
+            .iter()
+            .any(|cell| cell.backend != "kvm")
+        || reduced_kvm_dag
+            .steps
+            .iter()
+            .any(|step| step.tag() == "check.validation_capabilities")
+    {
+        return Err("reduced KVM-only batch retained ptrace capability evidence".into());
+    }
+    let reduced_artifact = reduced_kvm_dag
+        .steps
+        .iter()
+        .find(|step| step.tag() == "build.e2e_artifact")
+        .ok_or("reduced KVM-only batch lost its prebuilt artifact publisher")?;
+    if reduced_artifact
+        .deps
+        .iter()
+        .any(|dep| dep == "check.validation_capabilities")
+        || reduced_kvm_dag.steps.iter().any(|step| {
+            step.deps
+                .iter()
+                .any(|dep| dep == "check.validation_capabilities")
+        })
+    {
+        return Err(
+            "reduced KVM-only batch retained an artifact or consumer edge to ptrace capabilities"
+                .into(),
         );
     }
     let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
@@ -5601,14 +5836,20 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .any(|cell| cell.backend == "liteinst");
     let expected_green_build_tags: BTreeSet<String> =
-        required_build_tags(None, green_batch_includes_liteinst)
+        required_build_tags(
+            None,
+            green_batch_includes_liteinst,
+            expected_green_ids
+                .iter()
+                .any(|cell| matches!(cell.backend.as_str(), "ptrace" | "liteinst")),
+        )
             .into_iter()
             .map(str::to_string)
             .collect();
     let actual_green_build_tags: BTreeSet<String> = green_batch_dag
         .steps
         .iter()
-        .filter(|step| step.group == "build")
+        .filter(|step| expected_green_build_tags.contains(&step.tag()))
         .map(|step| step.tag())
         .collect();
     if actual_green_build_tags != expected_green_build_tags
@@ -5624,13 +5865,18 @@ fn self_test(root: &Path) -> Result<(), String> {
     for step in green_batch_dag
         .steps
         .iter()
-        .filter(|step| step.group == "build")
+        .filter(|step| expected_green_build_tags.contains(&step.tag()))
     {
         let deps: BTreeSet<&str> = step.deps.iter().map(String::as_str).collect();
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => BTreeSet::from(["build.workspace", "build.runtime_release"]),
+            "check.validation_capabilities" => BTreeSet::from(["build.workspace"]),
+            "build.e2e_artifact" => BTreeSet::from([
+                "build.workspace",
+                "build.runtime_release",
+                "check.validation_capabilities",
+            ]),
             "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
@@ -5733,7 +5979,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         format!("{}\n", dag_to_json(&forged_zero_dag)),
     )
     .map_err(|e| format!("cannot write forged-zero DAG: {e}"))?;
-    for tag in required_build_tags(None, false) {
+    for tag in required_build_tags(None, false, false) {
         let marker = build_marker(&forged_zero_results, tag);
         fs::create_dir_all(marker.parent().expect("build marker has parent"))
             .map_err(|e| format!("cannot create forged-zero build marker: {e}"))?;

@@ -22,10 +22,9 @@
 //! # Managed runtimes and interpreters
 //!
 //! This file also covers CPython, Lua, the Go runtime, and the JVM. The results
-//! below were measured with the ptrace backend, `--log=info`, and relaxations
-//! `--no-virtualize-cpuid --max-timeslice=disabled` (which keep strict
-//! determinism; they only accommodate hosts without CPUID/PMU interception),
-//! using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
+//! below were measured with the ptrace backend, `--log=info`, the minimal base
+//! environment, CPUID interception, and the default PMU-backed maximum
+//! timeslice, using Go 1.26.4 (Red Hat 1.26.4-1.el9) and OpenJDK 1.8.0_492.
 //!
 //! Two distinct outcomes were observed and are encoded as separate tests:
 //!
@@ -234,11 +233,7 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             "run",
             "--strict",
             "--verify",
-            // The test does not assert CPUID or PMU behavior; these flags
-            // keep the test portable to runners without those capabilities. They do not
-            // weakening determinism (they do not disable strict mode).
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(program)
@@ -433,13 +428,7 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
         .arg(format!("--verify-json={}", report_path.display()))
         .arg("--base-env=minimal")
         .arg(format!("--env=HOME={}", positive_home.path().display()))
-        .args([
-            // The test does not assert CPUID or PMU behavior; these flags keep
-            // it portable without weakening strict determinism.
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .arg("--")
         .arg(program)
         .args(["-I", "-B", "-c"])
         .arg(guest);
@@ -508,10 +497,9 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
 /// repeat run (L2).
 ///
 /// Consequently these JVM tests require accessible hardware performance counters
-/// (a working PMU), like the bulk of Hermit's determinism suite. On a host
-/// without a usable PMU they will fail; report that as a host limitation rather
-/// than weakening the assertion. CPUID interception is still relaxed via
-/// `--no-virtualize-cpuid`, which does not weaken strict determinism.
+/// (a working PMU) and CPUID interception, like the bulk of Hermit's determinism
+/// suite. On a host without either capability they fail rather than weakening
+/// the assertion.
 fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
     let _guard = hermit_run_lock();
 
@@ -525,9 +513,7 @@ fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
             "run",
             "--strict",
             "--verify",
-            // Relax only CPUID virtualization; keep RCB preemption on so the
-            // JVM's internal threads make progress (see the doc comment).
-            "--no-virtualize-cpuid",
+            "--base-env=minimal",
             "--",
         ])
         .arg(program)
@@ -786,22 +772,14 @@ fn compile_java(source: &str, class_name: &str) -> PathBuf {
 }
 
 /// Run `hermit run --strict -- <program> <args>` once (no `--verify`) and return
-/// the process output. Uses the same determinism-preserving relaxations as
-/// [`assert_l2_under_strict_verify`].
+/// the process output.
 fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=off",
-            "run",
-            "--strict",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["--log=off", "run", "--strict", "--"])
         .arg(program)
         .args(args);
 
@@ -884,10 +862,9 @@ fn java_threads_are_deterministic_under_strict_verify() {
     assert_l2_jvm_under_strict_verify(&java, &args);
 }
 
-// Small JVM JIT + runtime programs. These use `assert_l2_jvm_under_strict_verify`
-// (RCB preemption enabled) rather than the `--max-timeslice=disabled` helper the
-// startup-only `java_hello`/`java_threads` tests use, because a compute-bound JVM
-// livelocks under Hermit without preemption; see that helper's doc comment.
+// Small JVM JIT + runtime programs use `assert_l2_jvm_under_strict_verify` with
+// RCB preemption enabled because a compute-bound JVM livelocks under Hermit
+// without preemption; see that helper's doc comment.
 
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + a JDK + a usable PMU"]
@@ -1058,14 +1035,7 @@ fn run_make_under_strict(make: &Path, project_dir: &Path) -> Output {
         .args(["--kill-after", HERMIT_VERIFY_KILL_AFTER])
         .arg(hermit_verify_timeout())
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=off",
-            "run",
-            "--strict",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["--log=off", "run", "--strict", "--"])
         .arg(make)
         .args(["-B", "app"])
         .current_dir(project_dir);

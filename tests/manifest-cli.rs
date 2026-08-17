@@ -239,7 +239,7 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
 fn hermit_command(
     mode: &str,
     backend: &str,
-    lane: &str,
+    _lane: &str,
     timeout: i64,
     seed: Option<i64>,
     mode_args: &[String],
@@ -247,12 +247,8 @@ fn hermit_command(
     extra: &[String],
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile: Vec<String> = if portable {
-        vec![
-            "--no-virtualize-cpuid".to_owned(),
-            "--max-timeslice=disabled".to_owned(),
-        ]
+    let profile: Vec<String> = if mode == "verify" {
+        vec!["--base-env=minimal".to_owned()]
     } else {
         Vec::new()
     };
@@ -733,7 +729,9 @@ fn self_test() -> ExitCode {
     assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
     assert!(replay.contains("(.comparison.strictness == \"canonical\")"));
     assert!(replay.contains("(.compared_log_messages.left // 0) > 0"));
+    assert!(!replay.contains("--base-env=minimal"));
     assert!(!replay.contains("--no-virtualize-cpuid"));
+    assert!(!replay.contains("--max-timeslice=disabled"));
 
     let chaos = hermit_command(
         "chaos",
@@ -751,7 +749,8 @@ fn self_test() -> ExitCode {
     assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
     assert!(chaos.contains("(.comparison.strictness == \"canonical\")"));
     assert!(chaos.contains("--log=info"));
-    assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+    assert!(!chaos.contains("--no-virtualize-cpuid"));
+    assert!(!chaos.contains("--max-timeslice=disabled"));
     let seeded_chaos: Value = "seeds = [7, 9]".parse().unwrap();
     let no_seed_chaos = Value::Table(Default::default());
     assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
@@ -788,8 +787,23 @@ fn self_test() -> ExitCode {
         "guest",
     );
     assert!(verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
+    assert!(verify.contains("--base-env=minimal"));
+    assert!(!verify.contains("--no-virtualize-cpuid"));
+    assert!(!verify.contains("--max-timeslice=disabled"));
     assert!(verify.contains("(.bitwise_parity == true)"));
 
+    let privileged_verify = hermit_command(
+        "verify",
+        "ptrace",
+        "privileged",
+        60,
+        None,
+        &[],
+        "info",
+        &[],
+        "guest",
+    );
+    assert!(privileged_verify.contains("--base-env=minimal"));
     let canonical = r#"{"verified":true,"verdict":"matched","bitwise_parity":true,"comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":2,"right":2}}"#;
     assert_eq!(
         executable_receipt_bracket(canonical, 23).code(),

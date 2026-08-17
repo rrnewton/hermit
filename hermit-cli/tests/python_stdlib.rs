@@ -116,14 +116,7 @@ fn run_stdlib_tests(python: &Path) -> Output {
         .arg(format!("--kill-after={HERMIT_KILL_GRACE_SECONDS}s"))
         .arg(format!("{HERMIT_TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--strict", "--base-env=minimal", "--"])
         .arg(python)
         .args(["-c", UNITTEST_DRIVER])
         .args(MODULES);

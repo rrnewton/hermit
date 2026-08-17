@@ -56,7 +56,7 @@ liteinst = "Chaos scheduling is unsupported by LiteInst"
 
 [test.modes.custom]
 ci = true
-args = ["--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"]
+args = ["--base-env=minimal"]
 assert = { runs = 5, repeat_identical = true }
 backends_enabled = ["ptrace", "liteinst"]
 [test.modes.custom.backends_disabled]

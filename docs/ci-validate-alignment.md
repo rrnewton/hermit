@@ -12,7 +12,7 @@ Hermit CI is partitioned by host capability, not by test duration:
 
 | Lane | Workflow and runner | Local command | Capability contract |
 | --- | --- | --- | --- |
-| Portable | `ci-portable.yml`, `ubuntu-latest` | `./scripts/validate.rs portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
+| Portable | `ci-portable.yml`, `ubuntu-latest` | `./scripts/validate.rs portable-only --no-label-pr` | No KVM; verify/chaos request CPUID virtualization and the default PMU-backed maximum timeslice |
 | Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `./scripts/validate.rs --privileged-only --no-label-pr` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
 
 The portable workflow is the required broad product gate. The privileged
@@ -54,8 +54,15 @@ The modes have distinct contracts:
 | `chaos` | Require cross-seed diversity and exact within-seed reproduction |
 | `custom` | Run Hermit with manifest-declared edge-case arguments |
 
-Portable Hermit cells add `--no-virtualize-cpuid` and
-`--max-timeslice=disabled`. Every result records the source SHA and dirty bit,
+Portable verify cells add `--base-env=minimal`; chaos already uses the same
+controlled environment. Neither mode disables CPUID virtualization or the
+default PMU-backed maximum timeslice. Replay keeps its separate record/replay
+arguments. Before dependent portable nodes run, a suite-level ptrace check
+requires four delivered retired-branch PMU overflows and proves that a guest
+observes Hermit's synthetic CPUID identity. This is host-capability evidence,
+not a per-backend typed verification verdict. The workflow remains on
+`ubuntu-latest`; without an owner-provided capable label it is expected to fail
+this hard requirement. Every result records the source SHA and dirty bit,
 test and binary hashes, effective arguments, relaxations, lane, mode, backend,
 duration, and outcome. JSONL, JUnit XML, and a denominator-aware summary are
 stored below `target/e2e/` and uploaded by both workflows.

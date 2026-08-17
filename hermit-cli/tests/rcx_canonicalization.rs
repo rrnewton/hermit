@@ -83,17 +83,7 @@ fn rcx_guest() -> &'static Path {
 /// Run the guest once under `hermit run --strict` and return its output.
 fn run_under_hermit_strict() -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=off",
-        "run",
-        "--strict",
-        // Match the other strict e2e tests: these relaxations keep the test
-        // usable on VMs without CPUID interception without weakening strict mode.
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--base-env=minimal",
-        "--",
-    ]);
+    command.args(["--log=off", "run", "--strict", "--base-env=minimal", "--"]);
     command.arg(rcx_guest());
     command
         .output()

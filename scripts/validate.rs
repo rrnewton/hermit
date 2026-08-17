@@ -279,7 +279,7 @@ fn usage() -> &'static str {
      Levels:\n\
      \x20 quick            Core ptrace run/verify/record smoke tests; no alternate backends.\n\
      \x20 portable-only    Portable build, test, lint, format, and doc gates matching\n\
-     \x20                  GitHub-managed portable CI; no PMU or namespace requirements.\n\
+     \x20                  GitHub-managed portable CI; requires PMU overflow delivery and CPUID interception.\n\
      \x20 full             quick plus the complete suite and DBI/KVM gates (default).\n\
      \x20 super            Repeat stress probes under moderate oversubscription.\n\
      \x20 --quick          Alias for the quick level.\n\
@@ -293,9 +293,10 @@ fn usage() -> &'static str {
      \x20 --e9patch-compat-only         Gate core + installed e9patch canonical apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
-     \x20 --portable-only               No PMU/CPUID hardware required.\n\
+     \x20 --portable-only               Requires PMU overflow delivery and CPUID interception; no KVM.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
-     \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps).\n\
+     \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard; portable verification\n\
+     \x20                                  also runs the same-host capability preflight.\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
@@ -982,6 +983,45 @@ fn self_test() -> Result<(), String> {
             return Err(format!("force-full: focused mode {m} must be refused"));
         }
     }
+    let portable_verify = CompatMode::PortableStrict.run_args("true", "", "/tmp/verify.json");
+    let expected_portable_verify = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-json",
+        "/tmp/verify.json",
+        "--base-env=minimal",
+        "--",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if portable_verify != expected_portable_verify {
+        return Err(format!(
+            "portable verify arguments drifted: {portable_verify:?}"
+        ));
+    }
+    for mode in [CompatMode::Strict, CompatMode::Sabre, CompatMode::E9patch] {
+        let args = mode.run_args("true", "/tmp/nsswitch.conf", "/tmp/verify.json");
+        if !args.iter().any(|arg| arg == "--base-env=minimal")
+            || args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--no-virtualize-cpuid" | "--max-timeslice=disabled"
+                )
+            })
+        {
+            return Err(format!("{mode:?} verify arguments violate mode policy: {args:?}"));
+        }
+    }
+    let replay = CompatMode::Rr.run_args("true", "", "/tmp/verify.json");
+    if replay.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--base-env=minimal" | "--no-virtualize-cpuid" | "--max-timeslice=disabled"
+        )
+    }) {
+        return Err(format!("replay arguments inherited run-mode policy: {replay:?}"));
+    }
     // Shell quoting: a corpus argv element must survive round-tripping through
     // `bash -c` byte-for-byte. A silent mangling here would change what the guest
     // runs while every count still looked right.
@@ -1220,7 +1260,11 @@ cleared-caps refusal names {} starved step(s)",
             .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
         if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
             || !artifact.cmd.ends_with(" target/install_pkg")
-            || !["build.workspace", "build.runtime_release"]
+            || ![
+                "build.workspace",
+                "build.runtime_release",
+                "check.validation_capabilities",
+            ]
                 .iter()
                 .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
         {
@@ -1228,6 +1272,37 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
                     .into(),
             );
+        }
+        let capability = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "check.validation_capabilities")
+            .ok_or("full-plan bracket: portable validation capability check disappeared")?;
+        if capability.cmd != "./ci/check-validation-capabilities.sh target/debug/hermit"
+            || capability.deps != ["build.workspace"]
+        {
+            return Err(format!(
+                "full-plan bracket: portable validation capability check drifted: {} deps={:?}",
+                capability.cmd, capability.deps
+            ));
+        }
+        for tag in ["test.dbt_parity", "test.envelope_levels", "test.strict_compat"] {
+            let consumer = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| s.tag() == tag)
+                .ok_or_else(|| format!("full-plan bracket: {tag} disappeared"))?;
+            if !consumer
+                .deps
+                .iter()
+                .any(|dep| dep == "check.validation_capabilities")
+            {
+                return Err(format!(
+                    "full-plan bracket: {tag} can run without validation capabilities"
+                ));
+            }
         }
         let manifest_consumers: Vec<_> = full
             .cfg
@@ -1334,8 +1409,99 @@ cleared-caps refusal names {} starved step(s)",
         {
             return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
         }
+
+        let quick_args = parse_argv(&["quick".into(), "--no-label-pr".into()])
+            .map_err(|rc| format!("capability bracket: quick plan refused rc={rc}"))?;
+        let quick = build_plan(&root, &quick_args, &tmp)?;
+        for tag in ["quick.e2e_verify", "quick.verify_smoke"] {
+            let step = quick
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| format!("capability bracket: quick plan lost {tag}"))?;
+            if !step
+                .deps
+                .iter()
+                .any(|dep| dep == "quick.validation_capabilities")
+            {
+                return Err(format!(
+                    "capability bracket: {tag} can bypass the quick capability node"
+                ));
+            }
+        }
+        let run_smoke = quick
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "quick.run_smoke")
+            .ok_or("capability bracket: quick plan lost quick.run_smoke")?;
+        if run_smoke
+            .deps
+            .iter()
+            .any(|dep| dep == "quick.validation_capabilities")
+        {
+            return Err(
+                "capability bracket: ordinary quick run acquired verification prerequisites"
+                    .into(),
+            );
+        }
+        let replay_smoke = quick
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "quick.record_replay_smoke")
+            .ok_or("capability bracket: quick plan lost quick.record_replay_smoke")?;
+        if replay_smoke
+            .deps
+            .iter()
+            .any(|dep| dep == "quick.validation_capabilities")
+        {
+            return Err("capability bracket: quick replay inherited verify/chaos prerequisites".into());
+        }
+
+        let only_changed_args = parse_argv(&[
+            "--only".into(),
+            "portable".into(),
+            "test.sabre_examples".into(),
+        ])
+        .map_err(|rc| format!("capability bracket: portable changed shard refused rc={rc}"))?;
+        let only_changed = build_plan(&root, &only_changed_args, &tmp)?;
+        let changed_cmd = only_changed
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag().starts_with("shard.portable_"))
+            .ok_or("capability bracket: portable changed shard disappeared")?
+            .cmd
+            .clone();
+        if changed_cmd != "./ci/run-node.sh portable test.sabre_examples" {
+            return Err(format!(
+                "capability bracket: changed portable shard bypasses the run-node front door: {changed_cmd}"
+            ));
+        }
+        let only_build_args = parse_argv(&[
+            "--only".into(),
+            "portable".into(),
+            "build.workspace".into(),
+        ])
+        .map_err(|rc| format!("capability bracket: portable build shard refused rc={rc}"))?;
+        let only_build = build_plan(&root, &only_build_args, &tmp)?;
+        let build_cmd = only_build
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag().starts_with("shard.portable_"))
+            .ok_or("capability bracket: portable build shard disappeared")?
+            .cmd
+            .clone();
+        if build_cmd != "./ci/run-node.sh portable build.workspace" {
+            return Err(format!(
+                "capability bracket: build-only portable shard drifted from the run-node front door: {build_cmd}"
+            ));
+        }
         println!(
-            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse + quick/only capability routing bracketed",
             full.cfg.steps.len()
         );
     }
@@ -1562,6 +1728,31 @@ fn super_plan_bracket() -> Result<(), String> {
     ] {
         if !tags.contains(want) {
             return Err(format!("super plan: node {want} is missing"));
+        }
+    }
+    for guarded in [
+        "super.chaos_hello_race_verification_diagnostic",
+        "super.managed_jvm_strict_verify_diagnostics",
+        "super.ipc_determinism_diagnostic",
+        "super.random_source_determinism_diagnostic",
+        "super.threaded_integration_matrix_diagnostic",
+        "super.weekly_relaxed_default_mode_cases",
+        "super.pmu_buck_chaos_cases",
+    ] {
+        let step = plan
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == guarded)
+            .ok_or_else(|| format!("super plan: guarded node {guarded} is missing"))?;
+        if !step
+            .deps
+            .iter()
+            .any(|dep| dep == "super.validation_capabilities")
+        {
+            return Err(format!(
+                "super plan: {guarded} can bypass validation capabilities"
+            ));
         }
     }
     if !plan.super_mode {
@@ -2420,7 +2611,20 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // The corpus needs a release Hermit and the functional fixtures; both are
         // DAG nodes so they are boxed and timed like everything else.
         steps.push(build_release_hermit_node(compat_gate, &hermit_bin));
-        steps.push(prepare_fixtures_node("compatprep.fixtures", &fixtures));
+        let fixtures_dep = if mode == CompatMode::PortableStrict {
+            steps.push(validation_capabilities_node(
+                "compatprep.hermit_release",
+                &hermit_bin,
+            ));
+            "compatprep.validation_capabilities"
+        } else {
+            "compatprep.hermit_release"
+        };
+        steps.push(prepare_fixtures_node_dep(
+            "compatprep.fixtures",
+            &fixtures,
+            fixtures_dep,
+        ));
         if mode == CompatMode::E9patch {
             steps.push(nsswitch_fixture_node(&nsswitch));
         }
@@ -2500,7 +2704,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if args.level == Level::Quick && args.focused.is_none() {
         let hermit = "target/debug/hermit";
         let marker = "hermit-validation-smoke";
-        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let run_args = "run --base-env=minimal";
         let verify_dir = "target/validate-verify";
         let verify_report = format!("{verify_dir}/quick-verify.json");
         let replay_report = format!("{verify_dir}/quick-replay.json");
@@ -2518,8 +2722,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
+        add("validation_capabilities", "Require PMU overflow delivery and intercepted CPUID", "./ci/check-validation-capabilities.sh target/debug/hermit".into(), vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.validation_capabilities".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -2527,7 +2732,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         add("verify_smoke", "Hermit verify-mode smoke test",
             format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} {run_args} --verify --verify-json {} -- /bin/echo {marker} && {}",
                 validate_plan::shell_quote(&verify_report), validate_plan::shell_quote(&verify_report), report_check(&verify_report)),
-            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
+            vec!["quick.validation_capabilities".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
             format!("mkdir -p {verify_dir} && rm -f {} && timeout 30s {hermit} record start --verify --verify-json {} -- /bin/echo {marker} && {}",
                 validate_plan::shell_quote(&replay_report), validate_plan::shell_quote(&replay_report), report_check(&replay_report)),
@@ -2550,7 +2755,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let hermit_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
         let mut steps = pre;
         steps.push(validate_envelope::build_node(gate));
-        let probes = validate_envelope::nodes(&hermit_bin, reps, "envelope.build");
+        steps.push(validation_capabilities_node_named(
+            "envelope",
+            "validation_capabilities",
+            "envelope.build",
+            &hermit_bin,
+        ));
+        let probes =
+            validate_envelope::nodes(&hermit_bin, reps, "envelope.validation_capabilities");
         let nonblocking: BTreeSet<String> = probes.iter().map(|s| s.tag()).collect();
         steps.extend(probes);
         let cfg = validate_plan::config_from(steps, "working-envelope measurement");
@@ -2670,7 +2882,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|s| s.tag() == debug_producer)
             .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
+        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && mkdir -p target/ci && sha256sum target/debug/hermit > target/ci/hermit-debug.sha256";
         if portable_build.cmd != expected_fat_build {
             return Err(format!(
                 "fused debug producer command drifted; re-prove the artifact barrier: {}",
@@ -2820,6 +3032,12 @@ fn super_plan(
 
     let mut steps = pre;
     steps.push(nextest_setup_node(root, gate)?);
+    steps.push(validation_capabilities_node_named(
+        "super",
+        "validation_capabilities",
+        &build_rel,
+        &release_bin,
+    ));
     let mut nonblocking: BTreeSet<String> = BTreeSet::new();
     // `run_exact_detcore_cases` labels its rows "<group>: <case>"; consecutive
     // rows sharing a group prefix are one fail-fast family. Deriving the chain
@@ -2844,7 +3062,11 @@ fn super_plan(
                 // portable-strict flags after the shared functional fixtures are
                 // prepared (validate.sh:4603).
                 let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
-                steps.push(prepare_fixtures_node_dep("compatprep.fixtures", &fixtures, &build_rel));
+                steps.push(prepare_fixtures_node_dep(
+                    "compatprep.fixtures",
+                    &fixtures,
+                    "super.validation_capabilities",
+                ));
                 let only: BTreeSet<String> =
                     validate_corpus::portable_super_only().keys().map(|k| k.to_string()).collect();
                 let shell_build = tmp.join("shell-build");
@@ -2866,8 +3088,15 @@ fn super_plan(
                 )?);
             }
             Some("super_stress_suite") => {
-                let stress =
-                    validate_super::stress_nodes(&release_bin, &debug_bin, tmp, reps, &build_rel, &build_ws);
+                let stress = validate_super::stress_nodes(
+                    &release_bin,
+                    &debug_bin,
+                    tmp,
+                    reps,
+                    &build_rel,
+                    &build_ws,
+                    "super.validation_capabilities",
+                );
                 steps.extend(stress);
                 nonblocking.extend(validate_super::nonblocking_tags(reps));
             }
@@ -2886,6 +3115,19 @@ fn super_plan(
             None => {
                 // Fail-fast chaining inside a `run_exact_detcore_cases` family.
                 let mut deps = deps;
+                if matches!(
+                    g.job.as_str(),
+                    "chaos_hello_race_verification_diagnostic"
+                        | "managed_jvm_strict_verify_diagnostics"
+                        | "ipc_determinism_diagnostic"
+                        | "random_source_determinism_diagnostic"
+                        | "threaded_integration_matrix_diagnostic"
+                        | "weekly_relaxed_default_mode_cases"
+                        | "pmu_buck_chaos_cases"
+                ) || g.argv.iter().any(|arg| arg == "stress_suite")
+                {
+                    deps.push("super.validation_capabilities".into());
+                }
                 if let Some(f) = family(&g.label) {
                     if let Some((pf, ptag)) = &prev_family {
                         if *pf == f {
@@ -3164,8 +3406,37 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
     step
 }
 
-fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
-    prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
+fn validation_capabilities_node(
+    build_dep: &str,
+    hermit_bin: &str,
+) -> safe_ci_dag_runner::model::Step {
+    validation_capabilities_node_named(
+        "compatprep",
+        "validation_capabilities",
+        build_dep,
+        hermit_bin,
+    )
+}
+
+fn validation_capabilities_node_named(
+    group: &str,
+    job: &str,
+    build_dep: &str,
+    hermit_bin: &str,
+) -> safe_ci_dag_runner::model::Step {
+    step_with_caps(
+        group,
+        job,
+        "Require PMU preemption and intercepted CPUID for portable validation",
+        format!(
+            "./ci/check-validation-capabilities.sh {}",
+            validate_plan::shell_quote(hermit_bin)
+        ),
+        vec![build_dep.to_string()],
+        120,
+        120,
+        1024 * 1024 * 1024,
+    )
 }
 
 /// The functional-fixture prep node, with an explicit predecessor.

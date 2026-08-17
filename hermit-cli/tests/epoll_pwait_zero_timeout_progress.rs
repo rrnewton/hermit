@@ -86,12 +86,7 @@ fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--strict",
-        ])
+        .args(["run", "--base-env=minimal", "--strict"])
         .args(extra)
         .arg("--")
         .arg(guest())

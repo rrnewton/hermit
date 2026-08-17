@@ -43,8 +43,7 @@ fn assert_l2(case: &ProgramCase) {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(program)

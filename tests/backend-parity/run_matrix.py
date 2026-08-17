@@ -552,12 +552,9 @@ def hermit_command(
     command.extend(
         [
             "--base-env=minimal",
-            "--max-timeslice=disabled",
             "--tmp=/tmp",
         ]
     )
-    if backend == "ptrace" and name != "cpuid_policy":
-        command.append("--no-virtualize-cpuid")
     command.extend(["--", *guest])
     return command
 

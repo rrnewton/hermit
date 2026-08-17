@@ -72,13 +72,7 @@ fn run_workload(workload: &str, run: usize) -> String {
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "--log=error",
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--",
-        ])
+        .args(["--log=error", "run", "--base-env=minimal", "--"])
         .arg(fairness_guest())
         .arg(workload);
     let rendered = format!("{command:?}");

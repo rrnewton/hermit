@@ -72,13 +72,7 @@ fn epoll_guest() -> &'static Path {
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--base-env=minimal", "--"])
         .arg(epoll_guest())
         .arg(scenario);
 
@@ -119,8 +113,7 @@ fn assert_scenario_reaches_l2(scenario: &str) {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(epoll_guest())

@@ -79,13 +79,7 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
 
     for iteration in 0..DETERMINISM_RUNS {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-        command.args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ]);
+        command.args(["run", "--base-env=minimal", "--"]);
         command.arg(signal_guest()).arg(scenario);
         let output = command_output(
             command,

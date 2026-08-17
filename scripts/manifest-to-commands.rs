@@ -241,22 +241,17 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
 fn hermit_command(
     mode: &str,
     backend: &str,
-    lane: &str,
+    _lane: &str,
     timeout: i64,
     seed: Option<i64>,
     extra: &[String],
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile = if portable {
-        " --no-virtualize-cpuid --max-timeslice=disabled"
-    } else {
-        ""
-    };
+    let verify_profile = " --base-env=minimal";
     let (command, report) = match mode {
         "verify" => (
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify --verify-json \"$cell/captures/verify.json\"{verify_profile} -- {guest}",
                 shell_quote(backend)
             ),
             Some("\"$cell/captures/verify.json\"".to_owned()),
@@ -273,7 +268,7 @@ fn hermit_command(
             let report = format!("\"$cell/captures/verify-seed-{seed}.json\"");
             (
                 format!(
-                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json {report} --chaos --sched-heuristic=random --seed={seed}{profile} -- {guest}",
+                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json {report} --chaos --sched-heuristic=random --seed={seed} -- {guest}",
                     shell_quote(backend),
                 ),
                 Some(report),
@@ -737,7 +732,9 @@ backends_enabled = ["ptrace"]
         assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
         assert!(replay.contains("(.comparison.strictness == \"canonical\")"));
         assert!(replay.contains("(.compared_log_messages.left // 0) > 0"));
+        assert!(!replay.contains("--base-env=minimal"));
         assert!(!replay.contains("--no-virtualize-cpuid"));
+        assert!(!replay.contains("--max-timeslice=disabled"));
 
         let chaos = hermit_command(
             "chaos",
@@ -753,7 +750,8 @@ backends_enabled = ["ptrace"]
         assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
         assert!(chaos.contains("(.comparison.strictness == \"canonical\")"));
         assert!(chaos.contains("--log=info"));
-        assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+        assert!(!chaos.contains("--no-virtualize-cpuid"));
+        assert!(!chaos.contains("--max-timeslice=disabled"));
 
         let custom = hermit_command(
             "custom",
@@ -770,7 +768,14 @@ backends_enabled = ["ptrace"]
 
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], "guest");
         assert!(verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
+        assert!(verify.contains("--base-env=minimal"));
+        assert!(!verify.contains("--no-virtualize-cpuid"));
+        assert!(!verify.contains("--max-timeslice=disabled"));
         assert!(verify.contains("(.bitwise_parity == true)"));
+
+        let privileged_verify =
+            hermit_command("verify", "ptrace", "privileged", 60, None, &[], "guest");
+        assert!(privileged_verify.contains("--base-env=minimal"));
     }
 
     #[test]

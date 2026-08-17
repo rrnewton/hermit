@@ -31,14 +31,7 @@ fn required_program(name: &str, candidates: &[&str]) -> PathBuf {
 
 fn hermit_command(epoch: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log",
-        "DEBUG",
-        "run",
-        "--strict",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-    ]);
+    command.args(["--log", "DEBUG", "run", "--strict"]);
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
@@ -85,8 +78,7 @@ fn assert_l2(case: &ProgramCase) {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(program)

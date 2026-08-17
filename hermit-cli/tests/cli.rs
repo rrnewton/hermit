@@ -534,6 +534,7 @@ fn run_dbt_verify_publishes_canonical_evidence() {
         "dbt",
         "--strict",
         "--verify",
+        "--base-env=minimal",
         "--keep-logs",
         "--verify-log-dir",
         logs_text,
@@ -620,7 +621,15 @@ fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
-    let args = ["--log", "info", "run", "--verify", "--", program];
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        program,
+    ];
     let output = hermit(&args);
     assert_success(&output, &args);
     let warning = "used but not yet supported";
@@ -1003,6 +1012,7 @@ fn run_ptrace_and_dbt_verify_virtual_self_prlimit() {
             backend,
             "--strict",
             "--verify",
+            "--base-env=minimal",
             "--keep-logs",
             "--verify-log-dir",
             logs_text,
@@ -2158,14 +2168,7 @@ fn run_ptrace_virtual_clock_advances_across_execve() {
     let program = exec_clock_continuity_guest()
         .to_str()
         .expect("exec-clock-continuity guest path should be UTF-8");
-    let args = [
-        "run",
-        "--strict",
-        "--max-timeslice=disabled",
-        "--no-virtualize-cpuid",
-        "--",
-        program,
-    ];
+    let args = ["run", "--strict", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "exec-clock-continuity-ok\n");
@@ -2182,8 +2185,7 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
         "run",
         "--strict",
         "--verify",
-        "--max-timeslice=disabled",
-        "--no-virtualize-cpuid",
+        "--base-env=minimal",
         "--",
         program,
     ];

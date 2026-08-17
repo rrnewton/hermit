@@ -66,13 +66,7 @@ fn run_pattern(pattern: &str, iteration: usize) -> String {
     command
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--base-env=minimal", "--"])
         .arg(ipc_guest())
         .arg(pattern);
     let output = command_output(command, &format!("{pattern} iteration {iteration}"));

@@ -93,14 +93,7 @@ fn run_native(iteration: usize) -> Vec<u8> {
 
 fn run_strict(iteration: usize) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "run",
-        "--strict",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-    ]);
+    command.args(["run", "--strict", "--base-env=minimal", "--"]);
     command.arg(fp_reduction_guest());
     run_with_timeout(
         command,

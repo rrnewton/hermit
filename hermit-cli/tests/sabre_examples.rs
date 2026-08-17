@@ -177,13 +177,9 @@ fn example_command(
             .env("HERMIT_SABRE_BINARY", loader)
             .args(["--backend", "sabre"]);
     }
-    command.args([
-        "--strict",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-    ]);
+    command.arg("--strict");
     if verify {
-        command.arg("--verify");
+        command.args(["--verify", "--base-env=minimal"]);
         if let Some(directory) = retained_verify_log_dir {
             command
                 .args(["--keep-logs", "--verify-log-dir"])

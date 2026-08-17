@@ -35,15 +35,7 @@ fn reservation_path() -> Option<PathBuf> {
 
 fn hermit_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log",
-        "DEBUG",
-        "run",
-        "--strict",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-    ]);
+    command.args(["--log", "DEBUG", "run", "--strict", "--"]);
     command
 }
 
@@ -78,8 +70,7 @@ fn assert_l2(case: &ProgramCase<'_>) {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(program)

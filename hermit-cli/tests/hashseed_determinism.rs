@@ -97,14 +97,7 @@ fn run_native(python: &Path, script: &Path) -> String {
 /// Run the workload under `hermit run --strict`.
 fn run_hermit_strict(python: &Path, script: &Path) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--strict", "--base-env=minimal", "--"])
         .arg(python)
         .args(["-S", "-I"])
         .arg(script)

@@ -15,10 +15,10 @@
 # Output: a human-readable summary by default; machine-readable JSON with
 # --json (and/or written to a file with --out FILE).
 #
-# The assurance probes deliberately mirror scripts/validate.rs's host-capability-matched
-# flags (NOT full --strict): --base-env=minimal --no-virtualize-cpuid
-# --max-timeslice=disabled. This runs on hosts without PMU access or CPUID
-# faulting, so the counts are comparable to the working-envelope rubric.
+# This manual measurement uses validation's controlled environment
+# (`--base-env=minimal`) and first requires suite-level ptrace host evidence for
+# PMU overflow delivery and CPUID interception. It is not itself a CI result or
+# per-backend capability verdict.
 #
 #   L1  deterministic run            run ... -- PROG
 #   L2  bitwise-identical repeat     run ... --verify -- PROG
@@ -39,6 +39,7 @@ CASE_TIMEOUT=${CASE_TIMEOUT_SECONDS:-30}
 emit_json=0
 json_out=""
 run_rr=0
+self_test=0
 
 usage() {
     cat <<'EOF'
@@ -49,6 +50,7 @@ Options:
                     (instead of the human summary).
   --out FILE        Also write the JSON report to FILE.
   --run-rr          Additionally execute the rr suite (slow; off by default).
+  --self-test       Check repo-root resolution and the capability helper contract.
   -h, --help        Show this help.
 
 Environment:
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         --json) emit_json=1 ;;
         --out) shift; json_out=${1:-} ;;
         --run-rr) run_rr=1 ;;
+        --self-test) self_test=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -70,6 +73,17 @@ done
 
 log() { [[ $emit_json -eq 1 ]] || printf '%s\n' "$*" >&2; }
 
+if ((self_test)); then
+    [[ -x $repo_root/ci/check-validation-capabilities.sh ]] || {
+        printf 'compat-map self-test: capability helper not found under repo root: %s\n' \
+            "$repo_root" >&2
+        exit 1
+    }
+    "$repo_root/ci/check-validation-capabilities.sh" --self-test
+    printf 'compat-map self-test: PASS (repo root + capability helper)\n'
+    exit 0
+fi
+
 if [[ ! -x $HERMIT_BIN ]]; then
     printf 'error: hermit binary not found or not executable: %s\n' "$HERMIT_BIN" >&2
     # shellcheck disable=SC2016  # backticks are a literal hint, not a command substitution
@@ -77,8 +91,13 @@ if [[ ! -x $HERMIT_BIN ]]; then
     exit 1
 fi
 
-# Host-matched run flags shared by every assurance level (see header).
-declare -ar RUN_FLAGS=(run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled)
+"$repo_root/ci/check-validation-capabilities.sh" "$HERMIT_BIN" || {
+    printf 'error: compatibility map requires PMU overflow delivery and ptrace CPUID interception\n' >&2
+    exit 1
+}
+
+# Run flags shared by every assurance level (see header).
+declare -ar RUN_FLAGS=(run --base-env=minimal)
 verify_report_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-compat-map-verify.XXXXXX")
 trap 'rm -r -- "$verify_report_dir"' EXIT
 

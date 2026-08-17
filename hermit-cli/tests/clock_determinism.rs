@@ -78,13 +78,7 @@ fn clock_guest() -> &'static Path {
 
 fn run_clock_matrix(iteration: usize) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "run",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-    ]);
+    command.args(["run", "--base-env=minimal", "--"]);
     command.arg(clock_guest());
     let output = command_output(
         command,

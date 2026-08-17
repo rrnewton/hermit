@@ -395,7 +395,7 @@ def _hermit_command(hermit: Path, backend: str, binary: Path, mutate: str | None
     command = [str(hermit), "--log=info", "run"]
     if backend != GOLDEN_BACKEND:
         command.extend(["--backend", backend])
-    command.extend(["--strict", "--base-env=minimal", "--max-timeslice=disabled", "--tmp=/tmp"])
+    command.extend(["--strict", "--base-env=minimal", "--tmp=/tmp"])
     if mutate is not None:
         # --base-env=minimal strips the ambient env, so the mutation must be
         # passed through explicitly for the guest to observe it.

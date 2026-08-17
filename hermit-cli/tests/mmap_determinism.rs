@@ -64,13 +64,7 @@ fn mmap_guest() -> &'static Path {
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--base-env=minimal", "--"])
         .arg(mmap_guest())
         .arg(scenario);
 

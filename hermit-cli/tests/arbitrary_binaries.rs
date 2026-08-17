@@ -186,13 +186,7 @@ fn assert_marker(tool: &Tool, output: &Output, label: &str) {
 fn hermit_run(tool: &Tool) -> Output {
     let mut command = bounded_command(Path::new(env!("CARGO_BIN_EXE_hermit")), BINARY_TIMEOUT);
     command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--base-env=minimal", "--"])
         .arg(&tool.path)
         .args(tool.args);
     command_output(command, &format!("run for {}", tool.name))

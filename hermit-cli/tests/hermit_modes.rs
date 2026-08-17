@@ -340,10 +340,7 @@ fn workloads() -> &'static Workloads {
 
 fn hermit_command(base_env: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .arg("run")
-        .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"]);
+    command.arg("run").arg(format!("--base-env={base_env}"));
     command
 }
 
@@ -360,11 +357,7 @@ fn verify_guest_command(tmp: &Path, script: &str, extra_options: &[&str]) -> Com
     command
         .args(["run", "--verify"])
         .args(extra_options)
-        .args([
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-        ])
+        .arg("--base-env=minimal")
         .arg(format!("--tmp={}", tmp.display()))
         .arg("/tmp/guest");
     command
@@ -556,7 +549,15 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
     let mut command = Command::new(hermit_binary);
     command
         .env("HERMIT_SABRE_BINARY", &loader)
-        .args(["run", "--backend", "sabre", "--strict", "--verify", "--"])
+        .args([
+            "run",
+            "--backend",
+            "sabre",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+        ])
         .arg(program)
         .args(args)
         .process_group(0)
@@ -1092,8 +1093,6 @@ fn verify_reports_typed_memory_parity_on_landed_fixture() {
             "--detlog-heap",
             "--detlog-stack",
             "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
             "--",
         ])
         .arg(&guest)
@@ -1194,8 +1193,6 @@ int main(void) {
             "--verify",
             "--base-env=empty",
             "--env=VERIFY_CONFIGURED=expected",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
         ])
         .arg(format!("--tmp={}", tmp.path().display()))
         .arg("/tmp/guest")
@@ -1215,8 +1212,6 @@ fn hello_race_chaos_verify() {
             "--verify-allow=both",
             "--chaos",
             "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
             "--env=HERMIT_MODE=chaos",
         ])
         .arg(&workload.path);

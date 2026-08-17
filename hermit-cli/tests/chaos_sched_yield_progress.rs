@@ -78,7 +78,6 @@ fn run_seed(seed: u64) {
         .args([
             "run",
             "--base-env=minimal",
-            "--no-virtualize-cpuid",
             "--chaos",
             "--max-timeslice=disabled",
             &format!("--seed={seed}"),
@@ -126,14 +125,7 @@ fn run_strict_guest(args: &[&str]) {
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args([
-            "run",
-            "--strict",
-            "--verify",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--",
-        ])
+        .args(["run", "--strict", "--verify", "--base-env=minimal", "--"])
         .arg(guest())
         .args(args);
 
@@ -192,7 +184,6 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
                 "--preemption-timeout=disabled",
                 &option,
                 "--base-env=minimal",
-                "--no-virtualize-cpuid",
                 "--",
             ])
             .arg(guest())

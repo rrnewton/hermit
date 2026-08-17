@@ -27,13 +27,7 @@ fn read_procfs(path: &str) -> Vec<u8> {
 
 fn read_procfs_at_epoch(path: &str, epoch: Option<&str>) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command.args([
-        "--log=error",
-        "run",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-    ]);
+    command.args(["--log=error", "run", "--base-env=minimal"]);
     if let Some(epoch) = epoch {
         command.arg(format!("--epoch={epoch}"));
     }
@@ -443,8 +437,6 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
         "--log=error",
         "run",
         "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
         "--epoch=2000-12-31T23:59:59+00:00",
         "--",
         "/usr/bin/python3",

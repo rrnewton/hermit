@@ -296,8 +296,8 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       # Reproduce the debug build nodes EXACTLY from portable.json (no drift):
-      # e2e.metadata, setup.nextest, build.workspace, build.manifest_guests,
-      # build.flaky_harnesses.
+      # e2e.metadata, setup.nextest, build.workspace,
+      # check.validation_capabilities, and build.manifest_guests.
       - name: Run debug build nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -404,6 +404,8 @@ jobs:
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
           test -f target/debug/deps/libdetcore_dbt.so
+          test -f target/ci/hermit-debug.sha256
+          sha256sum -c target/ci/hermit-debug.sha256
           # Cargo test shards may rewrite target/debug/deps. Keep the DBT runtime
           # in Hermit's normal install-resource location so later CLI nodes do
           # not depend on that mutable Cargo output directory.
@@ -412,6 +414,7 @@ jobs:
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
+            target/ci/hermit-debug.sha256 \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
@@ -473,6 +476,8 @@ jobs:
       - name: Pack full release prebuilt tree (dbt + sabre + liteinst)
         run: |
           set -euo pipefail
+          test -f target/ci/hermit-release.sha256
+          sha256sum -c target/ci/hermit-release.sha256
           tar --zstd -cf "$RELEASE_TARBALL" \
             --exclude='target/release/deps' \
             --exclude='target/release/build' \
@@ -594,6 +599,8 @@ jobs:
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
+          test -f target/ci/hermit-debug.sha256
+          sha256sum -c target/ci/hermit-debug.sha256
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
@@ -638,8 +645,12 @@ jobs:
   # ----------------------------------------------- test shards (release-backed)
   test-release:
     name: "test: ${{ matrix.slug }}"
-    needs: [select, build-release]
-    if: needs.select.outputs.run_release_shards != 'false'
+    needs: [select, build-debug, build-release]
+    if: >-
+      !cancelled()
+      && needs.select.outputs.run_release_shards != 'false'
+      && needs.build-debug.result == 'success'
+      && needs.build-release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -681,6 +692,8 @@ jobs:
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
           test -x target/release/hermit
+          test -f target/ci/hermit-release.sha256
+          sha256sum -c target/ci/hermit-release.sha256
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf

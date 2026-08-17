@@ -85,13 +85,7 @@ fn mmap_stress_guest() -> &'static Path {
 fn run_once(run: usize) -> Vec<u8> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
+        .args(["run", "--base-env=minimal", "--"])
         .arg(mmap_stress_guest());
 
     let output = command_output(command, &format!("mmap-stress run {run}/{RUNS}"));
@@ -133,8 +127,7 @@ fn mmap_stress_reaches_strict_verify_l2() {
             "run",
             "--strict",
             "--verify",
-            "--no-virtualize-cpuid",
-            "--preemption-timeout=disabled",
+            "--base-env=minimal",
             "--",
         ])
         .arg(mmap_stress_guest());

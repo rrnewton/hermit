@@ -29,6 +29,11 @@
 //! L4_REPS=20   HERMIT_SMOKE_TIMEOUT=30s
 //! ```
 //!
+//! The probe table remains mechanically extracted. The run arguments intentionally
+//! moved after that extraction: current validation keeps the controlled minimal
+//! environment while exercising CPUID virtualization and the default PMU-backed
+//! maximum timeslice.
+//!
 //! The bash split each `"label|cmd"` on whitespace with `read -r -a`, so the
 //! argv below is that split, not a re-reading of the intent.
 //!
@@ -61,9 +66,8 @@ pub const PROBES: &[EnvelopeProbe] = &[
     EnvelopeProbe { label: "date", argv: &["/bin/date", "-u", "+%Y"] },
 ];
 
-/// `HERMIT_RUN_ARGS` (validate.sh:1230).
-pub const HERMIT_RUN_ARGS: &[&str] =
-    &["run", "--base-env=minimal", "--no-virtualize-cpuid", "--max-timeslice=disabled"];
+/// Current validation arguments shared by the working-envelope levels.
+pub const HERMIT_RUN_ARGS: &[&str] = &["run", "--base-env=minimal"];
 
 /// `L4_REPS` (validate.sh:1256).
 pub const L4_REPS_DEFAULT: i64 = 20;
@@ -390,6 +394,11 @@ pub fn compare(current: &serde_json::Value, baseline: &Path) -> Result<bool, (u8
 
 /// Inert brackets: nothing here runs hermit or publishes anything.
 pub fn self_test() -> Result<String, String> {
+    if HERMIT_RUN_ARGS != ["run", "--base-env=minimal"] {
+        return Err(format!(
+            "working-envelope run arguments drifted: {HERMIT_RUN_ARGS:?}"
+        ));
+    }
     // The node set must be exactly 5 per probe, and every one must be capped.
     let steps = nodes("/nonexistent/hermit", 3, "gate.manifest");
     let want = PROBES.len() * LEVELS.len();

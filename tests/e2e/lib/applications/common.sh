@@ -156,8 +156,7 @@ function run_hermit_verify {
     # and every mutation under it is the guest's own -- which Hermit already
     # makes deterministic.
     timeout "$HERMIT_APPLICATION_TIMEOUT" \
-        "$HERMIT_BIN" --log=info run --no-virtualize-cpuid \
-        --max-timeslice=disabled --base-env=minimal --strict --workdir=/tmp \
+        "$HERMIT_BIN" --log=info run --base-env=minimal --strict --workdir=/tmp \
         --verify --verify-json "$verdict_file" -- \
         "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 
