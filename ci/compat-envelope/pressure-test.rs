@@ -2590,6 +2590,14 @@ fn audit_dag(
                     "{tag} lost its runner-bounded exact-cell harness command"
                 ));
             }
+            if disabled_selector
+                && cmd.contains("--mode naked")
+                && !command_selects_backend(cmd, "native")
+            {
+                return Err(format!(
+                    "{tag} lost the exact native backend selector for a disabled naked cell"
+                ));
+            }
             if cmd.contains("--prebuilt")
                 && (!cmd.contains("/prepare/")
                     || !cmd.contains("/status")
@@ -3855,6 +3863,11 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn command_selects_backend(command: &str, backend: &str) -> bool {
+    command.contains(&format!("--backend {}", shell_quote(backend)))
+        || command.contains(&format!("--backend {backend}"))
+}
+
 fn literal_shell_command(
     cwd: &str,
     env: &BTreeMap<String, String>,
@@ -4417,6 +4430,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         .replace("--test fixture", "--test fixture --backend kvm");
     audit_dag(&disabled_fixture, 1, 100, &fixture_timeouts)
         .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
+    let mut disabled_naked_fixture = fixture.clone();
+    disabled_naked_fixture.steps[0].cmd = exact_cell_command
+        .replace("--include-manual", "--probe-disabled")
+        .replace("--mode verify", "--mode naked --backend native");
+    audit_dag(&disabled_naked_fixture, 1, 100, &fixture_timeouts)
+        .map_err(|e| format!("disabled naked cell with its native selector was refused: {e}"))?;
+    disabled_naked_fixture.steps[0].cmd = disabled_naked_fixture.steps[0]
+        .cmd
+        .replace(" --backend native", "");
+    if audit_dag(&disabled_naked_fixture, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("disabled naked cell without its exact native backend was accepted".into());
+    }
     let mut prepared_fixture = fixture.clone();
     prepared_fixture.steps[0].cmd = "printf '125\\n' > '/results/cells/fixture/harness-status'; \
          if ! test \"$(cat '/results/prepare/fixture/status' 2>/dev/null)\" = 0; then \

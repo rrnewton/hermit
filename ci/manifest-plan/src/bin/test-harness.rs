@@ -109,13 +109,12 @@ fn validate_args(command: &str, args: &Args) {
     {
         fail("--mode must be verify, chaos, replay, naked, or custom");
     }
-    if args
-        .selection
-        .backend
-        .as_deref()
-        .is_some_and(|backend| !matches!(backend, "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"))
-    {
-        fail("--backend must name a Hermit backend");
+    if let Some(backend) = args.selection.backend.as_deref() {
+        let hermit_backend = matches!(backend, "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst");
+        let naked_native = backend == "native" && args.selection.mode.as_deref() == Some("naked");
+        if !hermit_backend && !naked_native {
+            fail("--backend must name a Hermit backend, or native with --mode naked");
+        }
     }
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
@@ -266,7 +265,7 @@ fn audit_cli_brackets(root: &Path) {
             fail(format!("empty value for {option} was accepted"));
         }
     }
-    let output = Command::new(executable)
+    let output = Command::new(&executable)
         .args([
             "plan",
             "--lane",
@@ -281,6 +280,46 @@ fn audit_cli_brackets(root: &Path) {
     let cells = serde_json::from_slice::<Vec<JsonValue>>(&output.stdout).unwrap_or_default();
     if !output.status.success() || cells.is_empty() {
         fail("complete CLI control was refused or selected no cells");
+    }
+    let output = Command::new(&executable)
+        .args([
+            "audit-gaps",
+            "--test",
+            "backend-parity-c/aio-refusal",
+            "--mode",
+            "naked",
+            "--backend",
+            "native",
+            "--format",
+            "json",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|error| fail(error));
+    let cells = serde_json::from_slice::<Vec<JsonValue>>(&output.stdout).unwrap_or_default();
+    if !output.status.success()
+        || cells.len() != 1
+        || cells[0].get("backend").and_then(JsonValue::as_str) != Some("native")
+    {
+        fail("disabled naked cell was not selectable by its exact native backend");
+    }
+    let status = Command::new(executable)
+        .args([
+            "plan",
+            "--test",
+            "backend-parity-c/aio-refusal",
+            "--mode",
+            "verify",
+            "--backend",
+            "native",
+        ])
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|error| fail(error));
+    if status.success() {
+        fail("native backend was accepted outside naked mode");
     }
 }
 
