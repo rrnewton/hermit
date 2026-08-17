@@ -421,6 +421,14 @@ impl GlobalState {
         Self::initialize(cfg, false)
     }
 
+    async fn wait_for_internal_scheduler_start(&self) {
+        let daemon_started = {
+            let scheduler = self.sched.lock().unwrap();
+            scheduler.daemon_started.clone()
+        };
+        daemon_started.get().await;
+    }
+
     /// Runs the sequential scheduler on a backend-owned executor.
     pub async fn run_external_scheduler(&self, observer: Arc<dyn Fn(&'static str) + Send + Sync>) {
         sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
@@ -610,7 +618,11 @@ impl GlobalTool for GlobalState {
 
     /// Called once during startup.
     async fn init_global_state(cfg: &Config) -> GlobalState {
-        GlobalState::initialize(cfg, true)
+        let state = GlobalState::initialize(cfg, true);
+        if cfg.sequentialize_threads {
+            state.wait_for_internal_scheduler_start().await;
+        }
+        state
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
@@ -3847,6 +3859,37 @@ mod tests {
             Some("syscalls getppid,vmsplice used but not yet supported")
         );
         assert_eq!(format_unsupported_syscall_warning(&BTreeSet::new()), None);
+    }
+
+    #[tokio::test]
+    async fn global_init_waits_for_internal_scheduler_start() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let mut state = <GlobalState as GlobalTool>::init_global_state(&config).await;
+
+        assert_eq!(
+            state.sched.lock().unwrap().daemon_started.try_read(),
+            Some(())
+        );
+        state.cancel_internal_scheduler().await;
+    }
+
+    #[tokio::test]
+    async fn global_init_does_not_wait_when_sequential_scheduler_is_disabled() {
+        let config = Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        };
+        let state = tokio::time::timeout(
+            Duration::from_millis(100),
+            <GlobalState as GlobalTool>::init_global_state(&config),
+        )
+        .await
+        .expect("nonsequential global initialization waited for an absent scheduler");
+
+        assert_eq!(state.sched.lock().unwrap().daemon_started.try_read(), None);
     }
 
     #[tokio::test]
