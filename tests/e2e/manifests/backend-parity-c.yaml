@@ -5424,9 +5424,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
-          kvm: KVM does not complete a guest on the authoring host; qualify KVM separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
           liteinst: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately
       naked:
@@ -5490,9 +5490,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
-          kvm: KVM livelocks at guest startup on the current host; qualify KVM separately -- also a priority for this guest
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
           liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately
       naked:
