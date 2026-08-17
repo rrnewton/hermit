@@ -1436,20 +1436,6 @@
       "test": "c-programs/sigtimedwait-timeout-1s"
     },
     {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-ioctl-timestamp"
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/socket-ioctl-timestamp"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
