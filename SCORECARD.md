@@ -8,23 +8,23 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 219 | 789 | 1008 |
+| `ptrace` | 223 | 785 | 1008 |
 | `dbt` | 9 | 999 | 1008 |
 | `kvm` | 0 | 1008 | 1008 |
-| `sabre` | 53 | 955 | 1008 |
-| `liteinst` | 2 | 1006 | 1008 |
+| `sabre` | 56 | 952 | 1008 |
+| `liteinst` | 6 | 1002 | 1008 |
 | `native` | 0 | 336 | 336 |
-| **Total** | **283** | **5093** | **5376** |
+| **Total** | **294** | **5082** | **5376** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 216 / 336 | 9 / 336 | 0 / 336 | 53 / 336 | 2 / 336 | — | 280 | 1400 | 1680 |
+| `verify` | 220 / 336 | 9 / 336 | 0 / 336 | 56 / 336 | 6 / 336 | — | 291 | 1389 | 1680 |
 | `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
 | `chaos` | 2 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 2 | 1678 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
-| **Total** | | | | | | | **283** | **5093** | **5376** |
+| **Total** | | | | | | | **294** | **5082** | **5376** |
 
 ## Cross-backend parity
 
@@ -37,9 +37,9 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | Manifest category | Verify | Replay | Chaos | Green | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
-| `backend-parity-c` | 80 / 95 | 0 / 95 | 0 / 95 | 80 | 285 |
+| `backend-parity-c` | 81 / 95 | 0 / 95 | 0 / 95 | 81 | 285 |
 | `bin-c` | 0 / 2 | 0 / 2 | 0 / 2 | 0 | 6 |
-| `c-programs` | 76 / 160 | 0 / 160 | 0 / 160 | 76 | 480 |
+| `c-programs` | 79 / 160 | 0 / 160 | 0 / 160 | 79 | 480 |
 | `chaos-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 | `data-handling` | 5 / 5 | 0 / 5 | 0 / 5 | 5 | 15 |
 | `debugger-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
@@ -50,4 +50,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 23 / 25 | 1 / 25 | 0 / 25 | 24 | 75 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 285 selected regression cells: the 283 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 296 selected regression cells: the 294 green compatibility cells above (including 2 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

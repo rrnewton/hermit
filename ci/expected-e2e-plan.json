@@ -358,6 +358,27 @@
       "test": "backend-parity-c/personality-domain"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pid-probe"
+    },
+    {
+      "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pid-probe"
+    },
+    {
+      "backend": "sabre",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pid-probe"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -1030,6 +1051,27 @@
       "test": "c-programs/mmap-stress-determinism"
     },
     {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-directory-eopnotsupp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-directory-eopnotsupp"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/name-to-handle-directory-eopnotsupp"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1394,6 +1436,41 @@
       "test": "c-programs/sigtimedwait-timeout-1s"
     },
     {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/socket-cookie-unix"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/socket-cookie-unix"
+    },
+    {
+      "backend": "sabre",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/socket-cookie-unix"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/socket-ioctl-timestamp"
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/socket-ioctl-timestamp"
+    },
+    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -1577,6 +1654,48 @@
     },
     {
       "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/process-chains"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-contention"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "determinism-stress/thread-interleaving"
+    },
+    {
+      "backend": "ptrace",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "ptrace",
       "category": "determinism-stress-c",
       "lane": "portable",
       "mode": "verify",
@@ -1623,48 +1742,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "determinism-stress-c/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "determinism-stress/order-violation"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/order-violation"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/process-chains"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-contention"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "chaos",
-      "test": "determinism-stress/thread-interleaving"
-    },
-    {
-      "backend": "ptrace",
-      "category": "determinism-stress",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "determinism-stress/thread-output"
     },
     {
       "backend": "ptrace",
