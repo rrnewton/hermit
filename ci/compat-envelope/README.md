@@ -50,9 +50,10 @@ The path is deliberately direct:
    result directory.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
-5. The checked-in table and cell identities must still equal what the manifest
-   and expected plan derive. Normal validation changes no tracked scorecard
-   file.
+5. During the evidence-commit step, VALIDATE mechanically merges every clean,
+   exact-HEAD result row into `ci/compat-envelope/cells.json` and regenerates
+   `SCORECARD.md`. A PASS records green; FAIL or ERROR records red. Byte-identical
+   output is left untouched.
 
 `SCORECARD.md` reports the current regression-cell count. Explicit custom
 commands remain required validation checks even though they are outside this
@@ -64,10 +65,10 @@ compared-message counts. KVM remains output-only and therefore does not qualify
 for that claim. These are same-backend checks; cross-backend parity still needs
 fresh ptrace and non-ptrace observations of the same workload.
 
-A green cell turning red makes validate fail. The normal response is to fix the
-regression. Moving the cell out of the selected plan is not a fix, and
-`scorecard.rs update` refuses green-to-red movement unless an explicit
-compatibility-standard transition requests it.
+A selected green cell turning red still makes validate fail. Recording the red
+result changes only the accounting: it does not remove the cell from
+`ci/expected-e2e-plan.json`, weaken the comparator, or excuse the regression.
+The normal response remains to fix the regression.
 
 See every command and the exact green definition with:
 
@@ -87,8 +88,9 @@ git diff -- SCORECARD.md ci/compat-envelope/cells.json
 ```
 
 Review the table delta and the exact cell identity. The update command does not
-run a test and cannot turn a red cell green by itself; the subsequent validate
-must execute the newly selected cell.
+run a test and preserves observed statuses; the subsequent validate must execute
+the newly selected cell and will record it green only from a clean exact-HEAD
+PASS result.
 
 ## Red cells and the periodic full-matrix run
 

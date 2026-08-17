@@ -1925,6 +1925,25 @@ fn configure_e2e_result_root(
     Ok(path)
 }
 
+fn update_scorecard_from_results(root: &Path, result_root: &Path) -> Result<String, String> {
+    let output = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
+        .args(["update-results", "--results"])
+        .arg(result_root)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot start compatibility scorecard update: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "compatibility scorecard update failed{}{}",
+            if stdout.is_empty() { String::new() } else { format!("\n{stdout}") },
+            if stderr.is_empty() { String::new() } else { format!("\n{stderr}") },
+        ));
+    }
+    Ok(stdout)
+}
+
 /// Establish the self-tee. FAIL-CLOSED: any failure exits loudly rather than
 /// running without a durable receipt. Must be called AFTER `resolve_cgroups`
 /// (which re-execs), so the tee is set up once, in the final boxed process.
@@ -6108,6 +6127,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // like never having started. `SIG_IGN` for the window is what `trap ''
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
+    let scorecard_update_error = if nesting.nested {
+        None
+    } else {
+        match update_scorecard_from_results(&root, &e2e_result_root) {
+            Ok(message) => {
+                if !message.is_empty() {
+                    println!("{message}");
+                }
+                None
+            }
+            Err(message) => {
+                eprintln!("validate: ERROR: {message}");
+                Some(message)
+            }
+        }
+    };
     let interruption = interrupted_by().map(|s| s.to_string());
     // Stop the monitor and take the peak ONCE, here, so the ledger and the
     // summary cannot disagree about how crowded the box was.
@@ -6348,6 +6383,9 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
+    if scorecard_update_error.is_some() {
+        exit_code = 1;
+    }
     if !execution_complete {
         eprintln!(
             "validate: ERROR: not every required node completed with a non-aborted outcome; \
@@ -6468,6 +6506,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if let Some((_, msg)) = &envelope_error {
         detail.push(format!("envelope comparison could not run: {msg}"));
+    }
+    if let Some(message) = &scorecard_update_error {
+        detail.push(format!(
+            "the compatibility scorecard could not be updated from this run: {message}"
+        ));
     }
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(
