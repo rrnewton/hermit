@@ -174,8 +174,15 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
-    /// for command-line compatibility with `hermit run --strict`.
+    /// Accepted and IGNORED; present only for command-line compatibility with `hermit run
+    /// --strict`. It does not enable anything, and recording is NOT equivalent to `run --strict`:
+    /// the record/replay configuration sets `virtualize_time: false`, `deterministic_io: false`
+    /// and `virtualize_metadata: false`, and leaves the fail-closed unsupported-syscall settings
+    /// (`panic_on_unsupported_syscalls`, `exit_on_unsupported_syscall`,
+    /// `shutdown_on_unsupported_syscall`) off. Recording therefore captures host-derived values
+    /// such as the real monotonic clock rather than virtualizing them; what record/replay
+    /// guarantees is that the REPLAY reproduces THAT recording, not that two recordings agree
+    /// with each other. Use `hermit run --strict` for a determinism claim.
     #[clap(long = "strict")]
     _strict: bool,
 
@@ -486,12 +493,24 @@ impl StartOpts {
             ComparedRun {
                 output: &recording,
                 log: log1.into_temp_path(),
+                // This path executes the guest ONCE and then replays that one
+                // recording. Reporting these two sides as "run 1" and "run 2"
+                // read as a claim that the guest ran twice, which it does not.
+                label: "the recording",
             },
             ComparedRun {
                 output: &replay,
                 log: log2.into_temp_path(),
+                label: "the replay",
             },
             ComparisonOptions {
+                // Read from the configuration this run actually used rather
+                // than restating it: a literal here can drift out of agreement
+                // with the config, and the report would then assert something
+                // the run did not do. `record_or_replay_config` currently sets
+                // this false, so a match here is replay fidelity, not a
+                // determinism result.
+                virtualize_time: hermit::record_or_replay_config(data_dir).virtualize_time,
                 success_message: "Success: replay matched recording.",
                 failure_message: "Recording output did not match replay output!",
                 verbose: false,
