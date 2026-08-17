@@ -697,10 +697,12 @@ ordinary validation. **Red** is every \
 other test/mode/backend cell: measured failure, unavailable, or not yet run all remain red until \
 the cell is promoted into the regression plan and passes. Manifest-disabled combinations are red, \
 not omitted: a cell that cannot run is not green.\n\n\
-These are the current Basic Sanity Milestone 1 contracts. Every `verify` cell, and every seed in a \
-selected `chaos` cell, runs the same backend twice. Bare `--verify` uses the Stripped comparator, so these counts measure legacy \
-same-backend repeatability; they do not establish strict INFO-log determinism or cross-backend \
-parity.\n\n\
+Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
+twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
+accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
+`bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, and both INFO-message counts are \
+nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy \
+this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
 | Backend | Green | Red | Total |\n\
 | --- | ---: | ---: | ---: |\n",
     );

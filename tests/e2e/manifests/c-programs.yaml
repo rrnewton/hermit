@@ -199,7 +199,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -207,7 +207,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Path evidence found one raw libc syscall site per execution; trusted shared-object native execution is not SaBRe support
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -448,7 +447,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -456,7 +455,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -638,7 +636,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -646,7 +644,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -758,7 +755,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -766,7 +763,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1008,7 +1004,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -1016,7 +1012,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1228,7 +1223,7 @@ test:
         - -fopenmp
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -1236,7 +1231,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1656,7 +1650,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1664,7 +1658,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1716,7 +1709,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1724,7 +1717,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1776,7 +1768,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1784,7 +1776,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1846,7 +1837,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1854,7 +1845,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1922,7 +1912,7 @@ test:
         - -no-pie
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -1930,7 +1920,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -1992,7 +1981,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2000,7 +1989,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2062,7 +2050,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2070,7 +2058,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2132,7 +2119,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2140,7 +2127,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2261,7 +2247,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2269,7 +2255,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2331,7 +2316,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         guest_args:
@@ -2342,7 +2327,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2582,7 +2566,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -2590,7 +2574,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -2701,7 +2684,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         guest_args:
@@ -2712,7 +2695,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3127,7 +3109,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3135,7 +3117,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3187,7 +3168,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3195,7 +3176,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3247,7 +3227,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3255,7 +3235,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3307,7 +3286,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3315,7 +3294,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3446,7 +3424,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3454,7 +3432,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -3756,7 +3733,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -3764,7 +3741,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4136,7 +4112,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4144,7 +4120,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4196,7 +4171,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4204,7 +4179,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4256,7 +4230,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4264,7 +4238,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4617,7 +4590,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4625,7 +4598,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4677,7 +4649,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4685,7 +4657,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4737,7 +4708,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4745,7 +4716,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4857,7 +4827,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4865,7 +4835,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -4977,7 +4946,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -4985,7 +4954,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5053,7 +5021,7 @@ test:
         - -no-pie
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -5061,7 +5029,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5123,7 +5090,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -5131,7 +5098,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5323,7 +5289,7 @@ test:
         - -DFD_SOURCE=1
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -5331,7 +5297,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: SaBRe reaches L2, but backend-visible loader file opens shift virtual inode allocation
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5393,7 +5358,7 @@ test:
         - -DLOCK_API=1
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -5401,7 +5366,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5633,7 +5597,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -5641,7 +5605,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -5753,7 +5716,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -5761,7 +5724,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6053,7 +6015,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6061,7 +6023,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6129,7 +6090,7 @@ test:
         - -no-pie
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -6137,7 +6098,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6258,7 +6218,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6266,7 +6226,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6438,7 +6397,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6451,7 +6410,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6503,7 +6461,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6511,7 +6469,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6563,7 +6520,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6571,7 +6528,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6933,7 +6889,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -6941,7 +6897,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -6993,7 +6948,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -7001,7 +6956,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7053,7 +7007,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -7061,7 +7015,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7183,7 +7136,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -7191,7 +7144,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7253,7 +7205,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7261,7 +7213,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7383,7 +7334,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         guest_args:
@@ -7394,7 +7345,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7455,7 +7405,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7463,7 +7413,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7525,7 +7474,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7533,7 +7482,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -7665,7 +7613,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -7673,7 +7621,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8450,7 +8397,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8458,7 +8405,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8510,7 +8456,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8518,7 +8464,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8570,7 +8515,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -8578,7 +8523,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8690,7 +8634,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -8698,7 +8642,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -8760,7 +8703,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -8768,7 +8711,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9000,7 +8942,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9008,7 +8950,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9060,7 +9001,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9068,7 +9009,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9120,7 +9060,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9128,7 +9068,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9455,7 +9394,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9463,7 +9402,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9515,7 +9453,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
           - sabre
@@ -9523,7 +9461,6 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9825,7 +9762,7 @@ test:
         - -Wno-error=sign-compare
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -9833,7 +9770,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -9945,7 +9881,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -9953,7 +9889,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
@@ -10005,7 +9940,7 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
+        ci: true
         backends_enabled:
           - ptrace
         backends_disabled:
@@ -10013,7 +9948,6 @@ test:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: The first verify run exits with waitpid error 512 after one raw libc syscall site; neither functional L2 nor a pure SaBRe path is established
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       naked:
         ci: false
         backends_enabled: []
