@@ -335,39 +335,10 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
-fn translate_self_identity_targets(
-    sysnum: i64,
-    args: &mut [u64; 6],
-    virtual_pid: i32,
-    virtual_tid: i32,
-    host_pid: i32,
-    host_tid: i32,
-) {
-    if virtual_pid <= 0 || host_pid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-    if virtual_tid <= 0 || host_tid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_rt_tgsigqueueinfo
-        && args[0] as i32 == virtual_pid
-        && args[1] as i32 == virtual_tid
-    {
-        args[0] = host_pid as u32 as u64;
-        args[1] = host_tid as u32 as u64;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_rt_sigqueueinfo && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-}
+// TODO-HUMAN-REVIEW(PR-1065): DBT identity-target arguments stay virtual until
+// Detcore handles them. In particular, prlimit64 is fully emulated against the
+// virtual process identity; translating its pid to a host pid here would leak a
+// per-run value into canonical evidence and make the shared handler reject it.
 
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
@@ -1550,14 +1521,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     };
-    translate_self_identity_targets(
-        sysnum,
-        &mut dispatch_args,
-        scratch.virtual_pid,
-        scratch.virtual_tid,
-        pid,
-        tid,
-    );
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBT prlimit64 input validation.
     if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
@@ -1973,83 +1936,6 @@ mod tests {
             &shutdown,
             || panic!("shutdown should refuse without idling"),
         ));
-    }
-
-    #[test]
-    fn self_identity_syscalls_use_host_identities() {
-        let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_tgsigqueueinfo,
-            &mut targeted,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(targeted[..2], [10_003, 10_004]);
-
-        let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(process[0], 10_003);
-
-        let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_tgsigqueueinfo,
-            &mut other,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other[..2], [5, 6]);
-
-        let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process_group,
-            0,
-            0,
-            10_003,
-            10_004,
-        );
-        assert_eq!(process_group[0], 0);
-
-        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
-        assert_eq!(prlimit[0], 10_003);
-
-        let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut prlimit_without_tid,
-            3,
-            0,
-            10_003,
-            0,
-        );
-        assert_eq!(prlimit_without_tid[0], 10_003);
-
-        let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
-        assert_eq!(current[0], 0);
-
-        let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut other_process,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other_process[0], 5);
     }
 
     #[test]
