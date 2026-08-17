@@ -673,7 +673,7 @@ fn run_preparation(
         &context.root,
         program,
         args,
-        &cell_env(dir, false),
+        &preparation_env(dir),
         &captures.join("prepare.stdout"),
         &captures.join("prepare.stderr"),
         timeout,
@@ -1609,6 +1609,43 @@ fn cell_env(dir: &Path, verified: bool) -> BTreeMap<String, String> {
     ])
 }
 
+fn preparation_env(dir: &Path) -> BTreeMap<String, String> {
+    let mut env = cell_env(dir, false);
+    let ambient_home = std::env::var_os("HOME");
+    let rustup_home = std::env::var_os("RUSTUP_HOME");
+    let cargo_home = std::env::var_os("CARGO_HOME");
+    add_toolchain_homes(
+        &mut env,
+        rustup_home.as_deref(),
+        cargo_home.as_deref(),
+        ambient_home.as_deref(),
+    );
+    env
+}
+
+fn add_toolchain_homes(
+    env: &mut BTreeMap<String, String>,
+    rustup_home: Option<&OsStr>,
+    cargo_home: Option<&OsStr>,
+    ambient_home: Option<&OsStr>,
+) {
+    // Guest preparation is a build-time context, not guest execution. Preserve
+    // the invoking toolchain state even though the cell's HOME is isolated;
+    // these values are deliberately absent from `cell_env` and never become
+    // Hermit `--env` arguments.
+    for (name, explicit, fallback) in [
+        ("RUSTUP_HOME", rustup_home, ".rustup"),
+        ("CARGO_HOME", cargo_home, ".cargo"),
+    ] {
+        let value = explicit
+            .map(PathBuf::from)
+            .or_else(|| ambient_home.map(|home| PathBuf::from(home).join(fallback)));
+        if let Some(value) = value {
+            env.insert(name.into(), value.to_string_lossy().into_owned());
+        }
+    }
+}
+
 fn shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut words = vec!["cd".into(), shell_quote(cwd), "&&".into(), "env".into()];
     words.extend(
@@ -1882,6 +1919,15 @@ mod tests {
                 window[0] == "--env" && window[1].starts_with(&format!("{name}="))
             }));
         }
+        for name in ["RUSTUP_HOME", "CARGO_HOME"] {
+            assert!(!spec.env.contains_key(name));
+            assert!(
+                !spec
+                    .argv
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("{name}=")))
+            );
+        }
 
         let mut replay_test = recipe(true);
         let replay_mode = replay_test.modes.remove("verify").unwrap();
@@ -1921,6 +1967,28 @@ mod tests {
                 window[0] == "--env" && window[1].starts_with(&format!("{name}="))
             }));
         }
+    }
+
+    #[test]
+    fn preparation_preserves_toolchain_homes_outside_the_guest_environment() {
+        let mut derived = cell_env(Path::new("/cell"), false);
+        add_toolchain_homes(&mut derived, None, None, Some(OsStr::new("/host/home")));
+        assert_eq!(derived["RUSTUP_HOME"], "/host/home/.rustup");
+        assert_eq!(derived["CARGO_HOME"], "/host/home/.cargo");
+
+        let mut explicit = cell_env(Path::new("/cell"), false);
+        add_toolchain_homes(
+            &mut explicit,
+            Some(OsStr::new("/toolchains/rustup")),
+            Some(OsStr::new("/toolchains/cargo")),
+            Some(OsStr::new("/host/home")),
+        );
+        assert_eq!(explicit["RUSTUP_HOME"], "/toolchains/rustup");
+        assert_eq!(explicit["CARGO_HOME"], "/toolchains/cargo");
+
+        let guest = cell_env(Path::new("/cell"), false);
+        assert!(!guest.contains_key("RUSTUP_HOME"));
+        assert!(!guest.contains_key("CARGO_HOME"));
     }
 
     #[test]
