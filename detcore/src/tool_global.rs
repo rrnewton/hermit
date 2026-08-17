@@ -1499,6 +1499,9 @@ impl GlobalState {
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
+        if dettid == detpid {
+            sched.report_process_exit_hook(detpid);
+        }
         drop(sched);
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",

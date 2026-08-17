@@ -19,6 +19,7 @@ const DETERMINISM_RUNS: usize = 5;
 
 static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static WAITSTATUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
@@ -68,6 +69,38 @@ fn signal_guest() -> &'static Path {
                 .arg("-o")
                 .arg(&binary);
             command_output(command, "signal guest compilation");
+            binary
+        })
+        .as_path()
+}
+
+fn waitstatus_guest() -> &'static Path {
+    WAITSTATUS_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("hermit-cli should be inside the repository");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("signal-determinism");
+            fs::create_dir_all(&build_root)
+                .expect("failed to create signal determinism build directory");
+            let binary = build_root.join("signal_waitstatus_identity");
+
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-O2",
+                    "-g",
+                    "-pthread",
+                    "-D_GNU_SOURCE",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(repository.join("tests/c/signal_waitstatus_identity.c"))
+                .arg("-o")
+                .arg(&binary);
+            command_output(command, "signal wait-status guest compilation");
             binary
         })
         .as_path()
@@ -264,4 +297,66 @@ fn pending_signal_and_mask_survive_exec() {
 #[test]
 fn fork_kill_waitpid_is_strictly_deterministic() {
     verify_signal_scenario("fork-kill-waitpid", "fork-kill-waitpid-ok\n");
+}
+
+#[test]
+fn signal_waitstatus_identity_is_strictly_deterministic() {
+    const EXPECTED_STDOUT: &str = "normal_exit: exited code=7\n\
+sigterm: signalled sig=15 core=0\n\
+sigkill: signalled sig=9 core=0\n\
+sigill: signalled sig=4 core=host-policy\n\
+sigfpe: signalled sig=8 core=host-policy\n\
+abort: signalled sig=6 core=host-policy\n\
+exit_from_non_main_thread: exited code=11\n\
+failures=0\n";
+
+    let _guard = hermit_signal_lock();
+    for iteration in 0..DETERMINISM_RUNS {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create signal wait-status verification directory");
+        let report_path = directory.path().join("verify.json");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "60s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=info", "run", "--strict", "--verify"])
+            .arg(format!("--verify-json={}", report_path.display()))
+            .arg("--")
+            .arg(waitstatus_guest());
+        let output = command_output(
+            command,
+            &format!(
+                "strict signal wait-status verification, iteration {}",
+                iteration + 1
+            ),
+        );
+        assert_eq!(
+            output.stdout,
+            EXPECTED_STDOUT.as_bytes(),
+            "unexpected output for strict signal wait-status verification, iteration {}\nstderr:\n{}",
+            iteration + 1,
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report_path).expect("signal wait-status verification omitted verify JSON"),
+        )
+        .expect("signal wait-status verification verify JSON was invalid");
+        assert_eq!(report["verdict"], serde_json::json!("matched"));
+        assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+        let left = report["compared_log_messages"]["left"]
+            .as_u64()
+            .expect("signal wait-status verification omitted compared left INFO messages");
+        let right = report["compared_log_messages"]["right"]
+            .as_u64()
+            .expect("signal wait-status verification omitted compared right INFO messages");
+        assert!(
+            left > 0,
+            "signal wait-status verification compared no INFO messages"
+        );
+        assert_eq!(
+            left, right,
+            "signal wait-status INFO counts differed: {report}"
+        );
+    }
 }

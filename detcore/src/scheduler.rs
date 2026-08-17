@@ -530,6 +530,14 @@ pub struct Scheduler {
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
     deregistration_accounted: BTreeSet<DetTid>,
 
+    /// Process leaders whose exit hook has published the process's final state.
+    ///
+    /// A child-exit signal is scheduled at the deterministic `Exit` grant, before
+    /// the backend necessarily reaches that hook. Delay the signal until this
+    /// publication so a woken parent cannot observe the host-timed gap between
+    /// logical exit and kernel waitability.
+    process_exit_hooks_reported: BTreeSet<DetPid>,
+
     /// Whether the backend will report final physical process exits after logical cleanup.
     backend_reports_physical_process_exits: bool,
 
@@ -1234,6 +1242,7 @@ impl Scheduler {
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
+            process_exit_hooks_reported: Default::default(),
             backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
             logical_kill_logged: Default::default(),
@@ -1638,6 +1647,7 @@ impl Scheduler {
         // raw-TID tombstones: the pending exec record proves why Linux reused it.
         self.logically_killed_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
+        self.process_exit_hooks_reported.remove(&detpid);
         self.pending_physical_process_exits.remove(&detpid);
         assert!(
             self.next_turns
@@ -1730,6 +1740,11 @@ impl Scheduler {
     /// behavior; SaBRe teardown may deliver the cleanup after an earlier logical tombstone.
     pub(crate) fn note_deregistration_accounted(&mut self, dettid: DetTid) -> bool {
         !self.cancel_killed_thread_rpcs || self.deregistration_accounted.insert(dettid)
+    }
+
+    /// Publish that the process leader's exit hook has recorded final process state.
+    pub(crate) fn report_process_exit_hook(&mut self, detpid: DetPid) -> bool {
+        self.process_exit_hooks_reported.insert(detpid)
     }
 
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
@@ -1971,7 +1986,7 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_run_queue_admissions();
         self.step2a_wait_for_vfork_barrier()?;
-        self.step2b_process_timed(); // May populate run_queue.
+        self.step2b_process_timed()?; // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred(); // May populate run_queue.
         self.step2d_handle_empty_queue(global_time)?;
@@ -2073,7 +2088,7 @@ impl Scheduler {
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
     /// dispatching from the normal run queue.  Manipulates scheduler data structures
     /// accordingly.
-    fn step2b_process_timed(&mut self) {
+    fn step2b_process_timed(&mut self) -> Result<(), SkipTurn> {
         if let Some((time_ns, evt)) = self
             .blocked
             .timed_waiters
@@ -2082,10 +2097,20 @@ impl Scheduler {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
                 TimedEvent::SignalEvt(
-                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
+                    timed_waiters::SignalTimerId::ChildExit { child, parent },
                     dtid,
                     sig,
                 ) => {
+                    if !self.process_exit_hooks_reported.remove(&child) {
+                        self.blocked
+                            .timed_waiters
+                            .insert_child_exit(time_ns, child, parent, dtid);
+                        trace!(
+                            "waiting for process {} exit hook before deterministic child-exit signal",
+                            child
+                        );
+                        return Err(SkipTurn);
+                    }
                     // Deterministic child-exit SIGCHLD. If the host-async signal
                     // already arrived and was parked by the InboundSignal deferral
                     // gate, release it now at this logical time. Otherwise synthesize
@@ -2100,6 +2125,7 @@ impl Scheduler {
                 TimedEvent::SignalEvt(id, dtid, sig) => self.fire_alarm(id.process(), dtid, sig),
             }
         }
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5271,6 +5297,27 @@ mod test {
             (LogicalTime::from_nanos(150), LogicalTime::ZERO)
         );
         assert!(scheduler.blocked.timed_waiters.is_empty());
+    }
+
+    #[test]
+    fn child_exit_signal_waits_for_process_exit_hook() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let child = DetPid::from_raw(200);
+        let parent = DetPid::from_raw(100);
+        let deadline = LogicalTime::from_nanos(1_000);
+        scheduler.committed_time = deadline;
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert_child_exit(deadline, child, parent, parent);
+
+        assert!(scheduler.step2b_process_timed().is_err());
+        assert_eq!(scheduler.blocked.timed_waiters.len(), 1);
+
+        assert!(scheduler.report_process_exit_hook(child));
+        assert!(scheduler.step2b_process_timed().is_ok());
+        assert!(scheduler.blocked.timed_waiters.is_empty());
+        assert!(!scheduler.process_exit_hooks_reported.contains(&child));
     }
 
     #[test]
