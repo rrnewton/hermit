@@ -3894,6 +3894,10 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
+    const STEP_TIMEOUT_SECONDS: i64 = 5;
+    const CELL_COUNT: usize = 20;
+    const MANIFEST_GUEST_CAP: usize = 4;
+
     let direct = scratch.join("direct-scheduler");
     fs::create_dir_all(&direct)
         .map_err(|error| format!("cannot create direct-scheduler fixture: {error}"))?;
@@ -3907,12 +3911,12 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         "job": "shared",
         "cmd": format!("printf 'build\\n' >> {}", shell_quote(&build_count.to_string_lossy())),
         "deps": [],
-        "timeout": 5,
-        "cpu_timeout": 5,
+        "timeout": STEP_TIMEOUT_SECONDS,
+        "cpu_timeout": STEP_TIMEOUT_SECONDS,
         "hint": {"hard_mem_max_bytes": 67108864}
     })];
     let mut cell_tags = Vec::new();
-    for number in 1..=20 {
+    for number in 1..=CELL_COUNT {
         let tag = format!("cell.run-{number:02}");
         cell_tags.push(tag.clone());
         let output = executed.join(format!("{number:02}"));
@@ -3925,8 +3929,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
                 shell_quote(&output.to_string_lossy())
             ),
             "deps": ["build.shared"],
-            "timeout": 5,
-            "cpu_timeout": 5,
+            "timeout": STEP_TIMEOUT_SECONDS,
+            "cpu_timeout": STEP_TIMEOUT_SECONDS,
             "hint": {
                 "resources": {"manifest_guest": 1},
                 "hard_mem_max_bytes": 67108864
@@ -3938,29 +3942,48 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         "job": "summarize",
         "cmd": "true",
         "deps": cell_tags,
-        "timeout": 5,
-        "cpu_timeout": 5,
+        "timeout": STEP_TIMEOUT_SECONDS,
+        "cpu_timeout": STEP_TIMEOUT_SECONDS,
         "hint": {"hard_mem_max_bytes": 67108864}
     }));
     let dag = dag_from_json(
         &serde_json::to_string(&json!({
             "description": "pressure direct scheduler self-test",
-            "resource_caps": {"manifest_guest": 4},
+            "resource_caps": {"manifest_guest": MANIFEST_GUEST_CAP},
             "steps": steps,
         }))
         .map_err(|error| format!("cannot serialize direct-scheduler fixture: {error}"))?,
     )
     .map_err(|error| format!("cannot parse direct-scheduler fixture: {error}"))?;
 
+    let jobs = default_jobs();
+    let effective_cell_width = usize::try_from(jobs)
+        .unwrap_or(1)
+        .clamp(1, MANIFEST_GUEST_CAP);
+    let cell_waves = CELL_COUNT.div_ceil(effective_cell_width);
+    // The scheduler correctly refuses a step unless its complete declared
+    // budget fits inside the remaining whole-run bound. Account for the build,
+    // every resource-capped cell wave, and the summary, then retain one step
+    // budget for scheduler/process bookkeeping instead of relying on the
+    // fixture's current 50 ms commands.
+    let declared_critical_path_seconds =
+        STEP_TIMEOUT_SECONDS * i64::try_from(cell_waves + 2).unwrap();
+    let run_timeout_seconds = declared_critical_path_seconds + STEP_TIMEOUT_SECONDS;
     let execution = with_execution_root(scratch, || {
-        execute_typed_dag(&dag, default_jobs(), None, Instant::now(), 15)
+        execute_typed_dag(
+            &dag,
+            jobs,
+            None,
+            Instant::now(),
+            run_timeout_seconds,
+        )
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
         .iter()
         .filter(|outcome| outcome.tag.starts_with("cell."))
         .collect();
-    if cell_outcomes.len() != 20
+    if cell_outcomes.len() != CELL_COUNT
         || cell_outcomes.iter().filter(|outcome| outcome.ok).count() != 18
         || execution.passes < 2
     {
@@ -3979,9 +4002,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot read direct-scheduler build count: {error}"))?
         .lines()
         .count();
-    if executed_count != 20 || builds != 1 {
+    if executed_count != CELL_COUNT || builds != 1 {
         return Err(format!(
-            "direct scheduler did not share one build across 20 cells: outputs={executed_count} builds={builds}"
+            "direct scheduler did not share one build across {CELL_COUNT} cells: outputs={executed_count} builds={builds}"
         ));
     }
 
