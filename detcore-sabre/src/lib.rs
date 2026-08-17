@@ -273,9 +273,37 @@ impl Plugin {
     }
 
     fn handle_vdso(&self, sysno: Sysno, args: SyscallArgs) -> i32 {
-        self.adapter
-            .handle_syscall(Syscall::from_raw(sysno, args))
+        let call = Syscall::from_raw(sysno, args);
+        restart_on_erestartsys(|| self.adapter.handle_syscall(call))
             .map_or_else(|errno| -errno.into_raw(), |result| result as i32)
+    }
+}
+
+/// Repeat a Detcore syscall handler for as long as it asks to be restarted.
+///
+/// Detcore's internally polled blocking syscalls return `ERESTARTSYS` when the
+/// scheduler interrupts the poll: that errno is the kernel's private
+/// "re-execute this syscall" convention, never an application-visible result.
+/// Under the ptrace backend the kernel's syscall-restart frame consumes it and
+/// the guest never sees it. An in-guest dispatcher writes the handler's result
+/// straight into the guest's return register and has no such frame, so it must
+/// repeat the handler itself; otherwise the private errno reaches the program
+/// under test as `errno == 512`.
+///
+/// This is the same restart protocol `reverie-preload`'s `drive_tool_syscall`
+/// carries for the ld-preload backends. It applies to every syscall here rather
+/// than only `wait4`, because Detcore uses `ERESTARTSYS` for one purpose only:
+/// `NonblockableSyscall::signal_interrupt_errno` returns it for every
+/// restartable internally polled call, `read` and `futex` included.
+fn restart_on_erestartsys<F>(mut attempt: F) -> Result<usize, Errno>
+where
+    F: FnMut() -> Result<usize, Errno>,
+{
+    loop {
+        match attempt() {
+            Err(Errno::ERESTARTSYS) => continue,
+            other => return other,
+        }
     }
 }
 
@@ -304,10 +332,11 @@ impl reverie_sabre::Tool for Plugin {
                 Sysno::getrandom,
                 SyscallArgs::new(buffer as usize, length, flags as usize, 0, 0, 0),
             );
-            match <Self as reverie_sabre::ToolGlobal>::global()
-                .adapter
-                .handle_syscall(syscall)
-            {
+            match restart_on_erestartsys(|| {
+                <Self as reverie_sabre::ToolGlobal>::global()
+                    .adapter
+                    .handle_syscall(syscall)
+            }) {
                 Ok(result) => result as libc::ssize_t,
                 Err(error) => {
                     unsafe { *libc::__errno_location() = error.into_raw() };
@@ -329,19 +358,22 @@ impl reverie_sabre::Tool for Plugin {
         if let Some(result) = self.handle_post_load_syscall(&syscall) {
             return result;
         }
-        self.adapter.handle_syscall(syscall)
+        restart_on_erestartsys(|| self.adapter.handle_syscall(syscall))
     }
 
     fn syscall_with_inject<F>(
         &self,
         syscall: Syscall,
         _memory: &LocalMemory,
-        inject: F,
+        mut inject: F,
     ) -> Result<usize, Errno>
     where
         F: FnMut() -> usize + Send + Sync,
     {
-        self.adapter.handle_syscall_with_inject(syscall, inject)
+        restart_on_erestartsys(|| {
+            self.adapter
+                .handle_syscall_with_inject(syscall, &mut inject)
+        })
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -492,5 +524,47 @@ mod tests {
     #[should_panic(expected = "SaBRe RDTSC virtualization failed")]
     fn virtual_rdtsc_error_fails_closed() {
         require_virtual_rdtsc(Err(Errno::EIO));
+    }
+
+    #[test]
+    fn erestartsys_is_restarted_and_never_returned() {
+        // Detcore asks for a restart twice, then completes. The guest must see
+        // the completion, never the kernel-private errno.
+        let mut attempts = 0;
+        let result = restart_on_erestartsys(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(Errno::ERESTARTSYS)
+            } else {
+                Ok(144)
+            }
+        });
+        assert_eq!(result, Ok(144));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn erestartsys_restart_leaves_every_other_result_alone() {
+        // A real errno is the guest's answer and must not be retried; the same
+        // holds for a successful return.
+        let mut attempts = 0;
+        assert_eq!(
+            restart_on_erestartsys(|| {
+                attempts += 1;
+                Err(Errno::EINTR)
+            }),
+            Err(Errno::EINTR)
+        );
+        assert_eq!(attempts, 1);
+
+        let mut attempts = 0;
+        assert_eq!(
+            restart_on_erestartsys(|| {
+                attempts += 1;
+                Ok(0)
+            }),
+            Ok(0)
+        );
+        assert_eq!(attempts, 1);
     }
 }
