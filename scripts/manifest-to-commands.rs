@@ -120,6 +120,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
+        "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
+        "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "mkdir -p \"$cell/home\" \"$cell/xdg-config\" \"$cell/tmp\" \"$cell/fixtures\" \"$cell/captures\""
             .to_owned(),
         "if [ -d tests/e2e/xdg-config ]; then cp -a tests/e2e/xdg-config/. \"$cell/xdg-config/\"; fi"
@@ -259,16 +261,16 @@ fn hermit_command(
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict $record_verify_strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0),
             seed.unwrap_or(0)
@@ -708,6 +710,7 @@ test:
             "guest",
         );
         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+        assert!(replay.contains("--strict $record_verify_strict --verify"));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
         let chaos = hermit_command(
@@ -722,6 +725,7 @@ test:
         );
         assert!(chaos.contains("run --base-env=minimal"));
         assert!(chaos.contains("--verify --verify-allow=both"));
+        assert!(chaos.contains("--strict $run_verify_strict --verify"));
         assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
         assert!(chaos.contains("--log=info"));
         assert!(!chaos.contains("--no-virtualize-cpuid"));
@@ -743,8 +747,9 @@ test:
 
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
         assert!(verify.contains("run --base-env=minimal"));
-        assert!(verify.contains("--strict --verify --verify-json \"$cell/captures/verify.json\""));
-        assert!(!verify.contains("--verify-strict"));
+        assert!(verify.contains(
+            "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+        ));
     }
 
     #[test]

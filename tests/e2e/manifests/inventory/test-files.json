@@ -2,9 +2,9 @@
   "files": [
     {
       "disposition": "support-data",
-      "path": "tests/Cargo.yaml",
+      "path": "tests/Cargo.toml",
       "runner": "Cargo and Hermit Rust integration tests",
-      "why": "tests/Cargo.yaml is owned by Cargo and Hermit Rust integration tests: This package manifest declares the named Rust guest binaries and their dependencies. Cargo consumes it to build targets; it is configuration rather than executable input and the generic manifest must not duplicate Cargo's target graph."
+      "why": "tests/Cargo.toml is owned by Cargo and Hermit Rust integration tests: This package manifest declares the named Rust guest binaries and their dependencies. Cargo consumes it to build targets; it is configuration rather than executable input and the generic manifest must not duplicate Cargo's target graph."
     },
     {
       "disposition": "support-data",
@@ -1863,20 +1863,20 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/chaos/cas_sequence.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/chaos/cas_sequence.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `cas_sequence` is built from `tests/chaos/cas_sequence.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/cas_sequence.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `cas_sequence` is built from `tests/chaos/cas_sequence.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/chaos/hello_chaos.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/chaos/hello_chaos.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `hello_chaos` is built from `tests/chaos/hello_chaos.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/hello_chaos.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `hello_chaos` is built from `tests/chaos/hello_chaos.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/chaos/keyvalue.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/chaos/keyvalue.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `keyvalue` is built from `tests/chaos/keyvalue.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/keyvalue.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `keyvalue` is built from `tests/chaos/keyvalue.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "manifest-test",
@@ -1887,8 +1887,8 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/chaos/nanosleep-threads-nocrash-rust.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/chaos/nanosleep-threads-nocrash-rust.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `nanosleep-threads-nocrash-rust` is built from `tests/chaos/nanosleep-threads-nocrash-rust.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/chaos/nanosleep-threads-nocrash-rust.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `nanosleep-threads-nocrash-rust` is built from `tests/chaos/nanosleep-threads-nocrash-rust.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "manifest-test",
@@ -2750,9 +2750,9 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.yaml",
+      "path": "tests/reproducible-builds/build-time-0.1.3/Cargo.toml",
       "runner": "tests/reproducible-builds/run.sh",
-      "why": "tests/reproducible-builds/build-time-0.1.3/Cargo.yaml is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `Cargo.yaml` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
+      "why": "tests/reproducible-builds/build-time-0.1.3/Cargo.toml is owned by tests/reproducible-builds/run.sh: The reproducible-build asset `Cargo.toml` defines or documents the pinned build-time fixture crate. run.sh performs the paired builds and byte comparison, so individual crate metadata/source files are inputs rather than standalone tests."
     },
     {
       "disposition": "guest-fixture",
@@ -2805,170 +2805,170 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/bind_connect_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/bind_connect_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `bind_connect_race` is built from `tests/rust/bind_connect_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/bind_connect_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `bind_connect_race` is built from `tests/rust/bind_connect_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/clock_gettime.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/clock_gettime.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `clock_gettime` is built from `tests/rust/clock_gettime.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/clock_gettime.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `clock_gettime` is built from `tests/rust/clock_gettime.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/clock_total_order.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/clock_total_order.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `clock_total_order` is built from `tests/rust/clock_total_order.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/clock_total_order.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `clock_total_order` is built from `tests/rust/clock_total_order.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/exit_group.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/exit_group.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `exit_group` is built from `tests/rust/exit_group.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/exit_group.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `exit_group` is built from `tests/rust/exit_group.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/futex_and_print.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/futex_and_print.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `futex_and_print` is built from `tests/rust/futex_and_print.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_and_print.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_and_print` is built from `tests/rust/futex_and_print.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/futex_timeout.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/futex_timeout.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `futex_timeout` is built from `tests/rust/futex_timeout.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_timeout.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_timeout` is built from `tests/rust/futex_timeout.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/futex_wait_child.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/futex_wait_child.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `futex_wait_child` is built from `tests/rust/futex_wait_child.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_wait_child.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_wait_child` is built from `tests/rust/futex_wait_child.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/futex_wake_some.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/futex_wake_some.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `futex_wake_some` is built from `tests/rust/futex_wake_some.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/futex_wake_some.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_wake_some` is built from `tests/rust/futex_wake_some.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/heap_ptrs.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/heap_ptrs.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `heap_ptrs` is built from `tests/rust/heap_ptrs.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/heap_ptrs.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `heap_ptrs` is built from `tests/rust/heap_ptrs.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/interrogate_tty.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/interrogate_tty.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `interrogate_tty` is built from `tests/rust/interrogate_tty.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/interrogate_tty.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `interrogate_tty` is built from `tests/rust/interrogate_tty.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/landlock.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/landlock.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `landlock` is built from `tests/rust/landlock.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/landlock.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `landlock` is built from `tests/rust/landlock.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/mem_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/mem_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `mem_race` is built from `tests/rust/mem_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/mem_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `mem_race` is built from `tests/rust/mem_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/nanosleep.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/nanosleep.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `nanosleep` is built from `tests/rust/nanosleep.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/nanosleep.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `nanosleep` is built from `tests/rust/nanosleep.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/network_hello_world.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/network_hello_world.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `network_hello_world` is built from `tests/rust/network_hello_world.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/network_hello_world.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_hello_world` is built from `tests/rust/network_hello_world.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/pipe_basics.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/pipe_basics.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `pipe_basics` is built from `tests/rust/pipe_basics.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/pipe_basics.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `pipe_basics` is built from `tests/rust/pipe_basics.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/poll.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/poll.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `poll` is built from `tests/rust/poll.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/poll.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `poll` is built from `tests/rust/poll.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/poll_spin.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/poll_spin.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `poll_spin` is built from `tests/rust/poll_spin.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/poll_spin.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `poll_spin` is built from `tests/rust/poll_spin.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_abs_race` is built from `tests/rust/print_clock_nanosleep_monotonic_abs_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_monotonic_abs_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_abs_race` is built from `tests/rust/print_clock_nanosleep_monotonic_abs_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/print_clock_nanosleep_monotonic_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/print_clock_nanosleep_monotonic_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_race` is built from `tests/rust/print_clock_nanosleep_monotonic_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_monotonic_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_monotonic_race` is built from `tests/rust/print_clock_nanosleep_monotonic_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `print_clock_nanosleep_realtime_abs_race` is built from `tests/rust/print_clock_nanosleep_realtime_abs_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_clock_nanosleep_realtime_abs_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_clock_nanosleep_realtime_abs_race` is built from `tests/rust/print_clock_nanosleep_realtime_abs_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/print_nanosleep_race.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/print_nanosleep_race.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `print_nanosleep_race` is built from `tests/rust/print_nanosleep_race.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/print_nanosleep_race.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `print_nanosleep_race` is built from `tests/rust/print_nanosleep_race.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/rdtsc.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/rdtsc.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `rdtsc` is built from `tests/rust/rdtsc.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/rdtsc.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `rdtsc` is built from `tests/rust/rdtsc.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/recvmmsg.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/recvmmsg.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `recvmmsg` is built from `tests/rust/recvmmsg.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/recvmmsg.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `recvmmsg` is built from `tests/rust/recvmmsg.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/sched_yield.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/sched_yield.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `sched_yield` is built from `tests/rust/sched_yield.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/sched_yield.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `sched_yield` is built from `tests/rust/sched_yield.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/select.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/select.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `select` is built from `tests/rust/select.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/select.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `select` is built from `tests/rust/select.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/shutdown.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/shutdown.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `shutdown` is built from `tests/rust/shutdown.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/shutdown.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `shutdown` is built from `tests/rust/shutdown.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/socketpair.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/socketpair.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `socketpair` is built from `tests/rust/socketpair.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/socketpair.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `socketpair` is built from `tests/rust/socketpair.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/stack_ptr.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/stack_ptr.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `stack_ptr` is built from `tests/rust/stack_ptr.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/stack_ptr.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `stack_ptr` is built from `tests/rust/stack_ptr.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "support-data",
@@ -2979,14 +2979,14 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/thread_random.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/thread_random.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `thread_random` is built from `tests/rust/thread_random.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/thread_random.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `thread_random` is built from `tests/rust/thread_random.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/rust/tkill.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/rust/tkill.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `tkill` is built from `tests/rust/tkill.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/rust/tkill.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `tkill` is built from `tests/rust/tkill.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "guest-fixture",
@@ -3099,14 +3099,14 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/standalone/network_bind.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/standalone/network_bind.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `network_bind` is built from `tests/standalone/network_bind.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/network_bind.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_bind` is built from `tests/standalone/network_bind.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/standalone/network_bind_full.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/standalone/network_bind_full.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `network_bind_full` is built from `tests/standalone/network_bind_full.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/network_bind_full.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `network_bind_full` is built from `tests/standalone/network_bind_full.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "integration-helper",
@@ -3129,8 +3129,8 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/standalone/stacktrace_events.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/standalone/stacktrace_events.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `stacktrace_events` is built from `tests/standalone/stacktrace_events.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/standalone/stacktrace_events.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `stacktrace_events` is built from `tests/standalone/stacktrace_events.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "integration-helper",
@@ -3171,14 +3171,14 @@
     {
       "disposition": "cargo-binary",
       "path": "tests/stress/concurrency.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/stress/concurrency.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `concurrency` is built from `tests/stress/concurrency.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/stress/concurrency.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `concurrency` is built from `tests/stress/concurrency.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "cargo-binary",
       "path": "tests/stress/scheduling_fairness.rs",
-      "runner": "tests/Cargo.yaml and Hermit integration targets",
-      "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.yaml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.yaml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
+      "runner": "tests/Cargo.toml and Hermit integration targets",
+      "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
       "disposition": "support-data",
