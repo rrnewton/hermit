@@ -357,6 +357,20 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("hermit stderr should be UTF-8")
 }
 
+fn remove_retained_verify_logs(stderr: &str) {
+    for line in stderr.lines() {
+        let Some(path) = line
+            .strip_prefix("::   run 1: ")
+            .or_else(|| line.strip_prefix("::   run 2: "))
+        else {
+            continue;
+        };
+        fs::remove_file(path).unwrap_or_else(|error| {
+            panic!("failed to remove retained verification log {path}: {error}")
+        });
+    }
+}
+
 fn assert_failure_contains(output: &Output, expected: &[&str]) {
     assert_eq!(
         output.status.code(),
@@ -2149,6 +2163,98 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
         let output = command.output().expect("failed to run restricted hermit");
         assert_failure_contains(&output, &expected);
     }
+}
+
+#[test]
+fn verify_first_run_diagnostics_distinguish_launch_refusal_from_guest_failure() {
+    let _guard = HERMIT_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut denied = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    denied.args([
+        "run",
+        "--verify",
+        "--verify-strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        "/bin/true",
+    ]);
+    deny_syscall(&mut denied, libc::SYS_ptrace);
+    let denied = denied
+        .output()
+        .expect("failed to run ptrace-denied verify control");
+    assert_failure_contains(
+        &denied,
+        &["cannot use ptrace", "PTRACE_TRACEME", "--namespace-only"],
+    );
+
+    let temporary = tempfile::tempdir().expect("failed to create missing-loader fixture directory");
+    let source = temporary.path().join("missing_loader.c");
+    let guest = temporary.path().join("missing_loader");
+    fs::write(&source, "int main(void) { return 0; }\n")
+        .expect("failed to write missing-loader fixture");
+    let mut compiler = Command::new("cc");
+    compiler
+        .arg(&source)
+        .arg("-Wl,--dynamic-linker=/definitely/missing-hermit-test-loader")
+        .arg("-o")
+        .arg(&guest);
+    let compiled = compiler
+        .output()
+        .expect("failed to compile missing-loader fixture");
+    assert!(
+        compiled.status.success(),
+        "missing-loader fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr),
+    );
+
+    let missing_loader = hermit(&[
+        "run",
+        "--verify",
+        "--verify-strict",
+        "--tmp=/tmp",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        guest.to_str().expect("fixture path should be UTF-8"),
+    ]);
+    assert_failure_contains(
+        &missing_loader,
+        &[
+            ":: Run1...",
+            "Exit status: exited with code 1",
+            "First-run execution failure: syscall #1 execve = Err(Errno(ENOENT))",
+            ":: Verification logs retained:",
+        ],
+    );
+    remove_retained_verify_logs(&stderr(&missing_loader));
+
+    let failed = hermit(&[
+        "run",
+        "--verify",
+        "--verify-strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'guest-stdout-marker\\n'; printf 'guest-stderr-marker\\n' >&2; exit 23",
+    ]);
+    assert_failure_contains(
+        &failed,
+        &[
+            ":: Run1...",
+            "Exit status: exited with code 23",
+            "guest-stdout-marker",
+            "guest-stderr-marker",
+            ":: Verification logs retained:",
+            "First run during --verify exited with code 23",
+        ],
+    );
+    remove_retained_verify_logs(&stderr(&failed));
 }
 
 /// The container's virtual clock must keep advancing across `execve`.

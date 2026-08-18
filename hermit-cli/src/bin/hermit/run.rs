@@ -513,6 +513,46 @@ impl VerifyAllow {
     }
 }
 
+fn describe_exit_status(status: ExitStatus) -> String {
+    match status {
+        ExitStatus::Exited(code) => format!("exited with code {code}"),
+        ExitStatus::Signaled(signal, core_dumped) => {
+            let core = if core_dumped { " (core dumped)" } else { "" };
+            format!("terminated by signal {} ({signal:?}){core}", signal as i32)
+        }
+    }
+}
+
+fn failed_exec_from_log(path: &Path) -> std::io::Result<Option<String>> {
+    let mut failure = None;
+    for line in fs::read_to_string(path)?.lines() {
+        let Some((_, syscall)) = line.split_once("finish syscall #") else {
+            continue;
+        };
+        let Some((number, call)) = syscall.split_once(": ") else {
+            continue;
+        };
+        let name = if call.starts_with("execve(") {
+            "execve"
+        } else if call.starts_with("execveat(") {
+            "execveat"
+        } else {
+            continue;
+        };
+        let Some((_, outcome)) = call.rsplit_once(" = ") else {
+            continue;
+        };
+        if outcome.starts_with("Err(") {
+            // Do not copy the syscall arguments: execve includes the complete
+            // guest environment. The syscall number, operation, and errno are
+            // sufficient to distinguish an execution failure from a guest that
+            // started and deliberately returned a non-zero status.
+            failure = Some(format!("syscall #{number} {name} = {outcome}"));
+        }
+    }
+    Ok(failure)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum BaseEnv {
     Empty,
@@ -2787,9 +2827,7 @@ impl RunOpts {
         let mut out1: Output = match self.run_verify(log1_file, global) {
             Ok(output) => output,
             Err(error) => {
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
+                retain_verification_logs([("run 1", log1_path)])?;
                 return Err(error);
             }
         };
@@ -2824,15 +2862,22 @@ impl RunOpts {
         }
 
         if !self.verify_allow.satisfies(out1.status) {
+            let status = describe_exit_status(out1.status);
             eprintln!(
-                "First run errored during --verify, not continuing to a second. Stdout:\n{}\nStderr:\n{}",
+                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
+            match failed_exec_from_log(&log1_path) {
+                Ok(Some(failure)) => eprintln!("First-run execution failure: {failure}"),
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "WARNING: could not inspect first-run verification log {}: {error}",
+                    log1_path.display()
+                ),
             }
-            return Err(Error::msg("First run during --verify exited in error"));
+            retain_verification_logs([("run 1", log1_path)])?;
+            return Err(Error::msg(format!("First run during --verify {status}")));
         }
 
         eprintln!(":: {}", "Run2...".yellow().bold());
@@ -3274,6 +3319,23 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn failed_exec_diagnostic_excludes_argv_and_environment() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            log.path(),
+            "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #1: \
+             execve(0x1 -> \"/guest\", 0x2 -> [\"secret-argument\"], \
+             0x3 -> [\"SECRET_ENV=value\"]) = Err(Errno(ENOENT))\n",
+        )
+        .unwrap();
+
+        let diagnostic = failed_exec_from_log(log.path()).unwrap().unwrap();
+        assert_eq!(diagnostic, "syscall #1 execve = Err(Errno(ENOENT))");
+        assert!(!diagnostic.contains("secret-argument"));
+        assert!(!diagnostic.contains("SECRET_ENV"));
+    }
 
     #[test]
     fn verification_report_is_published_before_success_is_announced() {
