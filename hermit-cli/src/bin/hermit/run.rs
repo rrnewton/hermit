@@ -1956,6 +1956,12 @@ impl RunOpts {
                     &self.args,
                     self.verify,
                     self.verify_allow,
+                    self.verify_json.as_deref(),
+                    if self.verify_verbose || self.verify_strict {
+                        LogCompareStrictness::Canonical
+                    } else {
+                        LogCompareStrictness::Stripped
+                    },
                     self.summary,
                     global.log,
                     &self.effective_det_config(),

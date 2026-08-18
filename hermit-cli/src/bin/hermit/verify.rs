@@ -155,9 +155,10 @@ pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
     /// Whether the internal event stream was compared at all. When
-    /// `false` (e.g. KVM concurrent mode) only stdout/stderr/exit status were
-    /// compared and the strictness fields describe a log comparison that did not
-    /// run — a consumer must not read such a verdict as bitwise log parity.
+    /// `false`, the backend compared only its non-log observations: KVM uses
+    /// stdout/stderr/exit status, while DBT uses status/stdout and its Detcore
+    /// summary. The strictness fields describe a log comparison that did not run
+    /// — a consumer must not read such a verdict as bitwise log parity.
     pub compare_logs: bool,
     /// The message envelope selected from the captured log. The compared-message
     /// counts refer exactly to this scope.

@@ -307,7 +307,8 @@ impl Subcommand {
         //     mount-source and program validation, happens-before resolution,
         //     e9patch preparation;
         //   * the DBT arm, which returns `run_dbt(..)` and never reaches
-        //     `verify()`, so it produces no verdict at all;
+        //     `verify()`; `run_dbt` replaces this stamp only after its own
+        //     comparison reaches a verdict;
         //   * `--namespace-only`, which likewise bypasses `verify()`;
         //   * `StartOpts::main`'s own pre-validation before `record_verify`.
         //
@@ -441,21 +442,16 @@ mod tests {
     }
 
     /// TOP-LEVEL EXIT 2 -- the DBT arm of `RunOpts::main` RETURNS `run_dbt(..)`
-    /// and never reaches `verify()`, so a `--verify --verify-json` DBT run
-    /// cannot produce a verdict at all.
+    /// and never reaches `verify()`, so it must receive the verdict-artifact path
+    /// explicitly. Early DBT exits retain the top-level no-result stamp; a
+    /// completed DBT comparison replaces it with its typed, non-parity verdict.
     ///
-    /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbt` takes
-    /// `verify: bool` but no verdict-artifact path, in BOTH cfg arms
-    /// (`backends.rs`), so the bypass is a property of the signature: there is
-    /// no argument through which it could publish one. An earlier version of
-    /// this test drove the arm for real; with the stamp removed it did not fail
-    /// but HUNG (blocking in `reserve_output_stdin_snapshot` on the harness
-    /// stdin), which is a no-result wearing another outcome -- precisely the
-    /// bug class this file exists to prevent, and it would wedge a CI shard for
-    /// its whole timeout. A test that cannot hang is worth more here than one
-    /// that exercises the launch.
+    /// Asserted STRUCTURALLY for both cfg arms so a build without DBT support
+    /// cannot silently drop the channel while the DBT-enabled integration test
+    /// continues passing elsewhere. The CLI integration suite separately runs
+    /// the real backend and checks both a completed match and an early no-result.
     #[test]
-    fn dbt_arm_has_no_channel_to_publish_a_verdict() {
+    fn dbt_arm_has_a_channel_to_publish_a_verdict() {
         let source = include_str!("backends.rs");
         let signatures: Vec<&str> = source
             .match_indices("fn run_dbt(")
@@ -473,10 +469,9 @@ mod tests {
                 "run_dbt should still receive the verify flag"
             );
             assert!(
-                !signature.contains("verify_json") && !signature.contains("json"),
-                "run_dbt gained a verdict-artifact parameter; the DBT arm can now publish a \
-                 verdict, so it must clear or publish the receipt rather than relying solely on \
-                 the top-level pending stamp:\n{signature}"
+                signature.contains("verify_json"),
+                "run_dbt must receive the verdict-artifact path so a completed comparison can \
+                 replace the top-level no-result stamp:\n{signature}"
             );
         }
     }
