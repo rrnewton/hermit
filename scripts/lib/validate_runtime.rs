@@ -210,7 +210,7 @@ fn has_toolchain_phrase(line: &str) -> bool {
                 "cannot execute",
                 "could not create temporary file",
                 "failed to build archive at",
-                // MEASURED 2026-08-17, four phrasings of one host condition that
+                // MEASURED 2026-08-17, five phrasings of one host condition that
                 // reached a node's output and were classified as product reds:
                 // rustc's incremental link_or_copy step, which says "unable to
                 // copy" where the sibling path says "could not write output to";
@@ -227,6 +227,11 @@ fn has_toolchain_phrase(line: &str) -> bool {
                 // could plausibly print next to a legitimate EPERM, and Form 2
                 // would then excuse a real red. rustc always emits the prefix.
                 "error: failed to write ",
+                // coreutils `rm` refusing to unlink a scratch file, seen when a
+                // fixture cleans up its own /tmp work. Prefixed with the program
+                // name for the same reason as the line above: "cannot remove" on
+                // its own is ordinary English.
+                "rm: cannot remove",
             ],
         )
 }
@@ -1482,6 +1487,11 @@ pub fn self_test() -> Result<String, String> {
             "cp: cannot create symbolic link '/tmp/tmp.zIdYFwxfiQ/detcore/.ignore': \
              Operation not permitted",
         ),
+        // (e) coreutils rm refusing to unlink a fixture scratch file.
+        (
+            "toolchain-eperm",
+            "rm: cannot remove '/tmp/tmp.smlR46sit2': Operation not permitted",
+        ),
         // (d) clippy-driver failing to write a .rmeta, measured in lint.clippy.
         (
             "toolchain-eperm",
@@ -1541,6 +1551,8 @@ pub fn self_test() -> Result<String, String> {
         // Guest prose that happens to contain "failed to write" beside a real
         // EPERM. This is why that one anchor carries the `error: ` prefix.
         "guest wrote: failed to write /tmp/scratch: Operation not permitted",
+        // Likewise for "cannot remove": only coreutils' own prefixed form counts.
+        "guest wrote: cannot remove the lock file: Operation not permitted",
     ];
     let mut refused = 0usize;
     for text in refuse {
@@ -2048,7 +2060,7 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the proxy/VCS classes and the 4 measured build-tool phrasings, one of them \
+         (incl. the proxy/VCS classes and the 5 measured build-tool phrasings, one of them \
          spanning a cargo Caused-by block), node-detail extraction 1 hit / 2 miss (incl. partial), \
          retry verdict 1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, \
          CPU-vs-wall hints \
