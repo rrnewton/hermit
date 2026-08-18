@@ -71,12 +71,26 @@ struct DbtSummary {
 #[cfg(feature = "dbt")]
 impl DbtSummary {
     fn same_observable_behavior(&self, other: &Self) -> bool {
-        // `branches` is the count at the last intercepted syscall, not an execution digest.
-        // Keep it as callback-health telemetry without rejecting otherwise identical runs.
+        // `branches` is deliberately absent here because it is checked separately, with
+        // its own message, immediately after this call. It is NOT excluded because it is
+        // tolerant: the DynamoRIO client documents it as a deterministic function of the
+        // executed instruction stream that both `--verify` runs must reproduce
+        // (`reverie-dbt/native/client.c`, "Determinism: `branch_count` advances only at
+        // counted app branches"). The value is read at process exit via
+        // `reverie_dbt_runtime_totals`, not at the last intercepted syscall.
         self.syscalls == other.syscalls
             && self.rewritten == other.rewritten
             && self.stdin_reads == other.stdin_reads
             && self.memory_hash == other.memory_hash
+    }
+
+    /// The counted-branch clock must be identical across both `--verify` runs.
+    ///
+    /// The DynamoRIO client advances `branch_count` only at counted app branches,
+    /// making it a deterministic function of the executed instruction stream, so a
+    /// difference means the runs executed different streams.
+    fn same_branch_clock(&self, other: &Self) -> bool {
+        self.branches == other.branches
     }
 }
 
@@ -552,11 +566,20 @@ pub(super) fn run_dbt(
             "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
         )));
     }
-    if first_summary.branches != second_summary.branches {
-        eprintln!(
-            ":: DBT diagnostic branch counts differed at the last syscall: {} | {}",
+    // A branch-count difference is a determinism violation, not a diagnostic. The
+    // DynamoRIO client defines `branch_count` as a deterministic function of the
+    // executed instruction stream that both `--verify` runs must reproduce, so a
+    // difference means the two runs executed different counted-branch streams even
+    // when their syscalls, stdout and memory hash agree. Previously this was printed
+    // and ignored, which let such a run report "Determinism verified" and exit 0.
+    if !first_summary.same_branch_clock(&second_summary) {
+        write_output(&first)?;
+        return Err(Error::msg(format!(
+            "DBT verification failed: branch counts differed between runs ({} != {}); \
+             the counted-branch clock is deterministic, so the runs executed different \
+             instruction streams",
             first_summary.branches, second_summary.branches
-        );
+        )));
     }
 
     write_output(&first)?;
@@ -867,8 +890,14 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
-    fn dbt_summary_treats_last_syscall_branch_count_as_telemetry() {
+    fn dbt_summary_checks_the_branch_clock_separately_not_leniently() {
+        // `same_observable_behavior` omits `branches` because the branch clock is
+        // checked on its own, with its own failure message — not because a
+        // difference is tolerable. Both properties are asserted here so the
+        // omission can never be mistaken for leniency again.
         assert!(dbt_summary(563_145).same_observable_behavior(&dbt_summary(563_103)));
+        assert!(!dbt_summary(563_145).same_branch_clock(&dbt_summary(563_103)));
+        assert!(dbt_summary(563_145).same_branch_clock(&dbt_summary(563_145)));
     }
 
     #[test]
