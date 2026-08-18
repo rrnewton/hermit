@@ -31,6 +31,7 @@ static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 fn hermit(args: &[&str]) -> Output {
@@ -103,6 +104,31 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn stdio_lseek_identity_guest() -> &'static Path {
+    STDIO_LSEEK_IDENTITY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-lseek-identity");
+        fs::create_dir_all(&build_root).expect("failed to create stdio-lseek build directory");
+        let guest = build_root.join("stdio_lseek_identity");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/stdio_lseek_identity.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile stdio-lseek fixture");
+        assert!(
+            output.status.success(),
+            "stdio-lseek fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -769,6 +795,61 @@ fn backend_stats_are_info_gated_for_ptrace() {
         stderr(&info_output).contains("backend run complete backend=ptrace stats=metrics=none"),
         "{}",
         stderr(&info_output)
+    );
+}
+
+#[test]
+fn inherited_container_output_does_not_expose_capture_offset() {
+    let _guard = HERMIT_RUN_LOCK.lock().unwrap();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create stdio-lseek test directory");
+    let combined_log_path = directory.path().join("hermit-and-guest.log");
+    let report_path = directory.path().join("guest-report");
+    let guest_file_path = directory.path().join("guest-output");
+    let combined_log = fs::File::create(&combined_log_path)
+        .expect("failed to create combined Hermit/guest output log");
+    let args = ["--log", "info", "run", "--strict", "--"];
+    let status = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(args)
+        .arg(stdio_lseek_identity_guest())
+        .arg(&report_path)
+        .arg(&guest_file_path)
+        .stdout(Stdio::from(
+            combined_log
+                .try_clone()
+                .expect("failed to clone combined output log"),
+        ))
+        .stderr(Stdio::from(combined_log))
+        .status()
+        .expect("failed to run stdio-lseek identity fixture");
+    let combined = fs::read_to_string(&combined_log_path)
+        .expect("failed to read combined Hermit/guest output log");
+    let report = fs::read_to_string(&report_path).expect("failed to read guest seek report");
+
+    assert!(status.success(), "Hermit failed:\n{combined}");
+    assert!(
+        report.contains("inherited-stdout offset=-1 errno=29"),
+        "inherited stdout exposed the outer capture offset:\n{report}"
+    );
+    assert!(
+        report.contains("inherited-stderr offset=-1 errno=29"),
+        "inherited stderr exposed the outer capture offset:\n{report}"
+    );
+    assert!(
+        report.contains("stdout-alias offset=-1 errno=29"),
+        "a dup of inherited stdout exposed the outer capture offset:\n{report}"
+    );
+    assert!(
+        report.contains("stderr-alias offset=-1 errno=29"),
+        "a dup of inherited stderr exposed the outer capture offset:\n{report}"
+    );
+    assert!(
+        report.contains("guest-file-stdout offset=0 errno=0"),
+        "guest-installed stdout lost ordinary file seek semantics:\n{report}"
+    );
+    assert!(
+        report.contains("guest-file-stderr offset=0 errno=0"),
+        "guest-installed stderr lost ordinary file seek semantics:\n{report}"
     );
 }
 

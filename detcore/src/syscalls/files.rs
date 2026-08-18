@@ -42,6 +42,7 @@ use crate::fd::*;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::Device;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -70,6 +71,20 @@ fn should_tag_sabre_internal_pipe_io(
         && fd_type == FdType::Pipe
         && physically_nonblocking
         && !logically_nonblocking
+}
+
+/// Inherited container output is a stream even when an outer runner stores it
+/// in a seekable file.  The backing file also carries Hermit's own diagnostics,
+/// so exposing its live offset makes tool logging guest-visible.  Preserve real
+/// file semantics after a guest replaces stdout/stderr: `dup2(file, 1)` copies
+/// the file's resource rather than this container-output resource.
+fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
 }
 
 fn unix_autobind_addrlen() -> i32 {
@@ -669,9 +684,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
-        let procfs_position = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
+        let (procfs_position, resource) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (detfd.procfs_position(), detfd.resource())
+        })?;
+        if is_inherited_container_output(resource) {
+            return Err(Errno::ESPIPE.into());
+        }
         let Some((current, snapshot_len)) = procfs_position else {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
@@ -2728,10 +2746,13 @@ mod test {
 
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::is_inherited_container_output;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use crate::fd::FdType;
+    use crate::resources::Device;
+    use crate::resources::ResourceID;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -2773,6 +2794,20 @@ mod test {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn only_inherited_container_output_is_nonseekable() {
+        assert!(is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStdout
+        ))));
+        assert!(is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStderr
+        ))));
+        assert!(!is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStdin
+        ))));
+        assert!(!is_inherited_container_output(None));
     }
 
     #[test]
