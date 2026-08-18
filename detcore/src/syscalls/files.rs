@@ -37,6 +37,7 @@ use tracing::warn;
 
 use super::deterministic_stdio_inode;
 use crate::config::SchedHeuristic;
+use crate::consts::DET_PIPE_CAPACITY;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::procfs::ProcfsFile;
@@ -1819,9 +1820,40 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
             }
+            // Give the pipe a fixed capacity so neither the value the guest reads
+            // back with F_GETPIPE_SZ nor the point at which a writer fills the
+            // buffer depends on the host's per-user pipe-page accounting. See
+            // DET_PIPE_CAPACITY. Both ends share one buffer, so setting either
+            // end is enough. The pipe is empty here, so the shrink cannot return
+            // EBUSY, and shrinking is never refused for exceeding the soft limit.
+            self.set_deterministic_pipe_capacity(guest, fds[0]).await?;
         }
 
         Ok(res)
+    }
+
+    /// Pin a freshly created pipe to [`DET_PIPE_CAPACITY`].
+    ///
+    /// This is a determinization, not a sandbox boundary: it removes a host-derived
+    /// value from the guest's view the same way `handle_prlimit64` serves resource
+    /// limits from process-local state rather than asking the host.
+    async fn set_deterministic_pipe_capacity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<(), Errno> {
+        let applied = guest
+            .inject_with_retry(Syscall::Fcntl(
+                syscalls::Fcntl::new()
+                    .with_fd(raw_fd)
+                    .with_cmd(F_SETPIPE_SZ(DET_PIPE_CAPACITY)),
+            ))
+            .await?;
+        info!(
+            "DETLOG pipe capacity pinned to {} bytes on fd {} (host returned {})",
+            DET_PIPE_CAPACITY, raw_fd, applied
+        );
+        Ok(())
     }
 
     /// utime syscall: update access/modification time on a file
