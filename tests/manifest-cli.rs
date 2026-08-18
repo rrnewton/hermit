@@ -636,9 +636,50 @@ fn resolve_cell(test: &Value, id: &str, args: &Args) -> (String, String, String,
     (mode, backend, lane, timeout)
 }
 
+/// Append the manifest's `modes.<mode>.guest_args.<backend>` to the rendered
+/// guest invocation.
+///
+/// The execution runner appends these (`ci/manifest-plan/src/runner.rs`), so a
+/// rendered command that omits them is not the command the harness runs: an
+/// arg-required guest prints its usage, exits nonzero, and Hermit records
+/// `verdict: "no_result"` with a null comparison instead of a real result.
+///
+/// The runner's `--` rule is mirrored here: a shell-command guest needs the
+/// separator so the arguments arrive as positional parameters rather than as
+/// options to `sh` itself.
+fn append_guest_args(test: &Value, id: &str, mode: &str, backend: &str, guest: String) -> String {
+    let Some(spec) = modes_table(test, id).get(mode) else {
+        return guest;
+    };
+    let Some(declared) = spec
+        .get("guest_args")
+        .and_then(Value::as_table)
+        .and_then(|table| table.get(backend))
+    else {
+        return guest;
+    };
+    let declared = string_array(
+        Some(declared),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    );
+    if declared.is_empty() {
+        return guest;
+    }
+    let mut rendered = guest;
+    if matches!(test.get("direct"), Some(Value::String(_))) {
+        rendered.push_str(" --");
+    }
+    for argument in &declared {
+        rendered.push(' ');
+        rendered.push_str(&shell_quote(argument));
+    }
+    rendered
+}
+
 fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, args);
     let (setup, guest) = setup_prefix(test, id);
+    let guest = append_guest_args(test, id, &mode, &backend, guest);
     let log = args
         .flag("log")
         .map(str::to_owned)
@@ -780,6 +821,67 @@ fn self_test() -> ExitCode {
     );
     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
     assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
+
+    // A rendered command must carry the manifest's declared guest arguments.
+    // Dropping them runs an arg-required guest with no argv: it prints usage,
+    // exits nonzero, and Hermit records `verdict: "no_result"` with a null
+    // comparison, which reads as an unavailable cell rather than a tool bug.
+    let program_guest: Value = concat!(
+        "modes:\n",
+        "  verify:\n",
+        "    guest_args:\n",
+        "      liteinst: [multi]\n",
+        "      ptrace: [multi, extra arg]\n",
+    )
+    .parse()
+    .unwrap();
+    let rendered = |backend| {
+        append_guest_args(
+            &program_guest,
+            "fixture",
+            "verify",
+            backend,
+            "\"$cell/guest\"".to_owned(),
+        )
+    };
+    assert_eq!(rendered("liteinst"), "\"$cell/guest\" multi");
+    // Arguments are shell-quoted, and guest_args are per-backend.
+    assert_eq!(rendered("ptrace"), "\"$cell/guest\" multi 'extra arg'");
+    // A backend, or a mode, that declares nothing is left exactly as rendered.
+    assert_eq!(rendered("kvm"), "\"$cell/guest\"");
+    assert_eq!(
+        append_guest_args(
+            &program_guest,
+            "fixture",
+            "naked",
+            "native",
+            "\"$cell/guest\"".to_owned()
+        ),
+        "\"$cell/guest\""
+    );
+
+    // A shell-command guest takes the runner's `--` separator so the arguments
+    // become positional parameters instead of options to `sh` itself.
+    let shell_guest: Value = concat!(
+        "direct: echo hi\n",
+        "modes:\n",
+        "  verify:\n",
+        "    guest_args:\n",
+        "      ptrace: [tail]\n",
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        append_guest_args(
+            &shell_guest,
+            "fixture",
+            "verify",
+            "ptrace",
+            "sh -c 'echo hi'".to_owned()
+        ),
+        "sh -c 'echo hi' -- tail"
+    );
+
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }
