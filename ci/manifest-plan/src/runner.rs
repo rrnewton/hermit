@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -674,8 +675,14 @@ fn run_preparation(
         program,
         args,
         &preparation_env(dir),
-        &captures.join("prepare.stdout"),
-        &captures.join("prepare.stderr"),
+        ProcessCapture {
+            stdout: &captures.join("prepare.stdout"),
+            stderr: &captures.join("prepare.stderr"),
+            // Preparation diagnostics must reach both the per-cell evidence
+            // and the enclosing DAG node. The environmental classifier
+            // intentionally reads only that node's captured output.
+            forward_output_to_node: true,
+        },
         timeout,
     )?;
     if output.timed_out || !output.status.success() {
@@ -856,8 +863,13 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         &spec.argv[0],
         &spec.argv[1..],
         &spec.env,
-        &stdout_path,
-        &stderr_path,
+        ProcessCapture {
+            stdout: &stdout_path,
+            stderr: &stderr_path,
+            // Guest stdout/stderr remain capture-only. In particular, do not
+            // change their descriptor shape while repairing preparation output.
+            forward_output_to_node: false,
+        },
         spec.timeout_seconds,
     )?;
     if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
@@ -1021,24 +1033,82 @@ struct ProcessOutput {
     timed_out: bool,
 }
 
+struct ProcessCapture<'a> {
+    stdout: &'a Path,
+    stderr: &'a Path,
+    forward_output_to_node: bool,
+}
+
+/// Copy one preparation stream to its per-cell capture and the DAG node stream.
+///
+/// Sending the child's output directly to a regular file prevents the DAG node
+/// from capturing the same diagnostic. Giving the child a pipe and draining it
+/// here makes the node record and per-cell evidence carry identical bytes.
+fn copy_process_output<R, C, F>(
+    mut input: R,
+    mut capture: C,
+    mut forward: Option<F>,
+) -> Result<(), String>
+where
+    R: Read,
+    C: Write,
+    F: Write,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut forward_error = None;
+    loop {
+        let read = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        capture
+            .write_all(&buffer[..read])
+            .map_err(|e| e.to_string())?;
+        if forward_error.is_none() {
+            if let Some(output) = forward.as_mut() {
+                if let Err(error) = output.write_all(&buffer[..read]) {
+                    forward_error = Some(error);
+                }
+            }
+        }
+    }
+    capture.flush().map_err(|e| e.to_string())?;
+    if forward_error.is_none() {
+        if let Some(output) = forward.as_mut() {
+            if let Err(error) = output.flush() {
+                forward_error = Some(error);
+            }
+        }
+    }
+    match forward_error {
+        Some(error) => Err(error.to_string()),
+        None => Ok(()),
+    }
+}
+
 fn execute_process(
     cwd: &Path,
     program: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
-    stdout: &Path,
-    stderr: &Path,
+    capture: ProcessCapture<'_>,
     timeout_seconds: u64,
 ) -> Result<ProcessOutput, String> {
-    let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
-    let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
+    let mut stdout_file = Some(
+        File::create(capture.stdout).map_err(|e| format!("{}: {e}", capture.stdout.display()))?,
+    );
+    let mut stderr_file = Some(
+        File::create(capture.stderr).map_err(|e| format!("{}: {e}", capture.stderr.display()))?,
+    );
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(stdout_file)
-        .stderr(stderr_file);
+    command.args(args).current_dir(cwd).stdin(Stdio::null());
+    if capture.forward_output_to_node {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    } else {
+        command
+            .stdout(stdout_file.take().expect("capture stdout file"))
+            .stderr(stderr_file.take().expect("capture stderr file"));
+    }
     command.envs(env.iter());
     unsafe {
         command.pre_exec(|| {
@@ -1051,13 +1121,29 @@ fn execute_process(
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
+    let output_threads = if capture.forward_output_to_node {
+        let child_stdout = child.stdout.take().expect("piped child stdout");
+        let child_stderr = child.stderr.take().expect("piped child stderr");
+        let stdout_file = stdout_file.take().expect("forwarded stdout capture file");
+        let stderr_file = stderr_file.take().expect("forwarded stderr capture file");
+        vec![
+            thread::spawn(move || {
+                copy_process_output(child_stdout, stdout_file, Some(std::io::stdout()))
+            }),
+            thread::spawn(move || {
+                copy_process_output(child_stderr, stderr_file, Some(std::io::stderr()))
+            }),
+        ]
+    } else {
+        Vec::new()
+    };
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
-    loop {
+    let output = 'wait: loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            return Ok(ProcessOutput {
+            break ProcessOutput {
                 status,
                 timed_out: false,
-            });
+            };
         }
         if Instant::now() >= deadline {
             unsafe {
@@ -1066,10 +1152,10 @@ fn execute_process(
             let grace = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                    return Ok(ProcessOutput {
+                    break 'wait ProcessOutput {
                         status,
                         timed_out: true,
-                    });
+                    };
                 }
                 if Instant::now() >= grace {
                     break;
@@ -1080,13 +1166,19 @@ fn execute_process(
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let status = child.wait().map_err(|e| e.to_string())?;
-            return Ok(ProcessOutput {
+            break ProcessOutput {
                 status,
                 timed_out: true,
-            });
+            };
         }
         thread::sleep(Duration::from_millis(20));
+    };
+    for output_thread in output_threads {
+        output_thread
+            .join()
+            .map_err(|_| "process output thread panicked".to_string())??;
     }
+    Ok(output)
 }
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
@@ -1774,6 +1866,57 @@ fn execute_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_output_is_identical_in_capture_and_node_stream() {
+        let banner = b"Enforcer: FS, Reason: FILE_OPEN\n";
+        let mut capture = Vec::new();
+        let mut node_stream = Vec::new();
+
+        copy_process_output(&banner[..], &mut capture, Some(&mut node_stream)).unwrap();
+
+        assert_eq!(capture, banner);
+        assert_eq!(node_stream, banner);
+    }
+
+    #[test]
+    fn preparation_process_captures_the_forwarded_banner() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-preparation-output-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stdout = root.join("prepare.stdout");
+        let stderr = root.join("prepare.stderr");
+        let args = vec![
+            "-c".into(),
+            "printf 'Enforcer: FS, Reason: FILE_OPEN\\n' >&2; exit 23".into(),
+        ];
+
+        let output = execute_process(
+            &root,
+            "/bin/sh",
+            &args,
+            &BTreeMap::new(),
+            ProcessCapture {
+                stdout: &stdout,
+                stderr: &stderr,
+                forward_output_to_node: true,
+            },
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(23));
+        assert!(!output.timed_out);
+        assert_eq!(fs::read(&stdout).unwrap(), b"");
+        assert_eq!(
+            fs::read(&stderr).unwrap(),
+            b"Enforcer: FS, Reason: FILE_OPEN\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn recipe(ci: bool) -> TestRecipe {
         let disabled = BTreeMap::from([
