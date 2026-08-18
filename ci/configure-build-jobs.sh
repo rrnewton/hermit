@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c261050cfd41bec67e31bfd0cf6f56be008d0ebb ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie c261050cfd41bec67e31bfd0cf6f56be008d0ebb" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 15d3653d81f69e66fae7a5f33a52d0fd540a5b89 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 15d3653d81f69e66fae7a5f33a52d0fd540a5b89" >&2
     return 2
 fi
 
@@ -512,6 +512,23 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
+
+# CARRY TO 15d3653 (2026-08-17). The calibration carries unchanged because
+# every versioned input to the DynamoRIO content-key miss is object-identical
+# across c261050..15d3653:
+#
+#   git diff --name-status c261050..15d3653 -- reverie-dbt -> no output
+#   git rev-parse c261050:reverie-dbt -> 1a54c31a601c0d83dd4b86e8e75d891ab94b2010
+#   git rev-parse 15d3653:reverie-dbt -> 1a54c31a601c0d83dd4b86e8e75d891ab94b2010
+#   git rev-parse c261050:reverie-dbt/build.rs -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   git rev-parse 15d3653:reverie-dbt/build.rs -> 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   git rev-parse c261050:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 15d3653:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#
+# The only intervening change is in reverie-kvm/src/executor.rs. It does not
+# change the DBT build recipe, vendored DynamoRIO source, toolchain, or build
+# invocation. The recorded recipe identity and budget therefore carry
+# unchanged; fresh exact-head validation remains required.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
