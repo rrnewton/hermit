@@ -96,7 +96,7 @@ fn has_toolchain_phrase(line: &str) -> bool {
                 "cannot execute",
                 "could not create temporary file",
                 "failed to build archive at",
-                // MEASURED 2026-08-17, three phrasings of one host condition that
+                // MEASURED 2026-08-17, four phrasings of one host condition that
                 // reached a node's output and were classified as product reds:
                 // rustc's incremental link_or_copy step, which says "unable to
                 // copy" where the sibling path says "could not write output to";
@@ -107,6 +107,12 @@ fn has_toolchain_phrase(line: &str) -> bool {
                 // `cp -a`/`ln -s` refusing to make a link, which "can't create"
                 // above does not spell the same way.
                 "cannot create symbolic link",
+                // rustc/clippy failing to write a .rmeta or .o. Deliberately
+                // anchored WITH the `error: ` prefix, unlike its siblings above:
+                // "failed to write" on its own is ordinary English that a guest
+                // could plausibly print next to a legitimate EPERM, and Form 2
+                // would then excuse a real red. rustc always emits the prefix.
+                "error: failed to write ",
             ],
         )
 }
@@ -990,6 +996,12 @@ pub fn self_test() -> Result<String, String> {
             "cp: cannot create symbolic link '/tmp/tmp.zIdYFwxfiQ/detcore/.ignore': \
              Operation not permitted",
         ),
+        // (d) clippy-driver failing to write a .rmeta, measured in lint.clippy.
+        (
+            "toolchain-eperm",
+            "error: failed to write /w/target/debug/deps/librustbin_futex_and_print-06f5.rmeta: \
+             Operation not permitted (os error 1)",
+        ),
     ];
     let mut accepted = 0usize;
     for (want, text) in accept {
@@ -1040,6 +1052,9 @@ pub fn self_test() -> Result<String, String> {
         // failure: still refused, because no tool phrase joins it.
         "error: test harness reported a failure\n  \
          guest wrote: permission denied",
+        // Guest prose that happens to contain "failed to write" beside a real
+        // EPERM. This is why that one anchor carries the `error: ` prefix.
+        "guest wrote: failed to write /tmp/scratch: Operation not permitted",
     ];
     let mut refused = 0usize;
     for text in refuse {
@@ -1216,7 +1231,7 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the proxy/VCS classes and the 3 measured build-tool phrasings, one of them \
+         (incl. the proxy/VCS classes and the 4 measured build-tool phrasings, one of them \
          spanning a cargo Caused-by block), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
