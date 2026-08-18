@@ -221,8 +221,8 @@ the PIT, watchdog-skew, or no-clocksource warnings.
 
 ## Host time virtualization and clock calibration (issue #6)
 
-Even without `-icount`, the QEMU-side symptom above has a Hermit-side cause and
-a Hermit-side workaround.
+The QEMU-side symptom above has a Hermit-side cause. It does not currently have
+a working Hermit-side workaround; see the measurements later in this section.
 
 By default Hermit virtualizes the guest's clocks, but it does so from **two
 independent logical-time bases that are not coordinated with each other**:
@@ -247,24 +247,67 @@ clocksource: No current clocksource.
 tsc: Marking TSC unstable due to clocksource watchdog
 ```
 
-There are two independent ways to avoid this:
+Only one of the two conceivable ways out actually works:
 
-1. **QEMU side (deterministic-friendly):** `-icount shift=0,sleep=off`, which
-   makes QEMU drive both the guest TSC and the emulated device timers from one
-   instruction-derived virtual clock, as used by the verified profile above.
-2. **Hermit side:** `--no-virtualize-time --no-virtualize-metadata`, which lets
-   QEMU read the real, mutually consistent host clocks. This sacrifices time
-   determinism for the whole run but calibrates normally and reaches the
-   expected boot outcome.
+1. **QEMU side (works, and is the supported route):** `-icount shift=0,sleep=off`,
+   which makes QEMU drive both the guest TSC and the emulated device timers from
+   one instruction-derived virtual clock, as used by the verified profile above.
+2. **Hermit side (does *not* work):** `--no-virtualize-time
+   --no-virtualize-metadata` is intended to let QEMU read the real, mutually
+   consistent host clocks. It does not rescue a boot that lacks `-icount`.
 
-To surface this, `hermit run` prints a one-line advisory when it launches a
-`qemu-system-*` program while virtual time is enabled, pointing at both
-workarounds. The advisory is informational only; it does not change behavior.
+An earlier revision of this section claimed the Hermit-side option "calibrates
+normally and reaches the expected boot outcome". That claim was wrong. Measured
+on 2026-08-18 with the canonical command above, changing only `-icount` and the
+Hermit time flags, and using this document's own oracle
+(`SHARED_FUTEX_QEMU_KERNEL_OK` followed by `reboot: Power down`):
+
+| kernel | `-icount` | Hermit time | `--strict` | outcome |
+| --- | --- | --- | --- | --- |
+| 6.19.2 | yes | virtualized | yes | boot OK, 110 s |
+| 6.13.2 | yes | virtualized | yes | boot OK, 109 s |
+| 6.19.2 | no | virtualized | yes | guest panic after 8,953 serial bytes |
+| 6.19.2 | no | `--no-virtualize-time` | yes | Hermit exits 1 immediately |
+| 6.19.2 | no | `--no-virtualize-time` | no | guest panic, same signature |
+| 6.13.2 | no | `--no-virtualize-time` | no | guest panic, same signature |
+
+`6.13.2` is `6.13.2-0_fbk15_hardened_0_g33ebba20e5e4`, the kernel named in the
+Evidence section below, so this is not a newer-kernel regression. The two
+`-icount` rows establish that the reproduction is faithful: the supported route
+boots cleanly on both kernels on the same host.
+
+The failure is a guest panic during timer setup, not the softer calibration
+degradation described above:
+
+```text
+..MP-BIOS bug: 8254 timer not connected to IO-APIC
+Kernel panic - not syncing: IO-APIC + timer doesn't work!
+```
+
+Two further points. The option is *inert* against this failure: the panic
+signature is identical with and without it, so it changes nothing about the
+outcome. And it is incompatible with `--strict`, which the canonical command
+uses — strict mode rejects the now-unvirtualized `gettimeofday`, so Hermit exits
+before the guest starts:
+
+```text
+ERROR detcore: [detcore, dtid 3] inbound syscall: gettimeofday(...) = ?
+Error: Sandbox container exited unexpectedly
+```
+
+Treat `-icount shift=0,sleep=off` as required, not as one of two alternatives.
+
+Note that `hermit run` still prints a one-line advisory when it launches a
+`qemu-system-*` program while virtual time is enabled, and that advisory
+recommends *both* routes. Its Hermit-side suggestion is not supported by the
+measurements above. The advisory is informational only; it does not change
+behavior.
 
 A fully coherent multi-clock model (a single Hermit time base shared by
 `rdtsc`, `clock_gettime`, and their derived clocks, coordinated across threads)
-would remove the need for either workaround but is out of scope here; this
-section documents the supported workarounds instead.
+would remove the need for `-icount` here, and is the real fix for the
+Hermit-side cause described in this section. It remains out of scope for this
+document, which records the one workaround that is measured to work.
 
 ## Kernel and initramfs
 
