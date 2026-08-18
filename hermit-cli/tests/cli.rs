@@ -564,6 +564,110 @@ fn run_dbt_verifies_simple_env_shebang() {
     );
 }
 
+#[test]
+fn run_dbt_verify_json_distinguishes_output_only_match_from_no_result() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT verification-report directory");
+    let matched_path = directory.path().join("matched.json");
+    let matched_path_string = matched_path
+        .to_str()
+        .expect("DBT matched report path should be UTF-8");
+    let matched_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        matched_path_string,
+        "--",
+        "/bin/true",
+    ];
+    let matched = hermit(&matched_args);
+    assert_success(&matched, &matched_args);
+    let matched_report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&matched_path).expect("failed to read DBT matched report"),
+    )
+    .expect("DBT matched report should be valid JSON");
+    assert_eq!(matched_report["verified"], true);
+    assert_eq!(matched_report["verdict"], "matched");
+    assert_eq!(matched_report["bitwise_parity"], false);
+    assert_eq!(matched_report["comparison"]["strictness"], "canonical");
+    assert_eq!(matched_report["comparison"]["compare_logs"], false);
+    assert!(matched_report["compared_log_messages"].is_null());
+
+    let counter = directory.path().join("counter");
+    fs::write(&counter, "first\n").expect("failed to initialize DBT divergence counter");
+    let diverged_path = directory.path().join("diverged.json");
+    let diverged_path_string = diverged_path
+        .to_str()
+        .expect("DBT divergence report path should be UTF-8");
+    let counter_string = counter
+        .to_str()
+        .expect("DBT divergence counter path should be UTF-8");
+    let diverged_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        diverged_path_string,
+        "--",
+        "/bin/sh",
+        "-c",
+        "cat \"$1\"; printf 'second\\n' >\"$1\"",
+        "dbt-divergence",
+        counter_string,
+    ];
+    let diverged = hermit(&diverged_args);
+    assert!(!diverged.status.success());
+    let diverged_report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&diverged_path).expect("failed to read DBT divergence report"),
+    )
+    .expect("DBT divergence report should be valid JSON");
+    assert_eq!(diverged_report["verified"], false);
+    assert_eq!(diverged_report["verdict"], "diverged");
+    assert_eq!(diverged_report["bitwise_parity"], false);
+    assert_eq!(diverged_report["comparison"]["compare_logs"], false);
+    assert!(diverged_report["compared_log_messages"].is_null());
+
+    let no_result_path = directory.path().join("no-result.json");
+    let no_result_path_string = no_result_path
+        .to_str()
+        .expect("DBT no-result report path should be UTF-8");
+    let no_result_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        no_result_path_string,
+        "--",
+        "/bin/false",
+    ];
+    let no_result = hermit(&no_result_args);
+    assert_eq!(no_result.status.code(), Some(1));
+    let no_result_stderr = stderr(&no_result);
+    assert!(
+        no_result_stderr.contains(":: DBT Run1...") && !no_result_stderr.contains(":: DBT Run2..."),
+        "DBT no-result control unexpectedly reached the comparison:\n{no_result_stderr}",
+    );
+    let no_result_report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&no_result_path).expect("failed to read DBT no-result report"),
+    )
+    .expect("DBT no-result report should be valid JSON");
+    assert_eq!(no_result_report["verified"], false);
+    assert_eq!(no_result_report["verdict"], "no_result");
+    assert_eq!(no_result_report["bitwise_parity"], false);
+    assert!(no_result_report["comparison"].is_null());
+    assert!(no_result_report["compared_log_messages"].is_null());
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
 // After pidfd_send_signal/pidfd_getfd were determinized, restart_syscall is the

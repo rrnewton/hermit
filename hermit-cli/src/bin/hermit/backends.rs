@@ -57,6 +57,15 @@ use reverie_dbt::DbtRunner;
 use tracing::metadata::LevelFilter;
 
 use super::run::VerifyAllow;
+#[cfg(feature = "dbt")]
+use super::verify::ComparisonSpec;
+use super::verify::LogCompareStrictness;
+#[cfg(feature = "dbt")]
+use super::verify::Verdict;
+#[cfg(feature = "dbt")]
+use super::verify::VerificationOutcome;
+#[cfg(feature = "dbt")]
+use super::verify::write_verification_json;
 
 #[derive(Debug)]
 #[cfg(feature = "dbt")]
@@ -383,6 +392,8 @@ pub(super) fn run_dbt(
     args: &[String],
     verify: bool,
     verify_allow: VerifyAllow,
+    verify_json: Option<&Path>,
+    verify_strictness: LogCompareStrictness,
     summary: bool,
     log: Option<LevelFilter>,
     config: &Config,
@@ -534,6 +545,12 @@ pub(super) fn run_dbt(
     // contract (e.g. a guest that must exit 23 on both runs); without it, two
     // differing permitted failures would be accepted as "deterministic".
     if first.status != second.status {
+        publish_dbt_verification(
+            verify_json,
+            Verdict::Diverged,
+            output_status(&second),
+            verify_strictness,
+        )?;
         write_output(&first)?;
         return Err(Error::msg(format!(
             "DBT verification failed: guest exit status differed between runs ({:?} != {:?})",
@@ -542,12 +559,24 @@ pub(super) fn run_dbt(
     }
 
     if first.stdout != second.stdout {
+        publish_dbt_verification(
+            verify_json,
+            Verdict::Diverged,
+            output_status(&second),
+            verify_strictness,
+        )?;
         return Err(Error::msg(dbt_stdout_mismatch(
             &first.stdout,
             &second.stdout,
         )));
     }
     if !first_summary.same_observable_behavior(&second_summary) {
+        publish_dbt_verification(
+            verify_json,
+            Verdict::Diverged,
+            output_status(&second),
+            verify_strictness,
+        )?;
         return Err(Error::msg(format!(
             "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
         )));
@@ -559,6 +588,8 @@ pub(super) fn run_dbt(
         );
     }
 
+    let status = output_status(&first);
+    publish_dbt_verification(verify_json, Verdict::Matched, status, verify_strictness)?;
     write_output(&first)?;
     eprintln!(
         ":: Comparing DBT observed guest-memory hashes... {} | {}",
@@ -576,7 +607,32 @@ pub(super) fn run_dbt(
     // `--verify-allow both`) can verify deterministically, and the DBT backend
     // must surface that status to match the ptrace `--verify` path
     // (`compare_two_runs` returns `out2.status`).
-    Ok(output_status(&first))
+    Ok(status)
+}
+
+#[cfg(feature = "dbt")]
+fn publish_dbt_verification(
+    path: Option<&Path>,
+    verdict: Verdict,
+    guest_status: ExitStatus,
+    strictness: LogCompareStrictness,
+) -> Result<(), Error> {
+    if let Some(path) = path {
+        let outcome = VerificationOutcome {
+            verdict,
+            guest_status,
+            // DBT compared guest status/stdout and its Detcore summary, but did
+            // not compare the captured INFO event streams. Reuse the existing
+            // output-only representation so this match cannot satisfy canonical
+            // INFO parity.
+            comparison: ComparisonSpec::new(strictness, false, false),
+            compared_log_messages: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+        };
+        write_verification_json(path, &outcome)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,6 +642,8 @@ pub(super) fn run_dbt(
     _args: &[String],
     _verify: bool,
     _verify_allow: VerifyAllow,
+    _verify_json: Option<&Path>,
+    _verify_strictness: LogCompareStrictness,
     _summary: bool,
     _log: Option<LevelFilter>,
     _config: &Config,
