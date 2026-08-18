@@ -1442,7 +1442,13 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
 
-    tracing::info!(
+    // DEBUG, not INFO, deliberately: every field here is host wall-clock, so at
+    // INFO this line lands in the canonical stream that `--verify-strict`
+    // compares bitwise and can never match between two runs. It is hermit's own
+    // instrumentation, not guest-observable behavior, so it does not belong in
+    // the determinism evidence. No other backend emits wall-clock values at INFO
+    // -- which is why ptrace can reach `bitwise_parity: true` and KVM could not.
+    tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
         setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
