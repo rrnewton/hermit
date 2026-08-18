@@ -634,14 +634,21 @@ pub fn prepare_test(
     Ok(guest)
 }
 
-fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
-    let executable = path
-        .metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
-    if executable {
-        return Ok(());
-    }
-    let diagnostic = fs::read_to_string(captures.join("prepare.stderr"))
+/// What the preparation child actually said, stderr first.
+///
+/// The child's output is already captured to `prepare.stderr` / `prepare.stdout`;
+/// this is the only thing that carries it back to the caller. It matters beyond
+/// readability: validate classifies an environmentally-blocked gate by reading
+/// the FAILING NODE's own output region and nothing else, deliberately, so that
+/// an unrelated concurrent host denial cannot excuse a real red. A build step
+/// that swallows its compiler's stderr therefore hides the very evidence the
+/// classifier is looking for, and a host denial gets recorded as a product
+/// failure. Measured 2026-08-17 in one cold run: `build.manifest_guests`
+/// reported three guests as "missing or not executable" with no diagnostic while
+/// the jailer had denied their `cc`/`ld`, and `build.runtime_release` in the SAME
+/// run propagated its banner, was classified `bpfjailer-banner`, and was retried.
+fn preparation_diagnostic(captures: &Path) -> String {
+    fs::read_to_string(captures.join("prepare.stderr"))
         .ok()
         .filter(|text| !text.trim().is_empty())
         .or_else(|| {
@@ -649,15 +656,39 @@ fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String
                 .ok()
                 .filter(|text| !text.trim().is_empty())
         })
-        .unwrap_or_default();
-    Err(format!(
-        "compiled guest is missing or not executable: {}{}",
-        path.display(),
-        if diagnostic.is_empty() {
-            String::new()
-        } else {
-            format!("\n{diagnostic}")
-        }
+        .unwrap_or_default()
+}
+
+/// Append a captured diagnostic to `message`, or say plainly that there was none.
+///
+/// The empty case is spelled out rather than left blank: "no output was captured"
+/// is a different and much more suspicious fact than a compiler error, and a
+/// reader who cannot tell them apart cannot tell a denial from a broken guest.
+fn with_diagnostic(message: String, captures: &Path) -> String {
+    let diagnostic = preparation_diagnostic(captures);
+    if diagnostic.is_empty() {
+        format!(
+            "{message}\n  (no output was captured in {}; the preparation command produced none)",
+            captures.display()
+        )
+    } else {
+        format!("{message}\n{diagnostic}")
+    }
+}
+
+fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
+    let executable = path
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    if executable {
+        return Ok(());
+    }
+    Err(with_diagnostic(
+        format!(
+            "compiled guest is missing or not executable: {}",
+            path.display()
+        ),
+        captures,
     ))
 }
 
@@ -679,7 +710,21 @@ fn run_preparation(
         timeout,
     )?;
     if output.timed_out || !output.status.success() {
-        return Err(format!("fixture preparation failed for {program}"));
+        // Carry the child's own words back. This used to return the bare sentence
+        // and drop `prepare.stderr` on the floor, which turned every denied or
+        // broken compile into the same uninformative line.
+        let how = if output.timed_out {
+            format!("timed out after {timeout}s")
+        } else {
+            match output.status.code() {
+                Some(code) => format!("exited {code}"),
+                None => "was killed by a signal".to_string(),
+            }
+        };
+        return Err(with_diagnostic(
+            format!("fixture preparation failed for {program}: {how}"),
+            &captures,
+        ));
     }
     Ok(())
 }
