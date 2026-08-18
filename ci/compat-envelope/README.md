@@ -48,8 +48,12 @@ The path is deliberately direct:
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
 3. Each manifest bucket writes schema-4 `results.jsonl` rows, including the
    literal argv, explicit environment, working directory, and pasteable shell
-   command, to a unique durable
-   result directory.
+   command, to a unique durable result directory. A failing cell with one or
+   more divergent verification attempts also records the optional
+   `first_divergent_scheduler_turn` object: `observations` is the number of
+   actual divergent attempts, and `min`/`max` bound their reported turns. The
+   field is absent for matches, infrastructure errors, and `no_result`; a
+   measured turn zero is represented explicitly rather than by absence.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest

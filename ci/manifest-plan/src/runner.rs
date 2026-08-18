@@ -442,6 +442,13 @@ struct SabrePathRecord {
     trusted_shared_objects: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DivergenceTurnRange {
+    pub observations: u64,
+    pub min: u64,
+    pub max: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CellResult {
     pub schema: u64,
@@ -469,6 +476,8 @@ pub struct CellResult {
     pub relaxations: Vec<String>,
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_divergent_scheduler_turn: Option<DivergenceTurnRange>,
     pub attempts: Vec<AttemptResult>,
     pub reason: Option<String>,
 }
@@ -1285,6 +1294,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         outcome = "ERROR".into();
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
+    let first_divergent_scheduler_turn = cell_divergence_turn_range(&outcome, &attempts);
     Ok(CellResult {
         schema: CELL_RESULT_SCHEMA,
         run_id: context.run_id.clone(),
@@ -1327,6 +1337,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     .and_then(|assert| assert.min_normalized_entropy),
             )
         }),
+        first_divergent_scheduler_turn,
         attempts,
         reason,
     })
@@ -1382,9 +1393,51 @@ pub fn infrastructure_error_result(
         relaxations: Vec::new(),
         execution_path: None,
         diversity: None,
+        first_divergent_scheduler_turn: None,
         attempts: Vec::new(),
         reason: Some(reason),
     }
+}
+
+fn divergence_turn_range(attempts: &[AttemptResult]) -> Option<DivergenceTurnRange> {
+    let mut range = None::<DivergenceTurnRange>;
+    for attempt in attempts {
+        if attempt.outcome != "FAIL" {
+            continue;
+        }
+        let report: JsonValue =
+            serde_json::from_str(attempt.verification_report.as_deref()?).ok()?;
+        if report.get("verdict").and_then(JsonValue::as_str) != Some("diverged") {
+            continue;
+        }
+        let turn = report
+            .get("first_divergent_scheduler_turn")
+            .and_then(JsonValue::as_u64)?;
+        match &mut range {
+            Some(range) => {
+                range.observations += 1;
+                range.min = range.min.min(turn);
+                range.max = range.max.max(turn);
+            }
+            None => {
+                range = Some(DivergenceTurnRange {
+                    observations: 1,
+                    min: turn,
+                    max: turn,
+                });
+            }
+        }
+    }
+    range
+}
+
+fn cell_divergence_turn_range(
+    outcome: &str,
+    attempts: &[AttemptResult],
+) -> Option<DivergenceTurnRange> {
+    (outcome == "FAIL")
+        .then(|| divergence_turn_range(attempts))
+        .flatten()
 }
 
 fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<JsonValue>, String> {
@@ -1905,12 +1958,173 @@ mod tests {
             append_result(&path, &result).unwrap();
             let rows = fs::read_to_string(&path).unwrap();
             assert_eq!(rows.lines().count(), expected);
-            assert!(
-                rows.lines()
-                    .all(|line| serde_json::from_str::<JsonValue>(line).is_ok())
-            );
+            for line in rows.lines() {
+                let row = serde_json::from_str::<JsonValue>(line).unwrap();
+                assert!(row.get("first_divergent_scheduler_turn").is_none());
+            }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn attempt_with_divergence(outcome: &str, verdict: &str, turn: Option<u64>) -> AttemptResult {
+        AttemptResult {
+            index: "1".into(),
+            outcome: outcome.into(),
+            error_kind: None,
+            status: Some(1),
+            signal: None,
+            timed_out: false,
+            duration_ms: 1,
+            observation_sha256: None,
+            argv: vec!["hermit".into()],
+            guest_argv: vec!["guest".into()],
+            env: BTreeMap::new(),
+            cwd: "/repo".into(),
+            shell_command: "cd /repo && env hermit".into(),
+            stdout: String::new(),
+            stderr: String::new(),
+            verification_report: Some(
+                serde_json::json!({
+                    "verdict": verdict,
+                    "first_divergent_scheduler_turn": turn,
+                })
+                .to_string(),
+            ),
+            verification_report_sha256: None,
+            sabre_path_evidence: None,
+            sabre_path_evidence_sha256: None,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn divergence_turn_range_uses_each_failed_attempt() {
+        let attempts = vec![
+            attempt_with_divergence("FAIL", "diverged", Some(10)),
+            attempt_with_divergence("FAIL", "diverged", Some(4)),
+            attempt_with_divergence("FAIL", "diverged", Some(508)),
+        ];
+        assert_eq!(
+            divergence_turn_range(&attempts),
+            Some(DivergenceTurnRange {
+                observations: 3,
+                min: 4,
+                max: 508,
+            })
+        );
+    }
+
+    #[test]
+    fn repeated_cell_attempts_produce_one_range_from_their_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-divergence-repetitions-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let hermit = root.join("fake-hermit");
+        fs::write(
+            &hermit,
+            r##"#!/bin/sh
+verdict=
+turn=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --verify-json) verdict=$2; shift 2 ;;
+    --seed=10) turn=10; shift ;;
+    --seed=20) turn=4; shift ;;
+    --seed=30) turn=508; shift ;;
+    *) shift ;;
+  esac
+done
+printf '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":%s}\n' "$turn" > "$verdict"
+exit 1
+"##,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&hermit).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&hermit, permissions).unwrap();
+
+        let mut test = recipe(false);
+        test.modes.clear();
+        test.modes.insert(
+            "chaos".into(),
+            ModeRecipe {
+                ci: false,
+                ci_disabled_reason: Some("fixture".into()),
+                backends_enabled: vec!["ptrace".into()],
+                seeds: Some(vec![10, 20, 30]),
+                ..ModeRecipe::default()
+            },
+        );
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "chaos".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: hermit,
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: true,
+            record_verify_strict: true,
+        };
+        let result = run_cell(&context, &cell).unwrap();
+        assert_eq!(result.attempts.len(), 3);
+        assert_eq!(
+            result.first_divergent_scheduler_turn,
+            Some(DivergenceTurnRange {
+                observations: 3,
+                min: 4,
+                max: 508,
+            })
+        );
+        let row = serde_json::to_value(&result).unwrap();
+        assert_eq!(row["schema"], CELL_RESULT_SCHEMA);
+        assert_eq!(
+            row["first_divergent_scheduler_turn"],
+            serde_json::json!({"observations": 3, "min": 4, "max": 508})
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn divergence_turn_is_absent_without_a_product_verdict() {
+        let no_result = attempt_with_divergence("ERROR", "no_result", Some(99));
+        let matched = attempt_with_divergence("PASS", "matched", Some(0));
+        assert_eq!(divergence_turn_range(&[no_result, matched]), None);
+
+        let divergent = attempt_with_divergence("FAIL", "diverged", Some(17));
+        assert_eq!(cell_divergence_turn_range("ERROR", &[divergent]), None);
+
+        let measured = attempt_with_divergence("FAIL", "diverged", Some(17));
+        let missing = attempt_with_divergence("FAIL", "diverged", None);
+        assert_eq!(divergence_turn_range(&[measured, missing]), None);
+    }
+
+    #[test]
+    fn one_zero_turn_is_a_single_observation_not_absence() {
+        let attempt = attempt_with_divergence("FAIL", "diverged", Some(0));
+        assert_eq!(
+            divergence_turn_range(&[attempt]),
+            Some(DivergenceTurnRange {
+                observations: 1,
+                min: 0,
+                max: 0,
+            })
+        );
     }
 
     #[test]
