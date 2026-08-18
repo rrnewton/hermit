@@ -51,6 +51,7 @@ use crate::fd::*;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::Device;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -224,6 +225,20 @@ fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, 
         | Whence::SEEK_HOLE => Ok(0),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Inherited container output is a stream even when an outer runner stores it
+/// in a seekable file.  The backing file also carries Hermit's own diagnostics,
+/// so exposing its live offset makes tool logging guest-visible.  Preserve real
+/// file semantics after a guest replaces stdout/stderr: `dup2(file, 1)` copies
+/// the file's resource rather than this container-output resource.
+fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
 }
 
 fn unix_autobind_addrlen() -> i32 {
@@ -1462,12 +1477,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
-        let (fd_type, status_flags, procfs_position) =
+        let (fd_type, status_flags, procfs_position, resource) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.status_flags(), detfd.procfs_position())
+                (
+                    detfd.ty(),
+                    detfd.status_flags(),
+                    detfd.procfs_position(),
+                    detfd.resource(),
+                )
             })?;
         if fd_type == FdType::Rng {
             return random_device_lseek_result(status_flags, call.whence()).map_err(Into::into);
+        }
+        if is_inherited_container_output(resource) {
+            return Err(Errno::ESPIPE.into());
         }
         if timer_slack_binding.is_some() && status_flags & libc::O_PATH != 0 {
             return Err(Errno::EBADF.into());
@@ -4053,11 +4076,14 @@ mod test {
     use super::classify_timer_slack_binding;
     use super::parse_timer_slack_write;
     use super::random_device_lseek_result;
+    use super::is_inherited_container_output;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use super::vectored_offset;
     use crate::fd::FdType;
+    use crate::resources::Device;
+    use crate::resources::ResourceID;
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -4182,6 +4208,20 @@ mod test {
             Err(Errno::ESRCH),
             "a recycled numeric TID must not revive an old proc inode"
         );
+    }
+
+    #[test]
+    fn only_inherited_container_output_is_nonseekable() {
+        assert!(is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStdout
+        ))));
+        assert!(is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStderr
+        ))));
+        assert!(!is_inherited_container_output(Some(ResourceID::Device(
+            Device::ContainerStdin
+        ))));
+        assert!(!is_inherited_container_output(None));
     }
 
     #[test]
