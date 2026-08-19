@@ -292,3 +292,46 @@ fn container_init_dies_with_the_hermit_process_that_forked_it() {
         "container init after its hermit parent was killed outright",
     );
 }
+
+/// Isolates the stop-signal handlers: signal only the container init, leaving
+/// its `hermit` parent alive so the parent-death signal cannot be what ends the
+/// run. Each of these is discarded outright while the container init leaves the
+/// disposition at `SIG_DFL`.
+#[test]
+fn container_init_honours_signals_aimed_at_it_directly() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        let mut argv = vec![hermit_bin(), "run", "--"];
+        argv.extend_from_slice(SPINNER);
+
+        let (mut hermit, guard, init) = start_hung_run(&argv);
+        let outer = hermit.id() as i32;
+        assert!(
+            alive(outer),
+            "signal {signal}: the hermit parent must still be alive, or this test \
+             would be measuring the parent-death signal instead"
+        );
+
+        // SAFETY: `kill` takes a pid and a signal number and touches no caller
+        // memory. `init` was observed alive immediately above.
+        assert_eq!(
+            unsafe { libc::kill(init, signal) },
+            0,
+            "signal {signal}: failed to signal container init {init}: {}",
+            io::Error::last_os_error()
+        );
+
+        let died = poll_until(TEARDOWN_BUDGET, || (!alive(init)).then_some(()));
+        assert!(
+            died.is_some(),
+            "signal {signal}: container init {init} ignored it and is still running \
+             {TEARDOWN_BUDGET:?} later. The kernel discards default-disposition \
+             signals sent to a namespace init, so without a handler this signal \
+             never arrives at all."
+        );
+
+        let _ = hermit.wait();
+        assert_session_drains(guard.0, &format!("run after signal {signal} to its init"));
+    }
+}
