@@ -60,6 +60,7 @@ use tracing::trace;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
+use crate::consts::SCHED_TURN_TARGET;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -1277,6 +1278,7 @@ impl Scheduler {
 
         if blocked {
             info!(
+                target: SCHED_TURN_TARGET,
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} held at happens-before \
                  anchor(s) {:?} (syscall count {}) awaiting a BEFORE anchor",
                 self.turn, dettid, reached, count
@@ -2875,6 +2877,7 @@ impl Scheduler {
         if rs.poll_attempt > 0 {
             // The thread is polling and hasn't been "remade" as runnable yet.
             info!(
+                target: SCHED_TURN_TARGET,
                 "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} polling resource {:?}",
                 self.turn, dettid, rs
             );
@@ -2950,9 +2953,10 @@ impl Scheduler {
                         dettid, target_ns, self.committed_time
                     );
                     info!(
-                        "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
-                        self.turn, dettid, rid
-                    );
+                            target: SCHED_TURN_TARGET,
+                    "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {} which wanted resource {:?} (blocking)",
+                            self.turn, dettid, rid
+                        );
                     self.blocked.timed_waiters.insert(*target_ns, dettid);
                     self.skip_turn_blocked(dettid)
                 }
@@ -2964,7 +2968,8 @@ impl Scheduler {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
                 }
                 info!(
-                    "[scheduler] >>>>>>>\n\n COMMIT turn {}, BACKGROUND dettid {} (maybe-blocking)",
+                    target: SCHED_TURN_TARGET,
+                "[scheduler] >>>>>>>\n\n COMMIT turn {}, BACKGROUND dettid {} (maybe-blocking)",
                     self.turn, dettid
                 );
                 // Here we allow the action to execute asynchrounously, in the
@@ -3157,7 +3162,8 @@ impl Scheduler {
             .expect("nextturn present")
             .req = empty_req;
         info!(
-            "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, dettid {} changed priority to {}",
+            target: SCHED_TURN_TARGET,
+                "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, dettid {} changed priority to {}",
             self.turn, dettid, new_priority
         );
         self.skip_turn() // The thread shouldn't run.
@@ -3345,7 +3351,8 @@ impl Scheduler {
                     ""
                 };
                 info!(
-                    "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
+                    target: SCHED_TURN_TARGET,
+                "[sched-step5] >>>>>>>\n\n COMMIT turn {}, dettid {} using resources {:?}, on previously committed {}{}",
                     self.turn,
                     next_dtid,
                     rsrcs.resources,
