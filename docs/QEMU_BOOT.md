@@ -194,30 +194,85 @@ That profile trades deterministic QEMU host-thread scheduling for lower wall
 time. `-accel tcg,thread=single -smp 1` keeps the emulated guest to one TCG
 vCPU in either profile; it does not remove QEMU's host-side support threads.
 
-## Why fixed QEMU icount is required
+## What `-icount` does, and when a boot needs it
 
-Without `-icount`, QEMU obtains guest TSC and device time from different host
-clock paths. Under Hermit, the emulated TSC ultimately observes a thread-local
-synthetic RDTSC value, while PIT, APIC, and PM timers observe virtualized
-`CLOCK_MONOTONIC` aggregated across QEMU threads. Linux compares those clock
-domains while calibrating its clocksource.
-
-The no-icount control reached the kernel console but reported PIT calibration
-failure, a 374 ms TSC watchdog skew, and finally:
-
-```text
-clocksource: No current clocksource.
-```
-
-`-icount shift=0,sleep=off` makes QEMU use one instruction-derived virtual
-clock for guest TSC and device timers:
+`-icount shift=0,sleep=off` makes QEMU drive the guest TSC and the emulated
+device timers from one instruction-derived virtual clock:
 
 - `shift=0` advances QEMU virtual time by one nanosecond per guest
   instruction;
 - `sleep=off` disables pacing that clock against host wall time.
 
-The verified boot calibrated a coherent 1000.031 MHz TSC and emitted none of
-the PIT, watchdog-skew, or no-clocksource warnings.
+That removes the clock-domain mismatch described in the next section, and the
+verified strict boot calibrates a coherent 1000.031 MHz TSC with none of the
+PIT, watchdog-skew, or no-clocksource warnings.
+
+An earlier revision of this document titled this section "Why fixed QEMU icount
+is required" and presented `-icount` as a precondition for booting at all.
+**That is not what the measurements show, and the claim is retracted.** Whether
+a boot needs `-icount` depends on the profile and on the guest command line,
+and `-icount` carries two costs that the old framing hid.
+
+### Measured: `-icount` is not required, and is not free
+
+Measured 2026-08-18 at hermit `770b95c505` (binary SHA-256 `4d8e8924…`), QEMU
+10.1.2, guest 6.17.13, BusyBox initramfs. Raw logs and the driver scripts are
+in `experiments/qemu-coherent-timebase_20260818/`. PASS means the guest reached
+the run's success marker.
+
+| profile | `-icount` | vCPUs | guest cmdline | wall | outcome |
+| --- | --- | ---: | --- | ---: | --- |
+| compatibility | off | 1 | default | 19.3 s | PASS |
+| compatibility | off | 2 | default | 23.4 s | PASS |
+| compatibility | on | 1 | default | 31.8 s | PASS |
+| strict | off | 1 | default | 59.4 s | fails, guest panic |
+| strict | off | 2 | default | 60.6 s | fails, guest panic |
+| strict | on | 1 | default | 151.8 s | PASS |
+| strict | on | 2 | default | 0.1 s | QEMU refuses to start |
+| strict | off | 1 | `no_timer_check` | 103.5 s | PASS, TSC 999.964 MHz |
+| strict | off | 2 | `no_timer_check lpj=999964` | 382.0 s | PASS |
+
+Three things follow, none of them consistent with "required":
+
+1. **In the compatibility profile, no-icount boots and is the faster option.**
+   19.3 s without `-icount` against 31.8 s with it, at one vCPU. Turning
+   `-icount` on cost about 1.6x here.
+2. **In the strict profile the default-cmdline no-icount failure is real**, and
+   it is the panic documented in the next section. But it is a *guest timer
+   setup* failure, not an inability to run QEMU: adding `no_timer_check` to the
+   guest command line reaches PASS without `-icount` at all.
+3. **`-icount` is what produces the zero-output case, not no-icount.** The one
+   cell above that emits no console bytes is `-icount` with two vCPUs, and the
+   cause is QEMU declining the combination outright — see below.
+
+### `-icount` forecloses multi-threaded TCG, by QEMU's own rule
+
+This is the mechanical constraint the document never stated, and it is a
+property of QEMU rather than a Hermit limitation. QEMU refuses the combination:
+
+```text
+qemu-system-x86_64: -accel tcg,thread=multi: No MTTCG when icount is enabled
+```
+
+So enabling `-icount` forces `thread=single`, collapsing every guest vCPU onto
+one host thread. A reader who takes `-icount` as mandatory would reasonably
+conclude that steering the interleaving of two guest vCPUs is impossible under
+Hermit. It is not impossible; it is incompatible *with `-icount`*. The strict,
+no-icount, two-vCPU row above reaches PASS with both vCPUs on separate host
+threads, which is the configuration in which interleaving can be steered at
+all.
+
+### An unreconciled report
+
+A separate report described no-icount stalling with zero output. Nothing in the
+matrix above reproduces that: every no-icount cell produced console output —
+9,233 bytes even in the failing strict rows — and the only zero-output cell is
+`-icount` at two vCPUs, which is QEMU's MTTCG refusal above. That report may
+have used a configuration not covered here, or may have attributed the
+`-icount` two-vCPU case to no-icount. Treat the shape of a no-icount failure as
+configuration-dependent, and record the profile, vCPU count and guest command
+line alongside any future result.
+
 
 ## Host time virtualization and clock calibration (issue #6)
 
@@ -247,9 +302,9 @@ clocksource: No current clocksource.
 tsc: Marking TSC unstable due to clocksource watchdog
 ```
 
-Only one of the two conceivable ways out actually works:
+Of the two conceivable ways out, only the QEMU-side one works as written:
 
-1. **QEMU side (works, and is the supported route):** `-icount shift=0,sleep=off`,
+1. **QEMU side (works):** `-icount shift=0,sleep=off`,
    which makes QEMU drive both the guest TSC and the emulated device timers from
    one instruction-derived virtual clock, as used by the verified profile above.
 2. **Hermit side (does *not* work):** `--no-virtualize-time
@@ -295,7 +350,13 @@ ERROR detcore: [detcore, dtid 3] inbound syscall: gettimeofday(...) = ?
 Error: Sandbox container exited unexpectedly
 ```
 
-Treat `-icount shift=0,sleep=off` as required, not as one of two alternatives.
+So `-icount shift=0,sleep=off` is the one *Hermit-flag-free* way to make the
+canonical strict command boot as written. It is not the only way to boot
+without `-icount` at all: as the matrix earlier in this document shows, the
+compatibility profile boots without it, and the strict profile boots without it
+once the guest is given `no_timer_check`. Choose `-icount` when you want the
+canonical command to work unchanged; avoid it when you need more than one TCG
+thread, which it forbids.
 
 Note that `hermit run` still prints a one-line advisory when it launches a
 `qemu-system-*` program while virtual time is enabled, and that advisory
@@ -307,7 +368,7 @@ A fully coherent multi-clock model (a single Hermit time base shared by
 `rdtsc`, `clock_gettime`, and their derived clocks, coordinated across threads)
 would remove the need for `-icount` here, and is the real fix for the
 Hermit-side cause described in this section. It remains out of scope for this
-document, which records the one workaround that is measured to work.
+document, which records what is measured to work today.
 
 ## Kernel and initramfs
 
