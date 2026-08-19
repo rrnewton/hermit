@@ -258,6 +258,56 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
     Ok((container, identity_guard))
 }
 
+/// Tie the container's init process to the lifetime of the `hermit` process
+/// that created it.
+///
+/// [`Container::run`] forks the process that carries the guest into a fresh PID
+/// namespace, so that process is PID 1 *of that namespace*. Linux gives a
+/// namespace init the same protection it gives the system init: a signal whose
+/// disposition is `SIG_DFL` is discarded rather than delivered, even when the
+/// sender is in an ancestor namespace. Only `SIGKILL` and `SIGSTOP` from an
+/// ancestor still get through.
+///
+/// That is why an external deadline could not end a hung run. `timeout N`
+/// sends `SIGTERM` to the process group; the outer `hermit` process obeys it
+/// and dies, the init process discards it, `timeout` sees its own direct child
+/// gone and exits 124 without ever escalating, and the init process is
+/// reparented to host PID 1 and keeps running. `timeout --kill-after` does not
+/// help, because the escalation is conditioned on that already-dead direct
+/// child. Three runs survived this way for more than 45 hours and filled the
+/// filesystem.
+///
+/// `PR_SET_PDEATHSIG` closes that hole from inside: when the thread that forked
+/// this process exits, the kernel sends us `SIGKILL`, which is precisely one of
+/// the two signals a namespace init cannot ignore. Every existing caller keeps
+/// working and no exit code changes, which is why this lives here rather than
+/// in each of the ~20 scripts that wrap `hermit` in `timeout`.
+///
+/// Reverie uses the same idiom for exec'd untraced members in
+/// `safeptrace/src/notifier.rs`.
+///
+/// One residual gap: if the parent somehow died between the fork and this call,
+/// no death signal will ever arrive. The usual `getppid()` guard for that race
+/// is unavailable here, because inside a new PID namespace the out-of-namespace
+/// parent is not mapped and `getppid()` reports 0 whether or not it is alive.
+/// Closing it completely would mean arming the signal inside
+/// `Container::run` before container setup, which is a Reverie-side change.
+/// The window is a few milliseconds of container setup, and the case this
+/// guards against is a supervisor deadline seconds or minutes later.
+fn arm_parent_death_signal() -> Result<(), Error> {
+    // SAFETY: `PR_SET_PDEATHSIG` only sets the calling thread's parent-death
+    // signal attribute. It reads and writes no caller memory, and the remaining
+    // arguments are ignored for this option.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(std::io::Error::last_os_error()).context(
+            "Failed to arm the container init parent-death signal \
+             (prctl(PR_SET_PDEATHSIG, SIGKILL)); refusing to start a guest that \
+             an expiring deadline could not then kill",
+        );
+    }
+    Ok(())
+}
+
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
@@ -266,7 +316,11 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
     Ok(container
-        .run(|| f().map_err(SerializableError::from))
+        .run(|| {
+            // Runs in the freshly forked container init, not in the caller.
+            arm_parent_death_signal().map_err(SerializableError::from)?;
+            f().map_err(SerializableError::from)
+        })
         .context("Sandbox container exited unexpectedly")??)
 }
 
