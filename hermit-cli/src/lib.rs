@@ -1767,6 +1767,16 @@ async fn run_with_backend_inner(
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
+        if config.sequentialize_threads {
+            // Inform gdbserver not to serialize guests because this is
+            // done by detcore already. Without this the gdbserver freezes
+            // the other threads around a breakpoint stop and waits for each
+            // to report, but under detcore they are parked in its scheduler
+            // rather than blocked in the kernel, so they cannot answer until
+            // the scheduler runs them -- which it cannot while the stopped
+            // thread holds its turn. The replay path already does this.
+            builder = builder.sequentialized_guest();
+        }
     }
     let (exit_status, global_state) = builder.spawn().await?.wait().await?;
     global_state
@@ -1886,6 +1896,16 @@ async fn run_with_output_backend_inner(
     let mut builder = reverie_ptrace::TracerBuilder::<Detcore>::new(command).config(config.clone());
     if config.gdbserver {
         builder = builder.gdbserver(config.gdbserver_port);
+        if config.sequentialize_threads {
+            // Inform gdbserver not to serialize guests because this is
+            // done by detcore already. Without this the gdbserver freezes
+            // the other threads around a breakpoint stop and waits for each
+            // to report, but under detcore they are parked in its scheduler
+            // rather than blocked in the kernel, so they cannot answer until
+            // the scheduler runs them -- which it cannot while the stopped
+            // thread holds its turn. The replay path already does this.
+            builder = builder.sequentialized_guest();
+        }
     }
     let (output, global_state) = builder.spawn().await?.wait_with_output().await?;
     global_state
