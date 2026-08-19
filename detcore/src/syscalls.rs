@@ -18,7 +18,7 @@ mod signal;
 pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
 mod threads;
-mod time;
+pub(crate) mod time;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;
 use crate::types::DetInode;

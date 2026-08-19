@@ -253,6 +253,7 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+use crate::syscalls::time::guest_clock_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -1206,13 +1207,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // TODO: use global time for rdtsc:
+            // The guest TSC must name the same instant as `clock_gettime`. Both
+            // now read the coordinator's clock through the shared per-process
+            // floor, so a guest comparing the two -- a clocksource watchdog, a
+            // delay loop calibrated against a device timer, a second vCPU
+            // reading the TSC -- sees one time base instead of two.
+            //
+            // The `add_rdtsc()` charge above is folded into global time by the
+            // same RPC that reads it back (`send_and_update_time` updates the
+            // coordinator before dispatching the request), so consecutive reads
+            // from one thread still advance.
+            let tsc = guest_clock_time(guest).await;
             Ok(RdtscResult {
-                tsc: guest
-                    .thread_state()
-                    .thread_logical_time
-                    .as_nanos()
-                    .as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
+                // We treat virtual cycles as equivalent to virtual nanoseconds.
+                tsc: tsc.as_nanos(),
                 aux: None,
             })
         } else {
