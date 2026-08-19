@@ -16,6 +16,12 @@ use hermit::Error;
 use hermit::SerializableError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
+use nix::sys::signal::SaFlags;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::Signal;
+use nix::sys::signal::sigaction;
 use nix::unistd::Pid;
 use reverie::process::Container;
 use reverie::process::Mount;
@@ -308,6 +314,76 @@ fn arm_parent_death_signal() -> Result<(), Error> {
     Ok(())
 }
 
+/// The signals whose default action is to terminate the process and which a
+/// supervisor, a shell, or a terminal actually sends when it wants a run to
+/// stop. Every one of them is discarded by the kernel while the container init
+/// leaves it at `SIG_DFL`, so all three are dead letters today: `SIGTERM` from
+/// a deadline, `SIGINT` from Ctrl-C, and `SIGHUP` when the owning terminal or
+/// agent session goes away.
+const CONTAINER_INIT_STOP_SIGNALS: [Signal; 3] = [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP];
+
+/// Terminate the container init on a stop signal.
+///
+/// The exit code is the conventional `128 + signo` a shell reports for a
+/// process killed by that signal, rather than a genuine signalled wait status,
+/// because a namespace init cannot produce the latter. The usual way to honour
+/// a signal faithfully -- restore `SIG_DFL`, unblock, re-raise -- is measurably
+/// unavailable here: a plain process dies from that sequence with
+/// `WIFSIGNALED` set, but a namespace init survives it, because a self-sent
+/// signal does not come from an ancestor namespace and so is discarded exactly
+/// like the original. Reporting `128 + signo` is the closest honest
+/// approximation available.
+///
+/// Exiting is a complete teardown, not just this process leaving: the kernel
+/// `SIGKILL`s every remaining member of a PID namespace whose init exits, so
+/// the guest goes with it instead of being orphaned into a namespace with no
+/// init.
+extern "C" fn on_container_init_stop_signal(signal: libc::c_int) {
+    // SAFETY: `_exit` is async-signal-safe and is the only thing this handler
+    // does. It deliberately skips destructors: there is nothing in this process
+    // whose cleanup is worth blocking a requested shutdown on, and the
+    // caller-side guards live in the parent process.
+    unsafe { libc::_exit(128 + signal) }
+}
+
+/// Make the container init answer the signals a supervisor actually sends.
+///
+/// [`arm_parent_death_signal`] handles the case where the `hermit` process
+/// dies. This handles the case where it does not: a `SIGTERM` aimed at the run
+/// itself, a Ctrl-C, or a `SIGHUP` when the session ends. The kernel discards
+/// those only while the disposition is `SIG_DFL`; installing any handler at all
+/// is what makes them deliverable to a namespace init, so this both restores
+/// the expected behaviour and gives hermit a place to shut a run down on
+/// purpose rather than being shot.
+///
+/// The inherited signal mask matters as much as the disposition. A blocked
+/// signal stays pending forever and the handler never runs, which would leave
+/// the same silent no-op with a handler installed to suggest otherwise, so the
+/// mask is cleared for these three. `record_start.rs` learned the same lesson
+/// about `SIGALRM`.
+fn install_container_init_stop_handlers() -> Result<(), Error> {
+    let action = SigAction::new(
+        SigHandler::Handler(on_container_init_stop_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+
+    let mut unblock = SigSet::empty();
+    for signal in CONTAINER_INIT_STOP_SIGNALS {
+        // SAFETY: the handler performs only `_exit`, which is
+        // async-signal-safe, and the action outlives the call.
+        unsafe { sigaction(signal, &action) }
+            .with_context(|| format!("Failed to install the container init {signal} handler"))?;
+        unblock.add(signal);
+    }
+
+    unblock
+        .thread_unblock()
+        .context("Failed to unblock the container init stop signals")?;
+
+    Ok(())
+}
+
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
@@ -319,6 +395,7 @@ where
         .run(|| {
             // Runs in the freshly forked container init, not in the caller.
             arm_parent_death_signal().map_err(SerializableError::from)?;
+            install_container_init_stop_handlers().map_err(SerializableError::from)?;
             f().map_err(SerializableError::from)
         })
         .context("Sandbox container exited unexpectedly")??)
