@@ -987,7 +987,6 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "dbt")]
     use super::*;
 
     #[cfg(feature = "dbt")]
@@ -1013,6 +1012,52 @@ mod tests {
     #[cfg(feature = "dbt")]
     fn dbt_summary_treats_last_syscall_branch_count_as_telemetry() {
         assert!(dbt_summary(563_145).same_observable_behavior(&dbt_summary(563_103)));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_canonical_evidence_materializes_records_unchanged() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = log.into_parts();
+        let records = vec![
+            b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG first\n".to_vec(),
+            b"1970-01-01T00:00:00.000000Z INFO detcore::scheduler: second\n".to_vec(),
+        ];
+
+        let compared = materialize_dbt_comparison_log(&records, file, &path).unwrap();
+
+        assert_eq!(compared, 2);
+        assert_eq!(fs::read(&path).unwrap(), records.concat());
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_canonical_evidence_fails_closed_on_empty_or_unframed_records() {
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = empty.into_parts();
+        assert!(materialize_dbt_comparison_log(&[], file, &path).is_err());
+
+        let unframed = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = unframed.into_parts();
+        assert!(
+            materialize_dbt_comparison_log(
+                &[b"1970-01-01T00:00:00.000000Z INFO detcore: missing newline".to_vec()],
+                file,
+                &path,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_canonical_evidence_fails_closed_on_empty_or_malformed_artifact() {
+        let mut empty = tempfile::tempfile().unwrap();
+        assert!(decode_dbt_evidence(&mut empty).is_err());
+
+        let mut malformed = tempfile::tempfile().unwrap();
+        malformed.write_all(b"not framed evidence").unwrap();
+        assert!(decode_dbt_evidence(&mut malformed).is_err());
     }
 
     #[test]
