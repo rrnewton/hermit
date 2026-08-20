@@ -507,6 +507,31 @@ fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
     v.iter().filter(|(_, s)| is_detcore(s)).copied().collect()
 }
 
+/// Text of the INFO message the scheduler logs when it finds the run queue
+/// empty but is not finished yet. `Scheduler::step2_process_blocked` in
+/// [`crate::scheduler`] emits it and returns `SkipTurn`, so the loop goes
+/// around again and still exits later through the ordinary
+/// "run queue empty, exiting sched_loop." message.
+///
+/// Two consequences make this the message worth recording. First, both paths
+/// end with the same final scheduler message, so the *last* scheduler line does
+/// not say which path a run took; only whether this kick appeared does. Second,
+/// whether it appears is decided by host timing — the ptrace supervisor may not
+/// yet have reaped a physical process exit when the check runs — so a pair of
+/// runs of the same guest can differ here while agreeing on every committed
+/// scheduling decision.
+///
+/// Kept as a constant so the string sits beside the code that reads it; grep
+/// for this text to find the producing `info!`.
+const SCHEDULER_EMPTY_QUEUE_KICK: &str = "zero threads left anywhere, fizzling.";
+
+/// How many of `v` record the scheduler's empty-run-queue kick.
+fn count_empty_queue_kicks(v: &[(usize, &str)]) -> usize {
+    v.iter()
+        .filter(|(_, s)| s.contains(SCHEDULER_EMPTY_QUEUE_KICK))
+        .count()
+}
+
 fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<(usize, &'a str)> {
     lines
         .into_iter()
@@ -1144,6 +1169,22 @@ fn log_diff_summary_from_strs(
             w,
             "Done processing logs, no substantive differences found ({} | {} {which} messages compared).",
             summary.compared_left, summary.compared_right,
+        )?;
+        // A matching pair keeps only this summary; its logs are not retained.
+        // Without the next line there is no record of which shutdown path the
+        // two runs took, so establishing whether a guest is exposed to the
+        // empty-run-queue timing race at all needs many repeated runs rather
+        // than one reading. See [`SCHEDULER_EMPTY_QUEUE_KICK`] for why the count
+        // is the only thing that distinguishes the paths.
+        //
+        // Deliberately emitted here only: a diverging pair already reproduces
+        // the messages verbatim in its diff, and widening retention past this
+        // one line is how evidence directories stop being navigable.
+        writeln!(
+            w,
+            "Logs contain {} | {} scheduler empty-run-queue kick messages",
+            count_empty_queue_kicks(&infos_a),
+            count_empty_queue_kicks(&infos_b),
         )?;
     }
     Ok(summary)
@@ -2196,6 +2237,119 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         assert_eq!(
             super::strip_log_entry(r#"rename from="/tmp/a" to="/tmp/b" ok="1""#),
             r#"rename from="/tmp/<somewhere>" to="/tmp/<somewhere>" ok="<NUM>""#
+        );
+    }
+
+    const KICK_LINE_PREFIX: &str = "Logs contain";
+    const KICK_LINE_SUFFIX: &str = "scheduler empty-run-queue kick messages";
+
+    fn kick_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        }
+    }
+
+    /// A run that passes through the empty-run-queue kick still exits through
+    /// the ordinary message afterwards, so both shutdown paths end identically
+    /// and only the kick distinguishes them.
+    fn log_with_kick() -> &'static str {
+        "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 1s\n\
+2026-08-13T01:02:03.000001Z INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.\n\
+2026-08-13T01:02:03.000002Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+    }
+
+    fn log_without_kick() -> &'static str {
+        "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 1s\n\
+2026-08-13T01:02:03.000002Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+    }
+
+    fn run_diff(left: &str, right: &str) -> std::io::Result<(super::LogDiffSummary, String)> {
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(left, right, &kick_opts(), &mut out)?;
+        Ok((
+            summary,
+            String::from_utf8(out).expect("diff output is utf-8"),
+        ))
+    }
+
+    /// A matching pair keeps only its summary, so without this count there is no
+    /// record of which shutdown path either run took. Both directions of the
+    /// pass are covered: both runs kicked, and neither did.
+    #[test]
+    fn a_matching_pair_records_the_empty_queue_kick_count() -> std::io::Result<()> {
+        let (kicked, kicked_out) = run_diff(log_with_kick(), log_with_kick())?;
+        assert!(kicked.matched_with_evidence(), "both-kicked pair must pass");
+        assert!(
+            kicked_out.contains(&format!("{KICK_LINE_PREFIX} 1 | 1 {KICK_LINE_SUFFIX}")),
+            "a passing pair that kicked must retain the count, got:\n{kicked_out}"
+        );
+
+        let (quiet, quiet_out) = run_diff(log_without_kick(), log_without_kick())?;
+        assert!(
+            quiet.matched_with_evidence(),
+            "neither-kicked pair must pass"
+        );
+        assert!(
+            quiet_out.contains(&format!("{KICK_LINE_PREFIX} 0 | 0 {KICK_LINE_SUFFIX}")),
+            "a passing pair that did not kick must say so explicitly, got:\n{quiet_out}"
+        );
+        Ok(())
+    }
+
+    /// The other half of the bracket, and the half that matters: recording the
+    /// count must not move any verdict. A pair differing only by the kick was a
+    /// divergence before this line existed and must remain one — the count must
+    /// never stand in for agreement.
+    #[test]
+    fn recording_the_kick_count_does_not_move_any_verdict() -> std::io::Result<()> {
+        let (diverged, diverged_out) = run_diff(log_with_kick(), log_without_kick())?;
+        assert!(
+            diverged.diff_found,
+            "a pair differing only by the kick must still diverge"
+        );
+        assert!(
+            !diverged_out.contains(KICK_LINE_SUFFIX),
+            "the count is scoped to passing pairs; a diverging pair already \
+             reproduces the messages in its diff, got:\n{diverged_out}"
+        );
+
+        // Identical inputs keep every summary field they had, so the extra
+        // writeln! cannot be smuggling a verdict change in behind the text.
+        let (matched, _) = run_diff(log_with_kick(), log_with_kick())?;
+        assert!(!matched.diff_found);
+        assert_eq!(matched.first_divergent_scheduler_turn, None);
+        assert_eq!(matched.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(matched.first_divergent_record, None);
+        assert_eq!(matched.compared_left, matched.compared_right);
+        Ok(())
+    }
+
+    /// The count reads the message text, so an unrelated scheduler line must not
+    /// be mistaken for a kick.
+    #[test]
+    fn only_the_kick_message_is_counted() {
+        assert_eq!(
+            super::count_empty_queue_kicks(&[
+                (
+                    0,
+                    "INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+                ),
+                (
+                    1,
+                    "INFO detcore::scheduler: COMMIT turn 18, dettid 2, on previously committed 2s"
+                ),
+            ]),
+            0
+        );
+        assert_eq!(
+            super::count_empty_queue_kicks(&[(
+                0,
+                "INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling."
+            )]),
+            1
         );
     }
 }
