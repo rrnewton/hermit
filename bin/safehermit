@@ -260,12 +260,25 @@ if [ "$systemd_ok" = 1 ]; then
     done < <(env -0)
     env_state="APPLIED:$env_fwd variables forwarded"
     [ "$env_skipped" -eq 0 ] || env_state="$env_state; $env_skipped SKIPPED (name not a plain shell identifier, e.g. an exported function)"
-    runner=(systemd-run --user "--unit=$unit" --collect --quiet
-            "--property=MemoryMax=$mem_max" "--property=MemorySwapMax=0"
-            "--working-directory=$PWD" "${setenv_args[@]}" --pipe --wait --)
-    if [ "$no_deadline" != 1 ]; then
-        runner=("${runner[@]:0:5}" "--property=RuntimeMaxSec=$deadline" "${runner[@]:5}")
-    fi
+    # NO --collect HERE, DELIBERATELY, AND IT MUST NOT BE ADDED BACK.
+    # After the run we ask systemd whether the unit timed out, because that answer
+    # is authoritative and the exit code is not. --collect garbage-collects the unit
+    # the moment it finishes, and `systemctl show` on a unit that no longer exists
+    # does not fail and does not return empty -- it returns the DEFAULT, which is
+    # Result=success. Measured, three trials each on the same timed-out unit:
+    #     with    --collect:  Result=success
+    #     without --collect:  Result=timeout
+    # So keeping --collect while reading the result would report every timed-out run
+    # as a clean success, confidently and silently. That is worse than the inference
+    # it replaces. The unit is instead stopped and reset explicitly below.
+    # Built in one pass. The previous form appended the deadline by SPLICING at a
+    # hard-coded index -- "${runner[@]:0:5}" ... "${runner[@]:5}" -- which silently
+    # means something different the moment a flag is added or removed above it, as
+    # removing --collect just did. Nothing here depends on position now.
+    runner=(systemd-run --user "--unit=$unit" --quiet
+            "--property=MemoryMax=$mem_max" "--property=MemorySwapMax=0")
+    [ "$no_deadline" = 1 ] || runner+=("--property=RuntimeMaxSec=$deadline")
+    runner+=("--working-directory=$PWD" "${setenv_args[@]}" --pipe --wait --)
 else
     # NEVER fall back silently to an unbounded run.
     runner=()
@@ -404,10 +417,42 @@ if [ "$trunc" = true ]; then
     [ "${killed:-}" = "cgroup-killed" ] && rc=125
     say "LOG CAP: the run hit the ${max_log_bytes}-byte cap (${killed:-unknown}). The log is INCOMPLETE by design; the kept bytes are the evidence."
 fi
-# systemd reports a RuntimeMaxSec kill as SIGTERM/SIGKILL; surface it as a deadline.
-if [ "$no_deadline" != 1 ] && [ "$runner_state" = APPLIED ] && [ "$elapsed" -ge "$deadline" ] \
-   && { [ $rc -eq 143 ] || [ $rc -eq 137 ] || [ $rc -eq 1 ]; }; then
-    say "DEADLINE: the run reached ${deadline}s and was killed by its cgroup (exit $rc)."
+# ---------------------------------------------------------------- deadline verdict
+# ASK SYSTEMD, DO NOT INFER. This used to reconstruct "did the deadline fire?" from
+# two proxies -- `elapsed >= deadline` arithmetic, and an allowlist of child exit
+# codes (143/137/1) -- and both can be wrong.
+#
+# THE REPRODUCED FAILURE, which is why this is not a tidy-up. `--sh-deadline 6s` is a
+# perfectly ordinary thing for a caller to write and systemd accepts it: RuntimeMaxSec
+# takes a suffix, the bound IS applied, and the run IS killed. But bash `[ 6 -ge 6s ]`
+# aborts with "integer expression expected", so the whole condition went false and the
+# kill went UNREPORTED -- measured, a 600s child under `--sh-deadline 6s` returned exit
+# 1 after 6s with zero DEADLINE lines, against exit 124 for `--sh-deadline 6`. Exit 1
+# is hermit's own convention for "the guest failed", so the caller sees a plausible
+# ordinary failure and has no reason to suspect the run was killed.
+#
+# `Result` is what systemd itself concluded, so neither proxy is needed and the
+# arithmetic that broke on "6s" is deleted rather than repaired.
+#
+# THE NON-ANSWER IS TREATED AS A NON-ANSWER. If the result cannot be read, this says
+# so and falls back to the old inference rather than trusting a blank -- a unit that
+# no longer exists reports Result=success, so "unreadable" and "the run was fine" look
+# identical and must not be conflated.
+unit_result=""
+if [ "$runner_state" = APPLIED ] && [ "$unit" != none ]; then
+    unit_result="$(systemctl --user show "$unit.service" -p Result --value 2>/dev/null)"
+    field unit_result "${unit_result:-UNREADABLE}"
+    # Clean up explicitly, since --collect is deliberately not used. A timed-out unit
+    # is left in the failed state otherwise, and its name stays taken.
+    systemctl --user reset-failed "$unit.service" >/dev/null 2>&1 || true
+    systemctl --user stop "$unit.service" >/dev/null 2>&1 || true
+fi
+if [ "$unit_result" = timeout ]; then
+    say "DEADLINE: the run reached ${deadline} and was killed by its cgroup (systemd Result=timeout, child exit $rc)."
+    rc=124
+elif [ -z "$unit_result" ] && [ "$no_deadline" != 1 ] && [ "$runner_state" = APPLIED ] \
+     && { [ $rc -eq 143 ] || [ $rc -eq 137 ] || [ $rc -eq 1 ]; }; then
+    say "DEADLINE(inferred): systemd's unit result was UNREADABLE, so this is a GUESS from exit $rc, not a fact."
     rc=124
 fi
 
