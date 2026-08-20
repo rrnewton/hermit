@@ -73,6 +73,8 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 3;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -83,8 +85,42 @@ type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbt::RuntimeEmitter;
 type Idler = reverie_dbt::RuntimeIdler;
 
+#[repr(C)]
+struct DbtRuntimeCallbacksV1 {
+    emit: Emitter,
+    idle: Idler,
+    panic_on_unsupported_syscalls: i32,
+    unsupported_report_fd: i32,
+    emit_stdout: Emitter,
+}
+
+fn upgrade_runtime_callbacks_v1(
+    callbacks: &DbtRuntimeCallbacksV1,
+) -> reverie_dbt::DbtRuntimeCallbacks {
+    reverie_dbt::DbtRuntimeCallbacks {
+        emit: callbacks.emit,
+        idle: callbacks.idle,
+        panic_on_unsupported_syscalls: callbacks.panic_on_unsupported_syscalls,
+        unsupported_report_fd: callbacks.unsupported_report_fd,
+        emit_stdout: callbacks.emit_stdout,
+        emit_evidence: callbacks.emit,
+        evidence_log_level: 0,
+    }
+}
+
+fn runtime_callback_channels(
+    callbacks: &reverie_dbt::DbtRuntimeCallbacks,
+) -> (Emitter, Emitter, i32) {
+    (
+        callbacks.emit,
+        callbacks.emit_evidence,
+        callbacks.evidence_log_level,
+    )
+}
+
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
+static DBT_DIAGNOSTIC_EMITTER: OnceLock<Emitter> = OnceLock::new();
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DbtSubscriber {
@@ -195,6 +231,14 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
     unsafe { emit(message.as_ptr(), message.len()) };
 }
 
+fn emit_runtime_diagnostic(message: &str) {
+    if let Some(emit) = DBT_DIAGNOSTIC_EMITTER.get() {
+        unsafe { emit(message.as_ptr(), message.len()) };
+    } else {
+        eprint!("{message}");
+    }
+}
+
 /// Emit a routine per-run lifecycle breadcrumb (`detcore-dbt: …`).
 ///
 /// These progress markers narrate DBT backend startup and are useful when
@@ -248,14 +292,13 @@ fn dbt_log_level() -> Option<DbtLogLevel> {
     dbt_log_level_from_code(effective_dbt_log_level())
 }
 
-fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
-    if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
-        return true;
-    }
-    let Some(level) = dbt_log_level() else {
-        return false;
-    };
-    if tracing::subscriber::set_global_default(DbtSubscriber {
+fn install_dbt_subscriber_with<E>(
+    emit: Emitter,
+    level: DbtLogLevel,
+    canonical: bool,
+    install: impl FnOnce(DbtSubscriber) -> Result<(), E>,
+) -> bool {
+    if install(DbtSubscriber {
         emit,
         level,
         canonical,
@@ -266,6 +309,21 @@ fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
     }
     DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
+}
+
+fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
+    if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
+        return true;
+    }
+    let Some(level) = dbt_log_level() else {
+        return false;
+    };
+    install_dbt_subscriber_with(
+        emit,
+        level,
+        canonical,
+        tracing::subscriber::set_global_default,
+    )
 }
 
 fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) -> bool {
@@ -410,7 +468,54 @@ fn run_ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeAbi {
+    V1,
+    Current,
+}
+
+impl RuntimeAbi {
+    fn scheduler_tid(self, virtual_tid: i32, physical_tid: i32) -> Option<Tid> {
+        let tid = match self {
+            Self::V1 => physical_tid,
+            Self::Current => virtual_tid,
+        };
+        (tid > 0).then(|| Tid::from_raw(tid))
+    }
+
+    fn process_pid(self, virtual_pid: i32, physical_pid: i32) -> Option<Pid> {
+        let pid = match self {
+            Self::V1 => physical_pid,
+            Self::Current => virtual_pid,
+        };
+        (pid > 0).then(|| Pid::from_raw(pid))
+    }
+
+    fn open_file_creator(self, virtual_tid: i32, physical_tid: i32) -> Option<DetTid> {
+        let tid = match self {
+            Self::V1 if virtual_tid > 0 => virtual_tid,
+            Self::V1 => physical_tid,
+            Self::Current => virtual_tid,
+        };
+        (tid > 0).then(|| DetTid::from_raw(tid))
+    }
+
+    fn runtime_identity(
+        self,
+        virtual_tid: i32,
+        virtual_pid: i32,
+        physical_tid: i32,
+        physical_pid: i32,
+    ) -> Option<(Tid, Pid)> {
+        Some((
+            self.scheduler_tid(virtual_tid, physical_tid)?,
+            self.process_pid(virtual_pid, physical_pid)?,
+        ))
+    }
+}
+
 struct Runtime {
+    abi: RuntimeAbi,
     config: Config,
     global: GlobalState,
     tool: OnceLock<Detcore>,
@@ -426,6 +531,7 @@ struct ThreadRuntime {
 
 struct PendingThreadParent {
     parent_tid: Tid,
+    virtual_child_tid: Tid,
     rng_entropy: u128,
     state: DetcoreThreadState,
 }
@@ -464,6 +570,32 @@ static TOTAL_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 static MEMORY_HASH: AtomicU64 = AtomicU64::new(FNV_OFFSET);
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#2348): Single wiring point for the backend-selected detpid.
+/// Build a DBT thread's Detcore state and publish `det_pid` into it.
+///
+/// This exists as a named function because the assignment it performs was
+/// previously duplicated at the two call sites below and lacked a direct
+/// regression test. Routing both sites through one function makes removal of
+/// the backend-selected process identity a unit-test failure; see
+/// `dbt_thread_state_publishes_the_backend_selected_detpid`.
+///
+/// `det_pid` is what `RuntimeAbi::runtime_identity` selected: the client's
+/// published virtual pid on the current v2+ callback path, the host pid under v1. It reaches
+/// `tool_global::thread_start_request` as `ResourceID::MemAddrSpace(detpid)` and
+/// identifies the process to Detcore's scheduler. Child RNG identity is derived
+/// independently from deterministic creation pedigree/DBT child entropy.
+fn init_dbt_thread_state(
+    tool: &Detcore,
+    det_tid: Tid,
+    det_pid: DetTid,
+    parent: Option<(Tid, &DetcoreThreadState)>,
+) -> DetcoreThreadState {
+    let mut state = tool.init_thread_state(det_tid, parent);
+    state.detpid = Some(det_pid);
+    state
+}
+
 fn current_runtime() -> Arc<Runtime> {
     Arc::clone(
         RUNTIME
@@ -484,9 +616,46 @@ fn dbt_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBT child TIDs.
-fn dbt_scheduler_tid(host_tid: i32) -> Option<Tid> {
-    (host_tid > 0).then(|| Tid::from_raw(host_tid))
+// TODO-HUMAN-REVIEW(PR-1060): Review preservation of virtual DBT child TIDs.
+fn insert_pending_thread_parent(
+    pending: &mut HashMap<i32, PendingThreadParent>,
+    physical_child_tid: i32,
+    parent: PendingThreadParent,
+) -> Result<(), Tid> {
+    match pending.entry(physical_child_tid) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(parent);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            let stale_virtual_tid = entry.remove().virtual_child_tid;
+            Err(stale_virtual_tid)
+        }
+    }
+}
+
+fn resolve_pending_thread_parent(
+    pending: &mut HashMap<i32, PendingThreadParent>,
+    physical_child_tid: i32,
+    virtual_child_tid: Tid,
+    emit_diagnostic: impl FnOnce(&str),
+) -> Result<PendingThreadParent, i32> {
+    let Some(parent) = pending.get(&physical_child_tid) else {
+        return Err(1);
+    };
+    if parent.virtual_child_tid != virtual_child_tid {
+        let pending_virtual_tid = parent.virtual_child_tid;
+        pending.remove(&physical_child_tid);
+        emit_diagnostic(&format!(
+            "detcore-dbt: ERROR pending child identity mismatch: physical_tid={physical_child_tid} pending_virtual_tid={} observed_virtual_tid={}\n",
+            pending_virtual_tid.as_raw(),
+            virtual_child_tid.as_raw(),
+        ));
+        return Err(-1);
+    }
+    Ok(pending
+        .remove(&physical_child_tid)
+        .expect("matching pending child disappeared"))
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -847,22 +1016,10 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-/// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
-///
-/// The native client starts this entry point before registering guest events
-/// and waits for [`reverie_dbt_runtime_ready`] before allowing callbacks.
-///
-/// # Safety
-///
-/// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
-#[unsafe(no_mangle)]
-// TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, abi: RuntimeAbi) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
-    let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
-    let emit_diagnostic = callbacks.emit;
-    let emit_evidence = callbacks.emit_evidence;
-    let protected_level = callbacks.evidence_log_level;
+    let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
+    let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
@@ -945,11 +1102,18 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
             let global = GlobalState::init_for_external_scheduler(&config);
             emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
+                abi,
                 config,
                 global,
                 tool: OnceLock::new(),
                 next_child_ordinal: AtomicU64::new(1),
             }));
+        } else if slot.as_ref().is_some_and(|runtime| runtime.abi != abi) {
+            emit_marker(
+                emit_diagnostic,
+                b"detcore-dbt: ERROR runtime ABI changed after initialization\n",
+            );
+            unsafe { libc::_exit(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE) };
         }
         Arc::clone(slot.as_ref().expect("Detcore DBT runtime was initialized"))
     };
@@ -973,6 +1137,33 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
         emit_diagnostic,
         b"detcore-dbt: background scheduler completed\n",
     );
+}
+
+/// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
+///
+/// The native client starts this entry point before registering guest events
+/// and waits for [`reverie_dbt_runtime_ready`] before allowing callbacks.
+///
+/// # Safety
+///
+/// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
+#[unsafe(no_mangle)]
+// TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+    let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
+    unsafe { runtime_background_init(callbacks, RuntimeAbi::Current) };
+}
+
+/// Compatibility entry point for native clients using callback ABI version 1.
+///
+/// # Safety
+///
+/// `argument` must point to a valid version-1 callback structure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+    let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
+    let current = upgrade_runtime_callbacks_v1(callbacks);
+    unsafe { runtime_background_init(&current, RuntimeAbi::V1) };
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -1059,36 +1250,46 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 
     let host_tid = tid;
     let host_pid = pid;
+    if host_tid <= 0 || host_pid <= 0 {
+        return -1;
+    }
     let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, host_tid, host_pid)
+    else {
+        return -1;
+    };
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let parent = if host_tid == host_pid {
         None
     } else {
-        let parent = PENDING_THREAD_PARENTS
-            .lock()
-            .expect("pending DBT thread parent lock poisoned")
-            .remove(&host_tid);
-        let Some(parent) = parent else {
-            return 1;
-        };
-        Some(parent)
-    };
-    let Some(det_tid) = dbt_scheduler_tid(host_tid) else {
-        return -1;
+        match resolve_pending_thread_parent(
+            &mut PENDING_THREAD_PARENTS
+                .lock()
+                .expect("pending DBT thread parent lock poisoned"),
+            host_tid,
+            det_tid,
+            emit_runtime_diagnostic,
+        ) {
+            Ok(parent) => Some(parent),
+            Err(status) => return status,
+        }
     };
     let parent_ref = parent
         .as_ref()
         .map(|parent| (parent.parent_tid, &parent.state));
-    let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
-    let mut state = tool.init_thread_state(det_tid, parent_ref);
+    let mut state =
+        init_dbt_thread_state(tool, det_tid, DetTid::from_raw(det_pid.into()), parent_ref);
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
-        tid: det_pid,
+        tid: Pid::from_raw(det_tid.into()),
         state,
         initialized: false,
         post_exec_pending: host_tid == pid,
@@ -1096,7 +1297,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     if reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
-        det_pid,
+        Pid::from_raw(det_tid.into()),
         host_pid,
         branch_count,
         &mut thread.state,
@@ -1133,14 +1334,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     pid: i32,
     branch_count: u64,
     child_tid: i32,
-    // ABI 2 added a separate virtual child identity. Detcore already derives
-    // its own virtual identity from `scratch.virtual_pid` and the child
-    // ordinal, so this registration deliberately keeps that derivation and
-    // does not switch to the client-supplied value: changing how a child's
-    // deterministic identity is chosen is a determinism change, not a link
-    // repair, and belongs in its own reviewed commit. Accepting the argument
-    // is what ABI 2 requires; consuming it is a separate decision.
-    _virtual_child_tid: i32,
+    virtual_child_tid: i32,
     child_tid_addr: u64,
     flags: u64,
     invoke_syscall: SyscallInvoker,
@@ -1157,34 +1351,37 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
         .tool
         .get()
         .expect("Detcore DBT tool was initialized");
-    let virtual_pid = scratch.virtual_pid;
     let parent = unsafe { &mut *scratch.runtime_state };
     let flags = CloneFlags::from_bits_truncate(flags);
     parent.state.clone_flags = Some(flags);
     let parent_snapshot = parent.state.clone();
     let child_ordinal = runtime.next_child_ordinal.fetch_add(1, Ordering::SeqCst);
-    let Some(rng_entropy) = dbt_child_rng_entropy(virtual_pid, child_ordinal) else {
+    let Some(rng_entropy) = dbt_child_rng_entropy(scratch.virtual_pid, child_ordinal) else {
         parent.state.clone_flags = None;
         return -1;
     };
-    let Some(child_scheduler_tid) = dbt_scheduler_tid(child_tid) else {
+    let Some(child_scheduler_tid) = runtime.abi.scheduler_tid(virtual_child_tid, child_tid) else {
         parent.state.clone_flags = None;
         return -1;
     };
-    if PENDING_THREAD_PARENTS
-        .lock()
-        .expect("pending DBT thread parent lock poisoned")
-        .insert(
-            child_tid,
-            PendingThreadParent {
-                parent_tid: Tid::from_raw(parent.tid.into()),
-                rng_entropy,
-                state: parent_snapshot,
-            },
-        )
-        .is_some()
-    {
+    if let Err(pending_virtual_tid) = insert_pending_thread_parent(
+        &mut PENDING_THREAD_PARENTS
+            .lock()
+            .expect("pending DBT thread parent lock poisoned"),
+        child_tid,
+        PendingThreadParent {
+            parent_tid: Tid::from_raw(parent.tid.into()),
+            virtual_child_tid: child_scheduler_tid,
+            rng_entropy,
+            state: parent_snapshot,
+        },
+    ) {
         parent.state.clone_flags = None;
+        emit_runtime_diagnostic(&format!(
+            "detcore-dbt: ERROR duplicate pending child handoff: physical_tid={child_tid} stale_virtual_tid={} attempted_virtual_tid={}\n",
+            pending_virtual_tid.as_raw(),
+            child_scheduler_tid.as_raw(),
+        ));
         return -1;
     }
 
@@ -1245,6 +1442,44 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
     }
 }
 
+/// Compatibility entry point for native clients using callback ABI version 1.
+///
+/// # Safety
+///
+/// The pointers and callbacks must satisfy the version-1 thread-created ABI.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    parent_tid: i32,
+    pid: i32,
+    branch_count: u64,
+    child_tid: i32,
+    child_tid_addr: u64,
+    flags: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32 {
+    unsafe {
+        reverie_dbt_runtime_thread_created_v2(
+            scratch,
+            context,
+            parent_tid,
+            pid,
+            branch_count,
+            child_tid,
+            child_tid,
+            child_tid_addr,
+            flags,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        )
+    }
+}
+
 /// Releases Detcore state owned by a DynamoRIO application thread.
 ///
 /// # Safety
@@ -1252,7 +1487,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
 /// `scratch` must be the pointer initialized by
 /// [`reverie_dbt_runtime_thread_init`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(scratch: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
+    scratch: *mut c_void,
+    _context: *mut c_void,
+    _tid: i32,
+    _invoke_syscall: SyscallInvoker,
+) {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
         return;
@@ -1464,9 +1704,19 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     if first_event {
         emit_lifecycle_marker(emit, b"detcore-dbt: entered Rust syscall callback\n");
     }
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    };
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
-    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     translate_self_identity_targets(
         sysnum,
         &mut dispatch_args,
@@ -1550,12 +1800,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     }
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
-    let runtime = current_runtime();
-    let tid = Pid::from_raw(tid);
-    let pid = Pid::from_raw(pid);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(pid, &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
@@ -1575,15 +1824,24 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
         }
-        let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
-        if scratch.virtual_tid > 0 {
-            state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
-        }
+        let mut state = init_dbt_thread_state(
+            tool,
+            Tid::from_raw(det_tid.into()),
+            DetTid::from_raw(det_pid.into()),
+            None,
+        );
+        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
+        else {
+            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        };
+        state.set_open_file_creator(open_file_creator);
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid,
+            tid: det_tid,
             state,
             initialized: false,
             post_exec_pending: true,
@@ -1599,7 +1857,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             tool,
             context as usize,
             det_tid,
-            pid,
+            host_pid,
             branches,
             &mut thread.state,
             &runtime.global,
@@ -1625,7 +1883,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             tool,
             context as usize,
             det_tid,
-            pid,
+            host_pid,
             branches,
             &mut thread.state,
             &runtime.global,
@@ -1663,7 +1921,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         tool,
         context as usize,
         det_tid,
-        pid,
+        host_pid,
         branches,
         &mut thread.state,
         &runtime.global,
@@ -1725,25 +1983,24 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 /// "native/runtime ABI version or callback size mismatch" and calls
 /// `dr_exit_process(101)`.
 ///
-/// The value is read from Reverie rather than restated here. Hermit disables
-/// `reverie-dbt`'s `prototype-runtime` feature, so upstream's own `extern "C"`
-/// wrapper is not compiled in and Hermit must export one -- but the CONSTANT is
-/// not feature-gated, so re-reading it keeps the two repositories from drifting
-/// apart the moment someone bumps the version.
+/// The value is pinned locally rather than inferred from the dependency. The
+/// test below requires Reverie's declared version to equal this pin, so an
+/// upstream ABI bump fails closed until Hermit's exports have been reviewed and
+/// this implemented-version constant is advanced deliberately.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
-    reverie_dbt::DBT_RUNTIME_ABI_VERSION
+    IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
 }
 
 /// Reports the exact callback-structure size for the current ABI version.
 ///
-/// Computed with `size_of` over Reverie's own `DbtRuntimeCallbacks`, which is
-/// `#[repr(C)]` and not feature-gated. A hand-written number here would be a
-/// second source of truth for a struct layout, which is the class of drift this
-/// handshake exists to detect.
+/// This size is pinned alongside the implemented ABI version. The test below
+/// compares it with `size_of::<reverie_dbt::DbtRuntimeCallbacks>()`, so callback
+/// layout drift fails closed instead of being advertised automatically as an
+/// ABI Hermit already implements.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_callbacks_size() -> usize {
-    std::mem::size_of::<reverie_dbt::DbtRuntimeCallbacks>()
+    IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE
 }
 
 /// Reports the wire code identifying which runtime produced a stats record.
@@ -1790,6 +2047,264 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn test_emit(_bytes: *const u8, _length: usize) {}
+
+    unsafe extern "C" fn test_stdout(_bytes: *const u8, _length: usize) {}
+
+    unsafe extern "C" fn test_emit_evidence(_bytes: *const u8, _length: usize) {}
+
+    unsafe extern "C" fn test_idle() {}
+
+    #[test]
+    fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 3);
+        assert_eq!(
+            reverie_dbt::DBT_RUNTIME_ABI_VERSION,
+            IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
+        );
+        assert_eq!(
+            std::mem::size_of::<reverie_dbt::DbtRuntimeCallbacks>(),
+            IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE
+        );
+        assert_eq!(
+            reverie_dbt_runtime_abi_version(),
+            IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
+        );
+        assert_eq!(
+            reverie_dbt_runtime_callbacks_size(),
+            IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE
+        );
+        assert_eq!(
+            reverie_dbt_runtime_kind_code(),
+            reverie_dbt::backend_stats::DbtRuntimeKind::Unknown.to_wire()
+        );
+    }
+
+    #[test]
+    fn version_one_callbacks_upgrade_without_changing_existing_channels_or_policy() {
+        let legacy = DbtRuntimeCallbacksV1 {
+            emit: test_emit,
+            idle: test_idle,
+            panic_on_unsupported_syscalls: 1,
+            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD,
+            emit_stdout: test_stdout,
+        };
+        let current = upgrade_runtime_callbacks_v1(&legacy);
+
+        assert_eq!(current.emit as *const (), test_emit as *const ());
+        assert_eq!(current.idle as *const (), test_idle as *const ());
+        assert_eq!(current.panic_on_unsupported_syscalls, 1);
+        assert_eq!(current.unsupported_report_fd, UNSUPPORTED_SYSCALL_REPORT_FD);
+        assert_eq!(current.emit_stdout as *const (), test_stdout as *const ());
+        assert_eq!(current.emit_evidence as *const (), test_emit as *const ());
+        assert_eq!(current.evidence_log_level, 0);
+    }
+
+    #[test]
+    fn current_callbacks_route_protected_evidence_at_the_declared_level() {
+        let callbacks = reverie_dbt::DbtRuntimeCallbacks {
+            emit: test_emit,
+            idle: test_idle,
+            panic_on_unsupported_syscalls: 1,
+            unsupported_report_fd: UNSUPPORTED_SYSCALL_REPORT_FD,
+            emit_stdout: test_stdout,
+            emit_evidence: test_emit_evidence,
+            evidence_log_level: 3,
+        };
+        let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
+
+        assert_eq!(diagnostic as *const (), test_emit as *const ());
+        assert_eq!(evidence as *const (), test_emit_evidence as *const ());
+        assert_eq!(level, 3);
+        assert!(protected_evidence_capture_ready(level, true));
+        assert!(!protected_evidence_capture_ready(level, false));
+        assert!(protected_evidence_capture_ready(0, false));
+    }
+
+    #[test]
+    fn protected_evidence_records_have_deterministic_prefix_and_escaped_fields() {
+        let mut fields = String::new();
+        push_escaped_record_text(&mut fields, "line one\nline two\\tail\r");
+        assert_eq!(fields, "line one\\nline two\\\\tail\\r");
+        assert_eq!(
+            format_dbt_log_record(
+                tracing::Level::INFO.as_str(),
+                "detcore::scheduler",
+                &fields,
+                true,
+            ),
+            "1970-01-01T00:00:00.000000Z INFO detcore::scheduler: line one\\nline two\\\\tail\\r\n"
+        );
+        // The `canonical` flag arrived on main after this test was written
+        // (a811f33684). Pin BOTH branches: the deterministic prefix is what a
+        // verification record needs, and its ABSENCE is what keeps an ordinary
+        // diagnostic run from claiming a fixed timestamp it never had. Asserting
+        // only the true branch would let a change that always prefixes pass.
+        assert_eq!(
+            format_dbt_log_record(
+                tracing::Level::INFO.as_str(),
+                "detcore::scheduler",
+                &fields,
+                false,
+            ),
+            "INFO detcore::scheduler: line one\\nline two\\\\tail\\r\n"
+        );
+    }
+
+    #[test]
+    fn protected_evidence_refuses_when_subscriber_installation_fails() {
+        let previous = DBT_TRACING_ACTIVE.swap(false, Ordering::AcqRel);
+        let mut selected_emitter = None;
+        let installed = install_dbt_subscriber_with(
+            test_emit_evidence,
+            DbtLogLevel::Info,
+            true,
+            |subscriber| {
+                selected_emitter = Some(subscriber.emit as *const ());
+                Err::<(), ()>(())
+            },
+        );
+        assert!(!installed);
+        assert_eq!(selected_emitter, Some(test_emit_evidence as *const ()));
+        assert!(!DBT_TRACING_ACTIVE.load(Ordering::Acquire));
+        assert!(!protected_evidence_capture_ready(3, installed));
+        DBT_TRACING_ACTIVE.store(previous, Ordering::Release);
+    }
+
+    #[test]
+    fn current_exports_match_the_native_client_signatures() {
+        let _: extern "C" fn() -> u64 = reverie_dbt_runtime_image_init;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            i32,
+            u64,
+            i32,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+        ) -> i32 = reverie_dbt_runtime_thread_init;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            u64,
+            i32,
+            i32,
+            u64,
+            u64,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+        ) -> i32 = reverie_dbt_runtime_thread_created_v2;
+        let _: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, SyscallInvoker) =
+            reverie_dbt_runtime_thread_exit;
+        let _: unsafe extern "C" fn(*mut c_void, i32) = reverie_dbt_runtime_exec_failed;
+        let _: unsafe extern "C" fn(*mut c_void, i64, i64) =
+            reverie_dbt_runtime_process_clone_result;
+        let _: unsafe extern "C" fn(i64, *const u64) -> i32 = reverie_dbt_runtime_copied_syscall;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            u64,
+            i64,
+            *const u64,
+            u64,
+            *mut i64,
+            *mut i64,
+            *mut u64,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+            MemoryReader,
+            MemoryWriter,
+            Emitter,
+        ) -> i32 = reverie_dbt_runtime_pre_syscall;
+        let _: unsafe extern "C" fn(*mut c_void) = reverie_dbt_runtime_background_init_v2;
+        let _: extern "C" fn() = reverie_dbt_runtime_process_exit;
+        let _: extern "C" fn(u64) -> i32 = reverie_dbt_runtime_ready;
+        let _: extern "C" fn() -> *const libc::c_char = reverie_dbt_runtime_name;
+        let _: extern "C" fn() -> u8 = reverie_dbt_runtime_kind_code;
+        let _: unsafe extern "C" fn(*mut u64, *mut u64, *mut u64, *mut u64) =
+            reverie_dbt_runtime_totals;
+        let _: extern "C" fn() -> u32 = reverie_dbt_runtime_abi_version;
+        let _: extern "C" fn() -> usize = reverie_dbt_runtime_callbacks_size;
+
+        let _: unsafe extern "C" fn(*mut c_void) = reverie_dbt_runtime_background_init;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            u64,
+            i32,
+            u64,
+            u64,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+        ) -> i32 = reverie_dbt_runtime_thread_created;
+    }
+
+    #[test]
+    fn current_identity_uses_published_virtual_ids_not_host_ids() {
+        let (scheduler_tid, process_pid) = RuntimeAbi::Current
+            .runtime_identity(4, 3, 44_004, 44_003)
+            .expect("positive virtual identities must be accepted");
+        let scheduler_tid: i32 = scheduler_tid.into();
+        let process_pid: i32 = process_pid.into();
+        assert_eq!(scheduler_tid, 4);
+        assert_eq!(process_pid, 3);
+        assert_eq!(
+            RuntimeAbi::Current.runtime_identity(0, 3, 44_004, 44_003),
+            None
+        );
+        assert_eq!(
+            RuntimeAbi::Current.runtime_identity(4, 0, 44_004, 44_003),
+            None
+        );
+        assert_eq!(
+            RuntimeAbi::Current.runtime_identity(-1, 3, 44_004, 44_003),
+            None
+        );
+        assert_eq!(
+            RuntimeAbi::Current.runtime_identity(4, -1, 44_004, 44_003),
+            None
+        );
+    }
+
+    #[test]
+    fn version_one_identity_uses_physical_ids_when_virtual_fields_are_zero_or_different() {
+        for (virtual_tid, virtual_pid) in [(0, 0), (4, 3), (-1, -1)] {
+            let (scheduler_tid, process_pid) = RuntimeAbi::V1
+                .runtime_identity(virtual_tid, virtual_pid, 44_004, 44_003)
+                .expect("positive physical identities must be accepted for ABI v1");
+            let scheduler_tid: i32 = scheduler_tid.into();
+            let process_pid: i32 = process_pid.into();
+            assert_eq!(scheduler_tid, 44_004);
+            assert_eq!(process_pid, 44_003);
+        }
+        assert_eq!(RuntimeAbi::V1.runtime_identity(4, 3, 0, 44_003), None);
+        assert_eq!(RuntimeAbi::V1.runtime_identity(4, 3, 44_004, 0), None);
+    }
+
+    #[test]
+    fn version_one_open_file_creator_prefers_virtual_tid_with_physical_fallback() {
+        let scheduler_tid: i32 = RuntimeAbi::V1.scheduler_tid(4, 44_004).unwrap().into();
+        let virtual_creator = RuntimeAbi::V1.open_file_creator(4, 44_004).unwrap();
+        let fallback_creator = RuntimeAbi::V1.open_file_creator(0, 44_004).unwrap();
+
+        assert_eq!(scheduler_tid, 44_004);
+        assert_eq!(virtual_creator.as_raw(), 4);
+        assert_eq!(fallback_creator.as_raw(), 44_004);
+        assert_eq!(RuntimeAbi::V1.open_file_creator(-1, 0), None);
+    }
 
     #[test]
     fn canonical_dbt_log_records_have_timestamp_and_one_line() {
@@ -1873,16 +2388,184 @@ mod tests {
     }
 
     #[test]
-    fn child_scheduler_identity_remains_the_host_tid() {
-        let host_tid = 42_001;
-        let scheduler_tid: i32 = dbt_scheduler_tid(host_tid).unwrap().into();
-        assert_eq!(scheduler_tid, host_tid);
-        assert_eq!(dbt_scheduler_tid(0), None);
-        assert_eq!(dbt_scheduler_tid(-1), None);
+    fn current_scheduler_identity_requires_a_positive_virtual_tid() {
+        let scheduler_tid: i32 = RuntimeAbi::Current.scheduler_tid(4, 44_004).unwrap().into();
+        assert_eq!(scheduler_tid, 4);
+        assert_eq!(RuntimeAbi::Current.scheduler_tid(0, 44_004), None);
+        assert_eq!(RuntimeAbi::Current.scheduler_tid(-1, 44_004), None);
     }
 
     #[test]
-    fn self_identity_syscalls_use_host_identities() {
+    fn version_one_child_handoff_matches_on_physical_identity() {
+        let config = Config::default();
+        let tool: Detcore = Detcore::new(Pid::from_raw(44_003), &config);
+        let physical_child_tid = 44_005;
+        let virtual_parent_pid = 3;
+        let selected_child_tid = RuntimeAbi::V1
+            .scheduler_tid(0, physical_child_tid)
+            .expect("ABI v1 must select the physical child tid");
+        let rng_entropy = dbt_child_rng_entropy(virtual_parent_pid, 1)
+            .expect("ABI v1 child RNG still requires the published virtual process identity");
+        assert_eq!(rng_entropy, (virtual_parent_pid as u128) << 64 | 1);
+        assert_ne!(
+            rng_entropy,
+            dbt_child_rng_entropy(44_003, 1).expect("physical pid is positive")
+        );
+        let mut pending = HashMap::new();
+        insert_pending_thread_parent(
+            &mut pending,
+            physical_child_tid,
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(44_004),
+                virtual_child_tid: selected_child_tid,
+                rng_entropy,
+                state: tool.init_thread_state(Tid::from_raw(44_004), None),
+            },
+        )
+        .unwrap();
+
+        let observed_child_tid = RuntimeAbi::V1
+            .scheduler_tid(77, physical_child_tid)
+            .expect("ABI v1 must ignore a differing virtual child tid");
+        let parent = resolve_pending_thread_parent(
+            &mut pending,
+            physical_child_tid,
+            observed_child_tid,
+            |_| panic!("matching ABI v1 handoff emitted a mismatch diagnostic"),
+        )
+        .expect("ABI v1 physical child handoff must match subsequent thread init");
+        assert_eq!(parent.virtual_child_tid, Tid::from_raw(physical_child_tid));
+        assert!(pending.is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2348)
+    /// THE WIRING BRACKET. The other identity tests exercise `RuntimeAbi` as a
+    /// pure selector; this one reaches the assignment that delivers the selected
+    /// process id into the thread state. It fails when that assignment is
+    /// removed or fed the wrong identity.
+    #[test]
+    fn dbt_thread_state_publishes_the_backend_selected_detpid() {
+        let config = Config::default();
+        let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
+
+        // Host ids deliberately unlike the virtual ones, and unlike each other,
+        // so a state that published EITHER host value is distinguishable from
+        // one that published the virtual pid. These are the real host tids
+        // observed in the DETLOG this branch fixes.
+        let (host_tid, host_pid) = (918_946, 918_851);
+        let (virtual_tid, virtual_pid) = (4, 3);
+
+        let (det_tid, det_pid) = RuntimeAbi::Current
+            .runtime_identity(virtual_tid, virtual_pid, host_tid, host_pid)
+            .expect("current callbacks publish positive virtual ids");
+        let state = init_dbt_thread_state(&tool, det_tid, DetTid::from_raw(det_pid.into()), None);
+        assert_eq!(
+            state.detpid,
+            Some(DetTid::from_raw(virtual_pid)),
+            "current callbacks must publish the client's virtual pid into the thread state; this \
+             is the value that becomes ResourceID::MemAddrSpace and the scheduler's \
+             process identity"
+        );
+        assert_ne!(
+            state.detpid,
+            Some(DetTid::from_raw(host_pid)),
+            "the host pid must not replace current callback path's published virtual process identity"
+        );
+
+        // v1 selects the PHYSICAL pid, so the same helper must carry a different
+        // value. Without this the test would pass against an implementation that
+        // ignored the ABI and hard-coded the virtual id.
+        let (det_tid_v1, det_pid_v1) = RuntimeAbi::V1
+            .runtime_identity(virtual_tid, virtual_pid, host_tid, host_pid)
+            .expect("v1 falls back to positive physical ids");
+        let state_v1 =
+            init_dbt_thread_state(&tool, det_tid_v1, DetTid::from_raw(det_pid_v1.into()), None);
+        assert_eq!(
+            state_v1.detpid,
+            Some(DetTid::from_raw(host_pid)),
+            "v1 keeps physical process identity"
+        );
+        assert_ne!(
+            state.detpid, state_v1.detpid,
+            "if the two ABIs published the same pid this bracket would prove nothing"
+        );
+    }
+
+    #[test]
+    fn pending_thread_parent_distinguishes_absent_mismatch_and_match() {
+        let make_parent = |virtual_child_tid| {
+            let config = Config::default();
+            let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(3),
+                virtual_child_tid: Tid::from_raw(virtual_child_tid),
+                rng_entropy: dbt_child_rng_entropy(3, 1).unwrap(),
+                state: tool.init_thread_state(Tid::from_raw(3), None),
+            }
+        };
+
+        let mut pending = HashMap::new();
+        let mut diagnostic = None;
+        assert!(matches!(
+            resolve_pending_thread_parent(&mut pending, 42_001, Tid::from_raw(4), |message| {
+                diagnostic = Some(message.to_owned());
+            }),
+            Err(1)
+        ));
+        assert!(diagnostic.is_none(), "an absent handoff is not an error");
+
+        assert!(insert_pending_thread_parent(&mut pending, 42_001, make_parent(4)).is_ok());
+        assert!(matches!(
+            resolve_pending_thread_parent(&mut pending, 42_001, Tid::from_raw(9), |message| {
+                diagnostic = Some(message.to_owned());
+            }),
+            Err(-1)
+        ));
+        assert!(pending.is_empty(), "a mismatched stale handoff is removed");
+
+        assert!(insert_pending_thread_parent(&mut pending, 42_001, make_parent(4)).is_ok());
+        diagnostic = None;
+        let parent =
+            resolve_pending_thread_parent(&mut pending, 42_001, Tid::from_raw(4), |message| {
+                diagnostic = Some(message.to_owned())
+            })
+            .expect("matching physical and virtual identities must consume the handoff");
+        assert!(diagnostic.is_none(), "a matching handoff is not an error");
+        assert_eq!(parent.virtual_child_tid, Tid::from_raw(4));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn duplicate_pending_thread_parent_is_refused_and_cleans_stale_entry() {
+        let make_parent = |virtual_child_tid| {
+            let config = Config::default();
+            let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(3),
+                virtual_child_tid: Tid::from_raw(virtual_child_tid),
+                rng_entropy: dbt_child_rng_entropy(3, 1).unwrap(),
+                state: tool.init_thread_state(Tid::from_raw(3), None),
+            }
+        };
+
+        let mut pending = HashMap::new();
+        assert!(insert_pending_thread_parent(&mut pending, 42_001, make_parent(4)).is_ok());
+        assert_eq!(
+            insert_pending_thread_parent(&mut pending, 42_001, make_parent(9)),
+            Err(Tid::from_raw(4))
+        );
+        assert!(pending.is_empty(), "a duplicate leaves no stale handoff");
+    }
+
+    #[test]
+    fn self_identity_translation_uses_virtual_targets_even_with_v1_physical_scheduler_ids() {
+        let (v1_scheduler_tid, v1_process_pid) = RuntimeAbi::V1
+            .runtime_identity(4, 3, 10_004, 10_003)
+            .expect("ABI v1 physical callback identities are valid");
+        assert_eq!(i32::from(v1_scheduler_tid), 10_004);
+        assert_eq!(i32::from(v1_process_pid), 10_003);
+
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
         translate_self_identity_targets(
             libc::SYS_rt_tgsigqueueinfo,
@@ -2637,10 +3320,24 @@ mod tests {
             0
         }
 
-        let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
+        let mut scratch = NativeThreadScratch {
+            branches: 0,
+            observed_syscalls: 0,
+            rewritten_syscalls: 0,
+            runtime_state: std::ptr::null_mut(),
+            pending_thread_clone: 0,
+            thread_clone_flags: 0,
+            thread_clone_ctid: 0,
+            pending_thread_start: 0,
+            virtual_pid: 3,
+            virtual_ppid: 1,
+            virtual_tid: 3,
+            pending_virtual_child: 4,
+            pending_clone_flags: libc::CLONE_THREAD as u64,
+        };
         let status = unsafe {
             reverie_dbt_runtime_thread_init(
-                scratch.as_mut_ptr().cast(),
+                std::ptr::from_mut(&mut scratch).cast(),
                 std::ptr::null_mut(),
                 7,
                 7,
@@ -2654,7 +3351,6 @@ mod tests {
         };
 
         assert_eq!(status, 0);
-        let scratch = unsafe { scratch.assume_init() };
         assert_eq!(scratch.branches, 99);
         assert_eq!(scratch.observed_syscalls, 0);
         assert_eq!(scratch.rewritten_syscalls, 0);
@@ -2663,11 +3359,11 @@ mod tests {
         assert_eq!(scratch.thread_clone_flags, 0);
         assert_eq!(scratch.thread_clone_ctid, 0);
         assert_eq!(scratch.pending_thread_start, 0);
-        assert_eq!(scratch.virtual_pid, 0);
-        assert_eq!(scratch.virtual_ppid, 0);
-        assert_eq!(scratch.virtual_tid, 0);
-        assert_eq!(scratch.pending_virtual_child, 0);
-        assert_eq!(scratch.pending_clone_flags, 0);
+        assert_eq!(scratch.virtual_pid, 3);
+        assert_eq!(scratch.virtual_ppid, 1);
+        assert_eq!(scratch.virtual_tid, 3);
+        assert_eq!(scratch.pending_virtual_child, 4);
+        assert_eq!(scratch.pending_clone_flags, libc::CLONE_THREAD as u64);
     }
 
     #[test]
