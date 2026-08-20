@@ -25,7 +25,7 @@ fi
 # --print-pin is deliberately offline: the separate latest-main gate owns the
 # network authority, while this check prevents a pin bump from silently reusing
 # an earlier revision's clamp and measured threshold.
-expected_pin=268a25b6cbedd75b51a2e93854d9494ba8e2ff0a
+expected_pin=af82f1b92a2762840dc5894984be5e1f5bfc5cb9
 recorded_pin=$(
     "$ROOT_DIR/ci/run-reverie-pin-check.sh" --repo "$ROOT_DIR" --print-pin
 )
