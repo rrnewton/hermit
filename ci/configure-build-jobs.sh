@@ -512,6 +512,36 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # Budget values (MAX_PARALLEL_JOBS=16, 1050 effective-job-seconds, 263/66
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
+#
+# CARRY TO af82f1b9 (2026-08-20), ACROSS SIX PINS IN ONE SEQUENCE. The
+# calibration carries unchanged and the RECIPE IDENTITY DOES NOT MOVE: this is
+# the 0384d673 case, not the c261050 case, because neither source_recipe_key()
+# file input differs at ANY of the six pins between c261050 and af82f1b9.
+#
+#   pin        reverie-dbt/vendor/dynamorio                  reverie-dbt/build.rs
+#   c261050c   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   986e17e0   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   ee6716a6   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   4f57671d   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   efb7b08c   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   268a25b6   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   af82f1b9   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#
+# So the identity stays sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
+# and no derivation is needed; the entry above already validated that value.
+#
+# WHAT DID CHANGE UNDER reverie-dbt, and why it cannot move this budget:
+# 268a25b6 adds +4189/-115 across eight files -- native/client.c (+1291), a new
+# src/evidence.rs (+1589), src/launcher.rs, src/lib.rs, and four test fixtures.
+# None is a source_recipe_key() input. build_dynamorio() cmake-configures and
+# cmake-builds only vendor/dynamorio, which is byte-identical, so the DynamoRIO
+# content-key MISS this budget measures cannot have moved. The Rust and C that
+# did change is compiled by Cargo under the ordinary workspace budget.
+#
+# BUILD-RELEVANT ANYWAY, the separate axis the ab44bbf7 entry names: those eight
+# reverie-dbt files plus reverie-ptrace/src/tracer.rs at af82f1b9 are compiled by
+# Hermit, so this sequence requires REAL revalidation. This carry authorizes
+# reusing the budget, never reusing a receipt.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
