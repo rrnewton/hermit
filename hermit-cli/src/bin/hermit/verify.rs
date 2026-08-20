@@ -154,10 +154,10 @@ const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
 pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
-    /// Whether the internal event stream was compared at all. When
-    /// `false` (e.g. KVM concurrent mode) only stdout/stderr/exit status were
-    /// compared and the strictness fields describe a log comparison that did not
-    /// run — a consumer must not read such a verdict as bitwise log parity.
+    /// Whether the internal event stream was compared at all. When `false`, only
+    /// stdout/stderr/exit status were compared and the strictness fields describe
+    /// a log comparison that did not run — a consumer must not read such a
+    /// verdict as bitwise log parity.
     pub compare_logs: bool,
     /// The message envelope selected from the captured log. The compared-message
     /// counts refer exactly to this scope.
@@ -723,9 +723,9 @@ fn compare_two_runs_with_unsupported_scan(
         log: log2,
     } = second;
     let mut failed = false;
-    // None until the log comparison actually runs; stays None on the
-    // output-only (KVM concurrent) fallback so the report can distinguish
-    // "compared nothing" from "compared and matched".
+    // None until the log comparison actually runs; stays None on an output-only
+    // invocation so the report can distinguish "compared nothing" from
+    // "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
@@ -811,9 +811,7 @@ fn compare_two_runs_with_unsupported_scan(
                 eprintln!(":: {}", "Log differences found between runs.".red().bold());
             }
         } else {
-            eprintln!(
-                ":: KVM concurrent mode: comparing guest output and exit status; internal syscall trace order is not deterministic"
-            );
+            eprintln!(":: Captured verification logs were not compared for this invocation.");
         }
 
         if out1.status != out2.status {

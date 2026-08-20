@@ -1442,7 +1442,7 @@ async fn run_kvm(
     drop(backend);
     let teardown_finished = Instant::now();
 
-    tracing::info!(
+    tracing::debug!(
         target: "hermit::kvm",
         prepare_us = setup_started.duration_since(dispatch_started).as_micros() as u64,
         setup_us = execution_started.duration_since(setup_started).as_micros() as u64,
@@ -1610,7 +1610,7 @@ fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig 
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
-    config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
+    config.cancel_killed_thread_rpcs = matches!(backend, Backend::Sabre | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -2254,6 +2254,7 @@ mod tests {
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(!kvm.backend_serializes_fork_children);
         assert!(kvm.backend_dispatches_thread_tools);
+        assert!(kvm.cancel_killed_thread_rpcs);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
         assert!(kvm.backend_defers_vfork_child_registration);

@@ -32,17 +32,17 @@ Stripped verification (`hermit run --strict --verify`):
 | --- | ---: | --- | ---: |
 | ptrace | 28/28 | Stripped DETLOG | 100% |
 | DBT | 26/28 | Stripped DETLOG | 93% |
-| KVM | 22/28 | guest-visible only | 79% |
+| KVM | — | canonical comparison enabled; this 28-test row is not remeasured | — |
 
-The two verification kinds are not interchangeable. **Stripped DETLOG**
-(ptrace, DBT) means Hermit re-ran the guest and found the two normalized DETLOG
+The verification results must name the comparator that actually ran. **Stripped DETLOG**
+means Hermit re-ran the guest and found the two normalized DETLOG
 streams equal after stripping selected fields; it does not mean the full syscall
 and scheduling traces were bitwise-identical and does not establish L2.
-**guest-visible** verification (KVM) is weaker: reverie-kvm runs concurrently and
-declares outright that its internal syscall trace order is not deterministic, so
-`--verify` compares only guest stdout and exit status across the two runs. KVM's
-column is therefore capped at `guest`, never `detlog`. See the verification
-subsection below for the contract that holds at L1 but not under `--verify`.
+KVM now runs the same log comparison on `--verify`; whether a cell matches is a
+measured property of that workload. Concurrent `example-race` runs genuinely
+diverge, while the KVM cells that passed repeated canonical comparison do not.
+The historical 22/28 guest-visible count above predates log comparison and is
+therefore not reused as a current DETLOG result.
 
 The task's pre-existing DBT-native baseline is 70/89 tests (78.7%). That number
 measures the backend's own Reverie suite. The 23/24 number above is deliberately
