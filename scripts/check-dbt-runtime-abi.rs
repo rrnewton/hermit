@@ -59,6 +59,9 @@
 //! Usage:
 //!   scripts/check-dbt-runtime-abi.rs [--client PATH] [--runtime PATH]
 
+#[path = "lib/rust_script_prelude.rs"]
+mod rust_script_prelude;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -148,6 +151,7 @@ fn symbols(path: &Path, undefined: bool) -> BTreeSet<String> {
 }
 
 fn main() {
+    rust_script_prelude::init();
     let mut client = PathBuf::from(DEFAULT_CLIENT);
     let mut runtime = PathBuf::from(DEFAULT_RUNTIME);
     let mut args = std::env::args().skip(1);
