@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 268a25b6cbedd75b51a2e93854d9494ba8e2ff0a ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 268a25b6cbedd75b51a2e93854d9494ba8e2ff0a" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af82f1b92a2762840dc5894984be5e1f5bfc5cb9 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie af82f1b92a2762840dc5894984be5e1f5bfc5cb9" >&2
     return 2
 fi
 
