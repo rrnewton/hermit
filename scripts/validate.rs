@@ -1197,6 +1197,34 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
             ));
         }
+        // The surviving audit must run AFTER the node that builds the binary it
+        // invokes, and that builder must not wait on the audit. Losing this edge
+        // in `dedupe_identical` made every cold full run die at
+        // `exit 127: target/debug/test-harness: No such file or directory` with
+        // 56 of 59 nodes skipped, and made every warm run audit the tree with a
+        // stale binary. Asserted on the real full plan, not a fixture.
+        let builder = "setup.manifest_plan";
+        let find_deps = |tag: &str| {
+            full.cfg
+                .steps
+                .iter()
+                .find(|s| s.tag() == tag)
+                .map(|s| s.deps.clone())
+        };
+        let audit_deps = find_deps("gate.manifest")
+            .ok_or_else(|| "full-plan bracket: gate.manifest disappeared".to_string())?;
+        let builder_deps = find_deps(builder)
+            .ok_or_else(|| format!("full-plan bracket: {builder} disappeared"))?;
+        if !audit_deps.iter().any(|d| d == builder) {
+            return Err(format!(
+                "full-plan bracket: gate.manifest does not depend on {builder}, so a cold run cannot build the binary it invokes: deps={audit_deps:?}"
+            ));
+        }
+        if builder_deps.iter().any(|d| d == "gate.manifest") {
+            return Err(format!(
+                "full-plan bracket: {builder} still waits on gate.manifest, which is the cycle the dependency union must break: deps={builder_deps:?}"
+            ));
+        }
         let manifest_audit = full
             .cfg
             .steps
@@ -1207,7 +1235,7 @@ cleared-caps refusal names {} starved step(s)",
         let mut wrong_invocation = vec![manifest_audit];
         wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
         if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
-            || dedupe_identical(&mut wrong_invocation).is_ok()
+            || dedupe_identical(&mut wrong_invocation, "gate.manifest").is_ok()
         {
             return Err(
                 "full-plan bracket: manifest-audit identity depended on command text or accepted an unexpected invocation"
@@ -2684,7 +2712,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     // their dependents, so one full run pays that ~75 s audit exactly once. The
     // dedup is keyed by typed manifest-audit identity; an unexpected command is
     // refused explicitly instead of silently ceasing to match.
-    let removed = dedupe_identical(&mut steps)?;
+    let removed = dedupe_identical(&mut steps, gate)?;
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
@@ -3099,11 +3127,19 @@ fn selective_plan(
 /// the manifest audit (different tags, byte-identical command/tree) and the
 /// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
 /// root cwd). The observed preflight node survives in both cases.
-fn dedupe_identical(steps: &mut Vec<Step>) -> Result<Vec<String>, String> {
+/// `gate_dep` is the tag `validate_plan::lane_nodes` injects onto every
+/// dependency-less lane node to reproduce the fail-fast ordering. It is a
+/// scheduling artifact rather than a data dependency, so a removed duplicate
+/// never passes it on to its survivor: doing so would make `pre.reverie_pin`
+/// inherit an edge to `gate.manifest` from the deduped `check.reverie_pin` and
+/// invert the preflight.
+fn dedupe_identical(steps: &mut Vec<Step>, gate_dep: &str) -> Result<Vec<String>, String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut keep = Vec::with_capacity(steps.len());
     let mut removed = Vec::new();
+    // (survivor tag, the removed duplicate's own dependencies)
+    let mut inherited: Vec<(String, Vec<String>)> = Vec::new();
     for s in steps.drain(..) {
         let tag = s.tag();
         let key = if validation_step_identity(&s) == ValidationStepIdentity::ManifestAudit {
@@ -3139,6 +3175,10 @@ fn dedupe_identical(steps: &mut Vec<Step>) -> Result<Vec<String>, String> {
         match seen.get(&key) {
             Some(surv) => {
                 remap.insert(s.tag(), surv.clone());
+                // A duplicate's own dependencies are part of what made it
+                // correct; they are unioned into the survivor below, never
+                // dropped. See `inherited`.
+                inherited.push((surv.clone(), s.deps.clone()));
                 removed.push(s.tag());
             }
             None => {
@@ -3147,17 +3187,121 @@ fn dedupe_identical(steps: &mut Vec<Step>) -> Result<Vec<String>, String> {
             }
         }
     }
+    // Repoint dependents of a removed node onto its survivor.
     for s in keep.iter_mut() {
         for d in s.deps.iter_mut() {
             if let Some(t) = remap.get(d) {
                 *d = t.clone();
             }
         }
+    }
+
+    // Union each removed duplicate's OWN dependencies into its survivor.
+    //
+    // Discarding them is what made a cold `validate full` impossible. The
+    // preflight `gate.manifest` and each lane's `e2e.metadata` run the identical
+    // `test-harness validate` tree audit, but only the lane copy carries the edge
+    // to `setup.manifest_plan`, which BUILDS `target/debug/test-harness`. The
+    // preflight copy is pushed first so it always survived, its dependents were
+    // repointed, and the builder edge was silently deleted. Measured on a cold
+    // tree before this fix: `gate.manifest` died at node 3 of 59 with
+    // `exit 127: target/debug/test-harness: No such file or directory`, skipping
+    // the other 56, in 9.5 s. On a warm tree it did not fail -- it audited the
+    // tree with whatever STALE binary an earlier build had left behind, which is
+    // arguably worse, since the gate then vouches for a commit it never read.
+    let mut gained: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (survivor, deps) in inherited {
+        for dep in deps {
+            // An inherited dependency may itself name a removed duplicate.
+            let dep = remap.get(&dep).cloned().unwrap_or(dep);
+            if dep != survivor && dep != gate_dep {
+                gained.entry(survivor.clone()).or_default().insert(dep);
+            }
+        }
+    }
+    for s in keep.iter_mut() {
+        if let Some(extra) = gained.get(&s.tag()) {
+            s.deps.extend(extra.iter().cloned());
+        }
+    }
+
+    // Break the reverse edge the union would otherwise close into a cycle.
+    //
+    // `validate_plan::lane_nodes` hangs every dependency-less lane node off the
+    // manifest gate to reproduce the fail-fast ordering. That injection is wrong
+    // for the gate's OWN producer: `setup.manifest_plan` ships with no
+    // dependencies, so it acquires `gate.manifest`, and unioning the audit's
+    // builder edge back in would make the two depend on each other. A node the
+    // survivor now depends on cannot also depend on the survivor; the shipped
+    // lane files declare no such edge, so the only one dropped here is that
+    // injected fail-fast edge.
+    let mut drop_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (survivor, extra) in &gained {
+        for dep in extra {
+            drop_edges
+                .entry(dep.clone())
+                .or_default()
+                .insert(survivor.clone());
+        }
+    }
+    for s in keep.iter_mut() {
+        if let Some(drop) = drop_edges.get(&s.tag()) {
+            s.deps.retain(|d| !drop.contains(d));
+        }
         s.deps.sort();
         s.deps.dedup();
     }
+
+    // Fail closed on a cycle. Nothing downstream detects one: neither
+    // `scripts/validate.rs` nor `safe-ci-dag-runner` topologically checks the
+    // graph, so a cycle would present as nodes that silently never run -- the
+    // same "56 skipped" shape this function just stopped producing, but with no
+    // failing node to name. Since unioning dependencies is precisely the
+    // operation that can close a cycle, the check belongs here.
+    if let Some(stuck) = first_dependency_cycle(&keep) {
+        return Err(format!(
+            "node deduplication produced a dependency cycle among: {}",
+            stuck.join(", ")
+        ));
+    }
+
     *steps = keep;
     Ok(removed)
+}
+
+/// Return the tags that cannot be topologically ordered, or `None` when the
+/// graph is a DAG. Dependencies naming absent nodes are ignored here; the
+/// runner reports those separately.
+fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
+    let present: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
+    let mut pending: BTreeMap<String, BTreeSet<String>> = steps
+        .iter()
+        .map(|s| {
+            let deps = s
+                .deps
+                .iter()
+                .filter(|d| present.contains(*d))
+                .cloned()
+                .collect();
+            (s.tag(), deps)
+        })
+        .collect();
+    loop {
+        let ready: Vec<String> = pending
+            .iter()
+            .filter(|(_, deps)| deps.is_empty())
+            .map(|(tag, _)| tag.clone())
+            .collect();
+        if ready.is_empty() {
+            return (!pending.is_empty()).then(|| pending.keys().cloned().collect());
+        }
+        for tag in ready {
+            pending.remove(&tag);
+            for deps in pending.values_mut() {
+                deps.remove(&tag);
+            }
+        }
+    }
 }
 
 /// Heavy compatibility preparation is the innermost bound in the validation ladder:
