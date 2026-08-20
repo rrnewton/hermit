@@ -44,6 +44,9 @@ from qemu_controller import (  # noqa: E402
 DEMO_LABEL = "Demo 6: QEMU Snapshot Resume"
 HERMIT_REPO = Path(os.environ.get("HERMIT_REPO", ROOT / "hermit"))
 HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/hermit"))
+# Read at import, before anything can put HERMIT_RELEASE back into the environment
+# (demo 5 does exactly that), which would otherwise make this always true.
+HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
 ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "120"))
@@ -69,6 +72,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="guest shell command")
     return parser.parse_args()
+
+
+COMMAND_IMAGE_BYTES = 4096
+
+
+def write_command_image(path: Path, command: str) -> None:
+    """Fixed-size raw image holding the guest command.
+
+    The size is fixed because the same drive is attached at boot and at resume and
+    only its backing file differs; a geometry change between the two would not
+    match the device state recorded in the snapshot.
+    """
+    payload = command.encode() + b"\n"
+    if len(payload) > COMMAND_IMAGE_BYTES:
+        raise ValueError(
+            "guest command is {} bytes, over the {}-byte image".format(
+                len(payload), COMMAND_IMAGE_BYTES
+            )
+        )
+    path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
 
 
 def command_output(transcript: bytes, begin: str, end: str) -> bytes:
@@ -124,7 +147,17 @@ def main() -> int:
         ),
         dependency,
     )
-    run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
+    # A pinned binary is NOT rebuilt, matching demo 5 (05-qemu-boot.py) and for the
+    # reason recorded there: `make build-hermit` -> `init-hermit` -> `checkout-all`
+    # runs `git submodule update --init --recursive`, which DETACHES attached
+    # primaries and would build a different Hermit than the operator asked for. Demo
+    # 6 was calling it unconditionally, so a pinned run aborted on any checkout the
+    # submodule could not switch -- including a submodule another agent has left
+    # dirty, which is not a fact about this demo at all.
+    if HERMIT_PINNED and HERMIT.is_file() and os.access(str(HERMIT), os.X_OK):
+        print("Pinned Hermit (skipping build-hermit): {}".format(HERMIT))
+    else:
+        run_checked(["make", "--no-print-directory", "-s", "build-hermit"], cwd=ROOT)
     if not QEMU:
         raise RuntimeError("qemu-system-x86_64 is required")
     ensure_boot_snapshot()
@@ -157,14 +190,27 @@ def main() -> int:
             serial_log,
         ):
             runtime_path.unlink(missing_ok=True)
+        # The workload is a DISK input, not something typed into the console. Write
+        # the fixed-size image before QEMU launches so its contents are already
+        # present the instant the guest resumes; nothing then depends on when the
+        # host gets around to sending bytes.
+        # A STABLE path, not a per-run one. The image path appears in the recorded
+        # QEMU argv that the repeat check compares, and the anchor stores that argv
+        # raw, so a per-run path made every repeat report "QEMU argv differs" for a
+        # difference that is only the directory name. The serial pipe this replaced
+        # lived at a stable path under ASSETS for the same reason; the demo lock
+        # serialises runs, so sharing the path is no worse than it was.
+        command_image = ASSETS / "guest-command.img"
+        write_command_image(command_image, guest_command)
         qemu_argv = build_qemu_command(
             QEMU,
             qmp_socket,
-            serial_pipe,
+            serial_log,
             SNAPSHOT_DISK,
             ASSETS / "bzImage",
             ASSETS / "initramfs.cpio.gz",
             SNAPSHOT_NAME,
+            command_image,
         )
         post_name = "command-{}".format(command_digest[:16])
         command = [
@@ -184,8 +230,8 @@ def main() -> int:
             QEMU,
             "--qmp-socket",
             str(qmp_socket),
-            "--serial-pipe",
-            str(serial_pipe),
+            "--command-image",
+            str(command_image),
             "--serial-log",
             str(serial_log),
             "--disk",
@@ -198,8 +244,6 @@ def main() -> int:
             SNAPSHOT_NAME,
             "--timeout",
             str(TIMEOUT),
-            "--guest-command",
-            guest_command,
             "--post-snapshot-name",
             post_name,
         ]
