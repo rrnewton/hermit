@@ -3941,8 +3941,46 @@ impl Scheduler {
             self.blocked.futex_waiters.len()
         )
         .unwrap();
-        for x in self.blocked.futex_waiters.iter() {
-            writeln!(&mut buf, "    {:?}", x).unwrap();
+        // Sorted, and no `Ivar` Debug. `format_terminal_deadlock` above already
+        // documents the two sources this avoids, and this function had neither
+        // guard: `futex_waiters` is a `HashMap`, so it iterates in a randomized
+        // order once it holds more than one entry, and `FutexWaiter`'s derived
+        // `Debug` prints its `Ivar`'s parked waker as raw host pointers.
+        //
+        // Measured before this change, three runs of
+        // `--stop-after-turn=15 -- rustbin_futex_and_print`, which reaches this
+        // function through the `--stop-after-turn` warning:
+        //   Waker { data: 0x564ea2a82c80
+        //   Waker { data: 0x55f2120b9c80
+        //   Waker { data: 0x56163deeec80
+        // Three runs, three host addresses, in a WARN record that
+        // `--verify-strict` compares.
+        //
+        // Only guest-level identities are printed here: the futex key, the
+        // waiting dettid and the bitset are all values Detcore already
+        // determinizes.
+        let mut futex_rows: Vec<String> = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .map(|(futex, waiters)| {
+                let mut dettids: Vec<String> =
+                    waiters.iter().map(|w| w.dettid.to_string()).collect();
+                dettids.sort();
+                let mut bitsets: Vec<u32> = waiters.iter().map(|w| w.bitset).collect();
+                bitsets.sort_unstable();
+                format!(
+                    "    {:?} => {} waiter(s), dettids [{}], bitsets {:?}",
+                    futex,
+                    waiters.len(),
+                    dettids.join(", "),
+                    bitsets
+                )
+            })
+            .collect();
+        futex_rows.sort();
+        for row in futex_rows {
+            writeln!(&mut buf, "{}", row).unwrap();
         }
 
         writeln!(
