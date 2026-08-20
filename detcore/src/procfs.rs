@@ -94,6 +94,9 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
     UnixSockets,
+    /// `/proc/net/tcp`, `tcp6`, `udp`, `udp6`. The binary view of this same
+    /// table is normalized in `crate::sock_diag`; the two must agree.
+    InetSockets,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-966): Review Btrfs commit telemetry normalization.
     BtrfsCommitStats,
@@ -500,6 +503,9 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
             "/proc/net/unix" => ProcfsKind::UnixSockets,
+            "/proc/net/tcp" | "/proc/net/tcp6" | "/proc/net/udp" | "/proc/net/udp6" => {
+                ProcfsKind::InetSockets
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module accounting snapshots.
             "/proc/interrupts" | "/proc/softirqs" => ProcfsKind::InterruptCounters,
@@ -662,6 +668,7 @@ impl ProcfsFile {
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
             ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
+            ProcfsKind::InetSockets => sanitize_inet_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
                 sanitize_sysfs_rtc_attribute(&contents, self.kind.clone(), virtual_realtime_seconds)
@@ -1920,6 +1927,92 @@ fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
     for (_, row) in rows {
         normalized.push_str(&row);
         normalized.push('\n');
+    }
+    normalized.into_bytes()
+}
+
+/// Zero the host-assigned identities in `/proc/net/tcp{,6}` and
+/// `/proc/net/udp{,6}`.
+///
+/// Two columns carry host state and both differ on every run. Measured under
+/// `hermit run --strict`, two runs of a guest binding two listeners:
+///
+/// ```text
+/// run 1  ... 0 3066787052 1 0000000042a27170 100 ...
+/// run 2  ... 0 3071433840 1 000000005b1c887b 100 ...
+/// ```
+///
+/// `inode` is a host-global counter and `pointer` is the kernel socket address.
+/// This mirrors `sanitize_netlink_sockets`, which zeroes the same two kinds of
+/// field, and it is the text half of the `AF_INET`/`AF_INET6` work in
+/// `crate::sock_diag`: the binary and text views of this table agreed before
+/// (both leaking) and must still agree after.
+///
+/// Zero is in range for `inode` rather than a substitute chosen here. The
+/// kernel emits it itself for sockets with no owning file -- on the host that
+/// developed this, `/proc/net/tcp` carried 176 rows of which 12 had inode 0,
+/// all in state 06 (`TCP_TIME_WAIT`).
+///
+/// Row ORDER also varies and is canonicalized here, which zeroing alone does
+/// not fix. Measured after the two columns above were already zeroed, six runs
+/// of the same guest binding ports 8000 and 8001: port 8000 appeared in row 0
+/// on four runs and in row 1 on the other two. The kernel walks a hash table,
+/// so the order depends on host-side bucket state. Rows are therefore sorted on
+/// their content with `sl` excluded, and `sl` is then renumbered to match --
+/// sorting without renumbering would leave a positional index contradicting its
+/// own position.
+///
+/// Fail-open on any unexpected shape, like the other sanitizers.
+fn sanitize_inet_sockets(contents: &[u8]) -> Vec<u8> {
+    /// `inode`, counting from zero.
+    const INODE_FIELD: usize = 9;
+    /// The kernel socket pointer, printed `%pK` as 16 lower-hex digits.
+    const POINTER_FIELD: usize = 11;
+    /// `udp`/`udp6` rows are 13 fields, `tcp`/`tcp6` 17. Both put the two
+    /// host-state columns at the same index, so only the shorter is required.
+    const MIN_FIELDS: usize = 13;
+    const ZERO_POINTER: &str = "0000000000000000";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let Some(body) = text.strip_suffix('\n') else {
+        return contents.to_vec();
+    };
+    let mut lines = body.split('\n');
+    let Some(header) = lines.next() else {
+        return contents.to_vec();
+    };
+    // The four files have four different headers, so this checks the shape
+    // rather than an exact string: first column `sl`, and an `inode` column.
+    let header_fields = header.split_whitespace().collect::<Vec<_>>();
+    if header_fields.first() != Some(&"sl") || !header_fields.contains(&"inode") {
+        return contents.to_vec();
+    }
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < MIN_FIELDS {
+            return contents.to_vec();
+        }
+        if parse_decimal(fields[INODE_FIELD]).is_none() || !is_lower_hex(fields[POINTER_FIELD], 16)
+        {
+            return contents.to_vec();
+        }
+        fields[INODE_FIELD] = "0";
+        fields[POINTER_FIELD] = ZERO_POINTER;
+        // Sort on everything but the index, then reassign the index, so the
+        // ordering key cannot be perturbed by the very column it decides.
+        rows.push(fields[1..].join(" "));
+    }
+    rows.sort_unstable();
+
+    let mut normalized = String::with_capacity(text.len());
+    normalized.push_str(header);
+    normalized.push('\n');
+    for (index, row) in rows.iter().enumerate() {
+        normalized.push_str(&format!("{index}: {row}\n"));
     }
     normalized.into_bytes()
 }
@@ -4728,6 +4821,61 @@ total_commit_ms 0\n"
 0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
 0000000000000000 10 20 00000002 3 4 5 6 7 0\n"
         );
+    }
+
+    #[test]
+    fn inet_sockets_zero_both_host_identities_and_canonicalize_row_order() {
+        // Two rows deliberately given in the order the kernel happened to
+        // produce on one run; a later run produced them the other way round.
+        let contents = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787053 1 00000000703938cf 100 0 0 10 0\n   1: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3066787052 1 0000000042a27170 100 0 0 10 0\n"
+            .as_slice();
+        // Same rows, opposite order, different host inodes and pointers: a
+        // second run of the same guest. Both must normalize to one answer.
+        let swapped = b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:8000 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433840 1 000000005b1c887b 100 0 0 10 0\n   1: 0100007F:8001 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 3071433841 1 00000000ab7b588a 100 0 0 10 0\n"
+            .as_slice();
+
+        let first = sanitize_inet_sockets(contents);
+        assert_eq!(
+            first,
+            sanitize_inet_sockets(swapped),
+            "two runs differing only in host identity and row order must agree"
+        );
+
+        let text = String::from_utf8(first).unwrap();
+        for row in text.lines().skip(1) {
+            let fields = row.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields[9], "0", "inode must be zeroed: {row}");
+            assert_eq!(
+                fields[11], "0000000000000000",
+                "pointer must be zeroed: {row}"
+            );
+        }
+        // `sl` is renumbered to match the sorted order, not left contradicting it.
+        let indices = text
+            .lines()
+            .skip(1)
+            .map(|row| row.split_whitespace().next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec!["0:", "1:"]);
+        // And sorted on content: port 8000 sorts before 8001.
+        assert!(text.lines().nth(1).unwrap().contains(":8000"));
+    }
+
+    #[test]
+    fn inet_sockets_fail_open_on_unknown_schemas() {
+        for malformed in [
+            b"".as_slice(),
+            // No trailing newline.
+            b"  sl  local_address rem_address st inode",
+            // Header is not this table.
+            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n",
+            // Too few columns for the two host-state fields to exist.
+            b"  sl  local_address inode\n   0: 0100007F:8000 12345\n",
+            // Inode column not decimal.
+            b"  sl  a b c d e f g h inode j pointer\n   0: 1 2 3 4 5 6 7 8 zero 1 0000000042a27170\n",
+        ] {
+            assert_eq!(sanitize_inet_sockets(malformed), malformed);
+        }
     }
 
     #[test]
