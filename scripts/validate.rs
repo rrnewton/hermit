@@ -1204,6 +1204,30 @@ cleared-caps refusal names {} starved step(s)",
             .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
             .expect("manifest audit exists")
             .clone();
+        let manifest_producer = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+            .ok_or("full-plan bracket: manifest-plan producer disappeared")?;
+        if manifest_producer.cmd != validate_plan::MANIFEST_PLAN_BUILD_COMMAND
+            || manifest_producer.deps != [PIN_GATE_TAG.to_string()]
+            || manifest_producer.deps.iter().any(|dependency| dependency == "gate.manifest")
+        {
+            return Err(format!(
+                "full-plan bracket: manifest-plan producer is not directly after the pin gate: cmd={} deps={:?}",
+                manifest_producer.cmd, manifest_producer.deps
+            ));
+        }
+        if manifest_audit.deps
+            != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
+        {
+            return Err(format!(
+                "full-plan bracket: manifest audit can run without its binary producer: deps={:?}",
+                manifest_audit.deps
+            ));
+        }
+        println!("  {}", manifest_producer_edge_bracket(&full.cfg)?);
         let mut wrong_invocation = vec![manifest_audit];
         wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
         if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
@@ -1381,12 +1405,178 @@ cleared-caps refusal names {} starved step(s)",
             return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
         }
         println!(
-            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
             full.cfg.steps.len()
         );
     }
 
     Ok(())
+}
+
+/// Execute the production manifest producer/audit dependency spine in both
+/// directions. The positive case starts with no output and requires the
+/// producer to create it before the audit runs. The negative case makes the
+/// producer fail and requires the scheduler to dependency-skip the audit.
+fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-manifest-producer-edge-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|error| format!("manifest producer bracket: cannot create {}: {error}", tmp.display()))?;
+
+    let result = (|| -> Result<(), String> {
+        let required = [
+            "pre.submodules",
+            PIN_GATE_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ];
+        let fixture = |producer_cmd: String, gate_cmd: String| -> Result<DagConfig, String> {
+            let mut steps = Vec::new();
+            for tag in required {
+                let source = cfg
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == tag)
+                    .ok_or_else(|| format!("manifest producer bracket: production plan lost {tag}"))?;
+                let mut step = step_with_caps(
+                    &source.group,
+                    &source.job,
+                    "manifest producer dependency fixture",
+                    match tag {
+                        "pre.submodules" | PIN_GATE_TAG => "true".to_string(),
+                        validate_plan::MANIFEST_PLAN_PRODUCER_TAG => producer_cmd.clone(),
+                        "gate.manifest" => gate_cmd.clone(),
+                        _ => unreachable!(),
+                    },
+                    source.deps.clone(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                );
+                step.deps.retain(|dependency| required.contains(&dependency.as_str()));
+                steps.push(step);
+            }
+            Ok(validate_plan::config_from(
+                steps,
+                "manifest producer dependency fixture",
+            ))
+        };
+
+        let output = tmp.join("target/debug/test-harness");
+        let gate_ran = tmp.join("gate-ran");
+        let output_parent = output
+            .parent()
+            .ok_or_else(|| format!("manifest producer bracket: {} has no parent", output.display()))?;
+        let positive = fixture(
+            format!(
+                "mkdir -p {parent} && printf '#!/bin/sh\\nexit 0\\n' > {output} && chmod +x {output}",
+                parent = validate_plan::shell_quote(&output_parent.to_string_lossy()),
+                output = validate_plan::shell_quote(&output.to_string_lossy()),
+            ),
+            format!(
+                "test -x {output} && {output} && : > {gate_ran}",
+                output = validate_plan::shell_quote(&output.to_string_lossy()),
+                gate_ran = validate_plan::shell_quote(&gate_ran.to_string_lossy()),
+            ),
+        )?;
+        let positive_result = run_lane_with_env_retries(
+            &positive,
+            2,
+            true,
+            0,
+            None,
+            &tmp.join("positive.log"),
+            None,
+            0,
+            false,
+        );
+        if !positive_result.complete
+            || !positive_result.ok
+            || positive_result.outcomes.len() != required.len()
+            || !positive_result.skipped.is_empty()
+            || !output.is_file()
+            || !gate_ran.is_file()
+        {
+            return Err(format!(
+                "manifest producer bracket: absent output was not produced before the gate: complete={} ok={} outcomes={:?} skipped={:?} output={} gate_ran={}",
+                positive_result.complete,
+                positive_result.ok,
+                positive_result
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.ok))
+                    .collect::<Vec<_>>(),
+                positive_result.skipped,
+                output.is_file(),
+                gate_ran.is_file()
+            ));
+        }
+
+        std::fs::remove_file(&output)
+            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", output.display()))?;
+        std::fs::remove_file(&gate_ran)
+            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", gate_ran.display()))?;
+        let negative = fixture(
+            "exit 23".to_string(),
+            format!(
+                ": > {}",
+                validate_plan::shell_quote(&gate_ran.to_string_lossy())
+            ),
+        )?;
+        let negative_result = run_lane_with_env_retries(
+            &negative,
+            2,
+            true,
+            0,
+            None,
+            &tmp.join("negative.log"),
+            None,
+            0,
+            false,
+        );
+        let producer_failed = negative_result.outcomes.iter().any(|outcome| {
+            outcome.tag == validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                && !outcome.ok
+                && outcome.returncode == Some(23)
+        });
+        if negative_result.complete
+            || negative_result.ok
+            || !producer_failed
+            || negative_result.skipped != ["gate.manifest".to_string()]
+            || gate_ran.exists()
+        {
+            return Err(format!(
+                "manifest producer bracket: failed producer did not block the gate: complete={} ok={} producer_failed={producer_failed} outcomes={:?} skipped={:?} gate_ran={}",
+                negative_result.complete,
+                negative_result.ok,
+                negative_result
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.returncode))
+                    .collect::<Vec<_>>(),
+                negative_result.skipped,
+                gate_ran.exists()
+            ));
+        }
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp)
+        .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", tmp.display()));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(
+            "manifest producer edge: absent output built before gate; producer failure dependency-skips gate"
+                .into(),
+        ),
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => Err(format!(
+            "{problem}; cleanup also failed: {cleanup_problem}"
+        )),
+    }
 }
 
 /// Bind the current schema to the evidence the row actually carries.
@@ -1562,9 +1752,149 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
             sel2.unknown_tags
         ));
     }
+
+    // Exercise the real selector, not a hand-written keep set. A flaky-tests
+    // change reaches the chaos manifest cell through e2e.metadata and the
+    // shipped setup.manifest_plan producer. The producer is valid selector
+    // vocabulary even though plan composition satisfies it from preflight.
+    let selector = Command::new(root.join("ci").join("select-tests.rs"))
+        .args(["--files", "flaky-tests/Cargo.toml", "--format", "json"])
+        .output()
+        .map_err(|error| format!("selective bracket: cannot run real selector: {error}"))?;
+    if !selector.status.success() {
+        return Err(format!(
+            "selective bracket: real selector failed: {}",
+            String::from_utf8_lossy(&selector.stderr)
+        ));
+    }
+    let selected_json: serde_json::Value = serde_json::from_slice(&selector.stdout)
+        .map_err(|error| format!("selective bracket: real selector emitted invalid JSON: {error}"))?;
+    let selected: BTreeSet<String> = selected_json["nodes"]
+        .as_array()
+        .ok_or("selective bracket: real selector JSON has no nodes array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(str::to_string))
+        .collect();
+    for required in [
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+        "e2e.metadata",
+        "e2e.manifest_chaos_c",
+    ] {
+        if !selected.contains(required) {
+            return Err(format!(
+                "selective bracket: flaky-tests/Cargo.toml did not select required node {required}: {selected:?}"
+            ));
+        }
+    }
+    let raw = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
+    let mut real = validate_plan::select_lane_nodes(raw, &selected);
+    if !real.unknown_tags.is_empty() {
+        return Err(format!(
+            "selective bracket: real selector named unknown shipped tags before producer reuse: {:?}",
+            real.unknown_tags
+        ));
+    }
+    if !validate_plan::reuse_preflight_manifest_producer(
+        &mut real.steps,
+        "real selective result",
+    )? {
+        return Err(
+            "selective bracket: real selector omitted its manifest-plan producer dependency"
+                .into(),
+        );
+    }
+    if real
+        .steps
+        .iter()
+        .any(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+    {
+        return Err("selective bracket: lane retained a duplicate manifest-plan producer".into());
+    }
+    let metadata = real
+        .steps
+        .iter()
+        .find(|step| step.tag() == "e2e.metadata")
+        .ok_or("selective bracket: real selector lost e2e.metadata")?;
+    if !metadata
+        .deps
+        .iter()
+        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+    {
+        return Err(
+            "selective bracket: e2e.metadata was not bound to the preflight manifest producer"
+            .into(),
+        );
+    }
+
+    // Exercise the same SelectDecision::Full branch used when no trustworthy
+    // baseline exists. The complete shipped lane must also reuse preflight's
+    // producer; otherwise composition creates two setup.manifest_plan nodes and
+    // the lane copy still points back at gate.manifest.
+    let full_lane = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
+    let full_total = full_lane.len();
+    let full_steps = apply_selective_decision(
+        full_lane,
+        full_total,
+        SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
+    )?;
+    let mut full_nodes = validate_plan::preflight_nodes(root, false);
+    full_nodes.extend(full_steps);
+    let producer_count = full_nodes
+        .iter()
+        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .count();
+    if producer_count != 1 {
+        return Err(format!(
+            "selective bracket: full/no-baseline fallback has {producer_count} manifest-plan producers, expected 1"
+        ));
+    }
+    let producer = full_nodes
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .expect("exactly one producer exists");
+    let gate = full_nodes
+        .iter()
+        .find(|step| step.tag() == "gate.manifest")
+        .ok_or("selective bracket: full/no-baseline fallback lost gate.manifest")?;
+    if producer.deps != [PIN_GATE_TAG.to_string()]
+        || gate.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
+    {
+        return Err(format!(
+            "selective bracket: full/no-baseline producer ordering is wrong: producer={:?} gate={:?}",
+            producer.deps, gate.deps
+        ));
+    }
+    let tags: BTreeSet<String> = full_nodes.iter().map(|step| step.tag()).collect();
+    if tags.len() != full_nodes.len() {
+        return Err("selective bracket: full/no-baseline fallback contains duplicate tags".into());
+    }
+    let mut completed = BTreeSet::new();
+    loop {
+        let ready: Vec<String> = full_nodes
+            .iter()
+            .filter(|step| !completed.contains(&step.tag()))
+            .filter(|step| step.deps.iter().all(|dependency| completed.contains(dependency)))
+            .map(|step| step.tag())
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        completed.extend(ready);
+    }
+    if completed.len() != full_nodes.len() {
+        let blocked: Vec<String> = full_nodes
+            .iter()
+            .filter(|step| !completed.contains(&step.tag()))
+            .map(|step| step.tag())
+            .collect();
+        return Err(format!(
+            "selective bracket: full/no-baseline fallback contains a dependency cycle or missing dependency: {blocked:?}"
+        ));
+    }
     println!(
         "  selective subset: kept {child} + its dep {parent} from the real portable lane \
-         ({} edge(s) pruned); 1 unknown-tag refusal",
+         ({} edge(s) pruned); flaky-tests selector reused its manifest producer; \
+         full/no-baseline fallback has one acyclic producer; 1 unknown-tag refusal",
         sel.pruned_edges
     );
     Ok(())
@@ -2455,7 +2785,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             // passed. Avoid rerunning that ~75 s exact-tree audit inside the
             // nested payload, but retain the cheap, independently observed
             // submodule and pin gates.
-            steps.retain(|s| s.tag() != gate);
+            steps.retain(|s| {
+                s.tag() != gate && s.tag() != validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+            });
             PIN_GATE_TAG
         } else {
             gate
@@ -2626,7 +2958,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if lanes.len() == 2 && !args.merge_lanes {
         // Faithful reproduction of run_full_suite: portable lane, then privileged.
         let mut a = pre.clone();
-        a.extend(validate_plan::lane_nodes(root, lanes[0], "", gate)?);
+        a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
+            root, lanes[0], "", gate,
+        )?);
         let mut b = validate_plan::lane_nodes(root, lanes[1], "", gate)?;
         // The second run repeats preflight-free; its nodes hang off nothing.
         for s in b.iter_mut() {
@@ -2676,7 +3010,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         } else {
             String::new()
         };
-        steps.extend(validate_plan::lane_nodes(root, lane, &prefix, gate)?);
+        steps.extend(validate_plan::lane_nodes_reusing_manifest_producer(
+            root, lane, &prefix, gate,
+        )?);
     }
     // Fusing lanes can duplicate identical work. In particular, the always-on
     // gate.manifest and both lane e2e.metadata nodes run the exact same
@@ -2952,6 +3288,57 @@ enum SelectDecision {
     Full(String),
 }
 
+/// Apply one selector result while preserving the shipped lane as the tag
+/// authority. Producer reuse happens once, after unknown-tag validation, so it
+/// covers both dependency-closed subsets and fail-safe full-lane fallbacks.
+fn apply_selective_decision(
+    all: Vec<safe_ci_dag_runner::model::Step>,
+    total: usize,
+    decision: SelectDecision,
+) -> Result<Vec<safe_ci_dag_runner::model::Step>, String> {
+    let mut steps = match decision {
+        SelectDecision::Skip => {
+            println!(
+                "Selective validation: no CI-relevant changes since baseline — nothing to run \
+                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
+                 zero planned test nodes, so this cannot be misread as a full pass."
+            );
+            Vec::new()
+        }
+        SelectDecision::Nodes(keep) => {
+            let sel = validate_plan::select_lane_nodes(all, &keep);
+            if !sel.unknown_tags.is_empty() {
+                return Err(format!(
+                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
+                     selector and the DAG disagree, so refusing to run a subset derived from a \
+                     stale mapping",
+                    sel.unknown_tags.len(),
+                    sel.unknown_tags.join(", ")
+                ));
+            }
+            println!(
+                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
+                 dependency edge(s) pruned to the selected set):\n  {}",
+                sel.steps.len(),
+                sel.pruned_edges,
+                keep.iter().cloned().collect::<Vec<_>>().join(" ")
+            );
+            sel.steps
+        }
+        SelectDecision::Full(why) => {
+            println!("Selective validation: {why} — running the FULL portable lane.");
+            all
+        }
+    };
+    if validate_plan::reuse_preflight_manifest_producer(
+        &mut steps,
+        "selective portable lane",
+    )? {
+        println!("Selective validation: setup.manifest_plan is supplied by preflight.");
+    }
+    Ok(steps)
+}
+
 /// Ask `ci/select-tests.rs` what to run.
 ///
 /// This is PLAN CONSTRUCTION, not a gate: the selector produces no verdict about
@@ -3040,46 +3427,17 @@ fn selective_plan(
         ),
     }
 
+    // Keep the shipped lane's complete tag vocabulary through selection. In
+    // particular, the selector may return setup.manifest_plan as part of a
+    // dependency-closed result; it is replaced by the preflight producer only
+    // after unknown-tag validation below.
     let all = validate_plan::lane_nodes(root, "portable", "", gate)?;
     let total = all.len();
     let decision = match &baseline {
         Some(b) => ask_selector(root, Some(b)),
         None => SelectDecision::Full("no trustworthy green baseline".into()),
     };
-    let steps: Vec<safe_ci_dag_runner::model::Step> = match decision {
-        SelectDecision::Skip => {
-            println!(
-                "Selective validation: no CI-relevant changes since baseline — nothing to run \
-                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
-                 zero planned test nodes, so this cannot be misread as a full pass."
-            );
-            Vec::new()
-        }
-        SelectDecision::Nodes(keep) => {
-            let sel = validate_plan::select_lane_nodes(all, &keep);
-            if !sel.unknown_tags.is_empty() {
-                return Err(format!(
-                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
-                     selector and the DAG disagree, so refusing to run a subset derived from a \
-                     stale mapping",
-                    sel.unknown_tags.len(),
-                    sel.unknown_tags.join(", ")
-                ));
-            }
-            println!(
-                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
-                 dependency edge(s) pruned to the selected set):\n  {}",
-                sel.steps.len(),
-                sel.pruned_edges,
-                keep.iter().cloned().collect::<Vec<_>>().join(" ")
-            );
-            sel.steps
-        }
-        SelectDecision::Full(why) => {
-            println!("Selective validation: {why} — running the FULL portable lane.");
-            all
-        }
-    };
+    let steps = apply_selective_decision(all, total, decision)?;
     let mut nodes = pre;
     nodes.extend(steps);
     let cfg = validate_plan::config_from(nodes, "selective portable subset");
