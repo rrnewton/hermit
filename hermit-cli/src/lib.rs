@@ -246,6 +246,12 @@ fn output_backend_stdin_file() -> Result<Option<fs::File>, Error> {
     }
 }
 
+/// Returns a rewound descriptor for the stdin snapshot reserved for an
+/// output-capturing verification backend.
+pub fn output_stdin_snapshot() -> Result<Option<fs::File>, Error> {
+    output_backend_stdin_file()
+}
+
 /// Returns the stdin to hand a guest run in an output-capturing backend.
 ///
 /// When [`reserve_output_stdin_snapshot`] has stored a replayable snapshot the

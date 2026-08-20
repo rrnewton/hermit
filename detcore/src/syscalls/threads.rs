@@ -790,11 +790,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
+        let specific_exited_child = (call.pid() > 0).then(|| DetPid::from_raw(call.pid()));
         let value = if call.options().contains(WaitPidFlag::WNOHANG) {
             resource_request(guest, rsrc.clone()).await;
             info!(
                 "[dtid {}] Executing non-blocking wait4 in one shot.",
                 dettid
+            );
+            guest.inject_with_retry(call).await?
+        } else if specific_exited_child.is_some_and(|child| {
+            guest
+                .thread_state()
+                .has_exited_child_process_cpu_time(child)
+        }) {
+            // The child exit hook has already published the process's final logical
+            // CPU snapshot into the parent's shared process state. At that point the
+            // child needs no guest execution to finish, but the kernel can still be
+            // completing the tiny exit-hook-to-waitable transition. Continuing the
+            // WNOHANG loop makes that host-timed transition visible as a variable
+            // number of InternalIOPolling turns. Grant one scheduler turn and issue
+            // the caller's original blocking wait4 instead: it only bridges the
+            // physical teardown that follows an already-determined child exit.
+            resource_request(guest, rsrc).await;
+            info!(
+                "[dtid {}] Executing blocking wait4 for logically exited child {}.",
+                dettid,
+                call.pid()
             );
             guest.inject_with_retry(call).await?
         } else {
