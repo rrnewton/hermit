@@ -48,11 +48,12 @@
     },
     {
       "group": "check", "job": "script_sigpipe",
-      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE (prog | head)",
+      "desc": "Standalone scripts exit cleanly on downstream SIGPIPE, and every rust-script compiles",
+      "description": "MEASURED 2026-08-20 when this node gained the compile sweep. rust-scripts are not Cargo workspace members, so no cargo gate compiles them and this node is the only one that does. Sweeping all 14 tracked entrypoints via `rust-script --package` + `cargo check` measured 25.6s warm and 29.8s with fresh package and target directories, against 0.67s when every generated package is already built. Peak RSS of a cold `cargo check` of the heaviest script (ci/compat-envelope/scorecard.rs) was 278MB, so the former 512MB hard cap left only 1.8x margin and is raised to 1GiB. The former 60s timeout is raised to 300s: 10x the cold measurement, so a real hang still terminates well inside the job while normal variance cannot trip it.",
       "cmd": "./scripts/check-script-sigpipe.sh",
-      "timeout": 60,
-      "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
-               "hard_mem_max_bytes": 536870912, "classification": "light"}
+      "timeout": 300,
+      "hint": {"est_duration_s": 35, "rss_baseline_bytes": 314572800,
+               "hard_mem_max_bytes": 1073741824, "classification": "light"}
     },
     {
       "group": "setup", "job": "nextest",

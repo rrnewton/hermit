@@ -5,7 +5,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# check-script-sigpipe.sh — regression guard for shared SIGPIPE handling.
+# check-script-sigpipe.sh — regression guard for shared SIGPIPE handling, and
+# the only gate that compiles Hermit's rust-scripts at all.
 #
 # Every standalone Hermit rust-script calls `rust_script_prelude::init` so that
 # a downstream reader closing the pipe early (`prog | head`) terminates the
@@ -15,6 +16,31 @@
 # entrypoint to use `rust-script --force`. The forced Cargo check is cheap on a
 # warm build and makes Cargo, rather than a separate cache-key protocol, track
 # included modules and local path dependencies.
+#
+# ⚠️ IT THEN COMPILES EVERY ONE OF THEM, AND THAT IS NOT DECORATION.
+# rust-scripts are NOT Cargo workspace members, so `cargo build`, `cargo test`,
+# `cargo clippy` and `cargo fmt` never compile them — not by policy but by
+# construction. Several of them pull workspace source across that boundary with
+# `#[path]`:
+#
+#   ci/manifest-plan/src/canonical_verdict.rs -> ci/compat-envelope/scorecard.rs
+#                                                ci/compat-envelope/pressure-test.rs
+#   ci/manifest-plan/src/manifest_value.rs    -> scripts/manifest-to-commands.rs
+#                                                tests/manifest-cli.rs
+#   scripts/lib/*.rs                          -> all of them
+#
+# So a type change in a fully-gated workspace file can break a consumer that no
+# cargo gate compiles, and every cargo gate will report success while it is
+# broken. That is not hypothetical: on 2026-08-20 a field type change in
+# canonical_verdict.rs landed with 17/17 lib tests, `cargo fmt --check` clean and
+# `cargo clippy --all-targets` warning-free, having already broken scorecard.rs,
+# and it blocked EVERY validate until a follow-up fixed it.
+#
+# The list below is DISCOVERED, never hardcoded: it is exactly the tracked files
+# carrying the rust-script shebang, so a newly added script is covered without
+# anyone remembering to register it. Compiling via `--package` + `cargo check`
+# rather than by running each script means nothing is executed and no script's
+# side effects fire.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,6 +50,8 @@ fixture="scripts/lib/tests/sigpipe_smoke.rs"
 [[ -f $fixture ]] || { echo "check-script-sigpipe.sh: missing $fixture" >&2; exit 2; }
 command -v rustc >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: rustc is required" >&2; exit 2; }
 command -v realpath >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: realpath is required" >&2; exit 2; }
+command -v cargo >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: cargo is required" >&2; exit 2; }
+command -v rust-script >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: rust-script is required (cargo install rust-script)" >&2; exit 2; }
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -62,6 +90,7 @@ tracked="$(git ls-files -- '*.rs')" || {
     exit 2
 }
 consumers=0
+entrypoints=()
 while IFS= read -r source; do
     [[ -n $source ]] || continue
     IFS= read -r first <"$source" || {
@@ -89,6 +118,7 @@ while IFS= read -r source; do
                 exit 1
             fi
             consumers=$((consumers + 1))
+            entrypoints+=("$source")
             ;;
         *rust-script*)
             echo "check-script-sigpipe.sh: $source can reuse stale code: $first" >&2
@@ -102,3 +132,29 @@ done <<<"$tracked"
     exit 2
 }
 echo "check-script-sigpipe.sh: OK — $consumers tracked rust-script entrypoint(s) force Cargo freshness"
+
+# Compile every discovered entrypoint. Report ALL failures rather than stopping
+# at the first, so one run names everything a workspace type change broke
+# instead of forcing a fix-one-rerun loop.
+broken=()
+for source in "${entrypoints[@]}"; do
+    package="$(rust-script --package "$source" 2>"$tmp/pkg.err" | tail -n1)"
+    if [[ -z $package || ! -f $package/Cargo.toml ]]; then
+        echo "check-script-sigpipe.sh: cannot generate a Cargo package for $source" >&2
+        cat "$tmp/pkg.err" >&2 || true
+        broken+=("$source")
+        continue
+    fi
+    if ! cargo check --manifest-path "$package/Cargo.toml" >"$tmp/check.out" 2>&1; then
+        echo "check-script-sigpipe.sh: FAIL — $source does not compile" >&2
+        grep -E '^(error|warning: unused)' -A4 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
+        broken+=("$source")
+    fi
+done
+if ((${#broken[@]} > 0)); then
+    echo "check-script-sigpipe.sh: FAIL — ${#broken[@]} of $consumers rust-script(s) do not compile:" >&2
+    printf '  %s\n' "${broken[@]}" >&2
+    echo "  No cargo gate compiles these, so cargo build/test/clippy/fmt will all still pass." >&2
+    exit 1
+fi
+echo "check-script-sigpipe.sh: OK — all $consumers rust-script entrypoint(s) compile"
