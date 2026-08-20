@@ -532,6 +532,56 @@ fn count_empty_queue_kicks(v: &[(usize, &str)]) -> usize {
         .count()
 }
 
+/// Resource text of the COMMIT record produced when a guest's runtime reads the
+/// process's own memory map during bootstrap.
+///
+/// This record carries the second known shape of backend self-nondeterminism,
+/// and it is unlike the empty-run-queue kick in a way that matters. Two runs of
+/// one guest can agree on every scheduling decision — same turn, same thread,
+/// same resource — and still commit that turn at *different virtual times*,
+/// because virtual time advances with retired conditional branches and the
+/// number of branches the scan executes depends on the map it reads. So the
+/// evidence is not the presence of a message but the value inside one.
+///
+/// A diverging pair prints both times in its diff. A matching pair kept
+/// nothing, which left the prior question — does this guest perform the read at
+/// all, and therefore can it exhibit the drift — answerable only by collecting
+/// divergences over many runs.
+const RUNTIME_MAPS_READ_RESOURCE: &str = r#"Path("/proc/self/maps")"#;
+
+/// One run's first memory-map read COMMIT, rendered for the retained line.
+/// `None` is spelled out rather than omitted, so a run that never performed the
+/// read is distinguishable from a run whose value was simply not reported.
+fn describe_maps_commit(first: Option<(u64, Option<u64>)>) -> String {
+    match first {
+        Some((turn, Some(nanoseconds))) => {
+            format!("first at turn {turn}, committed virtual time {nanoseconds}ns")
+        }
+        Some((turn, None)) => format!("first at turn {turn}, committed virtual time unrecorded"),
+        None => "no such record".to_string(),
+    }
+}
+
+/// COMMIT records in `v` that read the process's own memory map: how many there
+/// are, and the turn and committed virtual time of the first.
+fn maps_read_commits(v: &[(usize, &str)]) -> (usize, Option<(u64, Option<u64>)>) {
+    let mut count = 0;
+    let mut first = None;
+    for (_, message) in v {
+        if !message.contains(RUNTIME_MAPS_READ_RESOURCE) {
+            continue;
+        }
+        let Some(position) = commit_position(message) else {
+            continue;
+        };
+        count += 1;
+        if first.is_none() {
+            first = Some(position);
+        }
+    }
+    (count, first)
+}
+
 fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<(usize, &'a str)> {
     lines
         .into_iter()
@@ -1185,6 +1235,41 @@ fn log_diff_summary_from_strs(
             "Logs contain {} | {} scheduler empty-run-queue kick messages",
             count_empty_queue_kicks(&infos_a),
             count_empty_queue_kicks(&infos_b),
+        )?;
+        // The other retained record, for the same reason and under the same
+        // limit: one line, this record only. Here the committed virtual time is
+        // the evidence rather than the record's presence, so it is reported
+        // alongside the turn.
+        //
+        // BOTH runs' values are printed, not just run 1's, and this is a
+        // correctness requirement rather than a precaution.
+        //
+        // Measured: with `strip_lines` -- the lossy comparator that plain
+        // `--verify` uses -- known nondeterministic numerical data is normalized
+        // before comparison, so a pair whose two runs committed the map read at
+        // *different* virtual times is a MATCHING pair and reaches this branch.
+        // Quoting one side there would report agreement on precisely the
+        // quantity this record exists to expose: a drift that `--verify-strict`
+        // catches and `--verify` does not. The counts above can likewise differ
+        // on a matching pair -- under the default `Deterministic` mode a kick
+        // asymmetry is not compared, so `1 | 0` is a pass.
+        //
+        // A run with no such record therefore has to read as "no such record"
+        // rather than being silently represented by the other run's value.
+        let (maps_left, first_left) = maps_read_commits(&infos_a);
+        let (maps_right, first_right) = maps_read_commits(&infos_b);
+        let positions = if first_left.is_none() && first_right.is_none() {
+            String::new()
+        } else {
+            format!(
+                " (run 1 {}, run 2 {})",
+                describe_maps_commit(first_left),
+                describe_maps_commit(first_right),
+            )
+        };
+        writeln!(
+            w,
+            "Logs contain {maps_left} | {maps_right} scheduler COMMIT records reading /proc/self/maps{positions}",
         )?;
     }
     Ok(summary)
@@ -2325,6 +2410,218 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         assert_eq!(matched.first_divergent_record, None);
         assert_eq!(matched.compared_left, matched.compared_right);
         Ok(())
+    }
+
+    const MAPS_LINE_SUFFIX: &str = "scheduler COMMIT records reading /proc/self/maps";
+
+    /// A guest whose runtime scans its own memory map during bootstrap. The
+    /// committed virtual time is the part that drifts between runs, so it is
+    /// parameterised.
+    fn log_with_maps_read(committed: &str) -> String {
+        format!(
+            "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {{Path(\"/proc/self/maps\"): R}}, on previously committed {committed}\n\
+2026-08-13T01:02:03.000001Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+        )
+    }
+
+    /// A matching pair discards its logs, so without this record there is no way
+    /// to tell a guest that never reads its own memory map — and therefore
+    /// cannot drift this way — from one that reads it and happened to agree.
+    #[test]
+    fn a_matching_pair_records_the_maps_read_commit() -> std::io::Result<()> {
+        let scanned = log_with_maps_read("12.345_678_901s");
+        let (summary, out) = run_diff(&scanned, &scanned)?;
+        assert!(summary.matched_with_evidence(), "the pair must pass");
+        assert!(
+            out.contains(&format!("Logs contain 1 | 1 {MAPS_LINE_SUFFIX}")),
+            "a passing pair that read the map must retain the record, got:\n{out}"
+        );
+        // The committed virtual time is the evidence, not just the count: it is
+        // what a later run is compared against to see drift.
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678901ns)"
+            ),
+            "the retained record must carry the turn and the committed virtual \
+             time, got:\n{out}"
+        );
+
+        let (quiet, quiet_out) = run_diff(log_without_kick(), log_without_kick())?;
+        assert!(quiet.matched_with_evidence());
+        assert!(
+            quiet_out.contains(&format!("Logs contain 0 | 0 {MAPS_LINE_SUFFIX}")),
+            "a passing pair that never read the map must say so explicitly, \
+             got:\n{quiet_out}"
+        );
+        Ok(())
+    }
+
+    /// The load-bearing half. A pair differing only in the committed virtual
+    /// time of the retained record was a divergence before this line existed and
+    /// must remain one; recording the value must never stand in for agreeing on
+    /// it.
+    #[test]
+    fn recording_the_maps_read_commit_does_not_move_any_verdict() -> std::io::Result<()> {
+        let (diverged, diverged_out) = run_diff(
+            &log_with_maps_read("12.345_678_901s"),
+            &log_with_maps_read("12.345_678_902s"),
+        )?;
+        assert!(
+            diverged.diff_found,
+            "a one-nanosecond difference in the committed time must still diverge"
+        );
+        assert_eq!(diverged.first_divergent_scheduler_turn, Some(10));
+        assert!(
+            !diverged_out.contains(MAPS_LINE_SUFFIX),
+            "the record is scoped to passing pairs; a diverging pair already \
+             prints both times in its diff, got:\n{diverged_out}"
+        );
+        Ok(())
+    }
+
+    /// Every other test here forces `LogComparisonMode::Info`, but the default
+    /// is `Deterministic`, which selects a different set of messages. Both
+    /// retained lines must appear on that path too, and the kick counts must be
+    /// attributed per side — under this mode a kick asymmetry is *not* compared,
+    /// so `1 | 0` is a passing pair and quoting a single side would report it as
+    /// agreement.
+    #[test]
+    fn both_records_are_retained_under_the_default_comparison_mode() -> std::io::Result<()> {
+        let default_opts = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            default_opts.comparison,
+            super::LogComparisonMode::Deterministic,
+            "this test exists to cover the default mode; if the default changes \
+             it must be re-pointed, not deleted"
+        );
+
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            log_with_kick(),
+            log_without_kick(),
+            &default_opts,
+            &mut out,
+        )?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(
+            summary.matched_with_evidence(),
+            "a kick asymmetry is not compared under the default mode, so this \
+             pair must pass; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("Logs contain 1 | 0 {KICK_LINE_SUFFIX}")),
+            "the asymmetry must be visible per side on the default path, \
+             got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("Logs contain 0 | 0 {MAPS_LINE_SUFFIX}")),
+            "the map-read line must also be emitted on the default path, \
+             got:\n{out}"
+        );
+
+        // The same path, with the map read present, must attribute both sides.
+        let scanned = log_with_maps_read("12.345_678_901s");
+        let mut out = Vec::new();
+        let summary =
+            super::log_diff_summary_from_strs(&scanned, &scanned, &default_opts, &mut out)?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(summary.matched_with_evidence());
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678901ns)"
+            ),
+            "both runs' values must be printed under the default mode, \
+             got:\n{out}"
+        );
+        Ok(())
+    }
+
+    /// The reason both sides must be printed, as a reachable case rather than a
+    /// precaution. `strip_lines` is the lossy comparator plain `--verify` uses:
+    /// it normalizes numeric data before comparing, so two runs that committed
+    /// the map read at different virtual times are a *matching* pair. Reporting
+    /// only run 1 there would claim agreement on the exact quantity this record
+    /// exists to expose — a drift `--verify-strict` catches and `--verify` does
+    /// not.
+    #[test]
+    fn a_stripped_pass_shows_both_runs_diverging_map_read_times() -> std::io::Result<()> {
+        let opts = super::LogDiffOpts {
+            strip_lines: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            log_with_maps_read("12.345_678_901s"),
+            log_with_maps_read("12.345_678_902s"),
+            &opts,
+            &mut out,
+        )?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(
+            summary.matched_with_evidence(),
+            "the stripped comparator normalizes the times, so this pair passes; \
+             got:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678902ns)"
+            ),
+            "a passing pair whose runs committed at DIFFERENT times must show \
+             both values; showing one would report agreement on a real drift, \
+             got:\n{out}"
+        );
+        Ok(())
+    }
+
+    /// A run that never performed the read must say so, rather than being
+    /// silently represented by the other run's value.
+    #[test]
+    fn a_run_without_the_maps_read_is_named_not_borrowed() {
+        assert_eq!(super::describe_maps_commit(None), "no such record");
+        assert_eq!(
+            super::describe_maps_commit(Some((10, Some(12_345_678_901)))),
+            "first at turn 10, committed virtual time 12345678901ns"
+        );
+        assert_eq!(
+            super::describe_maps_commit(Some((10, None))),
+            "first at turn 10, committed virtual time unrecorded"
+        );
+    }
+
+    /// The record is identified by both halves — a COMMIT *and* that resource —
+    /// so neither a COMMIT on another path nor an unrelated mention of the map
+    /// is counted.
+    #[test]
+    fn only_a_maps_read_commit_is_counted() {
+        assert_eq!(
+            super::maps_read_commits(&[
+                (
+                    0,
+                    "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
+                ),
+                (
+                    1,
+                    "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #257: openat(-100, \"/proc/self/maps\", 0x0) = Ok(4)"
+                ),
+            ]),
+            (0, None),
+            "a COMMIT on another path, and a syscall naming the map, are both \
+             excluded"
+        );
+        assert_eq!(
+            super::maps_read_commits(&[(
+                0,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 12.345_678_901s"
+            )]),
+            (1, Some((10, Some(12_345_678_901))))
+        );
     }
 
     /// The count reads the message text, so an unrelated scheduler line must not
