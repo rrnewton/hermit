@@ -861,6 +861,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             // /proc/maps unless one of these flags is enabled.
             return Ok(());
         }
+        // ...and don't incur it when nothing would observe the record either.
+        //
+        // The hash below is an argument to `detlog!`, so `tracing` already skips
+        // it when INFO is disabled. Enumerating the maps is NOT: it happens
+        // before the macro, on every syscall, whether or not a record is ever
+        // written. Measured on a QEMU/Linux boot with `RUST_LOG` unset, where
+        // each run emitted 123 bytes of log in total: no flag 43.71s,
+        // `--detlog-stack` 190.37s (4.36x), `--detlog-heap` 207.90s (4.76x).
+        // `--detlog-regs` was already inert because everything it does before
+        // its own `detlog!` is trivial; this restores the same property here.
+        //
+        // Skipping is invisible to the guest: enumerating maps and hashing guest
+        // memory are host-side observations of the tracee that neither issue a
+        // guest syscall nor advance virtual time, so a run that skips them
+        // executes the same guest instruction stream as one that does not.
+        if !detlog_observed!() {
+            return Ok(());
+        }
         // Out-of-process backends (e.g. KVM) report their guest memory regions
         // directly, because `guest.pid()` is the host VMM process there and its
         // `/proc/<pid>/maps` describes the VMM, not the guest address space.
