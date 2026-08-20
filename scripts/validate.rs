@@ -317,7 +317,8 @@ fn usage() -> &'static str {
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
-     \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps).\n\
+     \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
+     \x20                  declared caps; deps outside the selection are dropped.\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
@@ -1204,6 +1205,29 @@ cleared-caps refusal names {} starved step(s)",
             .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
             .expect("manifest audit exists")
             .clone();
+        let manifest_builders: Vec<&Step> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd == validate_plan::MANIFEST_PLAN_BUILD_COMMAND)
+            .collect();
+        if manifest_builders.len() != 1 || manifest_builders[0].tag() != "pre.manifest_plan" {
+            return Err(format!(
+                "full-plan bracket: manifest-plan build was not deduped to pre.manifest_plan: {:?}",
+                manifest_builders
+                    .iter()
+                    .map(|step| step.tag())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if manifest_builders[0].deps != [PIN_GATE_TAG]
+            || manifest_audit.deps != ["pre.manifest_plan"]
+        {
+            return Err(format!(
+                "full-plan bracket: cold manifest spine is not pin -> build -> audit: builder_deps={:?} audit_deps={:?}",
+                manifest_builders[0].deps, manifest_audit.deps
+            ));
+        }
         let mut wrong_invocation = vec![manifest_audit];
         wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
         if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
@@ -2488,11 +2512,102 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         });
     }
 
-    // Focused single-shard mode: run one already-built DAG shard, no deps.
+    // Focused single-node mode: run the SELECTED lane node(s) as ordinary steps
+    // of THIS run's own boxed DAG.
+    //
+    // This used to synthesise one `shard.<lane>_<node>` wrapper whose command was
+    // `./ci/run-node.sh <lane> <nodes>`, i.e. a SECOND `safe-ci-dag-runner`
+    // underneath the one already driving this run. That nesting broke `--only`
+    // outright, in two separate ways:
+    //
+    //   * The inner runner establishes and then reads back its OWN outer systemd
+    //     scope. Inside validate's scope it does not own one, so the readback of
+    //     MemoryMax/MemorySwapMax/memory.oom.group failed and it refused with
+    //     "the run is not safely contained" — 0s, exit 3, before any work ran.
+    //   * The wrapper invented caps (7200s wall / 7200s CPU / 16 GiB) in place of
+    //     whatever the selected node actually declares, so a node budgeted at 900s
+    //     in the full plan got eight hours here and `--run-timeout` below 7200 was
+    //     refused outright.
+    //
+    // Selecting the real node directly cures both and STRENGTHENS containment:
+    // the node now runs under this run's two-level boxing with per-step cgroups,
+    // carrying its own declared wall/CPU/memory caps, exactly as it does in a full
+    // run. That identity is the whole point of a reproducer — a focused rerun must
+    // reproduce what the full run did to that node, budgets included.
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
         let mut steps = pre;
-        steps.push(shard_node(gate, lane, nodes));
-        let cfg = validate_plan::config_from(steps, "single DAG shard");
+        // Preflight tags already in the plan; naming one is satisfied by the
+        // preflight itself and must not be looked up in the lane file.
+        let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
+        // CARRY the lane's top-level config. `config_from` would substitute
+        // DagConfig::default(), dropping resource_caps and default_step_timeout;
+        // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
+        let base = validate_plan::lane_config(root, lane)?;
+        let lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
+        let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
+
+        let requested: Vec<String> = nodes
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        if requested.is_empty() {
+            return Err("--only needs at least one <group.job> node tag".into());
+        }
+        // Refuse an unknown tag HERE, naming what is selectable, instead of
+        // letting it travel into a child process that reports it 90s later.
+        let unknown: Vec<&String> = requested
+            .iter()
+            .filter(|t| !available.contains(*t) && !preflight.contains(*t))
+            .collect();
+        if !unknown.is_empty() {
+            let mut known: Vec<&str> = available.iter().map(String::as_str).collect();
+            known.extend(preflight.iter().map(String::as_str));
+            known.sort_unstable();
+            return Err(format!(
+                "--only: unknown node tag(s) in lane {lane}: {}. Selectable tags: {}",
+                unknown.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
+                known.join(", ")
+            ));
+        }
+        let selected: BTreeSet<String> =
+            requested.iter().filter(|t| available.contains(*t)).cloned().collect();
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
+            // Same selection semantics run-node.sh documented for `run --only`:
+            // edges to steps OUTSIDE the selection are dropped (their outputs are
+            // assumed already built), edges AMONG the selection are preserved so a
+            // selected sub-graph still runs in order.
+            dropped.extend(step.deps.iter().filter(|d| !selected.contains(*d)).cloned());
+            step.deps.retain(|d| selected.contains(d));
+            if step.deps.is_empty() {
+                step.deps.push(gate.to_string());
+            }
+            steps.push(step);
+        }
+        // SAY that this mode assumes an already-built tree, and name the build
+        // edges it just dropped. Without this the mode is silent about its own
+        // precondition: a selected node whose artifact was never built dies with
+        // a 0-second exit 127 (the shell's "command not found"), which reads as a
+        // crash rather than as "you have not built this yet".
+        dropped.remove(gate);
+        if dropped.is_empty() {
+            eprintln!(
+                "validate: --only runs the selected node(s) against the CURRENT tree; \
+                 nothing they depend on is rebuilt first."
+            );
+        } else {
+            eprintln!(
+                "validate: --only assumes an already-built tree. Dropped {} dependency edge(s) \
+                 whose outputs must ALREADY exist: {}. Build them first (or name them in the \
+                 selection); a selected node exiting 127 in ~0s means its artifact is missing, \
+                 not that it crashed.",
+                dropped.len(),
+                dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        let cfg = validate_plan::config_from_base(&base, steps, "selected DAG node(s)");
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -3255,22 +3370,12 @@ fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
     )
 }
 
-fn shard_node(gate: &str, lane: &str, nodes: &str) -> safe_ci_dag_runner::model::Step {
-    step_with_caps(
-        "shard",
-        &validate_plan::sanitize_job(&format!("{lane}_{}", nodes.replace([',', '.'], "_"))),
-        &format!("DAG shard {lane}:{nodes}"),
-        format!(
-            "./ci/run-node.sh {} {}",
-            validate_plan::shell_quote(lane),
-            validate_plan::shell_quote(nodes)
-        ),
-        vec![gate.to_string()],
-        7200,
-        7200,
-        16 * 1024 * 1024 * 1024,
-    )
-}
+// `shard_node` used to live here: it wrapped the selected node in a synthetic
+// `shard.*` step whose command was `./ci/run-node.sh`, nesting a second
+// safe-ci-dag-runner under this one. See the `Focused::Only` branch in
+// `build_plan` for why that broke `--only` and what replaced it. `ci/run-node.sh`
+// itself is UNCHANGED and still serves the hosted GitHub fan-out, which really
+// does need a standalone runner per shard job.
 
 fn step_with_caps(
     group: &str,
@@ -6425,6 +6530,25 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
         exit_code = 1;
         pin_gate_bypassed = true;
+    }
+
+    // Exit 127 is the shell's "command not found", so a node that dies with it in
+    // roughly no time did not run and fail — its executable was never built. Say
+    // that, because a bare 0-second 127 in the table is indistinguishable from a
+    // crash, and a misread there costs far more than the line costs to print.
+    let missing_artifact: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.ok && o.returncode == Some(127) && o.duration_s < 5.0)
+        .map(|o| o.tag.as_str())
+        .collect();
+    if !missing_artifact.is_empty() {
+        eprintln!(
+            "validate: NOTE: {} node(s) exited 127 (command not found) in under 5s: {}. \
+             That is a MISSING BUILD ARTIFACT, not a test failure — the node's executable does \
+             not exist in this checkout. Build it, then re-run.",
+            missing_artifact.len(),
+            missing_artifact.join(", ")
+        );
     }
 
     // A NESTED payload writes nothing: the outer run owns the ledger and the

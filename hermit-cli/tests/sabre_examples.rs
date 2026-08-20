@@ -453,6 +453,9 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
 
     const SCHEDULER_EMPTY: &str =
         " INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop.";
+    const SCHEDULER_FIZZLE: &str = " INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.";
+    const BACKEND_EVIDENCE: &str =
+        " WARN hermit::sabre: :: Backend: sabre static rewriting + ptrace runtime;";
     const FALLBACK_COMPLETED: &str =
         " INFO hermit::sabre::fallback: SaBRe ptrace fallback completed";
     for (index, path) in logs.iter().enumerate() {
@@ -462,12 +465,26 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
                 path.display()
             )
         });
+        let scheduler_fizzle = log.match_indices(SCHEDULER_FIZZLE).collect::<Vec<_>>();
         let scheduler_empty = log.match_indices(SCHEDULER_EMPTY).collect::<Vec<_>>();
+        let backend_evidence = log.match_indices(BACKEND_EVIDENCE).collect::<Vec<_>>();
         let fallback_completed = log.match_indices(FALLBACK_COMPLETED).collect::<Vec<_>>();
+        assert_eq!(
+            scheduler_fizzle.len(),
+            1,
+            "retained run {} must contain exactly one scheduler-fizzle INFO:\n{log}",
+            index + 1,
+        );
         assert_eq!(
             scheduler_empty.len(),
             1,
             "retained run {} must contain exactly one scheduler-empty INFO:\n{log}",
+            index + 1,
+        );
+        assert_eq!(
+            backend_evidence.len(),
+            1,
+            "retained run {} must contain exactly one SaBRe backend-evidence fact:\n{log}",
             index + 1,
         );
         assert_eq!(
@@ -477,8 +494,10 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
             index + 1,
         );
         assert!(
-            scheduler_empty[0].0 < fallback_completed[0].0,
-            "retained run {} logged fallback completion before scheduler completion:\n{log}",
+            scheduler_fizzle[0].0 < scheduler_empty[0].0
+                && scheduler_empty[0].0 < backend_evidence[0].0
+                && backend_evidence[0].0 < fallback_completed[0].0,
+            "retained run {} did not preserve scheduler-shutdown, backend-evidence, fallback-completion ordering:\n{log}",
             index + 1,
         );
     }

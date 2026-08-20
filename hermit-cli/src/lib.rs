@@ -1124,7 +1124,7 @@ async fn run_sabre(
     if requires_forced_shutdown {
         global.force_shutdown_with_error();
     }
-    // Emit one unconditional, machine-readable per-run fact instead of a
+    // Prepare one unconditional, machine-readable per-run fact instead of a
     // free-form warning. SaBRe loads the guest interpreter before the Detcore
     // plugin, so pre-plugin loader syscalls are structurally absent from its
     // observation envelope. Versioning that fact lets scorecard consumers
@@ -1137,7 +1137,6 @@ async fn run_sabre(
     // comparator exception. A missing record remains distinct from a record
     // whose counters are zero.
     let backend_evidence = sabre_backend_evidence_line(&supervised.path_evidence);
-    tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
     if let Some(path) = path_evidence_file {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -1172,6 +1171,11 @@ async fn run_sabre(
     global
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
+    // The scheduler's final empty-system diagnostics are part of the compared
+    // evidence stream. Emit this controller fact only after `clean_up` has
+    // awaited scheduler termination so its ordering cannot race the final
+    // physical-exit-barrier drain.
+    tracing::warn!(target: "hermit::sabre", "{backend_evidence}");
     tracing::info!(
         target: "hermit::sabre::fallback",
         ptrace_fallback_sites = supervised.path_evidence.ptrace_fallback_sites,
@@ -1607,7 +1611,11 @@ pub fn run_with_backend(
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
     config.discover_live_file_metadata = backend == Backend::Sabre;
-    config.use_thread_local_clock_reads = backend == Backend::Sabre;
+    // Guest-visible wall and monotonic clocks must stay in the same global
+    // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
+    // per-thread execution clock does not advance when the scheduler skips
+    // global time while a thread is blocked.
+    config.use_thread_local_clock_reads = false;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     config.cancel_killed_thread_rpcs = backend == Backend::Sabre;
@@ -2220,11 +2228,11 @@ mod tests {
     }
 
     #[test]
-    fn sabre_backend_config_enables_process_local_capabilities() {
+    fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
         assert!(sabre.discover_live_file_metadata);
-        assert!(sabre.use_thread_local_clock_reads);
+        assert!(!sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);

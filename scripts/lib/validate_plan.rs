@@ -65,6 +65,12 @@ const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
 /// non-cap.
 const PREFLIGHT_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
+/// Build the binaries that own manifest validation before any node invokes
+/// `target/debug/test-harness`. A fresh validation checkout has no target cache;
+/// relying on a prior developer build made `gate.manifest` pass only when the
+/// worktree happened to be warm.
+pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
+
 /// Per-lane-node CPU budget applied as the DAG-level default, closing the
 /// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
 /// the build spine legitimately burns many CPU-minutes; it exists to stop an
@@ -234,7 +240,7 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .join(" ")
 }
 
-/// The three always-on preflight gates, as DAG nodes.
+/// The four always-on preflight gates, as DAG nodes.
 ///
 /// `validate.sh` runs these before every profile and fails fast if either of the
 /// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
@@ -248,6 +254,17 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     // the right repo because cwd is right" is an inference, not an observation —
     // and the archival pin is not a testing exemption.
     let root = shell_quote(&root.to_string_lossy());
+    let mut manifest_plan = node(
+        "pre",
+        "manifest_plan",
+        "Build manifest-plan binaries before centralized manifest validation",
+        MANIFEST_PLAN_BUILD_COMMAND.to_string(),
+        vec!["pre.reverie_pin".to_string()],
+        180,
+        PREFLIGHT_CPU_TIMEOUT_S,
+        PREFLIGHT_MEM_BYTES,
+    );
+    manifest_plan.hint.classification = safe_ci_dag_runner::model::StepClass::CpuBound;
     vec![
         node(
             "pre",
@@ -276,12 +293,13 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
         ),
+        manifest_plan,
         node(
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
             "target/debug/test-harness validate".to_string(),
-            vec!["pre.reverie_pin".to_string()],
+            vec!["pre.manifest_plan".to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,

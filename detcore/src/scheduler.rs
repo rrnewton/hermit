@@ -960,6 +960,13 @@ async fn sched_loop_inner(
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
             {
+                // Emit the empty-system diagnostic at the one terminal exit, not from
+                // `step2_process_blocked`. A backend controller may release the final
+                // physical-exit barrier while the scheduler is between this check and
+                // step 2. Logging from both places made the evidence depend on which
+                // side observed that asynchronous release first: some otherwise
+                // identical runs included the diagnostic and some did not.
+                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
@@ -2681,7 +2688,10 @@ impl Scheduler {
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
-                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                // The scheduler loop emits the diagnostic when this terminal state is
+                // observed at its single exit. Returning here gives the loop a chance
+                // to make that observation without racing a backend controller's final
+                // physical-exit-barrier release.
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
                 return Err(self.report_terminal_deadlock());
