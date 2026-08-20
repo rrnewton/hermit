@@ -1142,17 +1142,35 @@ fn evidence_paths_under_tmp_are_rejected_rather_than_silently_swallowed() {
         "message must offer a way out, not just a refusal: {msg}"
     );
 
-    let recorder = RunOpts::parse_from([
-        "fakehermit",
+    // Every flag below was measured losing its file under /tmp and writing it correctly
+    // elsewhere. --verify-json is excluded on the same evidence: 235 bytes in BOTH.
+    for flag in [
         "--record-preemptions-to",
-        "/tmp/preempt.json",
+        "--preemption-stacktrace-log-file",
+        "--summary-json",
+        "--save-config",
+    ] {
+        let opts = RunOpts::parse_from(["fakehermit", flag, "/tmp/evidence.out", "fakeprog"]);
+        assert!(
+            opts.reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
+                .is_err(),
+            "{flag} under /tmp must be refused"
+        );
+    }
+
+    let verify_json = RunOpts::parse_from([
+        "fakehermit",
+        "--verify",
+        "--verify-json",
+        "/tmp/vj.json",
         "fakeprog",
     ]);
     assert!(
-        recorder
+        verify_json
             .reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
-            .is_err(),
-        "--record-preemptions-to under /tmp must be refused"
+            .is_ok(),
+        "--verify-json is written by the parent and works under /tmp; refusing it would be \
+         an over-refusal, which is its own defect"
     );
 }
 
@@ -1184,6 +1202,26 @@ fn evidence_paths_outside_the_guest_tmp_are_left_alone() {
             .reject_evidence_paths_shadowed_by_guest_tmp(&outside)
             .is_ok(),
         "/var/tmp is a real host directory here, not the guest's private tmp"
+    );
+
+    // REGRESSION. An earlier version of this guard borrowed `|| !self.bind.is_empty()` from
+    // the neighbouring e9patch check and refused this combination. Measured against a
+    // pre-guard build, it writes 4,087 bytes: `--bind` mounts into the guest's /tmp, but
+    // when /tmp IS the host's /tmp the write still lands where the caller asked.
+    let shared_with_bind = RunOpts::parse_from([
+        "fakehermit",
+        "--tmp=/tmp",
+        "--bind",
+        "/var/tmp",
+        "--save-config",
+        "/tmp/cfg.json",
+        "fakeprog",
+    ]);
+    assert!(
+        shared_with_bind
+            .reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
+            .is_ok(),
+        "--tmp=/tmp with a --bind still shares the host /tmp; refusing it is a false refusal"
     );
 
     // `--tmp=/tmp` shares the host's /tmp with the guest, so /tmp paths genuinely work.
@@ -2100,6 +2138,15 @@ impl RunOpts {
     ///   `--record-preemptions-to /var/tmp/rp.json`  -> 26,803 bytes
     ///   `--log-file /tmp/lf.log`                    -> no file
     ///   `--log-file /var/tmp/lf.log`                -> 10,092 bytes
+    ///   `--summary-json /tmp/s.json`                -> no file
+    ///   `--summary-json /var/tmp/s.json`            -> 649 bytes
+    ///   `--save-config /tmp/c.json`                 -> no file
+    ///   `--save-config /var/tmp/c.json`             -> 3,955 bytes
+    ///   `--preemption-stacktrace-log-file /tmp/...` -> no file
+    ///   `--preemption-stacktrace-log-file /var/...` -> 162 bytes
+    ///
+    /// All five exited 0 in the /tmp case. `--verify-json` was tested and is NOT affected
+    /// (235 bytes in both locations), so it is not guarded.
     ///
     /// That cost real time: the missing files were read as "the flag is broken" and then
     /// as "no preemptions occurred", and a chaos investigation was reported on that basis.
@@ -2111,19 +2158,43 @@ impl RunOpts {
         &self,
         global: &GlobalOpts,
     ) -> Result<(), Error> {
-        // With `--tmp=/tmp` (or no isolation at all) the guest writes to the host's real
-        // /tmp and these paths work, so only complain when /tmp is actually remapped.
-        let tmp_is_remapped =
-            self.tmp.as_deref() != Some(Path::new(TMP_DIR)) || !self.bind.is_empty();
-        if !tmp_is_remapped {
+        // With `--tmp=/tmp` the guest writes to the host's real /tmp and these paths work,
+        // so only complain when /tmp is actually replaced.
+        //
+        // DELIBERATELY NOT `|| !self.bind.is_empty()`. The neighbouring e9patch guard uses
+        // that clause, but it is answering a different question -- whether a symlink can be
+        // resolved across any mount -- and borrowing it here caused a FALSE REFUSAL.
+        // Measured against a pre-guard build:
+        //     --tmp=/tmp --bind ... --save-config /tmp/x   -> 4,087 bytes  (works)
+        //     --tmp=/tmp             --save-config /tmp/x  -> 3,976 bytes  (works)
+        //     --bind ...             --save-config /tmp/x  -> no file      (lost)
+        // `--bind` mounts into the guest's /tmp, but when /tmp IS the host's /tmp the write
+        // still lands where the caller expects. Only the absence of `--tmp=/tmp` matters.
+        // Residual case not covered: a bind mounted exactly over the output file's own
+        // directory inside a shared /tmp could still shadow it. That was not observed and is
+        // not refused here, because over-refusing a path that works is its own defect.
+        if self.tmp.as_deref() == Some(Path::new(TMP_DIR)) {
             return Ok(());
         }
+        // Every flag here was CONFIRMED lost under /tmp and written correctly elsewhere,
+        // by running each one into both locations. `--verify-json` is deliberately absent:
+        // it is produced by the parent process and measured at 235 bytes in BOTH /tmp and
+        // /var/tmp, so guarding it would refuse a path that works.
         for (flag, path) in [
             ("--log-file", global.log_file.as_deref()),
             (
                 "--record-preemptions-to",
                 self.det_opts.det_config.record_preemptions_to.as_deref(),
             ),
+            (
+                "--preemption-stacktrace-log-file",
+                self.det_opts
+                    .det_config
+                    .preemption_stacktrace_log_file
+                    .as_deref(),
+            ),
+            ("--summary-json", self.summary_json.as_deref()),
+            ("--save-config", self.save_config.as_deref()),
         ] {
             let Some(path) = path else {
                 continue;
