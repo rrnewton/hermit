@@ -48,6 +48,7 @@ use crate::tool_global::cancel_exec;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
+use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -103,6 +104,10 @@ struct WaitidSiginfoHead {
 
 fn wait_status_is_termination(status: libc::c_int) -> bool {
     libc::WIFEXITED(status) || libc::WIFSIGNALED(status)
+}
+
+fn wait4_poll_blocked_child(pid: libc::pid_t, poll_result: &Result<i64, Errno>) -> Option<DetPid> {
+    (*poll_result == Ok(0) && pid > 0).then(|| DetPid::from_raw(pid))
 }
 
 fn waitid_code_is_termination(code: libc::c_int) -> bool {
@@ -797,6 +802,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid
             );
             guest.inject_with_retry(call).await?
+        } else if call.pid() > 0 {
+            let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
+            loop {
+                if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+                    return Err(Errno::ERESTARTSYS.into());
+                }
+
+                let result = guest.inject_with_retry(poll_call).await;
+                if let Some(child) = wait4_poll_blocked_child(call.pid(), &result)
+                    && resolve_kill_targets(guest, child).await.is_empty()
+                {
+                    // The process leader's exit hook has published the child's final
+                    // logical state, so no guest execution remains. The kernel can
+                    // still be completing the small exit-hook-to-waitable transition;
+                    // bridge only that physical teardown with the caller's original
+                    // blocking wait4 instead of exposing host timing as more polling
+                    // turns.
+                    info!(
+                        "[dtid {}] Executing blocking wait4 for logically exited child {}.",
+                        dettid,
+                        call.pid()
+                    );
+                    break guest.inject_with_retry(call).await?;
+                }
+
+                match result {
+                    Ok(0) => {
+                        rsrc.poll_attempt += 1;
+                        trace!(
+                            "Retry #{} for wait4 because child {} has not published its exit state",
+                            rsrc.poll_attempt,
+                            call.pid()
+                        );
+                        record_retry_event(guest, poll_call).await;
+                    }
+                    Ok(value) => break value,
+                    Err(errno) => return Err(errno.into()),
+                }
+            }
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
@@ -1246,6 +1290,20 @@ mod tests {
         assert!(!waitid_code_is_termination(libc::CLD_STOPPED));
         assert!(!waitid_code_is_termination(libc::CLD_CONTINUED));
         assert!(!waitid_code_is_termination(libc::CLD_TRAPPED));
+    }
+
+    #[test]
+    fn blocked_positive_wait4_poll_selects_exact_child_for_scheduler_query() {
+        let pid = 17;
+        let blocked = Ok(0);
+
+        assert_eq!(
+            wait4_poll_blocked_child(pid, &blocked),
+            Some(DetPid::from_raw(pid))
+        );
+        assert_eq!(wait4_poll_blocked_child(-1, &blocked), None);
+        assert_eq!(wait4_poll_blocked_child(pid, &Ok(pid.into())), None);
+        assert_eq!(wait4_poll_blocked_child(pid, &Err(Errno::ECHILD)), None);
     }
 
     #[test]
