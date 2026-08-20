@@ -2153,10 +2153,10 @@ mod tests {
             verified: true,
             bitwise_parity: true,
             verdict: "matched".into(),
-            comparison: crate::canonical_verdict::ComparisonReport {
+            comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: "canonical".into(),
                 compare_logs: true,
-            },
+            }),
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
