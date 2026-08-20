@@ -81,6 +81,21 @@ def snapshot_exists(path: Path, name: str) -> bool:
     return any(line.split()[1:2] == [name] for line in result.stdout.splitlines())
 
 
+COMMAND_IMAGE_BYTES = 4096
+PLACEHOLDER_COMMAND = "WAIT"
+
+
+def write_placeholder_command_image(path: Path) -> None:
+    """The image the guest polls before resume supplies a real command.
+
+    Same fixed size as the resume image (demo 6 writes that one): the drive is
+    attached at boot and at resume and only the backing file differs, so a geometry
+    change between the two would not match the device state in the snapshot.
+    """
+    payload = PLACEHOLDER_COMMAND.encode() + b"\n"
+    path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
+
+
 def main() -> int:
     os.environ["HERMIT_RELEASE"] = str(HERMIT)
     os.environ["QEMU_BIN"] = QEMU
@@ -153,6 +168,11 @@ def main() -> int:
             ]
         )
 
+        # Boot attaches the command drive with a PLACEHOLDER, so the device exists in
+        # the snapshot. Resume swaps only its backing file; a device absent here could
+        # not appear there, because vmstate records the device model.
+        command_image = run_dir / "guest-command.img"
+        write_placeholder_command_image(command_image)
         qemu_argv = build_qemu_command(
             QEMU,
             qmp_socket,
@@ -160,6 +180,8 @@ def main() -> int:
             snapshot_disk,
             ASSETS / "bzImage",
             ASSETS / "initramfs.cpio.gz",
+            None,
+            command_image,
         )
         command = [
             str(HERMIT),
@@ -193,6 +215,8 @@ def main() -> int:
             str(ASSETS / "bzImage"),
             "--initrd",
             str(ASSETS / "initramfs.cpio.gz"),
+            "--command-image",
+            str(command_image),
             "--snapshot-name",
             SNAPSHOT_NAME,
             "--timeout",

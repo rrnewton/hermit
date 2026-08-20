@@ -14,7 +14,7 @@ KERNEL_URL="${QEMU_KERNEL_URL:-$DEFAULT_KERNEL_URL}"
 KERNEL_MANIFOLD_PATH="${QEMU_KERNEL_MANIFOLD_PATH:-}"
 QEMU="${QEMU_BIN:-$(command -v qemu-system-x86_64 || true)}"
 PYTHON="${QEMU_DEMO_PYTHON:-$(command -v python3 || true)}"
-INITRAMFS_VERSION=3
+INITRAMFS_VERSION=6
 INITRAMFS_VERSION_FILE="$ARTIFACT_DIR/.initramfs-version"
 CHECK_ONLY=0
 # Bounds for the direct-connectivity smoke test in fetch_url (seconds).
@@ -220,6 +220,46 @@ echo "HERMIT-QEMU-BASELINE-BOOT-OK"
 echo "kernel: $(uname -r)"
 echo "rtc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=========================================="
+# THE WORKLOAD ARRIVES ON A DISK, NOT OVER THE SERIAL CONSOLE.
+#
+# Typing the command into the console made its arrival depend on host wall time,
+# so the guest saw a different arrival instant on every run. The command image is
+# attached before the snapshot is taken and its contents are already present the
+# instant the guest resumes, so everything the guest does after resume is a
+# function of (snapshot state, disk contents) and the host's timing cannot enter.
+#
+# WHAT KEEPS THE READ FRESH IS THE OPEN AND CLOSE, NOT A FLAG. Linux invalidates a
+# block device's buffer cache on its LAST close, and this loop opens and closes the
+# device once per iteration, so the placeholder read before the snapshot is not still
+# cached after it. Measured 2x2 (direct/buffered x closed-per-read/held-open): both
+# closed-per-read arms read the new command, both held-open arms read the stale
+# placeholder 20,000 polls later -- and iflag=direct made NO difference in either
+# row, so the flag it used to carry was doing nothing and has been removed.
+#
+# DO NOT "optimise" this by holding the device open across the loop. That is exactly
+# the held-open arm, and it puts page-cache-dependent behaviour back into the input
+# path -- the nondeterminism this whole change exists to remove.
+echo "HERMIT-QEMU-COMMAND-DISK-READY"
+CMDDEV=/dev/vda
+while :; do
+  CMD=$(dd if="$CMDDEV" bs=512 count=1 2>/dev/null | tr -d '\000' | head -n 1)
+  case "$CMD" in
+    ""|WAIT) ;;
+    *) break ;;
+  esac
+  # SLEEP, DO NOT SPIN. Demo 5 and 6 run the guest under `--no-rcb-time` with
+  # `--max-timeslice disabled`, i.e. with NO timer preemption -- and this file's
+  # sibling comment in 05-qemu-boot.py records that in exactly that configuration
+  # "unproductive SleepUntil(0) poll-yields kept the run queue non-empty ... and the
+  # vCPU was starved -> boot wedge". A busy poll loop is that same shape: measured,
+  # a spinning loop here left demo 6 unable to reach its END marker in 300s. Sleeping
+  # lets the guest CPU idle between reads, which under `-icount ...,sleep=off` costs
+  # almost no wall time because QEMU jumps to the next timer deadline.
+  sleep 1
+done
+echo "__HERMIT_COMMAND_BEGIN__"
+sh -c "$CMD"
+echo "__HERMIT_COMMAND_END__"
 echo "Interactive busybox shell. Type 'poweroff -f' to exit."
 exec setsid cttyhack sh
 INIT
