@@ -1319,12 +1319,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // NETLINK_SOCK_DIAG replies carry host-assigned socket inode numbers in
         // their msg_iov payload (not msg_control). Determinize them so the
         // binary socket-diag path agrees with the /proc/net/* text sanitizers.
-        if self.cfg.virtualize_metadata
-            && guest
-                .thread_state()
-                .with_detfd(call.sockfd(), |detfd| detfd.is_sock_diag())
-                .unwrap_or(false)
-        {
+        // The predicate is shared with the read/readv/recvfrom/recvmmsg paths so
+        // the five receive syscalls cannot drift apart again.
+        if self.sock_diag_reply_fd(guest, call.sockfd()) {
             return self.handle_sock_diag_recvmsg(guest, call).await;
         }
 
@@ -1368,13 +1365,137 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1064)
+    /// Whether replies received on `fd` must have their socket inode numbers
+    /// determinized.
+    ///
+    /// This is the single predicate every receive path consults. It exists as
+    /// one function because the flag used to be tested inline in `recvmsg`
+    /// alone, and four other receive syscalls reached the same dump without it
+    /// (see [`Self::sanitize_sock_diag_segments`]).
+    pub(crate) fn sock_diag_reply_fd<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> bool {
+        self.cfg.virtualize_metadata
+            && guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.is_sock_diag())
+                .unwrap_or(false)
+    }
+
+    /// Read an `iovec` array out of guest memory as plain `(address, capacity)`
+    /// scalars, so no non-`Send` raw pointer is held across an await.
+    fn read_iov_segments<G: Guest<Self>>(
+        guest: &mut G,
+        iov: usize,
+        iovlen: usize,
+    ) -> Result<Vec<(usize, usize)>, Error> {
+        if iov == 0 || iovlen == 0 {
+            return Ok(Vec::new());
+        }
+        let count = iovlen.min(libc::UIO_MAXIOV as usize);
+        let address: AddrMut<'_, libc::iovec> = AddrMut::from_raw(iov).ok_or(Errno::EFAULT)?;
+        // SAFETY: `iovec` is a plain C record; an all-zero value is a valid
+        // staging value immediately overwritten by `read_values`.
+        let mut iovecs: Vec<libc::iovec> =
+            (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+        guest.memory().read_values(address.into(), &mut iovecs)?;
+        Ok(iovecs
+            .iter()
+            .map(|iov| (iov.iov_base as usize, iov.iov_len))
+            .collect())
+    }
+
+    /// Zero the host-assigned socket inode numbers in a `NETLINK_SOCK_DIAG`
+    /// reply that the kernel has already written into guest memory.
+    ///
+    /// `segments` describes the destination buffers as `(address, capacity)` in
+    /// the order the kernel filled them; `received` is the syscall's return
+    /// value. The reply is gathered contiguously (it may be scattered across
+    /// several buffers), sanitized via `crate::sock_diag` (fail-open,
+    /// zero-only, never resizes), and written back preserving the original
+    /// boundaries. Bounded by both each buffer's capacity and `received`, which
+    /// under `MSG_TRUNC` can exceed the total capacity.
+    ///
+    /// Synchronous on purpose: every caller has already completed its receive,
+    /// so nothing here awaits and no guest address outlives the borrow.
+    fn sanitize_sock_diag_segments<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        segments: &[(usize, usize)],
+        received: usize,
+    ) -> Result<(), Error> {
+        if received == 0 || segments.is_empty() {
+            return Ok(());
+        }
+        let mut filled: Vec<(AddrMut<'_, u8>, usize)> = Vec::new();
+        let mut buffer: Vec<u8> = Vec::with_capacity(received);
+        let mut remaining = received;
+        for &(base, capacity) in segments {
+            if remaining == 0 {
+                break;
+            }
+            if base == 0 || capacity == 0 {
+                continue;
+            }
+            let take = capacity.min(remaining);
+            let address: AddrMut<'_, u8> = AddrMut::from_raw(base).ok_or(Errno::EFAULT)?;
+            let mut segment = vec![0u8; take];
+            guest.memory().read_exact(address, &mut segment)?;
+            buffer.extend_from_slice(&segment);
+            filled.push((address, take));
+            remaining -= take;
+        }
+
+        if !crate::sock_diag::sanitize_sock_diag_inodes(&mut buffer) {
+            return Ok(());
+        }
+
+        let mut offset = 0;
+        for (address, len) in filled {
+            guest
+                .memory()
+                .write_exact(address, &buffer[offset..offset + len])?;
+            offset += len;
+        }
+        Ok(())
+    }
+
+    /// `recvfrom` on a socket-diag descriptor: one destination buffer.
+    ///
+    /// `recv(2)` has no syscall of its own on x86_64 — glibc lowers it to
+    /// `recvfrom` with a null address — so this covers `recv` as well, which is
+    /// what Python's `socket.recv()` reaches.
+    pub async fn handle_sock_diag_recvfrom<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvfrom,
+    ) -> Result<i64, Error> {
+        let fd = call.fd();
+        let base = call.buf().map(|address| address.as_raw()).unwrap_or(0);
+        let len = call.len();
+        let result = self.handle_socket_receive(guest, call, fd, true).await?;
+        let received = usize::try_from(result).unwrap_or(0);
+        self.sanitize_sock_diag_segments(guest, &[(base, len)], received)?;
+        Ok(result)
+    }
+
+    /// `read` on a socket-diag descriptor: one destination buffer.
+    pub async fn handle_sock_diag_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<i64, Error> {
+        let base = call.buf().map(|address| address.as_raw()).unwrap_or(0);
+        let len = call.len();
+        let result = self.handle_read(guest, call).await?;
+        let received = usize::try_from(result).unwrap_or(0);
+        self.sanitize_sock_diag_segments(guest, &[(base, len)], received)?;
+        Ok(result)
+    }
+
     /// Receive a `NETLINK_SOCK_DIAG` dump and zero the host-assigned socket
     /// inode numbers in the reply so `ss`-style enumeration is deterministic.
     ///
     /// The dump lands in `msg_iov` (netlink diag sockets carry no ancillary
-    /// data), possibly scattered across several iovecs, so this reconstructs the
-    /// received bytes contiguously, sanitizes them via `crate::sock_diag`
-    /// (fail-open, zero-only), and writes them back preserving iovec boundaries.
+    /// data), possibly scattered across several iovecs.
     async fn handle_sock_diag_recvmsg<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1386,64 +1507,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // Snapshot the header's iovec pointer/count before the receive (they are
         // stable across it; the kernel fills the pointed-to buffers, not the
-        // array). Extract them as plain scalars so no non-`Send` raw pointer is
-        // held across the await below.
-        let message: libc::msghdr = guest.memory().read_value(message_address)?;
-        let msg_iov = message.msg_iov as usize;
-        let msg_iovlen = message.msg_iovlen;
+        // array). Scoped so the `msghdr`'s raw pointers are dropped before the
+        // await below: holding one would make this future non-`Send`.
+        let segments = {
+            let message: libc::msghdr = guest.memory().read_value(message_address)?;
+            Self::read_iov_segments(guest, message.msg_iov as usize, message.msg_iovlen)?
+        };
 
         let result = self.handle_socket_receive(guest, call, fd, true).await?;
         let received = usize::try_from(result).unwrap_or(0);
-        if received == 0 || msg_iov == 0 || msg_iovlen == 0 {
-            return Ok(result);
+        self.sanitize_sock_diag_segments(guest, &segments, received)?;
+        Ok(result)
+    }
+
+    /// `readv` on a socket-diag descriptor: an `iovec` array, no message header.
+    pub async fn handle_sock_diag_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+    ) -> Result<i64, Error> {
+        let iov = call.iov().map(|address| address.as_raw()).unwrap_or(0);
+        let segments = Self::read_iov_segments(guest, iov, call.len())?;
+        let result = self.handle_readv(guest, call).await?;
+        let received = usize::try_from(result).unwrap_or(0);
+        self.sanitize_sock_diag_segments(guest, &segments, received)?;
+        Ok(result)
+    }
+
+    /// `recvmmsg` on a socket-diag descriptor.
+    ///
+    /// Each delivered `mmsghdr` is a separate datagram with its own byte count
+    /// in `msg_len`, so each is gathered and sanitized independently; treating
+    /// the batch as one buffer would let one message's length run into the
+    /// next message's memory.
+    pub async fn handle_sock_diag_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmmsg,
+    ) -> Result<i64, Error> {
+        let Some(messages_address) = call.mmsg() else {
+            return self.handle_recvmmsg(guest, call).await;
+        };
+        let vlen = call.vlen();
+        if vlen == 0 || vlen > libc::UIO_MAXIOV as u32 {
+            return self.handle_recvmmsg(guest, call).await;
         }
+        let base = messages_address.as_raw();
 
-        let iov_count = msg_iovlen.min(libc::UIO_MAXIOV as usize);
-        let iov_address: AddrMut<'_, libc::iovec> =
-            AddrMut::from_raw(msg_iov).ok_or(Errno::EFAULT)?;
-        // SAFETY: `iovec` is a plain C record; an all-zero value is a valid
-        // staging value immediately overwritten by `read_values`.
-        let mut iovecs: Vec<libc::iovec> = (0..iov_count)
-            .map(|_| unsafe { std::mem::zeroed() })
-            .collect();
-        guest
-            .memory()
-            .read_values(iov_address.into(), &mut iovecs)?;
-
-        // Reconstruct the received bytes contiguously across scatter-gather
-        // segments, bounded by both each iov's capacity and the received count
-        // (which, under MSG_TRUNC, can exceed the buffer capacity).
-        let mut segments: Vec<(AddrMut<'_, u8>, usize)> = Vec::new();
-        let mut buffer: Vec<u8> = Vec::with_capacity(received);
-        let mut remaining = received;
-        for iov in &iovecs {
-            if remaining == 0 {
-                break;
-            }
-            if iov.iov_base.is_null() || iov.iov_len == 0 {
-                continue;
-            }
-            let take = iov.iov_len.min(remaining);
-            let address: AddrMut<'_, u8> =
-                AddrMut::from_raw(iov.iov_base as usize).ok_or(Errno::EFAULT)?;
-            let mut segment = vec![0u8; take];
-            guest.memory().read_exact(address, &mut segment)?;
-            buffer.extend_from_slice(&segment);
-            segments.push((address, take));
-            remaining -= take;
-        }
-
-        if !crate::sock_diag::sanitize_sock_diag_inodes(&mut buffer) {
-            return Ok(result);
-        }
-
-        // Write the sanitized bytes back, preserving the original boundaries.
-        let mut offset = 0;
-        for (address, len) in segments {
+        // Snapshot each message's iovec geometry BEFORE the receive: the kernel
+        // fills the pointed-to buffers and writes msg_len, but does not move the
+        // iovec arrays themselves. Scoped, and reduced to plain scalars, so the
+        // `mmsghdr` raw pointers are dropped before the await below: holding one
+        // would make this future non-`Send`.
+        let geometry: Vec<Vec<(usize, usize)>> = {
+            // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a
+            // valid staging value immediately overwritten by `read_values`.
+            let mut headers: Vec<libc::mmsghdr> = (0..vlen as usize)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
             guest
                 .memory()
-                .write_exact(address, &buffer[offset..offset + len])?;
-            offset += len;
+                .read_values(messages_address.into(), &mut headers)?;
+            let mut geometry = Vec::with_capacity(headers.len());
+            for header in &headers {
+                geometry.push(Self::read_iov_segments(
+                    guest,
+                    header.msg_hdr.msg_iov as usize,
+                    header.msg_hdr.msg_iovlen,
+                )?);
+            }
+            geometry
+        };
+
+        let result = self.handle_recvmmsg(guest, call).await?;
+        let delivered = usize::try_from(result).unwrap_or(0).min(geometry.len());
+        if delivered == 0 {
+            return Ok(result);
+        }
+
+        // Re-read the array for the per-message byte counts the kernel just
+        // wrote. Also scoped: nothing awaits past this point, but keeping the
+        // raw pointers contained keeps the rule visible.
+        let counts: Vec<usize> = {
+            let address: AddrMut<'_, libc::mmsghdr> =
+                AddrMut::from_raw(base).ok_or(Errno::EFAULT)?;
+            // SAFETY: as above.
+            let mut headers: Vec<libc::mmsghdr> = (0..vlen as usize)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
+            guest.memory().read_values(address.into(), &mut headers)?;
+            headers.iter().map(|h| h.msg_len as usize).collect()
+        };
+        for (index, segments) in geometry.iter().enumerate().take(delivered) {
+            self.sanitize_sock_diag_segments(guest, segments, counts[index])?;
         }
         Ok(result)
     }

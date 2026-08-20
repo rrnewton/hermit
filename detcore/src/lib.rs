@@ -1969,6 +1969,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
+                Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_read(guest, s).await
+                }
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
@@ -1981,6 +1984,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
                 // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
                 // read/pread64/pwrite64/writev.
+                Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_readv(guest, s).await
+                }
                 Syscall::Readv(s) => self.handle_readv(guest, s).await,
                 Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
                 Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
@@ -2291,6 +2297,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
+                // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
+                // a NETLINK_SOCK_DIAG dump exactly as recvmsg does. Until they
+                // were routed through the same sanitizer, four of the five
+                // usable receive syscalls returned raw host socket inode
+                // numbers, which made the determinization optional from the
+                // guest's point of view: `socket.recv()` alone was enough to
+                // skip it. Non-socket-diag descriptors take the same path as
+                // before; the predicate is checked inside.
+                Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_recvfrom(guest, s).await
+                }
                 Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
@@ -2307,6 +2324,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // timeout argument (deliberately ignored, see helpers.rs) does not
                 // introduce nondeterminism.
                 // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
+                Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_recvmmsg(guest, s).await
+                }
                 Syscall::Recvmmsg(s) => self.handle_recvmmsg(guest, s).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
