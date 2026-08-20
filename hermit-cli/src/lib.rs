@@ -59,7 +59,7 @@ pub use detcore::Detcore;
 pub use detcore::RecordOrReplay;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]
-pub use detcore_dbt::reverie_dbt_runtime_background_init;
+pub use detcore_dbt::reverie_dbt_runtime_background_init_v2;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]
 pub use detcore_dbt::reverie_dbt_runtime_name;

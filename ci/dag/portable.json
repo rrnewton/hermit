@@ -22,6 +22,16 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "dbt_runtime_abi",
+      "desc": "Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares",
+      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does.",
+      "cmd": "./scripts/check-dbt-runtime-abi.rs",
+      "deps": ["build.runtime_release"],
+      "timeout": 60,
+      "hint": {"est_duration_s": 3, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "backend_abstraction",
       "desc": "Detcore backend-abstraction check",
       "cmd": "./scripts/check-detcore-backend-abstraction.sh",
