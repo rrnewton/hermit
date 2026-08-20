@@ -9,12 +9,18 @@
  * fixture checks to confirm the value round-trips.
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static void fail(const char *message) {
+  fprintf(stderr, "%s: %s\n", message, strerror(errno));
+  exit(1);
+}
 
 /* Return the low permission bits (st_mode & 07777) for a path, or -1. */
 static int perm_bits(const char *path) {
@@ -29,10 +35,14 @@ int main(void) {
   int ok = 0;
 
   char root[] = "/tmp/umaskXXXXXX";
-  if (mkdtemp(root) == NULL) {
-    printf("umask ok=0\n");
-    return 0;
-  }
+  if (mkdtemp(root) == NULL)
+    /* A failed setup means no step below ran. Reporting `ok=0` and exiting 0
+       here made that indistinguishable from a completed run: the guest looked
+       successful, and because both --verify runs fail setup identically the
+       comparison agrees too, so the cell went green having tested nothing.
+       Exit nonzero instead, the way the other fixtures in this directory route
+       every setup failure through fail(). */
+    fail("mkdtemp");
 
   char file_a[128];
   snprintf(file_a, sizeof file_a, "%s/a", root);
