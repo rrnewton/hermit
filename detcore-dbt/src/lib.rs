@@ -83,13 +83,25 @@ type DetcoreThreadState = <Detcore as Tool>::ThreadState;
 type Emitter = reverie_dbt::RuntimeEmitter;
 type Idler = reverie_dbt::RuntimeIdler;
 
+#[repr(C)]
+struct DbtRuntimeCallbacksV1 {
+    emit: Emitter,
+    idle: Idler,
+    panic_on_unsupported_syscalls: i32,
+    unsupported_report_fd: i32,
+    emit_stdout: Emitter,
+}
+
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DbtSubscriber {
     emit: Emitter,
     level: DbtLogLevel,
 }
+
+const DBT_LOG_RECORD_PREFIX: &str = "1970-01-01T00:00:00.000000Z ";
 
 impl Subscriber for DbtSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
@@ -109,7 +121,7 @@ impl Subscriber for DbtSubscriber {
         let mut visitor = DbtEventVisitor::default();
         event.record(&mut visitor);
         let line = format!(
-            "{} {}: {}\n",
+            "{DBT_LOG_RECORD_PREFIX}{} {}: {}\n",
             metadata.level(),
             metadata.target(),
             visitor.fields
@@ -127,6 +139,17 @@ struct DbtEventVisitor {
     fields: String,
 }
 
+fn push_escaped_record_text(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            _ => output.push(character),
+        }
+    }
+}
+
 impl DbtEventVisitor {
     fn push(&mut self, field: &Field, value: String) {
         if !self.fields.is_empty() {
@@ -136,7 +159,7 @@ impl DbtEventVisitor {
             self.fields.push_str(field.name());
             self.fields.push('=');
         }
-        self.fields.push_str(&value);
+        push_escaped_record_text(&mut self.fields, &value);
     }
 }
 
@@ -185,32 +208,45 @@ fn emit_marker(emit: Emitter, message: &'static [u8]) {
 /// cached, so hot callers pay only an atomic load.
 fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    if *ENABLED.get_or_init(info_logging_enabled) {
+    if *ENABLED.get_or_init(debug_logging_enabled) {
         emit_marker(emit, message);
     }
 }
 
-fn info_logging_enabled() -> bool {
-    matches!(
-        std::env::var("HERMIT_LOG")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "info" | "debug" | "trace"
-    )
-}
-
-fn dbt_log_level() -> Option<DbtLogLevel> {
+fn effective_dbt_log_level() -> i32 {
+    let protected = DBT_EVIDENCE_LOG_LEVEL.load(Ordering::Acquire);
+    if protected != 0 {
+        return protected;
+    }
     match std::env::var("HERMIT_LOG")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
     {
-        "error" => Some(DbtLogLevel::Error),
-        "warn" => Some(DbtLogLevel::Warn),
-        "info" => Some(DbtLogLevel::Info),
-        "debug" => Some(DbtLogLevel::Debug),
-        "trace" => Some(DbtLogLevel::Trace),
+        "error" => 1,
+        "warn" => 2,
+        "info" => 3,
+        "debug" => 4,
+        "trace" => 5,
+        _ => 0,
+    }
+}
+
+fn debug_logging_enabled() -> bool {
+    matches!(effective_dbt_log_level(), 4 | 5)
+}
+
+fn info_logging_enabled() -> bool {
+    matches!(effective_dbt_log_level(), 3..=5)
+}
+
+fn dbt_log_level() -> Option<DbtLogLevel> {
+    match effective_dbt_log_level() {
+        1 => Some(DbtLogLevel::Error),
+        2 => Some(DbtLogLevel::Warn),
+        3 => Some(DbtLogLevel::Info),
+        4 => Some(DbtLogLevel::Debug),
+        5 => Some(DbtLogLevel::Trace),
         _ => None,
     }
 }
@@ -227,6 +263,10 @@ fn init_dbt_tracing(emit: Emitter) -> bool {
     }
     DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
+}
+
+fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) -> bool {
+    protected_level == 0 || tracing_active
 }
 
 /// Environment variable through which `hermit run --backend dbt` hands the
@@ -295,39 +335,10 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
     }
 }
 
-// TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
-// TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
-fn translate_self_identity_targets(
-    sysnum: i64,
-    args: &mut [u64; 6],
-    virtual_pid: i32,
-    virtual_tid: i32,
-    host_pid: i32,
-    host_tid: i32,
-) {
-    if virtual_pid <= 0 || host_pid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_prlimit64 && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-    if virtual_tid <= 0 || host_tid <= 0 {
-        return;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_rt_tgsigqueueinfo
-        && args[0] as i32 == virtual_pid
-        && args[1] as i32 == virtual_tid
-    {
-        args[0] = host_pid as u32 as u64;
-        args[1] = host_tid as u32 as u64;
-    }
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    if sysnum == libc::SYS_rt_sigqueueinfo && args[0] as i32 == virtual_pid {
-        args[0] = host_pid as u32 as u64;
-    }
-}
+// TODO-HUMAN-REVIEW(PR-1065): DBT identity-target arguments stay virtual until
+// Detcore handles them. In particular, prlimit64 is fully emulated against the
+// virtual process identity; translating its pid to a host pid here would leak a
+// per-run value into canonical evidence and make the shared handler reject it.
 
 fn run_cooperative<F: Future<Output = ()>>(future: F, idle: Idler) {
     let mut future = pin!(future);
@@ -383,6 +394,7 @@ struct ThreadRuntime {
 
 struct PendingThreadParent {
     parent_tid: Tid,
+    virtual_child_tid: Tid,
     rng_entropy: u128,
     state: DetcoreThreadState,
 }
@@ -410,6 +422,7 @@ static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock
 static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ROOT_LOCAL_READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static COPIED_PANIC_ON_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
@@ -431,6 +444,21 @@ fn current_runtime() -> Arc<Runtime> {
     )
 }
 
+fn wait_for_root_local_ready(
+    image_generation: u64,
+    root_local_ready_image: &AtomicU64,
+    runtime_shutdown: &AtomicBool,
+    mut idle: impl FnMut(),
+) -> bool {
+    while root_local_ready_image.load(Ordering::Acquire) != image_generation {
+        if runtime_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        idle();
+    }
+    true
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1060): Review the stable DBT child RNG identity encoding.
 fn dbt_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
@@ -441,9 +469,27 @@ fn dbt_child_rng_entropy(virtual_pid: i32, child_ordinal: u64) -> Option<u128> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-1060): Review preservation of physical DBT child TIDs.
-fn dbt_scheduler_tid(host_tid: i32) -> Option<Tid> {
-    (host_tid > 0).then(|| Tid::from_raw(host_tid))
+// TODO-HUMAN-REVIEW(PR-1060): Review preservation of virtual DBT child TIDs.
+fn dbt_scheduler_tid(virtual_tid: i32) -> Option<Tid> {
+    (virtual_tid > 0).then(|| Tid::from_raw(virtual_tid))
+}
+
+fn dbt_process_pid(virtual_pid: i32) -> Option<Pid> {
+    (virtual_pid > 0).then(|| Pid::from_raw(virtual_pid))
+}
+
+fn take_pending_thread_parent(
+    pending: &mut HashMap<i32, PendingThreadParent>,
+    physical_child_tid: i32,
+    virtual_child_tid: Tid,
+) -> Option<PendingThreadParent> {
+    if !pending
+        .get(&physical_child_tid)
+        .is_some_and(|parent| parent.virtual_child_tid == virtual_child_tid)
+    {
+        return None;
+    }
+    pending.remove(&physical_child_tid)
 }
 
 fn update_memory_hash(sysnum: i64, args: &[u64], read_memory: MemoryReader) {
@@ -801,7 +847,21 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
 /// Begins a new DynamoRIO application image and returns its generation.
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
+    READY_IMAGE.store(0, Ordering::Release);
+    ROOT_LOCAL_READY_IMAGE.store(0, Ordering::Release);
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Reports the native-client/external-runtime callback ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
+    reverie_dbt::DBT_RUNTIME_ABI_VERSION
+}
+
+/// Reports the exact callback structure size for the current ABI version.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_callbacks_size() -> usize {
+    std::mem::size_of::<reverie_dbt::DbtRuntimeCallbacks>()
 }
 
 /// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
@@ -814,31 +874,49 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
 /// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
-    let emit = callbacks.emit;
+    let emit_diagnostic = callbacks.emit;
+    let emit_evidence = callbacks.emit_evidence;
+    let protected_level = callbacks.evidence_log_level;
+    DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
-    emit_lifecycle_marker(emit, b"detcore-dbt: background client thread entered\n");
-    let tracing_active = init_dbt_tracing(emit);
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background client thread entered\n",
+    );
+    let tracing_active = init_dbt_tracing(emit_evidence);
+    if !protected_evidence_capture_ready(protected_level, tracing_active) {
+        emit_marker(
+            emit_diagnostic,
+            b"detcore-dbt: ERROR protected evidence subscriber installation failed\n",
+        );
+        unsafe { libc::_exit(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE) };
+    }
     let runtime = {
         let mut slot = RUNTIME.write().expect("Detcore DBT runtime lock poisoned");
         if slot.is_none() {
-            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore Config\n");
+            emit_lifecycle_marker(
+                emit_diagnostic,
+                b"detcore-dbt: constructing Detcore Config\n",
+            );
             let (mut config, source) = load_dbt_config();
             match source {
-                ConfigSource::Cli => {
-                    emit_lifecycle_marker(emit, b"detcore-dbt: using CLI-provided Detcore Config\n")
-                }
+                ConfigSource::Cli => emit_lifecycle_marker(
+                    emit_diagnostic,
+                    b"detcore-dbt: using CLI-provided Detcore Config\n",
+                ),
                 ConfigSource::ParseFallback => emit_marker(
-                    emit,
+                    emit_diagnostic,
                     b"detcore-dbt: WARNING could not parse HERMIT_DBT_DETCONFIG; using strict default\n",
                 ),
-                ConfigSource::Default => {
-                    emit_lifecycle_marker(emit, b"detcore-dbt: using strict default Detcore Config\n")
-                }
+                ConfigSource::Default => emit_lifecycle_marker(
+                    emit_diagnostic,
+                    b"detcore-dbt: using strict default Detcore Config\n",
+                ),
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
             // Config arrives via the CLI env above, but the panic flag comes from
@@ -871,9 +949,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
                 report_fd_is_available().then_some(UNSUPPORTED_SYSCALL_REPORT_FD);
             config.validate();
 
-            emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore GlobalState\n");
+            emit_lifecycle_marker(
+                emit_diagnostic,
+                b"detcore-dbt: initializing Detcore GlobalState\n",
+            );
             let global = GlobalState::init_for_external_scheduler(&config);
-            emit_lifecycle_marker(emit, b"detcore-dbt: GlobalState initialized\n");
+            emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
                 config,
                 global,
@@ -883,20 +964,62 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
         }
         Arc::clone(slot.as_ref().expect("Detcore DBT runtime was initialized"))
     };
-    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler ready\n");
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background runtime bootstrap ready\n",
+    );
     READY_IMAGE.store(image_generation, Ordering::SeqCst);
+    if !wait_for_root_local_ready(
+        image_generation,
+        &ROOT_LOCAL_READY_IMAGE,
+        &RUNTIME_SHUTDOWN,
+        || unsafe { (callbacks.idle)() },
+    ) {
+        return;
+    }
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: root local state ready; starting background scheduler\n",
+    );
     let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
             let line = format!("INFO detcore::scheduler: {event}\n");
-            unsafe { emit(line.as_ptr(), line.len()) };
+            unsafe { emit_diagnostic(line.as_ptr(), line.len()) };
         }
     });
     run_cooperative(
         runtime.global.run_external_scheduler(observer),
         callbacks.idle,
     );
-    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler completed\n");
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background scheduler completed\n",
+    );
+}
+
+/// Compatibility entry point for native clients using callback ABI version 1.
+///
+/// # Safety
+///
+/// `argument` must point to a valid version-1 callback structure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+    let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
+    let mut current = reverie_dbt::DbtRuntimeCallbacks {
+        emit: callbacks.emit,
+        idle: callbacks.idle,
+        panic_on_unsupported_syscalls: callbacks.panic_on_unsupported_syscalls,
+        unsupported_report_fd: callbacks.unsupported_report_fd,
+        emit_stdout: callbacks.emit_stdout,
+        emit_evidence: callbacks.emit,
+        evidence_log_level: 0,
+    };
+    unsafe {
+        reverie_dbt_runtime_background_init_v2(
+            (&mut current as *mut reverie_dbt::DbtRuntimeCallbacks).cast(),
+        )
+    };
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -904,6 +1027,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
 // TODO-HUMAN-REVIEW(PR-587): Confirm process-exit scheduler ownership.
 pub extern "C" fn reverie_dbt_runtime_process_exit() {
     READY_IMAGE.store(0, Ordering::Release);
+    ROOT_LOCAL_READY_IMAGE.store(0, Ordering::Release);
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
 }
 
@@ -949,61 +1073,62 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     write_registers: RegisterWriter,
 ) -> i32 {
     if defer_runtime != 0 {
-        unsafe {
-            scratch
-                .cast::<NativeThreadScratch>()
-                .write(NativeThreadScratch {
-                    branches: branch_count,
-                    observed_syscalls: 0,
-                    rewritten_syscalls: 0,
-                    runtime_state: std::ptr::null_mut(),
-                    pending_thread_clone: 0,
-                    thread_clone_flags: 0,
-                    thread_clone_ctid: 0,
-                    pending_thread_start: 0,
-                    virtual_pid: 0,
-                    virtual_ppid: 0,
-                    virtual_tid: 0,
-                    pending_virtual_child: 0,
-                    pending_clone_flags: 0,
-                });
-        }
+        // Reverie initializes the stable virtual identities before this
+        // callback. Initialize only Detcore-owned scratch fields so those
+        // identities survive until the delayed registration callback.
+        let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+        scratch.branches = branch_count;
+        scratch.observed_syscalls = 0;
+        scratch.rewritten_syscalls = 0;
+        scratch.runtime_state = std::ptr::null_mut();
+        scratch.pending_thread_clone = 0;
+        scratch.thread_clone_flags = 0;
+        scratch.thread_clone_ctid = 0;
+        scratch.pending_thread_start = 0;
         return 0;
     }
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
 
     let host_tid = tid;
     let host_pid = pid;
+    if host_tid <= 0 || host_pid <= 0 {
+        return -1;
+    }
+    let Some(det_tid) = dbt_scheduler_tid(scratch.virtual_tid) else {
+        return -1;
+    };
+    let Some(det_pid) = dbt_process_pid(scratch.virtual_pid) else {
+        return -1;
+    };
     let runtime = current_runtime();
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(Pid::from_raw(host_pid), &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let parent = if host_tid == host_pid {
         None
     } else {
-        let parent = PENDING_THREAD_PARENTS
-            .lock()
-            .expect("pending DBT thread parent lock poisoned")
-            .remove(&host_tid);
-        let Some(parent) = parent else {
+        let Some(parent) = take_pending_thread_parent(
+            &mut PENDING_THREAD_PARENTS
+                .lock()
+                .expect("pending DBT thread parent lock poisoned"),
+            host_tid,
+            det_tid,
+        ) else {
             return 1;
         };
         Some(parent)
     };
-    let Some(det_tid) = dbt_scheduler_tid(host_tid) else {
-        return -1;
-    };
     let parent_ref = parent
         .as_ref()
         .map(|parent| (parent.parent_tid, &parent.state));
-    let det_pid = Pid::from_raw(det_tid.into());
     let host_pid = Pid::from_raw(host_pid);
     let mut state = tool.init_thread_state(det_tid, parent_ref);
+    state.detpid = Some(DetTid::from_raw(det_pid.into()));
     if let Some(parent) = &parent {
         state.reseed_child_rngs(&parent.state, parent.rng_entropy);
     }
     let mut thread = Box::new(ThreadRuntime {
-        tid: det_pid,
+        tid: Pid::from_raw(det_tid.into()),
         state,
         initialized: false,
         post_exec_pending: host_tid == pid,
@@ -1011,7 +1136,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     if reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
-        det_pid,
+        Pid::from_raw(det_tid.into()),
         host_pid,
         branch_count,
         &mut thread.state,
@@ -1041,13 +1166,14 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 // TODO-HUMAN-REVIEW(PR-1060): Review deterministic child RNG identity allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     scratch: *mut c_void,
     context: *mut c_void,
     _parent_tid: i32,
     pid: i32,
     branch_count: u64,
     child_tid: i32,
+    virtual_child_tid: i32,
     child_tid_addr: u64,
     flags: u64,
     invoke_syscall: SyscallInvoker,
@@ -1074,7 +1200,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
         parent.state.clone_flags = None;
         return -1;
     };
-    let Some(child_scheduler_tid) = dbt_scheduler_tid(child_tid) else {
+    let Some(child_scheduler_tid) = dbt_scheduler_tid(virtual_child_tid) else {
         parent.state.clone_flags = None;
         return -1;
     };
@@ -1085,6 +1211,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
             child_tid,
             PendingThreadParent {
                 parent_tid: Tid::from_raw(parent.tid.into()),
+                virtual_child_tid: child_scheduler_tid,
                 rng_entropy,
                 state: parent_snapshot,
             },
@@ -1118,6 +1245,44 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
     }
     parent.state.clone_flags = None;
     0
+}
+
+/// Compatibility entry point for native clients using callback ABI version 1.
+///
+/// # Safety
+///
+/// The pointers and callbacks must satisfy the version-1 thread-created ABI.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+    scratch: *mut c_void,
+    context: *mut c_void,
+    parent_tid: i32,
+    pid: i32,
+    branch_count: u64,
+    child_tid: i32,
+    child_tid_addr: u64,
+    flags: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+) -> i32 {
+    unsafe {
+        reverie_dbt_runtime_thread_created_v2(
+            scratch,
+            context,
+            parent_tid,
+            pid,
+            branch_count,
+            child_tid,
+            child_tid,
+            child_tid_addr,
+            flags,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        )
+    }
 }
 
 /// Releases Detcore state owned by a DynamoRIO application thread.
@@ -1161,7 +1326,28 @@ fn resume_paused_runtime() {
     while RUNTIME_PAUSED.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-    READY_IMAGE.store(IMAGE_GENERATION.load(Ordering::Acquire), Ordering::Release);
+    let image_generation = IMAGE_GENERATION.load(Ordering::Acquire);
+    ROOT_LOCAL_READY_IMAGE.store(image_generation, Ordering::Release);
+    READY_IMAGE.store(image_generation, Ordering::Release);
+}
+
+fn prepare_runtime_after_failed_exec() {
+    if !RUNTIME_SHUTDOWN.load(Ordering::Acquire) {
+        resume_paused_runtime();
+        return;
+    }
+
+    // The native client stops the distinct scheduler process before exec so
+    // that process can publish its protected-evidence FINAL. A failed exec
+    // keeps the application image alive, so a replacement scheduler process
+    // will be started for the same image. Preserve the already-initialized
+    // local thread state, but do not advertise global readiness until that new
+    // scheduler has entered reverie_dbt_runtime_background_init_v2.
+    let image_generation = IMAGE_GENERATION.load(Ordering::Acquire);
+    READY_IMAGE.store(0, Ordering::Release);
+    RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
+    RUNTIME_PAUSED.store(false, Ordering::Release);
+    ROOT_LOCAL_READY_IMAGE.store(image_generation, Ordering::Release);
 }
 
 /// Restarts the existing scheduler after the kernel rejects a native exec.
@@ -1180,7 +1366,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, 
             .is_some(),
         "failed exec had no Detcore runtime"
     );
-    resume_paused_runtime();
+    prepare_runtime_after_failed_exec();
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1320,14 +1506,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
-    translate_self_identity_targets(
-        sysnum,
-        &mut dispatch_args,
-        scratch.virtual_pid,
-        scratch.virtual_tid,
-        pid,
-        tid,
-    );
+    if tid <= 0 || pid <= 0 {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
+    let Some(det_tid) = dbt_scheduler_tid(scratch.virtual_tid) else {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    };
+    let Some(det_pid) = dbt_process_pid(scratch.virtual_pid) else {
+        unsafe { result.write(-(Errno::EINVAL.into_raw() as i64)) };
+        TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    };
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBT prlimit64 input validation.
     if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
@@ -1376,6 +1569,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     if requires_native_lifecycle(sysnum) {
         if sysnum == libc::SYS_execve {
             READY_IMAGE.store(0, Ordering::Release);
+            ROOT_LOCAL_READY_IMAGE.store(0, Ordering::Release);
             RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
             while !RUNTIME_PAUSED.load(Ordering::Acquire) {
                 std::thread::yield_now();
@@ -1391,11 +1585,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     update_memory_hash(sysnum, raw_args, read_memory);
     let runtime = current_runtime();
-    let tid = Pid::from_raw(tid);
     let pid = Pid::from_raw(pid);
     let tool = runtime
         .tool
-        .get_or_init(|| Detcore::new(pid, &runtime.config));
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
     let syscall = Syscall::from_raw(
         Sysno::from(sysnum as i32),
         SyscallArgs::new(
@@ -1415,19 +1608,24 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
         }
-        let mut state = tool.init_thread_state(Tid::from_raw(tid.into()), None);
-        if scratch.virtual_tid > 0 {
-            state.set_open_file_creator(DetTid::from_raw(scratch.virtual_tid));
-        }
+        let mut state = tool.init_thread_state(det_tid, None);
+        state.detpid = Some(DetTid::from_raw(det_pid.into()));
+        state.set_open_file_creator(DetTid::from_raw(det_tid.into()));
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
         }
         scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid,
+            tid: Pid::from_raw(det_tid.into()),
             state,
             initialized: false,
             post_exec_pending: true,
         }));
+    }
+    if det_tid.as_raw() == det_pid.as_raw() {
+        // Start the scheduler only after the root Tool and local ThreadState
+        // exist. The thread-start hook can wait for the scheduler, so publish
+        // readiness immediately before entering that hook.
+        ROOT_LOCAL_READY_IMAGE.store(image_generation, Ordering::Release);
     }
     let thread = unsafe { &mut *scratch.runtime_state };
     let det_tid = thread.tid;
@@ -1586,6 +1784,42 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 mod tests {
     use super::*;
 
+    static RUNTIME_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn failed_exec_restarts_a_stopped_scheduler_without_publishing_global_readiness() {
+        let _guard = RUNTIME_STATE_TEST_LOCK.lock().unwrap();
+        let saved = (
+            IMAGE_GENERATION.load(Ordering::Acquire),
+            READY_IMAGE.load(Ordering::Acquire),
+            ROOT_LOCAL_READY_IMAGE.load(Ordering::Acquire),
+            RUNTIME_SHUTDOWN.load(Ordering::Acquire),
+            RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire),
+            RUNTIME_PAUSED.load(Ordering::Acquire),
+        );
+
+        IMAGE_GENERATION.store(23, Ordering::Release);
+        READY_IMAGE.store(23, Ordering::Release);
+        ROOT_LOCAL_READY_IMAGE.store(0, Ordering::Release);
+        RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+        RUNTIME_PAUSE_REQUESTED.store(true, Ordering::Release);
+        RUNTIME_PAUSED.store(true, Ordering::Release);
+        prepare_runtime_after_failed_exec();
+
+        assert_eq!(READY_IMAGE.load(Ordering::Acquire), 0);
+        assert_eq!(ROOT_LOCAL_READY_IMAGE.load(Ordering::Acquire), 23);
+        assert!(RUNTIME_SHUTDOWN.load(Ordering::Acquire));
+        assert!(!RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire));
+        assert!(!RUNTIME_PAUSED.load(Ordering::Acquire));
+
+        IMAGE_GENERATION.store(saved.0, Ordering::Release);
+        READY_IMAGE.store(saved.1, Ordering::Release);
+        ROOT_LOCAL_READY_IMAGE.store(saved.2, Ordering::Release);
+        RUNTIME_SHUTDOWN.store(saved.3, Ordering::Release);
+        RUNTIME_PAUSE_REQUESTED.store(saved.4, Ordering::Release);
+        RUNTIME_PAUSED.store(saved.5, Ordering::Release);
+    }
+
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {
         let first = dbt_child_rng_entropy(3, 1).unwrap();
@@ -1607,89 +1841,101 @@ mod tests {
     }
 
     #[test]
-    fn child_scheduler_identity_remains_the_host_tid() {
-        let host_tid = 42_001;
-        let scheduler_tid: i32 = dbt_scheduler_tid(host_tid).unwrap().into();
-        assert_eq!(scheduler_tid, host_tid);
+    fn scheduler_and_process_identities_require_positive_virtual_ids() {
+        let scheduler_tid: i32 = dbt_scheduler_tid(4).unwrap().into();
+        let process_pid: i32 = dbt_process_pid(3).unwrap().into();
+        assert_eq!(scheduler_tid, 4);
+        assert_eq!(process_pid, 3);
         assert_eq!(dbt_scheduler_tid(0), None);
         assert_eq!(dbt_scheduler_tid(-1), None);
+        assert_eq!(dbt_process_pid(0), None);
+        assert_eq!(dbt_process_pid(-1), None);
     }
 
     #[test]
-    fn self_identity_syscalls_use_host_identities() {
-        let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_tgsigqueueinfo,
-            &mut targeted,
-            3,
-            4,
-            10_003,
-            10_004,
+    fn pending_thread_parent_requires_physical_key_and_virtual_identity() {
+        let make_parent = |virtual_child_tid| {
+            let config = Config::default();
+            let tool: Detcore = Detcore::new(Pid::from_raw(3), &config);
+            PendingThreadParent {
+                parent_tid: Tid::from_raw(3),
+                virtual_child_tid: Tid::from_raw(virtual_child_tid),
+                rng_entropy: dbt_child_rng_entropy(3, 1).unwrap(),
+                state: tool.init_thread_state(Tid::from_raw(3), None),
+            }
+        };
+
+        let mut matching = HashMap::new();
+        matching.insert(42_001, make_parent(4));
+        assert!(take_pending_thread_parent(&mut matching, 42_001, Tid::from_raw(4)).is_some());
+        assert!(matching.is_empty());
+
+        let mut mismatching = HashMap::new();
+        mismatching.insert(42_001, make_parent(9));
+        assert!(take_pending_thread_parent(&mut mismatching, 42_002, Tid::from_raw(9)).is_none());
+        assert_eq!(mismatching.len(), 1);
+        assert!(take_pending_thread_parent(&mut mismatching, 42_001, Tid::from_raw(4)).is_none());
+        assert_eq!(mismatching.len(), 1);
+        assert!(take_pending_thread_parent(&mut mismatching, 42_001, Tid::from_raw(9)).is_some());
+        assert!(mismatching.is_empty());
+    }
+
+    #[test]
+    fn root_local_readiness_releases_only_the_matching_image_or_shutdown() {
+        let image_generation = 7;
+        let ready = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let idle_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_ready = Arc::clone(&ready);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_idle_count = Arc::clone(&idle_count);
+        let worker = std::thread::spawn(move || {
+            let mut reported_wait = false;
+            let result = wait_for_root_local_ready(
+                image_generation,
+                &worker_ready,
+                &worker_shutdown,
+                || {
+                    worker_idle_count.fetch_add(1, Ordering::Relaxed);
+                    if !reported_wait {
+                        entered_tx.send(()).unwrap();
+                        reported_wait = true;
+                    }
+                    std::thread::yield_now();
+                },
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("background barrier did not begin waiting");
+        ready.store(image_generation - 1, Ordering::Release);
+        while idle_count.load(Ordering::Acquire) < 2 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !worker.is_finished(),
+            "a stale image released the scheduler"
         );
-        assert_eq!(targeted[..2], [10_003, 10_004]);
-
-        let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process,
-            3,
-            4,
-            10_003,
-            10_004,
+        ready.store(image_generation, Ordering::Release);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("matching image did not release the scheduler")
         );
-        assert_eq!(process[0], 10_003);
+        worker.join().unwrap();
 
-        let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_tgsigqueueinfo,
-            &mut other,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other[..2], [5, 6]);
-
-        let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_rt_sigqueueinfo,
-            &mut process_group,
-            0,
-            0,
-            10_003,
-            10_004,
-        );
-        assert_eq!(process_group[0], 0);
-
-        let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
-        assert_eq!(prlimit[0], 10_003);
-
-        let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut prlimit_without_tid,
-            3,
-            0,
-            10_003,
-            0,
-        );
-        assert_eq!(prlimit_without_tid[0], 10_003);
-
-        let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
-        assert_eq!(current[0], 0);
-
-        let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(
-            libc::SYS_prlimit64,
-            &mut other_process,
-            3,
-            4,
-            10_003,
-            10_004,
-        );
-        assert_eq!(other_process[0], 5);
+        shutdown.store(true, Ordering::Release);
+        ready.store(0, Ordering::Release);
+        assert!(!wait_for_root_local_ready(
+            image_generation,
+            &ready,
+            &shutdown,
+            || panic!("shutdown should refuse without idling"),
+        ));
     }
 
     #[test]
@@ -2346,10 +2592,24 @@ mod tests {
             0
         }
 
-        let mut scratch = std::mem::MaybeUninit::<NativeThreadScratch>::uninit();
+        let mut scratch = NativeThreadScratch {
+            branches: 0,
+            observed_syscalls: 0,
+            rewritten_syscalls: 0,
+            runtime_state: std::ptr::null_mut(),
+            pending_thread_clone: 0,
+            thread_clone_flags: 0,
+            thread_clone_ctid: 0,
+            pending_thread_start: 0,
+            virtual_pid: 3,
+            virtual_ppid: 1,
+            virtual_tid: 3,
+            pending_virtual_child: 4,
+            pending_clone_flags: libc::CLONE_THREAD as u64,
+        };
         let status = unsafe {
             reverie_dbt_runtime_thread_init(
-                scratch.as_mut_ptr().cast(),
+                std::ptr::from_mut(&mut scratch).cast(),
                 std::ptr::null_mut(),
                 7,
                 7,
@@ -2363,7 +2623,6 @@ mod tests {
         };
 
         assert_eq!(status, 0);
-        let scratch = unsafe { scratch.assume_init() };
         assert_eq!(scratch.branches, 99);
         assert_eq!(scratch.observed_syscalls, 0);
         assert_eq!(scratch.rewritten_syscalls, 0);
@@ -2372,11 +2631,11 @@ mod tests {
         assert_eq!(scratch.thread_clone_flags, 0);
         assert_eq!(scratch.thread_clone_ctid, 0);
         assert_eq!(scratch.pending_thread_start, 0);
-        assert_eq!(scratch.virtual_pid, 0);
-        assert_eq!(scratch.virtual_ppid, 0);
-        assert_eq!(scratch.virtual_tid, 0);
-        assert_eq!(scratch.pending_virtual_child, 0);
-        assert_eq!(scratch.pending_clone_flags, 0);
+        assert_eq!(scratch.virtual_pid, 3);
+        assert_eq!(scratch.virtual_ppid, 1);
+        assert_eq!(scratch.virtual_tid, 3);
+        assert_eq!(scratch.pending_virtual_child, 4);
+        assert_eq!(scratch.pending_clone_flags, libc::CLONE_THREAD as u64);
     }
 
     #[test]
