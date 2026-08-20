@@ -59,7 +59,61 @@ Run commands from the repository root.
 cargo build --workspace
 ```
 
-The main binary is `target/debug/hermit`. A basic invocation is:
+The main binary is `target/debug/hermit`.
+
+### Agents run hermit through `./bin/safehermit`, not directly
+
+**This is how agents invoke hermit.** Use the parent repository's wrapper:
+
+```bash
+./bin/safehermit run -- <program> [args...]              # default binary
+./bin/safehermit /tmp/my-patched-hermit run -- <program> # any binary, by path
+```
+
+It is identical to hermit for all purposes — same arguments, same stdout and
+stderr, same exit code — and adds bounds plus a machine-readable report of which
+bounds it could and could not apply. Its own output goes to stderr prefixed
+`safehermit:` and never mixes into hermit's streams.
+
+Why this exists: on 2026-08-17 three hermit runs each wrote ~4.5 TB of stderr
+over 28+ hours and filled the filesystem, taking down the orchestrator and every
+running agent. The binary in that incident was `/tmp/hermit-ers-patched`, invoked
+by absolute path — which is why safehermit takes the binary as an argument rather
+than being a shim named `hermit` on `PATH`. Absolute-path execution never
+consults `PATH`, so a shim would have missed exactly that case.
+
+What it applies, each reported on every run as `APPLIED` or `NOT_APPLIED` with a
+reason:
+
+| field | meaning |
+| --- | --- |
+| `bound.wall` | wall deadline on a transient systemd unit (`RuntimeMaxSec`) |
+| `bound.cgroup` | `MemoryMax`, `MemorySwapMax=0` |
+| `bound.bytes` | low log cap; **lethal** — the run is cgroup-killed at the cap |
+| `bound.disk` | per-run subvolume + qgroup via `scripts/bounded-run-space` |
+| `binary`, `binary_sha256`, `binary_source` | which binary ran, and which precedence layer chose it |
+| `log_dir`, `log_file` | where the output went |
+
+Two behaviours worth knowing before you rely on them:
+
+- **The deadline is a cgroup kill, not `timeout`.** hermit's container init is a
+  namespace PID 1 with no `SIGTERM` handler, and the kernel discards
+  default-disposition signals to it, so `timeout` and `timeout --kill-after`
+  cannot reap a hung run. Do not substitute them.
+- **The log cap kills the run.** A spinning program should die from its timeout
+  or from the log hitting a low cap; the kept bytes are the evidence. safehermit
+  does not quiet hermit's log targets, because a quiet emitter hides the signal
+  that a run is stuck.
+
+Exit codes are hermit's own, except `124` (deadline fired) and `125` (log cap
+fired). If a bound cannot be applied — no systemd, no btrfs quotas — the run
+still proceeds and says so; it never runs silently unbounded.
+
+Running hermit directly is still correct for interactive debugging of a single
+short command. Anything long-running, unattended, or spawned by another agent
+goes through the wrapper.
+
+A direct invocation, for reference:
 
 ```bash
 ./target/debug/hermit run -- <program> [args...]
