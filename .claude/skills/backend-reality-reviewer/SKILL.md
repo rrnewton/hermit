@@ -86,7 +86,13 @@ repository:
 - Building on a feature branch = in progress.
 - PR opened = in review.
 - Merged to main + `hermit run --backend X` works = DONE.
-- Never close a backend milestone task for work on an unlanded branch.
+- Never report a backend milestone as delivered for work on an unlanded branch.
+  Closing the task is not the claim — the tags are. At implementation handoff,
+  post the PR and exact SHA, add the `implemented` tag, and close your own task
+  (`tg update <task> --status closed`). `implemented` without `landed` is what
+  keeps the unlanded backend visible in the drain; a closed task still tagged
+  `implemented` is NOT a delivered backend. Add `landed` once the commit is on
+  `main`.
 
 ## Deep Code-Path Audit
 
