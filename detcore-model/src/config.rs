@@ -507,6 +507,32 @@ pub struct Config {
     #[clap(long)]
     pub detlog_regs: bool,
 
+    /// Log a hash of each syscall's OUTPUT BUFFER, taken at the syscall boundary from the
+    /// address and length in the syscall's own arguments.
+    ///
+    /// WHAT IT SEES THAT THE MAPPING HASHES DO NOT. `--detlog-heap` and `--detlog-stack` hash a
+    /// whole named mapping, so their coverage is decided by where the guest happened to ALLOCATE
+    /// a buffer. Measured, three runs per cell, same netlink exchange with only the receive
+    /// buffer's home changed: a `[stack]` buffer is missed by `--detlog-heap`, a `[heap]` buffer
+    /// is missed by `--detlog-stack`, and a BSS/static or anonymous-`mmap` buffer is missed by
+    /// BOTH even with both enabled. Anonymous `mmap` is where glibc puts any `malloc` above the
+    /// 128 KiB `M_MMAP_THRESHOLD`. Reading the extent out of the syscall arguments makes the
+    /// buffer's home irrelevant.
+    ///
+    /// WHY IT IS NOT REDUNDANT WITH `--verify`. A syscall whose buffer is a bare pointer in
+    /// Reverie prints the ADDRESS, not the contents, so a `recvmsg` returning a stable
+    /// `Ok(1468)` whose payload varies produces a character-identical record and `--verify`
+    /// reports `bitwise_parity: true`. 44.1% of the syscalls in a QEMU/Linux boot move bytes
+    /// through such a buffer.
+    ///
+    /// COST is proportional to bytes actually moved, NOT to syscall count or mapping size:
+    /// ~0.75 s per GB of guest I/O. A QEMU/Linux boot moves 139.1 MB through these buffers,
+    /// against the 10.9 TB `--detlog-heap` hashes over the same run.
+    ///
+    /// NAME IS PROVISIONAL: `io-buffers` is the owner's candidate and is not settled.
+    #[clap(long)]
+    pub detlog_io_buffers: bool,
+
     /// Sampling cadence for `--detlog-regs`: hash every Nth guest-logical-control point.
     ///
     /// COST TIER. 1 (the default) is the FULL tier -- every control point hashed -- and is what a
@@ -895,6 +921,9 @@ impl fmt::Display for Config {
         }
         if self.detlog_regs_cadence != /* default */ 1 {
             write!(f, " --detlog-regs-cadence={}", self.detlog_regs_cadence)?;
+        }
+        if self.detlog_io_buffers {
+            write!(f, " --detlog-io-buffers")?;
         }
         if self.sysinfo_uptime_offset != /* default */ 120 {
             write!(f, " --sysinfo-uptime-offset={}", self.sysinfo_uptime_offset)?;

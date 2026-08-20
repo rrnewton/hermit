@@ -45,6 +45,7 @@ mod dirents;
 #[allow(missing_docs)]
 pub mod edit_distance;
 mod fd;
+mod io_buffers;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
@@ -2466,6 +2467,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.detlog_registers(guest, &control_point_regs, regs_seq);
         }
         self.detlog_memory_maps(guest)?;
+        // Same control point again, for the bytes this syscall moved through a guest buffer.
+        // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
+        // arguments, so it does not matter whether the buffer lives on the stack, in the brk
+        // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
+        // can see. Only successful calls moved anything.
+        if let Ok(ret) = &res
+            && self.cfg.detlog_io_buffers
+        {
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+        }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
             trace_schedevent(
