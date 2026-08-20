@@ -28,6 +28,7 @@ from demo_common import (  # noqa: E402
     print_header,
     publish_anchor,
     publish_file_atomic,
+    report_safehermit,
     run_checked,
     save_metadata,
     stop_process,
@@ -45,6 +46,24 @@ HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
 ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "600"))
+# Run hermit through the bounded entry point rather than bare. Three runs at
+# ~45 GiB/h once wrote 38 GiB of orphaned hermit-info.log in a single session and
+# tripped the disk headroom alarm twice; start_new_session below reaps the tree the
+# demo knows about, but nothing bounded the bytes.
+SAFEHERMIT = ROOT / "bin/safehermit"
+# MEASURED ON THIS DEMO, NOT GUESSED. Four healthy full boots on devbig014 (hermit
+# 0.2.0 g770b95c505fa, QEMU 10.1.2) wrote 253,386,127 / 253,585,587 / 253,643,026 /
+# 253,643,032 bytes of hermit-info.log in 50-54s of wall -- about 5.4 MiB/s, and a
+# spread of 0.1%, so unlike demo 6 this figure is stable across runs. The cap is
+# 3.17x the largest of them.
+#
+# THE DEFAULT WOULD HAVE BEEN LETHAL AND IT IS WORTH SAYING BY HOW MUCH:
+# safehermit's built-in cap is 64 MiB, which this demo passes roughly a quarter of
+# the way through the boot, so wiring it unchanged would kill every run and the
+# likely reaction would be to unwire the bound rather than raise it. A cap below
+# what a healthy run needs is worse than no cap, because it converts a working demo
+# into an unexplained kill.
+MAX_LOG_BYTES = int(os.environ.get("QEMU_MAX_LOG_BYTES", str(768 * 1024 * 1024)))
 SNAPSHOT_NAME = os.environ.get("QEMU_SNAPSHOT_NAME", "hermit-boot")
 # By default each concurrent run keeps its snapshot disk inside its own private
 # working directory (computed in main); QEMU_SNAPSHOT_DISK forces a fixed path.
@@ -148,6 +167,7 @@ def main() -> int:
     # boot markers.
     serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
+    safehermit_report = run_dir / "safehermit-report.txt"
     snapshot_disk = (
         Path(SNAPSHOT_DISK_OVERRIDE)
         if SNAPSHOT_DISK_OVERRIDE
@@ -184,6 +204,20 @@ def main() -> int:
             command_image,
         )
         command = [
+            str(SAFEHERMIT),
+            # Keep safehermit's own report out of info_log. info_log is hashed into
+            # run-metadata.json (info_log_sha256) and compare_runs line-diffs two
+            # runs of it, and six report lines embed a run id built from a UTC
+            # timestamp and safehermit's pid. Verified against the real comparator:
+            # hermit_log_diff on two logs identical apart from those lines reports
+            # "first divergence at line 1 ... run_id". Without this the repeat
+            # verification below fails on every run, for a reason that is not hermit.
+            "--sh-report",
+            str(safehermit_report),
+            "--sh-max-log-bytes",
+            str(MAX_LOG_BYTES),
+            "--sh-deadline",
+            str(TIMEOUT + 60),
             str(HERMIT),
             "run",
             "--strict",
@@ -224,6 +258,13 @@ def main() -> int:
         ]
         environment = os.environ.copy()
         environment["RUST_LOG"] = LOG_FILTER
+        # safehermit keeps its own capped copy of hermit's stderr. Point it inside
+        # this run's directory so it is archived and pruned with the run, instead of
+        # accumulating under a shared ignored/safehermit that nothing prunes. This
+        # does mean a healthy run now stores the log TWICE -- about 242 MiB each --
+        # which is the price of the cap being enforced on a stream the demo would
+        # otherwise write unbounded.
+        environment["SAFEHERMIT_LOG_ROOT"] = str(run_dir / "safehermit")
         # The guest controller imports demo_common; letting CPython write its
         # bytecode cache into the shared demos/lib/__pycache__ makes concurrent
         # runs race on the same .pyc (one wins openat(O_CREAT|O_EXCL), the other
@@ -251,6 +292,10 @@ def main() -> int:
                 stream_path=serial_log,
                 first_output_label="Waiting for first serial line",
             )
+        # Surface what the wrapper concluded. --sh-report keeps its lines out of the
+        # hashed and line-diffed hermit log, which means nothing shows them unless the
+        # caller does; and "status 125" on its own does not say a byte cap fired.
+        report_safehermit(safehermit_report, return_code)
         if return_code != 0:
             raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
         if not snapshot_exists(snapshot_disk, SNAPSHOT_NAME):
