@@ -329,6 +329,101 @@ Verify all of the following; a failure is a defect to fix before committing:
 To unstage a misplaced file: `git restore --staged <path>`, move it to its
 correct home, then commit.
 
+## Never Work Directly In A Shared Checkout
+
+`hermit/` and the `dev-hermit` parent are **shared**: several agents read and
+build from them at the same time. Switching the branch of a shared checkout, or
+leaving edits in it, is not a private act — it changes what every other agent
+sees, mid-build.
+
+This is measured, not hypothetical. Over one 2.5-hour window on 2026-08-19 the
+shared checkouts were switched at least **6 times in the parent and 4 times in
+hermit**. Each switch produced: a health tick reporting dirty files that belonged
+to nobody (the file went clean again when git rewrote it on the way back), and a
+window in which a concurrent reader got a tree that was *neither* branch. The
+same window is how three agents' branches came to carry an unrelated 608-file
+commit they never intended: each was cut from whatever the checkout happened to
+be on. Separately, `hermit-cli/src/bin/hermit/run.rs` was reported dirty in the
+shared checkout by a tick that sampled during exactly such a switch.
+
+**The rule: never `git checkout`, `git switch`, `git stash`, or commit inside a
+shared checkout.** Use one of the two methods below. Both cost nothing and
+neither can disturb another agent.
+
+### Method A — a worktree (use this when you need to build or run tests)
+
+```bash
+cd ~/work/dev-hermit/hermit                 # or the parent; never switch it
+W=/var/tmp/my-change.$$                     # outside the repo
+git worktree add -b my-branch_$(date +%Y%m%d) "$W" origin/main
+cd "$W"
+# ...edit, build, test here. Give it its own target dir so you do not
+# fight the shared build cache:
+CARGO_TARGET_DIR="$W/tgt" cargo build --release -p hermit
+
+To RUN what you built, do not invoke the binary directly -- go through
+`./bin/safehermit` (see *Build And Run*), which applies the wall, memory, byte
+and disk bounds and reports which of them it could not apply. This section is
+about where you EDIT and COMMIT; that one is about how you RUN. Both are needed
+and neither substitutes for the other.
+git add -A && git commit
+git push -u origin my-branch_$(date +%Y%m%d)
+cd - && git worktree remove --force "$W"    # tgt/ dies with it
+```
+
+`git worktree list` shows every live worktree; prune stale ones with
+`git worktree prune`.
+
+### Method B — a temporary index (use this when you only need to commit files)
+
+Builds a commit directly on `origin/main` **without any checkout at all**, so the
+shared working tree is never read, written, or switched. This is the cheapest
+correct way to land a file you have already edited and tested.
+
+```bash
+export GIT_INDEX_FILE=/tmp/.idx.$$          # NOT the repo index
+git read-tree origin/main                   # base explicitly on the ref you mean
+for f in path/to/one.rs path/to/two.rs; do
+  blob=$(git hash-object -w "$f")
+  mode=$(test -x "$f" && echo 100755 || echo 100644)
+  git update-index --add --cacheinfo $mode,$blob,"$f"
+done
+tree=$(git write-tree)
+commit=$(printf '%s' "$MSG" | git commit-tree "$tree" -p origin/main)
+git branch -f my-branch_$(date +%Y%m%d) "$commit"
+unset GIT_INDEX_FILE; rm -f /tmp/.idx.$$
+git push -u origin my-branch_$(date +%Y%m%d)
+```
+
+Note this commits the file *as it currently is on disk*, so it works even when
+your edits are sitting in the shared tree — which is how to rescue them.
+
+### If you already edited the shared checkout
+
+Do **not** revert. Preserve first, and verify byte-identity before touching
+anything:
+
+```bash
+git status --porcelain                      # exactly what is yours?
+# preserve via Method B, push, then:
+git hash-object path/to/file                # working-tree blob
+git rev-parse origin/my-branch:path/to/file # what you just pushed
+# only when those two hashes MATCH:
+git checkout HEAD -- path/to/file           # tracked file
+rm -f path/to/new-file                      # untracked file
+```
+
+Leaving a shared checkout dirty blocks the parent submodule snapshot for
+everyone, so finishing this step is part of the change, not cleanup afterwards.
+
+### Checklist
+
+- Shared checkout still on its original branch? `git branch --show-current`
+- Shared checkout clean of *your* files? `git status --porcelain`
+- Commit based on the ref you intended, not on whatever was checked out?
+  `git rev-parse my-branch^` should equal `git rev-parse origin/main`
+- Worktree removed when done? `git worktree list`
+
 ## Contributing And Pull Requests
 
 Primary development happens in the `rrnewton/hermit` fork. Configure `origin`
