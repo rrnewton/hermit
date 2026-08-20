@@ -1108,6 +1108,101 @@ fn display_runopts4() {
 }
 
 #[test]
+fn evidence_paths_under_tmp_are_rejected_rather_than_silently_swallowed() {
+    // REGRESSION. Both flags are opened inside the container, so a path under the guest's
+    // private /tmp used to produce no file, exit 0, and no message. Measured before this
+    // guard, same binary and command, only the path differing:
+    //   --record-preemptions-to /tmp/rp.json     -> no file
+    //   --record-preemptions-to /var/tmp/rp.json -> 26,803 bytes
+    // The missing file was read first as "the flag is broken" and then as "no preemptions
+    // occurred". Both readings were wrong and neither was distinguishable from the truth,
+    // because the run said nothing. Silence is the defect being pinned here, not the write.
+    let global_tmp_log = GlobalOpts {
+        log: None,
+        log_file: Some(PathBuf::from("/tmp/evidence.log")),
+        backend: None,
+    };
+    let quiet = GlobalOpts {
+        log: None,
+        log_file: None,
+        backend: None,
+    };
+
+    let run = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    let err = run
+        .reject_evidence_paths_shadowed_by_guest_tmp(&global_tmp_log)
+        .expect_err("--log-file under /tmp must be refused, not silently discarded");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--log-file"),
+        "message must name the flag: {msg}"
+    );
+    assert!(
+        msg.contains("/var/tmp") || msg.contains("--tmp=/tmp"),
+        "message must offer a way out, not just a refusal: {msg}"
+    );
+
+    let recorder = RunOpts::parse_from([
+        "fakehermit",
+        "--record-preemptions-to",
+        "/tmp/preempt.json",
+        "fakeprog",
+    ]);
+    assert!(
+        recorder
+            .reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
+            .is_err(),
+        "--record-preemptions-to under /tmp must be refused"
+    );
+}
+
+#[test]
+fn evidence_paths_outside_the_guest_tmp_are_left_alone() {
+    // The guard must not become its own outage. These are the cases that DID work before it
+    // and must keep working, including the escape hatch the error message advertises --
+    // promising `--tmp=/tmp` and then still refusing would be worse than saying nothing.
+    let quiet = GlobalOpts {
+        log: None,
+        log_file: None,
+        backend: None,
+    };
+    let outside = GlobalOpts {
+        log: None,
+        log_file: Some(PathBuf::from("/var/tmp/evidence.log")),
+        backend: None,
+    };
+
+    let plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    assert!(
+        plain
+            .reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
+            .is_ok(),
+        "a run with no evidence flags must be unaffected"
+    );
+    assert!(
+        plain
+            .reject_evidence_paths_shadowed_by_guest_tmp(&outside)
+            .is_ok(),
+        "/var/tmp is a real host directory here, not the guest's private tmp"
+    );
+
+    // `--tmp=/tmp` shares the host's /tmp with the guest, so /tmp paths genuinely work.
+    let shared = RunOpts::parse_from([
+        "fakehermit",
+        "--tmp=/tmp",
+        "--record-preemptions-to",
+        "/tmp/preempt.json",
+        "fakeprog",
+    ]);
+    assert!(
+        shared
+            .reject_evidence_paths_shadowed_by_guest_tmp(&quiet)
+            .is_ok(),
+        "--tmp=/tmp is the documented escape hatch and must not be refused"
+    );
+}
+
+#[test]
 fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
     let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     normal.validate_args_with_perf_support(true).unwrap();
@@ -1884,6 +1979,7 @@ impl RunOpts {
         if self.verify {
             validate_log_level(global)?;
         }
+        self.reject_evidence_paths_shadowed_by_guest_tmp(global)?;
         if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
         } else if self.verify {
@@ -1992,6 +2088,60 @@ impl RunOpts {
 
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
+    /// Refuse an evidence path that the guest's private `/tmp` will swallow.
+    ///
+    /// `--log-file` and `--record-preemptions-to` are both opened INSIDE the container.
+    /// When Hermit gives the guest an isolated `/tmp`, a path under `/tmp` is created in
+    /// a mount namespace that is torn down with the run: the file the operator asked for
+    /// never appears on the host, the exit status is still 0, and nothing is printed.
+    ///
+    /// Measured 2026-08-19, same binary and same command, only the path differing:
+    ///   `--record-preemptions-to /tmp/rp.json`      -> no file
+    ///   `--record-preemptions-to /var/tmp/rp.json`  -> 26,803 bytes
+    ///   `--log-file /tmp/lf.log`                    -> no file
+    ///   `--log-file /var/tmp/lf.log`                -> 10,092 bytes
+    ///
+    /// That cost real time: the missing files were read as "the flag is broken" and then
+    /// as "no preemptions occurred", and a chaos investigation was reported on that basis.
+    /// Both readings were wrong, and neither was distinguishable from the truth at the
+    /// time, because the run said nothing. These are EVIDENCE paths; silently producing
+    /// no evidence is the worst available outcome for a flag whose only job is to produce
+    /// some. Fail closed instead, and name the fix in the message.
+    fn reject_evidence_paths_shadowed_by_guest_tmp(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(), Error> {
+        // With `--tmp=/tmp` (or no isolation at all) the guest writes to the host's real
+        // /tmp and these paths work, so only complain when /tmp is actually remapped.
+        let tmp_is_remapped =
+            self.tmp.as_deref() != Some(Path::new(TMP_DIR)) || !self.bind.is_empty();
+        if !tmp_is_remapped {
+            return Ok(());
+        }
+        for (flag, path) in [
+            ("--log-file", global.log_file.as_deref()),
+            (
+                "--record-preemptions-to",
+                self.det_opts.det_config.record_preemptions_to.as_deref(),
+            ),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            if path_resolution_visits_prefix(path, Path::new(TMP_DIR))? {
+                anyhow::bail!(
+                    "{flag}={} resolves through {TMP_DIR}, which Hermit replaces with the \
+                     guest's private /tmp. The file would be written inside the container and \
+                     discarded when it exits, leaving no output and no error. Write it outside \
+                     {TMP_DIR} (for example /var/tmp or the current directory), or pass \
+                     --tmp={TMP_DIR} to share the host's /tmp with the guest.",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_args(&mut self) -> Result<(), Error> {
         let perf_supported = match self.selected_backend() {
             Backend::Ptrace | Backend::Liteinst | Backend::E9patch => {
