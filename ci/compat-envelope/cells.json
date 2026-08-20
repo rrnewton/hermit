@@ -7817,16 +7817,6 @@
       "test": "backend-parity-c/mmap-layout-pointer-order",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/mmap-layout-pointer-order",
-      "mode": "verify",
-      "backend": "ptrace",
       "enabled": true,
       "status": "green",
       "observations": []
@@ -7836,6 +7826,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/mmap-layout-pointer-order",
       "mode": "verify",
+      "backend": "ptrace",
+      "enabled": true,
+      "status": "green",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/mmap-layout-pointer-order",
+      "mode": "verify",
       "backend": "sabre",
       "enabled": false,
       "status": "red",
@@ -13897,8 +13897,8 @@
       "test": "backend-parity-c/stat-metadata-identity",
       "mode": "verify",
       "backend": "liteinst",
-      "enabled": false,
-      "status": "red",
+      "enabled": true,
+      "status": "green",
       "observations": []
     },
     {

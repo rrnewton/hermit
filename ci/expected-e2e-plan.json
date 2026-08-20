@@ -295,6 +295,13 @@
       "test": "backend-parity-c/mknod-special"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mmap-layout-pointer-order"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -503,6 +510,13 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/sockname-unnamed"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/stat-metadata-identity"
     },
     {
       "backend": "ptrace",
