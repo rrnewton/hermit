@@ -13,6 +13,14 @@ else
     hermit="$1"
 fi
 
+# The guest walks hermit's own source tree. Prefer this repository's layout and
+# fall back to the Buck-internal one, so the script runs both in an OSS checkout
+# and under Meta's internal harness. Before this it hardcoded only the internal
+# path, so `set -e` killed the run on the very first hermit invocation in any
+# public checkout -- which is why these assertions had never executed here.
+src_dir=./hermit-cli/src
+[ -d "$src_dir" ] || src_dir=./hermetic_infra/hermit/hermit-cli/src
+
 tmpdir=$(mktemp -d)
 log1=$(mktemp -p "$tmpdir")
 log2=$(mktemp -p "$tmpdir")
@@ -24,12 +32,12 @@ trap on_exit EXIT
 
 RUST_LOG=detcore=trace "$hermit" --log-file="$log1".log run --bind="$tmpdir" --base-env=minimal \
   --record-preemptions-to="$log1".trace \
-  -- bash -c 'find ./hermetic_infra/hermit/hermit-cli/src'
+  -- bash -c "find $src_dir"
 
 RUST_LOG=detcore=trace "$hermit" --log-file="$log2".log run --bind="$tmpdir" --base-env=minimal \
   --replay-schedule-from="$log1".trace \
   --record-preemptions-to="$log2".trace \
-  -- bash -c 'find ./hermetic_infra/hermit/hermit-cli/src'
+  -- bash -c "find $src_dir"
 
 wc "$log1".log "$log2".log "$log1".trace "$log2".trace
 
