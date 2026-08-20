@@ -236,7 +236,8 @@ PY
     [ -n "$allowed_cpus" ] && diag "core pin: --cores $cores -> AllowedCPUs=$allowed_cpus"
   fi
 
-  local unit="hermit-box-run-$$-$(date +%s%N).scope"
+  local unit
+  unit="hermit-box-run-$$-$(date +%s%N).scope"
   local -a sr=(systemd-run --user --scope --quiet --unit="$unit"
                --description="hermit-box-run passthrough: $*")
   [ -n "$allowed_cpus" ] && sr+=(-p "AllowedCPUs=$allowed_cpus")
@@ -257,8 +258,9 @@ PY
   local runner_pid=$!
 
   # Resolve the scope's cgroup path (may take a beat to register).
-  local cg="" cgpath="" i
-  for i in $(seq 1 40); do
+  local cg="" cgpath=""
+  # `_` because the counter bounds the retry loop and is never read.
+  for _ in $(seq 1 40); do
     cg="$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null || true)"
     if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cpu.stat" ]; then
       cgpath="/sys/fs/cgroup$cg"; break
