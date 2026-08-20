@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# latesthermit -- build hermit, then run it through safehermit.
+#
+# WHY THIS IS A SEPARATE COMMAND AND NOT A FLAG ON safehermit
+# ===========================================================
+# safehermit deliberately has no binary resolution: the path is always its first
+# argument, so the choice of binary is visible at every call site. That protects
+# a frozen demo pin from being silently replaced by a fresh build. But it creates
+# the opposite hazard -- somebody iterating on hermit forgets to rebuild and
+# spends an afternoon testing yesterday's binary.
+#
+# Two commands solve both without either having a hidden default:
+#
+#     safehermit   <path> ...      you name the binary; nothing is built
+#     latesthermit ...             built from source, then delegated
+#
+# The fresh-versus-pinned decision is made by WHICH COMMAND YOU TYPE, and either
+# way a reader of the call site can see which one it was.
+#
+# THE FAILURE THIS COMMAND EXISTS TO NOT HAVE
+# ===========================================
+# A `latesthermit` that quietly runs a stale target/release/hermit when the build
+# fails is the most confusing possible outcome -- worse than no command at all,
+# because the NAME PROMISES FRESHNESS. It is also the natural thing to write if
+# you do not check the build's exit status. So:
+#
+#   * the build's exit status is checked, and a failure is FATAL. There is no
+#     fallback to an existing binary, not even one that is present and working.
+#   * if the binary is missing after a "successful" build, that is also fatal.
+#   * the resolved path and its sha256 are PRINTED before the run, so a reader
+#     knows which bytes ran without inferring it from a timestamp.
+#
+# It delegates every bound to safehermit rather than reimplementing any of them,
+# so the two can never drift.
+#
+# USAGE
+#   latesthermit run -- ./prog                     # release build (default)
+#   latesthermit --lh-debug run -- ./prog          # debug build
+#   latesthermit --sh-deadline 60 run -- ./prog    # --sh-* flags pass through
+#
+# EXIT CODES
+#   whatever safehermit returns (which is hermit's own, or 124/125/126)
+#   2   build failure, or a usage error here
+set -uo pipefail
+
+PROG=latesthermit
+say(){ printf '%s: %s\n' "$PROG" "$*" >&2; }
+die(){ say "$*"; exit 2; }
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SAFEHERMIT="$ROOT/bin/safehermit"
+[ -x "$SAFEHERMIT" ] || die "cannot find $SAFEHERMIT -- latesthermit delegates to it and will not run without it"
+
+profile=release
+passthrough=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --lh-debug)   profile=debug; shift ;;
+        --lh-release) profile=release; shift ;;
+        --lh-help|-h) sed -n '2,/^set -uo pipefail/{/^set -uo pipefail/d;p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --sh-*)       passthrough+=("$1"); shift
+                      # --sh-* flags that take a value carry it along
+                      case "${passthrough[-1]}" in
+                          *=*) ;;
+                          --sh-no-deadline) ;;
+                          *) [ $# -ge 1 ] && { passthrough+=("$1"); shift; } ;;
+                      esac ;;
+        *) break ;;
+    esac
+done
+[ $# -ge 1 ] || die "no hermit arguments given (try --lh-help)"
+
+# ---------------------------------------------------------------- build
+case "$profile" in
+    release) build=(cargo build --release -p hermit); out="$ROOT/target/release/hermit" ;;
+    debug)   build=(cargo build           -p hermit); out="$ROOT/target/debug/hermit" ;;
+esac
+say "building: ${build[*]}  (cwd $ROOT)"
+if ! ( cd "$ROOT" && "${build[@]}" >&2 ); then
+    # FATAL, DELIBERATELY. Falling back to whatever is lying in target/ would run
+    # a stale binary under a name that promises a fresh one.
+    die "BUILD FAILED -- refusing to fall back to an existing binary. A command called '$PROG' must never run a stale one. Fix the build, or use: safehermit <path> ..."
+fi
+[ -x "$out" ] || die "build reported success but $out is missing or not executable -- refusing to guess at another binary"
+
+sha="$(sha256sum "$out" 2>/dev/null | cut -d' ' -f1)"; [ -n "$sha" ] || sha=unavailable
+say "built=$out"
+say "built_sha256=$sha"
+say "delegating to safehermit (all bounds come from there, none are reimplemented here)"
+
+exec "$SAFEHERMIT" "${passthrough[@]}" "$out" "$@"

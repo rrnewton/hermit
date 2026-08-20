@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# bounded-run-space — give one unit of work its own bounded place to write.
+#
+# WHAT THIS IS
+# ------------
+# Creates a btrfs subvolume with a qgroup limit, hands back its path, reports what
+# was used, and tears it down. The unit of bounding equals the unit of work, so a
+# run cannot exceed its allowance no matter which log target someone enables, and
+# cleanup is exact: delete the subvolume, and qgroup exclusive bytes say what came
+# back.
+#
+# WHY THIS EXISTS. On 2026-08-17..19 three hermit invocations wrote ~4.5 TB of
+# stderr each and filled the device. cgroup-v2 cannot prevent that: it has no
+# disk-SPACE control at all, and io.max is bandwidth, not bytes at rest. A qgroup
+# is the only mechanism here that bounds bytes at rest.
+#
+# MEASUREMENTS THIS IS BUILT ON (2026-08-19, 512 MiB loopback, compress=zstd:3 to
+# match /data; every number re-derived locally rather than inherited):
+#
+#   QGROUPS COUNT COMPRESSED, ON-DISK BYTES -- not logical. A 16 MiB max_rfer
+#   passed 513,747,600 LOGICAL bytes of the incident's own repeated log lines
+#   (490 MiB, 30.6x) before failing. qgroup referenced settled at 15.98 MiB.
+#   CONSEQUENCE FOR WHOEVER SETS --limit: this is a DISK number. "64M" buys a
+#   1-2 GB log file, which still costs real time to read, copy and grep.
+#
+#   THE ERRNO IS EDQUOT (122), NOT ENOSPC (28). ENOSPC is what a genuinely full
+#   filesystem gives. Both occur, on different code paths; a handler needs both.
+#
+#   COST IS NEGLIGIBLE: create + limit + delete measured at 2.1 ms of actual btrfs
+#   work over 20 iterations. Each `sudo` fork costs 11.3 ms, five times more than
+#   the work. Privilege is the cost here, not time.
+#
+# THE FAILURE MODE THIS IS DESIGNED AGAINST IS SILENCE, NOT HANGING. Measured on
+# hermit 0.2.0 across nine runs: it never hung. It either died with a bare exit 101
+# whose panic message could not be written (because the sink that filled WAS
+# stderr), or -- with --log-file -- completed in the same 26.0s as an unbounded
+# control, exit 1, guest output correct, and NOT ONE WORD about the log having been
+# truncated. On a full filesystem that path exited 0 with no log at all. A run that
+# reports success while its evidence is silently missing is worse than one that
+# hangs, because a hang gets investigated. So the bounded thing cannot be trusted to
+# report its own truncation: `report` below exists to do it from the outside.
+#
+# TWO TRAPS THIS ENCODES, both measured:
+#
+#   1. `btrfs qgroup limit` CANNOT BE TRUSTED BY ITS EXIT CODE ALONE for the
+#      property we care about. We therefore READ THE LIMIT BACK off the live
+#      qgroup and only report BOUNDED if the readback matches. A limit that was
+#      requested but not applied is precisely the "looks bounded, is not" failure
+#      this tool exists to prevent.
+#   2. NON-ROOT CAN CREATE A SUBVOLUME BUT CANNOT DELETE IT (create exit 0, delete
+#      exit 1, "Operation not permitted"). Creating without being able to destroy
+#      leaks a subvolume per run forever, so this refuses to create unless it can
+#      also verify it can clean up: everything goes through `sudo -n`.
+#
+# UNBOUNDED IS ALWAYS LOUD. If quotas are off, sudo is unavailable, or the target
+# is not btrfs, this still hands back a usable directory -- but it says UNBOUNDED
+# on stderr, exits 10 instead of 0, and drops a `.UNBOUNDED` marker file inside the
+# directory so someone finding the artifacts later knows they were never bounded.
+# A step that runs unbounded while appearing bounded is worse than no feature.
+#
+# USAGE
+#   dir=$(bounded-run-space create --limit 256M --tag mytag --base /tmp)   # exit 0 | 10
+#   bounded-run-space report  "$dir"                                       # exit 0 | 10 | 11
+#   bounded-run-space destroy "$dir"                                       # exit 0
+#
+# EXIT CODES
+#   0   bounded (create), under allowance (report), destroyed (destroy)
+#   2   bad usage
+#   10  UNBOUNDED -- the caller MUST relay this; the space exists but nothing caps it
+#   11  report only: the allowance was reached, so the contents are INCOMPLETE
+set -uo pipefail
+
+PROG=bounded-run-space
+die() { echo "$PROG: $*" >&2; exit 2; }
+say() { echo "$PROG: $*" >&2; }
+
+# --- size parsing (byte count, or 512M / 2G SI, or 1Gi binary) -------------------
+parse_size() {
+    python3 - "$1" <<'PY'
+import re, sys
+s = sys.argv[1].strip()
+m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([KMGT]i?B?|B)?', s, re.IGNORECASE)
+if not m: sys.exit(1)
+val = float(m.group(1)); unit = (m.group(2) or "").upper().rstrip("B")
+mult = {"":1,"K":1000,"M":1000**2,"G":1000**3,"T":1000**4,
+        "KI":1024,"MI":1024**2,"GI":1024**3,"TI":1024**4}
+if unit not in mult: sys.exit(1)
+b = int(val*mult[unit])
+if b <= 0: sys.exit(1)
+print(b)
+PY
+}
+
+is_btrfs() { [ "$(stat -fc %T "$1" 2>/dev/null || true)" = "btrfs" ]; }
+have_sudo() { sudo -n true >/dev/null 2>&1; }
+
+# Resolve the subvolume id of PATH, or empty.
+subvol_id() { sudo -n btrfs subvolume show "$1" 2>/dev/null | awk '/Subvolume ID/{print $3; exit}'; }
+
+# Read the LIVE limit and usage for a subvolume: "referenced exclusive max_rfer".
+# Empty when quotas are off or the qgroup is absent.
+qgroup_row() {
+    local path="$1" id="$2"
+    sudo -n btrfs qgroup show -re --raw "$path" 2>/dev/null \
+        | awk -v q="0/$id" '$1==q {print $2" "$3" "$4; exit}'
+}
+
+mark_unbounded() { # $1=dir  $2=reason
+    printf '%s\n' \
+        "This directory was NOT bounded." \
+        "reason: $2" \
+        "Nothing limited how many bytes were written here. Totals below are not a guarantee." \
+        > "$1/.UNBOUNDED" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------- create
+cmd_create() {
+    local limit="" base="${TMPDIR:-/tmp}" tag="run"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --limit) [ $# -ge 2 ] || die "--limit needs a value"; limit="$2"; shift 2 ;;
+            --limit=*) limit="${1#*=}"; shift ;;
+            --base)  [ $# -ge 2 ] || die "--base needs a value";  base="$2";  shift 2 ;;
+            --base=*)  base="${1#*=}";  shift ;;
+            --tag)   [ $# -ge 2 ] || die "--tag needs a value";   tag="$2";   shift 2 ;;
+            --tag=*)   tag="${1#*=}";   shift ;;
+            *) die "create: unknown argument '$1'" ;;
+        esac
+    done
+    [ -n "$limit" ] || die "create: --limit is required"
+    local bytes; bytes="$(parse_size "$limit")" || die "create: --limit: bad size '$limit'"
+    local safe; safe="$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-48)"
+    mkdir -p "$base" 2>/dev/null || die "create: cannot create base $base"
+    local dir="$base/brs-$safe-$$-$(date +%s%N)"
+
+    # Decide up front whether a bound is even possible, and name the reason if not.
+    local reason=""
+    if ! is_btrfs "$base"; then reason="$base is not btrfs (fstype=$(stat -fc %T "$base" 2>/dev/null))"
+    elif ! have_sudo;      then reason="passwordless sudo unavailable; subvolume create/delete both need it"
+    fi
+    if [ -n "$reason" ]; then
+        mkdir -p "$dir" || die "create: cannot create $dir"
+        mark_unbounded "$dir" "$reason"
+        say "UNBOUNDED: $reason"
+        say "UNBOUNDED: handing back a PLAIN DIRECTORY at $dir with NOTHING capping its size."
+        printf '%s\n' "$dir"; return 10
+    fi
+
+    if ! sudo -n btrfs subvolume create "$dir" >/dev/null 2>&1; then
+        mkdir -p "$dir" || die "create: cannot create $dir"
+        mark_unbounded "$dir" "btrfs subvolume create failed"
+        say "UNBOUNDED: could not create a subvolume at $dir; using a plain directory, size NOT capped."
+        printf '%s\n' "$dir"; return 10
+    fi
+    sudo -n chown "$(id -u):$(id -g)" "$dir" 2>/dev/null || true
+
+    local id; id="$(subvol_id "$dir")"
+    local limit_err; limit_err="$(sudo -n btrfs qgroup limit "$bytes" "0/$id" "$base" 2>&1)"
+    # READBACK, NOT THE EXIT CODE. Only a live max_rfer equal to what we asked for
+    # counts as bounded; anything else degrades loudly rather than pretending.
+    local row max_rfer; row="$(qgroup_row "$base" "$id")"; max_rfer="$(echo "$row" | awk '{print $3}')"
+    if [ "${max_rfer:-none}" != "$bytes" ]; then
+        mark_unbounded "$dir" "qgroup limit not in force (readback='${max_rfer:-unreadable}', wanted=$bytes; ${limit_err:-no error text})"
+        say "UNBOUNDED: asked for a ${bytes}-byte quota on subvolume 0/$id but the readback says '${max_rfer:-unreadable}'."
+        [ -n "$limit_err" ] && say "UNBOUNDED: btrfs said: $limit_err"
+        say "UNBOUNDED: $dir is a real subvolume but NOTHING CAPS ITS SIZE. Enable quotas to bound it."
+        printf '%s\n' "$dir"; return 10
+    fi
+
+    say "bounded: $dir  subvol=0/$id  limit=${bytes} bytes of ON-DISK (compressed) space"
+    say "bounded: note the allowance is measured AFTER compression; expect logical files many times larger"
+    printf '%s\n' "$dir"; return 0
+}
+
+# --------------------------------------------------------------------------- report
+cmd_report() {
+    local dir="${1:-}"; [ -n "$dir" ] || die "report: need a path"
+    [ -d "$dir" ] || die "report: no such directory $dir"
+    if [ -f "$dir/.UNBOUNDED" ]; then
+        say "UNBOUNDED: $dir was never bounded; byte totals here guarantee nothing."
+        sed 's/^/  /' "$dir/.UNBOUNDED" >&2 2>/dev/null || true
+        return 10
+    fi
+    local base id row; base="$(dirname "$dir")"; id="$(subvol_id "$dir")"
+    [ -n "$id" ] || { say "UNBOUNDED: $dir is not a subvolume"; return 10; }
+    row="$(qgroup_row "$base" "$id")"
+    [ -n "$row" ] || { say "UNBOUNDED: no qgroup row for 0/$id (quotas off?)"; return 10; }
+    local ref exc mx; ref="$(echo "$row" | awk '{print $1}')"; exc="$(echo "$row" | awk '{print $2}')"; mx="$(echo "$row" | awk '{print $3}')"
+    echo "referenced=$ref exclusive=$exc limit=$mx"
+    if [ "$mx" != "none" ] && [ "${ref:-0}" -ge "$(( mx - mx / 100 ))" ]; then
+        # Within 1% of the allowance: treat as reached. The bounded process will NOT
+        # tell you this -- measured: hermit exits 0 or 1 with a silently truncated log.
+        say "ALLOWANCE REACHED: referenced=$ref of limit=$mx. Anything written here is INCOMPLETE."
+        return 11
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------- destroy
+cmd_destroy() {
+    local dir="${1:-}"; [ -n "$dir" ] || die "destroy: need a path"
+    [ -d "$dir" ] || { say "destroy: $dir already gone"; return 0; }
+    local base id exc; base="$(dirname "$dir")"; id="$(subvol_id "$dir")"
+    if [ -z "$id" ]; then
+        rm -rf "$dir" 2>/dev/null || sudo -n rm -rf "$dir" 2>/dev/null || true
+        say "destroyed (plain directory, no reclaim figure available): $dir"
+        return 0
+    fi
+    exc="$(qgroup_row "$base" "$id" | awk '{print $2}')"
+    sudo -n btrfs subvolume delete "$dir" >/dev/null 2>&1 || say "destroy: subvolume delete failed for $dir"
+    # SYNC BEFORE MEASURING. Subvolume deletion is ASYNCHRONOUS: measured, reading df
+    # immediately after delete reported 0 bytes reclaimed on a filesystem that then
+    # gave back 10.7 MB. An unsynced reading under-reports how much space is still
+    # held, which is the dangerous direction.
+    sudo -n btrfs subvolume sync "$base" >/dev/null 2>&1 || true
+    if [ -n "$exc" ]; then
+        # Exclusive over-predicts slightly (measured: predicted 10,915,840, df returned
+        # 10,768,384 -- 1.4% optimistic), so it is an upper bound on reclaim, not exact.
+        say "destroyed: $dir  reclaimed about $exc bytes (qgroup exclusive; ~1.5% optimistic)"
+    else
+        say "destroyed: $dir"
+    fi
+    return 0
+}
+
+case "${1:-}" in
+    create)  shift; cmd_create "$@" ;;
+    report)  shift; cmd_report "$@" ;;
+    destroy) shift; cmd_destroy "$@" ;;
+    -h|--help|"") sed -n '2,/^set -uo pipefail/{/^set -uo pipefail/d;p}' "$0"; exit 0 ;;
+    *) die "unknown subcommand '${1}' (want create|report|destroy)" ;;
+esac

@@ -63,12 +63,33 @@ The main binary is `target/debug/hermit`.
 
 ### Agents run hermit through `./bin/safehermit`, not directly
 
-**This is how agents invoke hermit.** Use the parent repository's wrapper:
+**This is how agents invoke hermit.** Use this repository's wrapper:
 
 ```bash
-./bin/safehermit run -- <program> [args...]              # default binary
-./bin/safehermit /tmp/my-patched-hermit run -- <program> # any binary, by path
+./bin/safehermit ./target/debug/hermit  run -- <program> [args...]
+./bin/safehermit /tmp/my-patched-hermit run -- <program> [args...]
 ```
+
+If you want the freshly built binary, use the sibling command, which builds and
+then delegates every bound to `safehermit`:
+
+```bash
+./bin/latesthermit run -- <program> [args...]        # cargo build, then run it
+```
+
+It prints `built=` and `built_sha256=` so a reader knows which bytes ran, and a
+**failed build is fatal** — it never falls back to whatever is sitting in
+`target/`, because a command called `latesthermit` running a stale binary is a
+worse failure than no command at all.
+
+**The hermit binary path is always the first argument to `safehermit`, and there
+is no default.**
+That is deliberate: any default at all means callers silently get the wrong
+binary, and there is a real tension between freezing a build for demos and
+defaulting to a fresh one. Requiring the path makes the choice explicit and
+visible at the call site — a demo's frozen pin appears in the demo, not
+implicitly in this wrapper. It also makes an ad-hoc binary first-class rather
+than an override, which is the property the design turns on.
 
 It is identical to hermit for all purposes — same arguments, same stdout and
 stderr, same exit code — and adds bounds plus a machine-readable report of which
@@ -90,8 +111,8 @@ reason:
 | `bound.wall` | wall deadline on a transient systemd unit (`RuntimeMaxSec`) |
 | `bound.cgroup` | `MemoryMax`, `MemorySwapMax=0` |
 | `bound.bytes` | low log cap; **lethal** — the run is cgroup-killed at the cap |
-| `bound.disk` | per-run subvolume + qgroup via `scripts/bounded-run-space` |
-| `binary`, `binary_sha256`, `binary_source` | which binary ran, and which precedence layer chose it |
+| `bound.disk` | per-run subvolume + qgroup via `scripts/bounded-run-space` (in this repo) |
+| `binary`, `binary_sha256` | the binary the caller named, and its hash (informational only — nothing depends on it) |
 | `log_dir`, `log_file` | where the output went |
 
 Two behaviours worth knowing before you rely on them:
@@ -108,6 +129,10 @@ Two behaviours worth knowing before you rely on them:
 Exit codes are hermit's own, except `124` (deadline fired) and `125` (log cap
 fired). If a bound cannot be applied — no systemd, no btrfs quotas — the run
 still proceeds and says so; it never runs silently unbounded.
+
+Both `bin/safehermit` and the `scripts/bounded-run-space` it calls live in this
+repository. That is deliberate: hermit must be usable checked out on its own, so
+nothing on this path reaches out to the dev-hermit parent.
 
 Running hermit directly is still correct for interactive debugging of a single
 short command. Anything long-running, unattended, or spawned by another agent
