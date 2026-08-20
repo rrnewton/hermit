@@ -835,6 +835,26 @@
    ]
   },
   {
+   "label": "netlink-route",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "netlink-route"
+   ]
+  },
+  {
+   "label": "netlink-sock-diag",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "netlink-sock-diag"
+   ]
+  },
+  {
    "label": "lscpu",
    "argv": [
     "env",

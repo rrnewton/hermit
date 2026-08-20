@@ -510,6 +510,219 @@ EOF
         test -z "$output"
         printf 'ss:no-port-zero-listener\n'
         ;;
+    # A standalone NETLINK_ROUTE probe. The `ip` and `ss` rows above reach
+    # netlink incidentally but assert nothing about the reply, so before this
+    # row no corpus cell would have failed if detcore stopped normalizing
+    # netlink entirely. Runs under the default `--network=local`, i.e. one
+    # isolated loopback interface.
+    #
+    # The digest deliberately covers the WHOLE reply except two named fields.
+    # `IFLA_INET6_CACHEINFO.tstamp` is host uptime in USER_HZ and
+    # `.reachable_time` is a per-interface random draw the kernel is required to
+    # randomize (RFC 4861 6.3.2); both reach the guest unnormalized today. They
+    # are located by walking the attribute tree rather than by a fixed offset,
+    # and they are 8 bytes of 1488 -- the other 1480 are covered, so a NEW leak
+    # anywhere else in the reply changes the digest and fails this row.
+    #
+    # HERMIT_NETLINK_UNMASK=1 drops the mask. It can only ever make this row
+    # FAIL, never pass, so it cannot be used to weaken the check; it exists so
+    # the sensitivity of the digest stays reproducible. Masked, four runs agree;
+    # unmasked, four runs produced four distinct digests.
+    netlink-route)
+        /usr/bin/python3 - <<'PY'
+import hashlib, os, socket, struct
+
+NETLINK_ROUTE, RTM_GETLINK, RTM_NEWLINK = 0, 18, 16
+NLM_F_REQUEST, NLM_F_DUMP, NLMSG_DONE = 0x001, 0x300, 3
+IFLA_IFNAME, IFLA_AF_SPEC, IFLA_INET6_CACHEINFO = 3, 26, 5
+UNMASK = os.environ.get("HERMIT_NETLINK_UNMASK") == "1"
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+sock.bind((0, 0))
+sock.send(
+    struct.pack("=IHHII", 20, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, 0)
+    + struct.pack("=Bxxx", socket.AF_PACKET)
+)
+blob = b""
+while True:
+    chunk = sock.recv(65536)
+    blob += chunk
+    if len(chunk) >= 6 and struct.unpack("=H", chunk[4:6])[0] == NLMSG_DONE:
+        break
+    if len(chunk) < 20:
+        break
+sock.close()
+
+def attrs(buf, start, end):
+    off = start
+    while off + 4 <= end:
+        rta_len, rta_type = struct.unpack("<HH", buf[off:off + 4])
+        if rta_len < 4 or off + rta_len > end:
+            return
+        yield rta_type, off + 4, off + rta_len
+        off += (rta_len + 3) & ~3
+
+def walk(buf):
+    off = 0
+    while off + 16 <= len(buf):
+        nlmsg_len, nlmsg_type = struct.unpack("<IH", buf[off:off + 6])
+        if nlmsg_len < 16 or off + nlmsg_len > len(buf):
+            return
+        yield off, nlmsg_len, nlmsg_type
+        off += (nlmsg_len + 3) & ~3
+
+masked_bytes = bytearray(blob)
+masked_count = 0
+for off, nlmsg_len, nlmsg_type in walk(blob):
+    if nlmsg_type != RTM_NEWLINK:
+        continue
+    for t, ps, pe in attrs(blob, off + 32, off + nlmsg_len):
+        if t != IFLA_AF_SPEC:
+            continue
+        for fam, fs, fe in attrs(blob, ps, pe):
+            if fam != socket.AF_INET6:
+                continue
+            for a, s2, e2 in attrs(blob, fs, fe):
+                if a == IFLA_INET6_CACHEINFO and e2 - s2 >= 16:
+                    for b in range(s2 + 4, s2 + 12):
+                        masked_bytes[b] = 0
+                    masked_count += 1
+
+lines, messages = [], 0
+for off, nlmsg_len, nlmsg_type in walk(blob):
+    messages += 1
+    if nlmsg_type != RTM_NEWLINK:
+        continue
+    _fam, _pad, ifi_type, ifi_index, ifi_flags, _chg = struct.unpack(
+        "<BBHiII", blob[off + 16:off + 32]
+    )
+    name, inventory = "?", []
+    for t, ps, pe in attrs(blob, off + 32, off + nlmsg_len):
+        inventory.append("%d:%d" % (t, pe - ps))
+        if t == IFLA_IFNAME:
+            name = blob[ps:pe].rstrip(b"\0").decode()
+    lines.append(
+        "netlink-route:link name=%s index=%d type=%d flags=0x%08x attrs=%s"
+        % (name, ifi_index, ifi_type, ifi_flags, ",".join(inventory))
+    )
+
+# Fail closed. An empty or link-less dump would make the digest trivially
+# reproducible and certify nothing.
+if messages == 0 or not lines:
+    raise SystemExit("netlink-route: RTM_GETLINK returned no link messages")
+if masked_count != 1:
+    raise SystemExit(
+        "netlink-route: expected exactly 1 IFLA_INET6_CACHEINFO, found %d" % masked_count
+    )
+
+body = blob if UNMASK else bytes(masked_bytes)
+for line in lines:
+    print(line)
+print("netlink-route:messages=%d bytes=%d masked_fields=%d" % (messages, len(blob), masked_count))
+print("netlink-route:digest=%s" % hashlib.sha256(body).hexdigest())
+PY
+        ;;
+    # A standalone NETLINK_SOCK_DIAG probe, and the first end-to-end exercise of
+    # detcore/src/sock_diag.rs against a real kernel reply -- its zeroing had
+    # only ever run against synthetic buffers in its own unit tests. The corpus
+    # `ss` row above opens the same protocol but its every reply is a 20-byte
+    # NLMSG_DONE carrying zero diag messages, so it cannot reach the zeroing.
+    # Runs under the default `--network=local`.
+    #
+    # Sensitivity is not a test-only knob: `--no-virtualize-metadata` is the
+    # production gate at detcore/src/syscalls/io.rs:1322. With it, three runs
+    # returned three distinct sets of host inode numbers; without it, three runs
+    # returned all zeros.
+    #
+    # NOTE: this reads with recvmsg() deliberately. socket.recv() lowers to the
+    # recvfrom syscall, which does NOT consult the sock_diag flag and returns
+    # raw host inode numbers -- measured, and reported separately.
+    netlink-sock-diag)
+        /usr/bin/python3 - <<'PY'
+import socket, struct
+
+NETLINK_SOCK_DIAG, SOCK_DIAG_BY_FAMILY = 4, 20
+NLM_F_REQUEST, NLM_F_DUMP = 0x001, 0x300
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+UDIAG_SHOW_NAME, UNIX_DIAG_INO_OFFSET = 0x01, 4
+
+# Bind listeners so the dump is POPULATED. Abstract namespace: no filesystem
+# artifact to clean up and no path to vary.
+held = []
+for index in range(3):
+    unix_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_sock.bind("\0hermit-compat-sockdiag-%d" % index)
+    unix_sock.listen(1)
+    held.append(unix_sock)
+
+nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+nl.bind((0, 0))
+nl.send(
+    struct.pack("=IHHII", 40, SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST | NLM_F_DUMP, 1, 0)
+    + struct.pack("=BBHIIIII", socket.AF_UNIX, 0, 0, 0xFFFFFFFF, 0, UDIAG_SHOW_NAME, 0, 0)
+)
+
+blob = b""
+while True:
+    data, _ancillary, _flags, _addr = nl.recvmsg(65536)
+    if not data:
+        break
+    blob += data
+    done, off = False, 0
+    while off + 16 <= len(data):
+        length, kind = struct.unpack("<IH", data[off:off + 6])
+        if length < 16:
+            break
+        if kind in (NLMSG_DONE, NLMSG_ERROR):
+            done = True
+        off += (length + 3) & ~3
+    if done:
+        break
+nl.close()
+
+inodes, diag_messages, off = [], 0, 0
+while off + 16 <= len(blob):
+    nlmsg_len, nlmsg_type = struct.unpack("<IH", blob[off:off + 6])
+    if nlmsg_len < 16 or off + nlmsg_len > len(blob):
+        break
+    if nlmsg_type == SOCK_DIAG_BY_FAMILY:
+        diag_messages += 1
+        body = off + 16
+        if body + UNIX_DIAG_INO_OFFSET + 4 <= off + nlmsg_len:
+            (inode,) = struct.unpack(
+                "<I", blob[body + UNIX_DIAG_INO_OFFSET:body + UNIX_DIAG_INO_OFFSET + 4]
+            )
+            inodes.append(inode)
+    off += (nlmsg_len + 3) & ~3
+
+# Fail closed. Zero diag messages would make "every inode is zero" vacuously
+# true, which is the empty-corpus defect wearing a different hat.
+if diag_messages < len(held):
+    raise SystemExit(
+        "netlink-sock-diag: expected at least %d diag messages, got %d"
+        % (len(held), diag_messages)
+    )
+if len(inodes) != diag_messages:
+    raise SystemExit("netlink-sock-diag: %d messages but %d inodes parsed"
+                     % (diag_messages, len(inodes)))
+
+# Assert, do not merely print. The COUNT of nonzero inodes is stable across runs
+# whether or not the sanitizer ran (measured: "nonzero_inodes=5" was identical on
+# three runs with --no-virtualize-metadata), so a printed count would be compared
+# equal by --verify and certify nothing. Only the values move, so the check has
+# to be on the values, and it has to fail this run rather than wait for a diff.
+nonzero = [i for i in inodes if i != 0]
+if nonzero:
+    raise SystemExit(
+        "netlink-sock-diag: %d of %d socket inode(s) reached the guest unzeroed "
+        "(first: %d); detcore/src/sock_diag.rs did not sanitize this reply"
+        % (len(nonzero), len(inodes), nonzero[0])
+    )
+
+print("netlink-sock-diag:diag_messages=%d" % diag_messages)
+print("netlink-sock-diag:all_inodes_zeroed=yes")
+PY
+        ;;
     lscpu)
         readonly root="$WORK_DIR/sysroot"
         mkdir -p "$root/proc" \
