@@ -35,6 +35,7 @@ use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -2741,6 +2742,39 @@ impl RunOpts {
         } = self.mounts(tmpfs.path())?;
 
         let mut command = Command::new(&self.program);
+        // `--namespace-only` does NOT go through `with_container`: it unshares
+        // `Namespace::PID` and execs the guest directly, so the guest process
+        // ITSELF becomes PID 1 of the new namespace and inherits the same
+        // undeliverable-signal protection. An adversarial review found this
+        // second launch path after the `with_container` guards were in place --
+        // the fix worked and was not yet complete.
+        //
+        // There is no closure to arm here, so the guard goes in `pre_exec`,
+        // which reverie runs in the forked child before the guest image is
+        // loaded (`reverie-process/src/container.rs:738`). `PR_SET_PDEATHSIG`
+        // is preserved across `execve`, so it is still armed once the guest is
+        // running; reverie uses the same idiom for exec'd untraced members in
+        // `safeptrace/src/notifier.rs`.
+        //
+        // Only the death signal is armed, deliberately. The SIGTERM/SIGINT/
+        // SIGHUP handlers installed for the `with_container` path cannot help
+        // here: `execve` resets caught signals to `SIG_DFL`, so any handler set
+        // before exec is gone by the time the guest runs. Installing one would
+        // also be wrong on its own terms -- in this mode PID 1 is the user's own
+        // program, and hermit changing its signal dispositions would alter the
+        // behaviour being observed.
+        //
+        // SAFETY: the closure calls only `prctl(PR_SET_PDEATHSIG)`, which is
+        // async-signal-safe, touches no caller memory, and allocates nothing --
+        // the requirements for a `pre_exec` callback between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(Errno::last());
+                }
+                Ok(())
+            });
+        }
         command
             .args(&self.args)
             .unshare(Namespace::PID)
