@@ -14,6 +14,7 @@ import shutil
 import socket
 import stat
 import struct
+import signal
 import subprocess
 import sys
 import tempfile
@@ -816,14 +817,53 @@ class SerialSession:
 
 
 def stop_process(process: Optional[subprocess.Popen]) -> None:
+    """Stop a launched child, and its descendants when it leads its own group.
+
+    SIGNALLING ONE PID IS NOT ENOUGH FOR A HERMIT RUN. hermit supervises a ptraced
+    tree and the guest runs as a PID-namespace init, where the kernel discards
+    SIGTERM. Measured on demo 6 with QEMU_TIMEOUT=25: two hermit processes existed
+    during the run, this function killed the one it was handed, and the second
+    survived with ppid=1 -- still holding hermit-info.log and growing it from 704 MB
+    to 830 MB in ten seconds, about 45 GB/h. Three such orphans tripped the disk
+    headroom alarm and left 38 GiB behind on 2026-08-20.
+
+    The survivor was in the CHILD's process group, so killing that group reaches it.
+    That is only safe when the child leads a group of its own -- otherwise the group
+    is ours and we would kill the demo. Callers that launch long-running children
+    pass `start_new_session=True` to make that true; `drgn_hermit.py` has done this
+    since demo 7 was written and this brings the rest of the demos in line with it.
+    """
     if process is None or process.poll() is not None:
         return
-    process.terminate()
+    group: Optional[int] = None
+    try:
+        if os.getpgid(process.pid) == process.pid:
+            group = process.pid
+    except (OSError, ProcessLookupError):
+        group = None
+
+    def signal_all(sig: int) -> None:
+        if group is not None:
+            try:
+                os.killpg(group, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            process.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+    signal_all(signal.SIGTERM)
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        process.kill()
+        pass
+    signal_all(signal.SIGKILL)
+    try:
         process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def extract_info_tail(log_path: Path) -> List[str]:
