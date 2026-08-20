@@ -39,6 +39,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::SchedValue;
+use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
@@ -124,6 +125,48 @@ fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
     };
     sigchld.utime = 0;
     sigchld.stime = 0;
+}
+
+async fn complete_wait4_for_specific_child<T, G>(
+    guest: &mut G,
+    call: syscalls::Wait4,
+    rsrc: Resources,
+    child: DetPid,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let nonblocking = call.with_options(call.options() | WaitPidFlag::WNOHANG);
+
+    if resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled {
+        return Err(call.signal_interrupt_errno().into());
+    }
+
+    let result = guest.inject_with_retry(nonblocking).await;
+    if result.is_err() {
+        return Ok(nonblocking.normalize_nonblocking_result(result, false)?);
+    }
+
+    // Perform exactly one scheduled nonblocking observation for a specific
+    // positive child. Whether that observation already sees the host zombie is
+    // wall-clock timing, so both outcomes record the same polling event. A
+    // parent-visible exit snapshot cannot select the branch: WNOHANG can reap
+    // the child before the exit hook publishes that snapshot. If the child is
+    // not waitable yet, the original blocking wait completes the Linux
+    // operation without exposing a variable number of retries.
+    record_retry_event(guest, nonblocking).await;
+    info!(
+        "[dtid {}] Completing wait4 after one scheduled poll for child {}.",
+        guest.thread_state().dettid,
+        child
+    );
+
+    if nonblocking.syscall_would_have_blocked(result) {
+        Ok(guest.inject_with_retry(call).await?)
+    } else {
+        Ok(nonblocking.normalize_nonblocking_result(result, true)?)
+    }
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -790,7 +833,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("wait4");
 
-        let specific_exited_child = (call.pid() > 0).then(|| DetPid::from_raw(call.pid()));
+        let specific_child = (call.pid() > 0).then(|| DetPid::from_raw(call.pid()));
         let value = if call.options().contains(WaitPidFlag::WNOHANG) {
             resource_request(guest, rsrc.clone()).await;
             info!(
@@ -798,26 +841,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 dettid
             );
             guest.inject_with_retry(call).await?
-        } else if specific_exited_child.is_some_and(|child| {
-            guest
-                .thread_state()
-                .has_exited_child_process_cpu_time(child)
-        }) {
-            // The child exit hook has already published the process's final logical
-            // CPU snapshot into the parent's shared process state. At that point the
-            // child needs no guest execution to finish, but the kernel can still be
-            // completing the tiny exit-hook-to-waitable transition. Continuing the
-            // WNOHANG loop makes that host-timed transition visible as a variable
-            // number of InternalIOPolling turns. Grant one scheduler turn and issue
-            // the caller's original blocking wait4 instead: it only bridges the
-            // physical teardown that follows an already-determined child exit.
-            resource_request(guest, rsrc).await;
-            info!(
-                "[dtid {}] Executing blocking wait4 for logically exited child {}.",
-                dettid,
-                call.pid()
-            );
-            guest.inject_with_retry(call).await?
+        } else if let Some(child) = specific_child {
+            complete_wait4_for_specific_child(guest, call, rsrc, child).await?
         } else {
             // wait4 is a scheduler poll, not a record/replay data read (see doc above),
             // so it is not routed through the record/replay subtool.
