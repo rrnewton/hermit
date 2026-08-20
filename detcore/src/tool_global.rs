@@ -352,6 +352,13 @@ impl GlobalState {
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
+            // Announce before spawning, not from inside the spawned task. The
+            // task's first poll is unordered with respect to the rest of this
+            // bootstrap, so emitting there raced the root thread's seeding
+            // lines and produced a nondeterministic INFO stream. Emitting here
+            // sequences it: `Scheduler::new`'s SCHEDRAND line above, then this,
+            // then the root `ThreadState::new` seeding lines.
+            info!("[scheduler] daemon task starting up, waiting for guest thread start..");
             Some(tokio::spawn(sched_loop(sched.clone(), global_time.clone())))
         } else {
             None
@@ -423,6 +430,10 @@ impl GlobalState {
 
     /// Runs the sequential scheduler on a backend-owned executor.
     pub async fn run_external_scheduler(&self, observer: Arc<dyn Fn(&'static str) + Send + Sync>) {
+        // Emitted at the call site for the same reason as the spawned path in
+        // `initialize`, so both ways of starting the daemon place this line at
+        // a deterministic point in the caller's program order.
+        info!("[scheduler] daemon task starting up, waiting for guest thread start..");
         sched_loop_external(self.sched.clone(), self.global_time.clone(), observer).await;
     }
 

@@ -23,11 +23,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -86,13 +88,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -154,11 +156,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: DBT completes the five-step contract but its dedicated adapter publishes typed no_result with no INFO comparison, so it cannot establish L2
           kvm: Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available
           sabre: Not yet qualified for the personality(2) execution-domain round-trip
-          liteinst: Not yet qualified for the personality(2) execution-domain round-trip
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -725,6 +729,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
@@ -1103,11 +1109,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -1607,6 +1615,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
@@ -1670,11 +1680,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -2933,11 +2945,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -3185,11 +3199,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -3626,6 +3642,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM msync returns 0 but its in-memory mapping model does not flush MAP_SHARED writes to the backing file, so the pread write-through checks fail and it observes ok=3 instead of ok=5
@@ -3753,11 +3771,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor personality returns deterministic ENOSYS for sendfile(2); the in-kernel copy path is not yet emulated
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4139,11 +4157,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4202,11 +4220,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5031,11 +5049,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor does not implement the F_GETPIPE_SZ/F_SETPIPE_SZ pipe-capacity fcntl commands and returns a deterministic error
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5097,11 +5117,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor implements F_SETLK advisory locking but returns a deterministic ENOSYS for F_GETLK lock queries
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5163,11 +5185,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5229,11 +5253,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5295,11 +5321,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor returns a deterministic error for the F_SETOWN/F_GETOWN async-I/O owner fcntl family, so the SIGIO/SIGURG owner round-trip is unavailable
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5361,11 +5389,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -5757,6 +5787,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and hermit exits 1 under --backend dbi, so the fixture does not complete there. Recorded as an observed gap, not diagnosed by this change'
           kvm: KVM times out before guest start on the validation host, so no split-pattern verdict is available
@@ -5823,11 +5855,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change'
           kvm: KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family
           sabre: Not yet qualified for inotify/signalfd event delivery
-          liteinst: Not yet qualified for inotify/signalfd event delivery
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: Measured stable 5/5 natively on this host, so native repetition is not a nondeterminism contract; the value of this entry is cross-backend, not native-vs-hermit'
@@ -5949,11 +5983,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
-          liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'
@@ -6012,11 +6046,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
-          liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'

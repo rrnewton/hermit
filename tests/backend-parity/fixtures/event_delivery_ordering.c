@@ -196,7 +196,7 @@ int main(void) {
     int events = inotify_leg(dir, OPS, &first_mask, &all_same);
 #ifdef HERMIT_TEST_EVORDER_DROP_EVENT
     if (events > 0) {
-        events--; /* plant a dropped event: the denominator must expose it */
+        events = 0; /* plant complete loss: the contract must reject it */
     }
 #endif
 
@@ -269,9 +269,20 @@ int main(void) {
     unlink(path);
     rmdir(dir);
 
-    /* Exit status carries only the things that are true on ANY correct system:
-     * both legs produced something, and neither errored. The interesting
-     * observations are in stdout, where the harness pins them. */
-    bool usable = events > 0 && delivered > 0;
-    return usable ? EXIT_SUCCESS : EXIT_FAILURE;
+    /* Fail closed on the Linux contracts stated above. Coalescing permits any
+     * positive inotify count up to OPS, but every observed event must be the
+     * requested IN_MODIFY event. Pending standard signals are delivered in
+     * ascending signal-number order, independent of their raise order. */
+    bool inotify_valid = events > 0 && events <= OPS && all_same
+        && first_mask == IN_MODIFY;
+    bool signalfd_valid = delivered == RAISED && order[0] == SIGUSR1
+        && order[1] == SIGUSR2 && order[2] == SIGALRM;
+    if (!inotify_valid || !signalfd_valid) {
+        fprintf(stderr,
+                "event delivery contract mismatch: inotify_valid=%d "
+                "signalfd_valid=%d\n",
+                inotify_valid, signalfd_valid);
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }

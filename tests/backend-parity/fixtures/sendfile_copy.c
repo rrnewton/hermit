@@ -22,8 +22,8 @@
  *     own file offset. A trailing call copies 50 bytes from position 0 with an
  *     explicit offset and confirms both the updated pointer (50) and that the
  *     source's own offset is unchanged (still 256).
- *   - The bytes that arrive in the destination are exactly the source bytes:
- *     the first 256 destination bytes checksum to 0+1+...+255 = 32640.
+ *   - The bytes that arrive in the destination exactly equal the source bytes;
+ *     their checksum is also reported as 0+1+...+255 = 32640.
  *
  * Both files are mkstemp'd and immediately unlinked; the open descriptors keep
  * them alive and no path is ever observed. Only invariants are printed:
@@ -131,9 +131,14 @@ int main(void) {
   }
   if (got != sizeof(dst_bytes))
     fail("short destination readback");
+#ifdef HERMIT_TEST_SENDFILE_CORRUPT_DESTINATION
+  dst_bytes[0] ^= 1;
+#endif
   long checksum = 0;
   for (size_t i = 0; i < sizeof(dst_bytes); i++)
     checksum += (unsigned char)dst_bytes[i];
+  int destination_matches =
+      memcmp(dst_bytes, src_bytes, sizeof(dst_bytes)) == 0 ? 1 : 0;
 
   /* Explicit-offset form: copy 50 bytes from position 0, update the pointer,
    * and leave the source's own file offset unchanged. */
@@ -152,6 +157,43 @@ int main(void) {
   }
   int own_offset_kept = (lseek(src, 0, SEEK_CUR) == 256) ? 1 : 0;
 
+  struct stat dst_stat;
+  if (fstat(dst, &dst_stat) != 0)
+    fail("fstat destination");
+  off_t final_size = dst_stat.st_size;
+  if (lseek(dst, 256, SEEK_SET) != 256)
+    fail("lseek appended destination bytes");
+  char appended_bytes[50];
+  size_t appended_got = 0;
+  while (appended_got < sizeof(appended_bytes)) {
+    ssize_t r = read(dst, appended_bytes + appended_got,
+                     sizeof(appended_bytes) - appended_got);
+    if (r < 0) {
+      if (errno == EINTR)
+        continue;
+      fail("read appended destination bytes");
+    }
+    if (r == 0)
+      break;
+    appended_got += (size_t)r;
+  }
+#ifdef HERMIT_TEST_SENDFILE_CORRUPT_APPENDED_DESTINATION
+  if (appended_got > 0)
+    appended_bytes[0] ^= 1;
+#endif
+  int appended_matches =
+      appended_got == sizeof(appended_bytes) &&
+      memcmp(appended_bytes, src_bytes, sizeof(appended_bytes)) == 0;
+#ifdef HERMIT_TEST_SENDFILE_BAD_POSITION
+  pos--;
+#endif
+#ifdef HERMIT_TEST_SENDFILE_MOVED_SOURCE_OFFSET
+  own_offset_kept = 0;
+#endif
+#ifdef HERMIT_TEST_SENDFILE_BAD_FINAL_SIZE
+  final_size--;
+#endif
+
   if (close(src) != 0)
     fail("close src");
   if (close(dst) != 0)
@@ -159,5 +201,15 @@ int main(void) {
 
   printf("sendfile copied=%zu checksum=%ld pos=%ld own_offset_kept=%d\n", copied,
          checksum, (long)pos, own_offset_kept);
+
+  if (!destination_matches || !appended_matches || final_size != 306 ||
+      pos != 50 || !own_offset_kept) {
+    fprintf(stderr,
+            "sendfile contract mismatch: destination_matches=%d "
+            "appended_matches=%d final_size=%ld pos=%ld own_offset_kept=%d\n",
+            destination_matches, appended_matches, (long)final_size, (long)pos,
+            own_offset_kept);
+    return 1;
+  }
   return 0;
 }
