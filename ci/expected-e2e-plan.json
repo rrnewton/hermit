@@ -15,6 +15,13 @@
       "test": "applications/git-repository-workflow"
     },
     {
+      "backend": "kvm",
+      "category": "applications",
+      "lane": "privileged",
+      "mode": "verify",
+      "test": "applications/kvm-shell-environment"
+    },
+    {
       "backend": "ptrace",
       "category": "applications",
       "lane": "portable",
@@ -589,13 +596,6 @@
       "test": "backend-parity-c/vectored-io"
     },
     {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/add-key-enosys"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -615,13 +615,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/arch-prctl-determinism"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/cachestat-enosys"
     },
     {
       "backend": "ptrace",
@@ -687,13 +680,6 @@
       "test": "c-programs/fp-reduction-nondeterminism"
     },
     {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/futex-waitv-enosys"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -706,13 +692,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/futex-waitv-enosys"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/get-robust-list-self"
     },
     {
       "backend": "ptrace",
@@ -834,13 +813,6 @@
       "test": "c-programs/io-uring-ring-determinism"
     },
     {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/ioctl-fioclex"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -876,13 +848,6 @@
       "test": "c-programs/ipc-determinism"
     },
     {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/kcmp-eperm"
-    },
-    {
       "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
@@ -895,13 +860,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/kcmp-eperm"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/keyctl-enosys"
     },
     {
       "backend": "ptrace",
@@ -930,13 +888,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/keyctl-passthrough"
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/listmount-enosys"
     },
     {
       "backend": "ptrace",

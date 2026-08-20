@@ -214,6 +214,7 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            ("c_unsupported_syscall", "dbt_unsupported_syscall.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -329,6 +330,120 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     assert_eq!(
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
+    );
+}
+
+#[test]
+fn recording_rejects_an_unsupported_syscall_by_name() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_unsupported_syscall");
+
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start unsupported recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "unsupported recording hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "unsupported recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported syscall: restart_syscall"),
+        "unsupported recording did not name restart_syscall:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("dbt-unsupported-ok"),
+        "unsupported guest published its former success marker: {stdout}"
+    );
+}
+
+#[test]
+fn replay_rejects_an_unsupported_syscall_by_name() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create replay directory");
+    let guest = workload("c_unsupported_syscall");
+
+    // Record the same executable on a supported branch. Rewriting only the
+    // recorded argv then makes replay take its unsupported branch without
+    // requiring a fail-open recording mode to manufacture the fixture.
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path)
+        .arg("replay-control");
+    let record_output = command_output(record, "supported replay-control recording");
+    assert_eq!(
+        record_output.stdout, b"dbt-supported-replay-control\n",
+        "recording did not exercise the supported control branch"
+    );
+
+    let recording_id = fs::read_to_string(data_dir.path().join("last"))
+        .expect("recording did not publish its last ID");
+    let metadata_path = data_dir
+        .path()
+        .join(recording_id.trim())
+        .join("metadata.json");
+    let mut metadata: serde_json::Value = serde_json::from_reader(
+        fs::File::open(&metadata_path).expect("failed to open replay metadata"),
+    )
+    .expect("failed to parse replay metadata");
+    // Keep argc and the argument length identical so the initial stack layout
+    // and dynamic-loader syscall pointers still match the recording. Only the
+    // branch selected by the argument contents changes.
+    metadata["args"] = serde_json::json!(["replay-failure"]);
+    serde_json::to_writer_pretty(
+        fs::File::create(&metadata_path).expect("failed to rewrite replay metadata"),
+        &metadata,
+    )
+    .expect("failed to serialize replay metadata");
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let rendered = format!("{replay:?}");
+    let output = replay
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start unsupported replay: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "unsupported replay hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "unsupported replay reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported syscall: restart_syscall"),
+        "unsupported replay did not name restart_syscall:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("dbt-unsupported-ok"),
+        "unsupported replay published its former success marker: {stdout}"
     );
 }
 

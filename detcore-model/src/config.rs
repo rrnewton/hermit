@@ -61,7 +61,8 @@ pub struct Config {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
-    /// Guest clock reads use per-thread logical time instead of the global RPC arrival order.
+    /// Legacy serialized setting retained for record compatibility. Guest-visible wall and
+    /// monotonic clocks always use the coordinator's virtual-time domain.
     #[serde(default)]
     #[clap(skip)]
     pub use_thread_local_clock_reads: bool,
@@ -327,7 +328,8 @@ pub struct Config {
     pub deterministic_io: bool,
 
     /// Fail immediately on unsupported syscalls instead of forwarding them.
-    /// Explicit strict mode enables this policy.
+    /// Ordinary `hermit run` enables this policy; compatibility requires the
+    /// explicit `--allow-unsupported-syscalls` opt-out.
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 

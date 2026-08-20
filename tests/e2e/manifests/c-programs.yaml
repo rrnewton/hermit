@@ -28,7 +28,7 @@ test:
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
+        ci_disabled_reason: 'KVM canonical verification passed one of three repetitions and diverged in the other two. The first mismatch was scheduler turn 4 of 13 after clone3, where COMMIT virtual time was 2848750 versus 3697500 ns. The ptrace cell is unchanged by this KVM result.'
       naked:
         ci: false
         backends_enabled: []
@@ -80,7 +80,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -318,7 +326,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -1342,7 +1358,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -1521,7 +1545,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -2178,7 +2210,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -2448,7 +2488,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -2507,7 +2555,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
@@ -2625,7 +2681,15 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+          sabre: true
+        ci_disabled_reason:
+          dbt:
+            result: infrastructure-error
+            evidence: fad796f6 DBT smoke exit 255 and Reverie 9aed97d FINAL lifecycle
+            reason: Reverie af82f1b9 already includes reverie#459, but its native client requires the v2 runtime callback ABI and runtime-kind reporting symbols that this Hermit's detcore-dbt runtime/report plumbing does not export, so the required DBT smoke exits 255 with `using undefined symbol` before canonical comparison can run. After the matching Hermit consumer and report plumbing is composed, the scheduler background process created by dr_create_client_thread must still send FINAL before exit, as implemented in the Reverie 9aed97d lineage; without that lifecycle support the collector must leave verdict=no_result. Canonical evidence is therefore incomplete.
         backends_enabled:
           - ptrace
           - dbt
