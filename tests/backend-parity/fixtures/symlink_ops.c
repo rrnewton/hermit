@@ -42,6 +42,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Number of behavioral steps this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 #define PAYLOAD "abcdef"
 #define PAYLOAD_LEN 6
 
@@ -106,9 +110,13 @@ int main(void) {
   int link_fd = open(link, O_RDONLY);
   if (link_fd >= 0) {
     if (read(link_fd, buf, PAYLOAD_LEN) == PAYLOAD_LEN) {
+#ifdef HERMIT_TEST_SYMLINK_WRONG_CONTENT
+      buf[0] ^= 1;
+#endif
       for (size_t i = 0; i < PAYLOAD_LEN; i++)
         checksum += (unsigned char)buf[i];
-      ok++;
+      if (memcmp(buf, PAYLOAD, PAYLOAD_LEN) == 0)
+        ok++;
     }
     if (close(link_fd) != 0)
       fail("close link fd");
@@ -137,5 +145,15 @@ int main(void) {
     fail("rmdir root");
 
   printf("symlink_ops size=%ld checksum=%ld ok=%d\n", size, checksum, ok);
+
+  /* Every step above must have succeeded. Without this check the guest exits 0
+     no matter how many steps failed, so a real semantic regression only lowers
+     the printed count -- and because both --verify runs lower it identically,
+     bitwise parity still holds and the cell passes green. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(
+        stderr, "symlink_ops completed %d of %d steps\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
   return 0;
 }

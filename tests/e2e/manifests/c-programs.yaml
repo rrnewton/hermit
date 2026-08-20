@@ -2183,9 +2183,9 @@ test:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -4292,13 +4292,13 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately
           kvm: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately
           sabre: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify SaBRe separately
-          liteinst: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []

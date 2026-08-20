@@ -12,8 +12,9 @@
  * A single process creates a pipe, assembles a fixed byte stream (every value
  * 0..255 exactly once) out of three discontiguous source buffers, and writes
  * it with one writev(2). It then closes the write end and drains the pipe with
- * readv(2) into two discontiguous destination buffers until EOF, accumulating
- * the byte count and a running checksum.
+ * readv(2) into two discontiguous destination buffers until EOF, checking
+ * every byte against its expected 0..255 value while accumulating the byte
+ * count and a running checksum.
  *
  * This exercises the scatter/gather I/O path (iovec assembly on write, iovec
  * fan-out on read, partial-iov accounting) that the plain read/write contracts
@@ -22,8 +23,8 @@
  *
  * It is deliberately free of gated concerns:
  *   - Single process, no fork/thread: no scheduling interleave is observed.
- *   - The only observable is an aggregate over the byte stream (count plus an
- *     additive checksum), independent of how writev/readv chunk the segments.
+ *   - The observable is the exact fixed byte stream plus its count and
+ *     checksum, independent of how writev/readv chunk the segments.
  *   - No pid, timestamp, cpu-time, or address is observed.
  *
  * For the fixed 0..255 stream the byte count is 256 and the checksum is
@@ -101,6 +102,7 @@ int main(void) {
 
   long bytes = 0;
   long checksum = 0;
+  int stream_matches = 1;
   uint8_t dst_a[64];
   uint8_t dst_b[64];
   for (;;) {
@@ -123,6 +125,12 @@ int main(void) {
       uint8_t byte = (i < (ssize_t)sizeof(dst_a))
                          ? dst_a[i]
                          : dst_b[i - (ssize_t)sizeof(dst_a)];
+#ifdef HERMIT_TEST_VECTORED_IO_CORRUPT_BYTE
+      if (bytes == 0)
+        byte ^= 1;
+#endif
+      if (byte != (uint8_t)bytes)
+        stream_matches = 0;
       ++bytes;
       checksum += byte;
     }
@@ -130,6 +138,18 @@ int main(void) {
   if (close(fds[0]) != 0)
     fail("close read end");
 
+#ifdef HERMIT_TEST_VECTORED_IO_BAD_COUNT
+  bytes--;
+#endif
+
   printf("vectored_io bytes=%ld checksum=%ld\n", bytes, checksum);
+
+  if (bytes != STREAM_BYTES || !stream_matches) {
+    fprintf(stderr,
+            "vectored_io contract mismatch: bytes=%ld (expected %d), "
+            "stream_matches=%d\n",
+            bytes, STREAM_BYTES, stream_matches);
+    return 1;
+  }
   return 0;
 }

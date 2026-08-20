@@ -648,6 +648,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: DBT Python support is tracked by backend compatibility
           kvm: KVM Python coverage is in the privileged applications bucket

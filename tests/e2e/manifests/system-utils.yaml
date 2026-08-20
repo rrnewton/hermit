@@ -345,6 +345,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
@@ -596,6 +598,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
@@ -1091,6 +1095,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
