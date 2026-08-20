@@ -32,12 +32,25 @@ SOFTWARE.
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 int main() {
   int cpu = 0;
   int node = 0;
-  syscall(SYS_getcpu, &cpu, &node, NULL);
+  enum { EXPECTED_CHECKS = 2 };
+  int ok = 0;
+
+  if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0) {
+    ok++;
+  }
+  /* Hermit virtualizes affinity to CPU 0. Node is printed but not asserted:
+     no documented contract fixes it. */
+  if (cpu == 0) {
+    ok++;
+  }
+
   printf("CPU %d, Node %d\n", cpu, node);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -12,6 +12,7 @@
  */
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static volatile int g_dummy;
@@ -27,6 +28,7 @@ static void siginfo_handler(int sig, siginfo_t *info, void *ucontext) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     struct sigaction act;
     struct sigaction old;
     int ok = 0;
@@ -80,5 +82,5 @@ int main(void) {
     }
 
     printf("sigaction ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

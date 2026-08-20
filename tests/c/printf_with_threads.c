@@ -8,6 +8,7 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /*
   For some reason this triggers registry divergence under trace/replay usecase
@@ -24,8 +25,16 @@ void* thread1(void* vargp) {
 }
 
 int main() {
+  enum { EXPECTED_CHECKS = 2 };
+  int ok = 0;
   pthread_t thread;
-  pthread_create(&thread, NULL, thread1, NULL);
-  pthread_join(thread, NULL);
-  return 0;
+
+  if (pthread_create(&thread, NULL, thread1, NULL) == 0) {
+    ok++;
+  }
+  if (pthread_join(thread, NULL) == 0) {
+    ok++;
+  }
+
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

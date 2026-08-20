@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 
 /*
@@ -43,6 +44,7 @@
 #endif
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 2 };
   int ok = 0;
 
   /* Setting the machine-check kill policy is refused with a fixed ENOSYS. */
@@ -65,5 +67,5 @@ int main(void) {
   }
 
   printf("mcekill ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -15,11 +15,13 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     long pg = sysconf(_SC_PAGESIZE);
     size_t np = 6;
     size_t len = (size_t)pg * np;
@@ -81,5 +83,5 @@ int main(void) {
     }
 
     printf("mincore ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

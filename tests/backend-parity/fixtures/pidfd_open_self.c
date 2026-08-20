@@ -17,10 +17,12 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
 
     // (1) open a pidfd referring to this process via its (virtual) PID.
@@ -43,5 +45,5 @@ int main(void) {
     if (fd2 >= 0 && close((int)fd2) == 0) ok++;
 
     printf("pidfd ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

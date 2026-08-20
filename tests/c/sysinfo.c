@@ -26,7 +26,19 @@ int main() {
 
   allocateMemory(1 * MB); // allocating 1Mb of memory to check in sysinfo result
 
-  sysinfo(&info);
+  enum { EXPECTED_CHECKS = 2 };
+  /* Hermit's documented virtual container identity: 1,000,000,000 bytes.
+     freeram is deliberately NOT asserted; it tracks RSS and is the subject
+     of separate determinism work. */
+  const unsigned long VIRT_TOTALRAM = 1000000000UL;
+  int ok = 0;
+
+  if (sysinfo(&info) == 0) {
+    ok++;
+  }
+  if (info.totalram == VIRT_TOTALRAM) {
+    ok++;
+  }
 
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
   printf("uptime: %lu sec\n", info.uptime);
@@ -44,4 +56,5 @@ int main() {
   printf("\n");
   printf("mem_unit: %u\n", info.mem_unit);
   printf("Total - free = used: %'lu\n", info.totalram - info.freeram);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
