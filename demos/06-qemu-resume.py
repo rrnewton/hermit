@@ -260,6 +260,12 @@ def main() -> int:
                 stderr=subprocess.STDOUT,
                 env=environment,
                 cwd=str(ROOT),
+                # Own process group, so stop_process can take the whole tree down.
+                # hermit forks a second process that survives a signal to the pid
+                # alone; measured, it kept writing hermit-info.log at ~45 GB/h with
+                # ppid=1 after the demo exited. drgn_hermit.py has done this since
+                # demo 7 was written.
+                start_new_session=True,
             )
             return_code = wait_for_process(
                 process, TIMEOUT, progress_label="Hermit/QEMU resume"
