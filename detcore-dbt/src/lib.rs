@@ -949,24 +949,33 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
     write_registers: RegisterWriter,
 ) -> i32 {
     if defer_runtime != 0 {
+        // PRESERVE THE VIRTUAL IDENTITY THE CLIENT JUST PUBLISHED.
+        //
+        // The client zeroes this struct, writes the thread's virtual identity
+        // into it, and only then calls in here -- `reverie-dbt/native/client.c`
+        // sets `virtual_pid`/`virtual_ppid`/`virtual_tid` immediately before the
+        // call, under the comment "Publish stable virtual identities before
+        // entering Rust. Detcore consumes these fields while constructing its
+        // thread state." It is also the client, not Detcore, that answers the
+        // identity syscalls: it returns `counters->virtual_pid` for SYS_getpid,
+        // `virtual_ppid` for SYS_getppid and `virtual_tid` for SYS_gettid.
+        //
+        // Writing a whole fresh struct here therefore erased those three fields
+        // microseconds after the client set them, and every identity syscall on
+        // the DBT path answered 0. Measured on the same guest against the golden
+        // ptrace reference: ptrace reports getpid=3 gettid=3 getppid=1; DBT
+        // reported 0, 0, 0. Initialise only the fields Hermit owns and leave the
+        // client's alone.
         unsafe {
-            scratch
-                .cast::<NativeThreadScratch>()
-                .write(NativeThreadScratch {
-                    branches: branch_count,
-                    observed_syscalls: 0,
-                    rewritten_syscalls: 0,
-                    runtime_state: std::ptr::null_mut(),
-                    pending_thread_clone: 0,
-                    thread_clone_flags: 0,
-                    thread_clone_ctid: 0,
-                    pending_thread_start: 0,
-                    virtual_pid: 0,
-                    virtual_ppid: 0,
-                    virtual_tid: 0,
-                    pending_virtual_child: 0,
-                    pending_clone_flags: 0,
-                });
+            let scratch = &mut *scratch.cast::<NativeThreadScratch>();
+            scratch.branches = branch_count;
+            scratch.observed_syscalls = 0;
+            scratch.rewritten_syscalls = 0;
+            scratch.runtime_state = std::ptr::null_mut();
+            scratch.pending_thread_clone = 0;
+            scratch.thread_clone_flags = 0;
+            scratch.thread_clone_ctid = 0;
+            scratch.pending_thread_start = 0;
         }
         return 0;
     }
