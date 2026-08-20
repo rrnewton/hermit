@@ -407,73 +407,15 @@ for that repository-side change.
 
 ## Task Closure Policy
 
-A task is not finished when the code is written; it is finished when the change
-is on `main`. Phantom closures — tasks marked closed while the work never landed
-— are a recurring, expensive failure mode. Do not create one. The rules below
-are mandatory for every implementation and review agent.
+When this repository is coordinated through `dev-hermit`,
+[parent rule 15](https://github.com/rrnewton/dev-hermit/blob/main/AGENTS.md#highest-consequence-rules)
+and the
+[closure evidence contract](https://github.com/rrnewton/dev-hermit/blob/main/ci-hub/closure/README.md)
+are the sole sources for the TaskGraph closure actor, timing, status, and
+command. Do not restate that lifecycle here.
 
-1. **Agents MUST NOT close tasks.** Never run `tg update <task> --status
-   closed` (or any equivalent close/complete transition). Closing is reserved
-   for the coordinator, who does it only after confirming the work is on
-   `main`. An agent that closes its own task is asserting a landing it cannot
-   witness.
-2. **When your work is complete, add the `implemented` tag and post the PR
-   link.** `IMPLEMENTED` is a tag, not a TaskGraph status. The task remains
-   `in_progress`. "Complete" means the feature branch is pushed and a pull
-   request is open against `rrnewton/hermit:main`. Preserve the task's existing
-   tags when recording the transition and evidence:
-
-   ```bash
-   tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
-     | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
-     | validation: <exact commands + results, assurance level, backend>"
-   tg update <task> --tags <existing-tags>,implemented
-   ```
-
-   The PR link and the exact tested SHA are required, not optional. A branch
-   name alone is not evidence.
-3. **Adversarial review confirms the work exists in the PR.** Before a task's
-   `implemented` tag is trusted, a reviewer independently verifies that the claimed
-   change is actually present in the pull request diff, that the cited tests
-   exist and were run at the PR head SHA, and that the reported assurance level
-   (L0–L4), backend, and relaxations match reality. A claim that does not
-   survive this check must lose the `implemented` tag.
-4. **The task stays `in_progress` + `implemented` until the PR lands on
-   `main`.** Open, in-review, validation-red, awaiting-merge, and
-   blocked-on-a-dependency PRs are never `closed`. If the published artifact
-   disappears or the implementation claim proves false, remove the tag; do not
-   invent a status that TaskGraph does not have.
-5. **Only the coordinator closes tasks, through the verified gateway.** After
-   freshly verifying that the landed commit is reachable from the target
-   `main`, the coordinator uses the dev-hermit parent's
-   `./ci-hub/bin/close-task` with the PR or full SHA. Never use raw
-   `tg update --status closed`. A local green run, a GitHub state field, or a
-   label is not landing evidence.
-
-### Done vs. Not Done
-
-Use these concrete examples to decide the correct status. When in doubt, choose
-the lower status and say why in a task note.
-
-**Done (coordinator may close):**
-
-- PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
-  and the verified closure gateway accepts its freshly fetched ancestry.
-- A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
-  updated to the exact landed SHAs, and the pair revalidated.
-
-**`in_progress` + `implemented` (agent's terminal state — do NOT close):**
-
-- Branch pushed, PR open, exact-head validation green, awaiting merge.
-- PR open but validation red, or an exact-head receipt missing/stale — still
-  `in_progress` + `implemented`; report the exact failure, do not close.
-- Work committed and pushed but blocked on another PR or a reverie pin bump —
-  `in_progress` + `implemented` with the blocker and dependency SHAs named.
-
-**Not done (stays `in_progress`, never tagged `implemented` or closed):**
-
-- Code written but uncommitted or not pushed. Do not use a stash as a handoff.
-- "It builds/tests pass locally" with no pushed branch and no open PR.
-- A green local `cargo test` presented as project completion — a local run is
-  not a landing, and one backend passing is not "done" across all backends.
-- Tests marked `#[ignore]`, masked, or deleted to make a checkout look green.
+A Hermit implementation handoff additionally identifies the
+`rrnewton/hermit` pull-request URL, branch, exact 40-hex candidate and tested
+base, validation authority, assurance level, backend, log level, relaxations,
+and every cross-repository dependency SHA. A branch name, label, copied status,
+or unbound validation result is not evidence for those fields.
