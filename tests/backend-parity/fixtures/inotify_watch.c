@@ -14,10 +14,12 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/inotify.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 4 };
     int ok = 0;
 
     int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -39,5 +41,5 @@ int main(void) {
     }
 
     printf("ino ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

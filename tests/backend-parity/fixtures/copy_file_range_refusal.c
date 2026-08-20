@@ -59,6 +59,7 @@ static long fd_size(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
   char src_template[] = "/tmp/copy_file_range_src_XXXXXX";
   char dst_template[] = "/tmp/copy_file_range_dst_XXXXXX";
 
@@ -113,5 +114,5 @@ int main(void) {
 
   printf("copy_file_range_refusal src=%ld dst=%ld checksum=%ld ok=%d\n",
          src_size, dst_size, checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

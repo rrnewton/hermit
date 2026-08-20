@@ -29,6 +29,7 @@ static long fd_size(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   int ok = 0;
 
   char path[] = "/tmp/fallocXXXXXX";
@@ -81,5 +82,5 @@ int main(void) {
   close(fd);
   unlink(path);
   printf("fallocate ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

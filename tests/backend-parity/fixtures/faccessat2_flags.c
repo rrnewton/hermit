@@ -29,6 +29,7 @@ static int faccessat2_call(int dirfd, const char *path, int mode, int flags) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
     char tmpl[] = "/tmp/faccessat2_XXXXXX";
     int fd = mkstemp(tmpl);
@@ -70,5 +71,5 @@ int main(void) {
     close(fd);
     unlink(tmpl);
     printf("faccessat2 ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -35,6 +36,7 @@ static long fd_size(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 5 };
   int ok = 0;
 
   int fd = memfd_create("parity", MFD_CLOEXEC);
@@ -71,5 +73,5 @@ int main(void) {
 
   close(fd);
   printf("memfd_create ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

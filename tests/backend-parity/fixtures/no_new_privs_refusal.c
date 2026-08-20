@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/prctl.h>
 
 #ifndef PR_SET_NO_NEW_PRIVS
@@ -38,6 +39,7 @@ static int refused(int op, unsigned long arg2)
 
 int main(void)
 {
+	enum { EXPECTED_CHECKS = 3 };
 	int ok = 0;
 
 	/* Initial query is refused. */
@@ -50,5 +52,5 @@ int main(void)
 	ok += refused(PR_GET_NO_NEW_PRIVS, 0);
 
 	printf("nnp ok=%d\n", ok);
-	return 0;
+	return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

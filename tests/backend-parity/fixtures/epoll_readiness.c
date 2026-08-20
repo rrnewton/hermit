@@ -11,12 +11,14 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   int ok = 0;
 
   int ep = epoll_create1(EPOLL_CLOEXEC);
@@ -65,5 +67,5 @@ int main(void) {
   close(ep);
 
   printf("epoll ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

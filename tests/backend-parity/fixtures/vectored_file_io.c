@@ -50,6 +50,7 @@ static void fail(const char *message) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/vectored_file_io_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -111,5 +112,5 @@ int main(void) {
 
   printf("vectored_file_io size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

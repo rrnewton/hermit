@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/statfs.h>
 #include <unistd.h>
 
@@ -33,6 +34,7 @@
 
 int main(void)
 {
+	enum { EXPECTED_CHECKS = 6 };
 	int ok = 0;
 	struct statfs s;
 
@@ -61,5 +63,5 @@ int main(void)
 	}
 
 	printf("statfs ok=%d\n", ok);
-	return 0;
+	return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

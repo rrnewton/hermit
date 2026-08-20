@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     int ok = 0;
     char tmpl[] = "/tmp/msync_writeback_XXXXXX";
     int fd = mkstemp(tmpl);
@@ -67,5 +68,5 @@ int main(void) {
     unlink(tmpl);
     close(fd);
     printf("msync ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

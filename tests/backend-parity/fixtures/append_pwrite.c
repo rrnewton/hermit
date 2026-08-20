@@ -57,6 +57,7 @@ static off_t own_offset(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/append_pwrite_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -123,5 +124,5 @@ int main(void) {
 
   printf("append_pwrite size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -12,10 +12,12 @@
 // the answer carries no host state and is identical across hosts.
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -40,5 +42,5 @@ int main(void) {
     if (shutdown(-1, SHUT_RDWR) == -1 && errno == EBADF) ok++;
 
     printf("shutdown ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

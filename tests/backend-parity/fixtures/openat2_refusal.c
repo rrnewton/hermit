@@ -20,6 +20,7 @@
 #include <linux/types.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -50,6 +51,7 @@ static int expect_enosys(const struct parity_open_how *how)
 
 int main(void)
 {
+	enum { EXPECTED_CHECKS = 3 };
 	int ok = 0;
 
 	/* Plain read-only open via the extensible interface. */
@@ -77,5 +79,5 @@ int main(void)
 	ok += expect_enosys(&beneath);
 
 	printf("openat2 ok=%d\n", ok);
-	return 0;
+	return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

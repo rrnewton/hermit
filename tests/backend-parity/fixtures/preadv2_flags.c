@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
 
     char path[] = "/tmp/preadv2_flags.XXXXXX";
@@ -87,5 +88,5 @@ int main(void) {
     unlink(path);
 
     printf("preadv2 ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

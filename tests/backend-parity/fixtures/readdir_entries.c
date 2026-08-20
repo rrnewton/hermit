@@ -38,6 +38,7 @@ static int make_file(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
   int ok = 0;
   char joined[JOIN_CAP] = {0};
 
@@ -112,5 +113,5 @@ int main(void) {
   rmdir(root);
 
   printf("readdir ok=%d names=%s\n", ok, joined);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

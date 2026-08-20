@@ -17,6 +17,7 @@
 // wait to schedule.
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -32,6 +33,7 @@ static int roundtrip(int fd, int opt, int value) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 6 };
     int ok = 0;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -49,5 +51,5 @@ int main(void) {
     close(sv[0]);
     close(sv[1]);
     printf("sockopt ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
