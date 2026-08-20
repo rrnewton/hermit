@@ -45,6 +45,22 @@ static void fail(const char *message) {
   exit(1);
 }
 
+/*
+ * The e2e harness has no golden-output field: its verify oracle is exit status
+ * plus cross-attempt determinism. A deterministically wrong stdout therefore
+ * passes unnoticed unless the guest checks itself, so every invariant below is
+ * asserted rather than merely printed.
+ */
+static int violations;
+
+static void expect(const char *name, long long observed, long long wanted) {
+  if (observed != wanted) {
+    fprintf(stderr, "invariant %s: observed %lld, wanted %lld\n", name, observed,
+            wanted);
+    violations++;
+  }
+}
+
 /* Write the whole iovec set, tolerating short writes by advancing past the
  * bytes already sent. */
 static int writev_all(int fd, struct iovec *iov, int iovcnt) {
@@ -130,6 +146,11 @@ int main(void) {
   if (close(fds[0]) != 0)
     fail("close read end");
 
+  /* The two aggregates the header describes. `bytes` is counted from the readv
+     returns, so comparing it against the intended stream length catches a short
+     drain; `checksum` is 0+1+...+255. */
+  expect("bytes", (long long)bytes, STREAM_BYTES);
+  expect("checksum", (long long)checksum, 32640);
   printf("vectored_io bytes=%ld checksum=%ld\n", bytes, checksum);
-  return 0;
+  return violations == 0 ? 0 : 1;
 }

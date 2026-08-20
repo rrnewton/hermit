@@ -39,6 +39,22 @@ static void fail(const char *message) {
   exit(1);
 }
 
+/*
+ * The e2e harness has no golden-output field: its verify oracle is exit status
+ * plus cross-attempt determinism. A deterministically wrong stdout therefore
+ * passes unnoticed unless the guest checks itself, so every invariant below is
+ * asserted rather than merely printed.
+ */
+static int violations;
+
+static void expect(const char *name, long long observed, long long wanted) {
+  if (observed != wanted) {
+    fprintf(stderr, "invariant %s: observed %lld, wanted %lld\n", name, observed,
+            wanted);
+    violations++;
+  }
+}
+
 static int write_u64(int fd, uint64_t value) {
   for (;;) {
     ssize_t n = write(fd, &value, sizeof(value));
@@ -92,7 +108,11 @@ int main(void) {
   if (close(sem_fd) != 0)
     fail("close semaphore");
 
+  /* The two sums the header describes: 1+2+...+8 drained by one read, and five
+     semaphore reads of 1 each. Both are observed values, not literals. */
+  expect("counter", (long long)counter, 36);
+  expect("sem", (long long)sem_sum, 5);
   printf("eventfd counter=%llu sem=%llu\n", (unsigned long long)counter,
          (unsigned long long)sem_sum);
-  return 0;
+  return violations == 0 ? 0 : 1;
 }
