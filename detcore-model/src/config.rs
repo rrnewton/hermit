@@ -480,6 +480,18 @@ pub struct Config {
     pub detlog_heap: bool,
 
     /// An option to enable logging the hash of stack memory maps for the purpose of determinism checking
+    ///
+    /// THIS HASH COVERS argv AND THE ENVIRONMENT, which the kernel places at the
+    /// top of the initial process stack. Two runs whose command lines differ by a
+    /// single character therefore produce different stack hashes from the first
+    /// sample, even when the command lines are the same LENGTH and every stack
+    /// address matches. Measured: equal-length-but-different argv diverged the
+    /// hash 14 records in, while byte-identical argv held it for 5023 records.
+    ///
+    /// Holding a run-directory name to a fixed WIDTH is a sufficient control when
+    /// only addresses matter, and is NOT sufficient here. Comparing two runs
+    /// under this flag requires byte-identical argv and environment; otherwise
+    /// the first divergence you find is your own input.
     #[clap(long)]
     pub detlog_stack: bool,
 
