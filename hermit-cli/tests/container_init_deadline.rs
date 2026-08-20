@@ -335,3 +335,124 @@ fn container_init_honours_signals_aimed_at_it_directly() {
         assert_session_drains(guard.0, &format!("run after signal {signal} to its init"));
     }
 }
+
+/// How long to watch an unprotected init before concluding it discarded the
+/// signal. Short on purpose: this asserts that nothing happened, and a longer
+/// wait would only make the same point more slowly.
+const DISCARD_OBSERVATION: Duration = Duration::from_secs(5);
+
+/// The record path, which reaches `Container::run` through six call sites in
+/// `record_start.rs` rather than through `with_container`.
+///
+/// Worth its own test rather than trusting the `run` case: the guard was
+/// originally applied per launch path, and an adversarial review found a third
+/// path only after the first two were believed complete. A test per path is how
+/// that stops being a matter of memory.
+#[test]
+fn record_container_init_dies_with_the_hermit_process_that_forked_it() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut argv = vec![hermit_bin(), "record", "--"];
+    argv.extend_from_slice(SPINNER);
+
+    let (mut hermit, guard, init) = start_hung_run(&argv);
+    let outer = hermit.id() as i32;
+    assert_ne!(outer, init, "the container init must be a distinct process");
+
+    // SAFETY: `kill` takes a pid and a signal number and touches no caller
+    // memory. `outer` is our own child and has not been reaped yet.
+    assert_eq!(
+        unsafe { libc::kill(outer, libc::SIGKILL) },
+        0,
+        "failed to kill the outer hermit process: {}",
+        io::Error::last_os_error()
+    );
+    let status = hermit.wait().expect("failed to wait for hermit record");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    assert_session_drains(
+        guard.0,
+        "record container init after its hermit parent was killed outright",
+    );
+}
+
+/// `--namespace-only` unshares the PID namespace and EXECS the guest, so the
+/// guest itself becomes the namespace init. It never passes through
+/// `with_container`, and it is the path the 2026-08-17 incident binary took.
+#[test]
+fn namespace_only_container_init_dies_with_the_hermit_process_that_forked_it() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut argv = vec![hermit_bin(), "run", "--namespace-only", "--"];
+    argv.extend_from_slice(SPINNER);
+
+    let (mut hermit, guard, init) = start_hung_run(&argv);
+    let outer = hermit.id() as i32;
+
+    // SAFETY: as above.
+    assert_eq!(
+        unsafe { libc::kill(outer, libc::SIGKILL) },
+        0,
+        "failed to kill the outer hermit process: {}",
+        io::Error::last_os_error()
+    );
+    let status = hermit.wait().expect("failed to wait for hermit");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    assert_session_drains(
+        guard.0,
+        &format!("--namespace-only init {init} after its hermit parent was killed outright"),
+    );
+}
+
+/// PINS A LIMITATION, NOT A PROTECTION. Read the name carefully: this asserts
+/// that `--namespace-only` DISCARDS a directly aimed `SIGTERM`.
+///
+/// A test that appeared to prove `--namespace-only` is protected would be worse
+/// than no test, so this records the real behaviour instead. Under
+/// `--namespace-only` the guest is exec'd, and `execve` resets caught signals to
+/// `SIG_DFL`; a namespace init with `SIG_DFL` has the signal discarded by the
+/// kernel. So the ONLY thing guarding this path is the parent-death signal
+/// (covered by the test above). A directly aimed stop signal does nothing, and a
+/// credential-changing `execve` would clear even the death signal.
+///
+/// WHEN THIS TEST STARTS FAILING, THAT IS GOOD NEWS: it means the non-execing
+/// PID 1 supervisor landed and the guest is no longer the init. Replace this
+/// with the positive assertion at that point; do not weaken it in the meantime.
+/// Tracked at `guard_pid_namespaces_structurally`.
+#[test]
+fn namespace_only_discards_a_signal_aimed_directly_at_its_init() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut argv = vec![hermit_bin(), "run", "--namespace-only", "--"];
+    argv.extend_from_slice(SPINNER);
+
+    let (mut hermit, _guard, init) = start_hung_run(&argv);
+    let outer = hermit.id() as i32;
+    assert!(
+        alive(outer),
+        "the hermit parent must still be alive, or this would be measuring the \
+         parent-death signal instead"
+    );
+
+    // SAFETY: `kill` takes a pid and a signal number and touches no caller
+    // memory. `init` was observed alive by `start_hung_run`.
+    assert_eq!(
+        unsafe { libc::kill(init, libc::SIGTERM) },
+        0,
+        "failed to signal the namespace init {init}: {}",
+        io::Error::last_os_error()
+    );
+
+    let died = poll_until(DISCARD_OBSERVATION, || (!alive(init)).then_some(()));
+    assert!(
+        died.is_none(),
+        "--namespace-only init {init} DIED from a directly aimed SIGTERM. That is \
+         better than the documented behaviour, so this is not a regression -- but \
+         this test pins the gap deliberately and is now stale. If the non-execing \
+         PID 1 supervisor landed, replace this with the positive assertion."
+    );
+
+    let _ = unsafe { libc::kill(outer, libc::SIGKILL) };
+    let _ = hermit.wait();
+}
