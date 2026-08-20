@@ -134,6 +134,31 @@ fn select_thread_exit_detpid(
     }
 }
 
+fn select_thread_start_detpid(thread_detpid: Option<DetPid>, guest_pid: Pid) -> DetPid {
+    thread_detpid.unwrap_or_else(|| DetPid::from_raw(guest_pid.into()))
+}
+
+fn is_root_thread_start(is_root_process: bool, dettid: DetTid, detpid: DetPid) -> bool {
+    is_root_process && dettid == detpid
+}
+
+fn account_unobserved_initial_exec<T>(thread_state: &mut tool_local::ThreadState<T>) -> bool {
+    let detpid = thread_state
+        .detpid
+        .expect("detpid unset while accounting initial exec");
+    if thread_state.guest_past_first_execve() || thread_state.mm_id != MmId::initial(detpid) {
+        return false;
+    }
+
+    thread_state.stats.count_syscall();
+    thread_state
+        .thread_logical_time
+        .add_syscall_with_cost(syscall_time::cost_ns(Sysno::execve));
+    thread_state.account_process_cpu_time();
+    thread_state.mm_id = thread_state.mm_id.for_exec(detpid);
+    true
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the typed fail-closed backend signal.
 /// Identifies an unsupported syscall that a backend must terminate without unwinding.
@@ -1423,8 +1448,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
-        let detpid = DetPid::from_raw(guest.pid().into());
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
+        assert_eq!(new_dettid, guest.thread_state().dettid);
+        let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
+        let is_root_thread = is_root_thread_start(guest.is_root_process(), new_dettid, detpid);
         trace!(
             "[tid {}] detcore handle_thread_start, pid={}",
             guest.tid(),
@@ -1441,11 +1468,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        assert_eq!(new_dettid, guest.thread_state().dettid);
-
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
             create_vfork_child_thread(guest, new_dettid, vfork).await;
-        } else if guest.is_root_thread() {
+        } else if is_root_thread {
             // There is no fork event to catch for the root thread.
             debug!(
                 "[detcore, dtid {}] root thread start, scheduling.. full config:\n {:?}",
@@ -1458,7 +1483,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, self.detpid).await;
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {
@@ -1482,6 +1507,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // Some backends begin observation after the kernel has already installed the
+        // initial executable image.  Account for that exec exactly once so post-exec
+        // state matches a backend that observed the successful execve syscall.
+        account_unobserved_initial_exec(guest.thread_state_mut());
         guest.thread_state_mut().past_global_first_execve = true;
         tool_global::mark_past_first_execve(guest).await;
         self.pre_handler_hook(guest, false).await;
@@ -2829,6 +2858,77 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_start_identity_tests {
+    use super::*;
+
+    #[test]
+    fn backend_process_identity_is_preserved() {
+        let backend_detpid = DetPid::from_raw(3);
+        assert_eq!(
+            select_thread_start_detpid(Some(backend_detpid), Pid::from_raw(42_001)),
+            backend_detpid
+        );
+        assert_eq!(
+            select_thread_start_detpid(None, Pid::from_raw(42_001)),
+            DetPid::from_raw(42_001)
+        );
+    }
+
+    #[test]
+    fn root_thread_requires_root_process_and_matching_process_identity() {
+        let detpid = DetPid::from_raw(3);
+        assert!(is_root_thread_start(true, DetTid::from_raw(3), detpid));
+        assert!(!is_root_thread_start(false, DetTid::from_raw(3), detpid));
+        assert!(!is_root_thread_start(true, DetTid::from_raw(4), detpid));
+    }
+}
+
+#[cfg(test)]
+mod initial_exec_accounting_tests {
+    use super::*;
+
+    fn root_state() -> tool_local::ThreadState<()> {
+        let detpid = DetPid::from_raw(3);
+        let mut state = tool_local::ThreadState::new(detpid, &Config::default(), ());
+        state.detpid = Some(detpid);
+        state
+    }
+
+    #[test]
+    fn omitted_initial_exec_is_accounted_exactly_once() {
+        let detpid = DetPid::from_raw(3);
+        let mut state = root_state();
+        let before = state.thread_logical_time.as_nanos();
+
+        assert!(account_unobserved_initial_exec(&mut state));
+        assert_eq!(state.stats.syscall_count, 1);
+        assert_eq!(state.mm_id, MmId::initial(detpid).for_exec(detpid));
+        assert!(state.thread_logical_time.as_nanos() > before);
+
+        let after = state.thread_logical_time.as_nanos();
+        assert!(!account_unobserved_initial_exec(&mut state));
+        assert_eq!(state.stats.syscall_count, 1);
+        assert_eq!(state.thread_logical_time.as_nanos(), after);
+    }
+
+    #[test]
+    fn observed_exec_and_exec_reconnect_are_not_accounted_again() {
+        let detpid = DetPid::from_raw(3);
+        for syscall_count in [0, 1] {
+            let mut state = root_state();
+            state.mm_id = MmId::initial(detpid).for_exec(detpid);
+            state.stats.syscall_count = syscall_count;
+            let before = state.thread_logical_time.as_nanos();
+
+            assert!(!account_unobserved_initial_exec(&mut state));
+            assert_eq!(state.stats.syscall_count, syscall_count);
+            assert_eq!(state.mm_id, MmId::initial(detpid).for_exec(detpid));
+            assert_eq!(state.thread_logical_time.as_nanos(), before);
+        }
     }
 }
 

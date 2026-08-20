@@ -1942,15 +1942,17 @@ impl RunOpts {
         }
         // });
 
-        // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
-        // e9patch, and ptrace use the common container and run/verify machinery.
+        // Keep the established single-run DBT adapter for its summary and
+        // unsupported-syscall reporting. Verification uses the common
+        // run/compare machinery below so DBT is held to the same stdout,
+        // stderr, status, and complete INFO-log comparison as ptrace.
         match backend {
             Backend::Ptrace
             | Backend::Liteinst
             | Backend::Sabre
             | Backend::Kvm
             | Backend::E9patch => {}
-            Backend::Dbt => {
+            Backend::Dbt if !self.verify => {
                 let environment = self.guest_command()?.get_captured_envs();
                 return super::backends::run_dbt(
                     &self.program,
@@ -1963,6 +1965,7 @@ impl RunOpts {
                     environment,
                 );
             }
+            Backend::Dbt => {}
         }
 
         if backend == Backend::Liteinst {
@@ -3266,12 +3269,24 @@ impl RunOpts {
         };
         let level = verification_log_level(global.log, strictness, self.verify_verbose);
 
-        let _guard = init_file_tracing(Some(level), log_file);
-
         let command = self.guest_command()?;
 
         let config = self.effective_det_config();
         self.save_config_to_disk()?;
+
+        if self.selected_backend() == Backend::Dbt {
+            return hermit::run_with_output_backend_diagnostic_file(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+                self.runtime_backend(),
+                Some(log_file),
+                Some(level.to_string().to_ascii_lowercase()),
+            );
+        }
+
+        let _guard = init_file_tracing(Some(level), log_file);
 
         hermit::run_with_output_backend(
             command,

@@ -424,6 +424,13 @@ pub(super) fn run_dbt(
         })?
         .summary(true)
         .isolated_process_group(panic_on_unsupported_syscalls);
+    if let Some(level) = log
+        && level != LevelFilter::OFF
+    {
+        runner = runner
+            .client_argument("-log-level")
+            .client_argument(level.to_string());
+    }
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
     }
@@ -440,9 +447,6 @@ pub(super) fn run_dbt(
         environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
     );
     let mut guest = StdCommand::new(&prepared.program);
-    if let Some(level) = log {
-        environment.insert("HERMIT_LOG".into(), level.to_string().into());
-    }
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
