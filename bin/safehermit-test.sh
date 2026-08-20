@@ -77,5 +77,68 @@ grep -q marker-t6 <<<"$out" && grep -q 'bound.wall=NOT_APPLIED' "$t/6.err" \
   && ok "with no systemd the run proceeds AND declares the bound NOT_APPLIED" \
   || no "fail-loud" "either the run did not proceed or the missing bound was not declared"
 
+# T7 THE CALLER'S ENVIRONMENT ACTUALLY REACHES HERMIT.
+# This is a regression test for a defect the first six tests all passed over.
+# `systemd-run --user` does NOT inherit the invoking shell's environment -- it
+# starts the unit from the user manager's own -- so every caller variable was being
+# discarded, while the report claimed the caller's RUST_LOG was "passed through
+# untouched". Measured at the time: a guest whose stderr is 46,868,869 bytes in 8.4s
+# when hermit runs directly produced 0 bytes through the wrapper, and the run was
+# reported bytes_written=0 truncated=false exit_code=0 -- silent, clean-looking, and
+# entirely wrong.
+#
+# ASSERT THE FIXTURE FIRST, exactly as T5 does. If RUST_LOG made no difference to
+# this hermit build the test would pass while measuring nothing. Measured while
+# writing this: RUST_LOG=info over /bin/echo emits 0 bytes, so a fixture chosen for
+# convenience would have been silently vacuous. The filter below is the one demos 05
+# and 06 actually set, over a guest that makes enough syscalls to show it: 207,067
+# bytes loud against 52 bytes quiet on this box.
+T7_FILTER='warn,detcore=info,reverie_ptrace::task=info'
+T7_GUEST=(/bin/sh -c 'i=0; while [ $i -lt 300 ]; do echo $i; i=$((i+1)); done')
+RUST_LOG=error      "$HB" run -- "${T7_GUEST[@]}" >/dev/null 2>"$t/7.bare-quiet"
+RUST_LOG="$T7_FILTER" "$HB" run -- "${T7_GUEST[@]}" >/dev/null 2>"$t/7.bare-loud"
+q=$(stat -c%s "$t/7.bare-quiet"); l=$(stat -c%s "$t/7.bare-loud")
+if [ "$l" -lt 10000 ] || [ "$l" -le $(( q * 10 )) ]; then
+    no "env fixture" "the demo log filter ($l bytes) is not both substantial and an order of magnitude louder than RUST_LOG=error ($q bytes) bare; T7 would be vacuous"
+else
+    RUST_LOG="$T7_FILTER" "$SH" --sh-report "$t/7.report" "$t/hermit-arbitrary" run -- "${T7_GUEST[@]}" \
+        >/dev/null 2>"$t/7.err"
+    w=$(stat -c%s "$t/7.err")
+    # COMPARE AGAINST THE LOUD BASELINE, NOT THE QUIET ONE. An earlier version of
+    # this line asserted w > q*10, and it PASSED against the unfixed script: the
+    # quiet baseline measured 0 bytes, so q*10 was 0 and the 1,370 bytes an
+    # environment-stripped run still emits cleared it easily, against 207,067 for a
+    # bare loud run. A threshold anchored to zero is not a threshold. The wrapped
+    # run must be within the same order of magnitude as a bare LOUD run.
+    [ "$w" -gt $(( l / 2 )) ] \
+      && ok "the caller's RUST_LOG reaches hermit through the transient unit ($w bytes wrapped vs $q quiet, $l bare loud)" \
+      || no "env forwarding" "wrapped run emitted $w bytes against $l for a bare loud run (quiet baseline $q) -- the caller's environment is being dropped"
+    grep -q 'env.forwarded=APPLIED' "$t/7.report" \
+      && ok "environment forwarding is REPORTED, not assumed" \
+      || no "env reported" "no env.forwarded=APPLIED line in the report"
+fi
+
+# T8 --sh-report keeps this script's own lines OUT of the child's stderr.
+# Not cosmetic: demos/05-qemu-boot.py hashes its hermit log and demo_common
+# .compare_runs line-diffs two runs of it, and six report lines embed run_id (a UTC
+# timestamp plus pid). Verified against the real comparator -- hermit_log_diff on two
+# otherwise-identical logs reported "first divergence at line 1 ... run_id" -- so
+# without this the demo fails repeat verification on every run.
+"$SH" --sh-report "$t/8.report" "$t/hermit-arbitrary" run -- /bin/echo marker-t8 \
+    >"$t/8.out" 2>"$t/8.err"
+# `grep -c` prints 0 AND exits 1 on no-match, so a `|| echo 0` fallback appends a
+# SECOND zero and every later [ ] test dies with "integer expression expected".
+# Count without the fallback and let the printed 0 stand.
+n_err=$(grep -c '^safehermit: ' "$t/8.err"); n_rep=$(grep -c '^safehermit: ' "$t/8.report")
+grep -q marker-t8 "$t/8.out" && [ "$n_err" -eq 0 ] && [ "$n_rep" -gt 0 ] \
+  && ok "--sh-report moves the report off the child's stderr ($n_rep lines to the file, $n_err left on stderr)" \
+  || no "--sh-report" "stdout marker missing, or $n_err report lines still on stderr, or report file empty ($n_rep)"
+
+# T9 the report defaults to stderr -- the contract other callers already rely on.
+"$SH" "$t/hermit-arbitrary" run -- /bin/echo marker-t9 >/dev/null 2>"$t/9.err"
+[ "$(grep -c '^safehermit: ' "$t/9.err")" -gt 0 ] \
+  && ok "without --sh-report the report still goes to stderr (default unchanged)" \
+  || no "report default" "report vanished from stderr when no --sh-report was given"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
