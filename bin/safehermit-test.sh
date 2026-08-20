@@ -56,9 +56,15 @@ fi
 "$SH" --sh-max-log-bytes 4096 "$t/hermit-arbitrary" --log=info run -- /bin/echo hi >/dev/null 2>"$t/4.err"
 rc=$?
 tr_val=$(sed -n 's/^safehermit: truncated=//p' "$t/4.err")
-[ "$rc" = 0 ] && [ "$tr_val" = true -o "$tr_val" = false ] \
-  && ok "truncation is RECORDED as a boolean (got '$tr_val') and the child was not SIGPIPEd" \
-  || no "truncation record" "rc=$rc truncated='$tr_val' (must be true/false, never unknown)"
+# `[ p -o q ]` is SC2166: POSIX leaves -o undefined for more than a couple of
+# arguments and shells disagree, so the two comparisons are separate tests joined
+# by ||. This is the only shellcheck finding at the gate's severity anywhere under
+# bin/, and it had to go before bin/ could be added to the lint gate at all.
+if [ "$rc" = 0 ] && { [ "$tr_val" = true ] || [ "$tr_val" = false ]; }; then
+    ok "truncation is RECORDED as a boolean (got '$tr_val') and the child was not SIGPIPEd"
+else
+    no "truncation record" "rc=$rc truncated='$tr_val' (must be true/false, never unknown)"
+fi
 
 # T5 a genuine hang is killed by its deadline. Assert the fixture first.
 timeout 8 "$t/hermit-arbitrary" run -- /bin/sh -c 'while :; do :; done' >/dev/null 2>&1
