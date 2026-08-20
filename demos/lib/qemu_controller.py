@@ -29,6 +29,9 @@ if hasattr(subprocess, "_USE_VFORK"):
 
 
 BOOT_MARKER = "HERMIT-QEMU-BASELINE-BOOT-OK"
+# Emitted by the guest once it is polling the command disk; this is where the
+# boot snapshot is taken, so the resumed guest has not yet read the device.
+COMMAND_DISK_MARKER = "HERMIT-QEMU-COMMAND-DISK-READY"
 SHELL_PROMPT = "~ #"
 BEGIN_MARKER = "__HERMIT_COMMAND_BEGIN__"
 END_MARKER = "__HERMIT_COMMAND_END__"
@@ -170,6 +173,7 @@ def build_qemu_command(
     kernel: Path,
     initrd: Path,
     load_snapshot: Optional[str] = None,
+    command_image: Optional[Path] = None,
 ) -> List[str]:
     command = [
         qemu,
@@ -200,16 +204,16 @@ def build_qemu_command(
         # the transcript file that QEMU writes and the controller tails.
         command.extend(["-serial", "file:{}".format(serial_endpoint)])
     else:
-        # Resume must type a command into the console, so it needs a
-        # bidirectional transport. Use a `-serial pipe:` FIFO pair rather than a
-        # unix socket: a connected socket's fd is host-timing poll-ready and
-        # starves the -icount vCPU under `hermit --no-rcb-time` (the same failure
-        # as the demo-5 boot bug), whereas the pipe's input FIFO is poll-ready
-        # only while a command is queued, so QEMU's main loop blocks in poll()
-        # between commands instead of spinning. `serial_endpoint` is the pipe
-        # base path; QEMU opens `<base>.in`/`<base>.out` (created by the
-        # controller before launch).
-        command.extend(["-serial", "pipe:{}".format(serial_endpoint)])
+        # Resume USED TO type a command into the console over a bidirectional
+        # `-serial pipe:` FIFO pair. That made the workload's arrival instant a
+        # function of host wall time: the same snapshot resumed twice saw the
+        # bytes land at different points in guest execution. The command now
+        # arrives on a disk that is already populated when the guest resumes, so
+        # nothing is ever written into the guest and resume can use the same
+        # pure-write file sink as boot -- which also keeps a host-timing-driven
+        # pollable descriptor out of QEMU's glib main-loop poll set, the hazard
+        # documented for boot above.
+        command.extend(["-serial", "file:{}".format(serial_endpoint)])
     command.extend(
         [
             "-qmp",
@@ -218,6 +222,22 @@ def build_qemu_command(
             "if=none,id=hermit-snapshot-store,file={},format=qcow2".format(disk),
         ]
     )
+    if command_image is not None:
+        # Present at BOOT as well as resume: vmstate records the device model, so a
+        # device absent at snapshot cannot appear at resume. Only the backing FILE
+        # differs between the two, and its size is fixed so the geometry matches.
+        # readonly=on is required, not cosmetic: a writable raw drive is not
+        # snapshottable and `savevm` refuses the save.
+        command.extend(
+            [
+                "-drive",
+                "if=none,id=hermit-command,file={},format=raw,readonly=on".format(
+                    command_image
+                ),
+                "-device",
+                "virtio-blk-pci,drive=hermit-command",
+            ]
+        )
     if load_snapshot is not None:
         command.extend(["-loadvm", load_snapshot])
     command.extend(
@@ -246,6 +266,8 @@ def parse_args() -> argparse.Namespace:
     # resume uses a bidirectional `-serial pipe:` FIFO pair rooted at this base
     # path (QEMU opens <base>.in and <base>.out).
     parser.add_argument("--serial-pipe", type=Path)
+    # Fixed-size raw image holding the guest command; see build_qemu_command.
+    parser.add_argument("--command-image", type=Path)
     parser.add_argument("--serial-log", type=Path, required=True)
     parser.add_argument("--disk", type=Path, required=True)
     parser.add_argument("--kernel", type=Path, required=True)
@@ -265,14 +287,14 @@ def run_controller(arguments: argparse.Namespace) -> int:
     # build_qemu_command selects the backend from load_snapshot, so pass the
     # matching endpoint.
     serial_endpoint = (
-        arguments.serial_log if arguments.mode == "boot" else arguments.serial_pipe
+        # Both modes now use the write-only transcript file: resume no longer types
+        # into the guest, so it needs no input transport. `PipeSerial` below is left
+        # in place but is no longer reached from this flow.
+        arguments.serial_log
     )
     if arguments.mode == "resume":
-        if arguments.serial_pipe is None:
-            raise ValueError("resume mode requires --serial-pipe")
-        # QEMU's pipe chardev opens (does not create) the FIFOs, so create them
-        # before QEMU is launched below.
-        PipeSerial.create_fifos(arguments.serial_pipe)
+        if arguments.command_image is None:
+            raise ValueError("resume mode requires --command-image")
     command = build_qemu_command(
         arguments.qemu,
         arguments.qmp_socket,
@@ -281,6 +303,7 @@ def run_controller(arguments: argparse.Namespace) -> int:
         arguments.kernel,
         arguments.initrd,
         load_snapshot,
+        arguments.command_image,
     )
     process = None
     serial = None
@@ -292,7 +315,9 @@ def run_controller(arguments: argparse.Namespace) -> int:
             # QEMU writes the console straight to arguments.serial_log; tail it.
             serial = FileSerial(arguments.serial_log)
             serial.wait_for(BOOT_MARKER)
-            serial.wait_for(SHELL_PROMPT)
+            # Snapshot the guest while it is polling the command disk, NOT at a
+            # shell prompt: the prompt only existed to be typed into.
+            serial.wait_for(COMMAND_DISK_MARKER)
             qmp_command(
                 arguments.qmp_socket,
                 "human-monitor-command",
@@ -302,19 +327,17 @@ def run_controller(arguments: argparse.Namespace) -> int:
             )
             qmp_command(arguments.qmp_socket, "quit", blocking=True)
         else:
-            if not arguments.guest_command:
-                raise ValueError("resume mode requires --guest-command")
-            # FIFOs were created before launch; QEMU (up now, per the QMP wait
-            # above) holds both ends open, so PipeSerial's opens do not block.
-            serial = PipeSerial(arguments.serial_pipe, arguments.serial_log)
-            serial.send_line("")
-            serial.wait_for(SHELL_PROMPT)
-            serial.send_line("echo {}".format(BEGIN_MARKER))
-            serial.send_line(arguments.guest_command)
-            serial.send_line("echo {}".format(END_MARKER))
-            serial.wait_for(END_MARKER, count=2)
+            # Nothing is written into the guest. The command image was populated
+            # before QEMU launched, so the guest reads it and emits the markers
+            # itself; the controller only tails the transcript.
+            serial = FileSerial(arguments.serial_log)
+            serial.wait_for(END_MARKER)
             if arguments.no_save_snapshot:
-                serial.send_line("poweroff -f")
+                # Previously this typed `poweroff -f` into the console. With no input
+                # channel the guest cannot be told to shut down, so QEMU is stopped
+                # from the control side instead -- otherwise the guest sits at its
+                # shell and the controller waits for an exit that never comes.
+                qmp_command(arguments.qmp_socket, "quit", blocking=True)
             else:
                 if not arguments.post_snapshot_name:
                     raise ValueError("resume snapshot requires --post-snapshot-name")
