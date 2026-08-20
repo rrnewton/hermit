@@ -6,7 +6,22 @@ pub struct VerificationReport {
     pub verified: bool,
     pub bitwise_parity: bool,
     pub verdict: String,
-    pub comparison: ComparisonReport,
+    /// `None` when the run reached no verdict.
+    ///
+    /// This mirrors the producer, which documents the field as "`null` when no
+    /// verdict was reached" and writes exactly that from
+    /// `VerificationReport::no_result()` (`hermit-cli/src/bin/hermit/verify.rs`).
+    /// Declaring it non-optional made a legal producer value undeserialisable,
+    /// so a truthful `no_result` surfaced as `incomplete verification report:
+    /// invalid type: null, expected struct ComparisonReport` — an infrastructure
+    /// "unreadable report" rather than a graded verdict. Measured on three
+    /// consecutive `full` runs, that mislabelled the same 8 dbt cells every
+    /// time, and `ERROR` sinks a bucket exactly like `FAIL`
+    /// (`bin/test-harness.rs`: `failed |= result.outcome != "PASS"`).
+    ///
+    /// Note the sibling below was already `Option` and the producer nulls both
+    /// in the same runs, so the two halves of one wire format disagreed.
+    pub comparison: Option<ComparisonReport>,
     pub compared_log_messages: Option<ComparedLogMessages>,
 }
 
@@ -43,16 +58,28 @@ impl VerificationReport {
     /// comparison is incomplete evidence and therefore an infrastructure result.
     pub fn require_canonical_comparison(&self) -> Result<(), String> {
         let counts = self.compared_log_messages.as_ref();
-        if self.comparison.strictness == "canonical"
-            && self.comparison.compare_logs
+        // A reachable, truthful state, not a parse failure: the run recorded no
+        // verdict, so there is no comparison to grade. It still fails admission
+        // -- absent evidence is not evidence -- but it is reported as what it is
+        // rather than as a corrupt receipt, which is the distinction this
+        // method's contract already draws between a product result and
+        // incomplete evidence.
+        let Some(comparison) = self.comparison.as_ref() else {
+            return Err(format!(
+                "verification recorded no comparison (verdict={}), so there is no canonical INFO evidence to admit",
+                self.verdict
+            ));
+        };
+        if comparison.strictness == "canonical"
+            && comparison.compare_logs
             && counts.is_some_and(|counts| counts.left > 0 && counts.right > 0)
         {
             Ok(())
         } else {
             Err(format!(
                 "verification did not compare canonical non-vacuous INFO evidence: strictness={} compare_logs={} messages={}/{}",
-                self.comparison.strictness,
-                self.comparison.compare_logs,
+                comparison.strictness,
+                comparison.compare_logs,
                 counts.map_or(0, |counts| counts.left),
                 counts.map_or(0, |counts| counts.right),
             ))
@@ -84,10 +111,10 @@ mod tests {
             verified: true,
             bitwise_parity: true,
             verdict: "matched".into(),
-            comparison: ComparisonReport {
+            comparison: Some(ComparisonReport {
                 strictness: strictness.into(),
                 compare_logs,
-            },
+            }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
         }
     }
@@ -127,13 +154,66 @@ mod tests {
 
     #[test]
     fn readable_object_with_unreadable_nested_predicate_is_refused() {
+        // Still refused, still for a nested reason -- but the nested value has
+        // to be genuinely malformed. `comparison` present with a subfield of the
+        // wrong type cannot be graded and is not something the producer emits,
+        // so it remains a parse failure.
         let malformed = serde_json::json!({
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
-            "comparison": null,
+            "comparison": {"strictness": "canonical", "compare_logs": "yes"},
             "compared_log_messages": {"left": 1, "right": 1}
         });
         assert!(VerificationReport::from_json_value(malformed).is_err());
+    }
+
+    /// `comparison: null` USED to be asserted here as a parse failure. That was
+    /// the defect, not the safety property: the producer documents `null` as the
+    /// legal encoding of "no verdict was reached", so refusing to parse it
+    /// reported a truthful receipt as a corrupt one.
+    ///
+    /// The safety property is unchanged and is what this now asserts directly: a
+    /// null comparison must never yield a green. It is only the LABEL that
+    /// moves, from "unreadable report" to a refusal that names the real cause.
+    #[test]
+    fn no_result_receipt_parses_but_can_never_be_admitted() {
+        let no_result = serde_json::json!({
+            "verified": false,
+            "bitwise_parity": false,
+            "verdict": "no_result",
+            "comparison": null,
+            "compared_log_messages": null
+        });
+        let report = VerificationReport::from_json_value(no_result)
+            .expect("a documented no_result receipt must parse");
+        assert!(report.comparison.is_none());
+
+        let refusal = report
+            .require_canonical_match()
+            .expect_err("a no_result receipt must never be admitted as a green");
+        assert!(
+            refusal.contains("recorded no comparison") && refusal.contains("no_result"),
+            "the refusal must name the real cause rather than implying a corrupt file: {refusal}"
+        );
+        assert!(
+            report.require_canonical_comparison().is_err(),
+            "absent evidence is not evidence"
+        );
+    }
+
+    /// A green claim with a null comparison is the dangerous shape: everything
+    /// else about the receipt says "matched". It must still be refused.
+    #[test]
+    fn null_comparison_cannot_be_admitted_even_when_the_receipt_claims_a_match() {
+        let forged = serde_json::json!({
+            "verified": true,
+            "bitwise_parity": true,
+            "verdict": "matched",
+            "comparison": null,
+            "compared_log_messages": {"left": 110, "right": 110}
+        });
+        let report = VerificationReport::from_json_value(forged).expect("parses");
+        assert!(report.require_canonical_match().is_err());
     }
 }
