@@ -384,6 +384,29 @@ fn install_container_init_stop_handlers() -> Result<(), Error> {
     Ok(())
 }
 
+/// Arm both container-init guards. Call this as the FIRST statement inside any
+/// `Container::run` closure that is not going through [`with_container`].
+///
+/// Why this is public rather than folded into [`with_container`]: `hermit record`
+/// -- every spelling, including `record --verify` -- calls [`Container::run`]
+/// directly at six sites in `record_start.rs` and never goes through
+/// `with_container`. Those containers come from `recording_container()` ->
+/// `deterministic_container()` -> `default_container(true)`, which unshares
+/// `Namespace::PID`, so each one is a namespace init with exactly the bug the
+/// guards exist to fix. An adversarial review of the original change caught this:
+/// the claim that "all entry points funnel through `with_container`" was FALSE,
+/// and `record --verify` is precisely the long-running command an external
+/// deadline most needs to be able to end.
+///
+/// The structurally better home for this is reverie's `Container::run`, before
+/// `setup()`, which would also close the fork-to-prctl window. That is a
+/// reverie-side change plus a pin bump; this closes the six sites now.
+pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
+    arm_parent_death_signal().map_err(SerializableError::from)?;
+    install_container_init_stop_handlers().map_err(SerializableError::from)?;
+    Ok(())
+}
+
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
@@ -394,8 +417,7 @@ where
     Ok(container
         .run(|| {
             // Runs in the freshly forked container init, not in the caller.
-            arm_parent_death_signal().map_err(SerializableError::from)?;
-            install_container_init_stop_handlers().map_err(SerializableError::from)?;
+            arm_container_init_guards()?;
             f().map_err(SerializableError::from)
         })
         .context("Sandbox container exited unexpectedly")??)

@@ -401,6 +401,8 @@ impl StartOpts {
                     let data_path = data.path().to_path_buf();
                     let exit_status = container
                         .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                             let _guard = global.init_tracing();
                             let command = self.guest_command().map_err(SerializableError::from)?;
                             with_recording_deadline(timeout, || {
@@ -413,6 +415,8 @@ impl StartOpts {
                 }
                 None => container
                     .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                         let _guard = global.init_tracing();
                         let command = self.guest_command().map_err(SerializableError::from)?;
                         hermit.record(command).map_err(SerializableError::from)
@@ -458,6 +462,8 @@ impl StartOpts {
 
         let recording = recording_container
             .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                 let _guard = global1.init_tracing();
 
                 let command = self.guest_command().map_err(SerializableError::from)?;
@@ -478,6 +484,8 @@ impl StartOpts {
         let (mut replay_container, _replay_identity_guard) = deterministic_container()?;
         let replay = replay_container
             .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                 let _guard = global2.init_tracing();
                 hermit::replay_with_output(data_dir).map_err(SerializableError::from)
             })
@@ -528,6 +536,8 @@ impl StartOpts {
 
         let _result = container
             .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
 
                 let command = self.guest_command().map_err(SerializableError::from)?;
@@ -584,6 +594,8 @@ impl StartOpts {
         let (mut container, _identity_guard) = deterministic_container()?;
         let result = container
             .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
                 hermit::replay_with_gdbserver(data_dir, gdbserver_port)
                     .map_err(SerializableError::from)
