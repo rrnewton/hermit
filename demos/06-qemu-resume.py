@@ -27,6 +27,7 @@ from demo_common import (  # noqa: E402
     make_run_dir,
     print_comparison,
     print_header,
+    report_safehermit,
     release_demo_lock,
     run_checked,
     save_anchor,
@@ -50,6 +51,26 @@ HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
 ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "120"))
+# Run hermit through the bounded entry point rather than bare. The orphan this
+# demo's own start_new_session comment describes -- still writing hermit-info.log at
+# ~45 GiB/h with ppid=1 after the demo exited -- was reaped by the group kill but was
+# never byte-bounded while it lived.
+SAFEHERMIT = ROOT / "bin/safehermit"
+# MEASURED ON THIS DEMO, NOT GUESSED -- and measured MORE THAN ONCE, which is the
+# only reason this number is right. On devbig014 (hermit 0.2.0 g770b95c505fa, QEMU
+# 10.1.2) a healthy resume wrote:
+#     80,133,297 bytes in 10s   -- resuming one snapshot state
+#    153,236,739 bytes in 18-26s -- resuming another, twice, byte-identical
+# The same demo, healthy both times, differing by 1.9x depending on the snapshot it
+# resumes from. A cap derived from the first measurement alone would have been
+# 1.75x a healthy run rather than the 3.3x it appeared to be -- still passing, but
+# with a third of the headroom advertised, which is how a cap ends up firing on a
+# good run months later and getting blamed on something else. The cap is 3.50x the
+# LARGER observed healthy total.
+#
+# The 64 MiB default is 0.42x what a healthy resume already writes, so wiring this
+# demo unchanged would kill every run partway through.
+MAX_LOG_BYTES = int(os.environ.get("QEMU_MAX_LOG_BYTES", str(512 * 1024 * 1024)))
 SNAPSHOT_NAME = os.environ.get("QEMU_SNAPSHOT_NAME", "hermit-boot")
 SNAPSHOT_DISK = Path(
     os.environ.get("QEMU_SNAPSHOT_DISK", ASSETS / "hermit-snapshot.qcow2")
@@ -176,6 +197,7 @@ def main() -> int:
     serial_log = ASSETS / "serial.log"
     archived_serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
+    safehermit_report = run_dir / "safehermit-report.txt"
     output_path = run_dir / "guest-output.txt"
     archived_disk = run_dir / "post-command.qcow2"
     copy_file(BOOT_SNAPSHOT_DISK, SNAPSHOT_DISK)
@@ -214,6 +236,17 @@ def main() -> int:
         )
         post_name = "command-{}".format(command_digest[:16])
         command = [
+            str(SAFEHERMIT),
+            # Keep safehermit's report out of info_log: it is hashed into
+            # run-metadata.json and line-diffed against the anchor run, and six
+            # report lines embed a per-run id (UTC timestamp plus pid). Leaving them
+            # in fails repeat verification on every run.
+            "--sh-report",
+            str(safehermit_report),
+            "--sh-max-log-bytes",
+            str(MAX_LOG_BYTES),
+            "--sh-deadline",
+            str(TIMEOUT + 60),
             str(HERMIT),
             "run",
             "--strict",
@@ -251,6 +284,10 @@ def main() -> int:
             command.append("--no-save-snapshot")
         environment = os.environ.copy()
         environment["RUST_LOG"] = LOG_FILTER
+        # Keep safehermit's own capped copy inside this run's directory so it is
+        # pruned with the run rather than accumulating in a shared location. A
+        # healthy run therefore stores the log twice, about 76 MiB each.
+        environment["SAFEHERMIT_LOG_ROOT"] = str(run_dir / "safehermit")
         banner("Resume {} and run: {}".format(SNAPSHOT_NAME, guest_command))
         print("Restoring snapshot (timeout: {}s)...".format(TIMEOUT), flush=True)
         with info_log.open("wb") as log:
@@ -270,9 +307,19 @@ def main() -> int:
             return_code = wait_for_process(
                 process, TIMEOUT, progress_label="Hermit/QEMU resume"
             )
-        transcript = serial_log.read_bytes()
+        # CHECK THE STATUS BEFORE TOUCHING THE ARTIFACTS. This read used to come
+        # first, and when the run was killed early the serial log did not exist yet,
+        # so a FileNotFoundError pre-empted the informative error below. Measured on a
+        # review run with the cap set to 1 MiB: this demo reported
+        #   FAILURE: [Errno 2] No such file or directory: .../serial.log
+        # while demo 5, which already checked the status first, reported
+        #   FAILURE: Hermit/QEMU exited with status 125
+        # The missing file is a SYMPTOM of the kill, and reporting it instead of the
+        # kill sends the reader to debug the serial log.
+        report_safehermit(safehermit_report, return_code)
         if return_code != 0:
             raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
+        transcript = serial_log.read_bytes()
 
         copy_file(serial_log, archived_serial_log)
         guest_output = command_output(transcript, BEGIN_MARKER, END_MARKER)

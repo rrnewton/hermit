@@ -564,6 +564,71 @@ def make_run_dir(parent: Path, prefix: str) -> Path:
     return run_dir
 
 
+# safehermit's exit codes for the two bounds it enforces lethally. The wrapper
+# documents these; a caller that only prints the number teaches nobody what happened.
+SAFEHERMIT_EXIT_REASON = {
+    124: "the WALL DEADLINE fired: safehermit killed the run through its cgroup",
+    125: "the LOG BYTE CAP fired: safehermit killed the run through its cgroup",
+}
+
+
+def report_safehermit(report: Path, return_code: int) -> None:
+    """Surface the wrapper's verdict, because --sh-report puts it in a file.
+
+    Moving safehermit's report off stderr is what keeps its per-run `run_id` out of
+    the hermit log these demos hash and line-diff. The cost is that the report is no
+    longer in front of anyone, so the caller has to take over the job of showing it,
+    and this is that job.
+
+    TWO THINGS ARE PRINTED, FOR TWO DIFFERENT REASONS.
+
+    Any bound the wrapper could NOT apply is printed on EVERY run, pass or fail. That
+    is safehermit's own stated discipline -- "on the day of the incident several
+    mechanisms were present and inert, and a wrapper that only speaks up when
+    something breaks becomes another one of them" -- and redirecting the report would
+    have quietly reintroduced exactly that.
+
+    On a failure the exit code is TRANSLATED. Measured on a review run with the cap
+    set to 1 MiB: demo 5 reported `FAILURE: Hermit/QEMU exited with status 125` and
+    demo 6 reported `FAILURE: [Errno 2] No such file or directory: .../serial.log`.
+    Neither says a cap fired. The second is worse than silence -- it sends the reader
+    to look at the serial log, which is missing only because the run was killed before
+    it existed.
+    """
+    lines = []
+    try:
+        lines = Path(report).read_text(errors="replace").splitlines()
+    except OSError as error:
+        # A missing report is itself worth saying: it means the run may not have been
+        # bounded at all, which is the one thing this must never pass over in silence.
+        print(
+            "WARN: safehermit report unreadable ({}): cannot confirm which bounds "
+            "were applied to this run".format(error),
+            file=sys.stderr,
+        )
+        return
+
+    unapplied = [l for l in lines if "=NOT_APPLIED:" in l]
+    if unapplied:
+        print("Bounds safehermit could NOT apply to this run:", file=sys.stderr)
+        for line in unapplied:
+            print("  {}".format(line), file=sys.stderr)
+
+    if return_code != 0:
+        reason = SAFEHERMIT_EXIT_REASON.get(return_code)
+        if reason is not None:
+            print("safehermit: exit {} means {}".format(return_code, reason),
+                  file=sys.stderr)
+        # The wrapper's own one-line explanations, which name the cap size or the
+        # deadline that fired.
+        for line in lines:
+            if line.startswith("safehermit: LOG CAP") or line.startswith(
+                "safehermit: DEADLINE"
+            ):
+                print("  {}".format(line), file=sys.stderr)
+        print("  full wrapper report: {}".format(report), file=sys.stderr)
+
+
 def wait_for_process(
     process: subprocess.Popen,
     timeout: float,
