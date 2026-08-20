@@ -29,6 +29,21 @@ use super::global_opts::GlobalOpts;
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
     pub log: TempPath,
+    /// What this side of the comparison actually is, in the reader's terms:
+    /// `"run 1"`/`"run 2"` for the two fresh executions `hermit run --verify`
+    /// performs, and `"the recording"`/`"the replay"` for `hermit record start
+    /// --verify`.
+    ///
+    /// This exists because the comparator is shared by two paths with
+    /// genuinely different execution models, and it previously reported both of
+    /// them in run-mode vocabulary. On the `run` path that wording was
+    /// accurate; on the `record start` path it described a recording and its
+    /// replay as "run 1 and run 2", which reads as a claim that the guest was
+    /// executed twice. Two reviewers independently drew exactly that conclusion
+    /// from this output. A label that is true on one path and false on the
+    /// other, with nothing in the message to say which path produced it, is
+    /// worse than no label, so each side now names itself.
+    pub label: &'a str,
 }
 
 pub(crate) struct ComparisonOptions {
@@ -397,6 +412,9 @@ pub struct VerificationOutcome {
     pub first_divergent_scheduler_turn: Option<u64>,
     /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// The two sides' labels, carried so the terminal error names what was
+    /// actually compared instead of assuming two fresh executions.
+    pub compared_labels: (String, String),
 }
 
 impl VerificationOutcome {
@@ -413,7 +431,10 @@ impl VerificationOutcome {
     pub fn into_exit_status(self) -> Result<ExitStatus, Error> {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
-            Verdict::Diverged => Err(Error::msg("Mismatch between run 1 and run 2 outputs.")),
+            Verdict::Diverged => Err(Error::msg(format!(
+                "Mismatch between {} and {} outputs.",
+                self.compared_labels.0, self.compared_labels.1
+            ))),
             // Unreachable in practice: `compare_two_runs` only ever yields
             // Matched/Diverged, and the no-result state is published directly to
             // the JSON artifact rather than carried in an outcome. Fail closed
@@ -717,10 +738,12 @@ fn compare_two_runs_with_unsupported_scan(
     let ComparedRun {
         output: out1,
         log: log1,
+        label: label1,
     } = first;
     let ComparedRun {
         output: out2,
         log: log2,
+        label: label2,
     } = second;
     let mut failed = false;
     // None until the log comparison actually runs; stays None on the
@@ -741,7 +764,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stdout != out2.stdout {
         failed = true;
-        eprintln!("Mismatch in stdout between run 1 and run 2:");
+        eprintln!("Mismatch in stdout between {label1} and {label2}:");
         let str1 = String::from_utf8_lossy(&out1.stdout);
         let str2 = String::from_utf8_lossy(&out2.stdout);
         if str1.lines().count() > 1 {
@@ -753,7 +776,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if out1.stderr != out2.stderr {
         failed = true;
-        eprintln!("Mismatch in stderr between run 1 and run 2:");
+        eprintln!("Mismatch in stderr between {label1} and {label2}:");
         let str1 = String::from_utf8_lossy(&out1.stderr);
         let str2 = String::from_utf8_lossy(&out2.stderr);
         if str1.lines().count() > 1 {
@@ -808,7 +831,12 @@ fn compare_two_runs_with_unsupported_scan(
                 failed = true;
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
-                eprintln!(":: {}", "Log differences found between runs.".red().bold());
+                eprintln!(
+                    ":: {}",
+                    format!("Log differences found between {label1} and {label2}.")
+                        .red()
+                        .bold()
+                );
             }
         } else {
             eprintln!(
@@ -819,7 +847,9 @@ fn compare_two_runs_with_unsupported_scan(
         if out1.status != out2.status {
             failed = true;
             eprintln!(
-                "Mismatch in exit status between run 1 and run 2: {}",
+                "Mismatch in exit status between {} and {}: {}",
+                label1,
+                label2,
                 Comparison::new(&out1.status, &out2.status)
             );
         }
@@ -836,7 +866,7 @@ fn compare_two_runs_with_unsupported_scan(
 
     if let Err(error) = log_processing_result {
         if options.keep_logs || failed {
-            retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+            retain_verification_logs([(label1, log1), (label2, log2)])?;
         }
         return Err(error);
     }
@@ -845,7 +875,7 @@ fn compare_two_runs_with_unsupported_scan(
     // that behavior to successful comparisons instead of changing the failure
     // path.
     if options.keep_logs || failed {
-        retain_verification_logs([("run 1", log1), ("run 2", log2)])?;
+        retain_verification_logs([(label1, log1), (label2, log2)])?;
     }
 
     if failed {
@@ -860,6 +890,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            compared_labels: (label1.to_owned(), label2.to_owned()),
         })
     } else {
         Ok(VerificationOutcome {
@@ -869,6 +900,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            compared_labels: (label1.to_owned(), label2.to_owned()),
         })
     }
 }
@@ -1029,10 +1061,12 @@ mod tests {
             ComparedRun {
                 output: left,
                 log: left_log,
+                label: "run 1",
             },
             ComparedRun {
                 output: right,
                 log: right_log,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1134,6 +1168,72 @@ mod tests {
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
     }
 
+    /// Compare two diverging sides under caller-supplied labels and return the
+    /// terminal error text a user would actually see.
+    fn diverged_message(label1: &'static str, label2: &'static str) -> String {
+        let left = output(0, b"left-output", b"");
+        let right = output(0, b"right-output", b"");
+        let (left_log, right_log) = empty_logs();
+
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &left,
+                log: left_log,
+                label: label1,
+            },
+            ComparedRun {
+                output: &right,
+                log: right_log,
+                label: label2,
+            },
+            ComparisonOptions {
+                success_message: "verified",
+                failure_message: "failed",
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: false,
+                diagnostic_full_trace: false,
+                keep_logs: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        outcome.into_exit_status().unwrap_err().to_string()
+    }
+
+    /// The comparator is shared by two paths with different execution models,
+    /// so its output must name the sides it was actually given. Both directions
+    /// are asserted deliberately: a global rename to record/replay wording would
+    /// be just as wrong as the run-mode wording it replaced, because `hermit run
+    /// --verify` really does perform two fresh executions.
+    #[test]
+    fn divergence_message_names_the_sides_it_compared() {
+        // `record start --verify`: one execution, then a replay of it. Saying
+        // "run 1"/"run 2" here reads as a claim the guest ran twice, and two
+        // reviewers drew exactly that conclusion from this output.
+        let record = diverged_message("the recording", "the replay");
+        assert!(
+            record.contains("between the recording and the replay"),
+            "record/replay divergence must name the recording and the replay, got: {record}"
+        );
+        assert!(
+            !record.contains("run 1") && !record.contains("run 2"),
+            "record/replay divergence must not claim two runs, got: {record}"
+        );
+
+        // `hermit run --verify`: two genuinely fresh executions. This wording was
+        // correct before this change and must stay correct after it.
+        let run = diverged_message("run 1", "run 2");
+        assert!(
+            run.contains("between run 1 and run 2"),
+            "run-mode divergence must still name run 1 and run 2, got: {run}"
+        );
+        assert!(
+            !run.contains("recording") && !run.contains("replay"),
+            "run-mode divergence must not borrow record/replay wording, got: {run}"
+        );
+    }
+
     #[test]
     fn output_only_mode_ignores_internal_log_order() {
         let left = output(0, b"console", b"warning");
@@ -1146,10 +1246,12 @@ mod tests {
             ComparedRun {
                 output: &left,
                 log: left_log,
+                label: "run 1",
             },
             ComparedRun {
                 output: &right,
                 log: right_log,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1277,10 +1379,12 @@ mod tests {
             ComparedRun {
                 output: &out,
                 log: left,
+                label: "run 1",
             },
             ComparedRun {
                 output: &out,
                 log: right,
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: true,
@@ -1372,10 +1476,12 @@ mod tests {
                 ComparedRun {
                     output: &output,
                     log: left.into_temp_path(),
+                    label: "run 1",
                 },
                 ComparedRun {
                     output: &output,
                     log: right.into_temp_path(),
+                    label: "run 2",
                 },
                 ComparisonOptions {
                     verbose: false,
@@ -1410,10 +1516,12 @@ mod tests {
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
+                label: "run 1",
             },
             ComparedRun {
                 output: &output,
                 log: right.into_temp_path(),
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1467,10 +1575,12 @@ mod tests {
             ComparedRun {
                 output: &output,
                 log: left.into_temp_path(),
+                label: "run 1",
             },
             ComparedRun {
                 output: &output,
                 log: right.into_temp_path(),
+                label: "run 2",
             },
             ComparisonOptions {
                 verbose: false,
@@ -1890,6 +2000,7 @@ mod tests {
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            compared_labels: ("run 1".to_owned(), "run 2".to_owned()),
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }
