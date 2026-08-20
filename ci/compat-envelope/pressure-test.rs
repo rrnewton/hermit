@@ -117,17 +117,22 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--backend BACKEND] [--prebuilt-hermit PATH]
       [--green --repetitions COUNT] [--jobs COUNT]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch and repeated
       runs require a clean commit and execute from that repository root, with
       HEAD and cleanliness checked before and after execution. With no filters,
-      this selects all red cells, but refuses a plan whose declared worst-case
-      cell occupancy cannot fit the whole-run wall bound. Use --sample for a
-      bounded random batch, --mode to narrow its population, or give --test,
-      --mode, and --backend together for exactly one cell. The default result
-      directory is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos
+      this selects every enabled red cell whose manifest has ci=false, but
+      refuses a plan whose declared worst-case cell occupancy cannot fit the
+      whole-run wall bound. Exact --test/--mode/--backend selection is the only
+      path that can request another red cell; other cells do not enter a batch
+      or random sample.
+      Use --sample for a bounded random batch, --mode to narrow its population,
+      or give --test, --mode, and --backend together for exactly one cell. The
+      default result directory is ignored/compat-envelope/pressure-<SHA>-<time>.
+      A selected red chaos
       cell whose manifest declares no seeds remains red but is unavailable:
       exact requests refuse it, while batches report and omit it rather than
       inventing a run.
@@ -140,6 +145,7 @@ Commands:
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--backend BACKEND] [--prebuilt-hermit PATH]
       [--green --repetitions COUNT] [--jobs COUNT]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
@@ -163,17 +169,26 @@ Exact-cell options (run and plan):
                            guests run at once, and KVM remains limited to one.
 
 Bounded-batch options (run and plan):
-  --sample COUNT           Seeded random sample of red cells. Without --mode,
-                           samples verify, replay, and chaos; custom and naked
-                           are omitted. Sampling draws only from cells whose
-                           manifests provide executable commands. With --green
-                           and --repetitions, sample the enabled green cells.
+  --sample COUNT           Seeded random sample of enabled red ci=false cells
+                           whose manifests provide executable commands. Without
+                           --mode, every such mode is eligible, including native
+                           naked cells. With --green and --repetitions, sample
+                           the enabled green cells.
   --green                  With --repetitions, select all enabled green cells
                            instead of one exact cell. Optional --mode and
                            --sample filters are retained in run.json. A sample
                            records selected/eligible counts and its seed in
                            run.json and summary.json; it is subset evidence,
                            not a full-population result.
+  --backend BACKEND        Narrow a batch or sample to one backend. With
+                           --test, --mode and --backend still form one exact
+                           cell.
+  --prebuilt-hermit PATH   Copy and checksum an existing Hermit binary into the
+                           result directory, omit Hermit-producing build nodes,
+                           and pass that binary to fixture preparation and every
+                           selected cell. DBT, SaBRe, and LiteInst additionally
+                           consume HERMIT_INSTALL_DIR when it names a verified
+                           complete runtime-resource bundle.
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
@@ -285,6 +300,8 @@ struct CellSelection {
     green: bool,
     #[serde(default)]
     jobs: Option<i64>,
+    #[serde(default)]
+    prebuilt_hermit: Option<PathBuf>,
 }
 
 impl CellSelection {
@@ -748,6 +765,18 @@ struct ManifestBudgetRow {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManifestCellRow {
+    lane: String,
+    #[serde(rename = "bucket")]
+    category: String,
+    test: String,
+    mode: String,
+    backend: String,
+    enabled: bool,
+    ci: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct ResultRow {
     schema: u64,
     run_id: String,
@@ -764,6 +793,8 @@ struct ResultRow {
     reason: Option<String>,
     #[serde(default)]
     error_kind: Option<String>,
+    #[serde(default)]
+    binary_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -810,6 +841,10 @@ struct RunMetadata {
     jobs: i64,
     #[serde(default)]
     eligible_cells: usize,
+    #[serde(default)]
+    prebuilt_hermit_sha256: Option<String>,
+    #[serde(default)]
+    prebuilt_hermit_source: Option<String>,
     cells: Vec<CellId>,
 }
 
@@ -1360,7 +1395,7 @@ fn print_sample(metadata: &RunMetadata) {
 fn print_unavailable(metadata: &RunMetadata) {
     if metadata.unavailable_cells > 0 {
         println!(
-            "Unavailable red chaos cells omitted: {} (their manifests declare no seeds, so no guest command exists)",
+            "Unavailable enabled red ci=false chaos cells omitted: {} (their manifests declare no seeds, so no guest command exists)",
             metadata.unavailable_cells
         );
     }
@@ -1419,6 +1454,15 @@ fn result_options(
                 }
                 if selection.backend.replace(value).is_some() {
                     return Err("--backend may be specified only once".into());
+                }
+            }
+            "--prebuilt-hermit" if allow_selection => {
+                let value = PathBuf::from(
+                    args.next()
+                        .ok_or("--prebuilt-hermit requires an executable path")?,
+                );
+                if selection.prebuilt_hermit.replace(value).is_some() {
+                    return Err("--prebuilt-hermit may be specified only once".into());
                 }
             }
             "--cell-timeout" if allow_selection => {
@@ -1499,12 +1543,7 @@ fn result_options(
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
-    let exact_fields = [
-        selection.test.is_some(),
-        selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
-        selection.backend.is_some(),
-    ];
-    if exact_fields.iter().any(|present| *present) && !exact_fields.iter().all(|present| *present) {
+    if selection.test.is_some() && !selection.is_exact() {
         return Err(
             "an exact-cell selection requires --test, --mode, and --backend together".into(),
         );
@@ -1531,6 +1570,10 @@ fn result_options(
                 .as_nanos() as u64,
         );
     }
+    selection.prebuilt_hermit = selection
+        .prebuilt_hermit
+        .take()
+        .map(|path| absolute_from(root, path));
     let results = match (results, default_results) {
         (Some(path), _) => absolute_from(root, path),
         (None, true) => default_result_root(root)?,
@@ -1546,6 +1589,80 @@ fn absolute_from(root: &Path, path: PathBuf) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let output = Command::new("sha256sum")
+        .arg("--")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("cannot checksum {}: {e}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sha256sum failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let digest = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "sha256sum emitted an invalid digest for {}",
+            path.display()
+        ));
+    }
+    Ok(digest)
+}
+
+fn materialize_prebuilt_hermit(
+    source: &Path,
+    results: &Path,
+) -> Result<(PathBuf, String, String), String> {
+    let source = fs::canonicalize(source)
+        .map_err(|e| format!("cannot resolve prebuilt Hermit {}: {e}", source.display()))?;
+    let metadata = fs::metadata(&source)
+        .map_err(|e| format!("cannot inspect prebuilt Hermit {}: {e}", source.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "prebuilt Hermit {} is not an executable regular file",
+            source.display()
+        ));
+    }
+    let source_digest = file_sha256(&source)?;
+    let retained = results.join("prebuilt/hermit");
+    fs::create_dir_all(retained.parent().expect("prebuilt Hermit has parent"))
+        .map_err(|e| format!("cannot create retained prebuilt directory: {e}"))?;
+    fs::copy(&source, &retained).map_err(|e| {
+        format!(
+            "cannot retain prebuilt Hermit {} at {}: {e}",
+            source.display(),
+            retained.display()
+        )
+    })?;
+    let retained_digest = file_sha256(&retained)?;
+    if retained_digest != source_digest {
+        return Err(format!(
+            "retained prebuilt Hermit checksum changed: source={source_digest} retained={retained_digest}"
+        ));
+    }
+    if fs::metadata(&retained)
+        .map_err(|e| format!("cannot inspect retained prebuilt Hermit: {e}"))?
+        .permissions()
+        .mode()
+        & 0o111
+        == 0
+    {
+        return Err("retained prebuilt Hermit is not executable".into());
+    }
+    Ok((
+        retained,
+        source_digest,
+        source.to_string_lossy().into_owned(),
+    ))
 }
 
 fn print_exact_manifest_command(
@@ -1798,7 +1915,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     if selection.sample == Some(0) {
         return Err("--sample must be positive".into());
     }
-    let budgets = load_budgets(root)?;
+    let matrix_json = load_matrix_json(root)?;
+    let budgets = decode_budgets(&matrix_json)?;
+    let enabled_red_ci_false = decode_enabled_ci_false_cells(&matrix_json)?;
     let path = root.join(TRACKED_CELLS);
     let text =
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -1834,12 +1953,19 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             && selection
                 .backend
                 .as_deref()
-                .map_or(true, |value| cell.id.backend == value)
-            && !(selection.sample.is_some()
-                && selection.mode.is_none()
-                && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
+                .map_or(true, |value| cell.id.backend == value);
         match cell.status.as_str() {
-            "red" if selected && !selection.repeats_green_cell() => {
+            // Batch pressure runs measure enabled red cells whose manifest mode
+            // has ci=false. Before this guard, every disabled matrix entry entered
+            // the candidate set, so a run intended to measure that population
+            // sampled thousands of cells that no manifest mode enabled. Preserve
+            // exact red-cell probes for focused implementation work, but never let
+            // cells outside the requested population inflate a batch or sample.
+            "red"
+                if selected
+                    && !selection.repeats_green_cell()
+                    && (enabled_red_ci_false.contains(&cell.id) || selection.is_exact()) =>
+            {
                 let budget = budgets
                     .get(&(cell.id.test.clone(), cell.id.mode.clone()))
                     .ok_or_else(|| {
@@ -1885,7 +2011,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     if selected_cells.is_empty() {
         if !unavailable.is_empty() {
             return Err(format!(
-                "the selected red population has no executable commands; {} chaos cell(s) are unavailable because their manifests declare no seeds",
+                "the selected enabled red ci=false population has no executable commands; {} chaos cell(s) are unavailable because their manifests declare no seeds",
                 unavailable.len()
             ));
         }
@@ -1908,12 +2034,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 if selection.repeats_green_cell() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
                 } else {
-                    format!("tracked scorecard has no red cells for mode `{mode}`")
+                    format!("tracked scorecard has no enabled red ci=false cells for mode `{mode}`")
                 }
             } else if selection.repeats_green_cell() {
                 "tracked scorecard has no enabled green cells".into()
             } else {
-                "tracked scorecard has no red cells".into()
+                "tracked scorecard has no enabled red ci=false cells".into()
             },
         );
     }
@@ -1927,7 +2053,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 )
             } else {
                 format!(
-                    "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
+                    "--sample {count} exceeds the {} enabled red ci=false cells with executable commands in the selected population; {} selected enabled red chaos cell(s) are unavailable because their manifests declare no seeds",
                     selected_cells.len(),
                     unavailable.len()
                 )
@@ -1946,12 +2072,16 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let mut preparation_by_test = BTreeMap::new();
     for cell in &selected_cells {
-        let prepared_with = enabled_by_test.get(&cell.id.test).ok_or_else(|| {
-            format!(
-                "{} has no manifest-enabled mode available to build its fixture",
-                cell.id.test
-            )
-        })?;
+        let prepared_with = if cell.enabled {
+            &cell.id
+        } else {
+            enabled_by_test.get(&cell.id.test).ok_or_else(|| {
+                format!(
+                    "{} has no manifest-enabled mode available to build its fixture",
+                    cell.id.test
+                )
+            })?
+        };
         preparation_by_test
             .entry(cell.id.test.clone())
             .or_insert_with(|| prepared_with.clone());
@@ -1983,6 +2113,10 @@ fn sample_score(cell: &CellId, seed: u64) -> u64 {
 }
 
 fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, String> {
+    decode_budgets(&load_matrix_json(root)?)
+}
+
+fn load_matrix_json(root: &Path) -> Result<Vec<u8>, String> {
     let output = Command::new("cargo")
         .args([
             "run",
@@ -2002,7 +2136,7 @@ fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String), CellBudget>, S
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    decode_budgets(&output.stdout)
+    Ok(output.stdout)
 }
 
 fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellBudget>, String> {
@@ -2058,6 +2192,25 @@ fn decode_budgets(matrix_json: &[u8]) -> Result<BTreeMap<(String, String), CellB
         }
     }
     Ok(out)
+}
+
+fn decode_enabled_ci_false_cells(matrix_json: &[u8]) -> Result<BTreeSet<CellId>, String> {
+    let rows: Vec<ManifestCellRow> = serde_json::from_slice(matrix_json)
+        .map_err(|e| format!("manifest-plan emitted invalid matrix JSON: {e}"))?;
+    if rows.is_empty() {
+        return Err("manifest-plan emitted an empty matrix".into());
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.enabled && !row.ci)
+        .map(|row| CellId {
+            lane: row.lane,
+            category: row.category,
+            test: row.test,
+            mode: row.mode,
+            backend: row.backend,
+        })
+        .collect())
 }
 
 /// The harness may spend one manifest timeout preparing the fixture, then one
@@ -2423,6 +2576,11 @@ fn write_plan_after_scorecard_check(
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let harness_manifest = write_harness_manifest(root, results)?;
+    let prebuilt_hermit = selection
+        .prebuilt_hermit
+        .as_deref()
+        .map(|source| materialize_prebuilt_hermit(source, results))
+        .transpose()?;
 
     let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
@@ -2438,7 +2596,11 @@ fn write_plan_after_scorecard_check(
                 .expect("exact selection has backend"),
         )
     });
-    let required_builds = required_build_tags(exact_cell, includes_liteinst);
+    let required_builds = if prebuilt_hermit.is_some() {
+        BTreeSet::new()
+    } else {
+        required_build_tags(exact_cell, includes_liteinst)
+    };
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
@@ -2508,10 +2670,13 @@ fn write_plan_after_scorecard_check(
             format!(" --backend {}", shell_quote(&cell.backend))
         };
         let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+        let hermit_environment = prebuilt_hermit.as_ref().map_or_else(String::new, |value| {
+            format!(" HERMIT_BIN={}", shell_quote(&value.0.to_string_lossy()))
+        });
         let cmd = format!(
             "mkdir -p {status_dir} {temporary_directory}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
-             timeout --kill-after=10s {pressure_seconds}s env \
+             timeout --kill-after=10s {pressure_seconds}s env{hermit_environment} \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
              ./ci/test_harness.sh build --include-manual --include-occasional \
              --test {test} --mode {mode}{backend} || status=$?; \
@@ -2525,9 +2690,12 @@ fn write_plan_after_scorecard_check(
             backend = backend,
             status = shell_quote(&status_path.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
+            hermit_environment = hermit_environment,
         );
         let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds)?;
-        let preparation_deps = if selection.is_exact() {
+        let preparation_deps = if prebuilt_hermit.is_some() {
+            Vec::new()
+        } else if selection.is_exact() {
             selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
         } else {
             vec!["build.e2e_artifact".into()]
@@ -2606,7 +2774,18 @@ fn write_plan_after_scorecard_check(
             } else {
                 String::new()
             };
-            let harness = if selection.is_exact() {
+            let harness = if let Some((path, _, _)) = prebuilt_hermit.as_ref() {
+                format!(
+                    "HERMIT_BIN={} ./ci/test_harness.sh run {selector} --include-occasional --prebuilt --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    shell_quote(&path.to_string_lossy()),
+                    selector = selector,
+                    test = shell_quote(&cell.test),
+                    mode = shell_quote(&cell.mode),
+                    backend = backend,
+                    result_file = shell_quote(&result_in_progress.to_string_lossy()),
+                    junit = shell_quote(&junit_in_progress.to_string_lossy()),
+                )
+            } else if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
                 } else {
@@ -2671,13 +2850,21 @@ fn write_plan_after_scorecard_check(
             if cell.backend == "kvm" {
                 resources.insert("kvm".into(), 1);
             }
-            let deps = selected_cell_dependencies(
-                selection.is_exact(),
-                selection.uses_shared_preparation(),
-                &cell.mode,
-                &cell.backend,
-                preparation_tags.get(&cell.test).map(String::as_str),
-            );
+            let deps = if prebuilt_hermit.is_some() {
+                preparation_tags
+                    .get(&cell.test)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            } else {
+                selected_cell_dependencies(
+                    selection.is_exact(),
+                    selection.uses_shared_preparation(),
+                    &cell.mode,
+                    &cell.backend,
+                    preparation_tags.get(&cell.test).map(String::as_str),
+                )
+            };
             steps.push(Step {
                 group: "cell".into(),
                 job: slug,
@@ -2804,6 +2991,8 @@ fn write_plan_after_scorecard_check(
         green: selection.green,
         jobs: selection.scheduler_jobs(),
         eligible_cells,
+        prebuilt_hermit_sha256: prebuilt_hermit.as_ref().map(|value| value.1.clone()),
+        prebuilt_hermit_source: prebuilt_hermit.as_ref().map(|value| value.2.clone()),
         cells: cells.into_iter().map(|cell| cell.id).collect(),
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -2976,6 +3165,18 @@ fn validate_run_contract(
             metadata.detcore_tree, detcore_tree
         ));
     }
+    if metadata.prebuilt_hermit_sha256.is_some() != metadata.prebuilt_hermit_source.is_some() {
+        return Err("prebuilt Hermit metadata must retain both source and checksum".into());
+    }
+    if let Some(expected) = metadata.prebuilt_hermit_sha256.as_deref() {
+        let retained = results.join("prebuilt/hermit");
+        let observed = file_sha256(&retained)?;
+        if observed != expected {
+            return Err(format!(
+                "retained prebuilt Hermit checksum mismatch: expected={expected} observed={observed}"
+            ));
+        }
+    }
 
     let selection = CellSelection {
         mode: metadata.mode.clone(),
@@ -2988,6 +3189,7 @@ fn validate_run_contract(
         repetitions: metadata.repetitions,
         green: metadata.green,
         jobs: Some(metadata.jobs),
+        prebuilt_hermit: None,
     };
     let pressure_cells = pressure_cells(root, &selection)?;
     if metadata.repetitions.is_some() && metadata.eligible_cells == 0 {
@@ -3283,6 +3485,10 @@ fn result_row_matches_cell(
         && row.lane == cell.lane
         && row.mode == cell.mode
         && observed_backend == Some(cell.backend.as_str())
+        && metadata
+            .prebuilt_hermit_sha256
+            .as_ref()
+            .is_none_or(|expected| row.binary_sha256.as_ref() == Some(expected))
         && row.classification
             == if expected_required {
                 "required"
@@ -4014,6 +4220,8 @@ fn summarize(
         "repetitions": metadata.repetitions,
         "green": metadata.green,
         "jobs": metadata.jobs,
+        "prebuilt_hermit_sha256": metadata.prebuilt_hermit_sha256,
+        "prebuilt_hermit_source": metadata.prebuilt_hermit_source,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
         "selected_cells": metadata.cells.len(),
         "repeated_result": repeated_result,
@@ -5120,23 +5328,87 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("an arbitrary untracked source file was treated as clean".into());
     }
 
+    let selection_tracked_text = fs::read_to_string(root.join(TRACKED_CELLS))
+        .map_err(|e| format!("cannot read tracked cells for selection bracket: {e}"))?;
+    let selection_tracked: TrackedCells = serde_json::from_str(&selection_tracked_text)
+        .map_err(|e| format!("cannot parse tracked cells for selection bracket: {e}"))?;
+    let selection_matrix_json = load_matrix_json(root)?;
+    let selection_budgets = decode_budgets(&selection_matrix_json)?;
+    let enabled_ci_false = decode_enabled_ci_false_cells(&selection_matrix_json)?;
+    let enabled_red_ci_false_ids: BTreeSet<_> = selection_tracked
+        .cells
+        .iter()
+        .filter(|tracked| tracked.status == "red" && enabled_ci_false.contains(&tracked.id))
+        .map(|tracked| tracked.id.clone())
+        .collect();
     let unfiltered = pressure_cells(root, &CellSelection::default())?;
-    let unavailable_id = unfiltered
-        .unavailable
-        .first()
+    let unfiltered_ids: BTreeSet<_> = unfiltered
+        .selected
+        .iter()
+        .chain(unfiltered.unavailable.iter())
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    if unfiltered_ids != enabled_red_ci_false_ids {
+        return Err(
+            "unfiltered pressure selection is not exactly the tracked enabled red ci=false population"
+                .into(),
+        );
+    }
+
+    let enabled_tests: BTreeSet<_> = selection_tracked
+        .cells
+        .iter()
+        .filter(|tracked| tracked.enabled)
+        .map(|tracked| tracked.id.test.as_str())
+        .collect();
+    let disabled_executable_id = selection_tracked
+        .cells
+        .iter()
+        .find(|tracked| {
+            !tracked.enabled
+                && tracked.status == "red"
+                && enabled_tests.contains(tracked.id.test.as_str())
+                && selection_budgets
+                    .get(&(tracked.id.test.clone(), tracked.id.mode.clone()))
+                    .is_some_and(|budget| budget.attempts.is_some())
+        })
+        .ok_or("self-test needs one disabled red cell with an executable command")?
+        .id
+        .clone();
+    if unfiltered
+        .selected
+        .iter()
+        .chain(unfiltered.unavailable.iter())
+        .any(|tracked| tracked.id == disabled_executable_id)
+    {
+        return Err("a disabled red cell entered the unfiltered pressure population".into());
+    }
+    let disabled_exact_selection = CellSelection {
+        test: Some(disabled_executable_id.test.clone()),
+        mode: Some(disabled_executable_id.mode.clone()),
+        backend: Some(disabled_executable_id.backend.clone()),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let disabled_exact = pressure_cells(root, &disabled_exact_selection)?;
+    if disabled_exact.selected.len() != 1 || disabled_exact.selected[0].id != disabled_executable_id
+    {
+        return Err("exact selection did not preserve a disabled red cell probe".into());
+    }
+
+    let unavailable_id = selection_tracked
+        .cells
+        .iter()
+        .find(|tracked| {
+            tracked.status == "red"
+                && tracked.id.mode == "chaos"
+                && selection_budgets
+                    .get(&(tracked.id.test.clone(), tracked.id.mode.clone()))
+                    .is_some_and(|budget| budget.attempts.is_none())
+        })
         .ok_or("self-test needs at least one red chaos cell without seeds")?
         .id
         .clone();
-    if unavailable_id.mode != "chaos"
-        || unfiltered
-            .selected
-            .iter()
-            .any(|tracked| tracked.id == unavailable_id)
-    {
-        return Err(
-            "a red chaos cell without seeds entered the executable pressure population".into(),
-        );
-    }
     let unavailable_selection = CellSelection {
         test: Some(unavailable_id.test.clone()),
         mode: Some(unavailable_id.mode.clone()),
@@ -5529,28 +5801,30 @@ fn self_test(root: &Path) -> Result<(), String> {
             "seeded repeated-green sampling lost its selected or eligible-cell count".into(),
         );
     }
-    let one_cell_mode_results = scratch.join("one-cell-mode-green-plan");
-    let one_cell_mode_selection = CellSelection {
+    let mode_filtered_results = scratch.join("mode-filtered-green-plan");
+    let mode_filtered_selection = CellSelection {
         green: true,
         mode: Some("replay".into()),
         repetitions: Some(2),
         run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
         ..CellSelection::default()
     };
-    let (one_cell_mode_metadata, _) = write_plan_after_scorecard_check(
+    let (mode_filtered_metadata, _) = write_plan_after_scorecard_check(
         &checked_scorecard,
-        &one_cell_mode_results,
-        &one_cell_mode_results.join("dag.json"),
-        &one_cell_mode_selection,
+        &mode_filtered_results,
+        &mode_filtered_results.join("dag.json"),
+        &mode_filtered_selection,
     )?;
-    if !one_cell_mode_metadata.green
-        || one_cell_mode_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_mode_metadata, 1, 0, 2)
+    if !mode_filtered_metadata.green
+        || mode_filtered_metadata.cells.is_empty()
+        || mode_filtered_metadata
+            .cells
+            .iter()
+            .any(|cell| cell.mode != "replay")
+        || top_level_repeated_result_description(&mode_filtered_metadata, 1, 0, 2)
             != "one or more repeated checks failed"
     {
-        return Err(
-            "a one-cell mode-filtered green batch was described as an exact flaky cell".into(),
-        );
+        return Err("a mode-filtered green batch was described as an exact flaky cell".into());
     }
     let one_cell_sample_results = scratch.join("one-cell-sample-green-plan");
     let one_cell_sample_selection = CellSelection {
@@ -5766,9 +6040,83 @@ fn self_test(root: &Path) -> Result<(), String> {
         &sample_results.join("dag.json"),
         &sample_selection,
     )?;
-    if sample_metadata.cells.len() != 2 {
-        return Err("generated sampled plan did not retain its requested two cells".into());
+    if sample_metadata.cells.len() != 2
+        || sample_metadata.eligible_cells != enabled_red_ci_false_ids.len()
+    {
+        return Err(
+            "generated sampled plan did not retain its requested cells or complete enabled-red ci=false denominator"
+                .into(),
+        );
     }
+
+    let prebuilt_fixture = scratch.join("prebuilt-hermit-fixture");
+    fs::write(&prebuilt_fixture, "#!/bin/sh\nexit 0\n")
+        .map_err(|e| format!("cannot write prebuilt Hermit fixture: {e}"))?;
+    let mut prebuilt_permissions = fs::metadata(&prebuilt_fixture)
+        .map_err(|e| format!("cannot inspect prebuilt Hermit fixture: {e}"))?
+        .permissions();
+    prebuilt_permissions.set_mode(0o755);
+    fs::set_permissions(&prebuilt_fixture, prebuilt_permissions)
+        .map_err(|e| format!("cannot make prebuilt Hermit fixture executable: {e}"))?;
+    let prebuilt_results = scratch.join("prebuilt-plan");
+    let prebuilt_selection = CellSelection {
+        backend: Some("ptrace".into()),
+        sample: Some(2),
+        seed: Some(7),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        prebuilt_hermit: Some(prebuilt_fixture.clone()),
+        ..CellSelection::default()
+    };
+    let (mut prebuilt_metadata, prebuilt_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &prebuilt_results,
+        &prebuilt_results.join("dag.json"),
+        &prebuilt_selection,
+    )?;
+    let retained_prebuilt = prebuilt_results.join("prebuilt/hermit");
+    let retained_prebuilt_text = shell_quote(&retained_prebuilt.to_string_lossy());
+    let prebuilt_fixture_sha = file_sha256(&prebuilt_fixture)?;
+    let prebuilt_fixture_source = fs::canonicalize(&prebuilt_fixture)
+        .map_err(|e| format!("cannot canonicalize prebuilt fixture: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    if prebuilt_metadata.prebuilt_hermit_sha256.as_deref() != Some(prebuilt_fixture_sha.as_str())
+        || prebuilt_metadata.prebuilt_hermit_source.as_deref()
+            != Some(prebuilt_fixture_source.as_str())
+        || prebuilt_dag.steps.iter().any(|step| step.group == "build")
+        || prebuilt_dag.steps.iter().any(|step| {
+            step.group == "prepare"
+                && (!step.deps.is_empty()
+                    || !step
+                        .cmd
+                        .contains(&format!("HERMIT_BIN={retained_prebuilt_text}")))
+        })
+        || prebuilt_dag.steps.iter().any(|step| {
+            step.group == "cell"
+                && (!step
+                    .cmd
+                    .contains(&format!("HERMIT_BIN={retained_prebuilt_text}"))
+                    || !step.cmd.contains("--prebuilt")
+                    || step.cmd.contains("run-with-hermit-e2e-artifact.sh")
+                    || step.deps.iter().any(|dep| dep.starts_with("build.")))
+        })
+    {
+        return Err(
+            "prebuilt pressure plan did not retain its binary identity or omit Hermit-producing builds"
+                .into(),
+        );
+    }
+    fs::write(&retained_prebuilt, "tampered\n")
+        .map_err(|e| format!("cannot tamper retained prebuilt fixture: {e}"))?;
+    prebuilt_metadata.source_tree_dirty = false;
+    let prebuilt_tamper = validate_run_contract(root, &prebuilt_results, &prebuilt_metadata, false)
+        .expect_err("tampered retained prebuilt Hermit was accepted");
+    if !prebuilt_tamper.contains("checksum mismatch") {
+        return Err(format!(
+            "prebuilt checksum refusal lost its cause: {prebuilt_tamper}"
+        ));
+    }
+
     sample_metadata.source_tree_dirty = false;
     validate_run_contract(root, &sample_results, &sample_metadata, true)
         .map_err(|e| format!("clean retained batch could not be re-summarized: {e}"))?;
@@ -6151,6 +6499,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         green: false,
         jobs: PRESSURE_JOBS,
         eligible_cells: 1,
+        prebuilt_hermit_sha256: None,
+        prebuilt_hermit_source: None,
         cells: vec![sample_a.clone()],
     };
     let mut result_row = ResultRow {
@@ -6167,6 +6517,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         outcome: "FAIL".into(),
         reason: None,
         error_kind: None,
+        binary_sha256: None,
     };
     if !result_row_matches_cell(
         &result_row,
@@ -6205,6 +6556,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         outcome: "PASS".into(),
         reason: None,
         error_kind: None,
+        binary_sha256: None,
     };
     if !result_row_matches_cell(
         &repeated_result_row,
