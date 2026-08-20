@@ -181,6 +181,66 @@ where
     iovec_extents(guest, message.msg_iov as usize, message.msg_iovlen, moved)
 }
 
+/// Walk the `mmsghdr` array a batch receive filled.
+///
+/// `moved` here is a COUNT OF MESSAGES, not a byte count -- which is why
+/// `recvmmsg` cannot share the `clamp`/`msghdr_extents` path that every other
+/// receive uses. Each delivered message carries its own byte count in
+/// `msg_len`, so each is walked separately and bounded by that; treating the
+/// batch as one buffer would let one message's length run into the next
+/// message's memory.
+fn mmsghdr_extents<G, T>(
+    guest: &mut G,
+    mmsg_addr: usize,
+    vlen: u32,
+    delivered: i64,
+) -> Result<Vec<BufferExtent>, Error>
+where
+    G: Guest<T>,
+    T: Tool,
+{
+    let delivered = usize::try_from(delivered).unwrap_or(0);
+    let count = delivered.min(vlen as usize).min(libc::UIO_MAXIOV as usize);
+    if mmsg_addr == 0 || count == 0 {
+        return Ok(Vec::new());
+    }
+    let address: AddrMut<'_, libc::mmsghdr> = AddrMut::from_raw(mmsg_addr).ok_or(Errno::EFAULT)?;
+    // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a valid
+    // staging value that `read_values` immediately overwrites.
+    let mut headers: Vec<libc::mmsghdr> =
+        (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
+    guest.memory().read_values(address.into(), &mut headers)?;
+
+    let mut out = Vec::new();
+    for header in &headers {
+        out.extend(iovec_extents(
+            guest,
+            header.msg_hdr.msg_iov as usize,
+            header.msg_hdr.msg_iovlen,
+            i64::from(header.msg_len),
+        )?);
+    }
+    Ok(out)
+}
+
+/// Whether this syscall's return value bounds what it wrote.
+///
+/// True for the ordinary case, where the return IS the byte count, so a return
+/// of 0 or less means nothing was written. FALSE for `poll`/`ppoll`, whose
+/// return is a COUNT OF READY DESCRIPTORS: the kernel rewrites `revents` on
+/// every entry even when it returns 0. Measured -- `poll(timeout=0)` on two
+/// never-ready pipe fds returns 0 and still moves `revents` from a poisoned
+/// 0x7FFF to 0 on both entries.
+///
+/// This exists as a predicate consulted BY the single `ret <= 0` guard, rather
+/// than as poll arms placed above it, so the guard cannot be reordered back
+/// into swallowing the zero-ready case. The original gap was exactly that: the
+/// guard sat above the poll arms, and the unit test called `whole` directly, so
+/// it could not see the short-circuit above the code it exercised.
+fn ret_gates_output(call: &Syscall) -> bool {
+    !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
+}
+
 /// The extents a completed syscall moved, or `None` when this syscall has no
 /// output buffer worth hashing.
 ///
@@ -192,8 +252,11 @@ where
     G: Guest<T>,
     T: Tool,
 {
-    // Nothing was written on a failed or empty call.
-    if ret <= 0 {
+    // Nothing was written on a failed or empty call -- for every syscall whose
+    // return value is a byte count. `ret_gates_output` is what keeps the poll
+    // family out of this, and it is a predicate rather than an arm placed above
+    // so the exclusion cannot be undone by moving code.
+    if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
     }
     let raw = |a: Option<AddrMut<'_, u8>>| a.map(|p| p.as_raw() as u64);
@@ -212,6 +275,14 @@ where
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
         Syscall::Recvmsg(c) => msghdr_extents(guest, c.msg().map_or(0, |p| p.as_raw()), ret)?,
+        // `ret` is a MESSAGE count here, not a byte count; see
+        // `mmsghdr_extents`. recvmmsg is one of the four receive syscalls
+        // that could reach a NETLINK_SOCK_DIAG dump without passing the
+        // sock_diag sanitizer, so leaving it unhashed left this check blind
+        // to exactly the bypass it would otherwise have reported.
+        Syscall::Recvmmsg(c) => {
+            mmsghdr_extents(guest, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
+        }
         Syscall::Readv(c) => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
         Syscall::Preadv(c) => {
             iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
@@ -234,7 +305,8 @@ where
 
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
-        // the array and not a prefix of it.
+        // the array and not a prefix of it -- and it is reached even when
+        // `ret == 0`, via `ret_gates_output`.
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
             c.nfds() * std::mem::size_of::<libc::pollfd>() as u64,
@@ -302,6 +374,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use reverie::syscalls;
+
     use super::*;
 
     #[test]
@@ -351,6 +425,53 @@ mod tests {
         );
         assert!(whole(None, 24).is_empty());
         assert!(whole(Some(0x2000), 0).is_empty());
+    }
+
+    /// The gap this file had: `poll(...) = 0` produced no record at all,
+    /// because the `ret <= 0` guard sat above the poll arms. The pre-existing
+    /// test called `whole()` directly, so it passed throughout -- it could not
+    /// see a short-circuit above the code it called.
+    ///
+    /// This drives `ret_gates_output`, which is the predicate the single guard
+    /// consults, so the property is tested where it is decided rather than one
+    /// level away from it.
+    #[test]
+    fn the_poll_family_is_exempt_from_the_return_value_guard() {
+        let nfds = 3;
+        for call in [
+            Syscall::Poll(
+                syscalls::Poll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds),
+            ),
+            Syscall::Ppoll(
+                syscalls::Ppoll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds),
+            ),
+        ] {
+            assert!(
+                !ret_gates_output(&call),
+                "{} returns a count of READY DESCRIPTORS, not a byte count, so a \
+                 zero return must not suppress its extent",
+                call.name()
+            );
+        }
+
+        // Everything else must stay gated, or a failed or empty call would hash
+        // bytes the kernel never wrote.
+        for call in [
+            Syscall::Read(syscalls::Read::new()),
+            Syscall::Recvmsg(syscalls::Recvmsg::new()),
+            Syscall::Recvmmsg(syscalls::Recvmmsg::new()),
+        ] {
+            assert!(
+                ret_gates_output(&call),
+                "{} returns a byte or message count, so a zero return means \
+                 nothing was written",
+                call.name()
+            );
+        }
     }
 
     #[test]
