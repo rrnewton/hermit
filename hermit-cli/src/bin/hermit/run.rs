@@ -1884,8 +1884,14 @@ impl RunOpts {
         if self.verify {
             validate_log_level(global)?;
         }
-        if self.selected_backend() == Backend::Kvm {
+        let dbt_verification_stdin = if self.selected_backend() == Backend::Kvm {
             hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+            None
+        } else if self.verify && self.selected_backend() == Backend::Dbt {
+            // DBT owns its two-run adapter and replays this descriptor there.
+            // The common output-capturing backends reserve the same input in
+            // `hermit` because their execution path lives in the library.
+            super::startup_stdin()?
         } else if self.verify {
             // `--verify` runs the guest twice through the output-capturing
             // backend, which otherwise feeds the guest an empty stdin. Snapshot
@@ -1893,7 +1899,10 @@ impl RunOpts {
             // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
             // -x c -`) is dropped and hermit reports a false deterministic pass.
             hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
-        }
+            None
+        } else {
+            None
+        };
 
         // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
         // subsequent tracing_subscriber::fmt::init() call.
@@ -1952,11 +1961,6 @@ impl RunOpts {
             Backend::Dbt => {
                 let environment = self.guest_command()?.get_captured_envs();
                 let retained_log_dir = self.retained_verify_log_dir()?;
-                let verification_stdin = self
-                    .verify
-                    .then(hermit::output_stdin_snapshot)
-                    .transpose()?
-                    .flatten();
                 return super::backends::run_dbt(
                     &self.program,
                     &self.args,
@@ -1972,7 +1976,7 @@ impl RunOpts {
                     global.log_file.as_deref(),
                     &self.effective_det_config(),
                     environment,
-                    verification_stdin,
+                    dbt_verification_stdin,
                 );
             }
         }
