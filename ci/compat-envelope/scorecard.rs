@@ -1574,7 +1574,13 @@ fn self_test() -> Result<(), String> {
                     verified: true,
                     bitwise_parity: true,
                     verdict: "matched".into(),
-                    comparison: canonical_verdict::ComparisonReport { strictness: "canonical".into(), compare_logs: true },
+                    // `Some`: this fixture is a REACHED verdict (verified,
+                    // bitwise_parity, "matched"). `None` is reserved for the
+                    // documented producer no-result state.
+                    comparison: Some(canonical_verdict::ComparisonReport {
+                        strictness: "canonical".into(),
+                        compare_logs: true,
+                    }),
                     compared_log_messages: Some(canonical_verdict::ComparedLogMessages { left: 1, right: 1 }),
                 }).unwrap();
                 serde_json::json!({
