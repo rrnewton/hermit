@@ -3899,6 +3899,135 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 #[cfg(test)]
+mod procfs_wiring_guard {
+    //! The procfs snapshot WIRING, guarded where the wiring lives.
+    //!
+    //! WHY THIS IS A SOURCE-LEVEL GUARD AND NOT A BEHAVIOURAL TEST. The thing
+    //! at risk is not `ProcfsFile`'s logic -- that is exercised elsewhere. It is
+    //! the CALL from each read handler into the snapshot initialiser. Those
+    //! handlers are `async fn`s on the `Tool` trait taking a live `Guest`, so a
+    //! unit test cannot invoke one without standing up a traced guest process;
+    //! that is exactly why the only thing guarding this today is one heavyweight
+    //! integration test that compiles a C probe and runs hermit.
+    //!
+    //! MEASURED GAP (2026-08-07, hermit 75506005d): deleting the pread64
+    //! snapshot-initialisation block leaves ALL 386 detcore lib tests green.
+    //! A mechanism whose only proof of life is one fixture is one deletion away
+    //! from vanishing unnoticed -- the positioned-read determinism bug this
+    //! wiring fixes would silently return.
+    //!
+    //! These assertions are deliberately narrow: they bind to the CALL, name the
+    //! mechanism when they fail, and cost nothing to run. They do not claim to
+    //! verify that the snapshot is correct.
+
+    /// The production source only. `include_str!` pulls in THIS module too, so a
+    /// naive scan counts the guard's own string literals and reports phantom
+    /// duplicates -- it did exactly that on first run. Truncating at the guard's
+    /// own header makes every assertion below immune to self-reference.
+    fn production_source() -> &'static str {
+        const WHOLE: &str = include_str!("files.rs");
+        const GUARD: &str = "#[cfg(test)]\nmod procfs_wiring_guard {";
+        match WHOLE.find(GUARD) {
+            Some(cut) => &WHOLE[..cut],
+            None => WHOLE,
+        }
+    }
+
+    /// The body of `fn <name>` up to the next top-level `    }` at fn indent.
+    fn handler_body(name: &str) -> &'static str {
+        let start = production_source()
+            .find(&format!("fn {}<G: Guest<Self>>", name))
+            .unwrap_or_else(|| {
+                panic!(
+                    "procfs wiring guard: handler `{name}` not found in files.rs.\n\
+                     TWO VERY DIFFERENT CAUSES, and the guard cannot tell them apart:\n\
+                       (a) the handler was RENAMED or its signature changed -- the \
+                     mechanism is fine, update the name in this guard; or\n\
+                       (b) the handler was DELETED -- the procfs snapshot wiring is gone.\n\
+                     Check which before editing. This guard binds to source text on \
+                     purpose: the handlers are async `Tool` methods taking a live Guest, \
+                     so nothing cheaper can observe the call. It is deliberately loud \
+                     when it cannot see the code, because silently passing is the \
+                     failure it exists to prevent."
+                )
+            });
+        let rest = &production_source()[start..];
+        let end = rest
+            .find(
+                "
+    }
+",
+            )
+            .map(|e| e + 6)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn pread64_initializes_the_procfs_snapshot() {
+        let body = handler_body("handle_pread64");
+        assert!(
+            body.contains("procfs_needs_snapshot") && body.contains("initialize_procfs_snapshot"),
+            "MISSING MECHANISM: the pread64 handler no longer initialises the procfs \
+             snapshot. Positioned reads will fall through to LIVE KERNEL BYTES instead of \
+             the sanitized ProcfsFile snapshot, reintroducing the positioned-read \
+             nondeterminism that hermit-cli/tests/procfs_positioned_determinism.rs exists \
+             to catch. Restore the `procfs_needs_snapshot` -> `initialize_procfs_snapshot` \
+             call in handle_pread64."
+        );
+    }
+
+    #[test]
+    fn read_initializes_the_procfs_snapshot() {
+        let body = handler_body("handle_read");
+        assert!(
+            body.contains("procfs_needs_snapshot") && body.contains("initialize_procfs_snapshot"),
+            "MISSING MECHANISM: the sequential read handler no longer initialises the \
+             procfs snapshot. Reads of /proc will observe live kernel bytes. Restore the \
+             `procfs_needs_snapshot` -> `initialize_procfs_snapshot` call in handle_read."
+        );
+    }
+
+    #[test]
+    fn both_read_paths_share_one_snapshot_initializer() {
+        // The original defect was exactly this asymmetry: `read` consumed the
+        // sanitized snapshot while `pread64` did not. Forking the logic into two
+        // initialisers is how that asymmetry comes back.
+        let n = production_source()
+            .matches("async fn initialize_procfs_snapshot")
+            .count();
+        assert_eq!(
+            n, 1,
+            "MISSING MECHANISM: expected exactly ONE `initialize_procfs_snapshot` \
+             definition so every read path shares it; found {n}. Two initialisers is how \
+             read/pread64 drifted apart in the first place."
+        );
+        for handler in ["handle_read", "handle_pread64"] {
+            assert!(
+                handler_body(handler).contains("self.initialize_procfs_snapshot("),
+                "MISSING MECHANISM: `{handler}` does not call the shared \
+                 initialize_procfs_snapshot."
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_can_actually_see_the_handlers() {
+        // Positive control: if the extractor silently returned empty bodies the
+        // three assertions above would be vacuous rather than protective.
+        for handler in ["handle_read", "handle_pread64"] {
+            let body = handler_body(handler);
+            assert!(
+                body.len() > 200 && body.contains("call.fd()"),
+                "guard extractor did not find a real body for `{handler}` \
+                 (len {}), so the wiring assertions would be vacuous",
+                body.len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod test {
     use nix::fcntl::OFlag;
 
