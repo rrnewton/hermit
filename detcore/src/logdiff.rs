@@ -367,10 +367,49 @@ pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Re
 /// Separate a full, continuous log into discrete (possibly-multiline) log messages,
 /// stripping off the timestamps in the process.  Return lines tagged with their
 /// index number.
+/// The timestamp that begins every log record. A record runs from one match to
+/// the next, so records may span multiple lines -- which is why comparison is
+/// done on records and never on lines or bytes.
+static RECORD_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d\d:\d\d:\d\d\.\d+|\d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z) +")
+        .unwrap()
+});
+
+/// Byte offsets at which each record starts.
+fn record_starts(contents: &str) -> Vec<usize> {
+    RECORD_START
+        .find_iter(contents)
+        .map(|m| m.start())
+        .collect()
+}
+
+/// How many records in `contents` are known COMPLETE.
+///
+/// A record is complete only once the *next* record has begun, because nothing
+/// else marks its end. In a log still being written the final record may be
+/// half-flushed, so it is never counted and never compared: a partial write must
+/// not read as a difference. A buffer with one record start has zero complete
+/// records, and that is a real answer, not a failure.
+pub fn complete_record_count(contents: &str) -> usize {
+    record_starts(contents).len().saturating_sub(1)
+}
+
+/// The prefix of `contents` holding exactly its first `n` complete records.
+///
+/// Returns `None` when fewer than `n` complete records are present, so a caller
+/// can tell "the runs agree over n records" apart from "n records have not been
+/// written yet". Those two must never collapse into one answer.
+pub fn take_complete_records(contents: &str, n: usize) -> Option<&str> {
+    let starts = record_starts(contents);
+    if n == 0 {
+        return Some(&contents[..0]);
+    }
+    // Record n-1 ends where record n begins, so n complete records require n+1 starts.
+    starts.get(n).map(|end| &contents[..*end])
+}
+
 fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
-    let ts =
-        Regex::new(r"((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d\d:\d\d:\d\d\.\d+|\d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z) +")
-            .unwrap();
+    let ts = &*RECORD_START;
     let tag = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) ").unwrap();
     let iter = ts
         .split(contents) // Not aware of a streaming version of this RE split operation.
@@ -826,6 +865,10 @@ pub struct LogDiffSummary {
     /// Virtual nanoseconds at that same scheduler COMMIT, when its time is
     /// present and parseable.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// 1-based index of the first record that differs. "Diverged somewhere in
+    /// the first N records" is a bound, not a location, and on a long run the
+    /// two are far apart; this is the location.
+    pub first_divergent_record: Option<usize>,
 }
 
 impl LogDiffSummary {
@@ -877,6 +920,86 @@ pub fn try_log_diff_detailed(
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
     log_diff_summary_from_strs(str_a, str_b, opts, &mut std::io::stderr())
+}
+
+/// Total records in a log, including a final record that may still be being
+/// written. Use [`complete_record_count`] when the log is still growing.
+pub fn record_count(contents: &str) -> usize {
+    record_starts(contents).len()
+}
+
+/// Like [`try_log_diff_detailed`], but also reports how many records each log
+/// contained. Every log comparison should be able to say what it read, so a
+/// caller is never left to infer coverage from a bare verdict.
+pub fn try_log_diff_with_records(
+    file_a: &Path,
+    file_b: &Path,
+    opts: &LogDiffOpts,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    let vec_a = std::fs::read(file_a)?;
+    let vec_b = std::fs::read(file_b)?;
+    let str_a = String::from_utf8_lossy(&vec_a);
+    let str_b = String::from_utf8_lossy(&vec_b);
+    let records_a = record_count(&str_a);
+    let records_b = record_count(&str_b);
+    let summary = log_diff_summary_from_strs(&str_a, &str_b, opts, &mut std::io::stderr())?;
+    Ok((summary, records_a, records_b))
+}
+
+/// A comparison of two logs that may still be growing.
+///
+/// The verdict alone is not reportable. "The runs agree" and "the runs agree so
+/// far as anyone has looked" are different claims, and a caller who cannot tell
+/// them apart will stop early and conclude the wrong thing. The record counts
+/// are therefore part of the result, not optional detail alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixComparison {
+    /// The verdict over the compared prefix only.
+    pub summary: LogDiffSummary,
+    /// Complete records present in the first log when it was read.
+    pub records_available_left: usize,
+    /// Complete records present in the second log when it was read.
+    pub records_available_right: usize,
+    /// Records actually compared: the shorter of the two available counts.
+    pub records_compared: usize,
+}
+
+impl PrefixComparison {
+    /// True when one log has complete records the other has not reached yet, so
+    /// the comparison is bounded by reading rather than by the runs agreeing.
+    pub fn one_side_is_ahead(&self) -> bool {
+        self.records_available_left != self.records_available_right
+    }
+}
+
+/// Compare only the records both logs have finished writing.
+///
+/// The tail of a log being written may be half-flushed, and a half-flushed
+/// record is not a difference -- it is an absence. Truncating both inputs to
+/// their common *complete* prefix is what makes this safe to run against a live
+/// run: bytes that have not been written yet can never be mistaken for bytes
+/// that disagree.
+pub fn compare_complete_prefix(
+    contents_a: &str,
+    contents_b: &str,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<PrefixComparison> {
+    let records_available_left = complete_record_count(contents_a);
+    let records_available_right = complete_record_count(contents_b);
+    let records_compared = records_available_left.min(records_available_right);
+    // Both are Some: `records_compared` is at most each side's complete count.
+    let prefix_a = take_complete_records(contents_a, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let prefix_b = take_complete_records(contents_b, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let summary = log_diff_summary_from_strs(prefix_a, prefix_b, opts, w)?;
+    Ok(PrefixComparison {
+        summary,
+        records_available_left,
+        records_available_right,
+        records_compared,
+    })
 }
 
 /// Boolean-only wrapper retained for tests that only ask "did it differ?".
@@ -999,6 +1122,10 @@ fn log_diff_summary_from_strs(
             .then_some(first_position_candidate)
             .flatten()
             .and_then(|(_, time)| time),
+        first_divergent_record: diff_found
+            .then_some(first_different)
+            .flatten()
+            .and_then(|(left_index, right_index)| left_index.or(right_index)),
     };
 
     if diff_found {
@@ -1029,6 +1156,185 @@ mod test {
     use pretty_assertions::assert_eq;
 
     use crate::logdiff::DetLogFilter;
+
+    /// One well-formed log record. Records are delimited by their leading
+    /// timestamp, so `body` may contain newlines and still be one record.
+    fn record(second: usize, body: &str) -> String {
+        format!("Apr 09 06:08:{second:02}.100  INFO detcore: {body}\n")
+    }
+
+    fn info_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            ..Default::default()
+        }
+    }
+
+    fn compare(left: &str, right: &str) -> super::PrefixComparison {
+        super::compare_complete_prefix(left, right, &info_opts(), &mut Vec::new())
+            .expect("comparing in-memory strings cannot fail on I/O")
+    }
+
+    #[test]
+    fn a_record_is_complete_only_once_the_next_one_starts() {
+        assert_eq!(super::complete_record_count(""), 0);
+
+        // One record start means one record that is still being written.
+        let one = record(1, "first");
+        assert_eq!(super::complete_record_count(&one), 0);
+
+        // The second start is what proves the first record finished.
+        let two = format!("{}{}", record(1, "first"), record(2, "second"));
+        assert_eq!(super::complete_record_count(&two), 1);
+
+        let three = format!("{two}{}", record(3, "third"));
+        assert_eq!(super::complete_record_count(&three), 2);
+    }
+
+    #[test]
+    fn a_multiline_record_counts_once_and_is_not_split_at_its_newlines() {
+        let multiline = format!(
+            "{}{}",
+            record(1, "first\n    continued detail\n    more detail"),
+            record(2, "second")
+        );
+        // Two starts, so one complete record -- the embedded newlines are part
+        // of record one, not boundaries of their own.
+        assert_eq!(super::complete_record_count(&multiline), 1);
+
+        let prefix = super::take_complete_records(&multiline, 1).unwrap();
+        assert!(prefix.contains("continued detail"));
+        assert!(prefix.contains("more detail"));
+        assert!(!prefix.contains("second"));
+    }
+
+    #[test]
+    fn asking_past_the_written_end_is_none_not_a_short_answer() {
+        let two = format!("{}{}", record(1, "first"), record(2, "second"));
+        assert_eq!(super::take_complete_records(&two, 0), Some(""));
+        assert!(super::take_complete_records(&two, 1).is_some());
+        // Only one record is complete, so two is not yet readable. Returning a
+        // truncated prefix here would let "not written yet" pass as "agrees".
+        assert_eq!(super::take_complete_records(&two, 2), None);
+        assert_eq!(super::take_complete_records(&two, 99), None);
+    }
+
+    #[test]
+    fn a_half_written_final_record_is_never_a_difference() {
+        // Identical complete records; the runs differ only in the tail that
+        // neither has finished flushing.
+        let left = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "TAIL-LEFT")
+        );
+        let right = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "TAIL-RIGHT-AND-LONGER")
+        );
+
+        let comparison = compare(&left, &right);
+        assert!(
+            !comparison.summary.diff_found,
+            "an unfinished record must not read as a divergence"
+        );
+        assert_eq!(comparison.records_compared, 2);
+        assert!(!comparison.one_side_is_ahead());
+    }
+
+    #[test]
+    fn a_difference_inside_the_completed_prefix_is_found() {
+        let left = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "LEFT"),
+            record(3, "tail")
+        );
+        let right = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "RIGHT"),
+            record(3, "tail")
+        );
+
+        let comparison = compare(&left, &right);
+        assert!(comparison.summary.diff_found);
+        assert_eq!(comparison.records_compared, 2);
+    }
+
+    #[test]
+    fn comparison_is_bounded_by_the_shorter_log_and_says_so() {
+        let ahead = format!(
+            "{}{}{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "same"),
+            record(4, "same"),
+            record(5, "same")
+        );
+        let behind = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "same")
+        );
+
+        let comparison = compare(&ahead, &behind);
+        assert!(!comparison.summary.diff_found);
+        assert_eq!(comparison.records_available_left, 4);
+        assert_eq!(comparison.records_available_right, 2);
+        // Only what both sides have finished writing.
+        assert_eq!(comparison.records_compared, 2);
+        assert!(
+            comparison.one_side_is_ahead(),
+            "the caller must be able to see the comparison was reading-bound"
+        );
+    }
+
+    #[test]
+    fn the_first_differing_record_is_located_not_just_bounded() {
+        // 40 identical records, one difference at record 13, then 40 more.
+        let build = |marker: &str| {
+            (1..=81)
+                .map(|index| {
+                    let body = if index == 13 { marker } else { "same" };
+                    record(index % 60, &format!("record {index} {body}"))
+                })
+                .collect::<String>()
+        };
+        let left = build("LEFT");
+        let right = build("RIGHT");
+
+        let found = compare(&left, &right).summary.first_divergent_record;
+        assert_eq!(
+            found,
+            Some(13),
+            "bisection must name the record, not merely the prefix that contains it"
+        );
+    }
+
+    #[test]
+    fn identical_logs_have_no_first_divergent_record() {
+        let same = format!("{}{}{}", record(1, "a"), record(2, "b"), record(3, "c"));
+        assert_eq!(compare(&same, &same).summary.first_divergent_record, None);
+        // And an empty comparison reports no location rather than record zero.
+        assert_eq!(compare("", "").summary.first_divergent_record, None);
+    }
+
+    #[test]
+    fn nothing_written_yet_is_a_no_result_not_a_match() {
+        // A single unfinished record on each side: zero complete records.
+        let comparison = compare(&record(1, "first"), &record(1, "first"));
+        assert_eq!(comparison.records_compared, 0);
+        assert!(!comparison.summary.diff_found);
+        assert!(
+            !comparison.summary.matched_with_evidence(),
+            "comparing zero records must never report a match"
+        );
+    }
 
     #[test]
     fn unsafe_strip_lines_cli_name_and_warning_are_explicit() {
