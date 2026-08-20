@@ -814,7 +814,7 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
 /// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
     let emit = callbacks.emit;
@@ -1041,13 +1041,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
 // TODO-HUMAN-REVIEW(PR-1060): Review deterministic child RNG identity allocation.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
+pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     scratch: *mut c_void,
     context: *mut c_void,
     _parent_tid: i32,
     pid: i32,
     branch_count: u64,
     child_tid: i32,
+    // ABI 2 added a separate virtual child identity. Detcore already derives
+    // its own virtual identity from `scratch.virtual_pid` and the child
+    // ordinal, so this registration deliberately keeps that derivation and
+    // does not switch to the client-supplied value: changing how a child's
+    // deterministic identity is chosen is a determinism change, not a link
+    // repair, and belongs in its own reviewed commit. Accepting the argument
+    // is what ABI 2 requires; consuming it is a separate decision.
+    _virtual_child_tid: i32,
     child_tid_addr: u64,
     flags: u64,
     invoke_syscall: SyscallInvoker,
@@ -1555,6 +1563,51 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             1
         }
     }
+}
+
+/// Reports the DBT runtime ABI version this build implements.
+///
+/// The native client refuses to proceed unless this equals its own
+/// `REVERIE_DBT_RUNTIME_ABI_VERSION` and [`reverie_dbt_runtime_callbacks_size`]
+/// equals its `sizeof(runtime_callbacks_t)`; on a mismatch it prints
+/// "native/runtime ABI version or callback size mismatch" and calls
+/// `dr_exit_process(101)`.
+///
+/// The value is read from Reverie rather than restated here. Hermit disables
+/// `reverie-dbt`'s `prototype-runtime` feature, so upstream's own `extern "C"`
+/// wrapper is not compiled in and Hermit must export one -- but the CONSTANT is
+/// not feature-gated, so re-reading it keeps the two repositories from drifting
+/// apart the moment someone bumps the version.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
+    reverie_dbt::DBT_RUNTIME_ABI_VERSION
+}
+
+/// Reports the exact callback-structure size for the current ABI version.
+///
+/// Computed with `size_of` over Reverie's own `DbtRuntimeCallbacks`, which is
+/// `#[repr(C)]` and not feature-gated. A hand-written number here would be a
+/// second source of truth for a struct layout, which is the class of drift this
+/// handshake exists to detect.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_callbacks_size() -> usize {
+    std::mem::size_of::<reverie_dbt::DbtRuntimeCallbacks>()
+}
+
+/// Reports the wire code identifying which runtime produced a stats record.
+///
+/// The codes Reverie defines name its own bundled prototype runtimes --
+/// `PrototypeTool` = 0, `Counter1` = 1, `CounterLocal` = 2. Detcore is none of
+/// them, and inventing a code for it would collide the moment Reverie assigns
+/// that number. `DbtRuntimeKind::Unknown` (255) is the value Reverie reserves
+/// for exactly this case: its `from_wire` decodes an unrecognized code to
+/// `Unknown` "rather than failing the whole record", so the record's additive
+/// counters still land. [`reverie_dbt_runtime_name`] carries the readable
+/// identity ("Detcore"); this byte only has to be honest about not being one of
+/// the prototype kinds.
+#[unsafe(no_mangle)]
+pub extern "C" fn reverie_dbt_runtime_kind_code() -> u8 {
+    reverie_dbt::backend_stats::DbtRuntimeKind::Unknown.to_wire()
 }
 
 /// Returns the linked Reverie Tool name for native DBT-path evidence.
