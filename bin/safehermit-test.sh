@@ -140,5 +140,70 @@ grep -q marker-t8 "$t/8.out" && [ "$n_err" -eq 0 ] && [ "$n_rep" -gt 0 ] \
   && ok "without --sh-report the report still goes to stderr (default unchanged)" \
   || no "report default" "report vanished from stderr when no --sh-report was given"
 
+# ---------------------------------------------------------------------------
+# T10-T12 THE DEADLINE VERDICT COMES FROM SYSTEMD, NOT FROM GUESSWORK.
+# These use plain fixtures rather than hermit: what is under test is how the wrapper
+# CLASSIFIES an outcome, and a fixture can produce an exact outcome on demand where
+# hermit cannot. T5 already covers a real hermit hang.
+# ---------------------------------------------------------------------------
+printf '#!/bin/bash\ntrap "exit 0" TERM\nsleep 600 & wait $!\n' > "$t/exit0-on-term"
+printf '#!/bin/bash\nsleep 0.8; exit 1\n' > "$t/quickfail"
+chmod +x "$t/exit0-on-term" "$t/quickfail"
+
+# T10 A MISSED TIMEOUT. systemd accepts a duration suffix and enforces it, but the
+# old code compared `elapsed` against the raw string with bash integer arithmetic:
+# `[ 6 -ge 6s ]` aborts with "integer expression expected", the condition went false,
+# and a run that WAS killed reported exit 1 with no DEADLINE line. Exit 1 is hermit's
+# own convention for a failed guest, so the kill was indistinguishable from ordinary
+# failure. Measured before the fix: exit 1 and 0 DEADLINE lines.
+s=$(date +%s)
+"$SH" --sh-deadline 6s --sh-report "$t/10.report" "$t/exit0-on-term" >/dev/null 2>"$t/10.err"
+rc=$?; e=$(( $(date +%s) - s ))
+# Assert the fixture was really killed before trusting the verdict, as T5 does: a
+# 600s child that returns in under 30s did not finish on its own.
+if [ "$e" -ge 30 ]; then
+    no "suffixed-deadline fixture" "child ran ${e}s; it was not killed, so the test is vacuous"
+else
+    [ $rc -eq 124 ] && [ "$(grep -c '^safehermit: DEADLINE' "$t/10.report")" -gt 0 ] \
+      && [ "$(grep -c 'integer expression expected' "$t/10.err")" -eq 0 ] \
+      && ok "a suffixed deadline (--sh-deadline 6s) is still reported as a timeout (rc=$rc after ${e}s)" \
+      || no "suffixed deadline" "rc=$rc after ${e}s with $(grep -c '^safehermit: DEADLINE' "$t/10.report") DEADLINE lines; the run was killed but not reported as a timeout"
+fi
+
+# T11 A FALSE TIMEOUT, the inverse error. The wrapper's own startup is counted in
+# `elapsed` -- measured at ~0.27s, dominated by the systemd capability probe -- so a
+# child that exits 1 well INSIDE its deadline could still push elapsed to the deadline
+# and be relabelled 124. Measured before the fix: this exact fixture returned 124 with
+# a DEADLINE line while systemd reported Result=exit-code, i.e. never killed. A real
+# guest failure reported as a hang sends someone chasing a hang that never happened.
+"$SH" --sh-deadline 1 --sh-report "$t/11.report" "$t/quickfail" >/dev/null 2>/dev/null
+rc=$?
+res=$(sed -n 's/^safehermit: unit_result=//p' "$t/11.report")
+if [ "$res" = timeout ]; then
+    no "false-timeout fixture" "systemd says this run really did time out, so the test cannot distinguish the two errors"
+else
+    [ $rc -eq 1 ] && [ "$(grep -c '^safehermit: DEADLINE' "$t/11.report")" -eq 0 ] \
+      && ok "a run that fails on its own is NOT relabelled a timeout (rc=$rc, unit_result=$res)" \
+      || no "false timeout" "rc=$rc with unit_result=$res and $(grep -c '^safehermit: DEADLINE' "$t/11.report") DEADLINE lines; an ordinary failure was reported as a deadline"
+fi
+
+# T12 THE VERDICT IS READ, NOT DEFAULTED. This is the --collect trap. `systemctl show`
+# on a unit that no longer exists does not fail and does not return empty -- it returns
+# the DEFAULT, Result=success. Measured three trials each on the same timed-out unit:
+# with --collect it reads 'success', without it reads 'timeout'. So if --collect is
+# ever added back, the wrapper would call every timed-out run a clean success. This
+# asserts the value actually observed on a killed run, which no default can satisfy.
+s=$(date +%s)
+"$SH" --sh-deadline 5 --sh-report "$t/12.report" "$t/exit0-on-term" >/dev/null 2>/dev/null
+e=$(( $(date +%s) - s ))
+res=$(sed -n 's/^safehermit: unit_result=//p' "$t/12.report")
+if [ "$e" -ge 30 ]; then
+    no "unit-result fixture" "child ran ${e}s; it was not killed, so the test is vacuous"
+else
+    [ "$res" = timeout ] \
+      && ok "the deadline verdict is systemd's own unit result (unit_result=$res), not a default" \
+      || no "unit result" "unit_result='$res' on a run that was killed at its deadline; 'success' means --collect is back and the unit was garbage-collected before it could be read, 'UNREADABLE' means the query failed"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
