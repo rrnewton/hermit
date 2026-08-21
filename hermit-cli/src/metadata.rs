@@ -146,6 +146,38 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same detcore
     // configuration. Otherwise, the behavior of the program could diverge
     // during replay.
+    //
+    // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
+    //
+    // `virtualize_time: false` below is DELIBERATE, and the rationale used to live only
+    // in the separate dev-hermit workspace -- not in this repository, beside the code it
+    // governs. The cost of that was measured: three agents in one night read this line,
+    // searched this repo's source, git log, docs/ and issues, found nothing, and could
+    // not tell a design decision from a determinism bug; two coordinators then spent
+    // hours treating it as a candidate defect. A decision recorded in a different
+    // repository from the code it governs is, in practice, undocumented. Hence this
+    // comment. See rrnewton/hermit#2295.
+    //
+    // WHAT RECORD/REPLAY ACTUALLY GUARANTEES. Replay re-executes a recording against the
+    // recorded syscall data, so what must be reproducible is THIS recording's replay --
+    // not agreement between two independent recordings. Time is therefore left real: the
+    // recording captures what the guest actually observed, and replay returns those
+    // recorded values. `hermit record start --verify` records once, replays that
+    // recording, and compares the two; its success message says exactly that ("replay
+    // matched recording") and does not claim more.
+    //
+    // WHAT IT DOES NOT GUARANTEE, which is the part that misleads readers. Because time
+    // is not virtualized, two INDEPENDENT recordings of the same program observe
+    // different clock values. Demonstrated: `hermit run -- date` twice returns the
+    // identical virtual epoch, while `hermit record start -- date` twice returns real
+    // wall-clock times seconds apart. Replay fidelity says nothing about that, and
+    // nothing in either test suite currently compares two independent recordings.
+    // So do not read a green `--verify` as cross-recording determinism.
+    //
+    // This configuration differs from `hermit run --strict` on four of the five
+    // properties that define it (see run.rs: only `sequentialize_threads` matches).
+    // Any claim that recording is "strict" in that sense is wrong; the `--strict` flag
+    // on `hermit record` is accepted and ignored purely for command-line compatibility.
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,

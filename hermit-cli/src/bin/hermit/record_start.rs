@@ -175,8 +175,14 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
-    /// for command-line compatibility with `hermit run --strict`.
+    /// Accepted and ignored, for command-line compatibility with `hermit run --strict`.
+    /// Recording does NOT run under `run --strict`'s configuration: see
+    /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
+    /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
+    /// `panic_on_unsupported_syscalls: false`. A recorded guest therefore reads the REAL
+    /// host clock, and two independent recordings of the same program observe different
+    /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
+    /// two independent recordings agree.
     #[clap(long = "strict")]
     _strict: bool,
 
