@@ -358,6 +358,46 @@ once the guest is given `no_timer_check`. Choose `-icount` when you want the
 canonical command to work unchanged; avoid it when you need more than one TCG
 thread, which it forbids.
 
+### Re-verified 2026-08-21 on a later Hermit
+
+The corrections above were measured with Hermit `770b95c505`. They were
+re-measured on 2026-08-21 with `f05bf04e4f`, so they are not an artifact of one
+build. Same host, QEMU 10.1.2, busybox guest
+(`target/qemu-busybox/{bzImage,initramfs-busybox.cpio.gz}`), one vCPU, no
+`-icount`; each cell is one run of:
+
+```bash
+timeout --signal=KILL 180s ./target/release/hermit --log error run <PROFILE> -- \
+  qemu-system-x86_64 -nodefaults -nic none -machine q35 -cpu max -m 256M \
+  -accel tcg,thread=single -smp 1 -rtc base=utc,clock=vm \
+  -kernel target/qemu-busybox/bzImage \
+  -initrd target/qemu-busybox/initramfs-busybox.cpio.gz \
+  -display none -serial stdio -monitor none -no-reboot \
+  -append "console=ttyS0 panic=-1 rdinit=/init [no_timer_check]"
+```
+
+| `<PROFILE>` | guest cmdline | wall | console bytes | outcome |
+| --- | --- | --- | --- | --- |
+| `--no-sequentialize-threads --max-timeslice disabled` | default | 17.8 s | 26,580 | PASS |
+| `--strict` | default | 57.2 s | 9,235 | panic |
+| `--strict` | `no_timer_check` | 97.1 s | 25,732 | PASS |
+| *(none)* | default | 57.2 s | 9,233 | panic |
+| `--no-virtualize-time --no-virtualize-metadata` | default | 55.8 s | 9,233 | panic |
+| `--strict --no-virtualize-time --no-virtualize-metadata` | default | 0.1 s | 0 | Hermit exits 1 |
+
+The last two rows are the point of this section. Without `--strict`, the
+workaround produces a console byte-for-byte the same length as the run without
+it — 9,233 either way, same panic — which is what *inert* means here. With
+`--strict` the run dies before the guest starts.
+
+QEMU's MTTCG rule is a property of QEMU alone, and needs no Hermit to
+reproduce:
+
+```console
+$ qemu-system-x86_64 -accel tcg,thread=multi -icount shift=0,sleep=off -smp 2 ...
+qemu-system-x86_64: -accel tcg,thread=multi: No MTTCG when icount is enabled
+```
+
 Note that `hermit run` still prints a one-line advisory when it launches a
 `qemu-system-*` program while virtual time is enabled, and that advisory
 recommends *both* routes. Its Hermit-side suggestion is not supported by the
