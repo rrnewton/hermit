@@ -379,6 +379,24 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
         .status()
         .unwrap_or_else(|error| fail(format!("cannot execute {}: {error}", program.display())));
     if !status.success() {
+        // 127 IS AN ENVIRONMENT FAULT, NOT A FAILED AUDIT, AND SAYING "failed"
+        // FOR BOTH COSTS A CI RUN ITS WHOLE E2E COVERAGE. These programs carry
+        // `#!/usr/bin/env -S rust-script --force`; when that interpreter is
+        // absent the kernel never runs the script and the shell reports 127.
+        // The old message -- "tests/manifest-cli.rs self-test failed" -- reads
+        // as the self-test having run and found a defect. Measured on hermit
+        // run 32512027583: it had not run at all, and because build-debug gates
+        // every e2e shard, a missing tool was read as a product break.
+        if status.code() == Some(127) {
+            fail(format!(
+                "cannot run {}: exited 127, which means its interpreter was not found, \
+                 not that the audit failed. This program runs under \
+                 `#!/usr/bin/env -S rust-script --force`; install it with \
+                 `cargo install rust-script` or put it on PATH (on a dev box it is \
+                 usually ~/.cargo/bin, which a non-login shell does not inherit).",
+                program.display()
+            ));
+        }
         fail(format!("{} {} failed", program.display(), args.join(" ")));
     }
 }

@@ -240,6 +240,21 @@ jobs:
         run: git submodule update --init agent-utils
       - name: Rust components
         run: rustup component add rustfmt
+      # check.script_sigpipe compiles every tracked rust-script entrypoint, and
+      # scripts/check-script-sigpipe.sh refuses without the interpreter. No
+      # runner image ships it (see the strict-compat shard's note below), so the
+      # node died at `command -v rust-script` having measured nothing. Pinned to
+      # the same RUST_SCRIPT_VERSION as that shard so every job in this workflow
+      # resolves `#!/usr/bin/env rust-script` with one interpreter.
+      - name: Install rust-script (preflight)
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Verify rust-script resolves (preflight)
+        run: |
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; check.script_sigpipe would exit 2 having compiled nothing."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Run preflight nodes
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
@@ -284,6 +299,22 @@ jobs:
           sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # e2e.metadata runs `test-harness validate`, which shells out to
+      # tests/manifest-cli.rs -- one of fifteen tracked entrypoints carrying
+      # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
+      # exec fails 127 and run_audit reported it as "self-test failed", i.e. an
+      # absent interpreter wearing a product-failure label. Because build-debug
+      # gates every e2e shard, one missing tool cost the run its whole e2e
+      # coverage. Same pin as the other two jobs.
+      - name: Install rust-script (build-debug)
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Verify rust-script resolves (build-debug)
+        run: |
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; e2e.metadata would die at exec with status 127."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       # Reproduce the debug build nodes EXACTLY from portable.json (no drift):
       # e2e.metadata, setup.nextest, build.workspace, build.manifest_guests,
       # build.flaky_harnesses.
