@@ -20,6 +20,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore::Detcore;
 use detcore::types::NANOS_PER_RCB;
+use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
@@ -387,6 +388,59 @@ fn rdtsc_deltas() {
             );
             // Whatever the delta is, it has to have stepped by AT LEAST the multiplier:
             assert!(tsc2 - tsc1 > 12345);
+        },
+        config,
+        true,
+    );
+}
+
+/// `rdtsc` and `clock_gettime` must name the same instant.
+///
+/// They used to read two different clocks: `rdtsc` returned the calling
+/// thread's own logical time while `clock_gettime` returned the coordinator's,
+/// which is the sum over threads. A guest comparing them -- a clocksource
+/// watchdog, a delay loop calibrated against a device timer -- saw two clocks
+/// disagreeing by milliseconds and diverging in rate with the thread count.
+///
+/// Sampling repeatedly rather than once is deliberate: agreeing on a first read
+/// while drifting afterwards is the failure this is meant to catch.
+#[test]
+fn rdtsc_agrees_with_clock_gettime() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            // One intercepted syscall's worth of virtual time separates the two
+            // reads, plus slack for the retired branches between them.
+            let tolerance = 100 * NANOS_PER_SYSCALL as u64;
+            for i in 0..8 {
+                let tsc = RdtscResult::new(Rdtsc::Tsc).tsc;
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) },
+                    0
+                );
+                let mono = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                let gap = mono.abs_diff(tsc);
+                println!(
+                    "sample {}: rdtsc {} clock_gettime {} gap {}",
+                    i, tsc, mono, gap
+                );
+                assert!(
+                    gap < tolerance,
+                    "rdtsc and clock_gettime are {} ns apart on sample {}, which is more \
+                     than the {} ns a single intercepted syscall accounts for; they are \
+                     reading different clocks again",
+                    gap,
+                    i,
+                    tolerance,
+                );
+            }
         },
         config,
         true,
