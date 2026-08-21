@@ -246,7 +246,16 @@ jobs:
       # node died at `command -v rust-script` having measured nothing. Pinned to
       # the same RUST_SCRIPT_VERSION as that shard so every job in this workflow
       # resolves `#!/usr/bin/env rust-script` with one interpreter.
+      # RUSTFLAGS is set workflow-wide to `-C link-arg=-llzma` for Hermit's own
+      # build. rust-script does not link lzma, and preflight has no Dependencies
+      # step installing liblzma-dev, so inheriting that flag fails the install at
+      # `rust-lld: unable to find library -llzma` -- measured on run 32513921209.
+      # The strict-compat shard gets away with it only because its job installs
+      # liblzma-dev first. Clearing RUSTFLAGS for the tool build is the narrower
+      # fix than adding an apt step to a 10-minute lint job.
       - name: Install rust-script (preflight)
+        env:
+          RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Verify rust-script resolves (preflight)
         run: |
@@ -306,7 +315,12 @@ jobs:
       # absent interpreter wearing a product-failure label. Because build-debug
       # gates every e2e shard, one missing tool cost the run its whole e2e
       # coverage. Same pin as the other two jobs.
+      # RUSTFLAGS cleared for the same reason as preflight: the workflow-wide
+      # `-C link-arg=-llzma` is for Hermit's build, not for this tool, and it
+      # fails the install outright on a runner without liblzma-dev.
       - name: Install rust-script (build-debug)
+        env:
+          RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
       - name: Verify rust-script resolves (build-debug)
         run: |
