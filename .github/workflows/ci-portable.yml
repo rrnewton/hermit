@@ -34,17 +34,6 @@ name: CI (GitHub-managed portable)
 # and the partial per-cell workflow were retired when this lane was promoted.
 
 on:
-  # NO `pull_request` trigger (owner directive 2026-08-03). This is the ONLY lane
-  # on GitHub's shared public hosted-runner pool (runs-on: ubuntu-latest); auto-
-  # firing its ~34-min build on every PR push flooded that pool and throttled our
-  # own queue (runs sat queued for hours). PRs are validated via the Rust driver
-  # (the `locally-validated` label -> merge-gate), NOT a hosted PR build. Run a
-  # hosted build on a PR MANUALLY via `workflow_dispatch` when actually needed.
-  # The self-hosted privileged/demo lanes are handled separately.
-  push:
-    branches: [main]
-  merge_group:
-    types: [checks_requested]
   workflow_dispatch:
 
 concurrency:

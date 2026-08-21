@@ -1,13 +1,6 @@
 name: CI (privileged)
 
 on:
-  # NO `pull_request` trigger (owner directive 2026-08-03): don't auto-fire the
-  # scarce self-hosted privileged PMU lane on PRs. It is a bonus signal, NOT a
-  # required merge-gate check, so removing its PR trigger cannot block landing.
-  # Run it on a PR MANUALLY via `workflow_dispatch` when a privileged smoke is
-  # actually needed.
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 # QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref); with

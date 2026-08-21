@@ -18,40 +18,6 @@ name: P0 Demo Gate (Hermit hot paths)
 # trigger and the requirement stay consistent. Hot-path gating is UNCHANGED for
 # detcore*/**, hermit-cli/**, tests/c/** (guest programs), and everything else.
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/demo-hot-path.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "common/**"
-      - "detcore*/**"
-      - "examples/**"
-      - "flaky-tests/**"
-      - "hermit-cli/**"
-      - "hermit-install/**"
-      - "hermit-resources/**"
-      - "rust-toolchain.toml"
-      - "tests/**"
-      - "!tests/e2e/**"
-      - "!tests/backend-parity/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/demo-hot-path.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "common/**"
-      - "detcore*/**"
-      - "examples/**"
-      - "flaky-tests/**"
-      - "hermit-cli/**"
-      - "hermit-install/**"
-      - "hermit-resources/**"
-      - "rust-toolchain.toml"
-      - "tests/**"
-      - "!tests/e2e/**"
-      - "!tests/backend-parity/**"
   workflow_dispatch:
     inputs:
       sha:

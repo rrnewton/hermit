@@ -6,8 +6,6 @@ name: Docs
 # below the landing page at `hermit/index.html`.
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 # Supersede older runs for the same ref so documentation deploys do not
