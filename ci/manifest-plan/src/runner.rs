@@ -896,6 +896,39 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                 .trim_start_matches("Error: ")
         ));
     }
+    // "THIS RUNNER COULD NOT RUN THE BACKEND" AND "THE BACKEND RAN AND RECORDED
+    // NOTHING" ARE DIFFERENT FACTS AND THEY USED TO CARRY THE SAME VERDICT.
+    // Both landed on outcome=ERROR with error_kind=incomplete-verification-evidence
+    // -- the first because no report file was written, the second because the
+    // report it wrote had no comparison in it. A sweep aggregates on error_kind,
+    // so an unstaged backend on the runner was indistinguishable from a product
+    // defect in every cell it touched. Measured: an unstaged SaBRe produced 56
+    // such cells in one sweep, and the sweep was discarded because nobody could
+    // tell which kind they were.
+    //
+    // Neither is suppressed: an unavailable backend is still an ERROR, because
+    // silently passing over it would hide a broken runner just as surely. It is
+    // simply reported as its own kind, so the two can be counted apart. The
+    // discriminator is Hermit's own refusal, `Backend::ensure_available`
+    // (hermit-cli/src/lib.rs), which is the single producer of this wording and
+    // refuses before any guest process exists.
+    let backend_unavailable = !launch_refusal
+        && !output.status.success()
+        && stderr.lines().next().is_some_and(|line| {
+            line.starts_with("Error: backend `") && line.contains("` is unavailable:")
+        });
+    if backend_unavailable {
+        outcome = "ERROR".into();
+        error_kind = Some("backend-unavailable".into());
+        reason = Some(format!(
+            "backend unavailable on this runner, so nothing was measured: {}",
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("Error: unknown backend unavailability")
+                .trim_start_matches("Error: ")
+        ));
+    }
     let mut report_json = None;
     let mut report_sha = None;
     let (sabre_path_evidence, sabre_path_evidence_sha256) = spec
@@ -916,7 +949,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
                 match VerificationReport::from_json_slice(&bytes) {
                     Ok(report) => {
-                        if launch_refusal {
+                        if launch_refusal || backend_unavailable {
                             // The process never created a guest.  A report at
                             // this point is stale or otherwise unrelated and
                             // cannot supersede the refusal classification.
@@ -945,13 +978,15 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                         }
                     }
                     Err(error) => {
-                        outcome = "ERROR".into();
-                        error_kind = Some("incomplete-verification-evidence".into());
-                        reason = Some(format!("verification report is unreadable: {error}"));
+                        if !backend_unavailable {
+                            outcome = "ERROR".into();
+                            error_kind = Some("incomplete-verification-evidence".into());
+                            reason = Some(format!("verification report is unreadable: {error}"));
+                        }
                     }
                 }
             }
-            Err(_error) if launch_refusal => {}
+            Err(_error) if launch_refusal || backend_unavailable => {}
             Err(error) => {
                 outcome = "ERROR".into();
                 error_kind = Some("incomplete-verification-evidence".into());
@@ -2191,6 +2226,114 @@ mod tests {
         let result = execute_spec(&spec, "1").unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    /// Build one attempt from a real subprocess, so the classification under
+    /// test is the one the sweep actually uses rather than a reconstruction.
+    fn attempt_from_script(script: &str, report: Option<&str>) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-backend-availability-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let mut argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "sh".to_string(),
+        ];
+        argv.push(report.unwrap_or("").to_string());
+        argv.push(verdict.to_string_lossy().into_owned());
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/backend-availability".into(),
+                mode: "verify".into(),
+                backend: Some("sabre".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv,
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 10,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+        };
+        let result = execute_spec(&spec, "1").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
+    /// A backend this runner could not run, and a backend that ran and recorded
+    /// nothing, must not report the same thing.
+    ///
+    /// They did. Both were `ERROR` with `error_kind=incomplete-verification-evidence`
+    /// -- the first because no report file existed, the second because the report
+    /// had no comparison in it -- and a sweep counts by `error_kind`. An unstaged
+    /// SaBRe therefore produced 56 cells indistinguishable from product defects,
+    /// and that sweep was discarded. One is an environment problem on the runner;
+    /// the other is a real finding; they need opposite responses.
+    #[test]
+    fn an_unavailable_backend_is_not_reported_as_a_silent_one() {
+        let unavailable = attempt_from_script(
+            "echo \"Error: backend \\`sabre\\` is unavailable: \
+             HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file\" >&2; exit 1",
+            None,
+        );
+        let silent = attempt_from_script(
+            "printf %s \"$1\" > \"$2\"; exit 0",
+            Some(
+                r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#,
+            ),
+        );
+
+        // Neither is suppressed. Both remain ERROR: an unavailable backend that
+        // reported nothing at all would hide a broken runner.
+        assert_eq!(unavailable.outcome, "ERROR");
+        assert_eq!(silent.outcome, "ERROR");
+
+        // The machine-readable discriminator, which is what a sweep aggregates.
+        assert_eq!(
+            unavailable.error_kind.as_deref(),
+            Some("backend-unavailable"),
+            "an unrunnable backend must carry its own kind: {:?}",
+            unavailable.reason
+        );
+        assert_eq!(
+            silent.error_kind.as_deref(),
+            Some("incomplete-verification-evidence"),
+            "a backend that ran and recorded nothing keeps the evidence kind: {:?}",
+            silent.reason
+        );
+        assert_ne!(
+            unavailable.error_kind, silent.error_kind,
+            "the two states must be countable apart"
+        );
+
+        // The human-readable reason must also separate them, and the unavailable
+        // one must name the backend rather than an errno on a missing file.
+        let unavailable_reason = unavailable.reason.clone().expect("reason");
+        let silent_reason = silent.reason.clone().expect("reason");
+        assert!(
+            unavailable_reason.contains("backend unavailable on this runner")
+                && unavailable_reason.contains("sabre"),
+            "unavailable reason must name the backend and the environment: {unavailable_reason}"
+        );
+        assert!(
+            !unavailable_reason.contains("verification report is missing"),
+            "the old wording pointed at a missing file, not at the backend: {unavailable_reason}"
+        );
+        assert!(
+            silent_reason.contains("no_result"),
+            "silent reason must still name the producer state: {silent_reason}"
+        );
+        assert_ne!(unavailable_reason, silent_reason);
     }
 
     #[test]
