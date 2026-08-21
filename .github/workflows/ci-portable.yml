@@ -711,6 +711,26 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      # check.dbt_runtime_abi runs scripts/check-dbt-runtime-abi.rs, which carries
+      # `#!/usr/bin/env -S rust-script --force`. No runner image ships that
+      # interpreter (see the strict-compat shard's note), so without this the node
+      # would die at exec with status 127 having compared no symbols -- the exact
+      # failure this shard's node exists to make legible, reproduced one level up.
+      # Gated to dbt-parity because it is the only release shard that runs a
+      # rust-script node, and a ~1-min `cargo install` on sabre and liteinst would
+      # buy them nothing. Same RUST_SCRIPT_VERSION pin as the other three jobs so
+      # one interpreter resolves every shebang in this workflow.
+      - name: Install rust-script (dbt-parity shard)
+        if: matrix.slug == 'dbt-parity'
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Verify rust-script resolves (dbt-parity shard)
+        if: matrix.slug == 'dbt-parity'
+        run: |
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; check.dbt_runtime_abi would die at exec with status 127."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
