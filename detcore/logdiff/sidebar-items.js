@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DetLogFilter","LogComparisonMode"],"fn":["compare_complete_prefix","complete_record_count","host_addr","log_diff","log_diff_detailed","record_count","strip_log_entry","take_complete_records","try_log_diff_detailed","try_log_diff_with_records","write_canonical_info"],"struct":["Comparison","LogDiffOpts","LogDiffSummary","PrefixComparison"]};

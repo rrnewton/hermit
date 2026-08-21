@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INSTALL_DIR_ENV"],"fn":["install_dir","resource"]};
