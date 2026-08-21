@@ -327,7 +327,8 @@ pub struct Config {
     pub deterministic_io: bool,
 
     /// Fail immediately on unsupported syscalls instead of forwarding them.
-    /// Explicit strict mode enables this policy.
+    /// Ordinary `hermit run` enables this policy; compatibility requires the
+    /// explicit `--allow-unsupported-syscalls` opt-out.
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
 
