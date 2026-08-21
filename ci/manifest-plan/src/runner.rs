@@ -1634,6 +1634,29 @@ fn cell_env(dir: &Path, verified: bool) -> BTreeMap<String, String> {
             dir.join("xdg-config").to_string_lossy().into_owned(),
         ),
         (
+            // THIS IS A GUEST PATH, NOT A HOST PATH, AND IT IS DELIBERATELY THE
+            // SAME STRING FOR EVERY VERIFIED CELL. Hermit replaces the guest's
+            // /tmp with an isolated per-run directory, so /tmp/hermit-e2e
+            // resolves inside each run's own mount: two cells sharing this
+            // string cannot see each other's files, and no host directory of
+            // this name is ever created. Measured 2026-08-21 by giving one test
+            // two concurrent non-naked cells whose guest begins with
+            // `rm -rf "$E2E_TMPDIR/<name>"` -- both passed, three times.
+            //
+            // A PER-CELL HOST PATH WOULD BREAK VERIFICATION, which is why this
+            // is not "fixed" into one directory per cell. Verification executes
+            // the guest TWICE and compares; the isolated /tmp is fresh for each
+            // repeat, while a host-backed path carries run one's mutations into
+            // run two. Measured the same day with a guest that appends one line
+            // per run: this path verifies deterministic, a per-cell host path
+            // reports "differences found" with the host file holding both runs'
+            // writes. The reasoning is inherited from the shell harness this
+            // replaced (ci/test_harness.sh at be4c090500); it is restated here
+            // because losing it in the port produced a false report of a
+            // cross-cell collision that does not exist.
+            //
+            // `naked` runs no Hermit and therefore has no isolated /tmp, so it
+            // gets the cell's own directory.
             "E2E_TMPDIR".into(),
             if verified {
                 "/tmp/hermit-e2e".into()
