@@ -2658,6 +2658,80 @@ mod subscription_tests {
         );
     }
 
+    /// `--detlog-io-buffers` can only hash a syscall Detcore is subscribed to.
+    /// Under `--passthru-opt` the subscription narrows, so the check's coverage
+    /// narrows with it -- silently, because a syscall that never reaches
+    /// Detcore produces no record and no record is indistinguishable from a
+    /// syscall that moved no bytes.
+    ///
+    /// Measured 2026-08-21 on `f05bf04e4f`, one probe calling `getcwd`,
+    /// `recvmsg`, `readv` and `readlink`:
+    ///
+    /// ```text
+    /// hermit --log=info run                --detlog-io-buffers -- ./probe   12 [iobuf] records
+    /// hermit --log=info run --passthru-opt --detlog-io-buffers -- ./probe   11 [iobuf] records
+    /// ```
+    ///
+    /// The single lost syscall is `getcwd`, and the reason is structural: 9 of
+    /// the 20 are in the literal allow-list and 10 more arrive via the
+    /// unconditional Determinized sweep at the end of `subscriptions`, but
+    /// `getcwd` is classified `PassThrough`, so neither path picks it up.
+    ///
+    /// WHY THIS IS A TEST AND NOT A RUNTIME WARNING. The set is stable, so a
+    /// warning would print the same sentence on every `--passthru-opt` run
+    /// forever and be tuned out within a week. The exposure is not today's
+    /// one-syscall gap; it is that 19 of 20 holds only because two
+    /// INDEPENDENTLY MAINTAINED lists happen to agree -- the classification
+    /// table in `syscall_classification.rs` and the match arms in
+    /// `io_buffers.rs`. Reclassifying any one of those ten from `Determinized`
+    /// to `PassThrough` would drop it out of the sweep and out of io-buffers'
+    /// reach with nothing failing. This asserts the relationship so that edit
+    /// cannot land quietly.
+    ///
+    /// It is deliberately an EQUALITY, not a subset check, so it fails in both
+    /// directions: a nineteenth syscall going missing, and `getcwd` becoming
+    /// covered while this expectation still claims it is not.
+    #[test]
+    fn passthru_opt_leaves_io_buffer_hashing_blind_only_for_getcwd() {
+        let subscribed: Vec<Sysno> = <Detcore as Tool>::subscriptions(&strict_config(true))
+            .iter_syscalls()
+            .collect();
+        let unreachable: Vec<Sysno> = crate::io_buffers::HASHED_SYSCALLS
+            .iter()
+            .copied()
+            .filter(|sysno| !subscribed.contains(sysno))
+            .collect();
+
+        assert_eq!(
+            unreachable,
+            vec![Sysno::getcwd],
+            "--passthru-opt changes which syscalls `--detlog-io-buffers` can hash, and the set \
+             moved. {} of {} reachable. If a syscall was RECLASSIFIED out of Determinized, that \
+             silently shrank an enabled determinism check -- re-derive rather than editing this \
+             expectation to match.",
+            crate::io_buffers::HASHED_SYSCALLS.len() - unreachable.len(),
+            crate::io_buffers::HASHED_SYSCALLS.len()
+        );
+    }
+
+    /// The other direction, and the reason the check above is worth having:
+    /// with the default subscription every buffer-carrying syscall is
+    /// reachable, so there is nothing to report on an ordinary run.
+    #[test]
+    fn the_default_subscription_reaches_every_io_buffer_syscall() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
+        let unreachable: Vec<Sysno> = crate::io_buffers::HASHED_SYSCALLS
+            .iter()
+            .copied()
+            .filter(|sysno| !subscriptions.iter_syscalls().any(|s| s == *sysno))
+            .collect();
+
+        assert!(
+            unreachable.is_empty(),
+            "without --passthru-opt every io-buffer syscall must be reachable; missing {unreachable:?}"
+        );
+    }
+
     #[test]
     fn strict_subscriptions_intercept_every_event_by_default() {
         let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));

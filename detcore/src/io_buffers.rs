@@ -237,6 +237,43 @@ where
 /// into swallowing the zero-ready case. The original gap was exactly that: the
 /// guard sat above the poll arms, and the unit test called `whole` directly, so
 /// it could not see the short-circuit above the code it exercised.
+/// Every syscall `extents` below returns a non-empty result for.
+///
+/// KEEP THIS IN STEP WITH THE `extents` MATCH -- it is the same set written
+/// twice, once as `Syscall::` arms (which need constructed calls and a `Guest`
+/// to exercise) and once as bare `Sysno`s (which a subscription can be asked
+/// about). The second spelling exists so the relationship between this check
+/// and what Detcore actually intercepts can be ASSERTED rather than assumed;
+/// see `passthru_opt_leaves_io_buffer_hashing_blind_only_for_getcwd` in
+/// `lib.rs`. Adding an arm to `extents` without adding it here does not break
+/// that test, so add both.
+#[cfg(test)]
+pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
+    // Bytes the kernel produced.
+    reverie::syscalls::Sysno::read,
+    reverie::syscalls::Sysno::pread64,
+    reverie::syscalls::Sysno::recvfrom,
+    reverie::syscalls::Sysno::getrandom,
+    reverie::syscalls::Sysno::getcwd,
+    reverie::syscalls::Sysno::getdents64,
+    reverie::syscalls::Sysno::readlink,
+    reverie::syscalls::Sysno::readlinkat,
+    reverie::syscalls::Sysno::recvmsg,
+    reverie::syscalls::Sysno::recvmmsg,
+    reverie::syscalls::Sysno::readv,
+    reverie::syscalls::Sysno::preadv,
+    // Bytes the guest produced.
+    reverie::syscalls::Sysno::write,
+    reverie::syscalls::Sysno::pwrite64,
+    reverie::syscalls::Sysno::sendto,
+    reverie::syscalls::Sysno::sendmsg,
+    reverie::syscalls::Sysno::writev,
+    reverie::syscalls::Sysno::pwritev,
+    // Rewritten in place across the whole array.
+    reverie::syscalls::Sysno::poll,
+    reverie::syscalls::Sysno::ppoll,
+];
+
 fn ret_gates_output(call: &Syscall) -> bool {
     !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
 }
