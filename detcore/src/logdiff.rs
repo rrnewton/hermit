@@ -423,12 +423,56 @@ fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
             } else {
                 (i, s)
             }
-        });
+        })
+        // Drop the evidence transport's own self-description here, at the one
+        // point that defines what any comparison can see. Doing it here rather
+        // than per-caller is what keeps `write_canonical_info` -- which promises
+        // to print "the canonical INFO messages that strict verification would
+        // compare" -- true by construction instead of by two filters agreeing.
+        // The tag check above still runs on these records first, so a malformed
+        // one is still a hard error rather than something quietly skipped.
+        .filter(|(_, s)| !is_evidence_transport_self_record(s));
     iter.collect()
 }
 
 fn is_info(line: &str) -> bool {
     line.starts_with("INFO ")
+}
+
+/// A record the DBT evidence transport emits ABOUT ITSELF, rather than about
+/// the run it is carrying.
+///
+/// The transport announces its own startup ("protected evidence initialized")
+/// into the very stream whose records are the evidence, so that line arrives
+/// looking exactly like a compared record. It is not one: it says the
+/// apparatus came up, and says nothing about the guest. Excluding it is what
+/// keeps the compared counts meaning *"records of the run"*, which is what
+/// every consumer of [`LogDiffSummary::matched_with_evidence`] and of
+/// `compared_log_messages` already assumes they mean.
+///
+/// Measured consequence of NOT excluding it: two runs whose logs contained
+/// only this one line compared 1 | 1 with no difference, so
+/// `matched_with_evidence()` returned true and the canonical admission
+/// predicate (`counts.left > 0 && counts.right > 0`) admitted a bitwise-parity
+/// green established by the evidence system announcing itself.
+///
+/// Keyed on the record's tracing TARGET, not on the message text: every record
+/// this target carries is the transport describing itself or its own test
+/// hooks (`reverie-dbt/native/client.c`), and a text match would silently stop
+/// working the next time one of those strings is reworded.
+///
+/// This is deliberately NARROW. It does not exclude other non-guest records
+/// (a canonical ptrace comparison of `tests/c/getpid.c` measured 108 of 110
+/// INFO records under `detcore*` targets, plus one `reverie_ptrace::task` and
+/// one `hermit::backend_stats`). Whether those belong in the compared set is a
+/// separate question about what the comparison is for; excluding them here
+/// would change every existing green cell, which this does not.
+fn is_evidence_transport_self_record(line: &str) -> bool {
+    static PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) +reverie_dbt::evidence:").unwrap()
+    });
+
+    PREFIX.is_match(line)
 }
 
 fn is_commit(line: &str) -> bool {
@@ -2647,6 +2691,143 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
                 "INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling."
             )]),
             1
+        );
+    }
+
+    /// The exact record the DBT evidence transport emits about itself, copied
+    /// from `reverie-dbt/native/client.c` rather than reconstructed.
+    const EVIDENCE_TRANSPORT_SELF_RECORD: &str =
+        "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+
+    /// One ordinary record of a run, for the "still admitted" direction.
+    const ONE_REAL_RECORD: &str = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #1: getpid() = Ok(3)";
+
+    fn canonical_info_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        }
+    }
+
+    /// REFUSED DIRECTION. Two runs whose canonical INFO stream contains only the
+    /// evidence transport announcing itself have compared NOTHING about the
+    /// guest, so the comparison must report an empty selection -- which is what
+    /// makes every downstream consumer refuse it.
+    ///
+    /// Before the exclusion this measured `compared 1 | 1`, `diff_found=false`,
+    /// `matched_with_evidence()==true`, and the canonical admission predicate
+    /// (`counts.left > 0 && counts.right > 0`) admitted it as a bitwise-parity
+    /// green. The green was established by the apparatus saying it had started.
+    #[test]
+    fn a_comparison_of_only_the_transports_own_record_has_no_evidence() -> std::io::Result<()> {
+        let summary = super::log_diff_summary_from_strs(
+            EVIDENCE_TRANSPORT_SELF_RECORD,
+            EVIDENCE_TRANSPORT_SELF_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(
+            (summary.compared_left, summary.compared_right),
+            (0, 0),
+            "the transport's own record must not count as a compared record"
+        );
+        assert!(
+            !summary.matched_with_evidence(),
+            "an empty selection is a no-result, never a match"
+        );
+        Ok(())
+    }
+
+    /// ADMITTED DIRECTION, and it is the one that stops this fix from becoming
+    /// the same defect with the sign flipped. A comparison can be as small as a
+    /// SINGLE real record and is still a real comparison. No floor is imposed,
+    /// because no floor could be justified: the assertion is "at least one
+    /// record OF THE RUN was compared", not "enough records were compared".
+    #[test]
+    fn a_single_genuine_record_is_still_a_comparison_with_evidence() -> std::io::Result<()> {
+        let summary = super::log_diff_summary_from_strs(
+            ONE_REAL_RECORD,
+            ONE_REAL_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(
+            summary.matched_with_evidence(),
+            "one genuine compared record is a real comparison and must still admit"
+        );
+        Ok(())
+    }
+
+    /// The transport's record is dropped from a stream that also carries real
+    /// ones, leaving the genuine records compared and the count honest. This is
+    /// the shape a real DBT run produces once its records flow.
+    #[test]
+    fn the_transports_own_record_is_dropped_from_a_stream_that_also_carries_real_ones()
+    -> std::io::Result<()> {
+        let mixed = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
+        let summary = super::log_diff_summary_from_strs(
+            &mixed,
+            &mixed,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(
+            (summary.compared_left, summary.compared_right),
+            (1, 1),
+            "only the genuine record counts, so the count is one and not two"
+        );
+        assert!(summary.matched_with_evidence());
+        Ok(())
+    }
+
+    /// A difference confined to the transport's own records is not a divergence
+    /// of the run. Excluding those records from the COUNT but leaving them in
+    /// the compared text would report a product divergence for a difference in
+    /// the apparatus, so the exclusion applies to both.
+    #[test]
+    fn a_difference_only_in_the_transports_own_records_is_not_a_divergence() -> std::io::Result<()>
+    {
+        let with_transport = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
+        let summary = super::log_diff_summary_from_strs(
+            &with_transport,
+            ONE_REAL_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert!(
+            !summary.diff_found,
+            "a difference confined to the apparatus's own records is not a product divergence"
+        );
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        Ok(())
+    }
+
+    /// The exclusion is keyed on the tracing target, so it covers every record
+    /// that target carries -- not just the startup wording that was measured.
+    /// It must NOT catch a real record that merely mentions the transport.
+    #[test]
+    fn the_exclusion_is_keyed_on_the_target_not_on_one_message() {
+        assert!(super::is_evidence_transport_self_record(
+            "INFO reverie_dbt::evidence: protected evidence initialized"
+        ));
+        assert!(super::is_evidence_transport_self_record(
+            "INFO reverie_dbt::evidence: explicit SYS_exit thread callback completed"
+        ));
+        assert!(super::is_evidence_transport_self_record(
+            "WARN  reverie_dbt::evidence: direct entry must be refused"
+        ));
+        assert!(
+            !super::is_evidence_transport_self_record(
+                "INFO detcore: DETLOG protected evidence initialized"
+            ),
+            "a genuine detcore record must not be dropped for mentioning the transport"
+        );
+        assert!(
+            !super::is_evidence_transport_self_record("INFO reverie_dbt::launcher: starting"),
+            "only the evidence transport's own target is excluded"
         );
     }
 }
