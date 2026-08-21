@@ -238,6 +238,17 @@ jobs:
       # shim), so the tracked runner submodule must be present in this job too.
       - name: Initialize safe-ci-dag-runner submodule
         run: git submodule update --init agent-utils
+      # check.script_sigpipe COMPILES all fifteen tracked rust-scripts, and the
+      # workflow-wide RUSTFLAGS link them with `-llzma` (Hermit's own build needs
+      # it). Preflight is otherwise a lint job with no apt step, so the library
+      # was absent and nine of fifteen scripts failed to link -- measured on run
+      # 32514647702, AFTER the interpreter itself was installed. The interpreter
+      # and the library it links with are two separate prerequisites and this job
+      # was missing both.
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add rustfmt
       # check.script_sigpipe compiles every tracked rust-script entrypoint, and
