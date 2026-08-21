@@ -738,6 +738,18 @@ fn is_vmm_program(program: &Path) -> bool {
         .is_some_and(|name| name.starts_with("qemu-system-"))
 }
 
+/// Whether the emulator's own command line already asks for QEMU's
+/// instruction-derived clock.
+///
+/// `-icount` is the remedy this advisory recommends, so a run that already
+/// passes it has nothing left to act on and the advisory only adds noise.
+/// Accepts both spellings QEMU takes: `-icount shift=0,sleep=off` as two
+/// arguments, and `-icount=shift=0,sleep=off` as one.
+fn emulator_uses_instruction_count_clock(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "-icount" || arg.starts_with("-icount="))
+}
+
 /// Advisory warning for running a VMM under Hermit's host-time virtualization.
 ///
 /// QEMU and similar emulators derive the emulated PIT, PM timer, APIC timer,
@@ -747,18 +759,33 @@ fn is_vmm_program(program: &Path) -> bool {
 /// observes inconsistent clock domains and its calibration breaks. See issue #6
 /// and `docs/QEMU_BOOT.md`. Returns the message to print, or `None` when no
 /// warning applies.
-fn vmm_time_virtualization_warning(program: &Path, virtualize_time: bool) -> Option<String> {
-    if virtualize_time && is_vmm_program(program) {
+///
+/// WHAT THIS USED TO SAY, AND WHY IT NO LONGER SAYS IT. Until 2026-08-21 the
+/// message offered `--no-virtualize-time --no-virtualize-metadata` as one of two
+/// remedies. Measured on 2026-08-21 with hermit `f05bf04e4f`, a busybox guest at
+/// one vCPU and no `-icount`, that option changes nothing about this failure:
+/// the run with it and the run without it both panic in guest timer setup and
+/// both produce a 9,233-byte console. Combined with `--strict` it is worse than
+/// useless — strict mode rejects the now-unvirtualized `gettimeofday` and Hermit
+/// exits 1 before the guest starts. Recommending it sent readers down a dead end
+/// at the moment they were most likely to follow the advice, so the message now
+/// names only remedies that were measured to reach a booted guest.
+fn vmm_time_virtualization_warning(
+    program: &Path,
+    args: &[String],
+    virtualize_time: bool,
+) -> Option<String> {
+    if virtualize_time && is_vmm_program(program) && !emulator_uses_instruction_count_clock(args) {
         Some(format!(
             "WARNING: {} looks like a hardware emulator (VMM). Hermit's host-time \
              virtualization exposes mutually inconsistent clock sources (a synthetic RDTSC \
              versus a virtualized clock_gettime) to the emulated guest, which can corrupt its \
              clock calibration (for example \"Unable to calibrate against PIT\", TSC marked \
-             unstable, or \"No current clocksource\") and stall boot. If the nested guest \
-             misbehaves, either disable Hermit's virtual clock with \
-             --no-virtualize-time --no-virtualize-metadata, or make the emulator use a single \
-             instruction-derived clock (for QEMU: -icount shift=0,sleep=off). \
-             See docs/QEMU_BOOT.md.",
+             unstable, or \"No current clocksource\") and stall boot. Two routes were measured \
+             to reach a booted guest: give the emulator a single instruction-derived clock \
+             (for QEMU: -icount shift=0,sleep=off), or pass no_timer_check on the nested \
+             guest's kernel command line. Note that -icount forecloses multi-threaded TCG, \
+             which QEMU refuses to combine with it. See docs/QEMU_BOOT.md.",
             program.display()
         ))
     } else {
@@ -774,19 +801,88 @@ fn vmm_time_warning_fires_for_qemu_with_virtual_time() {
         "/usr/bin/qemu-system-x86_64",
         "qemu-system-aarch64",
     ] {
-        let warning = vmm_time_virtualization_warning(Path::new(program), true);
+        let warning = vmm_time_virtualization_warning(Path::new(program), &[], true);
         let message = warning
             .unwrap_or_else(|| panic!("expected a warning for {program} under virtual time"));
-        assert!(message.contains("--no-virtualize-time"));
         assert!(message.contains("-icount"));
+        assert!(message.contains("no_timer_check"));
+    }
+}
+
+/// The advisory must not send a reader to a route that does not work.
+///
+/// This assertion replaces one that required the message to CONTAIN
+/// `--no-virtualize-time`. That earlier assertion was not wrong when it was
+/// written — it pinned the wording deliberately — but it outlived the
+/// measurement, so a passing test stood between the reader and a correction.
+/// The pin is kept and inverted rather than deleted: the wording is still
+/// asserted, now against what the measurement supports.
+#[test]
+fn vmm_time_warning_does_not_recommend_disabling_virtual_time() {
+    let message = vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &[], true)
+        .expect("expected a warning under virtual time");
+    assert!(
+        !message.contains("--no-virtualize-time"),
+        "the advisory must not recommend --no-virtualize-time: measured 2026-08-21, it leaves \
+         the guest panicking in timer setup with a byte-identical console, and combined with \
+         --strict it aborts the run before the guest starts. Message was: {message}"
+    );
+    assert!(
+        !message.contains("--no-virtualize-metadata"),
+        "same: --no-virtualize-metadata is half of a route that does not work. Message was: \
+         {message}"
+    );
+}
+
+/// The second half of the defect: the advisory fired whenever virtual time was
+/// on, including for runs that had already applied its own recommendation.
+/// Measured before the fix: `hermit run --no-sequentialize-threads -- \
+/// qemu-system-x86_64 -icount shift=0,sleep=off ...` printed the warning.
+#[test]
+fn vmm_time_warning_silent_when_the_emulator_already_uses_icount() {
+    for args in [
+        vec!["-icount".to_string(), "shift=0,sleep=off".to_string()],
+        vec!["-icount=shift=0,sleep=off".to_string()],
+        vec![
+            "-nographic".to_string(),
+            "-icount".to_string(),
+            "shift=auto".to_string(),
+        ],
+    ] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &args, true).is_none(),
+            "the emulator already uses the instruction-derived clock this advisory \
+             recommends, so there is nothing left to act on: {args:?}"
+        );
+    }
+}
+
+/// The guard on the guard: a command line that merely mentions icount in some
+/// other position must still warn, or the silence above would swallow real
+/// cases.
+#[test]
+fn vmm_time_warning_still_fires_for_arguments_that_only_resemble_icount() {
+    for args in [
+        vec!["-no-icount".to_string()],
+        vec!["--icount".to_string()],
+        vec!["-append".to_string(), "icount=1".to_string()],
+        vec!["-drive".to_string(), "file=icount.qcow2".to_string()],
+    ] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &args, true).is_some(),
+            "these do not enable QEMU's instruction-derived clock, so the advisory still \
+             applies: {args:?}"
+        );
     }
 }
 
 #[test]
 fn vmm_time_warning_silent_without_virtual_time() {
-    // The workaround (disabling virtual time) must not itself warn.
+    // Hermit's virtual clock is off, so there is no clock-domain mismatch to
+    // warn about. (This is not an endorsement of --no-virtualize-time as a
+    // remedy for a stalled boot; see the note on the warning function.)
     assert!(
-        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), false).is_none(),
+        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &[], false).is_none(),
         "no warning is expected once virtual time is disabled"
     );
 }
@@ -795,7 +891,7 @@ fn vmm_time_warning_silent_without_virtual_time() {
 fn vmm_time_warning_silent_for_non_vmm_programs() {
     for program in ["ls", "/bin/echo", "qemu-img", "my-qemu-wrapper"] {
         assert!(
-            vmm_time_virtualization_warning(Path::new(program), true).is_none(),
+            vmm_time_virtualization_warning(Path::new(program), &[], true).is_none(),
             "unexpected VMM warning for {program}"
         );
     }
@@ -2354,7 +2450,9 @@ impl RunOpts {
         // Checked last so it reflects any overrides above that disable virtual
         // time (e.g. --strace-only).
         let virtualize_time = self.det_opts.det_config.virtualize_time;
-        if let Some(warning) = vmm_time_virtualization_warning(&self.program, virtualize_time) {
+        if let Some(warning) =
+            vmm_time_virtualization_warning(&self.program, &self.args, virtualize_time)
+        {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!("{warning}");
         }
