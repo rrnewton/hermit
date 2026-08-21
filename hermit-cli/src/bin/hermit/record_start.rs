@@ -511,6 +511,9 @@ impl StartOpts {
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                // Recording does not enable the syscall output-buffer hash, so
+                // a replay verdict here is not a content-parity claim either.
+                compare_io_buffers: false,
                 keep_logs: false,
             },
         )?;
