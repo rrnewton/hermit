@@ -171,7 +171,7 @@ pub struct RunOpts {
     /// default; this explicit flag additionally rejects unsupported syscalls immediately.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
     )]
     strict: bool,
 
@@ -1321,6 +1321,68 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
+fn strict_rejects_strace_only() {
+    // `--strace-only`'s own doc comment says it is shorthand for, among other
+    // things, `--no-sequentialize-threads --no-deterministic-io` -- the exact
+    // two flags `--strict` already refuses by name. Accepting the shorthand
+    // while refusing its parts is the inconsistency this closes.
+    let error = RunOpts::try_parse_from(["fakehermit", "--strict", "--strace-only", "fakeprog"])
+        .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let message = error.to_string();
+    assert!(message.contains("--strict"));
+    assert!(message.contains("--strace-only"));
+}
+
+#[test]
+fn strict_rejects_every_route_to_host_networking() {
+    // Explicit, and the two routes that reach host networking as a side effect
+    // of a flag that is not about networking. All three were accepted silently
+    // before: measured from inside the guest, each showed interfaces `eth0 lo`
+    // where `--strict` alone shows `lo`.
+    for (args, expected_cause) in [
+        (vec!["--strict", "--network=host"], "--network=host"),
+        (vec!["--strict", "--no-namespace"], "--no-namespace"),
+        (vec!["--strict", "--gdbserver"], "--gdbserver"),
+    ] {
+        let mut argv = vec!["fakehermit"];
+        argv.extend(args.iter().copied());
+        argv.push("fakeprog");
+        let mut opts = match RunOpts::try_parse_from(&argv) {
+            Ok(opts) => opts,
+            Err(error) => {
+                // `--no-namespace` already carries a clap conflict with
+                // `network`; a parse-time refusal is an acceptable refusal.
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                continue;
+            }
+        };
+        let error = opts
+            .validate_args_with_perf_support(true)
+            .expect_err(&format!("{argv:?} must be refused under --strict"));
+        let message = error.to_string();
+        assert!(
+            message.contains("--strict"),
+            "{argv:?}: message must name --strict: {message}"
+        );
+        assert!(
+            message.contains(expected_cause),
+            "{argv:?}: message must name the cause {expected_cause}: {message}"
+        );
+    }
+}
+
+#[test]
+fn non_strict_runs_still_allow_host_networking() {
+    // The refusal is about `--strict` claiming something it did not enforce,
+    // not about forbidding host networking outright.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--network=host", "fakeprog"]);
+    opts.validate_args_with_perf_support(true)
+        .expect("host networking without --strict must remain allowed");
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
 fn gdbserver_forces_host_networking() {
     // Without --gdbserver the default networking stays local.
     let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
@@ -2250,6 +2312,41 @@ impl RunOpts {
                  while the gdbserver is attached."
             );
             self.network = NetworkingMode::Host;
+        }
+
+        // `--strict` calls itself fail-closed strict deterministic mode, so it
+        // must refuse the settings hermit itself documents as
+        // determinism-compromising rather than accept them silently. Before
+        // this, `--strict --network=host` exited 0 with no warning, even though
+        // `--network`'s own help says `host` "compromises isolation and
+        // deterministic reproducibility".
+        //
+        // Checked HERE, after every override above, because two of the three
+        // routes to host networking are side effects of flags that are not
+        // about networking at all: `--no-namespace` sets it above, and
+        // `--gdbserver` sets it just above (that one at least prints a
+        // warning; the others were silent). Measured from inside the guest,
+        // `--strict` alone sees interfaces `lo`, while `--strict --network=host`,
+        // `--strict --no-namespace` and `--strict --strace-only` all see
+        // `eth0 lo`.
+        //
+        // This forbids rather than warns because the directive is that a hole
+        // must be opened deliberately: drop `--strict`, or ask for the hole
+        // explicitly without also claiming strictness.
+        if self.strict && self.network == NetworkingMode::Host {
+            let cause = if self.no_namespace {
+                "--no-namespace, which forces host networking"
+            } else if self.det_opts.det_config.gdbserver {
+                "--gdbserver, which forces host networking"
+            } else {
+                "--network=host"
+            };
+            anyhow::bail!(
+                "--strict is fail-closed deterministic mode and cannot be combined with {}: \
+                 host networking exposes the guest to external traffic that hermit does not \
+                 determinize. Re-run without --strict to allow it deliberately.",
+                cause
+            );
         }
 
         // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
