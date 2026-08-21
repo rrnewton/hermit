@@ -14,6 +14,7 @@ use std::thread;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RunContext;
+use hermit_manifest_plan::runner::SelectedCell;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
@@ -1029,6 +1030,97 @@ fn for_each_parallel<T: Send>(
     });
 }
 
+/// The concurrency each category is run at by CI, read from the DAG rather than
+/// restated here. A category whose node carries no `--jobs` is run serially.
+///
+/// This is derived, not maintained: a hand-kept copy of these widths would drift
+/// from `ci/dag/*.json` the moment a node changed, which is the same defect
+/// class as the numbers it is meant to guard.
+fn dag_category_widths(root: &Path) -> BTreeMap<String, u64> {
+    let mut widths = BTreeMap::new();
+    for lane in ["portable", "privileged"] {
+        let path = root.join(format!("ci/dag/{lane}.json"));
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(dag) = serde_json::from_slice::<Dag>(&bytes) else {
+            continue;
+        };
+        for step in &dag.steps {
+            let Some(manifest) = &step.manifest else {
+                continue;
+            };
+            let width = command_jobs(&step.cmd).ok().flatten().unwrap_or(1);
+            widths
+                .entry(manifest.category.clone())
+                .and_modify(|existing: &mut u64| *existing = (*existing).max(width))
+                .or_insert(width);
+        }
+    }
+    widths
+}
+
+/// Say when a hand-chosen `--jobs` exceeds the width CI runs a category at.
+///
+/// MEASURED 2026-08-21, and this is why the warning exists rather than a lower
+/// default. `--jobs` is one flat width applied to every selected cell, while the
+/// DAG gives each category its own: 20 for `backend-parity-c` and `c-programs`,
+/// whose node records a pressure test sustaining that width, and 1 for the other
+/// eleven. Running the whole population at `--jobs 24` therefore applies 24-way
+/// concurrency to categories CI never runs above one.
+///
+/// The `system-utils` category, 29 cells, measured four times on one box: 0
+/// failing cells at `--jobs 1` twice, then 6 and 8 at `--jobs 24` -- and a
+/// DIFFERENT six and eight, four cells common and six appearing in only one of
+/// the two runs. `language-runtimes` was the control: 1 failure at both widths,
+/// four times, so width does not manufacture failures everywhere. Every affected
+/// cell was `verify`/ptrace on a timing- or entropy-sensitive workload
+/// (`openssl-rand`, `mcookie-random`, `mktemp-name`, `proc-uptime`,
+/// `date-nanoseconds`). Verify runs the guest twice and compares; under
+/// contention the two runs stop agreeing. The divergence is real -- reading it
+/// as a product defect is what is false.
+///
+/// This warns rather than clamping. Clamping would silently make a requested
+/// width mean something else, and the width is legitimate for a category that
+/// declares it. The reader is told which categories are being run wider than CI
+/// runs them, so a surprising red can be attributed instead of investigated.
+fn warn_when_wider_than_ci(root: &Path, jobs: usize, cells: &[SelectedCell]) {
+    if jobs <= 1 {
+        return;
+    }
+    let widths = dag_category_widths(root);
+    if widths.is_empty() {
+        return;
+    }
+    let mut exceeded: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+    for cell in cells {
+        let Some(declared) = widths.get(cell.category.as_str()) else {
+            continue;
+        };
+        if (jobs as u64) > *declared {
+            let entry = exceeded
+                .entry(cell.category.as_str())
+                .or_insert((*declared, 0));
+            entry.1 += 1;
+        }
+    }
+    if exceeded.is_empty() {
+        return;
+    }
+    eprintln!(
+        "test-harness: WARNING --jobs {jobs} exceeds the width CI runs {} of the selected categories at:",
+        exceeded.len()
+    );
+    for (category, (declared, count)) in &exceeded {
+        eprintln!(
+            "  {category}: {count} selected cell(s); ci/dag runs this category at --jobs {declared}"
+        );
+    }
+    eprintln!(
+        "  Timing- and entropy-sensitive verify cells diverge under concurrency, so a failure \
+         here may be contention rather than a defect. Re-run the failing cell at --jobs 1 before \
+         reporting it."
+    );
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -1061,6 +1153,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut indexed_results = Vec::new();
     let mut failed = false;
     let jobs = args.jobs.unwrap_or(1);
+    warn_when_wider_than_ci(root, jobs, &cells);
     let expected = cells.len();
     for_each_parallel(
         expected,
@@ -1143,6 +1236,7 @@ mod tests {
 
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
+    use super::dag_category_widths;
     use super::for_each_parallel;
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
@@ -1152,6 +1246,53 @@ mod tests {
         fi
         timeout 720s ci/run-dag.sh privileged --unsafe-no-cgroups
 "#;
+
+    /// The widths this harness warns against must come from the DAG, so they
+    /// cannot drift from it.
+    ///
+    /// Measured 2026-08-21: `system-utils` at `--jobs 24` produced 6 then 8
+    /// failing cells out of 29 -- a different six and eight -- where `--jobs 1`
+    /// produced none, twice. The DAG runs that category serially for exactly that
+    /// reason. If this assertion ever has to be edited because the DAG changed,
+    /// the warning changed with it, which is the point of deriving rather than
+    /// restating.
+    #[test]
+    fn ci_widths_are_read_from_the_dag_not_restated_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root");
+        let widths = dag_category_widths(&root);
+        assert!(
+            !widths.is_empty(),
+            "no category widths were read from ci/dag/*.json"
+        );
+
+        // The two categories whose node records a measured pressure test.
+        for category in ["backend-parity-c", "c-programs"] {
+            assert_eq!(
+                widths.get(category).copied(),
+                Some(20),
+                "{category} should carry the DAG's declared width"
+            );
+        }
+        // A category CI runs serially. `system-utils` is the one this defect was
+        // measured on.
+        assert_eq!(
+            widths.get("system-utils").copied(),
+            Some(1),
+            "system-utils carries no --jobs in the DAG, so CI runs it serially"
+        );
+
+        // The majority being serial is the fact that makes a flat `--jobs` wrong:
+        // a single global width cannot be right for both groups at once.
+        let serial = widths.values().filter(|width| **width == 1).count();
+        assert!(
+            serial > widths.len() / 2,
+            "expected most categories to be serial in CI, got {serial} of {}",
+            widths.len()
+        );
+    }
 
     #[test]
     fn privileged_unboxed_execution_requires_the_exact_actions_guard() {
