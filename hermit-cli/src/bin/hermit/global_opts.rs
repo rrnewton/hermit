@@ -8,7 +8,10 @@
 
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use anyhow::Context;
+use anyhow::Error;
 use clap::Parser;
 use hermit::Backend;
 use tracing::metadata::LevelFilter;
@@ -41,9 +44,31 @@ pub struct GlobalOpts {
     #[clap(short, long, value_name = "LEVEL", env = "HERMIT_LOG")]
     pub log: Option<LevelFilter>,
 
-    /// Log to a file instead of the terminal.
+    /// Log to a file instead of the terminal. The path is resolved on the HOST,
+    /// exactly like a shell redirect, not inside the container the guest runs in.
     #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
+
+    /// The log file, already opened in the HOST's filename namespace.
+    ///
+    /// WHY THE FILE IS CARRIED INSTEAD OF RE-OPENED FROM THE PATH. Tracing has to be
+    /// initialized INSIDE the container -- see `init_tracing`, whose reason is that
+    /// the tracer may create a thread -- and the container mounts a fresh writable
+    /// /tmp over its root (container.rs: "A fresh writable /tmp is mounted separately
+    /// for ordinary scratch files"). So opening the path at that point resolves it in
+    /// the GUEST namespace. For `--log-file /tmp/x.log` the create then SUCCEEDS, into
+    /// the guest's tmpfs, and the file dies with the container: exit 0, no log, no
+    /// warning. Measured 2026-08-20; one debugging session was lost to it.
+    ///
+    /// An open file descriptor is unaffected by a later mount-namespace change, so
+    /// opening on the host and carrying the handle in is mechanically what a shell
+    /// redirect does. Only the OPEN moves out of the container; tracing itself is
+    /// still initialized inside, so the stated reason for that is untouched.
+    ///
+    /// `Arc` because `GlobalOpts` is `Clone` (verify clones it per run) and because
+    /// each `init_tracing` needs its own owned `File`, produced with `try_clone`.
+    #[clap(skip)]
+    pub log_file_handle: Option<Arc<File>>,
 
     /// Select the process instrumentation backend. This is the preferred, global
     /// position (e.g. `hermit --backend ptrace run ...`); for backwards
@@ -53,11 +78,45 @@ pub struct GlobalOpts {
 }
 
 impl GlobalOpts {
+    /// Open `--log-file` in the HOST's filename namespace.
+    ///
+    /// Call this from `main`, before any container exists. That placement is the
+    /// whole point: it is the moment a shell would perform `> file`.
+    ///
+    /// Reports the path on failure instead of proceeding. A run that was asked for a
+    /// log and produces neither the log nor an error is indistinguishable from a run
+    /// whose log was legitimately empty, and the person debugging cannot tell which.
+    pub fn open_log_file(&mut self) -> Result<(), Error> {
+        if let Some(path) = &self.log_file {
+            let file = File::create(path).with_context(|| {
+                format!("cannot open --log-file {} for writing", path.display())
+            })?;
+            self.log_file_handle = Some(Arc::new(file));
+        }
+        Ok(())
+    }
+
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
+    ///
+    /// The file itself is NOT opened here when it came from `--log-file`; see
+    /// `log_file_handle` for why opening at this point resolves the path in the
+    /// guest namespace and silently loses it.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing(&self) -> Option<impl Drop + use<>> {
-        if let Some(path) = &self.log_file {
+        if let Some(handle) = &self.log_file_handle {
+            // Each subscriber needs an owned File; `try_clone` dups the descriptor,
+            // so every run writes through the same host-side open file.
+            let file_writer = handle
+                .try_clone()
+                .expect("cannot duplicate the host log file descriptor");
+            Some(init_file_tracing(self.log, file_writer))
+        } else if let Some(path) = &self.log_file {
+            // An internal caller set the path directly rather than going through
+            // `open_log_file` -- today that is verify's double-run setup, which
+            // creates its own temp files and is measured NOT to hit the namespace
+            // problem. Keep the historical behaviour for those, rather than changing
+            // a path this task did not investigate.
             let file_writer = File::create(path).expect("Failed to open log file");
             Some(init_file_tracing(self.log, file_writer))
         } else {

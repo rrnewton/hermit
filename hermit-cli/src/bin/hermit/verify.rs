@@ -982,6 +982,7 @@ mod tests {
         GlobalOpts {
             log,
             log_file: None,
+            log_file_handle: None,
             backend: None,
         }
     }

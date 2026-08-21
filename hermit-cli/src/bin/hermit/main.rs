@@ -376,9 +376,18 @@ fn main() {
         status.raise_or_exit();
     }
     let Args {
-        global,
+        mut global,
         mut command,
     } = Args::parse();
+
+    // Open --log-file HERE, in the host's filename namespace, before any container
+    // exists. This is the moment a shell would perform `> file`, and doing it later
+    // -- inside the container, where tracing must be initialized -- resolves the path
+    // against the guest's fresh /tmp and silently discards the log.
+    if let Err(err) = global.open_log_file() {
+        display_error(err);
+        ExitStatus::Exited(1).raise_or_exit();
+    }
 
     command
         .main(&global)

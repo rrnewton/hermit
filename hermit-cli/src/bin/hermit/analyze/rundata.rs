@@ -185,7 +185,15 @@ impl RunData {
             // Analyze threads the backend through its own `RunOpts`, so there is no
             // separate global-position backend to apply here.
             backend: None,
+            log_file_handle: None,
         };
+        // Open it HERE, on the host, for the same reason `main` does: `launch` runs
+        // before the container exists, and opening later would resolve this path in
+        // the guest namespace. Analyze's log lands under the run's own directory, so
+        // it is only exposed when that directory is itself inside the container's
+        // /tmp -- but the fix is the same and costs nothing.
+        let mut gopts = gopts;
+        gopts.open_log_file()?;
         let final_record_path = self
             .runopts
             .det_opts
