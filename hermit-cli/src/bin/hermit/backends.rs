@@ -713,6 +713,7 @@ pub(super) fn run_dbt(
             strictness: LogCompareStrictness::Canonical,
             compare_logs: true,
             diagnostic_full_trace: verify_verbose,
+            compare_io_buffers: false,
             keep_logs,
         },
     )?;
