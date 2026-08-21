@@ -1477,6 +1477,60 @@ fn image_script_validation_resolves_interpreter_inside_rootfs() {
     );
 }
 
+/// End-to-end preflight regression: an executable whose complete contents are a
+/// shebang with no interpreter must be *rejected* by `validate_executable`, and
+/// must not panic on the way there.
+///
+/// This is the checked-in discrimination for the shared-parser change. Each of
+/// the two pre-fix states fails it, for a different reason:
+///
+/// * With the old duplicated `shebang_interpreter` helper in this file — the one
+///   that did `bytes[2..].iter().position(..)? + 2` — the `?` returns `None` for
+///   these inputs, so `validate_executable` skips its shebang block entirely and
+///   returns `Ok(())`. Preflight silently accepts the file. The `Ok(())` arm
+///   below panics.
+/// * With `let mut j = 1 + i;` restored in `Shebang::from_buf`, the shared
+///   parser slices `&buf[i..i + 1]` where `i == buf.len()` and panics with
+///   "range end index N out of range for slice of length N".
+///
+/// Scope: this pins one preflight rejection for one input class. It is not a
+/// shebang-parser test — interpreter arguments, the 256-byte truncation
+/// boundary, and non-UTF-8 interpreter paths are not covered here, and the
+/// positive case (a resolvable interpreter) lives in
+/// `image_script_validation_resolves_interpreter_inside_rootfs`.
+///
+/// `#!\n` is carried for completeness only: it already yielded an empty
+/// interpreter under the old helper, so on its own it discriminates nothing. The
+/// two inputs that carry the regression are `#!` and `#! \t`, the shapes whose
+/// interpreter field runs to the end of the header buffer.
+#[test]
+fn validate_executable_rejects_empty_shebang_interpreter() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let script = tmp.path().join("empty-shebang");
+    let requested = Path::new("/bin/empty-shebang");
+
+    for contents in [b"#!".as_slice(), b"#! \t", b"#!\n"] {
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The empty-interpreter rejection precedes guest-root resolution, so the
+        // host preflight path and the image path must both reach it.
+        for guest_root in [None, Some(tmp.path())] {
+            let error = match validate_executable(&script, requested, guest_root) {
+                Ok(()) => panic!(
+                    "preflight accepted an executable whose contents are {contents:?} \
+                     (guest_root: {guest_root:?}); it must be rejected"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("empty shebang interpreter"),
+                "contents {contents:?} (guest_root: {guest_root:?}): unexpected error: {error:#}"
+            );
+        }
+    }
+}
+
 #[test]
 fn image_guest_program_resolution_matches_execve_pathname_rules() {
     // Absolute paths pass through unchanged.
