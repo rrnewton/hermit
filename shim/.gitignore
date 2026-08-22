@@ -5,8 +5,6 @@
 # License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 # of this source tree.
 
-# We currently expect end users to run reindeer vendor themselves
-# so mark these things as to ignore
-/third-party/rust/.cargo/
-/third-party/rust/BUCK
-/third-party/rust/vendor/
+# Generated Reindeer output is ignored by the repository-root .gitignore.
+# Do not put the whole vendor tree here: pinned Reindeer reads ignore files
+# through this shim cell root and would omit every vendored source file.

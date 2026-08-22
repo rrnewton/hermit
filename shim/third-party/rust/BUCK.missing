@@ -9,9 +9,9 @@ fail("""----------------------------------------------------
 
 You need to generate BUCK dependencies from Cargo.toml using reindeer!
 
-Try this:
+From the repository root, run:
 
-    ./bootstrap/reindeer --third-party-dir shim/third-party/rust buckify
+    ./bootstrap/regenerate-rust-deps
 
 See the following links for more information:
 
