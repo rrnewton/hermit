@@ -1960,6 +1960,8 @@ fn super_plan_bracket() -> Result<(), String> {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }],
         "caps-audit negative bracket",
     );
@@ -3659,6 +3661,10 @@ fn step_with_caps(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        // Undeclared, as these nodes were before the runner grew the fields. See
+        // validate_plan::node for why this is not `Some(vec![])`.
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
@@ -4031,6 +4037,12 @@ fn forward_step_profiles(result: &RunResult, jobs: i64) {
         None,
         "unverified",
         "validate.rs",
+        // Each caller passes the rows of exactly one `run_dag_boxed_deadline`
+        // execution, so a freshly minted run_id (`None`) groups precisely that
+        // execution. An environmental retry is a separate execution and gets its
+        // own id, which is what keeps the retry's rows distinguishable from the
+        // first attempt's instead of merging both into one apparent run.
+        None,
     ) {
         Some(path) => eprintln!(
             "validate: wrote {} inner step profile row(s) to {}",
