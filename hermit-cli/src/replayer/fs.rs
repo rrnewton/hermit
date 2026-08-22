@@ -476,21 +476,35 @@ fn vectored_offset(low: u64, high: u64) -> i64 {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#662): Audit temporary blocking and restoration for replay side effects.
+fn finish_kernel_side_effect(
+    result: Result<i64, Errno>,
+    restored: Result<i64, Errno>,
+) -> Result<Result<i64, Errno>, Errno> {
+    match restored {
+        // The inner result is the injected syscall outcome. Callers still compare
+        // it with the recording; the outer error is reserved for setup/restore
+        // failures that must propagate through the replay handler.
+        Ok(0) => Ok(result),
+        Ok(_) => Err(Errno::EIO),
+        Err(error) => Err(error),
+    }
+}
+
 async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     guest: &mut G,
     fd: libc::c_int,
     syscall: Syscall,
-) -> Result<i64, Errno> {
+) -> Result<Result<i64, Errno>, Errno> {
     let result = guest.inject(syscall).await;
     if result != Err(Errno::EAGAIN) {
-        return result;
+        return Ok(result);
     }
 
     let flags = guest
         .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFL))
         .await? as libc::c_int;
     if flags & libc::O_NONBLOCK == 0 {
-        return result;
+        return Ok(result);
     }
     guest
         .inject(
@@ -503,8 +517,7 @@ async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     let restored = guest
         .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_SETFL(flags)))
         .await;
-    assert_eq!(restored, Ok(0), "failed to restore replay fd flags");
-    result
+    finish_kernel_side_effect(result, restored)
 }
 
 impl Replayer {
@@ -583,7 +596,7 @@ impl Replayer {
         };
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, fd, syscall).await;
+                let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
@@ -611,7 +624,7 @@ impl Replayer {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
+                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
@@ -767,7 +780,7 @@ impl Replayer {
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
                 let actual =
-                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
+                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await?;
                 assert_eq!(
                     actual, event.result,
                     "replayed eventfd write side effect diverged"
@@ -1055,6 +1068,20 @@ mod tests {
     use tokio::io::unix::AsyncFd;
 
     use super::*;
+
+    #[test]
+    fn kernel_side_effect_restore_result_is_propagated() {
+        assert_eq!(finish_kernel_side_effect(Ok(7), Ok(0)), Ok(Ok(7)));
+        assert_eq!(
+            finish_kernel_side_effect(Err(Errno::EAGAIN), Ok(0)),
+            Ok(Err(Errno::EAGAIN))
+        );
+        assert_eq!(
+            finish_kernel_side_effect(Ok(7), Err(Errno::EBADF)),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(finish_kernel_side_effect(Ok(7), Ok(1)), Err(Errno::EIO));
+    }
 
     #[tokio::test]
     async fn replay_output_preserves_regular_file_offset() {
