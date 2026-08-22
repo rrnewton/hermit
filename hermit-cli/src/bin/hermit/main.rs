@@ -662,6 +662,24 @@ mod tests {
     }
 
     #[test]
+    fn replay_accepts_serve_only_for_an_external_debugger() {
+        let args =
+            Args::try_parse_from(["hermit", "replay", "--serve-only", "--gdbserver-port=2345"])
+                .unwrap();
+
+        assert!(matches!(args.command, Subcommand::Replay(_)));
+    }
+
+    #[test]
+    fn replay_serve_only_rejects_gdb_commands() {
+        let error =
+            Args::try_parse_from(["hermit", "replay", "--serve-only", "--gdbex=break main"])
+                .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn bisect_accepts_schedule_endpoints_and_run_args() {
         let args = Args::try_parse_from([
             "hermit",
