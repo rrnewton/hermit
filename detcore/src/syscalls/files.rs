@@ -12,6 +12,7 @@ use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 
+use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use rand::RngExt as _;
 use reverie::Error;
@@ -28,6 +29,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
@@ -1691,6 +1693,135 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ret = self.record_or_replay(guest, call).await?;
         self.canonicalize_statfs_buf(guest, call.buf())?;
         Ok(ret)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1851): Determinized ownership mutation. Emulate the
+    // IDENTITY half of the call and let Linux answer the ARGUMENT half.
+    /// The `chown` family (`chown`, `fchown`, `fchownat`, `lchown`).
+    ///
+    /// Detcore presents a fixed virtual-root identity, so the *permission*
+    /// answer must be the one a real root gets: success, for any uid. But root
+    /// privilege affects only the ownership permission check — it does not
+    /// waive pathname, descriptor, or flag errors. A real root's
+    /// `chown("/does/not/exist", 0, 0)` still fails with `ENOENT`.
+    ///
+    /// So this does not fabricate a bare `Ok(0)`. It translates the mutation
+    /// into a side-effect-free metadata lookup with the same target-selection
+    /// arguments, and reports success only if that lookup succeeds:
+    ///
+    /// * `F_GETFL` validates `fchown`'s descriptor and distinguishes an
+    ///   `O_PATH` descriptor (valid for `fstat`, invalid for `fchown`);
+    ///   `newfstatat` performs the corresponding path walk for the three
+    ///   pathname variants, preserving `ENOENT`, `ENOTDIR`, `ELOOP`,
+    ///   `ENAMETOOLONG`, `EFAULT`, and `EBADF`;
+    /// * `fchownat` flags are checked explicitly before the lookup, so an
+    ///   unsupported flag still returns `EINVAL` rather than being accepted by
+    ///   a metadata syscall with a wider flag vocabulary;
+    /// * no setattr operation is attempted. This matters beyond ownership:
+    ///   Linux clears set-id bits and updates ctime even for
+    ///   `chown(path, -1, -1)`, so reissuing a sentinel chown is not a no-op.
+    ///
+    /// Routed through `record_or_replay` rather than `inject`, so a replay does
+    /// not need the guest's filesystem to still exist.
+    ///
+    /// **Semantic boundary, stated explicitly.** Detcore does not model
+    /// per-file ownership, so the success is not observable through a later
+    /// `stat`. A guest that chowns to a foreign uid and reads the owner back
+    /// sees the unchanged owner — a divergence a single-uid container cannot
+    /// avoid, and strictly smaller than the status quo in which the guest
+    /// believes it is root and cannot chown at all.
+    ///
+    /// **Residual, also stated.** This emulates ownership permission and target
+    /// validation, not every write-time filesystem policy. In particular a
+    /// target on a read-only mount can pass the metadata lookup where a real
+    /// chown would return `EROFS`. Path resolution also still requires search
+    /// permission on the parent directories, so `EACCES` remains a function of
+    /// the host identity under `--no-namespace`. That exposure is shared with
+    /// every pass-through filesystem syscall (`open`, `stat`, `chmod`) and is
+    /// not introduced here; it is recorded so the boundary is not overstated.
+    ///
+    /// The behavioural contract is bracketed end to end by
+    /// `hermit-cli/tests/chown_virtual_root_identity.rs`; the unit tests in
+    /// `syscall_classification` pin membership only and cannot see this
+    /// function's result.
+    pub async fn handle_ownership_change_noop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let call = match call {
+            Syscall::Fchown(c) => {
+                let flags = self
+                    .record_or_replay(
+                        guest,
+                        syscalls::Fcntl::new().with_fd(c.fd()).with_cmd(F_GETFL),
+                    )
+                    .await?;
+                if flags & i64::from(OFlag::O_PATH.bits()) != 0 {
+                    return Err(Error::Errno(Errno::EBADF));
+                }
+                return Ok(0);
+            }
+            other => other,
+        };
+
+        if let Syscall::Fchownat(c) = &call {
+            let allowed = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
+            if c.flags().bits() & !allowed.bits() != 0 {
+                return Err(Error::Errno(Errno::EINVAL));
+            }
+        }
+
+        let mut stack = guest.stack().await;
+        let statptr: StatPtr = StatPtr(stack.reserve());
+        stack.commit()?;
+
+        let validate = match call {
+            Syscall::Chown(c) => Syscall::Newfstatat(
+                syscalls::Newfstatat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(c.path())
+                    .with_stat(Some(statptr))
+                    .with_flags(AtFlags::empty()),
+            ),
+            Syscall::Lchown(c) => Syscall::Newfstatat(
+                syscalls::Newfstatat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(c.path())
+                    .with_stat(Some(statptr))
+                    .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
+            ),
+            Syscall::Fchownat(c) => Syscall::Newfstatat(
+                syscalls::Newfstatat::new()
+                    .with_dirfd(c.dirfd())
+                    .with_path(c.path())
+                    .with_stat(Some(statptr))
+                    .with_flags(c.flags()),
+            ),
+            // Unreachable while `is_ownership_change_noop_syscall` and this
+            // match name the same four syscalls. Fail closed if they drift:
+            // "not attempted" must never be observationally identical to a
+            // validated emulated success.
+            other => {
+                warn!(
+                    "ownership-change no-op reached with an unexpected syscall {:?}; \
+                     refusing unvalidated success",
+                    other.number()
+                );
+                return Err(Error::Errno(Errno::ENOSYS));
+            }
+        };
+
+        // The errno of the side-effect-free validating call is the guest's
+        // answer; only an actually executed successful validation becomes the
+        // emulated success. Clear the scratch output on both paths.
+        let result = self.record_or_replay(guest, validate).await;
+        guest
+            .memory()
+            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
+        result?;
+        Ok(0)
     }
 
     /// Overwrite the host-varying fields of a `statfs` result buffer with fixed

@@ -244,6 +244,7 @@ use crate::syscall_classification::is_landlock_sandbox_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_optional_memory_feature_syscall;
+use crate::syscall_classification::is_ownership_change_noop_syscall;
 use crate::syscall_classification::is_perf_event_enosys_syscall;
 use crate::syscall_classification::is_privileged_admin_refused_syscall;
 use crate::syscall_classification::is_privileged_observation_refused_syscall;
@@ -1929,6 +1930,37 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if is_credential_identity_noop_syscall(call.number()) =>
             {
                 Ok(0)
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
+            // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
+            // identity that the credential query (#1549) and credential set
+            // (#787) families already implement. A real root process's chown
+            // succeeds for any uid, so 0 is the value the virtual identity must
+            // observe; forwarding instead returned the errno of whatever host
+            // identity the backend happened to run under (EPERM with no user
+            // namespace, EINVAL for an unmapped uid inside a one-uid map, and
+            // backend-dependent for in-process backends).
+            //
+            // The emulation covers the IDENTITY half only. Root privilege
+            // waives the ownership permission check; it does not waive pathname,
+            // descriptor, or flag errors, so handle_ownership_change_noop
+            // translates the target arguments into a side-effect-free metadata
+            // lookup and returns 0 only if that validation succeeds. ENOENT,
+            // EBADF, EFAULT, ENOTDIR and the fchownat flag EINVAL therefore
+            // still reach the guest; the host-identity-dependent EPERM/EINVAL
+            // cannot be produced at all. No setattr is attempted, so host
+            // ownership, mode bits, and timestamps are never modified, and
+            // Detcore does not model per-file ownership, so the success is not
+            // observable through a later stat -- see
+            // is_ownership_change_noop_syscall and handle_ownership_change_noop
+            // for the full boundary, and
+            // hermit-cli/tests/chown_virtual_root_identity.rs for the bracket
+            // that fails if this arm's RESULT regresses.
+            SyscallClassification::Determinized
+                if is_ownership_change_noop_syscall(call.number()) =>
+            {
+                self.handle_ownership_change_noop(guest, call).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#827): Deterministic ENOSYS for the Landlock
