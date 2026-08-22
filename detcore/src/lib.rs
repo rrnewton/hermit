@@ -254,6 +254,7 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+use crate::syscalls::time::guest_clock_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -1225,13 +1226,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // TODO: use global time for rdtsc:
+            // rdtsc reads the SAME clock clock_gettime does.
+            //
+            // These used to differ: rdtsc returned this thread's local logical
+            // time while clock_gettime returned global virtual time. Only
+            // global time is charged NANOS_PER_SCHED per scheduler turn
+            // (GlobalTime::add_scheduler_time), so the two drifted apart by
+            // the whole scheduler bill. The gap grows with the SQUARE of the
+            // clock multiplier, because the timeslice is denominated in
+            // virtual nanoseconds and converted to an RCB budget by dividing
+            // by the multiplier, so the turn count itself grows with it.
+            let tsc = guest_clock_time(guest).await.as_nanos();
             Ok(RdtscResult {
-                tsc: guest
-                    .thread_state()
-                    .thread_logical_time
-                    .as_nanos()
-                    .as_nanos(), // We treat virtual cycles as equivalent to virtual nanoseconds.
+                // We treat virtual cycles as equivalent to virtual nanoseconds.
+                tsc,
                 aux: None,
             })
         } else {
