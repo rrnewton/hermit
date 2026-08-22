@@ -78,6 +78,14 @@ pub struct LogDiffOpts {
     /// The internal message set to compare.
     #[clap(skip)]
     pub comparison: LogComparisonMode,
+
+    /// Print both selected logs exactly as they are passed to the comparator.
+    ///
+    /// The output names the active comparison policy and reflects every
+    /// selection, wall-clock-prefix removal, and normalization step.
+    #[clap(long)]
+    pub print_logs: bool,
+
     /// Limit the number of differences printed. Set to 0 for no limit.
     #[clap(long, default_value = "20")]
     pub limit: u64,
@@ -151,6 +159,62 @@ impl LogDiffOpts {
                 }
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogNormalization {
+    Exact,
+    Stripped,
+    Canonical,
+}
+
+/// The scope and normalization that jointly determine a log comparison.
+///
+/// Construct this once from [`LogDiffOpts`], then use it for selection,
+/// transformation, and the displayed policy name so those three facts cannot
+/// drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogComparisonPolicy {
+    comparison: LogComparisonMode,
+    normalization: LogNormalization,
+}
+
+impl LogComparisonPolicy {
+    fn from_options(options: &LogDiffOpts) -> Self {
+        let normalization = if options.strip_lines {
+            LogNormalization::Stripped
+        } else if options.canonicalize_addresses {
+            LogNormalization::Canonical
+        } else {
+            LogNormalization::Exact
+        };
+        Self {
+            comparison: options.comparison,
+            normalization,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match (self.comparison, self.normalization) {
+            (LogComparisonMode::Deterministic, LogNormalization::Exact) => "Deterministic",
+            (LogComparisonMode::Deterministic, LogNormalization::Stripped) => "Stripped",
+            (LogComparisonMode::Deterministic, LogNormalization::Canonical) => {
+                "Deterministic with Canonical host-address normalization"
+            }
+            (LogComparisonMode::Info, LogNormalization::Exact) => "Info",
+            (LogComparisonMode::Info, LogNormalization::Stripped) => {
+                "Info with Stripped normalization"
+            }
+            (LogComparisonMode::Info, LogNormalization::Canonical) => "Canonical",
+            (LogComparisonMode::FullTrace, LogNormalization::Exact) => "FullTrace",
+            (LogComparisonMode::FullTrace, LogNormalization::Stripped) => {
+                "FullTrace with Stripped normalization"
+            }
+            (LogComparisonMode::FullTrace, LogNormalization::Canonical) => {
+                "FullTrace with Canonical host-address normalization"
+            }
+        }
     }
 }
 
@@ -314,26 +378,26 @@ fn canonicalize_addresses_in_line(
         .into_owned()
 }
 
-fn messages_for_comparison(messages: &[(usize, &str)], opts: &LogDiffOpts) -> Vec<String> {
-    if opts.strip_lines {
-        messages
+fn messages_for_comparison(messages: &[(usize, &str)], policy: LogComparisonPolicy) -> Vec<String> {
+    match policy.normalization {
+        LogNormalization::Stripped => messages
             .iter()
             .map(|(_, message)| strip_log_entry(message))
-            .collect()
-    } else if opts.canonicalize_addresses {
-        let mut addresses = HashMap::new();
-        let mut next_address = 1usize;
-        messages
-            .iter()
-            .map(|(_, message)| {
-                canonicalize_addresses_in_line(message, &mut addresses, &mut next_address)
-            })
-            .collect()
-    } else {
-        messages
+            .collect(),
+        LogNormalization::Canonical => {
+            let mut addresses = HashMap::new();
+            let mut next_address = 1usize;
+            messages
+                .iter()
+                .map(|(_, message)| {
+                    canonicalize_addresses_in_line(message, &mut addresses, &mut next_address)
+                })
+                .collect()
+        }
+        LogNormalization::Exact => messages
             .iter()
             .map(|(_, message)| (*message).to_owned())
-            .collect()
+            .collect(),
     }
 }
 
@@ -344,7 +408,7 @@ fn canonical_info_from_str(contents: &str) -> Vec<String> {
         comparison: LogComparisonMode::Info,
         ..Default::default()
     };
-    messages_for_comparison(&info, &opts)
+    messages_for_comparison(&info, LogComparisonPolicy::from_options(&opts))
 }
 
 /// Print the canonical INFO messages that strict verification would compare for
@@ -650,11 +714,10 @@ fn collect_syscalls<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
 
 fn first_different_message_indices(
     left: &[(usize, &str)],
+    compared_left: &[String],
     right: &[(usize, &str)],
-    opts: &LogDiffOpts,
+    compared_right: &[String],
 ) -> Option<(Option<usize>, Option<usize>)> {
-    let compared_left = messages_for_comparison(left, opts);
-    let compared_right = messages_for_comparison(right, opts);
     let common = compared_left.len().min(compared_right.len());
 
     if let Some(position) =
@@ -836,23 +899,19 @@ impl<'a> Display for Comparison<'a> {
 //  - detect reorderings and/or switch to larger differences for consecutive multi-line mismatches
 fn diff_vecs(
     which: &str,
-    v1: &[(usize, &str)],
-    v2: &[(usize, &str)],
+    left: (&[(usize, &str)], &[String]),
+    right: (&[(usize, &str)], &[String]),
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
     left_syscalls: &[(usize, &str)],
     right_syscalls: &[(usize, &str)],
 ) -> std::io::Result<bool> {
+    let (v1, compared_left) = left;
+    let (v2, compared_right) = right;
     writeln!(w, "  Comparing {which} messages...\n")?;
     if v1.is_empty() && v2.is_empty() {
         return Ok(false);
     }
-
-    // Prepare both complete streams before the compare loop: address ordinals
-    // are assigned by first appearance across the full selected stream, not by
-    // however many differences the caller asks us to print.
-    let compared_left = messages_for_comparison(v1, opts);
-    let compared_right = messages_for_comparison(v2, opts);
 
     let mut diff_count = 0;
     for (position, ((left_index, left), (right_index, right))) in
@@ -906,7 +965,7 @@ fn diff_vecs(
             )?;
             diff_count += 1;
             let start = v2.len() - std::cmp::min(10, v2.len() - v1.len());
-            for (_, message) in &v2[start..] {
+            for message in &compared_right[start..] {
                 writeln!(w, "{message}")?;
             }
         }
@@ -918,7 +977,7 @@ fn diff_vecs(
             )?;
             diff_count += 1;
             let start = v1.len() - std::cmp::min(10, v1.len() - v2.len());
-            for (_, message) in &v1[start..] {
+            for message in &compared_left[start..] {
                 writeln!(w, "{message}")?;
             }
         }
@@ -928,26 +987,50 @@ fn diff_vecs(
     Ok(diff_count > 0)
 }
 
+fn write_compared_messages(
+    writer: &mut impl std::io::Write,
+    messages: &[String],
+) -> std::io::Result<()> {
+    for message in messages {
+        writeln!(writer, "{message}")?;
+    }
+    Ok(())
+}
+
+fn write_compared_logs(
+    writer: &mut impl std::io::Write,
+    policy: LogComparisonPolicy,
+    compared_left: &[String],
+    compared_right: &[String],
+) -> std::io::Result<()> {
+    writeln!(writer, "Comparison policy: {}", policy.name())?;
+    writeln!(writer, "--- begin run 1 compared log ---")?;
+    write_compared_messages(writer, compared_left)?;
+    writeln!(writer, "--- end run 1 compared log ---")?;
+    writeln!(writer, "--- begin run 2 compared log ---")?;
+    write_compared_messages(writer, compared_right)?;
+    writeln!(writer, "--- end run 2 compared log ---")?;
+    Ok(())
+}
+
 fn git_diff(
     which: &str,
-    v1: &[(usize, &str)],
-    v2: &[(usize, &str)],
+    left: (&[(usize, &str)], &[String]),
+    right: (&[(usize, &str)], &[String]),
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
     left_syscalls: &[(usize, &str)],
     right_syscalls: &[(usize, &str)],
 ) -> std::io::Result<bool> {
+    let (v1, compared_left) = left;
+    let (v2, compared_right) = right;
     writeln!(w, "  Comparing {which} messages...\n")?;
 
     let mut file1 = NamedTempFile::new()?;
     let mut file2 = NamedTempFile::new()?;
 
-    for (_, line) in v1 {
-        writeln!(file1, "{line}")?;
-    }
-    for (_, line) in v2 {
-        writeln!(file2, "{line}")?;
-    }
+    write_compared_messages(&mut file1, compared_left)?;
+    write_compared_messages(&mut file2, compared_right)?;
 
     match Command::new("git")
         .args(["diff", "--color", "--color-words", "-w"])
@@ -958,7 +1041,15 @@ fn git_diff(
         Ok(code) => Ok(!code.success()),
         Err(error) => {
             eprintln!("Error launching git, falling back to basic diff: {error}");
-            diff_vecs(which, v1, v2, opts, w, left_syscalls, right_syscalls)
+            diff_vecs(
+                which,
+                (v1, compared_left),
+                (v2, compared_right),
+                opts,
+                w,
+                left_syscalls,
+                right_syscalls,
+            )
         }
     }
 }
@@ -1182,25 +1273,39 @@ fn log_diff_summary_from_strs(
         detlogs_b.len(),
     )?;
 
-    if opts.strip_lines {
+    let policy = LogComparisonPolicy::from_options(opts);
+
+    if policy.normalization == LogNormalization::Stripped {
         writeln!(
             w,
             "Normalizing known nondeterministic numerical data before comparison..."
         )?;
-    } else if opts.canonicalize_addresses {
+    } else if policy.normalization == LogNormalization::Canonical {
         writeln!(
             w,
             "Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly..."
         )?;
     }
 
-    let (which, compared_a, compared_b) = match opts.comparison {
+    let (which, compared_a, compared_b) = match policy.comparison {
         LogComparisonMode::Deterministic => ("DETLOG", &detlogs_a, &detlogs_b),
         LogComparisonMode::Info => ("INFO", &infos_a, &infos_b),
         LogComparisonMode::FullTrace => ("full trace", &all_a, &all_b),
     };
 
-    let first_different = first_different_message_indices(compared_a, compared_b, opts);
+    // Prepare both complete streams exactly once. Address ordinals are assigned
+    // by first appearance across the full selected stream, and every consumer
+    // below (printing, position reporting, and comparison) receives these same
+    // String values rather than independently rendering the logs.
+    let prepared_a = messages_for_comparison(compared_a, policy);
+    let prepared_b = messages_for_comparison(compared_b, policy);
+
+    if opts.print_logs {
+        write_compared_logs(w, policy, &prepared_a, &prepared_b)?;
+    }
+
+    let first_different =
+        first_different_message_indices(compared_a, &prepared_a, compared_b, &prepared_b);
     let first_position_candidate = first_different.and_then(|(left_index, right_index)| {
         left_index
             .and_then(|index| commit_position_at_or_before(&all_a, index))
@@ -1210,8 +1315,8 @@ fn log_diff_summary_from_strs(
     let diff_found = if opts.git_diff {
         git_diff(
             which,
-            compared_a,
-            compared_b,
+            (compared_a, &prepared_a),
+            (compared_b, &prepared_b),
             opts,
             w,
             &left_syscalls,
@@ -1220,8 +1325,8 @@ fn log_diff_summary_from_strs(
     } else {
         diff_vecs(
             which,
-            compared_a,
-            compared_b,
+            (compared_a, &prepared_a),
+            (compared_b, &prepared_b),
             opts,
             w,
             &left_syscalls,
@@ -1571,6 +1676,7 @@ mod test {
                 strip_lines: false,
                 canonicalize_addresses: false,
                 comparison: super::LogComparisonMode::Deterministic,
+                print_logs: false,
                 syscall_history: 5,
                 no_color: false,
                 skip_commit: false,
@@ -1623,6 +1729,191 @@ mod test {
         assert!(output.contains("Prior completed syscalls for run 1:"));
         assert!(output.contains("Prior completed syscalls for run 2:"));
         assert_eq!(output.matches("finish syscall #1: read").count(), 2);
+        Ok(())
+    }
+
+    fn printed_log(output: &str, run: u8) -> &str {
+        let start = format!("--- begin run {run} compared log ---\n");
+        let end = format!("--- end run {run} compared log ---\n");
+        output
+            .split_once(&start)
+            .expect("printed log start marker")
+            .1
+            .split_once(&end)
+            .expect("printed log end marker")
+            .0
+    }
+
+    #[test]
+    fn printed_logs_are_the_exact_selected_comparator_inputs() -> std::io::Result<()> {
+        let left = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG value=101\n\
+2026-08-15T01:02:03.000001Z INFO unrelated: omitted value=303";
+        let right = "2026-08-15T04:05:06.000000Z INFO detcore: DETLOG value=202\n\
+2026-08-15T04:05:06.000001Z INFO unrelated: omitted value=404";
+
+        let exact = super::LogDiffOpts {
+            print_logs: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut exact_output = Vec::new();
+        let exact_summary =
+            super::log_diff_summary_from_strs(left, right, &exact, &mut exact_output)?;
+        let exact_output = String::from_utf8(exact_output).unwrap();
+
+        assert!(exact_summary.diff_found);
+        assert!(exact_output.contains("Comparison policy: Deterministic\n"));
+        assert_eq!(
+            printed_log(&exact_output, 1).as_bytes(),
+            b"INFO detcore: DETLOG value=101\n"
+        );
+        assert_eq!(
+            printed_log(&exact_output, 2).as_bytes(),
+            b"INFO detcore: DETLOG value=202\n"
+        );
+
+        let stripped = super::LogDiffOpts {
+            strip_lines: true,
+            print_logs: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut stripped_output = Vec::new();
+        let stripped_summary =
+            super::log_diff_summary_from_strs(left, right, &stripped, &mut stripped_output)?;
+        let stripped_output = String::from_utf8(stripped_output).unwrap();
+
+        assert!(stripped_summary.matched_with_evidence());
+        assert!(stripped_output.contains("Comparison policy: Stripped\n"));
+        assert_eq!(
+            printed_log(&stripped_output, 1).as_bytes(),
+            b"INFO detcore: DETLOG value=<NUM>\n"
+        );
+        assert_eq!(
+            printed_log(&stripped_output, 1),
+            printed_log(&stripped_output, 2)
+        );
+        assert_ne!(
+            printed_log(&exact_output, 1),
+            printed_log(&stripped_output, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn printed_policy_name_tracks_the_selected_scope_and_normalization() -> std::io::Result<()> {
+        let log = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\n\
+2026-08-15T01:02:03.000001Z DEBUG unrelated: diagnostic=2";
+
+        let cases = [
+            (
+                super::LogDiffOpts {
+                    comparison: super::LogComparisonMode::Info,
+                    print_logs: true,
+                    no_color: true,
+                    ..Default::default()
+                },
+                "Comparison policy: Info\n",
+                "INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\n",
+            ),
+            (
+                super::LogDiffOpts {
+                    comparison: super::LogComparisonMode::FullTrace,
+                    print_logs: true,
+                    no_color: true,
+                    ..Default::default()
+                },
+                "Comparison policy: FullTrace\n",
+                "INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\nDEBUG unrelated: diagnostic=2\n",
+            ),
+            (
+                super::LogDiffOpts {
+                    comparison: super::LogComparisonMode::Deterministic,
+                    canonicalize_addresses: true,
+                    print_logs: true,
+                    no_color: true,
+                    ..Default::default()
+                },
+                "Comparison policy: Deterministic with Canonical host-address normalization\n",
+                "INFO detcore: DETLOG stable=1 address=<addr1>\n",
+            ),
+            (
+                super::LogDiffOpts {
+                    comparison: super::LogComparisonMode::Deterministic,
+                    strip_lines: true,
+                    print_logs: true,
+                    no_color: true,
+                    ..Default::default()
+                },
+                "Comparison policy: Stripped\n",
+                "INFO detcore: DETLOG stable=<NUM> address=<hostaddr <ADDR>>\n",
+            ),
+        ];
+
+        for (options, expected_name, expected_log) in cases {
+            let mut output = Vec::new();
+            let summary = super::log_diff_summary_from_strs(log, log, &options, &mut output)?;
+            let output = String::from_utf8(output).unwrap();
+            assert!(summary.matched_with_evidence());
+            assert!(output.contains(expected_name), "{output}");
+            assert_eq!(printed_log(&output, 1), expected_log);
+            assert_eq!(printed_log(&output, 2), expected_log);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn printed_canonical_policy_uses_the_info_scope_and_address_ordinals() -> std::io::Result<()> {
+        let left = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG stable=1\n\
+2026-08-15T01:02:03.000001Z INFO unrelated: value=101 address=<hostaddr 0xaaaa>";
+        let right = "2026-08-15T04:05:06.000000Z INFO detcore: DETLOG stable=1\n\
+2026-08-15T04:05:06.000001Z INFO unrelated: value=202 address=<hostaddr 0xbbbb>";
+
+        let deterministic = super::LogDiffOpts {
+            print_logs: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut deterministic_output = Vec::new();
+        let deterministic_summary = super::log_diff_summary_from_strs(
+            left,
+            right,
+            &deterministic,
+            &mut deterministic_output,
+        )?;
+        let deterministic_output = String::from_utf8(deterministic_output).unwrap();
+        assert!(deterministic_summary.matched_with_evidence());
+        assert!(deterministic_output.contains("Comparison policy: Deterministic\n"));
+        assert_eq!(
+            printed_log(&deterministic_output, 1).as_bytes(),
+            b"INFO detcore: DETLOG stable=1\n"
+        );
+        assert_eq!(
+            printed_log(&deterministic_output, 1),
+            printed_log(&deterministic_output, 2)
+        );
+
+        let options = super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            print_logs: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let summary = super::log_diff_summary_from_strs(left, right, &options, &mut output)?;
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(summary.diff_found);
+        assert!(output.contains("Comparison policy: Canonical\n"));
+        assert_eq!(
+            printed_log(&output, 1).as_bytes(),
+            b"INFO detcore: DETLOG stable=1\nINFO unrelated: value=101 address=<addr1>\n"
+        );
+        assert_eq!(
+            printed_log(&output, 2).as_bytes(),
+            b"INFO detcore: DETLOG stable=1\nINFO unrelated: value=202 address=<addr1>\n"
+        );
         Ok(())
     }
 

@@ -714,11 +714,13 @@ mod tests {
             "log-diff",
             "left.log",
             "right.log",
+            "--print-logs",
             "--json",
             "diff.json",
         ])
         .unwrap();
         assert_eq!(two.file_b, Some(PathBuf::from("right.log")));
+        assert!(two.more.print_logs);
         assert_eq!(two.json, Some(PathBuf::from("diff.json")));
     }
 
