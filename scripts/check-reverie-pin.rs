@@ -84,10 +84,13 @@ mod rust_script_prelude;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
+use std::sync::OnceLock;
 
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
 const MAIN_REF: &str = "refs/heads/main";
@@ -438,12 +441,12 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
 /// The cache is reused across invocations and re-fetched every time: a stale
 /// cache would silently answer with an old main, which is the failure mode this
 /// whole change exists to remove.
-fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
+fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
     let cache = root.join("target/ci/reverie-graph.git");
     if !cache.join("HEAD").is_file() {
         fs::create_dir_all(cache.parent().unwrap_or(&cache))
             .map_err(|error| format!("could not create the Reverie graph cache: {error}"))?;
-        let init = Command::new("git")
+        let init = isolated_git_command()?
             .args(["init", "--bare", "--quiet"])
             .arg(&cache)
             .output()
@@ -455,6 +458,7 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
             ));
         }
     }
+    let graph = GuardedGitRepo::open(&cache, root)?;
     // `--filter=blob:none` is a BANDWIDTH optimization, not a correctness
     // requirement: ancestry needs commits, never blobs. It is also not
     // universally supported -- a local-PATH remote rejects it outright
@@ -468,24 +472,21 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
     // poisons any retry. Both were observed -- the promisor poisoning as an
     // intermittent bracket failure. Measured unfiltered: 1.4s / 12 MB, far
     // inside this node's 120s timeout. A gate should buy robustness with that.
-    let fetch = git_in(
-        &cache,
-        &[
-            "fetch",
-            "--no-tags",
-            "--quiet",
-            "--force",
-            remote,
-            "+refs/heads/main:refs/heads/main",
-        ],
-    )?;
+    let fetch = graph.run(&[
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        "--force",
+        remote,
+        "+refs/heads/main:refs/heads/main",
+    ])?;
     if !fetch.status.success() {
         return Err(format!(
             "could not fetch the Reverie commit graph from {remote}: {}",
             String::from_utf8_lossy(&fetch.stderr).trim()
         ));
     }
-    Ok(cache)
+    Ok(graph)
 }
 
 /// Is `ancestor` reachable from `descendant`?
@@ -505,25 +506,25 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
 /// Treating the second as an ERROR would turn a genuine violation into a
 /// checker crash; treating it as "not reachable" is both true and fail-closed.
 /// Anything else is still a real error and is still raised.
-fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+fn is_ancestor(graph: &GuardedGitRepo, ancestor: &str, descendant: &str) -> Result<bool, String> {
     // ABSENT ANCESTOR is a genuine verdict: the graph has main, and the pin is
     // not in it, so the pin is not reachable. ABSENT DESCENDANT is NOT a
     // verdict -- it means the graph we fetched does not even contain main, so
     // we cannot tell, and answering "false" there produces a FALSE REFUSAL.
     // That bug was live: the harness reported "Hermit pin: X / Reverie main: X"
     // -- identical -- while claiming X was not reachable from main.
-    let main_present = git_in(graph, &["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
+    let main_present = graph.run(&["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
     if !main_present.status.success() {
         return Err(format!(
             "the fetched Reverie graph does not contain {descendant}; cannot judge \
              reachability (incomplete fetch, not a pin violation)"
         ));
     }
-    let pin_present = git_in(graph, &["cat-file", "-e", &format!("{ancestor}^{{commit}}")])?;
+    let pin_present = graph.run(&["cat-file", "-e", &format!("{ancestor}^{{commit}}")])?;
     if !pin_present.status.success() {
         return Ok(false);
     }
-    let output = git_in(graph, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    let output = graph.run(&["merge-base", "--is-ancestor", ancestor, descendant])?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -622,7 +623,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     if env::var(ACK_ENV).map(|value| value == "1").unwrap_or(false) {
         return Ok(0); // CASE 3, acknowledged.
     }
-    let behind = git_in(&graph, &["rev-list", "--count", &format!("{candidate}..{main}")])?;
+    let behind = graph.run(&["rev-list", "--count", &format!("{candidate}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     loud_header("REVERIE PIN ADVANCED BELOW THE MAIN TIP - ACKNOWLEDGEMENT");
     eprintln!("Previous pin: {head}");
@@ -641,7 +642,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
 }
 
 fn query_main(remote: &str) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = isolated_git_command()?
         .args(["ls-remote", "--exit-code", remote, MAIN_REF])
         .output()
         .map_err(|error| format!("could not run git ls-remote: {error}"))?;
@@ -660,6 +661,123 @@ fn query_main(remote: &str) -> Result<String, String> {
         return Err(format!("remote returned invalid main SHA {sha:?}"));
     }
     Ok(sha)
+}
+
+/// Git deliberately exports repository-local variables to hooks. `git -C`
+/// does not override them: an inherited `GIT_DIR` still selects that repository
+/// after changing directory. Any command aimed at a different repository must
+/// therefore clear Git's complete, version-specific local environment first.
+fn git_local_env_vars() -> Result<&'static [OsString], String> {
+    static LOCAL_ENV_VARS: OnceLock<Result<Vec<OsString>, String>> = OnceLock::new();
+    let vars = LOCAL_ENV_VARS.get_or_init(|| {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .map_err(|error| format!("could not enumerate Git local environment variables: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git rev-parse --local-env-vars failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let vars: Vec<OsString> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|name| !name.is_empty())
+            .map(OsString::from)
+            .collect();
+        for required in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            if !vars.iter().any(|name| name == required) {
+                return Err(format!(
+                    "git rev-parse --local-env-vars omitted required variable {required}; refusing to run an isolated Git command"
+                ));
+            }
+        }
+        Ok(vars)
+    });
+    match vars {
+        Ok(vars) => Ok(vars),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn clear_git_local_env(command: &mut Command) -> Result<(), String> {
+    for name in git_local_env_vars()? {
+        command.env_remove(name);
+    }
+    Ok(())
+}
+
+fn isolated_git_command() -> Result<Command, String> {
+    let mut command = Command::new("git");
+    clear_git_local_env(&mut command)?;
+    Ok(command)
+}
+
+fn isolated_git_in(dir: &Path, args: &[&str]) -> Result<Output, String> {
+    isolated_git_command()?
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+}
+
+fn canonical_git_path(repo: &Path, selector: &str) -> Result<PathBuf, String> {
+    let output = isolated_git_in(repo, &["rev-parse", selector])?;
+    if !output.status.success() {
+        return Err(format!(
+            "git -C {} rev-parse {selector} failed: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let path = if reported.is_absolute() {
+        reported
+    } else {
+        repo.join(reported)
+    };
+    fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "could not canonicalize Git path {} reported for {}: {error}",
+            path.display(),
+            repo.display()
+        )
+    })
+}
+
+/// A bare repository proven distinct from the product repository. Keeping the
+/// validated git-dir in this type makes every later graph query use the same
+/// isolated command path instead of relying on each caller to remember it.
+#[derive(Debug)]
+struct GuardedGitRepo {
+    git_dir: PathBuf,
+}
+
+impl GuardedGitRepo {
+    fn open(cache: &Path, product_root: &Path) -> Result<Self, String> {
+        let cache_git_dir = canonical_git_path(cache, "--git-dir")?;
+        let product_common_dir = canonical_git_path(product_root, "--git-common-dir")?;
+        if cache_git_dir == product_common_dir {
+            return Err(format!(
+                "REFUSING Reverie graph cache: cache git-dir {} resolves to the Hermit common git-dir {}",
+                cache_git_dir.display(),
+                product_common_dir.display()
+            ));
+        }
+        Ok(Self {
+            git_dir: cache_git_dir,
+        })
+    }
+
+    fn run(&self, args: &[&str]) -> Result<Output, String> {
+        isolated_git_command()?
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+    }
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -1440,7 +1558,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         }
     }
 
-    let behind = git_in(&graph, &["rev-list", "--count", &format!("{pin}..{main}")])?;
+    let behind = graph.run(&["rev-list", "--count", &format!("{pin}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     if pin == main {
         println!(
@@ -1793,6 +1911,212 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    #[test]
+    fn isolated_commands_clear_every_git_local_environment_variable() {
+        let vars = git_local_env_vars().expect("enumerate Git local environment");
+        let mut command = Command::new("env");
+        for name in vars {
+            command.env(name, "poisoned-by-parent-git-process");
+        }
+        clear_git_local_env(&mut command).expect("clear Git local environment");
+        let output = command.output().expect("print child environment");
+        assert!(output.status.success());
+        let child_env = String::from_utf8_lossy(&output.stdout);
+        for name in vars {
+            let assignment = format!("{}=", name.to_string_lossy());
+            assert!(
+                !child_env.lines().any(|line| line.starts_with(&assignment)),
+                "isolated command retained {assignment}"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_git_dir_imports_foreign_main_but_cleared_fetch_is_safe() {
+        let root = temp_path("git-env-victim");
+        let remote = temp_path("git-env-foreign");
+        let cache = root.join("target/ci/raw-cache.git");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+
+        let victim_main = commit_file(&root, "victim", "Hermit\n");
+        assert!(
+            git_in(&root, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let foreign_main = commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::create_dir_all(&cache).expect("create raw cache directory");
+
+        // This is the exact incident shape. `-C cache` changes directory, but
+        // inherited GIT_DIR still selects the product repository. core.bare
+        // removes Git's checked-out-branch refusal, so the foreign main lands
+        // in the product repository.
+        assert!(
+            git_in(&root, &["config", "core.bare", "true"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let victim_git_dir = root.join(".git");
+        let vulnerable = Command::new("git")
+            .env("GIT_DIR", &victim_git_dir)
+            .arg("-C")
+            .arg(&cache)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--force",
+                remote.to_str().expect("UTF-8 fixture path"),
+                "+refs/heads/main:refs/heads/main",
+            ])
+            .output()
+            .expect("run vulnerable fetch");
+        assert!(
+            vulnerable.status.success(),
+            "the regression bracket must reproduce the import: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        let imported = Command::new("git")
+            .arg("--git-dir")
+            .arg(&victim_git_dir)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .expect("read imported main");
+        assert_eq!(
+            String::from_utf8_lossy(&imported.stdout).trim(),
+            foreign_main,
+            "the raw command must demonstrate the foreign-ref import"
+        );
+
+        // Restore only the disposable fixture, then run the same fetch after
+        // applying the production environment isolation. The foreign ref must
+        // land in the cache and the product main must remain unchanged.
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&victim_git_dir)
+                .args(["update-ref", "refs/heads/main", &victim_main])
+                .status()
+                .expect("restore fixture main")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&victim_git_dir)
+                .args(["config", "core.bare", "false"])
+                .status()
+                .expect("restore fixture core.bare")
+                .success()
+        );
+        let init = isolated_git_command()
+            .expect("build isolated init")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .output()
+            .expect("initialize cache");
+        assert!(init.status.success());
+
+        let mut safe = Command::new("git");
+        safe.env("GIT_DIR", &victim_git_dir);
+        clear_git_local_env(&mut safe).expect("isolate cache fetch");
+        let safe_fetch = safe
+            .arg("--git-dir")
+            .arg(&cache)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--force",
+                remote.to_str().expect("UTF-8 fixture path"),
+                "+refs/heads/main:refs/heads/main",
+            ])
+            .output()
+            .expect("run isolated fetch");
+        assert!(safe_fetch.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&root, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            victim_main,
+            "isolated cache fetch must not move product main"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &isolated_git_in(&cache, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            foreign_main,
+            "isolated fetch must still update the intended cache"
+        );
+
+        fs::remove_dir_all(root).expect("remove victim fixture");
+        fs::remove_dir_all(remote).expect("remove foreign fixture");
+    }
+
+    #[test]
+    fn reverie_graph_refuses_cache_that_resolves_to_product_common_git_dir() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("same-gitdir-victim");
+        let remote = temp_path("same-gitdir-foreign");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        let victim_main = commit_file(&root, "victim", "Hermit\n");
+        assert!(
+            git_in(&root, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let cache = root.join("target/ci/reverie-graph.git");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        symlink(root.join(".git"), &cache).expect("point cache at product git-dir");
+
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+            .expect_err("cache resolving to product common git-dir must be refused");
+        assert!(
+            error.contains("REFUSING Reverie graph cache")
+                && error.contains("resolves to the Hermit common git-dir"),
+            "refusal must identify the violated identity guard: {error}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&root, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            victim_main,
+            "the refusal must fire before any foreign ref update"
+        );
+
+        fs::remove_dir_all(root).expect("remove victim fixture");
+        fs::remove_dir_all(remote).expect("remove foreign fixture");
     }
 
     /// NEGATIVE SIDE: plant a checkout that is strictly behind `origin/main`
