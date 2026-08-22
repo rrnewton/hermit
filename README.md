@@ -269,9 +269,39 @@ dapper debug --control-port 4711 stack-trace 1
 dapper debug --control-port 4711 step over 1
 ```
 
-The same adapter command can be used by an editor or another DAP client. The
-adapter reports GDB's capabilities; reverse execution is not advertised by
-Hermit's GDB server yet.
+The same adapter command can be used by an editor or another DAP client. To
+enable reverse execution for a recording, let the adapter manage the replay by
+adding the recording arguments to `spawnConfig`:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap",
+    "args": [
+      "--replay", "RECORDING_ID",
+      "--data-dir", "/path/to/recordings",
+      "--gdbserver-port", "1234"
+    ]
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  }
+}
+```
+
+In this mode the adapter advertises `supportsStepBack` and implements DAP
+`stepBack` and `reverseContinue` by restarting the deterministic replay and
+running forward to the requested earlier source position. This first
+implementation favors correctness over speed.
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap-replay.json
+dapper debug --control-port 4711 step back 1
+dapper debug --control-port 4711 reverse-continue 1
+```
 
 ### Chaos Mode Demonstration
 
