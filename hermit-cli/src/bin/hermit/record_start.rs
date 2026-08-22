@@ -40,6 +40,7 @@ use super::container::IdentityGuard;
 use super::container::RunGuarded;
 use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
+use super::record_envelope::RecordEnvelope;
 use super::run::is_elf_file;
 use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
@@ -217,7 +218,8 @@ pub struct StartOpts {
     /// this path: `{"verified":bool,"bitwise_parity":bool,
     /// "verdict":"matched"|"diverged","comparison":{"strictness":
     /// "stripped"|"canonical","compare_logs":bool,"log_scope":
-    /// "deterministic"|"info"|"full_trace","strip_lines":bool,
+    /// "deterministic"|"info"|"full_trace","record_envelope":
+    /// "all_records_v1","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
@@ -229,9 +231,10 @@ pub struct StartOpts {
     /// not) infer the verdict from the process exit code. A record/replay parity
     /// ratchet must key on `bitwise_parity`, NOT `verified`: `bitwise_parity` is
     /// true only under the `canonical` (`BitwiseInfoV1`) policy — a full-INFO
-    /// comparison that strips only the real wall-clock prefix, canonicalizes host
-    /// addresses to first-appearance ordinals, and compares everything else
-    /// exactly (see --verify-strict) — rather than a stripped match.
+    /// comparison inside a named canonical record envelope that strips only the
+    /// real wall-clock prefix, canonicalizes host addresses to first-appearance
+    /// ordinals, and compares everything else exactly (see --verify-strict) —
+    /// rather than a stripped or opaque filtered match.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
 
@@ -516,6 +519,7 @@ impl StartOpts {
                 // a replay verdict here is not a content-parity claim either.
                 compare_io_buffers: false,
                 keep_logs: false,
+                record_envelope: RecordEnvelope::all_records_v1(),
             },
         )?;
 

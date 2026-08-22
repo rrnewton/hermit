@@ -39,7 +39,11 @@ pub struct LogDiffOptions {
 
 impl LogDiffOptions {
     fn into_args(self) -> Vec<String> {
-        let mut result = Vec::new();
+        // hermit-verify compares ordinary Hermit logs. Name the all-records
+        // envelope explicitly instead of relying on the standalone command's
+        // default, so this product callsite remains auditable if that default
+        // ever changes.
+        let mut result = vec!["--record-envelope=all-records-v1".to_owned()];
         if self.skip_detlog_others && self.skip_detlog_syscalls && self.skip_detlog_syscall_results
         {
             result.push("--skip-detlog".to_owned());
@@ -258,6 +262,20 @@ mod test {
         assert_eq!(
             args.into_iter().any(|x| x.contains("--ignore-lines")),
             false
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_diff_command_names_its_record_envelope() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new(PathBuf::from("hermit"));
+        let args =
+            verify.build_command_args(&env.runs()[0], &env.runs()[1], LogDiffOptions::default());
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--record-envelope=all-records-v1")
         );
         Ok(())
     }

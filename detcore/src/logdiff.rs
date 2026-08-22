@@ -401,8 +401,21 @@ fn messages_for_comparison(messages: &[(usize, &str)], policy: LogComparisonPoli
     }
 }
 
+#[cfg(test)]
 fn canonical_info_from_str(contents: &str) -> Vec<String> {
-    let info = filter_infos(&extract_log_messages(contents));
+    canonical_info_from_str_with_filter(contents, |_| true)
+}
+
+fn canonical_info_from_str_with_filter(
+    contents: &str,
+    keep_record: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let info = filter_infos(
+        &extract_log_messages(contents)
+            .into_iter()
+            .filter(|(_, record)| keep_record(record))
+            .collect::<Vec<_>>(),
+    );
     let opts = LogDiffOpts {
         canonicalize_addresses: true,
         comparison: LogComparisonMode::Info,
@@ -419,9 +432,24 @@ fn canonical_info_from_str(contents: &str) -> Vec<String> {
 /// `--unsafe-strip-lines` transformation: scheduler turns, virtual time, syscall
 /// values, counts, flags, and every other substantive byte are preserved.
 pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
+    write_canonical_info_with_filter(file, writer, |_| true)
+}
+
+/// Print canonical INFO messages after applying a caller-supplied record filter.
+///
+/// Every record is parsed and its level tag validated before `keep_record` is
+/// consulted. Existing callers should use [`write_canonical_info`]; backend
+/// adapters use this form to exclude transport-only records at their boundary.
+/// This low-level hook does not name the predicate, so any product verdict or
+/// JSON report using it must bind the function to a typed, serialized policy.
+pub fn write_canonical_info_with_filter(
+    file: &Path,
+    writer: &mut impl Write,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<usize> {
     let bytes = std::fs::read(file)?;
     let contents = String::from_utf8_lossy(&bytes);
-    let messages = canonical_info_from_str(&contents);
+    let messages = canonical_info_from_str_with_filter(&contents, keep_record);
     for message in &messages {
         writeln!(writer, "{message}")?;
     }
@@ -487,56 +515,12 @@ fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
             } else {
                 (i, s)
             }
-        })
-        // Drop the evidence transport's own self-description here, at the one
-        // point that defines what any comparison can see. Doing it here rather
-        // than per-caller is what keeps `write_canonical_info` -- which promises
-        // to print "the canonical INFO messages that strict verification would
-        // compare" -- true by construction instead of by two filters agreeing.
-        // The tag check above still runs on these records first, so a malformed
-        // one is still a hard error rather than something quietly skipped.
-        .filter(|(_, s)| !is_evidence_transport_self_record(s));
+        });
     iter.collect()
 }
 
 fn is_info(line: &str) -> bool {
     line.starts_with("INFO ")
-}
-
-/// A record the DBT evidence transport emits ABOUT ITSELF, rather than about
-/// the run it is carrying.
-///
-/// The transport announces its own startup ("protected evidence initialized")
-/// into the very stream whose records are the evidence, so that line arrives
-/// looking exactly like a compared record. It is not one: it says the
-/// apparatus came up, and says nothing about the guest. Excluding it is what
-/// keeps the compared counts meaning *"records of the run"*, which is what
-/// every consumer of [`LogDiffSummary::matched_with_evidence`] and of
-/// `compared_log_messages` already assumes they mean.
-///
-/// Measured consequence of NOT excluding it: two runs whose logs contained
-/// only this one line compared 1 | 1 with no difference, so
-/// `matched_with_evidence()` returned true and the canonical admission
-/// predicate (`counts.left > 0 && counts.right > 0`) admitted a bitwise-parity
-/// green established by the evidence system announcing itself.
-///
-/// Keyed on the record's tracing TARGET, not on the message text: every record
-/// this target carries is the transport describing itself or its own test
-/// hooks (`reverie-dbt/native/client.c`), and a text match would silently stop
-/// working the next time one of those strings is reworded.
-///
-/// This is deliberately NARROW. It does not exclude other non-guest records
-/// (a canonical ptrace comparison of `tests/c/getpid.c` measured 108 of 110
-/// INFO records under `detcore*` targets, plus one `reverie_ptrace::task` and
-/// one `hermit::backend_stats`). Whether those belong in the compared set is a
-/// separate question about what the comparison is for; excluding them here
-/// would change every existing green cell, which this does not.
-fn is_evidence_transport_self_record(line: &str) -> bool {
-    static PREFIX: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) +reverie_dbt::evidence:").unwrap()
-    });
-
-    PREFIX.is_match(line)
 }
 
 fn is_commit(line: &str) -> bool {
@@ -1122,6 +1106,22 @@ pub fn try_log_diff_detailed(
     file_b: &Path,
     opts: &LogDiffOpts,
 ) -> std::io::Result<LogDiffSummary> {
+    try_log_diff_detailed_with_filter(file_a, file_b, opts, |_| true)
+}
+
+/// Fallible log comparison with a caller-supplied record filter.
+///
+/// Existing callers keep the unfiltered behavior through
+/// [`try_log_diff_detailed`]. Backend adapters use this form to apply policy
+/// without placing backend names or semantics in Detcore. This low-level hook
+/// does not name the predicate, so any product verdict or JSON report using it
+/// must bind the function to a typed, serialized policy.
+pub fn try_log_diff_detailed_with_filter(
+    file_a: &Path,
+    file_b: &Path,
+    opts: &LogDiffOpts,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<LogDiffSummary> {
     // For now the log-diff mode reads both logs fully into memory. This could be
     // modified in the future for a streaming solution, at least for scrolling through
     // the identical prefixes of very large logs.
@@ -1129,7 +1129,7 @@ pub fn try_log_diff_detailed(
     let vec_b = std::fs::read(file_b)?;
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
-    log_diff_summary_from_strs(str_a, str_b, opts, &mut std::io::stderr())
+    log_diff_summary_from_strs_with_filter(str_a, str_b, opts, &mut std::io::stderr(), keep_record)
 }
 
 /// Total records in a log, including a final record that may still be being
@@ -1146,13 +1146,31 @@ pub fn try_log_diff_with_records(
     file_b: &Path,
     opts: &LogDiffOpts,
 ) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    try_log_diff_with_records_and_filter(file_a, file_b, opts, |_| true)
+}
+
+/// Compare two logs with a caller-supplied record filter and report source counts.
+/// Product callers must bind the predicate to a typed, serialized policy; this
+/// backend-neutral layer intentionally carries no backend policy identity.
+pub fn try_log_diff_with_records_and_filter(
+    file_a: &Path,
+    file_b: &Path,
+    opts: &LogDiffOpts,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
     let vec_a = std::fs::read(file_a)?;
     let vec_b = std::fs::read(file_b)?;
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
     let records_a = record_count(&str_a);
     let records_b = record_count(&str_b);
-    let summary = log_diff_summary_from_strs(&str_a, &str_b, opts, &mut std::io::stderr())?;
+    let summary = log_diff_summary_from_strs_with_filter(
+        &str_a,
+        &str_b,
+        opts,
+        &mut std::io::stderr(),
+        keep_record,
+    )?;
     Ok((summary, records_a, records_b))
 }
 
@@ -1195,6 +1213,19 @@ pub fn compare_complete_prefix(
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<PrefixComparison> {
+    compare_complete_prefix_with_filter(contents_a, contents_b, opts, w, |_| true)
+}
+
+/// Compare the complete common prefix after applying a caller-supplied record filter.
+/// Product callers must bind the predicate to a typed, serialized policy; this
+/// backend-neutral layer intentionally carries no backend policy identity.
+pub fn compare_complete_prefix_with_filter(
+    contents_a: &str,
+    contents_b: &str,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<PrefixComparison> {
     let records_available_left = complete_record_count(contents_a);
     let records_available_right = complete_record_count(contents_b);
     let records_compared = records_available_left.min(records_available_right);
@@ -1203,7 +1234,7 @@ pub fn compare_complete_prefix(
         .expect("common prefix never exceeds either side's complete record count");
     let prefix_b = take_complete_records(contents_b, records_compared)
         .expect("common prefix never exceeds either side's complete record count");
-    let summary = log_diff_summary_from_strs(prefix_a, prefix_b, opts, w)?;
+    let summary = log_diff_summary_from_strs_with_filter(prefix_a, prefix_b, opts, w, keep_record)?;
     Ok(PrefixComparison {
         summary,
         records_available_left,
@@ -1224,18 +1255,42 @@ fn log_diff_from_strs(
     Ok(log_diff_summary_from_strs(file_a_str, file_b_str, opts, w)?.diff_found)
 }
 
+#[cfg(test)]
 fn log_diff_summary_from_strs(
     file_a_str: impl AsRef<str>,
     file_b_str: impl AsRef<str>,
     opts: &LogDiffOpts,
     w: &mut impl std::io::Write,
 ) -> std::io::Result<LogDiffSummary> {
+    log_diff_summary_from_strs_with_filter(file_a_str, file_b_str, opts, w, |_| true)
+}
+
+/// Compare two in-memory logs after applying a caller-supplied record filter.
+///
+/// Every record is parsed and its level tag validated before `keep_record` is
+/// consulted, so filtering cannot turn malformed input into a successful
+/// comparison. Backend-specific transport policy belongs in the backend adapter;
+/// this function supplies only the abstract comparison hook. Product verdicts
+/// using it must serialize the typed policy bound to this predicate.
+pub fn log_diff_summary_from_strs_with_filter(
+    file_a_str: impl AsRef<str>,
+    file_b_str: impl AsRef<str>,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<LogDiffSummary> {
     let all_a = filter_ignored(
-        extract_log_messages(file_a_str.as_ref()),
+        extract_log_messages(file_a_str.as_ref())
+            .into_iter()
+            .filter(|(_, record)| keep_record(record))
+            .collect(),
         &opts.ignore_lines,
     );
     let all_b = filter_ignored(
-        extract_log_messages(file_b_str.as_ref()),
+        extract_log_messages(file_b_str.as_ref())
+            .into_iter()
+            .filter(|(_, record)| keep_record(record))
+            .collect(),
         &opts.ignore_lines,
     );
 
@@ -2982,143 +3037,6 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
                 "INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling."
             )]),
             1
-        );
-    }
-
-    /// The exact record the DBT evidence transport emits about itself, copied
-    /// from `reverie-dbt/native/client.c` rather than reconstructed.
-    const EVIDENCE_TRANSPORT_SELF_RECORD: &str =
-        "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
-
-    /// One ordinary record of a run, for the "still admitted" direction.
-    const ONE_REAL_RECORD: &str = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #1: getpid() = Ok(3)";
-
-    fn canonical_info_opts() -> super::LogDiffOpts {
-        super::LogDiffOpts {
-            comparison: super::LogComparisonMode::Info,
-            canonicalize_addresses: true,
-            no_color: true,
-            ..Default::default()
-        }
-    }
-
-    /// REFUSED DIRECTION. Two runs whose canonical INFO stream contains only the
-    /// evidence transport announcing itself have compared NOTHING about the
-    /// guest, so the comparison must report an empty selection -- which is what
-    /// makes every downstream consumer refuse it.
-    ///
-    /// Before the exclusion this measured `compared 1 | 1`, `diff_found=false`,
-    /// `matched_with_evidence()==true`, and the canonical admission predicate
-    /// (`counts.left > 0 && counts.right > 0`) admitted it as a bitwise-parity
-    /// green. The green was established by the apparatus saying it had started.
-    #[test]
-    fn a_comparison_of_only_the_transports_own_record_has_no_evidence() -> std::io::Result<()> {
-        let summary = super::log_diff_summary_from_strs(
-            EVIDENCE_TRANSPORT_SELF_RECORD,
-            EVIDENCE_TRANSPORT_SELF_RECORD,
-            &canonical_info_opts(),
-            &mut Vec::new(),
-        )?;
-        assert_eq!(
-            (summary.compared_left, summary.compared_right),
-            (0, 0),
-            "the transport's own record must not count as a compared record"
-        );
-        assert!(
-            !summary.matched_with_evidence(),
-            "an empty selection is a no-result, never a match"
-        );
-        Ok(())
-    }
-
-    /// ADMITTED DIRECTION, and it is the one that stops this fix from becoming
-    /// the same defect with the sign flipped. A comparison can be as small as a
-    /// SINGLE real record and is still a real comparison. No floor is imposed,
-    /// because no floor could be justified: the assertion is "at least one
-    /// record OF THE RUN was compared", not "enough records were compared".
-    #[test]
-    fn a_single_genuine_record_is_still_a_comparison_with_evidence() -> std::io::Result<()> {
-        let summary = super::log_diff_summary_from_strs(
-            ONE_REAL_RECORD,
-            ONE_REAL_RECORD,
-            &canonical_info_opts(),
-            &mut Vec::new(),
-        )?;
-        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
-        assert!(
-            summary.matched_with_evidence(),
-            "one genuine compared record is a real comparison and must still admit"
-        );
-        Ok(())
-    }
-
-    /// The transport's record is dropped from a stream that also carries real
-    /// ones, leaving the genuine records compared and the count honest. This is
-    /// the shape a real DBT run produces once its records flow.
-    #[test]
-    fn the_transports_own_record_is_dropped_from_a_stream_that_also_carries_real_ones()
-    -> std::io::Result<()> {
-        let mixed = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
-        let summary = super::log_diff_summary_from_strs(
-            &mixed,
-            &mixed,
-            &canonical_info_opts(),
-            &mut Vec::new(),
-        )?;
-        assert_eq!(
-            (summary.compared_left, summary.compared_right),
-            (1, 1),
-            "only the genuine record counts, so the count is one and not two"
-        );
-        assert!(summary.matched_with_evidence());
-        Ok(())
-    }
-
-    /// A difference confined to the transport's own records is not a divergence
-    /// of the run. Excluding those records from the COUNT but leaving them in
-    /// the compared text would report a product divergence for a difference in
-    /// the apparatus, so the exclusion applies to both.
-    #[test]
-    fn a_difference_only_in_the_transports_own_records_is_not_a_divergence() -> std::io::Result<()>
-    {
-        let with_transport = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
-        let summary = super::log_diff_summary_from_strs(
-            &with_transport,
-            ONE_REAL_RECORD,
-            &canonical_info_opts(),
-            &mut Vec::new(),
-        )?;
-        assert!(
-            !summary.diff_found,
-            "a difference confined to the apparatus's own records is not a product divergence"
-        );
-        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
-        Ok(())
-    }
-
-    /// The exclusion is keyed on the tracing target, so it covers every record
-    /// that target carries -- not just the startup wording that was measured.
-    /// It must NOT catch a real record that merely mentions the transport.
-    #[test]
-    fn the_exclusion_is_keyed_on_the_target_not_on_one_message() {
-        assert!(super::is_evidence_transport_self_record(
-            "INFO reverie_dbt::evidence: protected evidence initialized"
-        ));
-        assert!(super::is_evidence_transport_self_record(
-            "INFO reverie_dbt::evidence: explicit SYS_exit thread callback completed"
-        ));
-        assert!(super::is_evidence_transport_self_record(
-            "WARN  reverie_dbt::evidence: direct entry must be refused"
-        ));
-        assert!(
-            !super::is_evidence_transport_self_record(
-                "INFO detcore: DETLOG protected evidence initialized"
-            ),
-            "a genuine detcore record must not be dropped for mentioning the transport"
-        );
-        assert!(
-            !super::is_evidence_transport_self_record("INFO reverie_dbt::launcher: starting"),
-            "only the evidence transport's own target is excluded"
         );
     }
 }

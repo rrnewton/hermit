@@ -76,6 +76,7 @@ fn canonical_info_from_standalone_log_diff(log: &str) -> String {
     // an offline inspection step, not KVM's output/status-only built-in verify.
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .arg("log-diff")
+        .arg("--record-envelope=all-records-v1")
         .arg(&log_path)
         .env_remove("HERMIT_LOG")
         .env_remove("HERMIT_LOG_FILE")

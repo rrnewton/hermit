@@ -21,6 +21,29 @@ pub struct VerificationReport {
 pub struct ComparisonReport {
     pub strictness: String,
     pub compare_logs: bool,
+    pub record_envelope: RecordEnvelopeReport,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordEnvelopeReport {
+    AllRecordsV1,
+    DbtEvidenceTransportV1,
+    CallerDefined,
+}
+
+impl RecordEnvelopeReport {
+    fn is_canonical(self) -> bool {
+        matches!(self, Self::AllRecordsV1 | Self::DbtEvidenceTransportV1)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllRecordsV1 => "all_records_v1",
+            Self::DbtEvidenceTransportV1 => "dbt_evidence_transport_v1",
+            Self::CallerDefined => "caller_defined",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -92,14 +115,16 @@ impl VerificationReport {
         };
         if comparison.strictness == "canonical"
             && comparison.compare_logs
+            && comparison.record_envelope.is_canonical()
             && counts.is_some_and(|counts| counts.left > 0 && counts.right > 0)
         {
             Ok(())
         } else {
             Err(format!(
-                "verification did not compare canonical non-vacuous INFO evidence: strictness={} compare_logs={} messages={}/{}",
+                "verification did not compare canonical non-vacuous INFO evidence: strictness={} compare_logs={} record_envelope={} messages={}/{}",
                 comparison.strictness,
                 comparison.compare_logs,
+                comparison.record_envelope.as_str(),
                 counts.map_or(0, |counts| counts.left),
                 counts.map_or(0, |counts| counts.right),
             ))
@@ -134,6 +159,7 @@ mod tests {
             comparison: Some(ComparisonReport {
                 strictness: strictness.into(),
                 compare_logs,
+                record_envelope: RecordEnvelopeReport::AllRecordsV1,
             }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
         }
@@ -170,6 +196,9 @@ mod tests {
                 .require_canonical_match()
                 .is_err()
         );
+        let mut weak = report("canonical", true, 1, 1);
+        weak.comparison.as_mut().unwrap().record_envelope = RecordEnvelopeReport::CallerDefined;
+        assert!(weak.require_canonical_match().is_err());
     }
 
     /// The exact bytes hermit writes for a run that reached no verdict, copied
@@ -231,9 +260,34 @@ mod tests {
         assert!(VerificationReport::from_json_slice(malformed.as_bytes()).is_err());
         let missing_field = REAL_NO_RESULT_REPORT.replace(
             r#""comparison":null"#,
-            r#""comparison":{"compare_logs":true}"#,
+            r#""comparison":{"compare_logs":true,"record_envelope":"all_records_v1"}"#,
         );
         assert!(VerificationReport::from_json_slice(missing_field.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn comparison_record_envelope_is_required_and_unknown_values_are_refused() {
+        let missing = serde_json::json!({
+            "verified": true,
+            "bitwise_parity": true,
+            "verdict": "matched",
+            "comparison": {"strictness": "canonical", "compare_logs": true},
+            "compared_log_messages": {"left": 1, "right": 1}
+        });
+        assert!(VerificationReport::from_json_value(missing).is_err());
+
+        let unknown = serde_json::json!({
+            "verified": true,
+            "bitwise_parity": true,
+            "verdict": "matched",
+            "comparison": {
+                "strictness": "canonical",
+                "compare_logs": true,
+                "record_envelope": "unknown_v9"
+            },
+            "compared_log_messages": {"left": 1, "right": 1}
+        });
+        assert!(VerificationReport::from_json_value(unknown).is_err());
     }
 
     #[test]
