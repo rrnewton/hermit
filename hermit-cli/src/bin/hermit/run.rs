@@ -1207,9 +1207,33 @@ fn display_runopts4() {
 
 #[test]
 fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+    // Owner directive #71: fail-closed is now the DEFAULT, so a plain run has it ON.
     let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     normal.validate_args_with_perf_support(true).unwrap();
-    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
+
+    // ... and the opt-out is the only way to turn it off.
+    let mut opted_out =
+        RunOpts::parse_from(["fakehermit", "--no-panic-on-unsupported-syscalls", "fakeprog"]);
+    opted_out.validate_args_with_perf_support(true).unwrap();
+    assert!(!opted_out.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert!(!opted_out.det_opts.det_config.shutdown_on_unsupported_syscall);
+
+    // --strict REFUSES the opt-out rather than silently overriding it.
+    let mut conflict = RunOpts::parse_from(
+        ["fakehermit", "--strict", "--no-panic-on-unsupported-syscalls", "fakeprog"]);
+    assert!(conflict.validate_args_with_perf_support(true).is_err());
+
+    // --passthru-opt is permissive by nature: it implies the opt-out instead of bailing,
+    // which the old default made impossible to hit.
+    let mut passthru = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+    passthru.validate_args_with_perf_support(true).unwrap();
+    assert!(!passthru.det_opts.det_config.panic_on_unsupported_syscalls);
+
+    // ... but combined with an EXPLICIT request it is still a hard conflict.
+    let mut passthru_explicit = RunOpts::parse_from(
+        ["fakehermit", "--passthru-opt", "--panic-on-unsupported-syscalls", "fakeprog"]);
+    assert!(passthru_explicit.validate_args_with_perf_support(true).is_err());
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     strict.validate_args_with_perf_support(true).unwrap();
@@ -1218,10 +1242,8 @@ fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls
     assert!(strict.det_opts.det_config.deterministic_io);
     assert!(!strict.det_opts.det_config.passthru_opt);
     assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
-    assert_eq!(
-        format!("{}", strict),
-        " --panic-on-unsupported-syscalls -- fakeprog"
-    );
+    // Display now renders the OPT-OUT (the non-default), not the opt-in.
+    assert_eq!(format!("{}", strict), " -- fakeprog");
 }
 
 #[test]
@@ -2275,14 +2297,30 @@ impl RunOpts {
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
-        if self.strict {
-            config.panic_on_unsupported_syscalls = true;
-        }
-        if config.passthru_opt && config.panic_on_unsupported_syscalls {
+        // Fail-closed on unsupported syscalls is the DEFAULT (owner directive #71).
+        // Opting out is explicit; --strict additionally REFUSES the opt-out rather than
+        // silently overriding it, so a strict run can never be quietly permissive.
+        let explicit_fail_closed = self.strict || config.panic_on_unsupported_syscalls;
+        if self.strict && config.no_panic_on_unsupported_syscalls {
             anyhow::bail!(
-                "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
-                 (--strict or --panic-on-unsupported-syscalls)"
+                "--strict cannot be combined with --no-panic-on-unsupported-syscalls: strict \
+                 mode requires fail-closed unsupported-syscall handling"
             );
+        }
+        config.panic_on_unsupported_syscalls = !config.no_panic_on_unsupported_syscalls;
+        if config.passthru_opt {
+            // --passthru-opt is inherently permissive. Before fail-closed became the
+            // default this pair could only arise from an explicit request, so bailing was
+            // right. Now the default alone would make EVERY --passthru-opt run bail, so
+            // only an EXPLICIT fail-closed request is still a conflict; otherwise
+            // --passthru-opt implies the opt-out.
+            if explicit_fail_closed {
+                anyhow::bail!(
+                    "--passthru-opt cannot be combined with fail-closed unsupported-syscall \
+                     handling (--strict or --panic-on-unsupported-syscalls)"
+                );
+            }
+            config.panic_on_unsupported_syscalls = false;
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
 

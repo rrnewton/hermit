@@ -327,9 +327,20 @@ pub struct Config {
     pub deterministic_io: bool,
 
     /// Fail immediately on unsupported syscalls instead of forwarding them.
-    /// Explicit strict mode enables this policy.
+    /// This is the DEFAULT (owner directive #71): silently forwarding an unsupported
+    /// syscall produces a "passing" run whose determinism was never verified, which is
+    /// exactly the fail-quietly pattern being eliminated. Retained as an explicit opt-in
+    /// so existing invocations and `--strict` keep working unchanged.
     #[clap(long)]
     pub panic_on_unsupported_syscalls: bool,
+
+    /// Opt OUT of the default fail-closed unsupported-syscall handling, forwarding them
+    /// instead. This makes the run's determinism UNVERIFIED for any syscall Hermit does
+    /// not model -- use it only to triage what a program needs, never to make a run pass.
+    /// Rejected together with `--strict`, which requires fail-closed.
+    #[serde(default)]
+    #[clap(long, conflicts_with = "panic_on_unsupported_syscalls")]
+    pub no_panic_on_unsupported_syscalls: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-644): Review backend-safe fail-closed termination.
@@ -833,8 +844,10 @@ impl fmt::Display for Config {
         if self.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
         }
-        if self.panic_on_unsupported_syscalls {
-            write!(f, " --panic-on-unsupported-syscalls")?;
+        // Fail-closed is the default, so the round-trippable token is the OPT-OUT.
+        // Printing the opt-in here would append it to every rendered command line.
+        if self.no_panic_on_unsupported_syscalls {
+            write!(f, " --no-panic-on-unsupported-syscalls")?;
         }
         if self.panic_on_rcb_overshoot {
             write!(f, " --panic-on-rbc-overshoot")?;
