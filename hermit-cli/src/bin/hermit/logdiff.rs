@@ -20,6 +20,49 @@ use tempfile::NamedTempFile;
 
 use super::global_opts::GlobalOpts;
 
+/// Return whether a parsed DBT evidence record describes the guest rather than
+/// the evidence transport itself.
+///
+/// `hermit log-diff` must classify archived DBT logs even when this binary was
+/// built without the optional DBT runtime, so this policy belongs in the CLI
+/// layer and is deliberately independent of the `dbt` Cargo feature.
+pub(super) fn keep_dbt_evidence_record(record: &str) -> bool {
+    let Some((level, body)) = record.split_once(' ') else {
+        return true;
+    };
+    !matches!(level, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
+        || !body
+            .trim_start_matches(' ')
+            .starts_with("reverie_dbt::evidence:")
+}
+
+fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
+    logdiff::write_canonical_info_with_filter(file, writer, keep_dbt_evidence_record)
+}
+
+fn try_log_diff_with_records(
+    left: &Path,
+    right: &Path,
+    options: &logdiff::LogDiffOpts,
+) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize)> {
+    logdiff::try_log_diff_with_records_and_filter(left, right, options, keep_dbt_evidence_record)
+}
+
+fn compare_complete_prefix(
+    left: &str,
+    right: &str,
+    options: &logdiff::LogDiffOpts,
+    writer: &mut impl Write,
+) -> std::io::Result<logdiff::PrefixComparison> {
+    logdiff::compare_complete_prefix_with_filter(
+        left,
+        right,
+        options,
+        writer,
+        keep_dbt_evidence_record,
+    )
+}
+
 /// Command-line options for the "logdiff" subcommand.
 #[derive(Debug, Parser)]
 pub struct LogDiffCLIOpts {
@@ -105,8 +148,7 @@ impl LogDiffCLIOpts {
                 );
                 return ExitStatus::Exited(2);
             }
-            return match logdiff::write_canonical_info(&self.file_a, &mut std::io::stdout().lock())
-            {
+            return match write_canonical_info(&self.file_a, &mut std::io::stdout().lock()) {
                 Ok(0) => {
                     eprintln!(
                         "hermit log-diff: {} contains no comparable INFO messages",
@@ -150,7 +192,7 @@ impl LogDiffCLIOpts {
         }
 
         let (summary, records_left, records_right) =
-            match logdiff::try_log_diff_with_records(&self.file_a, file_b, &options) {
+            match try_log_diff_with_records(&self.file_a, file_b, &options) {
                 Ok(result) => result,
                 Err(error) => {
                     eprintln!(
@@ -222,14 +264,14 @@ impl LogDiffCLIOpts {
             // Buffer the comparison transcript: printing it on every poll would
             // bury the one line that matters.
             let mut transcript = Vec::new();
-            let comparison =
-                match logdiff::compare_complete_prefix(&left, &right, options, &mut transcript) {
-                    Ok(comparison) => comparison,
-                    Err(error) => {
-                        eprintln!("hermit log-diff: comparison failed while following: {error}");
-                        return ExitStatus::Exited(2);
-                    }
-                };
+            let comparison = match compare_complete_prefix(&left, &right, options, &mut transcript)
+            {
+                Ok(comparison) => comparison,
+                Err(error) => {
+                    eprintln!("hermit log-diff: comparison failed while following: {error}");
+                    return ExitStatus::Exited(2);
+                }
+            };
             let records = JsonRecords {
                 compared: comparison.records_compared,
                 available_left: comparison.records_available_left,
@@ -571,6 +613,82 @@ mod tests {
             comparison: logdiff::LogComparisonMode::Info,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn standalone_logdiff_refuses_transport_only_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+
+        std::fs::write(&left, transport).unwrap();
+        std::fs::write(&right, transport).unwrap();
+        assert_eq!(write_canonical_info(&left, &mut Vec::new()).unwrap(), 0);
+        let (empty, _, _) = try_log_diff_with_records(&left, &right, &follow_options()).unwrap();
+        assert!(!empty.matched_with_evidence());
+    }
+
+    #[test]
+    fn standalone_logdiff_admits_one_real_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+
+        std::fs::write(&left, real).unwrap();
+        std::fs::write(&right, real).unwrap();
+        assert_eq!(write_canonical_info(&left, &mut Vec::new()).unwrap(), 1);
+        let (one, _, _) = try_log_diff_with_records(&left, &right, &follow_options()).unwrap();
+        assert_eq!((one.compared_left, one.compared_right), (1, 1));
+        assert!(one.matched_with_evidence());
+    }
+
+    #[test]
+    fn standalone_logdiff_drops_transport_beside_one_real_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+
+        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
+        std::fs::write(&right, format!("{transport}\n{real}")).unwrap();
+        assert_eq!(write_canonical_info(&left, &mut Vec::new()).unwrap(), 1);
+        let (one, _, _) = try_log_diff_with_records(&left, &right, &follow_options()).unwrap();
+        assert_eq!((one.compared_left, one.compared_right), (1, 1));
+        assert!(one.matched_with_evidence());
+    }
+
+    #[test]
+    fn standalone_logdiff_ignores_difference_confined_to_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+
+        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
+        std::fs::write(&right, real).unwrap();
+        let (summary, _, _) = try_log_diff_with_records(&left, &right, &follow_options()).unwrap();
+        assert!(!summary.diff_found);
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+    }
+
+    #[test]
+    fn dbt_evidence_filter_is_keyed_on_transport_target() {
+        assert!(!keep_dbt_evidence_record(
+            "INFO reverie_dbt::evidence: protected evidence initialized"
+        ));
+        assert!(!keep_dbt_evidence_record(
+            "WARN  reverie_dbt::evidence: direct entry must be refused"
+        ));
+        assert!(keep_dbt_evidence_record(
+            "INFO detcore: DETLOG reverie_dbt::evidence: protected evidence initialized"
+        ));
+        assert!(keep_dbt_evidence_record(
+            "INFO reverie_dbt::launcher: starting"
+        ));
     }
 
     #[test]

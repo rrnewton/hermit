@@ -58,6 +58,13 @@ pub(crate) struct ComparisonOptions {
     /// Keep both captured logs at their selected paths after comparison,
     /// whether the runs match or diverge.
     pub keep_logs: bool,
+    /// Backend-owned predicate selecting records that describe the run rather
+    /// than the backend's transport machinery.
+    pub keep_log_record: fn(&str) -> bool,
+}
+
+pub(crate) fn keep_all_log_records(_record: &str) -> bool {
+    true
 }
 
 /// How strictly two runs' internal logs are compared — the condition a
@@ -837,8 +844,12 @@ fn compare_two_runs_with_unsupported_scan(
                 "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
             );
 
-            let summary =
-                logdiff::try_log_diff_detailed(log1.as_ref(), log2.as_ref(), &diff_options)?;
+            let summary = logdiff::try_log_diff_detailed_with_filter(
+                log1.as_ref(),
+                log2.as_ref(),
+                &diff_options,
+                options.keep_log_record,
+            )?;
             compared_log_messages = Some(ComparedLogCounts {
                 left: summary.compared_left,
                 right: summary.compared_right,
@@ -1081,6 +1092,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                keep_log_record: keep_all_log_records,
             },
         )
     }
@@ -1199,6 +1211,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                keep_log_record: keep_all_log_records,
             },
         )
         .unwrap();
@@ -1331,6 +1344,7 @@ mod tests {
                 diagnostic_full_trace: true,
                 compare_io_buffers: false,
                 keep_logs: false,
+                keep_log_record: keep_all_log_records,
             },
         )
         .unwrap();
@@ -1427,6 +1441,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: false,
                     keep_logs,
+                    keep_log_record: keep_all_log_records,
                 },
             )
             .unwrap();
@@ -1466,6 +1481,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                keep_log_record: keep_all_log_records,
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
         )
@@ -1524,6 +1540,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                keep_log_record: keep_all_log_records,
             },
         );
 
