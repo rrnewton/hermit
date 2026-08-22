@@ -2339,3 +2339,32 @@ fn hermit_dap_reports_a_missing_gdb_path() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[test]
+fn hermit_dap_help_describes_managed_replay() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+        .arg("--help")
+        .output()
+        .expect("failed to run hermit-dap");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--replay ID"), "stdout:\n{stdout}");
+    assert!(stdout.contains("stepBack"), "stdout:\n{stdout}");
+    assert!(stdout.contains("reverseContinue"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn hermit_dap_rejects_replay_options_without_replay() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+        .args(["--data-dir", "/tmp/recordings"])
+        .output()
+        .expect("failed to run hermit-dap");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--data-dir requires --replay"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
