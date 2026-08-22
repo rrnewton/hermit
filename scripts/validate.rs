@@ -4276,8 +4276,15 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ));
     }
 
-    // A genuine failure must not be reclassified or retried. With one worker,
-    // both independent peers remain runnable but unreported after fail-fast.
+    // A genuine failure must not be reclassified or retried, and the lane's
+    // completeness axis must report whether the rest of the plan was measured.
+    //
+    // These two runs are the same DAG under the two launch policies, and they are
+    // bracketed together because the difference between them is the whole point of
+    // the completeness axis. Until agent-utils 6a3c2d7 ("make --keep-going keep
+    // going") a `keep_going` run suppressed the eager reap of in-flight steps and
+    // then launched nothing further, so BOTH policies left the peers unmeasured and
+    // this bracket could not tell them apart. It now checks each one separately.
     let failure_log = tmp.join("unclassified.log");
     std::fs::write(
         &failure_log,
@@ -4292,10 +4299,13 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         ],
         ..Default::default()
     };
+    // Default eager-exit: with one worker both independent peers remain runnable but
+    // never launched, so the lane is a red that is ALSO incomplete, and the
+    // completeness axis must refuse to let it exit 0.
     let failed = run_lane_with_env_retries(
         &failed_cfg,
         1,
-        true,
+        false,
         0,
         None,
         &failure_log,
@@ -4316,6 +4326,33 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             failed.ok,
             failed.env_retries,
             failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+        ));
+    }
+
+    // Same failure under keep-going: still an unretried red, and still not green,
+    // but now every peer is measured, so the lane is completely accounted for. The
+    // failure verdict must not soften just because coverage got wider.
+    let kept = run_lane_with_env_retries(
+        &failed_cfg,
+        1,
+        true,
+        0,
+        None,
+        &failure_log,
+        None,
+        1,
+        false,
+    );
+    let mut kept_tags: Vec<&str> = kept.outcomes.iter().map(|o| o.tag.as_str()).collect();
+    kept_tags.sort_unstable();
+    if !kept.complete
+        || kept.ok
+        || kept.env_retries != 0
+        || kept_tags != vec!["fixture.fail", "fixture.pending_a", "fixture.pending_b"]
+    {
+        return Err(format!(
+            "scheduler accounting: keep-going did not measure every independent peer while keeping the failure red: complete={} ok={} retries={} outcomes={kept_tags:?}",
+            kept.complete, kept.ok, kept.env_retries
         ));
     }
 
