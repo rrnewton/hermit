@@ -2699,7 +2699,32 @@ impl Scheduler {
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
-                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                // `trace!`, not `info!`, and that level is load-bearing.
+                //
+                // How many times this branch is reached is a function of HOST
+                // scheduling, not of the guest. The branch above spins on
+                // `yield_now()` until the host kernel delivers the child's final
+                // wait status, so whether the scheduler arrives here once or not
+                // at all before the run queue drains depends on when that
+                // external, real-time event lands. Under concurrent
+                // verification it lands later, and this line then appears in one
+                // run of a `--verify` pair and not the other.
+                //
+                // Measured: over 312 concurrent SaBRe cell-runs, 4 diverged, and
+                // in every one of the four the ENTIRE difference between the two
+                // runs was this line plus the position of one unrelated WARN.
+                // Zero guest events, syscalls, virtual-time values or COMMITs
+                // differed; guest exit status and stdout were identical. The
+                // canonical `BitwiseInfoV1` comparator reads the full INFO
+                // remainder, so an INFO line emitted from a host-timing-dependent
+                // poll is a determinism hazard by construction.
+                //
+                // The sibling branch immediately above already logs at `trace!`
+                // for the same reason; this branch was the inconsistent one.
+                // Keep the whole loop sub-INFO. Do not promote this back without
+                // making the host's wait-status delivery deterministic, which is
+                // not possible -- it is an external event.
+                trace!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
                 return Err(self.report_terminal_deadlock());
