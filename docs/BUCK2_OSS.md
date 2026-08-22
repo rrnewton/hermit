@@ -72,11 +72,15 @@ using `providers[].url` and hyphen-form keys (`linux-x86_64`). Fetch a public
 launcher and invoke it explicitly rather than putting it on `PATH`, so nothing
 internal is shadowed:
 
+Unpack it **outside** the checkout, so it does not show up as untracked files:
+
 ```sh
+mkdir -p ~/.local/dotslash && cd ~/.local/dotslash
 with-proxy curl -sSL -o ds.tgz \
   https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz
-tar xzf ds.tgz            # yields ./dotslash
-with-proxy ./dotslash ./bootstrap/buck2 build reverie//:reverie-ptrace
+tar xzf ds.tgz && rm ds.tgz     # yields ~/.local/dotslash/dotslash
+cd -
+with-proxy ~/.local/dotslash/dotslash ./bootstrap/buck2 build reverie//:reverie-ptrace
 ```
 
 **`regenerate-rust-deps` needs two Cargo environment variables.** Without the
@@ -141,9 +145,25 @@ Measured 2026-08-21 from a fresh recursive clone at `e95ab8c9`, reverie
 | `build reverie//:reverie-ptrace` | exit 0, 24.8s, `libreverie_ptrace-0229eb76.rmeta` |
 | `build --keep-going shim//third-party/rust/...` | exit 3, 1m31s; red on `reverie-dbt-0.2` and `reverie-sabre-0.2` plus the `winapi-0.3-build-script-run` analysis exception; 14 incompatible targets skipped |
 
-Those four generation hashes were produced independently in two different
+Those four generation hashes were produced independently in three different
 checkouts, so generation is deterministic across clones and not merely
 repeatable in one worktree.
+
+**The first `shim//third-party/rust/...` build in a cold checkout can report a
+third failure that is not real.** Once in five runs of that command, a freshly
+cloned tree additionally failed
+`gh_facebook_buck2_shims_meta//third-party/rust:serde_core-1-build-script-build`
+with a missing intermediate input:
+
+```
+transitive_dependency_symlinks.py: error: argument --artifacts: can't open
+  '...__serde_core-1-build-script-build__/.../XIPL-depslink-symlinked_dirs.json'
+```
+
+That is an action-graph symptom rather than a compile error, and it cleared on
+both immediate re-runs of the identical command in the same checkout. If you
+see three failures instead of two, re-run before drawing a conclusion; the red
+set in the table above is what the branch actually reproduces.
 
 ## Known stopping point
 
