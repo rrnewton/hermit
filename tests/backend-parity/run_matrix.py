@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from enum import Enum
 import hashlib
 import json
 import os
@@ -186,6 +187,42 @@ L2_ALLOWED = {
     "dbt": {"stripped", "bitwise", "gap"},
     "kvm": {"guest", "gap"},
 }
+
+
+class LogCompareStrictness(Enum):
+    """The Hermit log-comparison policy requested by this matrix."""
+
+    STRIPPED = "stripped"
+    CANONICAL = "canonical"
+
+    def flags(self) -> tuple[str, ...]:
+        if self == LogCompareStrictness.STRIPPED:
+            return ("--verify", "--verify-allow", "both")
+        if self == LogCompareStrictness.CANONICAL:
+            return ("--verify", "--verify-strict", "--verify-allow", "both")
+        raise AssertionError(f"unhandled log comparison strictness: {self!r}")
+
+    def comparison_claim(self) -> str:
+        if self == LogCompareStrictness.STRIPPED:
+            return (
+                "Stripped DETLOG comparison "
+                "(numbers/addresses/paths normalized; NOT bitwise)"
+            )
+        if self == LogCompareStrictness.CANONICAL:
+            return (
+                "canonical INFO parity "
+                "(byte-identical remainder after host-address normalization)"
+            )
+        raise AssertionError(f"unhandled log comparison strictness: {self!r}")
+
+    def mode_summary(self) -> str:
+        displayed_flags = "--strict --verify"
+        if self == LogCompareStrictness.CANONICAL:
+            displayed_flags += " --verify-strict"
+        return f"MODE: L2 ({displayed_flags}), {self.comparison_claim()} per probe"
+
+
+DEFAULT_VERIFY_POLICY = LogCompareStrictness.STRIPPED
 
 
 class MatrixError(Exception):
@@ -547,6 +584,7 @@ def hermit_command(
     strict: bool,
     verify: bool = False,
     verify_json: Path | None = None,
+    verify_policy: LogCompareStrictness = DEFAULT_VERIFY_POLICY,
 ) -> list[str]:
     command = [str(hermit), "run"]
     if backend != "ptrace":
@@ -568,7 +606,7 @@ def hermit_command(
         # `--verify-allow both` keeps the guest's own exit status (including
         # deliberate non-zero cases such as exit_status) flowing through so the
         # runner can still enforce exit-status parity.
-        command.extend(["--verify", "--verify-allow", "both"])
+        command.extend(verify_policy.flags())
         if verify_json is not None:
             command.append(f"--verify-json={verify_json}")
     command.extend(
@@ -831,6 +869,7 @@ def run_case_verify(
     expected_status: int,
     expected_l2: str,
     evidence: dict[str, str] | None = None,
+    verify_policy: LogCompareStrictness = DEFAULT_VERIFY_POLICY,
 ) -> tuple[str, str, float]:
     """L2 probe: one `hermit run --strict --verify` invocation.
 
@@ -853,6 +892,7 @@ def run_case_verify(
             strict=True,
             verify=True,
             verify_json=verdict_path,
+            verify_policy=verify_policy,
         )
         result = run_with_timeout(command)
         observed_evidence = (
@@ -964,6 +1004,7 @@ def run_case(
     verify: bool = False,
     expected_l2: str = "gap",
     evidence: dict[str, str] | None = None,
+    verify_policy: LogCompareStrictness = DEFAULT_VERIFY_POLICY,
 ) -> tuple[str, str, float]:
     guest, expected_status, expected_stdout = case_command(name, fixtures)
     reference_guest = [*guest]
@@ -980,7 +1021,14 @@ def run_case(
         guest = [*guest, "--kvm"]
     if verify:
         return run_case_verify(
-            hermit, backend, name, guest, expected_status, expected_l2, evidence
+            hermit,
+            backend,
+            name,
+            guest,
+            expected_status,
+            expected_l2,
+            evidence,
+            verify_policy,
         )
     baseline: bytes | None = None
     started = time.monotonic()
@@ -1507,8 +1555,8 @@ def parse_args() -> argparse.Namespace:
         "--verify",
         action="store_true",
         help=(
-            "lift every probe to L2: run with hermit run --strict --verify so "
-            "hermit's internal double-run asserts a bitwise-identical DETLOG "
+            "lift every probe to L2 using the "
+            f"{DEFAULT_VERIFY_POLICY.comparison_claim()} "
             "(implies --strict; guest stdout is diverted, so stdout parity is "
             "not checked in this mode)"
         ),
@@ -1520,11 +1568,12 @@ def main() -> int:
     args = parse_args()
     names = validate_catalog()
     backends = args.backends or list(BACKENDS)
+    verify_policy = DEFAULT_VERIFY_POLICY
     # --verify is the L2 lift and presupposes strict mode (L2 = --strict
     # --verify); enable strict implicitly so callers can ask for L2 with one flag.
     strict = args.strict or args.verify
     if args.verify:
-        print("MODE: L2 (--strict --verify), byte-identical DETLOG per probe")
+        print(verify_policy.mode_summary())
     elif strict:
         print("MODE: L1 (--strict), byte-identical stdout across 3 runs")
     else:
@@ -1597,6 +1646,7 @@ def main() -> int:
                     args.verify,
                     expected,
                     evidence,
+                    verify_policy,
                 )
                 if is_gap and status == "PASS":
                     status = "XPASS"

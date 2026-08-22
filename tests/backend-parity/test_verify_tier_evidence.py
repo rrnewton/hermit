@@ -31,8 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_matrix import (  # noqa: E402
     EVIDENCE_COLUMNS,
     L2_RANK,
+    DEFAULT_VERIFY_POLICY,
+    LogCompareStrictness,
     SCORECARD_HEADER,
     expectation,
+    hermit_command,
     verify_tier_from_json,
 )
 
@@ -130,6 +133,33 @@ print("case RANK — the ladder orders the tiers and 'bitwise' is the ceiling")
 check("guest < stripped < bitwise",
       L2_RANK["guest"] < L2_RANK["stripped"] < L2_RANK["bitwise"], repr(L2_RANK))
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
+
+print("case MODE — the summary and Hermit flags come from one comparison policy")
+for strictness in LogCompareStrictness:
+    check(f"{strictness.value} policy supplies flags and a summary",
+          bool(strictness.flags()) and bool(strictness.mode_summary()))
+stripped_summary = DEFAULT_VERIFY_POLICY.mode_summary()
+stripped_command = hermit_command(
+    Path("/hermit"), "ptrace", ["/bin/true"], "hello_stdout", True,
+    verify=True, verify_policy=DEFAULT_VERIFY_POLICY,
+)
+check("Stripped summary names the lossy policy", "Stripped" in stripped_summary,
+      stripped_summary)
+check("Stripped summary does NOT claim byte identity",
+      "byte-identical" not in stripped_summary, stripped_summary)
+check("Stripped command does NOT request --verify-strict",
+      "--verify-strict" not in stripped_command, repr(stripped_command))
+
+canonical_policy = LogCompareStrictness.CANONICAL
+canonical_summary = canonical_policy.mode_summary()
+canonical_command = hermit_command(
+    Path("/hermit"), "ptrace", ["/bin/true"], "hello_stdout", True,
+    verify=True, verify_policy=canonical_policy,
+)
+check("Canonical summary still claims the byte-identical compared remainder",
+      "byte-identical remainder" in canonical_summary, canonical_summary)
+check("Canonical command requests --verify-strict",
+      "--verify-strict" in canonical_command, repr(canonical_command))
 
 print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
 # Asserting bitwise before an INFO-tier comparator exists would red every
