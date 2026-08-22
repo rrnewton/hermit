@@ -582,7 +582,15 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         .to_str()
         .expect("DBT unsupported-syscall guest path should be UTF-8");
 
-    let normal_args = ["run", "--backend", "dbt", "--verify", "--", program];
+    let normal_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+    ];
     let normal = hermit(&normal_args);
     assert_success(&normal, &normal_args);
     assert_eq!(stdout(&normal), "dbt-unsupported-ok\n");
@@ -594,7 +602,15 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "expected one aggregate warning:\n{normal_stderr}"
     );
 
-    let tamper_args = ["run", "--backend", "dbt", "--", program, "report-tamper"];
+    let tamper_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--",
+        program,
+        "report-tamper",
+    ];
     let tamper = hermit(&tamper_args);
     assert_success(&tamper, &tamper_args);
     assert_eq!(stdout(&tamper), "dbt-unsupported-report-tamper-ok\n");
@@ -609,6 +625,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbt",
+        "--allow-unsupported-syscalls",
         "--",
         program,
         "fork-report-tamper",
@@ -626,6 +643,22 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         stderr(&fork_tamper)
     );
 
+    // THE DEFAULT NOW REFUSES. The three arms above pass
+    // `--allow-unsupported-syscalls` precisely because forwarding is no longer
+    // what an ordinary run does; without it this same invocation fails closed.
+    let default_args = ["run", "--backend", "dbt", "--", program];
+    let default_run = hermit(&default_args);
+    assert!(
+        !default_run.status.success(),
+        "an ordinary run must refuse an unsupported syscall by default:\n{}",
+        stderr(&default_run)
+    );
+    assert!(
+        stderr(&default_run).contains("restart_syscall"),
+        "the default refusal must name the syscall:\n{}",
+        stderr(&default_run)
+    );
+
     let strict_args = ["run", "--backend", "dbt", "--strict", "--", program];
     let strict = hermit(&strict_args);
     assert!(
@@ -638,7 +671,16 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "strict DBT failure omitted unsupported syscall:\n{}",
         stderr(&strict)
     );
-    let normal_fork_args = ["run", "--backend", "dbt", "--verify", "--", program, "fork"];
+    let normal_fork_args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+        "fork",
+    ];
     let normal_fork = hermit(&normal_fork_args);
     assert_success(&normal_fork, &normal_fork_args);
     assert_eq!(stdout(&normal_fork), "dbt-unsupported-fork-ok\n");
@@ -653,6 +695,7 @@ fn run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them() {
         "run",
         "--backend",
         "dbt",
+        "--allow-unsupported-syscalls",
         "--verify",
         "--",
         program,
