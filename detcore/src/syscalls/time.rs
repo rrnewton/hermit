@@ -93,16 +93,12 @@ fn deterministic_timex(now: Timespec) -> libc::timex {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-845): Review SaBRe thread-local guest clock reads.
-async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
+pub(crate) async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let raw = if guest.config().use_thread_local_clock_reads {
-        guest.thread_state().thread_logical_time.as_nanos()
-    } else {
-        thread_observe_time(guest).await
-    };
+    let raw = thread_observe_time(guest).await;
     guest.thread_state().observe_guest_clock(raw)
 }
 
