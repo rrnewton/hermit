@@ -2305,3 +2305,37 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
         ],
     );
 }
+#[test]
+fn hermit_dap_forwards_remote_settings_to_gdb() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+        .args(["--gdb", "/bin/echo"])
+        .output()
+        .expect("failed to run hermit-dap");
+
+    assert!(
+        output.status.success(),
+        "hermit-dap failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "--quiet --nx --init-eval-command=set debuginfod enabled off \
+         --init-eval-command=set sysroot / --interpreter=dap\n"
+    );
+}
+
+#[test]
+fn hermit_dap_reports_a_missing_gdb_path() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit-dap"))
+        .arg("--gdb")
+        .output()
+        .expect("failed to run hermit-dap");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--gdb requires a path"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
