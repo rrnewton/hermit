@@ -230,6 +230,9 @@ when that executable is not `/usr/bin/gdb`:
 ```bash
 cargo build -p hermit --bin hermit --bin hermit-dap
 target/debug/hermit run --gdbserver --gdbserver-port=1234 -- /path/to/program
+
+# Or serve the latest recording without launching GDB itself.
+target/debug/hermit replay --serve-only --gdbserver-port=1234
 ```
 
 In another terminal, a DAP client can spawn `target/debug/hermit-dap` and send
