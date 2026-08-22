@@ -2043,6 +2043,38 @@ fn record_list_json_reports_an_empty_inventory() {
 }
 
 #[test]
+fn record_list_rejects_a_non_directory_inventory() {
+    let parent = tempfile::tempdir().expect("failed to create recording data parent");
+    let data_file = parent.path().join("not-a-directory");
+    fs::write(&data_file, b"not a recording inventory")
+        .expect("failed to create non-directory data path");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "list", "--json", "--data-dir"])
+        .arg(&data_file)
+        .output()
+        .expect("failed to run hermit record list");
+    assert_failure_contains(
+        &output,
+        &["Failed to read recording inventory", "not-a-directory"],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "clean", "--data-dir"])
+        .arg(&data_file)
+        .output()
+        .expect("failed to run hermit record clean");
+    assert_failure_contains(
+        &output,
+        &["Failed to read recording inventory", "not-a-directory"],
+    );
+    assert_eq!(
+        fs::read(&data_file).expect("record clean removed the data path"),
+        b"not a recording inventory"
+    );
+}
+
+#[test]
 fn run_rejects_invalid_programs_with_actionable_errors() {
     let output = hermit(&["run", "--", "/definitely/missing/hermit-program"]);
     assert_failure_contains(
@@ -2203,5 +2235,73 @@ fn run_ptrace_virtual_clock_across_execve_is_deterministic() {
         stderr(&output).contains("deterministic"),
         "expected a determinism verdict from --verify:\n{}",
         stderr(&output),
+    );
+}
+
+/// `--log-file` must resolve on the HOST, exactly like a shell redirect.
+///
+/// The container mounts a fresh writable /tmp over its root, and tracing is
+/// initialized inside the container. Opening the log there resolved `/tmp/x.log`
+/// against the GUEST's tmpfs, where the create SUCCEEDED and the file then died with
+/// the namespace: exit 0, no log, no warning. A user who asked for a log got success
+/// and nothing, which is indistinguishable from a log that was legitimately empty.
+/// Measured 2026-08-20; a debugging session was lost to it.
+///
+/// /tmp is the case that matters because it is both the natural place to put a
+/// scratch log and the one directory the container replaces.
+#[test]
+fn log_file_under_tmp_lands_on_the_host() {
+    let directory = tempfile::Builder::new()
+        .prefix("hermit_log_file_host_ns_")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let log = directory.path().join("guest.log");
+
+    let output = hermit(&[
+        "--log=info",
+        "--log-file",
+        log.to_str().unwrap(),
+        "run",
+        "--",
+        "/bin/true",
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "unexpected status: {output:?}"
+    );
+    assert!(
+        log.exists(),
+        "--log-file under /tmp produced no host file: {output:?}"
+    );
+    let size = std::fs::metadata(&log).unwrap().len();
+    // Non-empty, not merely created: an empty file is the symptom this fixes.
+    assert!(
+        size > 0,
+        "--log-file under /tmp produced an empty host file"
+    );
+}
+
+/// A log destination that cannot be opened must say so and fail, never exit 0
+/// having written nothing. This half needs no policy ruling: silent success is
+/// never the right answer to "write my diagnostics here".
+#[test]
+fn log_file_that_cannot_be_opened_is_refused_by_path() {
+    let output = hermit(&[
+        "--log=info",
+        "--log-file",
+        "/nonexistent-root-dir-for-hermit-test/guest.log",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
+
+    assert_failure_contains(
+        &output,
+        &[
+            "cannot open --log-file",
+            "/nonexistent-root-dir-for-hermit-test/guest.log",
+        ],
     );
 }

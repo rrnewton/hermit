@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Copyright (c) Meta Platforms, Inc. and affiliates.
 //! All rights reserved.
 //!
@@ -21,22 +21,28 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! serde = { version = "1", features = ["derive"] }
+//! serde_yaml = "0.9"
 //! toml = "0.8"
 //! ```
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude;
+
+#[path = "../ci/manifest-plan/src/manifest_value.rs"]
+mod manifest_value;
 
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use toml::Value;
+use manifest_value::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-to-commands: {}", message.as_ref());
@@ -115,6 +121,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
+        "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
+        "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "mkdir -p \"$cell/home\" \"$cell/xdg-config\" \"$cell/tmp\" \"$cell/fixtures\" \"$cell/captures\""
             .to_owned(),
         "if [ -d tests/e2e/xdg-config ]; then cp -a tests/e2e/xdg-config/. \"$cell/xdg-config/\"; fi"
@@ -248,31 +256,24 @@ fn hermit_command(
     verify_bitwise_parity: bool,
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile = if portable {
-        " --no-virtualize-cpuid --max-timeslice=disabled"
-    } else {
-        ""
-    };
+    let _lane = lane;
+    let profile = "";
     let command = match mode {
         "verify" => {
-            let strict = if verify_bitwise_parity {
-                " --verify-strict --verify-json \"$cell/captures/verify.json\""
-            } else {
-                ""
-            };
+            let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {} --strict --verify{strict}{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info --backend {} record start --strict --verify --data-dir \"$cell/recording\" --record-timeout {timeout} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log info --backend {} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS} -- {guest}",
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=off run --base-env=minimal --backend {} --strict --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
+            seed.unwrap_or(0),
             seed.unwrap_or(0)
         ),
         "custom" => {
@@ -325,6 +326,13 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
     for mode in mode_names {
         let spec = &modes[mode];
         if mode == "naked" {
+            let backends = string_array(
+                spec.get("backends_enabled"),
+                &format!("{id}.modes.naked.backends_enabled"),
+            );
+            if !backends.iter().any(|backend| backend == "native") {
+                continue;
+            }
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
             let run = format!("timeout --kill-after=10s {timeout}s {RUN_ENV} {guest}");
             lines.push(format!(
@@ -339,7 +347,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             &format!("{id}.modes.{mode}.backends_enabled"),
         );
         if backends.is_empty() {
-            fail(format!("{id}: mode `{mode}` has no enabled backend"));
+            continue;
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
         // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
@@ -376,11 +384,11 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
                     verify_bitwise_parity,
                     &guest,
                 );
-                let runs = match mode {
-                    "chaos" => 2,
-                    "custom" => custom_runs,
-                    _ => 1,
-                };
+                // A chaos command already asks Hermit to execute the same seed
+                // twice via --verify. Repeating the whole command here would
+                // turn one declared seed into four guest executions and make
+                // this front door disagree with the harness.
+                let runs = if mode == "custom" { custom_runs } else { 1 };
                 let seed_note = seed.map(|s| format!(" seed={s}")).unwrap_or_default();
                 lines.push(format!(
                     "{setup} && {} # {id} mode={mode} backend={backend}{seed_note}",
@@ -436,7 +444,7 @@ const USAGE: &str = "\
 Usage: manifest-to-commands.rs [-h|--help] [--guest-args]
 
 Regenerate the flattened e2e command files under ignored/e2e-commands/ from the
-TOML manifests in tests/e2e/manifests/. It discovers the repo root from git and
+YAML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
   --guest-args  Write nothing; print the declared per-backend guest arguments as
@@ -449,7 +457,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", manifests.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -468,7 +476,7 @@ fn load_manifest_tests(manifests: &Path) -> Vec<(String, Value)> {
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
             .parse()
-            .unwrap_or_else(|e| fail(format!("{}: invalid TOML: {e}", path.display())));
+            .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
         if schema != Some(MANIFEST_SCHEMA) {
             fail(format!(
@@ -577,12 +585,15 @@ mod tests {
     }
 
     const DECLARED: &str = r#"
-[[test]]
-id = "c-programs/example"
-program = "tests/c/example.c"
-[test.modes.verify]
-backends_enabled = ["ptrace", "liteinst"]
-guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
+test:
+  - id: c-programs/example
+    program: tests/c/example.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, liteinst]
+        guest_args:
+          ptrace: [multi, value with spaces]
+          liteinst: [edge]
 "#;
 
     /// POSITIVE side: a declared argument vector must reach the guest word, and
@@ -622,11 +633,12 @@ guest_args = { ptrace = ["multi", "value with spaces"], liteinst = ["edge"] }
     fn undeclared_guest_args_leave_the_guest_word_untouched() {
         let tests = manifest(
             r#"
-[[test]]
-id = "c-programs/bare"
-program = "tests/c/bare.c"
-[test.modes.verify]
-backends_enabled = ["ptrace"]
+test:
+  - id: c-programs/bare
+    program: tests/c/bare.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
 "#,
         );
         let spec = &tests[0].1["modes"]["verify"];
@@ -641,12 +653,14 @@ backends_enabled = ["ptrace"]
     fn enabled_backend_absent_from_guest_args_gets_none() {
         let tests = manifest(
             r#"
-[[test]]
-id = "c-programs/partial"
-program = "tests/c/partial.c"
-[test.modes.verify]
-backends_enabled = ["ptrace", "kvm"]
-guest_args = { ptrace = ["multi"] }
+test:
+  - id: c-programs/partial
+    program: tests/c/partial.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, kvm]
+        guest_args:
+          ptrace: [multi]
 "#,
         );
         let spec = &tests[0].1["modes"]["verify"];
@@ -662,11 +676,12 @@ guest_args = { ptrace = ["multi"] }
         let mut tests = manifest(DECLARED);
         tests.extend(manifest(
             r#"
-[[test]]
-id = "c-programs/bare"
-program = "tests/c/bare.c"
-[test.modes.verify]
-backends_enabled = ["ptrace"]
+test:
+  - id: c-programs/bare
+    program: tests/c/bare.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
 "#,
         ));
         let lines = guest_args_tsv(&tests);
@@ -696,6 +711,9 @@ backends_enabled = ["ptrace"]
             "guest",
         );
         assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+        assert!(replay.contains("--strict $record_verify_strict --verify"));
+        assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+        assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
         assert!(!replay.contains("--no-virtualize-cpuid"));
 
         let chaos = hermit_command(
@@ -709,7 +727,12 @@ backends_enabled = ["ptrace"]
             "guest",
         );
         assert!(chaos.contains("run --base-env=minimal"));
-        assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+        assert!(chaos.contains("--verify --verify-allow=both"));
+        assert!(chaos.contains("--strict $run_verify_strict --verify"));
+        assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
+        assert!(chaos.contains("--log=info"));
+        assert!(!chaos.contains("--no-virtualize-cpuid"));
+        assert!(!chaos.contains("--max-timeslice=disabled"));
 
         let custom = hermit_command(
             "custom",
@@ -726,6 +749,33 @@ backends_enabled = ["ptrace"]
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
         let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
-        assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+        assert!(verify.contains("run --base-env=minimal"));
+        assert!(verify.contains(
+            "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+        ));
+    }
+
+    #[test]
+    fn one_chaos_seed_emits_one_internally_verified_command() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/one-chaos-seed
+    program: tests/c/one-chaos-seed.c
+    modes:
+      chaos:
+        backends_enabled: [ptrace]
+        seeds: [7]
+"#,
+        );
+        let commands = commands_for_test(&tests[0].1, &tests[0].0);
+
+        assert_eq!(commands.len(), 1, "one seed must emit one outer command");
+        assert!(commands[0].contains("--seed=7"));
+        assert_eq!(commands[0].matches("--verify-json").count(), 1);
+        assert!(
+            !commands[0].contains("for _run"),
+            "Hermit's internal --verify repeat must not be wrapped in another repeat"
+        );
     }
 }

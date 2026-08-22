@@ -25,9 +25,13 @@ the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format
 matrix-json` emits both sides of each manifest's required enabled/disabled
-partition. A disabled combination is red; a cell that cannot run is not green.
-The existing `--format json` and text views remain enabled-only because they
-are execution plans rather than scorecards.
+partition. It also emits the validated per-test timeout and the number of
+`execute_attempt` calls the existing harness makes for each mode. A seedless
+chaos mode has `attempts: null`: it remains red but has no command to run. The
+pressure-test entry point consumes this output instead of parsing the manifest
+a second way. A disabled combination is red; a cell that cannot run is not
+green. The existing `--format json` and text views remain enabled-only because
+they are execution plans rather than scorecards.
 
 ## Ordinary validation
 
@@ -42,7 +46,9 @@ The path is deliberately direct:
 1. `hermit-manifest-plan` validates the complete matrix and emits the enabled
    execution plan.
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
-3. Each manifest bucket writes schema-3 `results.jsonl` rows to a unique durable
+3. Each manifest bucket writes schema-4 `results.jsonl` rows, including the
+   literal argv, explicit environment, working directory, and pasteable shell
+   command, to a unique durable
    result directory.
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
@@ -53,6 +59,13 @@ The path is deliberately direct:
 `SCORECARD.md` reports the current regression-cell count. Explicit custom
 commands remain required validation checks even though they are outside this
 uniform comparable denominator.
+
+The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
+itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
+therefore measure same-backend repeatability under the current contract; they
+do not establish strict INFO-log determinism or cross-backend parity. The
+scorecard says this directly and reports no cross-backend parity count until
+the manifest has cells that really compare fresh ptrace and non-ptrace logs.
 
 A green cell turning red makes validate fail. The normal response is to fix the
 regression. Moving the cell out of the selected plan is not a fix, and
@@ -106,6 +119,10 @@ For a reproducible bounded sample across verify, replay, and chaos, run:
 Add `--mode verify` to sample only the first improvement target. Custom commands
 and native naked controls are not part of an unqualified random sample. The
 seed and every selected identity are retained in `run.json`.
+Chaos cells whose manifests declare no seeds remain red but are not executable.
+An exact request refuses before creating a plan; a batch reports and omits
+those cells instead of inventing a default seed or recording a zero-execution
+failure. The scorecard denominator is unchanged.
 
 Generate the same graph without executing it by replacing `run` with `plan`
 and supplying `--results DIR`. A request for every red cell is accepted only
@@ -163,7 +180,8 @@ The ignored run directory retains `dag.json`, `run.json`, captured per-cell
 stdout/stderr, result rows, runner profiles, and `summary.json`. Verify-mode
 attempts also retain both raw INFO logs named by Hermit. A ptrace verify attempt
 runs the same Hermit binary's one-input `log-diff` command and retains the
-normalized first-run INFO stream for later cross-backend parity work.
+normalized first-run INFO stream for later cross-backend parity work. Retaining
+that input is preparation, not a parity result.
 Replay-mode raw-log retention is not implemented yet. A one-time PASS is
 printed as a candidate for repeated confirmation; it never edits the tracked
 green set automatically.

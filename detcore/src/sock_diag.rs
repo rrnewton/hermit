@@ -51,6 +51,14 @@ const UNIX_DIAG_PEER: u16 = 2;
 /// Offset of `ndiag_ino` within `struct netlink_diag_msg`.
 const NETLINK_DIAG_INO_OFFSET: usize = 16;
 
+/// Offset of `idiag_inode` within `struct inet_diag_msg`, shared by `AF_INET`
+/// and `AF_INET6`: four leading bytes, then a 48-byte `inet_diag_sockid`, then
+/// `idiag_expires`, `idiag_rqueue`, `idiag_wqueue` and `idiag_uid`.
+///
+/// Confirmed against the installed headers rather than counted by hand --
+/// `offsetof(struct inet_diag_msg, idiag_inode)` is 68 and `sizeof` is 72.
+const INET_DIAG_INO_OFFSET: usize = 68;
+
 /// Zero every socket inode number in a `NETLINK_SOCK_DIAG` multipart reply.
 ///
 /// Returns `true` when `buf` was rewritten (at least one non-zero inode was
@@ -186,6 +194,19 @@ fn zero_family_inodes(out: &mut [u8], body: usize, end: usize, modified: &mut bo
         libc::AF_NETLINK => {
             zero_u32(out, body + NETLINK_DIAG_INO_OFFSET, end, modified);
         }
+        // `ss -t`/`ss -u` and anything else reading the socket table. Both
+        // families share `struct inet_diag_msg`, so they share the offset.
+        libc::AF_INET | libc::AF_INET6 => {
+            zero_u32(out, body + INET_DIAG_INO_OFFSET, end, modified);
+        }
+        // AF_VSOCK and AF_XDP also register socket-diag handlers on this
+        // kernel, and their bodies also carry a host-assigned inode
+        // (`vdiag_ino`, `xdiag_ino`). They are deliberately absent: no dump on
+        // this host returns a single message for either, so the offsets could
+        // not be checked against a real reply. This parser is zero-only and
+        // bounds-checked, so a wrong offset would not fault -- it would
+        // silently zero the wrong field and fail open, which is worse than an
+        // acknowledged gap. Add them alongside a populated dump, not before.
         _ => {}
     }
 }

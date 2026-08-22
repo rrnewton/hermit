@@ -162,8 +162,6 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         // compiler / build-system / linker phrasing.
         if (line.contains("fatal error: ") && line.matches(':').count() >= 2)
             || line.contains("cmake error")
-            || (line.contains("test_harness.sh:")
-                && line.contains("cannot create temp file for here-document"))
             || has_any(
                 line,
                 &[
@@ -871,10 +869,6 @@ pub fn self_test() -> Result<String, String> {
         (
             "toolchain-eperm",
             "cc: fatal error: cannot execute 'as': execvp: Operation not permitted",
-        ),
-        (
-            "toolchain-eperm",
-            "./ci/test_harness.sh: line 368: cannot create temp file for here-document: Operation not permitted",
         ),
         (
             "third-party-build",

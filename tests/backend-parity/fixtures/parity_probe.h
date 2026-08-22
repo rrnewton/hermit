@@ -48,7 +48,7 @@
  * mechanically to every family member.
  *
  * _GNU_SOURCE is supplied by the compile flags (both parity_mutation.py and
- * ci/test_harness.sh compile with -D_GNU_SOURCE); do not define it here.
+ * target/debug/test-harness compile with -D_GNU_SOURCE); do not define it here.
  */
 
 #ifndef HERMIT_BACKEND_PARITY_PROBE_H

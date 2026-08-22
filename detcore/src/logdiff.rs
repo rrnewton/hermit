@@ -367,10 +367,49 @@ pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Re
 /// Separate a full, continuous log into discrete (possibly-multiline) log messages,
 /// stripping off the timestamps in the process.  Return lines tagged with their
 /// index number.
+/// The timestamp that begins every log record. A record runs from one match to
+/// the next, so records may span multiple lines -- which is why comparison is
+/// done on records and never on lines or bytes.
+static RECORD_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d\d:\d\d:\d\d\.\d+|\d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z) +")
+        .unwrap()
+});
+
+/// Byte offsets at which each record starts.
+fn record_starts(contents: &str) -> Vec<usize> {
+    RECORD_START
+        .find_iter(contents)
+        .map(|m| m.start())
+        .collect()
+}
+
+/// How many records in `contents` are known COMPLETE.
+///
+/// A record is complete only once the *next* record has begun, because nothing
+/// else marks its end. In a log still being written the final record may be
+/// half-flushed, so it is never counted and never compared: a partial write must
+/// not read as a difference. A buffer with one record start has zero complete
+/// records, and that is a real answer, not a failure.
+pub fn complete_record_count(contents: &str) -> usize {
+    record_starts(contents).len().saturating_sub(1)
+}
+
+/// The prefix of `contents` holding exactly its first `n` complete records.
+///
+/// Returns `None` when fewer than `n` complete records are present, so a caller
+/// can tell "the runs agree over n records" apart from "n records have not been
+/// written yet". Those two must never collapse into one answer.
+pub fn take_complete_records(contents: &str, n: usize) -> Option<&str> {
+    let starts = record_starts(contents);
+    if n == 0 {
+        return Some(&contents[..0]);
+    }
+    // Record n-1 ends where record n begins, so n complete records require n+1 starts.
+    starts.get(n).map(|end| &contents[..*end])
+}
+
 fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
-    let ts =
-        Regex::new(r"((Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d\d \d\d:\d\d:\d\d\.\d+|\d+-\d\d-\d\dT\d\d:\d\d:\d\d.\d+Z) +")
-            .unwrap();
+    let ts = &*RECORD_START;
     let tag = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) ").unwrap();
     let iter = ts
         .split(contents) // Not aware of a streaming version of this RE split operation.
@@ -384,12 +423,56 @@ fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
             } else {
                 (i, s)
             }
-        });
+        })
+        // Drop the evidence transport's own self-description here, at the one
+        // point that defines what any comparison can see. Doing it here rather
+        // than per-caller is what keeps `write_canonical_info` -- which promises
+        // to print "the canonical INFO messages that strict verification would
+        // compare" -- true by construction instead of by two filters agreeing.
+        // The tag check above still runs on these records first, so a malformed
+        // one is still a hard error rather than something quietly skipped.
+        .filter(|(_, s)| !is_evidence_transport_self_record(s));
     iter.collect()
 }
 
 fn is_info(line: &str) -> bool {
     line.starts_with("INFO ")
+}
+
+/// A record the DBT evidence transport emits ABOUT ITSELF, rather than about
+/// the run it is carrying.
+///
+/// The transport announces its own startup ("protected evidence initialized")
+/// into the very stream whose records are the evidence, so that line arrives
+/// looking exactly like a compared record. It is not one: it says the
+/// apparatus came up, and says nothing about the guest. Excluding it is what
+/// keeps the compared counts meaning *"records of the run"*, which is what
+/// every consumer of [`LogDiffSummary::matched_with_evidence`] and of
+/// `compared_log_messages` already assumes they mean.
+///
+/// Measured consequence of NOT excluding it: two runs whose logs contained
+/// only this one line compared 1 | 1 with no difference, so
+/// `matched_with_evidence()` returned true and the canonical admission
+/// predicate (`counts.left > 0 && counts.right > 0`) admitted a bitwise-parity
+/// green established by the evidence system announcing itself.
+///
+/// Keyed on the record's tracing TARGET, not on the message text: every record
+/// this target carries is the transport describing itself or its own test
+/// hooks (`reverie-dbt/native/client.c`), and a text match would silently stop
+/// working the next time one of those strings is reworded.
+///
+/// This is deliberately NARROW. It does not exclude other non-guest records
+/// (a canonical ptrace comparison of `tests/c/getpid.c` measured 108 of 110
+/// INFO records under `detcore*` targets, plus one `reverie_ptrace::task` and
+/// one `hermit::backend_stats`). Whether those belong in the compared set is a
+/// separate question about what the comparison is for; excluding them here
+/// would change every existing green cell, which this does not.
+fn is_evidence_transport_self_record(line: &str) -> bool {
+    static PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) +reverie_dbt::evidence:").unwrap()
+    });
+
+    PREFIX.is_match(line)
 }
 
 fn is_commit(line: &str) -> bool {
@@ -466,6 +549,81 @@ fn filter_infos<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
 
 fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
     v.iter().filter(|(_, s)| is_detcore(s)).copied().collect()
+}
+
+/// Text of the INFO message the scheduler logs when it finds the run queue
+/// empty but is not finished yet. `Scheduler::step2_process_blocked` in
+/// [`crate::scheduler`] emits it and returns `SkipTurn`, so the loop goes
+/// around again and still exits later through the ordinary
+/// "run queue empty, exiting sched_loop." message.
+///
+/// Two consequences make this the message worth recording. First, both paths
+/// end with the same final scheduler message, so the *last* scheduler line does
+/// not say which path a run took; only whether this kick appeared does. Second,
+/// whether it appears is decided by host timing — the ptrace supervisor may not
+/// yet have reaped a physical process exit when the check runs — so a pair of
+/// runs of the same guest can differ here while agreeing on every committed
+/// scheduling decision.
+///
+/// Kept as a constant so the string sits beside the code that reads it; grep
+/// for this text to find the producing `info!`.
+const SCHEDULER_EMPTY_QUEUE_KICK: &str = "zero threads left anywhere, fizzling.";
+
+/// How many of `v` record the scheduler's empty-run-queue kick.
+fn count_empty_queue_kicks(v: &[(usize, &str)]) -> usize {
+    v.iter()
+        .filter(|(_, s)| s.contains(SCHEDULER_EMPTY_QUEUE_KICK))
+        .count()
+}
+
+/// Resource text of the COMMIT record produced when a guest's runtime reads the
+/// process's own memory map during bootstrap.
+///
+/// This record carries the second known shape of backend self-nondeterminism,
+/// and it is unlike the empty-run-queue kick in a way that matters. Two runs of
+/// one guest can agree on every scheduling decision — same turn, same thread,
+/// same resource — and still commit that turn at *different virtual times*,
+/// because virtual time advances with retired conditional branches and the
+/// number of branches the scan executes depends on the map it reads. So the
+/// evidence is not the presence of a message but the value inside one.
+///
+/// A diverging pair prints both times in its diff. A matching pair kept
+/// nothing, which left the prior question — does this guest perform the read at
+/// all, and therefore can it exhibit the drift — answerable only by collecting
+/// divergences over many runs.
+const RUNTIME_MAPS_READ_RESOURCE: &str = r#"Path("/proc/self/maps")"#;
+
+/// One run's first memory-map read COMMIT, rendered for the retained line.
+/// `None` is spelled out rather than omitted, so a run that never performed the
+/// read is distinguishable from a run whose value was simply not reported.
+fn describe_maps_commit(first: Option<(u64, Option<u64>)>) -> String {
+    match first {
+        Some((turn, Some(nanoseconds))) => {
+            format!("first at turn {turn}, committed virtual time {nanoseconds}ns")
+        }
+        Some((turn, None)) => format!("first at turn {turn}, committed virtual time unrecorded"),
+        None => "no such record".to_string(),
+    }
+}
+
+/// COMMIT records in `v` that read the process's own memory map: how many there
+/// are, and the turn and committed virtual time of the first.
+fn maps_read_commits(v: &[(usize, &str)]) -> (usize, Option<(u64, Option<u64>)>) {
+    let mut count = 0;
+    let mut first = None;
+    for (_, message) in v {
+        if !message.contains(RUNTIME_MAPS_READ_RESOURCE) {
+            continue;
+        }
+        let Some(position) = commit_position(message) else {
+            continue;
+        };
+        count += 1;
+        if first.is_none() {
+            first = Some(position);
+        }
+    }
+    (count, first)
 }
 
 fn filter_ignored<'a>(lines: Vec<(usize, &'a str)>, omits: &Vec<String>) -> Vec<(usize, &'a str)> {
@@ -826,6 +984,10 @@ pub struct LogDiffSummary {
     /// Virtual nanoseconds at that same scheduler COMMIT, when its time is
     /// present and parseable.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// 1-based index of the first record that differs. "Diverged somewhere in
+    /// the first N records" is a bound, not a location, and on a long run the
+    /// two are far apart; this is the location.
+    pub first_divergent_record: Option<usize>,
 }
 
 impl LogDiffSummary {
@@ -877,6 +1039,86 @@ pub fn try_log_diff_detailed(
     let str_a = String::from_utf8_lossy(&vec_a);
     let str_b = String::from_utf8_lossy(&vec_b);
     log_diff_summary_from_strs(str_a, str_b, opts, &mut std::io::stderr())
+}
+
+/// Total records in a log, including a final record that may still be being
+/// written. Use [`complete_record_count`] when the log is still growing.
+pub fn record_count(contents: &str) -> usize {
+    record_starts(contents).len()
+}
+
+/// Like [`try_log_diff_detailed`], but also reports how many records each log
+/// contained. Every log comparison should be able to say what it read, so a
+/// caller is never left to infer coverage from a bare verdict.
+pub fn try_log_diff_with_records(
+    file_a: &Path,
+    file_b: &Path,
+    opts: &LogDiffOpts,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    let vec_a = std::fs::read(file_a)?;
+    let vec_b = std::fs::read(file_b)?;
+    let str_a = String::from_utf8_lossy(&vec_a);
+    let str_b = String::from_utf8_lossy(&vec_b);
+    let records_a = record_count(&str_a);
+    let records_b = record_count(&str_b);
+    let summary = log_diff_summary_from_strs(&str_a, &str_b, opts, &mut std::io::stderr())?;
+    Ok((summary, records_a, records_b))
+}
+
+/// A comparison of two logs that may still be growing.
+///
+/// The verdict alone is not reportable. "The runs agree" and "the runs agree so
+/// far as anyone has looked" are different claims, and a caller who cannot tell
+/// them apart will stop early and conclude the wrong thing. The record counts
+/// are therefore part of the result, not optional detail alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixComparison {
+    /// The verdict over the compared prefix only.
+    pub summary: LogDiffSummary,
+    /// Complete records present in the first log when it was read.
+    pub records_available_left: usize,
+    /// Complete records present in the second log when it was read.
+    pub records_available_right: usize,
+    /// Records actually compared: the shorter of the two available counts.
+    pub records_compared: usize,
+}
+
+impl PrefixComparison {
+    /// True when one log has complete records the other has not reached yet, so
+    /// the comparison is bounded by reading rather than by the runs agreeing.
+    pub fn one_side_is_ahead(&self) -> bool {
+        self.records_available_left != self.records_available_right
+    }
+}
+
+/// Compare only the records both logs have finished writing.
+///
+/// The tail of a log being written may be half-flushed, and a half-flushed
+/// record is not a difference -- it is an absence. Truncating both inputs to
+/// their common *complete* prefix is what makes this safe to run against a live
+/// run: bytes that have not been written yet can never be mistaken for bytes
+/// that disagree.
+pub fn compare_complete_prefix(
+    contents_a: &str,
+    contents_b: &str,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<PrefixComparison> {
+    let records_available_left = complete_record_count(contents_a);
+    let records_available_right = complete_record_count(contents_b);
+    let records_compared = records_available_left.min(records_available_right);
+    // Both are Some: `records_compared` is at most each side's complete count.
+    let prefix_a = take_complete_records(contents_a, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let prefix_b = take_complete_records(contents_b, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let summary = log_diff_summary_from_strs(prefix_a, prefix_b, opts, w)?;
+    Ok(PrefixComparison {
+        summary,
+        records_available_left,
+        records_available_right,
+        records_compared,
+    })
 }
 
 /// Boolean-only wrapper retained for tests that only ask "did it differ?".
@@ -999,6 +1241,10 @@ fn log_diff_summary_from_strs(
             .then_some(first_position_candidate)
             .flatten()
             .and_then(|(_, time)| time),
+        first_divergent_record: diff_found
+            .then_some(first_different)
+            .flatten()
+            .and_then(|(left_index, right_index)| left_index.or(right_index)),
     };
 
     if diff_found {
@@ -1018,6 +1264,57 @@ fn log_diff_summary_from_strs(
             "Done processing logs, no substantive differences found ({} | {} {which} messages compared).",
             summary.compared_left, summary.compared_right,
         )?;
+        // A matching pair keeps only this summary; its logs are not retained.
+        // Without the next line there is no record of which shutdown path the
+        // two runs took, so establishing whether a guest is exposed to the
+        // empty-run-queue timing race at all needs many repeated runs rather
+        // than one reading. See [`SCHEDULER_EMPTY_QUEUE_KICK`] for why the count
+        // is the only thing that distinguishes the paths.
+        //
+        // Deliberately emitted here only: a diverging pair already reproduces
+        // the messages verbatim in its diff, and widening retention past this
+        // one line is how evidence directories stop being navigable.
+        writeln!(
+            w,
+            "Logs contain {} | {} scheduler empty-run-queue kick messages",
+            count_empty_queue_kicks(&infos_a),
+            count_empty_queue_kicks(&infos_b),
+        )?;
+        // The other retained record, for the same reason and under the same
+        // limit: one line, this record only. Here the committed virtual time is
+        // the evidence rather than the record's presence, so it is reported
+        // alongside the turn.
+        //
+        // BOTH runs' values are printed, not just run 1's, and this is a
+        // correctness requirement rather than a precaution.
+        //
+        // Measured: with `strip_lines` -- the lossy comparator that plain
+        // `--verify` uses -- known nondeterministic numerical data is normalized
+        // before comparison, so a pair whose two runs committed the map read at
+        // *different* virtual times is a MATCHING pair and reaches this branch.
+        // Quoting one side there would report agreement on precisely the
+        // quantity this record exists to expose: a drift that `--verify-strict`
+        // catches and `--verify` does not. The counts above can likewise differ
+        // on a matching pair -- under the default `Deterministic` mode a kick
+        // asymmetry is not compared, so `1 | 0` is a pass.
+        //
+        // A run with no such record therefore has to read as "no such record"
+        // rather than being silently represented by the other run's value.
+        let (maps_left, first_left) = maps_read_commits(&infos_a);
+        let (maps_right, first_right) = maps_read_commits(&infos_b);
+        let positions = if first_left.is_none() && first_right.is_none() {
+            String::new()
+        } else {
+            format!(
+                " (run 1 {}, run 2 {})",
+                describe_maps_commit(first_left),
+                describe_maps_commit(first_right),
+            )
+        };
+        writeln!(
+            w,
+            "Logs contain {maps_left} | {maps_right} scheduler COMMIT records reading /proc/self/maps{positions}",
+        )?;
     }
     Ok(summary)
 }
@@ -1029,6 +1326,185 @@ mod test {
     use pretty_assertions::assert_eq;
 
     use crate::logdiff::DetLogFilter;
+
+    /// One well-formed log record. Records are delimited by their leading
+    /// timestamp, so `body` may contain newlines and still be one record.
+    fn record(second: usize, body: &str) -> String {
+        format!("Apr 09 06:08:{second:02}.100  INFO detcore: {body}\n")
+    }
+
+    fn info_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            ..Default::default()
+        }
+    }
+
+    fn compare(left: &str, right: &str) -> super::PrefixComparison {
+        super::compare_complete_prefix(left, right, &info_opts(), &mut Vec::new())
+            .expect("comparing in-memory strings cannot fail on I/O")
+    }
+
+    #[test]
+    fn a_record_is_complete_only_once_the_next_one_starts() {
+        assert_eq!(super::complete_record_count(""), 0);
+
+        // One record start means one record that is still being written.
+        let one = record(1, "first");
+        assert_eq!(super::complete_record_count(&one), 0);
+
+        // The second start is what proves the first record finished.
+        let two = format!("{}{}", record(1, "first"), record(2, "second"));
+        assert_eq!(super::complete_record_count(&two), 1);
+
+        let three = format!("{two}{}", record(3, "third"));
+        assert_eq!(super::complete_record_count(&three), 2);
+    }
+
+    #[test]
+    fn a_multiline_record_counts_once_and_is_not_split_at_its_newlines() {
+        let multiline = format!(
+            "{}{}",
+            record(1, "first\n    continued detail\n    more detail"),
+            record(2, "second")
+        );
+        // Two starts, so one complete record -- the embedded newlines are part
+        // of record one, not boundaries of their own.
+        assert_eq!(super::complete_record_count(&multiline), 1);
+
+        let prefix = super::take_complete_records(&multiline, 1).unwrap();
+        assert!(prefix.contains("continued detail"));
+        assert!(prefix.contains("more detail"));
+        assert!(!prefix.contains("second"));
+    }
+
+    #[test]
+    fn asking_past_the_written_end_is_none_not_a_short_answer() {
+        let two = format!("{}{}", record(1, "first"), record(2, "second"));
+        assert_eq!(super::take_complete_records(&two, 0), Some(""));
+        assert!(super::take_complete_records(&two, 1).is_some());
+        // Only one record is complete, so two is not yet readable. Returning a
+        // truncated prefix here would let "not written yet" pass as "agrees".
+        assert_eq!(super::take_complete_records(&two, 2), None);
+        assert_eq!(super::take_complete_records(&two, 99), None);
+    }
+
+    #[test]
+    fn a_half_written_final_record_is_never_a_difference() {
+        // Identical complete records; the runs differ only in the tail that
+        // neither has finished flushing.
+        let left = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "TAIL-LEFT")
+        );
+        let right = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "TAIL-RIGHT-AND-LONGER")
+        );
+
+        let comparison = compare(&left, &right);
+        assert!(
+            !comparison.summary.diff_found,
+            "an unfinished record must not read as a divergence"
+        );
+        assert_eq!(comparison.records_compared, 2);
+        assert!(!comparison.one_side_is_ahead());
+    }
+
+    #[test]
+    fn a_difference_inside_the_completed_prefix_is_found() {
+        let left = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "LEFT"),
+            record(3, "tail")
+        );
+        let right = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "RIGHT"),
+            record(3, "tail")
+        );
+
+        let comparison = compare(&left, &right);
+        assert!(comparison.summary.diff_found);
+        assert_eq!(comparison.records_compared, 2);
+    }
+
+    #[test]
+    fn comparison_is_bounded_by_the_shorter_log_and_says_so() {
+        let ahead = format!(
+            "{}{}{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "same"),
+            record(4, "same"),
+            record(5, "same")
+        );
+        let behind = format!(
+            "{}{}{}",
+            record(1, "same"),
+            record(2, "same"),
+            record(3, "same")
+        );
+
+        let comparison = compare(&ahead, &behind);
+        assert!(!comparison.summary.diff_found);
+        assert_eq!(comparison.records_available_left, 4);
+        assert_eq!(comparison.records_available_right, 2);
+        // Only what both sides have finished writing.
+        assert_eq!(comparison.records_compared, 2);
+        assert!(
+            comparison.one_side_is_ahead(),
+            "the caller must be able to see the comparison was reading-bound"
+        );
+    }
+
+    #[test]
+    fn the_first_differing_record_is_located_not_just_bounded() {
+        // 40 identical records, one difference at record 13, then 40 more.
+        let build = |marker: &str| {
+            (1..=81)
+                .map(|index| {
+                    let body = if index == 13 { marker } else { "same" };
+                    record(index % 60, &format!("record {index} {body}"))
+                })
+                .collect::<String>()
+        };
+        let left = build("LEFT");
+        let right = build("RIGHT");
+
+        let found = compare(&left, &right).summary.first_divergent_record;
+        assert_eq!(
+            found,
+            Some(13),
+            "bisection must name the record, not merely the prefix that contains it"
+        );
+    }
+
+    #[test]
+    fn identical_logs_have_no_first_divergent_record() {
+        let same = format!("{}{}{}", record(1, "a"), record(2, "b"), record(3, "c"));
+        assert_eq!(compare(&same, &same).summary.first_divergent_record, None);
+        // And an empty comparison reports no location rather than record zero.
+        assert_eq!(compare("", "").summary.first_divergent_record, None);
+    }
+
+    #[test]
+    fn nothing_written_yet_is_a_no_result_not_a_match() {
+        // A single unfinished record on each side: zero complete records.
+        let comparison = compare(&record(1, "first"), &record(1, "first"));
+        assert_eq!(comparison.records_compared, 0);
+        assert!(!comparison.summary.diff_found);
+        assert!(
+            !comparison.summary.matched_with_evidence(),
+            "comparing zero records must never report a match"
+        );
+    }
 
     #[test]
     fn unsafe_strip_lines_cli_name_and_warning_are_explicit() {
@@ -1890,6 +2366,468 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         assert_eq!(
             super::strip_log_entry(r#"rename from="/tmp/a" to="/tmp/b" ok="1""#),
             r#"rename from="/tmp/<somewhere>" to="/tmp/<somewhere>" ok="<NUM>""#
+        );
+    }
+
+    const KICK_LINE_PREFIX: &str = "Logs contain";
+    const KICK_LINE_SUFFIX: &str = "scheduler empty-run-queue kick messages";
+
+    fn kick_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        }
+    }
+
+    /// A run that passes through the empty-run-queue kick still exits through
+    /// the ordinary message afterwards, so both shutdown paths end identically
+    /// and only the kick distinguishes them.
+    fn log_with_kick() -> &'static str {
+        "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 1s\n\
+2026-08-13T01:02:03.000001Z INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling.\n\
+2026-08-13T01:02:03.000002Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+    }
+
+    fn log_without_kick() -> &'static str {
+        "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: COMMIT turn 17, dettid 2, on previously committed 1s\n\
+2026-08-13T01:02:03.000002Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+    }
+
+    fn run_diff(left: &str, right: &str) -> std::io::Result<(super::LogDiffSummary, String)> {
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(left, right, &kick_opts(), &mut out)?;
+        Ok((
+            summary,
+            String::from_utf8(out).expect("diff output is utf-8"),
+        ))
+    }
+
+    /// A matching pair keeps only its summary, so without this count there is no
+    /// record of which shutdown path either run took. Both directions of the
+    /// pass are covered: both runs kicked, and neither did.
+    #[test]
+    fn a_matching_pair_records_the_empty_queue_kick_count() -> std::io::Result<()> {
+        let (kicked, kicked_out) = run_diff(log_with_kick(), log_with_kick())?;
+        assert!(kicked.matched_with_evidence(), "both-kicked pair must pass");
+        assert!(
+            kicked_out.contains(&format!("{KICK_LINE_PREFIX} 1 | 1 {KICK_LINE_SUFFIX}")),
+            "a passing pair that kicked must retain the count, got:\n{kicked_out}"
+        );
+
+        let (quiet, quiet_out) = run_diff(log_without_kick(), log_without_kick())?;
+        assert!(
+            quiet.matched_with_evidence(),
+            "neither-kicked pair must pass"
+        );
+        assert!(
+            quiet_out.contains(&format!("{KICK_LINE_PREFIX} 0 | 0 {KICK_LINE_SUFFIX}")),
+            "a passing pair that did not kick must say so explicitly, got:\n{quiet_out}"
+        );
+        Ok(())
+    }
+
+    /// The other half of the bracket, and the half that matters: recording the
+    /// count must not move any verdict. A pair differing only by the kick was a
+    /// divergence before this line existed and must remain one — the count must
+    /// never stand in for agreement.
+    #[test]
+    fn recording_the_kick_count_does_not_move_any_verdict() -> std::io::Result<()> {
+        let (diverged, diverged_out) = run_diff(log_with_kick(), log_without_kick())?;
+        assert!(
+            diverged.diff_found,
+            "a pair differing only by the kick must still diverge"
+        );
+        assert!(
+            !diverged_out.contains(KICK_LINE_SUFFIX),
+            "the count is scoped to passing pairs; a diverging pair already \
+             reproduces the messages in its diff, got:\n{diverged_out}"
+        );
+
+        // Identical inputs keep every summary field they had, so the extra
+        // writeln! cannot be smuggling a verdict change in behind the text.
+        let (matched, _) = run_diff(log_with_kick(), log_with_kick())?;
+        assert!(!matched.diff_found);
+        assert_eq!(matched.first_divergent_scheduler_turn, None);
+        assert_eq!(matched.first_divergent_virtual_nanoseconds, None);
+        assert_eq!(matched.first_divergent_record, None);
+        assert_eq!(matched.compared_left, matched.compared_right);
+        Ok(())
+    }
+
+    const MAPS_LINE_SUFFIX: &str = "scheduler COMMIT records reading /proc/self/maps";
+
+    /// A guest whose runtime scans its own memory map during bootstrap. The
+    /// committed virtual time is the part that drifts between runs, so it is
+    /// parameterised.
+    fn log_with_maps_read(committed: &str) -> String {
+        format!(
+            "2026-08-13T01:02:03.000000Z INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {{Path(\"/proc/self/maps\"): R}}, on previously committed {committed}\n\
+2026-08-13T01:02:03.000001Z INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+        )
+    }
+
+    /// A matching pair discards its logs, so without this record there is no way
+    /// to tell a guest that never reads its own memory map — and therefore
+    /// cannot drift this way — from one that reads it and happened to agree.
+    #[test]
+    fn a_matching_pair_records_the_maps_read_commit() -> std::io::Result<()> {
+        let scanned = log_with_maps_read("12.345_678_901s");
+        let (summary, out) = run_diff(&scanned, &scanned)?;
+        assert!(summary.matched_with_evidence(), "the pair must pass");
+        assert!(
+            out.contains(&format!("Logs contain 1 | 1 {MAPS_LINE_SUFFIX}")),
+            "a passing pair that read the map must retain the record, got:\n{out}"
+        );
+        // The committed virtual time is the evidence, not just the count: it is
+        // what a later run is compared against to see drift.
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678901ns)"
+            ),
+            "the retained record must carry the turn and the committed virtual \
+             time, got:\n{out}"
+        );
+
+        let (quiet, quiet_out) = run_diff(log_without_kick(), log_without_kick())?;
+        assert!(quiet.matched_with_evidence());
+        assert!(
+            quiet_out.contains(&format!("Logs contain 0 | 0 {MAPS_LINE_SUFFIX}")),
+            "a passing pair that never read the map must say so explicitly, \
+             got:\n{quiet_out}"
+        );
+        Ok(())
+    }
+
+    /// The load-bearing half. A pair differing only in the committed virtual
+    /// time of the retained record was a divergence before this line existed and
+    /// must remain one; recording the value must never stand in for agreeing on
+    /// it.
+    #[test]
+    fn recording_the_maps_read_commit_does_not_move_any_verdict() -> std::io::Result<()> {
+        let (diverged, diverged_out) = run_diff(
+            &log_with_maps_read("12.345_678_901s"),
+            &log_with_maps_read("12.345_678_902s"),
+        )?;
+        assert!(
+            diverged.diff_found,
+            "a one-nanosecond difference in the committed time must still diverge"
+        );
+        assert_eq!(diverged.first_divergent_scheduler_turn, Some(10));
+        assert!(
+            !diverged_out.contains(MAPS_LINE_SUFFIX),
+            "the record is scoped to passing pairs; a diverging pair already \
+             prints both times in its diff, got:\n{diverged_out}"
+        );
+        Ok(())
+    }
+
+    /// Every other test here forces `LogComparisonMode::Info`, but the default
+    /// is `Deterministic`, which selects a different set of messages. Both
+    /// retained lines must appear on that path too, and the kick counts must be
+    /// attributed per side — under this mode a kick asymmetry is *not* compared,
+    /// so `1 | 0` is a passing pair and quoting a single side would report it as
+    /// agreement.
+    #[test]
+    fn both_records_are_retained_under_the_default_comparison_mode() -> std::io::Result<()> {
+        let default_opts = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            default_opts.comparison,
+            super::LogComparisonMode::Deterministic,
+            "this test exists to cover the default mode; if the default changes \
+             it must be re-pointed, not deleted"
+        );
+
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            log_with_kick(),
+            log_without_kick(),
+            &default_opts,
+            &mut out,
+        )?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(
+            summary.matched_with_evidence(),
+            "a kick asymmetry is not compared under the default mode, so this \
+             pair must pass; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("Logs contain 1 | 0 {KICK_LINE_SUFFIX}")),
+            "the asymmetry must be visible per side on the default path, \
+             got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("Logs contain 0 | 0 {MAPS_LINE_SUFFIX}")),
+            "the map-read line must also be emitted on the default path, \
+             got:\n{out}"
+        );
+
+        // The same path, with the map read present, must attribute both sides.
+        let scanned = log_with_maps_read("12.345_678_901s");
+        let mut out = Vec::new();
+        let summary =
+            super::log_diff_summary_from_strs(&scanned, &scanned, &default_opts, &mut out)?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(summary.matched_with_evidence());
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678901ns)"
+            ),
+            "both runs' values must be printed under the default mode, \
+             got:\n{out}"
+        );
+        Ok(())
+    }
+
+    /// The reason both sides must be printed, as a reachable case rather than a
+    /// precaution. `strip_lines` is the lossy comparator plain `--verify` uses:
+    /// it normalizes numeric data before comparing, so two runs that committed
+    /// the map read at different virtual times are a *matching* pair. Reporting
+    /// only run 1 there would claim agreement on the exact quantity this record
+    /// exists to expose — a drift `--verify-strict` catches and `--verify` does
+    /// not.
+    #[test]
+    fn a_stripped_pass_shows_both_runs_diverging_map_read_times() -> std::io::Result<()> {
+        let opts = super::LogDiffOpts {
+            strip_lines: true,
+            no_color: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let summary = super::log_diff_summary_from_strs(
+            log_with_maps_read("12.345_678_901s"),
+            log_with_maps_read("12.345_678_902s"),
+            &opts,
+            &mut out,
+        )?;
+        let out = String::from_utf8(out).expect("diff output is utf-8");
+        assert!(
+            summary.matched_with_evidence(),
+            "the stripped comparator normalizes the times, so this pair passes; \
+             got:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
+                 run 2 first at turn 10, committed virtual time 12345678902ns)"
+            ),
+            "a passing pair whose runs committed at DIFFERENT times must show \
+             both values; showing one would report agreement on a real drift, \
+             got:\n{out}"
+        );
+        Ok(())
+    }
+
+    /// A run that never performed the read must say so, rather than being
+    /// silently represented by the other run's value.
+    #[test]
+    fn a_run_without_the_maps_read_is_named_not_borrowed() {
+        assert_eq!(super::describe_maps_commit(None), "no such record");
+        assert_eq!(
+            super::describe_maps_commit(Some((10, Some(12_345_678_901)))),
+            "first at turn 10, committed virtual time 12345678901ns"
+        );
+        assert_eq!(
+            super::describe_maps_commit(Some((10, None))),
+            "first at turn 10, committed virtual time unrecorded"
+        );
+    }
+
+    /// The record is identified by both halves — a COMMIT *and* that resource —
+    /// so neither a COMMIT on another path nor an unrelated mention of the map
+    /// is counted.
+    #[test]
+    fn only_a_maps_read_commit_is_counted() {
+        assert_eq!(
+            super::maps_read_commits(&[
+                (
+                    0,
+                    "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
+                ),
+                (
+                    1,
+                    "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #257: openat(-100, \"/proc/self/maps\", 0x0) = Ok(4)"
+                ),
+            ]),
+            (0, None),
+            "a COMMIT on another path, and a syscall naming the map, are both \
+             excluded"
+        );
+        assert_eq!(
+            super::maps_read_commits(&[(
+                0,
+                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 10, dettid 3 using resources {Path(\"/proc/self/maps\"): R}, on previously committed 12.345_678_901s"
+            )]),
+            (1, Some((10, Some(12_345_678_901))))
+        );
+    }
+
+    /// The count reads the message text, so an unrelated scheduler line must not
+    /// be mistaken for a kick.
+    #[test]
+    fn only_the_kick_message_is_counted() {
+        assert_eq!(
+            super::count_empty_queue_kicks(&[
+                (
+                    0,
+                    "INFO detcore::scheduler: [scheduler] run queue empty, exiting sched_loop."
+                ),
+                (
+                    1,
+                    "INFO detcore::scheduler: COMMIT turn 18, dettid 2, on previously committed 2s"
+                ),
+            ]),
+            0
+        );
+        assert_eq!(
+            super::count_empty_queue_kicks(&[(
+                0,
+                "INFO detcore::scheduler: scheduler (step2_process_blocked): zero threads left anywhere, fizzling."
+            )]),
+            1
+        );
+    }
+
+    /// The exact record the DBT evidence transport emits about itself, copied
+    /// from `reverie-dbt/native/client.c` rather than reconstructed.
+    const EVIDENCE_TRANSPORT_SELF_RECORD: &str =
+        "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+
+    /// One ordinary record of a run, for the "still admitted" direction.
+    const ONE_REAL_RECORD: &str = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #1: getpid() = Ok(3)";
+
+    fn canonical_info_opts() -> super::LogDiffOpts {
+        super::LogDiffOpts {
+            comparison: super::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            no_color: true,
+            ..Default::default()
+        }
+    }
+
+    /// REFUSED DIRECTION. Two runs whose canonical INFO stream contains only the
+    /// evidence transport announcing itself have compared NOTHING about the
+    /// guest, so the comparison must report an empty selection -- which is what
+    /// makes every downstream consumer refuse it.
+    ///
+    /// Before the exclusion this measured `compared 1 | 1`, `diff_found=false`,
+    /// `matched_with_evidence()==true`, and the canonical admission predicate
+    /// (`counts.left > 0 && counts.right > 0`) admitted it as a bitwise-parity
+    /// green. The green was established by the apparatus saying it had started.
+    #[test]
+    fn a_comparison_of_only_the_transports_own_record_has_no_evidence() -> std::io::Result<()> {
+        let summary = super::log_diff_summary_from_strs(
+            EVIDENCE_TRANSPORT_SELF_RECORD,
+            EVIDENCE_TRANSPORT_SELF_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(
+            (summary.compared_left, summary.compared_right),
+            (0, 0),
+            "the transport's own record must not count as a compared record"
+        );
+        assert!(
+            !summary.matched_with_evidence(),
+            "an empty selection is a no-result, never a match"
+        );
+        Ok(())
+    }
+
+    /// ADMITTED DIRECTION, and it is the one that stops this fix from becoming
+    /// the same defect with the sign flipped. A comparison can be as small as a
+    /// SINGLE real record and is still a real comparison. No floor is imposed,
+    /// because no floor could be justified: the assertion is "at least one
+    /// record OF THE RUN was compared", not "enough records were compared".
+    #[test]
+    fn a_single_genuine_record_is_still_a_comparison_with_evidence() -> std::io::Result<()> {
+        let summary = super::log_diff_summary_from_strs(
+            ONE_REAL_RECORD,
+            ONE_REAL_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(
+            summary.matched_with_evidence(),
+            "one genuine compared record is a real comparison and must still admit"
+        );
+        Ok(())
+    }
+
+    /// The transport's record is dropped from a stream that also carries real
+    /// ones, leaving the genuine records compared and the count honest. This is
+    /// the shape a real DBT run produces once its records flow.
+    #[test]
+    fn the_transports_own_record_is_dropped_from_a_stream_that_also_carries_real_ones()
+    -> std::io::Result<()> {
+        let mixed = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
+        let summary = super::log_diff_summary_from_strs(
+            &mixed,
+            &mixed,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(
+            (summary.compared_left, summary.compared_right),
+            (1, 1),
+            "only the genuine record counts, so the count is one and not two"
+        );
+        assert!(summary.matched_with_evidence());
+        Ok(())
+    }
+
+    /// A difference confined to the transport's own records is not a divergence
+    /// of the run. Excluding those records from the COUNT but leaving them in
+    /// the compared text would report a product divergence for a difference in
+    /// the apparatus, so the exclusion applies to both.
+    #[test]
+    fn a_difference_only_in_the_transports_own_records_is_not_a_divergence() -> std::io::Result<()>
+    {
+        let with_transport = format!("{EVIDENCE_TRANSPORT_SELF_RECORD}\n{ONE_REAL_RECORD}");
+        let summary = super::log_diff_summary_from_strs(
+            &with_transport,
+            ONE_REAL_RECORD,
+            &canonical_info_opts(),
+            &mut Vec::new(),
+        )?;
+        assert!(
+            !summary.diff_found,
+            "a difference confined to the apparatus's own records is not a product divergence"
+        );
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        Ok(())
+    }
+
+    /// The exclusion is keyed on the tracing target, so it covers every record
+    /// that target carries -- not just the startup wording that was measured.
+    /// It must NOT catch a real record that merely mentions the transport.
+    #[test]
+    fn the_exclusion_is_keyed_on_the_target_not_on_one_message() {
+        assert!(super::is_evidence_transport_self_record(
+            "INFO reverie_dbt::evidence: protected evidence initialized"
+        ));
+        assert!(super::is_evidence_transport_self_record(
+            "INFO reverie_dbt::evidence: explicit SYS_exit thread callback completed"
+        ));
+        assert!(super::is_evidence_transport_self_record(
+            "WARN  reverie_dbt::evidence: direct entry must be refused"
+        ));
+        assert!(
+            !super::is_evidence_transport_self_record(
+                "INFO detcore: DETLOG protected evidence initialized"
+            ),
+            "a genuine detcore record must not be dropped for mentioning the transport"
+        );
+        assert!(
+            !super::is_evidence_transport_self_record("INFO reverie_dbt::launcher: starting"),
+            "only the evidence transport's own target is excluded"
         );
     }
 }

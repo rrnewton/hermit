@@ -510,6 +510,295 @@ EOF
         test -z "$output"
         printf 'ss:no-port-zero-listener\n'
         ;;
+    # A standalone NETLINK_ROUTE probe. The `ip` and `ss` rows above reach
+    # netlink incidentally but assert nothing about the reply, so before this
+    # row no corpus cell would have failed if detcore stopped normalizing
+    # netlink entirely. Runs under the default `--network=local`, i.e. one
+    # isolated loopback interface.
+    #
+    # The digest deliberately covers the WHOLE reply except two named fields.
+    # `IFLA_INET6_CACHEINFO.tstamp` is host uptime in USER_HZ and
+    # `.reachable_time` is a per-interface random draw the kernel is required to
+    # randomize (RFC 4861 6.3.2); both reach the guest unnormalized today. They
+    # are located by walking the attribute tree rather than by a fixed offset,
+    # and they are 8 bytes of 1488 -- the other 1480 are covered, so a NEW leak
+    # anywhere else in the reply changes the digest and fails this row.
+    #
+    # HERMIT_NETLINK_UNMASK=1 drops the mask. It can only ever make this row
+    # FAIL, never pass, so it cannot be used to weaken the check; it exists so
+    # the sensitivity of the digest stays reproducible. Masked, four runs agree;
+    # unmasked, four runs produced four distinct digests.
+    netlink-route)
+        /usr/bin/python3 - <<'PY'
+import hashlib, os, socket, struct
+
+NETLINK_ROUTE, RTM_GETLINK, RTM_NEWLINK = 0, 18, 16
+NLM_F_REQUEST, NLM_F_DUMP, NLMSG_DONE = 0x001, 0x300, 3
+IFLA_IFNAME, IFLA_AF_SPEC, IFLA_INET6_CACHEINFO = 3, 26, 5
+UNMASK = os.environ.get("HERMIT_NETLINK_UNMASK") == "1"
+
+sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)
+sock.bind((0, 0))
+sock.send(
+    struct.pack("=IHHII", 20, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, 0)
+    + struct.pack("=Bxxx", socket.AF_PACKET)
+)
+blob = b""
+while True:
+    chunk = sock.recv(65536)
+    blob += chunk
+    if len(chunk) >= 6 and struct.unpack("=H", chunk[4:6])[0] == NLMSG_DONE:
+        break
+    if len(chunk) < 20:
+        break
+sock.close()
+
+def attrs(buf, start, end):
+    off = start
+    while off + 4 <= end:
+        rta_len, rta_type = struct.unpack("<HH", buf[off:off + 4])
+        if rta_len < 4 or off + rta_len > end:
+            return
+        yield rta_type, off + 4, off + rta_len
+        off += (rta_len + 3) & ~3
+
+def walk(buf):
+    off = 0
+    while off + 16 <= len(buf):
+        nlmsg_len, nlmsg_type = struct.unpack("<IH", buf[off:off + 6])
+        if nlmsg_len < 16 or off + nlmsg_len > len(buf):
+            return
+        yield off, nlmsg_len, nlmsg_type
+        off += (nlmsg_len + 3) & ~3
+
+masked_bytes = bytearray(blob)
+masked_count = 0
+for off, nlmsg_len, nlmsg_type in walk(blob):
+    if nlmsg_type != RTM_NEWLINK:
+        continue
+    for t, ps, pe in attrs(blob, off + 32, off + nlmsg_len):
+        if t != IFLA_AF_SPEC:
+            continue
+        for fam, fs, fe in attrs(blob, ps, pe):
+            if fam != socket.AF_INET6:
+                continue
+            for a, s2, e2 in attrs(blob, fs, fe):
+                if a == IFLA_INET6_CACHEINFO and e2 - s2 >= 16:
+                    for b in range(s2 + 4, s2 + 12):
+                        masked_bytes[b] = 0
+                    masked_count += 1
+
+lines, messages = [], 0
+for off, nlmsg_len, nlmsg_type in walk(blob):
+    messages += 1
+    if nlmsg_type != RTM_NEWLINK:
+        continue
+    _fam, _pad, ifi_type, ifi_index, ifi_flags, _chg = struct.unpack(
+        "<BBHiII", blob[off + 16:off + 32]
+    )
+    name, inventory = "?", []
+    for t, ps, pe in attrs(blob, off + 32, off + nlmsg_len):
+        inventory.append("%d:%d" % (t, pe - ps))
+        if t == IFLA_IFNAME:
+            name = blob[ps:pe].rstrip(b"\0").decode()
+    lines.append(
+        "netlink-route:link name=%s index=%d type=%d flags=0x%08x attrs=%s"
+        % (name, ifi_index, ifi_type, ifi_flags, ",".join(inventory))
+    )
+
+# Fail closed. An empty or link-less dump would make the digest trivially
+# reproducible and certify nothing.
+if messages == 0 or not lines:
+    raise SystemExit("netlink-route: RTM_GETLINK returned no link messages")
+if masked_count != 1:
+    raise SystemExit(
+        "netlink-route: expected exactly 1 IFLA_INET6_CACHEINFO, found %d" % masked_count
+    )
+
+body = blob if UNMASK else bytes(masked_bytes)
+for line in lines:
+    print(line)
+print("netlink-route:messages=%d bytes=%d masked_fields=%d" % (messages, len(blob), masked_count))
+print("netlink-route:digest=%s" % hashlib.sha256(body).hexdigest())
+PY
+        ;;
+    # A standalone NETLINK_SOCK_DIAG probe covering EVERY kernel receive
+    # syscall that can retrieve a netlink reply, not just one of them.
+    #
+    # This is the first end-to-end exercise of detcore/src/sock_diag.rs against a
+    # real kernel reply -- its zeroing had only ever run against synthetic
+    # buffers in its own unit tests. The corpus `ss` row above opens the same
+    # protocol but its every reply is a 20-byte NLMSG_DONE carrying zero diag
+    # messages, so it cannot reach the zeroing. Runs under the default
+    # `--network=local`.
+    #
+    # Why all five: the sanitizer was originally wired into recvmsg alone, and
+    # read, readv, recvfrom and recvmmsg reached the same dump without it, so a
+    # guest could skip determinization just by choosing a different syscall --
+    # `socket.recv()` was enough, since glibc lowers recv(2) to recvfrom and
+    # there is no `recv` syscall on x86_64. Measured before the fix: recvmsg
+    # returned nonzero_inodes=0 while the other four returned 5. This row exists
+    # so that cannot regress silently on any one path.
+    #
+    # preadv/preadv2/pread64 are deliberately absent: a socket is not seekable,
+    # so the kernel refuses them with ESPIPE before any data moves. Measured, not
+    # assumed.
+    #
+    # Sensitivity is not a test-only knob: `--no-virtualize-metadata` is the
+    # production gate at detcore/src/syscalls/io.rs. With it, all five paths
+    # return raw host inode numbers and this row exits 1.
+    netlink-sock-diag)
+        /usr/bin/python3 - <<'PY'
+import ctypes, socket, struct
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+NR = {"read": 0, "readv": 19, "recvfrom": 45, "recvmsg": 47, "recvmmsg": 299}
+
+NETLINK_SOCK_DIAG, SOCK_DIAG_BY_FAMILY = 4, 20
+NLM_F_REQUEST, NLM_F_DUMP = 0x001, 0x300
+UDIAG_SHOW_NAME, UNIX_DIAG_INO_OFFSET = 0x01, 4
+BUFSZ = 65536
+
+
+class iovec(ctypes.Structure):
+    _fields_ = [("iov_base", ctypes.c_void_p), ("iov_len", ctypes.c_size_t)]
+
+
+class msghdr(ctypes.Structure):
+    _fields_ = [
+        ("msg_name", ctypes.c_void_p), ("msg_namelen", ctypes.c_uint32),
+        ("msg_iov", ctypes.POINTER(iovec)), ("msg_iovlen", ctypes.c_size_t),
+        ("msg_control", ctypes.c_void_p), ("msg_controllen", ctypes.c_size_t),
+        ("msg_flags", ctypes.c_int),
+    ]
+
+
+class mmsghdr(ctypes.Structure):
+    _fields_ = [("msg_hdr", msghdr), ("msg_len", ctypes.c_uint32)]
+
+
+# Bind listeners so every dump is POPULATED. Abstract namespace: no filesystem
+# artifact to clean up and no path to vary.
+held = []
+for index in range(3):
+    unix_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_sock.bind("\0hermit-compat-sockdiag-%d" % index)
+    unix_sock.listen(1)
+    held.append(unix_sock)
+
+
+def open_dump():
+    """A bound socket-diag socket with a UNIX_DIAG dump already requested."""
+    nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_SOCK_DIAG)
+    nl.bind((0, 0))
+    nl.send(
+        struct.pack("=IHHII", 40, SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST | NLM_F_DUMP, 1, 0)
+        + struct.pack("=BBHIIIII", socket.AF_UNIX, 0, 0, 0xFFFFFFFF, 0, UDIAG_SHOW_NAME, 0, 0)
+    )
+    return nl
+
+
+def syscall(name, *args):
+    ctypes.set_errno(0)
+    return libc.syscall(ctypes.c_long(NR[name]), *args), ctypes.get_errno()
+
+
+def one_iov(buf):
+    iov = (iovec * 1)()
+    iov[0].iov_base = ctypes.cast(buf, ctypes.c_void_p)
+    iov[0].iov_len = BUFSZ
+    return iov
+
+
+def blank_msghdr(buf):
+    header = msghdr()
+    ctypes.memset(ctypes.byref(header), 0, ctypes.sizeof(header))
+    header.msg_iov = one_iov(buf)
+    header.msg_iovlen = 1
+    return header
+
+
+def via_read(fd, buf):
+    return syscall("read", ctypes.c_int(fd), buf, ctypes.c_size_t(BUFSZ))
+
+
+def via_readv(fd, buf):
+    return syscall("readv", ctypes.c_int(fd), one_iov(buf), ctypes.c_int(1))
+
+
+def via_recvfrom(fd, buf):
+    return syscall("recvfrom", ctypes.c_int(fd), buf, ctypes.c_size_t(BUFSZ),
+                   ctypes.c_int(0), None, None)
+
+
+def via_recvmsg(fd, buf):
+    header = blank_msghdr(buf)
+    return syscall("recvmsg", ctypes.c_int(fd), ctypes.byref(header), ctypes.c_int(0))
+
+
+def via_recvmmsg(fd, buf):
+    batch = (mmsghdr * 1)()
+    ctypes.memset(ctypes.byref(batch), 0, ctypes.sizeof(batch))
+    batch[0].msg_hdr = blank_msghdr(buf)
+    rc, err = syscall("recvmmsg", ctypes.c_int(fd), batch, ctypes.c_uint(1),
+                      ctypes.c_int(0), None)
+    return (batch[0].msg_len if rc > 0 else rc), err
+
+
+METHODS = [
+    ("read", via_read), ("readv", via_readv), ("recvfrom", via_recvfrom),
+    ("recvmsg", via_recvmsg), ("recvmmsg", via_recvmmsg),
+]
+
+
+def inodes_in(blob, size):
+    found, off = [], 0
+    while off + 16 <= size:
+        nlmsg_len, nlmsg_type = struct.unpack("<IH", blob[off:off + 6])
+        if nlmsg_len < 16 or off + nlmsg_len > size:
+            break
+        if nlmsg_type == SOCK_DIAG_BY_FAMILY:
+            body = off + 16
+            if body + UNIX_DIAG_INO_OFFSET + 4 <= off + nlmsg_len:
+                found.append(struct.unpack(
+                    "<I",
+                    blob[body + UNIX_DIAG_INO_OFFSET:body + UNIX_DIAG_INO_OFFSET + 4],
+                )[0])
+        off += (nlmsg_len + 3) & ~3
+    return found
+
+
+for name, receive in METHODS:
+    nl = open_dump()
+    buf = ctypes.create_string_buffer(BUFSZ)
+    count, err = receive(nl.fileno(), buf)
+    nl.close()
+    if count < 0:
+        raise SystemExit("netlink-sock-diag: %s failed, errno %d" % (name, err))
+    inodes = inodes_in(bytes(buf.raw), count)
+
+    # Fail closed per path. Zero diag messages would make "every inode is zero"
+    # vacuously true, which is the empty-corpus defect wearing a different hat.
+    if len(inodes) < len(held):
+        raise SystemExit(
+            "netlink-sock-diag: %s returned %d diag message(s), expected at least %d"
+            % (name, len(inodes), len(held))
+        )
+
+    # Assert, do not merely print. The COUNT of nonzero inodes is stable across
+    # runs whether or not the sanitizer ran, so a printed count would be compared
+    # equal by --verify and certify nothing. Only the values move.
+    nonzero = [i for i in inodes if i != 0]
+    if nonzero:
+        raise SystemExit(
+            "netlink-sock-diag: %s delivered %d of %d socket inode(s) unzeroed "
+            "(first: %d); this receive path bypassed detcore/src/sock_diag.rs"
+            % (name, len(nonzero), len(inodes), nonzero[0])
+        )
+    print("netlink-sock-diag:%s diag_messages=%d all_inodes_zeroed=yes"
+          % (name, len(inodes)))
+PY
+        ;;
     lscpu)
         readonly root="$WORK_DIR/sysroot"
         mkdir -p "$root/proc" \

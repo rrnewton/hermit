@@ -9,7 +9,7 @@
 
 Every test-corpus PR adds an entry to the inventory, so the file is a constant
 source of merge conflicts. Those conflicts are textual, not semantic: the gate
-in ``ci/test_harness.sh`` sorts both sides before comparing, so entry ORDER
+in ``target/debug/test-harness`` sorts both sides before comparing, so entry ORDER
 carries no meaning and two PRs registering different files never actually
 disagree. The mechanical resolution is therefore a union keyed by ``path``.
 
@@ -194,7 +194,7 @@ def _self_test() -> int:
         return {"files": list(entries), "schema": 2}
 
     def entry(path: str, disposition: str = "manifest-test") -> dict:
-        runner = "ci/test_harness.sh"
+        runner = "target/debug/test-harness"
         return {
             "disposition": disposition,
             "path": path,

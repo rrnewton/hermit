@@ -31,9 +31,7 @@ pub(crate) struct ComparedRun<'a> {
     pub log: TempPath,
 }
 
-pub(crate) struct ComparisonOptions<'a> {
-    pub success_message: &'a str,
-    pub failure_message: &'a str,
+pub(crate) struct ComparisonOptions {
     /// Controls only how much diff *output* is printed (a larger syscall-history
     /// window), NOT the comparison semantics. Comparison strictness is carried
     /// separately in [`Self::strictness`] so a quiet run can still be
@@ -51,6 +49,12 @@ pub(crate) struct ComparisonOptions<'a> {
     /// mode; an ordinary `--verify-strict` verdict must not depend on diagnostic
     /// events merely because the caller requested that they be captured.
     pub diagnostic_full_trace: bool,
+    /// Whether the compared records contain the CONTENT of syscall output
+    /// buffers, i.e. whether the run enabled `--detlog-io-buffers`.
+    ///
+    /// This is not a comparator setting; it describes what the records being
+    /// compared can possibly show. See [`ComparisonSpec::compare_io_buffers`].
+    pub compare_io_buffers: bool,
     /// Keep both captured logs at their selected paths after comparison,
     /// whether the runs match or diverge.
     pub keep_logs: bool,
@@ -161,6 +165,28 @@ pub struct ComparisonSpec {
     /// compared and the strictness fields describe a log comparison that did not
     /// run — a consumer must not read such a verdict as bitwise log parity.
     pub compare_logs: bool,
+    /// Whether the compared records contain the CONTENT of syscall output
+    /// buffers, not merely the syscalls' return values.
+    ///
+    /// ⚠️ WHEN THIS IS `false`, A MATCH IS NOT A CONTENT-PARITY RESULT, and a
+    /// consumer must not read it as one. Reverie types many output buffers as
+    /// bare pointers, so the record prints the ADDRESS and not the bytes --
+    /// `reverie-syscalls/src/syscalls.rs` carries standing TODOs saying exactly
+    /// that for `Read` and `Write`. Two runs whose buffers differ while their
+    /// return values agree therefore produce character-identical records and
+    /// compare equal.
+    ///
+    /// That is not hypothetical. A `recvmsg` of a netlink RTM_GETLINK dump
+    /// returns a stable `Ok(1468)` on every run while four bytes of its payload
+    /// vary (host kernel jiffies and a kernel-randomised timer). Measured: the
+    /// same guest reports `verdict: matched, bitwise_parity: true` with this
+    /// `false`, and `verdict: diverged` with it `true`. On one QEMU/Linux boot,
+    /// 44.1% of syscalls (278,824 of 632,228) move bytes through a buffer whose
+    /// content the record does not show.
+    ///
+    /// Set by `--detlog-io-buffers`. It is recorded here rather than inferred so
+    /// a consumer can require it instead of assuming it.
+    pub compare_io_buffers: bool,
     /// The message envelope selected from the captured log. The compared-message
     /// counts refer exactly to this scope.
     pub log_scope: ComparedLogScope,
@@ -214,6 +240,7 @@ impl ComparisonSpec {
         strictness: LogCompareStrictness,
         compare_logs: bool,
         diagnostic_full_trace: bool,
+        compare_io_buffers: bool,
     ) -> Self {
         // Map the strictness label onto the concrete diff flags AND the versioned
         // policy tokens in one place, so the flags the engine sees, the tokens
@@ -254,6 +281,7 @@ impl ComparisonSpec {
         ComparisonSpec {
             strictness,
             compare_logs,
+            compare_io_buffers,
             log_scope,
             strip_lines,
             canonicalize_addresses,
@@ -310,6 +338,14 @@ impl ComparisonSpec {
     ///
     /// A consumer asking for parity must reject `Matched` under every weaker
     /// comparison; this predicate is that single acceptance rule.
+    /// ⚠️ EVERY CLAUSE BELOW IS ABOUT THE COMPARATOR, NOT ABOUT WHAT THE
+    /// RECORDS CONTAIN. This answers "was the comparison maximally strict over
+    /// the records it was given", which is not the same question as "are the
+    /// two runs bitwise identical". A divergence in a syscall's output buffer is
+    /// absent from the records entirely unless [`Self::compare_io_buffers`] is
+    /// set, so this can return `true` for a pair of runs that differ in guest
+    /// memory. Check `compare_io_buffers` alongside this when the distinction
+    /// matters.
     pub fn is_bitwise_parity(&self) -> bool {
         self.compare_logs
             && self.full_trace
@@ -705,7 +741,7 @@ pub(crate) fn retain_verification_logs<const N: usize>(
 pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
-    options: ComparisonOptions<'_>,
+    options: ComparisonOptions,
 ) -> Result<VerificationOutcome, Error> {
     compare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
 }
@@ -713,7 +749,7 @@ pub fn compare_two_runs(
 fn compare_two_runs_with_unsupported_scan(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
-    options: ComparisonOptions<'_>,
+    options: ComparisonOptions,
     scan_unsupported_syscalls: impl Fn(&Path) -> io::Result<BTreeSet<String>>,
 ) -> Result<VerificationOutcome, Error> {
     let ComparedRun {
@@ -739,6 +775,7 @@ fn compare_two_runs_with_unsupported_scan(
         options.strictness,
         options.compare_logs,
         options.diagnostic_full_trace,
+        options.compare_io_buffers,
     );
 
     if out1.stdout != out2.stdout {
@@ -851,7 +888,6 @@ fn compare_two_runs_with_unsupported_scan(
     }
 
     if failed {
-        eprintln!(":: {}", options.failure_message.red().bold());
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
@@ -865,7 +901,6 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_virtual_nanoseconds,
         })
     } else {
-        eprintln!(":: {}", options.success_message.green().bold());
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             guest_status: out2.status,
@@ -874,6 +909,24 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
         })
+    }
+}
+
+/// Announce a verification verdict only after its machine-readable report has
+/// been published.
+///
+/// Keeping this outside [`compare_two_runs`] closes the interval in which the
+/// CLI previously printed `Success` and an outer bucket timeout could kill it
+/// before `write_verification_json` replaced the pending `no_result` report.
+pub fn announce_verification_outcome(
+    outcome: &VerificationOutcome,
+    success_message: &str,
+    failure_message: &str,
+) {
+    if outcome.verified() {
+        eprintln!(":: {}", success_message.green().bold());
+    } else {
+        eprintln!(":: {}", failure_message.red().bold());
     }
 }
 
@@ -929,6 +982,7 @@ mod tests {
         GlobalOpts {
             log,
             log_file: None,
+            log_file_handle: None,
             backend: None,
         }
     }
@@ -1021,12 +1075,11 @@ mod tests {
                 log: right_log,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                compare_io_buffers: false,
                 keep_logs: false,
             },
         )
@@ -1140,12 +1193,11 @@ mod tests {
                 log: right_log,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Stripped,
                 compare_logs: false,
                 diagnostic_full_trace: false,
+                compare_io_buffers: false,
                 keep_logs: false,
             },
         )
@@ -1185,7 +1237,7 @@ mod tests {
 
     #[test]
     fn comparison_spec_maps_strictness_to_concrete_flags() {
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false);
+        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false, false);
         assert!(stripped.strip_lines);
         assert!(!stripped.full_trace);
         assert_eq!(
@@ -1193,7 +1245,7 @@ mod tests {
             LogComparisonMode::Deterministic
         );
 
-        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false);
+        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false, true);
         assert!(!canonical.strip_lines);
         assert!(canonical.canonicalize_addresses);
         assert!(canonical.exact_remainder);
@@ -1201,7 +1253,7 @@ mod tests {
         assert_eq!(canonical.log_scope, ComparedLogScope::Info);
         assert_eq!(canonical.log_comparison_mode(), LogComparisonMode::Info);
 
-        let diagnostic = ComparisonSpec::new(LogCompareStrictness::Canonical, true, true);
+        let diagnostic = ComparisonSpec::new(LogCompareStrictness::Canonical, true, true, true);
         assert_eq!(diagnostic.log_scope, ComparedLogScope::FullTrace);
         assert_eq!(
             diagnostic.log_comparison_mode(),
@@ -1273,12 +1325,11 @@ mod tests {
                 log: right,
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: true,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
                 diagnostic_full_trace: true,
+                compare_io_buffers: false,
                 keep_logs: false,
             },
         )
@@ -1370,12 +1421,11 @@ mod tests {
                     log: right.into_temp_path(),
                 },
                 ComparisonOptions {
-                    success_message: "verified",
-                    failure_message: "failed",
                     verbose: false,
                     strictness: LogCompareStrictness::Canonical,
                     compare_logs: true,
                     diagnostic_full_trace: false,
+                    compare_io_buffers: false,
                     keep_logs,
                 },
             )
@@ -1410,12 +1460,11 @@ mod tests {
                 log: right.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                compare_io_buffers: false,
                 keep_logs: true,
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
@@ -1469,12 +1518,11 @@ mod tests {
                 log: right.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "verified",
-                failure_message: "failed",
                 verbose: false,
                 strictness: LogCompareStrictness::Canonical,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                compare_io_buffers: false,
                 keep_logs: true,
             },
         );
@@ -1827,7 +1875,7 @@ mod tests {
     fn bitwise_parity_contract_accepts_only_full_unfiltered_comparison() {
         // Positive: the exact qualifying comparison the `--verify-strict` path
         // produces.
-        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false);
+        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false, true);
         assert!(
             full.is_bitwise_parity(),
             "a full-INFO unstripped unfiltered comparison must qualify"
@@ -1835,7 +1883,7 @@ mod tests {
 
         // Negatives: each independent weakening of the qualifying spec must be
         // refused, so no single relaxed dimension can pass as bitwise parity.
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false);
+        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false, false);
         assert!(
             !stripped.is_bitwise_parity(),
             "a stripped comparison normalizes away the parity-relevant data"

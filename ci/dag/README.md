@@ -102,7 +102,7 @@ The centralized manifests use an explicit build barrier before execution:
    tree, then atomically publishes a content-addressed bundle. Every later
    shared-target Cargo writer waits on this barrier.
 3. `build.manifest_guests` prepares every `ci=true` program once. One
-   `e2e.manifest_<bucket>` node per TOML bucket declares both producers and runs
+   `e2e.manifest_<bucket>` node per YAML bucket declares both producers and runs
    through `run-with-hermit-e2e-artifact.sh`, which re-verifies identity before
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
    tests may then relink `target/debug/hermit` or restage `target/install_pkg`
@@ -115,7 +115,7 @@ The centralized manifests use an explicit build barrier before execution:
    selects nothing, is a failure rather than a vacuous pass.
 
 Every run node carries a structured `manifest` selector as well as its command.
-`ci/test_harness.sh audit-ci` derives the expected bucket set from the TOMLs,
+`target/debug/test-harness audit-ci` derives the expected bucket set from the YAML manifests,
 requires the command to be the canonical rendering of that selector, and
 compares the aggregate selected cells with `ci/expected-e2e-plan.json`. Buckets
 whose entries are still manual execute as explicit empty nodes; `--allow-empty`

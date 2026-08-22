@@ -12,7 +12,7 @@ Background
 The legacy ``tests/backend-parity/matrix.tsv`` side-matrix (driven by the
 standalone ``run_matrix.py`` harness) records parity per backend for freestanding
 C guests, but only ptrace/DBT/KVM ever run it -- it is invisible to the
-mode x backend x test symmetry enforced over ``tests/e2e/manifests/*.toml`` by
+mode x backend x test symmetry enforced over ``tests/e2e/manifests/*.yaml`` by
 ``ci/manifest-plan`` (PR #1518). #1498 removes ``matrix.tsv`` entirely and folds
 its catalog back into ``run_matrix.py``. Dozens of open PRs still add a
 ``matrix.tsv`` row + a fixture + a ``run_matrix.py`` edit; none can land as-is.
@@ -24,7 +24,7 @@ This tool mechanizes the coverage migration for those PRs. For each source PR it
   2. writes the fixture into the working tree (so the manifest ``program`` path
      exists for the lint) if it is not already present;
   3. appends a symmetric ``[[test]]`` block to
-     ``tests/e2e/manifests/backend-parity-c.toml`` -- ptrace established first,
+     ``tests/e2e/manifests/backend-parity-c.yaml`` -- ptrace established first,
      every backend x mode cell declared, DBT/KVM enabled only where the source
      row's ``--verify`` (L2) witness actually passed, everything else disabled
      with a concrete reason carried over from the matrix row;
@@ -69,12 +69,13 @@ import difflib
 import json
 import subprocess
 import sys
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.toml"
+MANIFEST = REPO_ROOT / "tests/e2e/manifests/backend-parity-c.yaml"
 INVENTORY = REPO_ROOT / "tests/e2e/manifests/inventory/test-files.json"
 BUCKET = "backend-parity-c"
 
@@ -227,88 +228,76 @@ def build_plan(
     return Plan(row.name, slug, program, lane, enabled, disabled, fixture_content, note)
 
 
-def render_test_block(plan: Plan) -> str:
+def render_test_entry(plan: Plan) -> dict:
     requires = ["linux", "x86_64", "userns", "ptrace", "cc"]
     if plan.lane == "privileged":
         requires.insert(4, "cpuid")
-    requires_toml = ", ".join(f'"{r}"' for r in requires)
-    enabled_toml = ", ".join(f'"{b}"' for b in plan.enabled)
-
-    lines = [
-        "",
-        "[[test]]",
-        f'id = "{BUCKET}/{plan.slug}"',
-        f'description = "Strict verification for {plan.program}"',
-        f'lane = "{plan.lane}"',
-        f"requires = [{requires_toml}]",
-        "timeout_seconds = 90",
-        "occasional = false",
-        f'program = "{plan.program}"',
-        "observation = { status = true, stdout = true, stderr = false, artifacts = [] }",
-        "",
-        "[test.modes.verify]",
-        "ci = false",
-        # A generated cell has never been run, so it is born not-running WITH a
-        # reason saying exactly that. ci/manifest-plan enforces this for the
-        # backend-parity-c bucket; do not emit a bare `ci = false`.
-        f'ci_disabled_reason = "{_escape(BIRTH_CI_DISABLED_REASON)}"',
-        f"backends_enabled = [{enabled_toml}]",
-        "[test.modes.verify.backends_disabled]",
-    ]
-    for backend in ("dbt", "kvm", "sabre", "liteinst"):
-        if backend in plan.disabled:
-            lines.append(f'{backend} = "{_escape(plan.disabled[backend])}"')
-    lines += [
-        "",
-        "[test.modes.naked]",
-        "ci = false",
-        'ci_disabled_reason = "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run."',
-        "backends_enabled = []",
-        "[test.modes.naked.backends_disabled]",
-        'native = "This migration inventories strict verification; it does not assert native nondeterminism"',
-        "",
-        "[test.modes.replay]",
-        "ci = false",
-        'ci_disabled_reason = "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest."',
-        "backends_enabled = []",
-        "[test.modes.replay.backends_disabled]",
-        'ptrace = "Record/replay qualification is separate from the initial strict-verification migration"',
-        'dbt = "Record/replay is unsupported by DBT"',
-        'kvm = "Record/replay is unsupported by KVM"',
-        'sabre = "Record/replay is unsupported by SaBRe"',
-        'liteinst = "Record/replay is unsupported by LiteInst"',
-        "",
-        "[test.modes.chaos]",
-        "ci = false",
-        'ci_disabled_reason = "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none."',
-        "backends_enabled = []",
-        "[test.modes.chaos.backends_disabled]",
-        'ptrace = "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle"',
-        'dbt = "Chaos scheduling is unsupported by DBT"',
-        'kvm = "Chaos scheduling is unsupported by KVM"',
-        'sabre = "Chaos scheduling is unsupported by SaBRe"',
-        'liteinst = "Chaos scheduling is unsupported by LiteInst"',
-        "",
-        "[test.modes.custom]",
-        "ci = false",
-        'ci_disabled_reason = "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest."',
-        "backends_enabled = []",
-        "[test.modes.custom.backends_disabled]",
-        'ptrace = "No custom edge-case arguments have been calibrated for this C guest"',
-        'dbt = "No custom edge-case arguments have been calibrated for this C guest"',
-        'kvm = "No custom edge-case arguments have been calibrated for this C guest"',
-        'sabre = "No custom edge-case arguments have been calibrated for this C guest"',
-        'liteinst = "No custom edge-case arguments have been calibrated for this C guest"',
-    ]
-    return "\n".join(lines) + "\n"
+    disabled = {
+        backend: plan.disabled[backend]
+        for backend in ("dbt", "kvm", "sabre", "liteinst")
+        if backend in plan.disabled
+    }
+    common_disabled = {
+        backend: "No custom edge-case arguments have been calibrated for this C guest"
+        for backend in ("ptrace", "dbt", "kvm", "sabre", "liteinst")
+    }
+    return {
+        "id": f"{BUCKET}/{plan.slug}",
+        "description": f"Strict verification for {plan.program}",
+        "lane": plan.lane,
+        "requires": requires,
+        "timeout_seconds": 90,
+        "occasional": False,
+        "program": plan.program,
+        "observation": {"status": True, "stdout": True, "stderr": False, "artifacts": []},
+        "modes": {
+            "verify": {
+                "ci": False,
+                "ci_disabled_reason": BIRTH_CI_DISABLED_REASON,
+                "backends_enabled": plan.enabled,
+                "backends_disabled": disabled,
+            },
+            "naked": {
+                "ci": False,
+                "ci_disabled_reason": "NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.",
+                "backends_enabled": [],
+                "backends_disabled": {"native": "This migration inventories strict verification; it does not assert native nondeterminism"},
+            },
+            "replay": {
+                "ci": False,
+                "ci_disabled_reason": "NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.",
+                "backends_enabled": [],
+                "backends_disabled": {
+                    "ptrace": "Record/replay qualification is separate from the initial strict-verification migration",
+                    "dbt": "Record/replay is unsupported by DBT", "kvm": "Record/replay is unsupported by KVM",
+                    "sabre": "Record/replay is unsupported by SaBRe", "liteinst": "Record/replay is unsupported by LiteInst",
+                },
+            },
+            "chaos": {
+                "ci": False,
+                "ci_disabled_reason": "NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.",
+                "backends_enabled": [],
+                "backends_disabled": {
+                    "ptrace": "Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle",
+                    "dbt": "Chaos scheduling is unsupported by DBT", "kvm": "Chaos scheduling is unsupported by KVM",
+                    "sabre": "Chaos scheduling is unsupported by SaBRe", "liteinst": "Chaos scheduling is unsupported by LiteInst",
+                },
+            },
+            "custom": {
+                "ci": False,
+                "ci_disabled_reason": "NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.",
+                "backends_enabled": [],
+                "backends_disabled": common_disabled,
+            },
+        },
+    }
 
 
-def _escape(text: str) -> str:
-    return text.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def manifest_has_id(manifest_text: str, plan: Plan) -> bool:
-    return f'id = "{BUCKET}/{plan.slug}"' in manifest_text
+def manifest_has_id(manifest: dict, plan: Plan) -> bool:
+    return any(
+        test.get("id") == f"{BUCKET}/{plan.slug}"
+        for test in manifest.get("test", [])
+    )
 
 
 def inventory_entry(program: str) -> dict:
@@ -316,12 +305,12 @@ def inventory_entry(program: str) -> dict:
         "path": program,
         "disposition": "manifest-test",
         "runner": (
-            "ci/test_harness.sh via tests/e2e/manifests/backend-parity-c.toml "
+            "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml "
             "(explicit mode selection; ci=false)"
         ),
         "why": (
-            f"{program} is owned by ci/test_harness.sh via "
-            "tests/e2e/manifests/backend-parity-c.toml (explicit mode selection; "
+            f"{program} is owned by target/debug/test-harness via "
+            "tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; "
             "ci=false): Direct C guest is centrally discoverable with ptrace "
             "verification enabled for explicit runs; it remains outside blocking "
             "CI until its standalone build and output contract are calibrated"
@@ -459,8 +448,10 @@ def plans_from_local(row_str: str, fixture: str) -> tuple:
 # --------------------------------------------------------------------------- #
 def run(plans: list, apply: bool) -> int:
     manifest_text = MANIFEST.read_text()
+    manifest = yaml.safe_load(manifest_text)
     inv = json.loads(INVENTORY.read_text())
-    new_manifest = manifest_text
+    new_manifest = json.loads(json.dumps(manifest))
+    new_manifest_text = manifest_text
     changed_fixtures = []
     converted, skipped_existing = [], []
 
@@ -468,7 +459,12 @@ def run(plans: list, apply: bool) -> int:
         if manifest_has_id(new_manifest, plan):
             skipped_existing.append(plan.slug)
             continue
-        new_manifest = new_manifest.rstrip("\n") + "\n" + render_test_block(plan)
+        entry = render_test_entry(plan)
+        new_manifest["test"].append(entry)
+        rendered = yaml.safe_dump([entry], sort_keys=False, width=1000)
+        new_manifest_text = new_manifest_text.rstrip("\n") + "\n" + "\n".join(
+            f"  {line}" for line in rendered.rstrip("\n").splitlines()
+        ) + "\n"
         converted.append(plan)
 
     inv_after = json.loads(json.dumps(inv))
@@ -490,7 +486,7 @@ def run(plans: list, apply: bool) -> int:
 
     if not apply:
         print("\n--- DRY RUN (no files written) ---")
-        _print_diff(MANIFEST, manifest_text, new_manifest)
+        _print_diff(MANIFEST, manifest_text, new_manifest_text)
         if inv_changed:
             _print_diff(INVENTORY, INVENTORY.read_text(), new_inv_text)
         for plan in converted:
@@ -499,7 +495,7 @@ def run(plans: list, apply: bool) -> int:
         return 0
 
     if converted:
-        MANIFEST.write_text(new_manifest)
+        MANIFEST.write_text(new_manifest_text)
     if inv_changed:
         INVENTORY.write_text(new_inv_text)
     for plan in converted:

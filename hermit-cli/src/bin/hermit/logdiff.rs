@@ -9,6 +9,8 @@
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use clap::Parser;
 use detcore::logdiff;
@@ -36,6 +38,27 @@ pub struct LogDiffCLIOpts {
     #[clap(long)]
     canonical_info: bool,
 
+    /// Compare two runs that are still being written, reporting divergence as
+    /// soon as it appears instead of waiting for both to finish. Only records
+    /// both logs have finished writing are compared, so a half-flushed tail is
+    /// never mistaken for a difference.
+    #[clap(long)]
+    follow: bool,
+
+    /// How often to re-read the logs while following.
+    #[clap(long, value_name = "MILLISECONDS", default_value = "500")]
+    follow_interval_ms: u64,
+
+    /// Give up following after this long. 0 waits indefinitely. Timing out is
+    /// reported as its own outcome, never as agreement.
+    #[clap(long, value_name = "SECONDS", default_value = "300")]
+    follow_timeout_secs: u64,
+
+    /// Consecutive polls with both logs unchanged before they are treated as
+    /// quiescent and following stops.
+    #[clap(long, value_name = "POLLS", default_value = "3")]
+    follow_settle_polls: u32,
+
     #[clap(flatten)]
     pub more: logdiff::LogDiffOpts,
 }
@@ -48,6 +71,10 @@ impl LogDiffCLIOpts {
             file_b: Some(PathBuf::from(b)),
             json: None,
             canonical_info: false,
+            follow: false,
+            follow_interval_ms: 500,
+            follow_timeout_secs: 300,
+            follow_settle_polls: 3,
             more: Default::default(),
         }
     }
@@ -118,19 +145,34 @@ impl LogDiffCLIOpts {
             return ExitStatus::Exited(2);
         }
 
-        let summary = match logdiff::try_log_diff_detailed(&self.file_a, file_b, &options) {
-            Ok(summary) => summary,
-            Err(error) => {
-                eprintln!(
-                    "hermit log-diff: could not compare {} and {}: {error}",
-                    self.file_a.display(),
-                    file_b.display()
-                );
-                return ExitStatus::Exited(2);
-            }
+        if self.follow {
+            return self.follow_two_runs(file_b, &options);
+        }
+
+        let (summary, records_left, records_right) =
+            match logdiff::try_log_diff_with_records(&self.file_a, file_b, &options) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!(
+                        "hermit log-diff: could not compare {} and {}: {error}",
+                        self.file_a.display(),
+                        file_b.display()
+                    );
+                    return ExitStatus::Exited(2);
+                }
+            };
+        let records = JsonRecords {
+            compared: records_left.min(records_right),
+            available_left: records_left,
+            available_right: records_right,
+            withheld_incomplete_tail: false,
         };
+        eprintln!(
+            "hermit log-diff: compared {} records in full (left {} | right {})",
+            records.compared, records_left, records_right
+        );
         if let Some(path) = &self.json
-            && let Err(error) = write_json(path, &json_report(&summary, &options))
+            && let Err(error) = write_json(path, &json_report(&summary, &options, records))
         {
             eprintln!(
                 "hermit log-diff: could not write JSON report to {}: {error}",
@@ -146,6 +188,168 @@ impl LogDiffCLIOpts {
             eprintln!("hermit log-diff: no comparable messages; refusing to report a match");
             ExitStatus::Exited(2)
         }
+    }
+
+    /// Compare two runs while they are still being written.
+    ///
+    /// Exit status is deliberately four-valued, because "they agree", "they
+    /// agree as far as I read", and "I ran out of time before either finished"
+    /// are three different answers and only one of them is good news:
+    ///
+    /// * 0 -- both logs stopped growing and never diverged.
+    /// * 1 -- a divergence was found; the record index bounding it is reported.
+    /// * 2 -- the logs could not be read, or held nothing comparable.
+    /// * 3 -- the timeout expired while at least one run was still writing.
+    fn follow_two_runs(&self, file_b: &Path, options: &logdiff::LogDiffOpts) -> ExitStatus {
+        let interval = Duration::from_millis(self.follow_interval_ms.max(1));
+        let settle_polls = self.follow_settle_polls.max(1);
+        let deadline = (self.follow_timeout_secs > 0)
+            .then(|| Instant::now() + Duration::from_secs(self.follow_timeout_secs));
+
+        let mut previous_sizes: Option<(usize, usize)> = None;
+        let mut unchanged_polls = 0u32;
+        let mut last_reported_records = usize::MAX;
+
+        loop {
+            let (left, right) = match (read_growing_log(&self.file_a), read_growing_log(file_b)) {
+                (Ok(left), Ok(right)) => (left, right),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("hermit log-diff: could not read logs while following: {error}");
+                    return ExitStatus::Exited(2);
+                }
+            };
+
+            // Buffer the comparison transcript: printing it on every poll would
+            // bury the one line that matters.
+            let mut transcript = Vec::new();
+            let comparison =
+                match logdiff::compare_complete_prefix(&left, &right, options, &mut transcript) {
+                    Ok(comparison) => comparison,
+                    Err(error) => {
+                        eprintln!("hermit log-diff: comparison failed while following: {error}");
+                        return ExitStatus::Exited(2);
+                    }
+                };
+            let records = JsonRecords {
+                compared: comparison.records_compared,
+                available_left: comparison.records_available_left,
+                available_right: comparison.records_available_right,
+                withheld_incomplete_tail: true,
+            };
+
+            if records.compared != last_reported_records {
+                eprintln!(
+                    "hermit log-diff: identical so far over {} records (left has {} | right has {})",
+                    records.compared, records.available_left, records.available_right
+                );
+                last_reported_records = records.compared;
+            }
+
+            if comparison.summary.diff_found {
+                std::io::stderr().write_all(&transcript).ok();
+                let first = comparison.summary.first_divergent_record;
+                match first {
+                    Some(index) => eprintln!(
+                        "hermit log-diff: DIVERGED at record {index} of {} compared",
+                        records.compared
+                    ),
+                    None => eprintln!(
+                        "hermit log-diff: DIVERGED within the first {} records compared",
+                        records.compared
+                    ),
+                }
+                return self.finish_follow(
+                    options,
+                    &comparison.summary,
+                    records,
+                    JsonVerdict::Diverged,
+                    "diverged",
+                    ExitStatus::Exited(1),
+                );
+            }
+
+            let sizes = (left.len(), right.len());
+            if previous_sizes == Some(sizes) {
+                unchanged_polls += 1;
+            } else {
+                unchanged_polls = 0;
+            }
+            previous_sizes = Some(sizes);
+
+            if unchanged_polls >= settle_polls {
+                if comparison.summary.matched_with_evidence() {
+                    eprintln!(
+                        "hermit log-diff: both logs unchanged for {settle_polls} polls; \
+                         identical over {} records compared",
+                        records.compared
+                    );
+                    return self.finish_follow(
+                        options,
+                        &comparison.summary,
+                        records,
+                        JsonVerdict::IdenticalSoFar,
+                        "quiescent",
+                        ExitStatus::Exited(0),
+                    );
+                }
+                eprintln!(
+                    "hermit log-diff: both logs unchanged for {settle_polls} polls but only {} \
+                     records were comparable; refusing to report a match",
+                    records.compared
+                );
+                return self.finish_follow(
+                    options,
+                    &comparison.summary,
+                    records,
+                    JsonVerdict::NoComparableMessages,
+                    "quiescent",
+                    ExitStatus::Exited(2),
+                );
+            }
+
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                eprintln!(
+                    "hermit log-diff: timed out after {}s with {} records compared and at least \
+                     one run still writing; NOT a match -- the rest was never read",
+                    self.follow_timeout_secs, records.compared
+                );
+                return self.finish_follow(
+                    options,
+                    &comparison.summary,
+                    records,
+                    JsonVerdict::IdenticalSoFar,
+                    "timeout",
+                    ExitStatus::Exited(3),
+                );
+            }
+
+            std::thread::sleep(interval);
+        }
+    }
+
+    fn finish_follow(
+        &self,
+        options: &logdiff::LogDiffOpts,
+        summary: &logdiff::LogDiffSummary,
+        records: JsonRecords,
+        verdict: JsonVerdict,
+        stopped_because: &'static str,
+        status: ExitStatus,
+    ) -> ExitStatus {
+        let Some(path) = &self.json else {
+            return status;
+        };
+        let mut report = json_report(summary, options, records);
+        report.verdict = verdict;
+        report.follow_stopped_because = Some(stopped_because);
+        if let Err(error) = write_json(path, &report) {
+            eprintln!(
+                "hermit log-diff: could not write JSON report to {}: {error}",
+                path.display()
+            );
+            return ExitStatus::Exited(2);
+        }
+        status
     }
 }
 
@@ -174,6 +378,11 @@ fn canonical_comparison_is_unrelaxed(options: &logdiff::LogDiffOpts) -> Result<(
 enum JsonVerdict {
     NoResult,
     Matched,
+    /// No difference over the records compared so far, with more of at least
+    /// one run still unread. This is deliberately *not* `Matched`: a caller who
+    /// treats agreement over a prefix as agreement overall will stop early and
+    /// conclude the wrong thing. Read `records.compared` before believing it.
+    IdenticalSoFar,
     Diverged,
     NoComparableMessages,
 }
@@ -182,6 +391,19 @@ enum JsonVerdict {
 struct JsonMessageCounts {
     left: usize,
     right: usize,
+}
+
+/// How much of each run was actually read. Always present: a verdict without a
+/// denominator cannot be acted on.
+#[derive(Serialize)]
+struct JsonRecords {
+    /// Records compared in both streams -- the shorter side bounds this.
+    compared: usize,
+    available_left: usize,
+    available_right: usize,
+    /// True when a still-being-written tail was deliberately held back so a
+    /// partial write could not read as a difference.
+    withheld_incomplete_tail: bool,
 }
 
 #[derive(Serialize)]
@@ -200,7 +422,16 @@ struct JsonComparison<'a> {
 struct JsonReport<'a> {
     verdict: JsonVerdict,
     selected_messages: JsonMessageCounts,
+    records: JsonRecords,
     comparison: JsonComparison<'a>,
+    /// Why following stopped: `diverged`, `quiescent`, or `timeout`. Absent for
+    /// a one-shot comparison of two finished logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follow_stopped_because: Option<&'static str>,
+    /// 1-based index of the first differing record, located by bisection rather
+    /// than merely bounded by `records.compared`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_divergent_record: Option<usize>,
     first_divergent_scheduler_turn: Option<u64>,
     first_divergent_virtual_nanoseconds: Option<u64>,
 }
@@ -208,6 +439,7 @@ struct JsonReport<'a> {
 fn json_report<'a>(
     summary: &logdiff::LogDiffSummary,
     options: &'a logdiff::LogDiffOpts,
+    records: JsonRecords,
 ) -> JsonReport<'a> {
     let verdict = if summary.diff_found {
         JsonVerdict::Diverged
@@ -236,6 +468,9 @@ fn json_report<'a>(
             left: summary.compared_left,
             right: summary.compared_right,
         },
+        records,
+        follow_stopped_because: None,
+        first_divergent_record: summary.first_divergent_record,
         comparison: JsonComparison {
             stream,
             unsafe_strip_lines: options.strip_lines,
@@ -258,10 +493,30 @@ fn pending_json_report(options: &logdiff::LogDiffOpts) -> JsonReport<'_> {
         compared_right: 0,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
     };
-    let mut report = json_report(&summary, options);
+    let mut report = json_report(&summary, options, no_records());
     report.verdict = JsonVerdict::NoResult;
     report
+}
+
+fn no_records() -> JsonRecords {
+    JsonRecords {
+        compared: 0,
+        available_left: 0,
+        available_right: 0,
+        withheld_incomplete_tail: false,
+    }
+}
+
+/// Read a log that may not exist yet or may be mid-write. A run that has not
+/// created its log is "nothing to compare", not an error.
+fn read_growing_log(path: &Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 fn write_json(path: &Path, report: &JsonReport<'_>) -> std::io::Result<()> {
@@ -284,6 +539,171 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// Append `count` records to `path`, one every `gap`, flushing each so a
+    /// reader sees a genuinely growing file. Record `diverge_at` carries
+    /// `marker`, so two writers with different markers part company there.
+    fn spawn_writer(
+        path: PathBuf,
+        marker: &'static str,
+        diverge_at: usize,
+        count: usize,
+        gap: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::create(&path).unwrap();
+            for index in 0..count {
+                let body = if index == diverge_at { marker } else { "same" };
+                writeln!(
+                    file,
+                    "Apr 09 06:08:{:02}.100  INFO detcore: record {index} {body}",
+                    index % 60
+                )
+                .unwrap();
+                file.flush().unwrap();
+                std::thread::sleep(gap);
+            }
+        })
+    }
+
+    fn follow_options() -> logdiff::LogDiffOpts {
+        logdiff::LogDiffOpts {
+            comparison: logdiff::LogComparisonMode::Info,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn follow_reports_divergence_before_either_run_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let json = directory.path().join("follow.json");
+
+        // 200 records each, diverging at record 5. If follow mode waited for
+        // completion this would take ~4s; it should answer in a fraction of it.
+        let gap = Duration::from_millis(20);
+        let writers = [
+            spawn_writer(left.clone(), "LEFT", 5, 200, gap),
+            spawn_writer(right.clone(), "RIGHT", 5, 200, gap),
+        ];
+
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.follow = true;
+        options.follow_interval_ms = 10;
+        options.follow_timeout_secs = 30;
+        options.json = Some(json.clone());
+
+        let started = Instant::now();
+        let status = options.follow_two_runs(&right, &follow_options());
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(status, ExitStatus::Exited(1)),
+            "divergence must exit 1, got {status:?}"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(report["verdict"], "diverged");
+        assert_eq!(report["follow_stopped_because"], "diverged");
+        assert!(
+            report["records"]["withheld_incomplete_tail"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // The divergence is located, not merely bounded. Records are 1-based
+        // and the writers differ at 0-based index 5, i.e. the 6th record.
+        assert_eq!(
+            report["first_divergent_record"], 6,
+            "the report must name the record that differs"
+        );
+
+        // The whole point: it answered without reading either run to the end.
+        let compared = report["records"]["compared"].as_u64().unwrap();
+        assert!(
+            (6..200).contains(&compared),
+            "must bound the divergence after it is written and long before the \
+             runs end, compared={compared}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must not wait for completion, took {elapsed:?}"
+        );
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn follow_timing_out_is_not_reported_as_agreement() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let json = directory.path().join("follow.json");
+
+        // Identical and still being written when the timeout expires.
+        let gap = Duration::from_millis(30);
+        let writers = [
+            spawn_writer(left.clone(), "same", usize::MAX, 200, gap),
+            spawn_writer(right.clone(), "same", usize::MAX, 200, gap),
+        ];
+
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.follow = true;
+        options.follow_interval_ms = 100;
+        options.follow_timeout_secs = 1;
+        options.json = Some(json.clone());
+
+        let status = options.follow_two_runs(&right, &follow_options());
+        assert!(
+            matches!(status, ExitStatus::Exited(3)),
+            "an unfinished follow must not share an exit code with success, got {status:?}"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(
+            report["verdict"], "identical_so_far",
+            "agreement over a prefix is never `matched`"
+        );
+        assert_eq!(report["follow_stopped_because"], "timeout");
+        assert!(report["records"]["compared"].as_u64().unwrap() > 0);
+
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn every_report_carries_the_record_count_it_was_based_on() {
+        let options = logdiff::LogDiffOpts::default();
+        let summary = logdiff::LogDiffSummary {
+            diff_found: false,
+            compared_left: 4,
+            compared_right: 4,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+        };
+        let records = JsonRecords {
+            compared: 40,
+            available_left: 41,
+            available_right: 40,
+            withheld_incomplete_tail: true,
+        };
+        let value = serde_json::to_value(json_report(&summary, &options, records)).unwrap();
+        assert_eq!(value["records"]["compared"], 40);
+        assert_eq!(value["records"]["available_left"], 41);
+        assert_eq!(value["records"]["available_right"], 40);
+
+        // Even the placeholder written before any comparison names its zero.
+        let pending = serde_json::to_value(pending_json_report(&options)).unwrap();
+        assert_eq!(pending["verdict"], "no_result");
+        assert_eq!(pending["records"]["compared"], 0);
+    }
 
     #[test]
     fn one_log_and_two_log_json_forms_parse() {
@@ -311,8 +731,9 @@ mod tests {
             compared_right: 8,
             first_divergent_scheduler_turn: Some(17),
             first_divergent_virtual_nanoseconds: Some(123),
+            first_divergent_record: Some(9),
         };
-        let value = serde_json::to_value(json_report(&summary, &options)).unwrap();
+        let value = serde_json::to_value(json_report(&summary, &options, no_records())).unwrap();
         assert_eq!(value["verdict"], "diverged");
         assert_eq!(value["selected_messages"]["left"], 8);
         assert_eq!(value["comparison"]["stream"], "deterministic");
@@ -326,7 +747,7 @@ mod tests {
             ..summary
         };
         assert_eq!(
-            serde_json::to_value(json_report(&matched, &options)).unwrap()["verdict"],
+            serde_json::to_value(json_report(&matched, &options, no_records())).unwrap()["verdict"],
             "matched"
         );
 
@@ -336,7 +757,7 @@ mod tests {
             ..matched
         };
         assert_eq!(
-            serde_json::to_value(json_report(&empty, &options)).unwrap()["verdict"],
+            serde_json::to_value(json_report(&empty, &options, no_records())).unwrap()["verdict"],
             "no_comparable_messages"
         );
     }
@@ -381,8 +802,9 @@ mod tests {
             compared_right: 3,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
         };
-        write_json(&path, &json_report(&summary, &options)).unwrap();
+        write_json(&path, &json_report(&summary, &options, no_records())).unwrap();
         let terminal = std::fs::read_to_string(&path).unwrap();
         assert_eq!(terminal.lines().count(), 1);
         assert_eq!(

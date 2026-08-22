@@ -31,10 +31,12 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::Shebang;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -55,6 +57,7 @@ use super::tracing::init_file_tracing;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
@@ -168,7 +171,7 @@ pub struct RunOpts {
     /// default; this explicit flag additionally rejects unsupported syscalls immediately.
     #[clap(
         long,
-        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io"]
+        conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
     )]
     strict: bool,
 
@@ -427,7 +430,7 @@ pub struct RunOpts {
     e9patch_program: Option<PathBuf>,
 }
 
-fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
+pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
     static ENV_RE: LazyLock<regex::Regex> = LazyLock::new(||
         // Here we are extremely permissive, allowing all charecters in the "Portable Character
         // Set", ISO/IEC 6429:1992 standard:
@@ -735,6 +738,18 @@ fn is_vmm_program(program: &Path) -> bool {
         .is_some_and(|name| name.starts_with("qemu-system-"))
 }
 
+/// Whether the emulator's own command line already asks for QEMU's
+/// instruction-derived clock.
+///
+/// `-icount` is the remedy this advisory recommends, so a run that already
+/// passes it has nothing left to act on and the advisory only adds noise.
+/// Accepts both spellings QEMU takes: `-icount shift=0,sleep=off` as two
+/// arguments, and `-icount=shift=0,sleep=off` as one.
+fn emulator_uses_instruction_count_clock(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "-icount" || arg.starts_with("-icount="))
+}
+
 /// Advisory warning for running a VMM under Hermit's host-time virtualization.
 ///
 /// QEMU and similar emulators derive the emulated PIT, PM timer, APIC timer,
@@ -744,18 +759,33 @@ fn is_vmm_program(program: &Path) -> bool {
 /// observes inconsistent clock domains and its calibration breaks. See issue #6
 /// and `docs/QEMU_BOOT.md`. Returns the message to print, or `None` when no
 /// warning applies.
-fn vmm_time_virtualization_warning(program: &Path, virtualize_time: bool) -> Option<String> {
-    if virtualize_time && is_vmm_program(program) {
+///
+/// WHAT THIS USED TO SAY, AND WHY IT NO LONGER SAYS IT. Until 2026-08-21 the
+/// message offered `--no-virtualize-time --no-virtualize-metadata` as one of two
+/// remedies. Measured on 2026-08-21 with hermit `f05bf04e4f`, a busybox guest at
+/// one vCPU and no `-icount`, that option changes nothing about this failure:
+/// the run with it and the run without it both panic in guest timer setup and
+/// both produce a 9,233-byte console. Combined with `--strict` it is worse than
+/// useless — strict mode rejects the now-unvirtualized `gettimeofday` and Hermit
+/// exits 1 before the guest starts. Recommending it sent readers down a dead end
+/// at the moment they were most likely to follow the advice, so the message now
+/// names only remedies that were measured to reach a booted guest.
+fn vmm_time_virtualization_warning(
+    program: &Path,
+    args: &[String],
+    virtualize_time: bool,
+) -> Option<String> {
+    if virtualize_time && is_vmm_program(program) && !emulator_uses_instruction_count_clock(args) {
         Some(format!(
             "WARNING: {} looks like a hardware emulator (VMM). Hermit's host-time \
              virtualization exposes mutually inconsistent clock sources (a synthetic RDTSC \
              versus a virtualized clock_gettime) to the emulated guest, which can corrupt its \
              clock calibration (for example \"Unable to calibrate against PIT\", TSC marked \
-             unstable, or \"No current clocksource\") and stall boot. If the nested guest \
-             misbehaves, either disable Hermit's virtual clock with \
-             --no-virtualize-time --no-virtualize-metadata, or make the emulator use a single \
-             instruction-derived clock (for QEMU: -icount shift=0,sleep=off). \
-             See docs/QEMU_BOOT.md.",
+             unstable, or \"No current clocksource\") and stall boot. Two routes were measured \
+             to reach a booted guest: give the emulator a single instruction-derived clock \
+             (for QEMU: -icount shift=0,sleep=off), or pass no_timer_check on the nested \
+             guest's kernel command line. Note that -icount forecloses multi-threaded TCG, \
+             which QEMU refuses to combine with it. See docs/QEMU_BOOT.md.",
             program.display()
         ))
     } else {
@@ -771,19 +801,88 @@ fn vmm_time_warning_fires_for_qemu_with_virtual_time() {
         "/usr/bin/qemu-system-x86_64",
         "qemu-system-aarch64",
     ] {
-        let warning = vmm_time_virtualization_warning(Path::new(program), true);
+        let warning = vmm_time_virtualization_warning(Path::new(program), &[], true);
         let message = warning
             .unwrap_or_else(|| panic!("expected a warning for {program} under virtual time"));
-        assert!(message.contains("--no-virtualize-time"));
         assert!(message.contains("-icount"));
+        assert!(message.contains("no_timer_check"));
+    }
+}
+
+/// The advisory must not send a reader to a route that does not work.
+///
+/// This assertion replaces one that required the message to CONTAIN
+/// `--no-virtualize-time`. That earlier assertion was not wrong when it was
+/// written — it pinned the wording deliberately — but it outlived the
+/// measurement, so a passing test stood between the reader and a correction.
+/// The pin is kept and inverted rather than deleted: the wording is still
+/// asserted, now against what the measurement supports.
+#[test]
+fn vmm_time_warning_does_not_recommend_disabling_virtual_time() {
+    let message = vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &[], true)
+        .expect("expected a warning under virtual time");
+    assert!(
+        !message.contains("--no-virtualize-time"),
+        "the advisory must not recommend --no-virtualize-time: measured 2026-08-21, it leaves \
+         the guest panicking in timer setup with a byte-identical console, and combined with \
+         --strict it aborts the run before the guest starts. Message was: {message}"
+    );
+    assert!(
+        !message.contains("--no-virtualize-metadata"),
+        "same: --no-virtualize-metadata is half of a route that does not work. Message was: \
+         {message}"
+    );
+}
+
+/// The second half of the defect: the advisory fired whenever virtual time was
+/// on, including for runs that had already applied its own recommendation.
+/// Measured before the fix: `hermit run --no-sequentialize-threads -- \
+/// qemu-system-x86_64 -icount shift=0,sleep=off ...` printed the warning.
+#[test]
+fn vmm_time_warning_silent_when_the_emulator_already_uses_icount() {
+    for args in [
+        vec!["-icount".to_string(), "shift=0,sleep=off".to_string()],
+        vec!["-icount=shift=0,sleep=off".to_string()],
+        vec![
+            "-nographic".to_string(),
+            "-icount".to_string(),
+            "shift=auto".to_string(),
+        ],
+    ] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &args, true).is_none(),
+            "the emulator already uses the instruction-derived clock this advisory \
+             recommends, so there is nothing left to act on: {args:?}"
+        );
+    }
+}
+
+/// The guard on the guard: a command line that merely mentions icount in some
+/// other position must still warn, or the silence above would swallow real
+/// cases.
+#[test]
+fn vmm_time_warning_still_fires_for_arguments_that_only_resemble_icount() {
+    for args in [
+        vec!["-no-icount".to_string()],
+        vec!["--icount".to_string()],
+        vec!["-append".to_string(), "icount=1".to_string()],
+        vec!["-drive".to_string(), "file=icount.qcow2".to_string()],
+    ] {
+        assert!(
+            vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &args, true).is_some(),
+            "these do not enable QEMU's instruction-derived clock, so the advisory still \
+             applies: {args:?}"
+        );
     }
 }
 
 #[test]
 fn vmm_time_warning_silent_without_virtual_time() {
-    // The workaround (disabling virtual time) must not itself warn.
+    // Hermit's virtual clock is off, so there is no clock-domain mismatch to
+    // warn about. (This is not an endorsement of --no-virtualize-time as a
+    // remedy for a stalled boot; see the note on the warning function.)
     assert!(
-        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), false).is_none(),
+        vmm_time_virtualization_warning(Path::new("qemu-system-x86_64"), &[], false).is_none(),
         "no warning is expected once virtual time is disabled"
     );
 }
@@ -792,7 +891,7 @@ fn vmm_time_warning_silent_without_virtual_time() {
 fn vmm_time_warning_silent_for_non_vmm_programs() {
     for program in ["ls", "/bin/echo", "qemu-img", "my-qemu-wrapper"] {
         assert!(
-            vmm_time_virtualization_warning(Path::new(program), true).is_none(),
+            vmm_time_virtualization_warning(Path::new(program), &[], true).is_none(),
             "unexpected VMM warning for {program}"
         );
     }
@@ -1318,6 +1417,68 @@ fn strict_flag_rejects_determinism_opt_outs() {
 }
 
 #[test]
+fn strict_rejects_strace_only() {
+    // `--strace-only`'s own doc comment says it is shorthand for, among other
+    // things, `--no-sequentialize-threads --no-deterministic-io` -- the exact
+    // two flags `--strict` already refuses by name. Accepting the shorthand
+    // while refusing its parts is the inconsistency this closes.
+    let error = RunOpts::try_parse_from(["fakehermit", "--strict", "--strace-only", "fakeprog"])
+        .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    let message = error.to_string();
+    assert!(message.contains("--strict"));
+    assert!(message.contains("--strace-only"));
+}
+
+#[test]
+fn strict_rejects_every_route_to_host_networking() {
+    // Explicit, and the two routes that reach host networking as a side effect
+    // of a flag that is not about networking. All three were accepted silently
+    // before: measured from inside the guest, each showed interfaces `eth0 lo`
+    // where `--strict` alone shows `lo`.
+    for (args, expected_cause) in [
+        (vec!["--strict", "--network=host"], "--network=host"),
+        (vec!["--strict", "--no-namespace"], "--no-namespace"),
+        (vec!["--strict", "--gdbserver"], "--gdbserver"),
+    ] {
+        let mut argv = vec!["fakehermit"];
+        argv.extend(args.iter().copied());
+        argv.push("fakeprog");
+        let mut opts = match RunOpts::try_parse_from(&argv) {
+            Ok(opts) => opts,
+            Err(error) => {
+                // `--no-namespace` already carries a clap conflict with
+                // `network`; a parse-time refusal is an acceptable refusal.
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+                continue;
+            }
+        };
+        let error = opts
+            .validate_args_with_perf_support(true)
+            .expect_err(&format!("{argv:?} must be refused under --strict"));
+        let message = error.to_string();
+        assert!(
+            message.contains("--strict"),
+            "{argv:?}: message must name --strict: {message}"
+        );
+        assert!(
+            message.contains(expected_cause),
+            "{argv:?}: message must name the cause {expected_cause}: {message}"
+        );
+    }
+}
+
+#[test]
+fn non_strict_runs_still_allow_host_networking() {
+    // The refusal is about `--strict` claiming something it did not enforce,
+    // not about forbidding host networking outright.
+    let mut opts = RunOpts::parse_from(["fakehermit", "--network=host", "fakeprog"]);
+    opts.validate_args_with_perf_support(true)
+        .expect("host networking without --strict must remain allowed");
+    assert_eq!(opts.network, NetworkingMode::Host);
+}
+
+#[test]
 fn gdbserver_forces_host_networking() {
     // Without --gdbserver the default networking stays local.
     let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
@@ -1464,6 +1625,68 @@ fn image_script_validation_resolves_interpreter_inside_rootfs() {
     std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     validate_executable(&script, Path::new("/bin/image-script"), Some(rootfs)).unwrap();
+
+    std::fs::write(&script, b"#!/missing-image-interpreter\nexit 0\n").unwrap();
+    let error = validate_executable(&script, Path::new("/bin/image-script"), Some(rootfs))
+        .expect_err("a missing guest interpreter must be rejected");
+    assert!(
+        error.to_string().contains("/missing-image-interpreter"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// End-to-end preflight regression: an executable whose complete contents are a
+/// shebang with no interpreter must be *rejected* by `validate_executable`, and
+/// must not panic on the way there.
+///
+/// This is the checked-in discrimination for the shared-parser change. Each of
+/// the two pre-fix states fails it, for a different reason:
+///
+/// * With the old duplicated `shebang_interpreter` helper in this file — the one
+///   that did `bytes[2..].iter().position(..)? + 2` — the `?` returns `None` for
+///   these inputs, so `validate_executable` skips its shebang block entirely and
+///   returns `Ok(())`. Preflight silently accepts the file. The `Ok(())` arm
+///   below panics.
+/// * With `let mut j = 1 + i;` restored in `Shebang::from_buf`, the shared
+///   parser slices `&buf[i..i + 1]` where `i == buf.len()` and panics with
+///   "range end index N out of range for slice of length N".
+///
+/// Scope: this pins one preflight rejection for one input class. It is not a
+/// shebang-parser test — interpreter arguments, the 256-byte truncation
+/// boundary, and non-UTF-8 interpreter paths are not covered here, and the
+/// positive case (a resolvable interpreter) lives in
+/// `image_script_validation_resolves_interpreter_inside_rootfs`.
+///
+/// `#!\n` is carried for completeness only: it already yielded an empty
+/// interpreter under the old helper, so on its own it discriminates nothing. The
+/// two inputs that carry the regression are `#!` and `#! \t`, the shapes whose
+/// interpreter field runs to the end of the header buffer.
+#[test]
+fn validate_executable_rejects_empty_shebang_interpreter() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let script = tmp.path().join("empty-shebang");
+    let requested = Path::new("/bin/empty-shebang");
+
+    for contents in [b"#!".as_slice(), b"#! \t", b"#!\n"] {
+        std::fs::write(&script, contents).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The empty-interpreter rejection precedes guest-root resolution, so the
+        // host preflight path and the image path must both reach it.
+        for guest_root in [None, Some(tmp.path())] {
+            let error = match validate_executable(&script, requested, guest_root) {
+                Ok(()) => panic!(
+                    "preflight accepted an executable whose contents are {contents:?} \
+                     (guest_root: {guest_root:?}); it must be rejected"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("empty shebang interpreter"),
+                "contents {contents:?} (guest_root: {guest_root:?}): unexpected error: {error:#}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1546,20 +1769,7 @@ fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     let mut file = File::open(path).ok()?;
     let mut bytes = [0_u8; 256];
     let count = file.read(&mut bytes).ok()?;
-    let bytes = &bytes[..count];
-    if !bytes.starts_with(b"#!") {
-        return None;
-    }
-
-    let start = bytes[2..]
-        .iter()
-        .position(|byte| !matches!(byte, b' ' | b'\t'))?
-        + 2;
-    let end = bytes[start..]
-        .iter()
-        .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-        .map_or(bytes.len(), |offset| start + offset);
-    Some(PathBuf::from(OsStr::from_bytes(&bytes[start..end])))
+    Shebang::interpreter_from_buf(&bytes[..count])
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2200,12 +2410,49 @@ impl RunOpts {
             self.network = NetworkingMode::Host;
         }
 
+        // `--strict` calls itself fail-closed strict deterministic mode, so it
+        // must refuse the settings hermit itself documents as
+        // determinism-compromising rather than accept them silently. Before
+        // this, `--strict --network=host` exited 0 with no warning, even though
+        // `--network`'s own help says `host` "compromises isolation and
+        // deterministic reproducibility".
+        //
+        // Checked HERE, after every override above, because two of the three
+        // routes to host networking are side effects of flags that are not
+        // about networking at all: `--no-namespace` sets it above, and
+        // `--gdbserver` sets it just above (that one at least prints a
+        // warning; the others were silent). Measured from inside the guest,
+        // `--strict` alone sees interfaces `lo`, while `--strict --network=host`,
+        // `--strict --no-namespace` and `--strict --strace-only` all see
+        // `eth0 lo`.
+        //
+        // This forbids rather than warns because the directive is that a hole
+        // must be opened deliberately: drop `--strict`, or ask for the hole
+        // explicitly without also claiming strictness.
+        if self.strict && self.network == NetworkingMode::Host {
+            let cause = if self.no_namespace {
+                "--no-namespace, which forces host networking"
+            } else if self.det_opts.det_config.gdbserver {
+                "--gdbserver, which forces host networking"
+            } else {
+                "--network=host"
+            };
+            anyhow::bail!(
+                "--strict is fail-closed deterministic mode and cannot be combined with {}: \
+                 host networking exposes the guest to external traffic that hermit does not \
+                 determinize. Re-run without --strict to allow it deliberately.",
+                cause
+            );
+        }
+
         // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
         // whose emulated guest clock calibration this corrupts (issue #6).
         // Checked last so it reflects any overrides above that disable virtual
         // time (e.g. --strace-only).
         let virtualize_time = self.det_opts.det_config.virtualize_time;
-        if let Some(warning) = vmm_time_virtualization_warning(&self.program, virtualize_time) {
+        if let Some(warning) =
+            vmm_time_virtualization_warning(&self.program, &self.args, virtualize_time)
+        {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
             eprintln!("{warning}");
         }
@@ -2740,6 +2987,39 @@ impl RunOpts {
         } = self.mounts(tmpfs.path())?;
 
         let mut command = Command::new(&self.program);
+        // `--namespace-only` does NOT go through `with_container`: it unshares
+        // `Namespace::PID` and execs the guest directly, so the guest process
+        // ITSELF becomes PID 1 of the new namespace and inherits the same
+        // undeliverable-signal protection. An adversarial review found this
+        // second launch path after the `with_container` guards were in place --
+        // the fix worked and was not yet complete.
+        //
+        // There is no closure to arm here, so the guard goes in `pre_exec`,
+        // which reverie runs in the forked child before the guest image is
+        // loaded (`reverie-process/src/container.rs:738`). `PR_SET_PDEATHSIG`
+        // is preserved across `execve`, so it is still armed once the guest is
+        // running; reverie uses the same idiom for exec'd untraced members in
+        // `safeptrace/src/notifier.rs`.
+        //
+        // Only the death signal is armed, deliberately. The SIGTERM/SIGINT/
+        // SIGHUP handlers installed for the `with_container` path cannot help
+        // here: `execve` resets caught signals to `SIG_DFL`, so any handler set
+        // before exec is gone by the time the guest runs. Installing one would
+        // also be wrong on its own terms -- in this mode PID 1 is the user's own
+        // program, and hermit changing its signal dispositions would alter the
+        // behaviour being observed.
+        //
+        // SAFETY: the closure calls only `prctl(PR_SET_PDEATHSIG)`, which is
+        // async-signal-safe, touches no caller memory, and allocates nothing --
+        // the requirements for a `pre_exec` callback between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(Errno::last());
+                }
+                Ok(())
+            });
+        }
         command
             .args(&self.args)
             .unshare(Namespace::PID)
@@ -2868,6 +3148,34 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
+        // Say what was actually established. Without `--detlog-io-buffers` the
+        // compared records carry no syscall output-buffer CONTENT -- Reverie
+        // types many output buffers as bare pointers, so the record shows the
+        // address and not the bytes -- and two runs whose buffers differ while
+        // their return values agree compare equal. Measured on a netlink
+        // `recvmsg` that returns a stable `Ok(1468)` while four payload bytes
+        // vary: this path reported "Determinism verified" on a run that the same
+        // command with `--detlog-io-buffers` reports as diverged. Claiming
+        // determinism there was the defect, so the sentence now names its limit.
+        let success_message = if kvm_output_only {
+            "Success: KVM guest output and exit status matched."
+        } else if !self.det_opts.det_config.detlog_io_buffers {
+            // The "Determinism verified" marker is RETAINED verbatim and the
+            // qualification appended after it. That is not politeness: ~110
+            // files in this repository assert on that exact substring -- Rust
+            // integration tests, tests/e2e/lib/**/*.sh, and the backend-parity
+            // Python harnesses -- so replacing the sentence would be a
+            // project-wide contract change rather than a wording fix. Appending
+            // keeps every consumer working while the reader still learns the
+            // limit.
+            "Success: deterministic. Determinism verified. NOTE: syscall \
+             output-buffer CONTENT was not compared, so a divergence confined to \
+             a buffer whose length is stable would not have been seen; add \
+             --detlog-io-buffers to include it."
+        } else {
+            "Success: deterministic. Determinism verified."
+        };
+        let failure_message = "Failure: nondeterministic.";
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -2878,12 +3186,6 @@ impl RunOpts {
                 log: log2_path,
             },
             ComparisonOptions {
-                success_message: if kvm_output_only {
-                    "Success: KVM guest output and exit status matched."
-                } else {
-                    "Success: deterministic. Determinism verified."
-                },
-                failure_message: "Failure: nondeterministic.",
                 verbose: self.verify_verbose,
                 // --verify-verbose historically implied a bitwise compare (it
                 // flipped strip_lines off + FullTrace on); preserve that, and let
@@ -2895,6 +3197,7 @@ impl RunOpts {
                 },
                 compare_logs: !kvm_output_only,
                 diagnostic_full_trace: self.verify_verbose,
+                compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
                 keep_logs: self.keep_logs,
             },
         )?;
@@ -2906,6 +3209,7 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_verification_json(path, &outcome)?;
         }
+        announce_verification_outcome(&outcome, success_message, failure_message);
 
         // On divergence, preserve the historical behavior: return the error
         // (nonzero process exit) without emitting the guest's output or backend
@@ -3272,6 +3576,22 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn verification_report_is_published_before_success_is_announced() {
+        let source = include_str!("run.rs");
+        let verification = source
+            .split_once("let outcome = compare_two_runs(")
+            .expect("verification comparison")
+            .1;
+        let publish = verification
+            .find("write_verification_json(path, &outcome)")
+            .expect("verification report publication");
+        let announce = verification
+            .find("announce_verification_outcome(&outcome")
+            .expect("verification announcement");
+        assert!(publish < announce);
+    }
 
     #[test]
     fn verification_log_flags_are_discoverable_and_old_print_spelling_still_parses() {

@@ -218,6 +218,41 @@ enum Subcommand {
     Replay(ReplayOpts),
 
     /// Print one log canonically, or compare two run/record logs.
+    ///
+    /// COMPARING TWO SEPARATELY-PRODUCED RUNS: MAKE THE TWO COMMAND LINES
+    /// BYTE-IDENTICAL, or you will measure your own inputs.
+    ///
+    /// The kernel places argv and the environment at the top of the initial
+    /// process stack, so a command-line difference perturbs the guest before it
+    /// executes a single instruction. That one fact shows up as two different
+    /// failure modes, with two different triggers, and the obvious fix for the
+    /// first does not fix the second:
+    ///
+    ///   * A LENGTH difference moves the entry stack pointer, so every stack
+    ///     ADDRESS shifts. Measured: one byte of argv moved addresses by 32
+    ///     bytes -- not one-for-one, because the stack is aligned -- and two
+    ///     otherwise identical runs diverged 20 records in.
+    ///
+    ///   * A CONTENT difference at equal length leaves the addresses alone but
+    ///     changes the stack BYTES, which --detlog-stack hashes. Measured: with
+    ///     argv padded to equal length the stack range was identical in both
+    ///     runs, yet the hash diverged 14 records in; with byte-identical argv
+    ///     that same hash held for 5023 records.
+    ///
+    /// So padding to equal length fixes the first and leaves the second. Only
+    /// byte-identical argv and environment fixes both. If the two runs must
+    /// differ, put the difference somewhere other than the command line -- for
+    /// example in a file the guest reads.
+    ///
+    /// `hermit run --verify` is NOT affected: it produces both runs from one
+    /// invocation, so their command lines are identical by construction. This
+    /// warning is for comparisons you assemble yourself.
+    ///
+    /// The general point, which outlives this particular trap: before reusing a
+    /// control convention from earlier work, ask what the NEW measurement is
+    /// sensitive to. Holding a run-directory name to a fixed width controls
+    /// length but not content, and those are different properties.
+    #[clap(verbatim_doc_comment)]
     LogDiff(LogDiffCLIOpts),
 
     /// Analyze Pass and failing runs
@@ -341,9 +376,18 @@ fn main() {
         status.raise_or_exit();
     }
     let Args {
-        global,
+        mut global,
         mut command,
     } = Args::parse();
+
+    // Open --log-file HERE, in the host's filename namespace, before any container
+    // exists. This is the moment a shell would perform `> file`, and doing it later
+    // -- inside the container, where tracing must be initialized -- resolves the path
+    // against the guest's fresh /tmp and silently discards the log.
+    if let Err(err) = global.open_log_file() {
+        display_error(err);
+        ExitStatus::Exited(1).raise_or_exit();
+    }
 
     command
         .main(&global)

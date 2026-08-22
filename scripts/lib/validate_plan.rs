@@ -49,6 +49,7 @@ use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::ResourceHint;
 use safe_ci_dag_runner::model::Step;
+use safe_ci_dag_runner::model::StepClass;
 
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;
@@ -64,6 +65,13 @@ const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
 /// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
 /// non-cap.
 const PREFLIGHT_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
+/// The manifest audit is an executable consumer, so its producer is part of
+/// the always-on preflight spine rather than an incidental lane root.
+pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
+pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
+const MANIFEST_PLAN_BUILD_TIMEOUT_S: i64 = 180;
+const MANIFEST_PLAN_BUILD_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
 /// Per-lane-node CPU budget applied as the DAG-level default, closing the
 /// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
@@ -108,13 +116,12 @@ impl CompatMode {
         }
     }
 
-    /// The assurance label printed per row, mirroring `assurance` in
-    /// `strict_compatibility_probe`.
-    pub fn assurance(self) -> &'static str {
+    /// Plain-language name printed per row and in the summary.
+    pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "L2",
+            CompatMode::Strict | CompatMode::PortableStrict => "legacy stripped verify",
             CompatMode::Sabre => "SaBRe",
-            CompatMode::E9patch => "e9patch L2",
+            CompatMode::E9patch => "e9patch legacy stripped verify",
             CompatMode::Rr => "rr",
         }
     }
@@ -235,7 +242,7 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
         .join(" ")
 }
 
-/// The three always-on preflight gates, as DAG nodes.
+/// The always-on preflight gates and the manifest-audit binary producer, as DAG nodes.
 ///
 /// `validate.sh` runs these before every profile and fails fast if either of the
 /// first two fails (validate.sh:4745-4752); the dependency edges below reproduce
@@ -244,11 +251,24 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
 pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     let proxy = if with_proxy { "with-proxy " } else { "" };
     // The Reverie-pin launcher is bound to THIS repository explicitly, never left
-    // to whatever directory the node happens to start in. `ci/test_harness.sh`'s
+    // to whatever directory the node happens to start in. `target/debug/test-harness`'s
     // `assert_reverie_pin_enforcement` audits that binding, because "it will be
     // the right repo because cwd is right" is an inference, not an observation —
     // and the archival pin is not a testing exemption.
     let root = shell_quote(&root.to_string_lossy());
+    let mut manifest_plan = node(
+        "setup",
+        "manifest_plan",
+        "Build the manifest-plan binaries the metadata validation runs",
+        MANIFEST_PLAN_BUILD_COMMAND.to_string(),
+        vec!["pre.reverie_pin".to_string()],
+        MANIFEST_PLAN_BUILD_TIMEOUT_S,
+        LANE_DEFAULT_CPU_TIMEOUT_S,
+        MANIFEST_PLAN_BUILD_MEM_BYTES,
+    );
+    manifest_plan.hint.est_duration_s = 60.0;
+    manifest_plan.hint.classification = StepClass::CpuBound;
+
     vec![
         node(
             "pre",
@@ -277,12 +297,13 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
         ),
+        manifest_plan,
         node(
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
-            "./ci/test_harness.sh validate".to_string(),
-            vec!["pre.reverie_pin".to_string()],
+            "target/debug/test-harness validate".to_string(),
+            vec![MANIFEST_PLAN_PRODUCER_TAG.to_string()],
             PREFLIGHT_TIMEOUT_S,
             PREFLIGHT_CPU_TIMEOUT_S,
             PREFLIGHT_MEM_BYTES,
@@ -290,9 +311,74 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
     ]
 }
 
+/// Remove a lane's duplicate manifest-plan producer and bind its consumers to
+/// the always-on preflight producer.
+///
+/// Lane JSON retains the producer because it is also executable independently.
+/// Once a lane is attached to validate's preflight, however, keeping that root
+/// would either duplicate the tag or recreate the old `gate -> producer -> gate`
+/// cycle. Refuse command drift before remapping the dependency.
+pub fn lane_nodes_reusing_manifest_producer(
+    root: &Path,
+    lane: &str,
+    prefix: &str,
+    gate_dep: &str,
+) -> Result<Vec<Step>, String> {
+    let mut steps = lane_nodes(root, lane, prefix, gate_dep)?;
+    if !reuse_preflight_manifest_producer(&mut steps, &format!("lane {lane}"))? {
+        return Err(format!("lane {lane} has no manifest-plan producer"));
+    }
+    Ok(steps)
+}
+
+/// Replace a selected lane's manifest-plan producer with the equivalent node
+/// already present in validate's preflight spine.
+///
+/// Returning `false` for an absent producer is intentional: a selective set may
+/// not need any manifest-plan consumer. If the selector did include it, its tag
+/// remains valid selection vocabulary and every selected dependent is remapped
+/// to the preflight node before the lane is attached.
+pub fn reuse_preflight_manifest_producer(
+    steps: &mut Vec<Step>,
+    context: &str,
+) -> Result<bool, String> {
+    let producer_indexes: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| (step.job == "manifest_plan").then_some(index))
+        .collect();
+    if producer_indexes.len() > 1 {
+        return Err(format!(
+            "{context} contains {} manifest-plan producers",
+            producer_indexes.len()
+        ));
+    }
+    let Some(index) = producer_indexes.first().copied() else {
+        return Ok(false);
+    };
+    if steps[index].cmd != MANIFEST_PLAN_BUILD_COMMAND {
+        return Err(format!(
+            "{context} manifest-plan producer command drifted: {}",
+            steps[index].cmd
+        ));
+    }
+    let lane_producer_tag = steps[index].tag();
+    steps.remove(index);
+    for step in steps.iter_mut() {
+        for dependency in &mut step.deps {
+            if dependency == &lane_producer_tag {
+                *dependency = MANIFEST_PLAN_PRODUCER_TAG.to_string();
+            }
+        }
+        step.deps.sort();
+        step.deps.dedup();
+    }
+    Ok(true)
+}
+
 /// THE one place a CI lane's file is resolved.
 ///
-/// `ci/test_harness.sh` audits that this expression appears EXACTLY ONCE in this
+/// `target/debug/test-harness` audits that this expression appears EXACTLY ONCE in this
 /// file, so that a lane's node set can never be resolved from two places that
 /// could drift. Both `lane_nodes` (steps) and `lane_config` (top-level config)
 /// go through here; adding a second construction of the path is what the audit
@@ -420,7 +506,7 @@ pub fn compat_nodes_for(
         out.push(node(
             "compat",
             &sanitize_job(&row.label),
-            &format!("{} compatibility: {}", mode.assurance(), row.label),
+            &format!("{} compatibility: {}", mode.display_name(), row.label),
             format!("{} </dev/null", shell_join(&argv)),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
             wall,
@@ -500,7 +586,7 @@ pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
 /// file, kept its steps, and threw its configuration away. That is not a
 /// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
 /// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 1,
-/// manifest_guest: 4}`; dropping them left `res_free` evaluating
+/// manifest_guest: 20}`; dropping them left `res_free` evaluating
 /// `unwrap_or(0) >= 1` for the 16 steps demanding `hermit_guest` and the 13
 /// demanding `manifest_guest`, so none could ever be admitted. The scheduler's
 /// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with

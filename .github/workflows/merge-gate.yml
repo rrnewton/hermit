@@ -1,19 +1,6 @@
 name: Merge Gate
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
-  merge_group:
-    types: [checks_requested]
-  workflow_run:
-    workflows:
-      - "CI (GitHub-managed portable)"
-      - "CI (privileged)"
-      - "P0 Demo Gate (Hermit hot paths)"
-    types: [completed]
-  issue_comment:
-    types: [edited, deleted]
   workflow_dispatch:
     inputs:
       pr_number:

@@ -264,14 +264,14 @@ Additional backend-wide limits:
 Validate manifest policy and run the blocking SaBRe cells:
 
 ```bash
-./ci/test_harness.sh validate
-./ci/test_harness.sh run --lane portable --backend sabre --ci-only
+target/debug/test-harness validate
+target/debug/test-harness run --lane portable --backend sabre --ci-only
 ```
 
 Run a manual enabled cell with its exact ID:
 
 ```bash
-./ci/test_harness.sh run --include-manual --mode verify \
+target/debug/test-harness run --include-manual --mode verify \
   --backend sabre --test c-programs/syscall-file-io
 ```
 

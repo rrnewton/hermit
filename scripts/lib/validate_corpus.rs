@@ -107,7 +107,12 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
 
 /// `STRICT_COMPAT_TOTAL` (validate.sh:1108). The corpus contains semantic
 /// workloads only; banner-only probes were removed when the E2E harness landed.
-pub const STRICT_COMPAT_TOTAL: usize = 191;
+///
+/// 191 at extraction. 193 since the `netlink-route` and `netlink-sock-diag`
+/// rows were added: the corpus reached netlink only incidentally through `ip`,
+/// `ss`, and every `python3` row, none of which asserted anything about a reply,
+/// so no cell would have failed if detcore stopped normalizing netlink at all.
+pub const STRICT_COMPAT_TOTAL: usize = 193;
 
 /// `RR_COMPAT_EXPECTED` (validate.sh:1117). The exact set measured to pass
 /// record/replay. Raising this without a fresh sweep produces a phantom ratchet.

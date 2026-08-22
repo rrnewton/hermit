@@ -116,7 +116,10 @@ and the reason is documented.
 ## Script Convention
 
 - Project scripts use rust-script as `.rs` files with the shebang
-  `#!/usr/bin/env rust-script`.
+  `#!/usr/bin/env -S rust-script --force`. The `--force` flag delegates included-module
+  and local-path dependency freshness to Cargo instead of rust-script's main-file-only
+  executable cache. This convention requires an `env` implementation with `-S` support
+  (GNU coreutils 8.30 or newer on supported Linux hosts).
 - Prefer rust-script over Python for all new scripts.
 - `scripts/` is reserved for repository-wide utilities. Co-locate actions over
   a directory's data with that directory; see `docs/DIRECTORY_ACTIONS.md`.
@@ -404,27 +407,31 @@ for that repository-side change.
 
 ## Task Closure Policy
 
-A task is not finished when the code is written; it is finished when the change
-is on `main`. Phantom closures — tasks marked closed while the work never landed
-— are a recurring, expensive failure mode. Do not create one. The rules below
+Closing a task and landing the change are two different facts, and they are
+recorded by two different tags. Phantom closures — a task that reads as
+delivered while the work never reached `main` — are a recurring, expensive
+failure mode, which is what the second tag exists to prevent. The rules below
 are mandatory for every implementation and review agent.
 
-1. **Agents MUST NOT close tasks.** Never run `tg update <task> --status
-   closed` (or any equivalent close/complete transition). Closing is reserved
-   for the coordinator, who does it only after confirming the work is on
-   `main`. An agent that closes its own task is asserting a landing it cannot
-   witness.
-2. **When your work is complete, add the `implemented` tag and post the PR
-   link.** `IMPLEMENTED` is a tag, not a TaskGraph status. The task remains
-   `in_progress`. "Complete" means the feature branch is pushed and a pull
-   request is open against `rrnewton/hermit:main`. Preserve the task's existing
-   tags when recording the transition and evidence:
+1. **You close your own task.** When your work is done, post the evidence, add
+   the `implemented` tag, and close the task yourself with
+   `tg update <task> --status closed`. Closure is not routed through a
+   coordinator. Leaving a finished, evidenced task open is itself a defect: it
+   hides the task from every queue that reads status, and the parent's health
+   tick reports `implemented` without `closed` as a lifecycle violation.
+2. **The implementor adds `implemented`; whoever lands the change adds
+   `landed`.** Both are tags, not TaskGraph statuses, and carrying them
+   separately is what makes "closed but not landed" a cheap query. `implemented`
+   means the feature branch is pushed and a pull request is open against
+   `rrnewton/hermit:main` — it does not claim a landing. Preserve the task's
+   existing tags when recording the transition and evidence:
 
    ```bash
    tg note <task> "IMPLEMENTED: https://github.com/rrnewton/hermit/pull/<n> \
      | branch <feature-branch> @ <40-hex SHA> | base origin/main <SHA> \
      | validation: <exact commands + results, assurance level, backend>"
    tg update <task> --tags <existing-tags>,implemented
+   tg update <task> --status closed
    ```
 
    The PR link and the exact tested SHA are required, not optional. A branch
@@ -435,39 +442,41 @@ are mandatory for every implementation and review agent.
    exist and were run at the PR head SHA, and that the reported assurance level
    (L0–L4), backend, and relaxations match reality. A claim that does not
    survive this check must lose the `implemented` tag.
-4. **The task stays `in_progress` + `implemented` until the PR lands on
-   `main`.** Open, in-review, validation-red, awaiting-merge, and
-   blocked-on-a-dependency PRs are never `closed`. If the published artifact
-   disappears or the implementation claim proves false, remove the tag; do not
-   invent a status that TaskGraph does not have.
-5. **Only the coordinator closes tasks, through the verified gateway.** After
-   freshly verifying that the landed commit is reachable from the target
-   `main`, the coordinator uses the dev-hermit parent's
-   `./ci-hub/bin/close-task` with the PR or full SHA. Never use raw
-   `tg update --status closed`. A local green run, a GitHub state field, or a
-   label is not landing evidence.
+4. **A closed task tagged `implemented` but not `landed` is unlanded work, and
+   it stays visible as exactly that.** Do not add `landed` for an open,
+   in-review, validation-red, awaiting-merge, or blocked-on-a-dependency pull
+   request. Removing a tag is how a false claim is retracted: if the published
+   artifact disappears or the implementation claim proves false, drop
+   `implemented` and say so in a note. Do not invent a status that TaskGraph
+   does not have.
+5. **Add `landed` once the commit is on `main`, verified against freshly
+   fetched ancestry.** A local green run, a GitHub state field, or a label is
+   not landing evidence. Recording the landing through the dev-hermit parent's
+   `./ci-hub/bin/close-task <task> --code <PR-or-full-SHA> --repo <owner/repo>
+   --source <checkout>` additionally writes the `CLOSURE-VERIFIED` note, which
+   is what the parent's health tick currently reads to discharge landing debt.
 
-### Done vs. Not Done
+### Landed vs. Not Landed
 
-Use these concrete examples to decide the correct status. When in doubt, choose
-the lower status and say why in a task note.
+Use these concrete examples to decide which tags a closed task carries. When in
+doubt, claim the weaker tag and say why in a task note.
 
-**Done (coordinator may close):**
+**`landed`:**
 
 - PR #### is merged into `rrnewton/hermit:main`; the merge commit is on `main`
-  and the verified closure gateway accepts its freshly fetched ancestry.
+  and its freshly fetched ancestry confirms it.
 - A coordinated Hermit/Reverie change: both PRs merged, the parent gitlink(s)
   updated to the exact landed SHAs, and the pair revalidated.
 
-**`in_progress` + `implemented` (agent's terminal state — do NOT close):**
+**`implemented` but not `landed` (close the task; the tag carries the debt):**
 
 - Branch pushed, PR open, exact-head validation green, awaiting merge.
-- PR open but validation red, or an exact-head receipt missing/stale — still
-  `in_progress` + `implemented`; report the exact failure, do not close.
+- PR open but validation red, or an exact-head receipt missing/stale — report
+  the exact failure in a note.
 - Work committed and pushed but blocked on another PR or a reverie pin bump —
-  `in_progress` + `implemented` with the blocker and dependency SHAs named.
+  name the blocker and the dependency SHAs.
 
-**Not done (stays `in_progress`, never tagged `implemented` or closed):**
+**Neither tag — the work is not done, so the task stays open:**
 
 - Code written but uncommitted or not pushed. Do not use a stash as a handoff.
 - "It builds/tests pass locally" with no pushed branch and no open PR.

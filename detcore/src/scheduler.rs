@@ -909,7 +909,25 @@ async fn sched_loop_inner(
     blocking_backoff: bool,
     observer: Option<SchedulerObserver>,
 ) {
-    info!("[scheduler] daemon task starting up, waiting for guest thread start..");
+    // The "daemon task starting up" INFO line is deliberately NOT emitted here.
+    //
+    // This body runs inside a `tokio::spawn`ed task (see
+    // `GlobalState::initialize`), so the moment it is first polled is
+    // unsynchronized with the spawning thread's continued bootstrap. That made
+    // the line race the root thread's `USER RAND` / `CHAOSRAND` seeding lines
+    // from `ThreadState::new`, and the L2 comparator reads the INFO stream as
+    // ordered evidence: the two runs were identical as multisets and differed
+    // only in this one line's position, which is a real `bitwise_parity: false`.
+    //
+    // The announcement is now emitted by whoever starts the daemon, in that
+    // thread's program order, so it is deterministically sequenced after
+    // `Scheduler::new`'s `SCHEDRAND` line and before the root `ThreadState`.
+    // That is the order the ptrace backend already produced reliably.
+    //
+    // The observer callback stays here, at the point the task genuinely begins
+    // executing, because it is a barrier signal for external backends and is
+    // not part of the compared log stream. Moving the log does not cost us the
+    // "it actually started" observation for the consumer that needs it.
     if let Some(observer) = &observer {
         observer("daemon task starting; waiting for guest thread");
     }
@@ -3923,8 +3941,46 @@ impl Scheduler {
             self.blocked.futex_waiters.len()
         )
         .unwrap();
-        for x in self.blocked.futex_waiters.iter() {
-            writeln!(&mut buf, "    {:?}", x).unwrap();
+        // Sorted, and no `Ivar` Debug. `format_terminal_deadlock` above already
+        // documents the two sources this avoids, and this function had neither
+        // guard: `futex_waiters` is a `HashMap`, so it iterates in a randomized
+        // order once it holds more than one entry, and `FutexWaiter`'s derived
+        // `Debug` prints its `Ivar`'s parked waker as raw host pointers.
+        //
+        // Measured before this change, three runs of
+        // `--stop-after-turn=15 -- rustbin_futex_and_print`, which reaches this
+        // function through the `--stop-after-turn` warning:
+        //   Waker { data: 0x564ea2a82c80
+        //   Waker { data: 0x55f2120b9c80
+        //   Waker { data: 0x56163deeec80
+        // Three runs, three host addresses, in a WARN record that
+        // `--verify-strict` compares.
+        //
+        // Only guest-level identities are printed here: the futex key, the
+        // waiting dettid and the bitset are all values Detcore already
+        // determinizes.
+        let mut futex_rows: Vec<String> = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .map(|(futex, waiters)| {
+                let mut dettids: Vec<String> =
+                    waiters.iter().map(|w| w.dettid.to_string()).collect();
+                dettids.sort();
+                let mut bitsets: Vec<u32> = waiters.iter().map(|w| w.bitset).collect();
+                bitsets.sort_unstable();
+                format!(
+                    "    {:?} => {} waiter(s), dettids [{}], bitsets {:?}",
+                    futex,
+                    waiters.len(),
+                    dettids.join(", "),
+                    bitsets
+                )
+            })
+            .collect();
+        futex_rows.sort();
+        for row in futex_rows {
+            writeln!(&mut buf, "{}", row).unwrap();
         }
 
         writeln!(

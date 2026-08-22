@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x109);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +146,38 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same detcore
     // configuration. Otherwise, the behavior of the program could diverge
     // during replay.
+    //
+    // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
+    //
+    // `virtualize_time: false` below is DELIBERATE, and the rationale used to live only
+    // in the separate dev-hermit workspace -- not in this repository, beside the code it
+    // governs. The cost of that was measured: three agents in one night read this line,
+    // searched this repo's source, git log, docs/ and issues, found nothing, and could
+    // not tell a design decision from a determinism bug; two coordinators then spent
+    // hours treating it as a candidate defect. A decision recorded in a different
+    // repository from the code it governs is, in practice, undocumented. Hence this
+    // comment. See rrnewton/hermit#2295.
+    //
+    // WHAT RECORD/REPLAY ACTUALLY GUARANTEES. Replay re-executes a recording against the
+    // recorded syscall data, so what must be reproducible is THIS recording's replay --
+    // not agreement between two independent recordings. Time is therefore left real: the
+    // recording captures what the guest actually observed, and replay returns those
+    // recorded values. `hermit record start --verify` records once, replays that
+    // recording, and compares the two; its success message says exactly that ("replay
+    // matched recording") and does not claim more.
+    //
+    // WHAT IT DOES NOT GUARANTEE, which is the part that misleads readers. Because time
+    // is not virtualized, two INDEPENDENT recordings of the same program observe
+    // different clock values. Demonstrated: `hermit run -- date` twice returns the
+    // identical virtual epoch, while `hermit record start -- date` twice returns real
+    // wall-clock times seconds apart. Replay fidelity says nothing about that, and
+    // nothing in either test suite currently compares two independent recordings.
+    // So do not read a green `--verify` as cross-recording determinism.
+    //
+    // This configuration differs from `hermit run --strict` on four of the five
+    // properties that define it (see run.rs: only `sequentialize_threads` matches).
+    // Any claim that recording is "strict" in that sense is wrong; the `--strict` flag
+    // on `hermit record` is accepted and ignored purely for command-line compatibility.
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         panic_on_unsupported_syscalls: false,
@@ -155,8 +187,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         panic_on_rcb_overshoot: false,
         sequentialize_threads: true,
         runs_post_fork: default_config.runs_post_fork,
-        // Record/replay keeps partial Detcore subscription; madvise policy semantics
-        // begin in v0x102.
+        // Record/replay keeps a partial Detcore subscription. Complete coverage
+        // of the Determinized classification begins in v0x10a; madvise policy
+        // semantics begin in v0x102.
         passthru_opt: true,
         deterministic_io: false,
         virtualize_time: false,
@@ -213,6 +246,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detlog_heap: false,
         detlog_stack: false,
         detlog_regs: false,
+        detlog_io_buffers: false,
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: 1024 * 1024 * 1024,
@@ -236,6 +270,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
 
 #[cfg(test)]
 mod tests {
+    use reverie::Tool;
+    use reverie::syscalls::Sysno;
+
     use super::*;
 
     #[test]
@@ -251,7 +288,40 @@ mod tests {
     }
 
     #[test]
-    fn record_version_rejects_pre_madvise_policy_streams() {
+    fn record_and_replay_subscribe_every_determinized_syscall() {
+        let config = record_or_replay_config(Path::new("replay-data"));
+        let record = <detcore::Detcore<crate::recorder::Recorder> as Tool>::subscriptions(&config);
+        let replay = <detcore::Detcore<crate::replayer::Replayer> as Tool>::subscriptions(&config);
+
+        for (phase, subscriptions) in [("record", record), ("replay", replay)] {
+            let delivered = subscriptions.iter_syscalls().collect::<Vec<_>>();
+            let missing = detcore::all_pinned_syscalls()
+                .filter(|sysno| detcore::is_determinized_syscall(*sysno))
+                .filter(|sysno| !delivered.contains(sysno))
+                .collect::<Vec<_>>();
+            assert!(
+                missing.is_empty(),
+                "{phase} lets Determinized syscalls bypass Detcore: {}",
+                missing
+                    .iter()
+                    .map(|sysno| sysno.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(
+                delivered.contains(&Sysno::syslog),
+                "{phase} must deliver syslog to its deterministic Detcore handler"
+            );
+            assert!(
+                !delivered.contains(&Sysno::chdir),
+                "{phase} must leave unlisted PassThrough chdir unsubscribed"
+            );
+        }
+    }
+
+    #[test]
+    fn record_version_rejects_pre_complete_determinized_subscription_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
     }

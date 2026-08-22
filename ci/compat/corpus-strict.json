@@ -835,6 +835,26 @@
    ]
   },
   {
+   "label": "netlink-route",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "netlink-route"
+   ]
+  },
+  {
+   "label": "netlink-sock-diag",
+   "argv": [
+    "env",
+    "REAL_COMPAT_FIXTURES={{REAL_COMPAT_FIXTURES}}",
+    "bash",
+    "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh",
+    "netlink-sock-diag"
+   ]
+  },
+  {
    "label": "lscpu",
    "argv": [
     "env",
@@ -1283,7 +1303,10 @@
    "label": "findmnt",
    "argv": [
     "/usr/bin/findmnt",
-    "--kernel",
+    "--fstab",
+    "--tab-file",
+    "{{ROOT_DIR}}/ci/compat/findmnt.fixture",
+    "--nocanonicalize",
     "--list",
     "--output",
     "TARGET,SOURCE,FSTYPE,OPTIONS"

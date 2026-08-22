@@ -5,7 +5,7 @@
 # "CI timed out". This file is the inventory of that condition as it stands, not
 # permission for it.
 #
-# The guard (ci/test_harness.sh assert_node_budgets_fit_their_job_kill) fails on
+# The guard (`target/debug/test-harness audit-ci`) fails on
 # any inversion NOT listed here, and equally on any entry here that no longer
 # inverts -- so the list can only shrink, and a fix must delete its line.
 #

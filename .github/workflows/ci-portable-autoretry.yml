@@ -34,9 +34,7 @@ name: Portable auto-retry on cancellation
 #     cancelled on purpose for local validation, so this job exits without a
 #     rerun. A PR without the label is unaffected.
 on:
-  workflow_run:
-    workflows: ["CI (GitHub-managed portable)"]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   actions: write

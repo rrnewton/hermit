@@ -9,12 +9,17 @@
  * fixture checks to confirm the value round-trips.
  */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* Number of behavioral steps this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 5
 
 /* Return the low permission bits (st_mode & 07777) for a path, or -1. */
 static int perm_bits(const char *path) {
@@ -29,9 +34,15 @@ int main(void) {
   int ok = 0;
 
   char root[] = "/tmp/umaskXXXXXX";
-  if (mkdtemp(root) == NULL) {
-    printf("umask ok=0\n");
-    return 0;
+#ifdef HERMIT_TEST_UMASK_SETUP_FAILURE
+  errno = EACCES;
+  char *created_root = NULL;
+#else
+  char *created_root = mkdtemp(root);
+#endif
+  if (created_root == NULL) {
+    fprintf(stderr, "umask setup failed: mkdtemp: %s\n", strerror(errno));
+    return 1;
   }
 
   char file_a[128];
@@ -85,5 +96,14 @@ int main(void) {
   rmdir(root);
 
   printf("umask ok=%d\n", ok);
+
+  /* Every step above must have succeeded. Without this check the guest exits 0
+     no matter how many steps failed, so a real semantic regression only lowers
+     the printed count -- and because both --verify runs lower it identically,
+     bitwise parity still holds and the cell passes green. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "umask completed %d of %d steps\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
   return 0;
 }

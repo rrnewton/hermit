@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Copyright (c) Meta Platforms, Inc. and affiliates.
 //! All rights reserved.
 //!

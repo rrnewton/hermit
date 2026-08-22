@@ -11,7 +11,7 @@
  *
  * A single process exercises both eventfd(2) modes:
  *   - Default counter mode: eight writes (values 1..8) accumulate into the
- *     64-bit counter; a single read returns the sum (36) and resets it.
+ *     64-bit counter; a single read returns the sum (36).
  *   - Semaphore mode (EFD_SEMAPHORE): one write of 5 seeds the counter; five
  *     reads each return 1 and decrement, summing to 5.
  *
@@ -83,16 +83,41 @@ int main(void) {
   if (write_u64(sem_fd, 5) != 0)
     fail("write semaphore");
   uint64_t sem_sum = 0;
+  int sem_units_valid = 1;
   for (int i = 0; i < 5; ++i) {
     uint64_t unit = 0;
     if (read_u64(sem_fd, &unit) != 0)
       fail("read semaphore");
+#ifdef HERMIT_TEST_EVENTFD_BAD_SEMAPHORE_UNIT
+    if (i == 0)
+      unit = 0;
+    else if (i == 1)
+      unit = 2;
+#endif
+    if (unit != 1)
+      sem_units_valid = 0;
     sem_sum += unit;
   }
   if (close(sem_fd) != 0)
     fail("close semaphore");
 
+#ifdef HERMIT_TEST_EVENTFD_BAD_COUNTER
+  counter--;
+#endif
+#ifdef HERMIT_TEST_EVENTFD_BAD_SEMAPHORE_SUM
+  sem_sum--;
+#endif
+
   printf("eventfd counter=%llu sem=%llu\n", (unsigned long long)counter,
          (unsigned long long)sem_sum);
+
+  if (counter != 36 || sem_sum != 5 || !sem_units_valid) {
+    fprintf(stderr,
+            "eventfd arithmetic mismatch: counter=%llu (expected 36), "
+            "sem=%llu (expected 5), sem_units_valid=%d\n",
+            (unsigned long long)counter, (unsigned long long)sem_sum,
+            sem_units_valid);
+    return 1;
+  }
   return 0;
 }

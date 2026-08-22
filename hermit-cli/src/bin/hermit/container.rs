@@ -16,6 +16,12 @@ use hermit::Error;
 use hermit::SerializableError;
 use nix::sched::CpuSet;
 use nix::sched::sched_getaffinity;
+use nix::sys::signal::SaFlags;
+use nix::sys::signal::SigAction;
+use nix::sys::signal::SigHandler;
+use nix::sys::signal::SigSet;
+use nix::sys::signal::Signal;
+use nix::sys::signal::sigaction;
 use nix::unistd::Pid;
 use reverie::process::Container;
 use reverie::process::Mount;
@@ -258,6 +264,149 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
     Ok((container, identity_guard))
 }
 
+/// Tie the container's init process to the lifetime of the `hermit` process
+/// that created it.
+///
+/// [`Container::run`] forks the process that carries the guest into a fresh PID
+/// namespace, so that process is PID 1 *of that namespace*. Linux gives a
+/// namespace init the same protection it gives the system init: a signal whose
+/// disposition is `SIG_DFL` is discarded rather than delivered, even when the
+/// sender is in an ancestor namespace. Only `SIGKILL` and `SIGSTOP` from an
+/// ancestor still get through.
+///
+/// That is why an external deadline could not end a hung run. `timeout N`
+/// sends `SIGTERM` to the process group; the outer `hermit` process obeys it
+/// and dies, the init process discards it, `timeout` sees its own direct child
+/// gone and exits 124 without ever escalating, and the init process is
+/// reparented to host PID 1 and keeps running. `timeout --kill-after` does not
+/// help, because the escalation is conditioned on that already-dead direct
+/// child. Three runs survived this way for more than 45 hours and filled the
+/// filesystem.
+///
+/// `PR_SET_PDEATHSIG` closes that hole from inside: when the thread that forked
+/// this process exits, the kernel sends us `SIGKILL`, which is precisely one of
+/// the two signals a namespace init cannot ignore. Every existing caller keeps
+/// working and no exit code changes, which is why this lives here rather than
+/// in each of the ~20 scripts that wrap `hermit` in `timeout`.
+///
+/// Reverie uses the same idiom for exec'd untraced members in
+/// `safeptrace/src/notifier.rs`.
+///
+/// One residual gap: if the parent somehow died between the fork and this call,
+/// no death signal will ever arrive. The usual `getppid()` guard for that race
+/// is unavailable here, because inside a new PID namespace the out-of-namespace
+/// parent is not mapped and `getppid()` reports 0 whether or not it is alive.
+/// Closing it completely would mean arming the signal inside
+/// `Container::run` before container setup, which is a Reverie-side change.
+/// The window is a few milliseconds of container setup, and the case this
+/// guards against is a supervisor deadline seconds or minutes later.
+fn arm_parent_death_signal() -> Result<(), Error> {
+    // SAFETY: `PR_SET_PDEATHSIG` only sets the calling thread's parent-death
+    // signal attribute. It reads and writes no caller memory, and the remaining
+    // arguments are ignored for this option.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(std::io::Error::last_os_error()).context(
+            "Failed to arm the container init parent-death signal \
+             (prctl(PR_SET_PDEATHSIG, SIGKILL)); refusing to start a guest that \
+             an expiring deadline could not then kill",
+        );
+    }
+    Ok(())
+}
+
+/// The signals whose default action is to terminate the process and which a
+/// supervisor, a shell, or a terminal actually sends when it wants a run to
+/// stop. Every one of them is discarded by the kernel while the container init
+/// leaves it at `SIG_DFL`, so all three are dead letters today: `SIGTERM` from
+/// a deadline, `SIGINT` from Ctrl-C, and `SIGHUP` when the owning terminal or
+/// agent session goes away.
+const CONTAINER_INIT_STOP_SIGNALS: [Signal; 3] = [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP];
+
+/// Terminate the container init on a stop signal.
+///
+/// The exit code is the conventional `128 + signo` a shell reports for a
+/// process killed by that signal, rather than a genuine signalled wait status,
+/// because a namespace init cannot produce the latter. The usual way to honour
+/// a signal faithfully -- restore `SIG_DFL`, unblock, re-raise -- is measurably
+/// unavailable here: a plain process dies from that sequence with
+/// `WIFSIGNALED` set, but a namespace init survives it, because a self-sent
+/// signal does not come from an ancestor namespace and so is discarded exactly
+/// like the original. Reporting `128 + signo` is the closest honest
+/// approximation available.
+///
+/// Exiting is a complete teardown, not just this process leaving: the kernel
+/// `SIGKILL`s every remaining member of a PID namespace whose init exits, so
+/// the guest goes with it instead of being orphaned into a namespace with no
+/// init.
+extern "C" fn on_container_init_stop_signal(signal: libc::c_int) {
+    // SAFETY: `_exit` is async-signal-safe and is the only thing this handler
+    // does. It deliberately skips destructors: there is nothing in this process
+    // whose cleanup is worth blocking a requested shutdown on, and the
+    // caller-side guards live in the parent process.
+    unsafe { libc::_exit(128 + signal) }
+}
+
+/// Make the container init answer the signals a supervisor actually sends.
+///
+/// [`arm_parent_death_signal`] handles the case where the `hermit` process
+/// dies. This handles the case where it does not: a `SIGTERM` aimed at the run
+/// itself, a Ctrl-C, or a `SIGHUP` when the session ends. The kernel discards
+/// those only while the disposition is `SIG_DFL`; installing any handler at all
+/// is what makes them deliverable to a namespace init, so this both restores
+/// the expected behaviour and gives hermit a place to shut a run down on
+/// purpose rather than being shot.
+///
+/// The inherited signal mask matters as much as the disposition. A blocked
+/// signal stays pending forever and the handler never runs, which would leave
+/// the same silent no-op with a handler installed to suggest otherwise, so the
+/// mask is cleared for these three. `record_start.rs` learned the same lesson
+/// about `SIGALRM`.
+fn install_container_init_stop_handlers() -> Result<(), Error> {
+    let action = SigAction::new(
+        SigHandler::Handler(on_container_init_stop_signal),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+
+    let mut unblock = SigSet::empty();
+    for signal in CONTAINER_INIT_STOP_SIGNALS {
+        // SAFETY: the handler performs only `_exit`, which is
+        // async-signal-safe, and the action outlives the call.
+        unsafe { sigaction(signal, &action) }
+            .with_context(|| format!("Failed to install the container init {signal} handler"))?;
+        unblock.add(signal);
+    }
+
+    unblock
+        .thread_unblock()
+        .context("Failed to unblock the container init stop signals")?;
+
+    Ok(())
+}
+
+/// Arm both container-init guards. Call this as the FIRST statement inside any
+/// `Container::run` closure that is not going through [`with_container`].
+///
+/// Why this is public rather than folded into [`with_container`]: `hermit record`
+/// -- every spelling, including `record --verify` -- calls [`Container::run`]
+/// directly at six sites in `record_start.rs` and never goes through
+/// `with_container`. Those containers come from `recording_container()` ->
+/// `deterministic_container()` -> `default_container(true)`, which unshares
+/// `Namespace::PID`, so each one is a namespace init with exactly the bug the
+/// guards exist to fix. An adversarial review of the original change caught this:
+/// the claim that "all entry points funnel through `with_container`" was FALSE,
+/// and `record --verify` is precisely the long-running command an external
+/// deadline most needs to be able to end.
+///
+/// The structurally better home for this is reverie's `Container::run`, before
+/// `setup()`, which would also close the fork-to-prctl window. That is a
+/// reverie-side change plus a pin bump; this closes the six sites now.
+pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
+    arm_parent_death_signal().map_err(SerializableError::from)?;
+    install_container_init_stop_handlers().map_err(SerializableError::from)?;
+    Ok(())
+}
+
 /// Helper to run a function inside a container, taking care to display any
 /// errors and propagate the exit status.
 pub fn with_container<F, T>(container: &mut Container, mut f: F) -> Result<T, Error>
@@ -266,7 +415,11 @@ where
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
     Ok(container
-        .run(|| f().map_err(SerializableError::from))
+        .run(|| {
+            // Runs in the freshly forked container init, not in the caller.
+            arm_container_init_guards()?;
+            f().map_err(SerializableError::from)
+        })
         .context("Sandbox container exited unexpectedly")??)
 }
 

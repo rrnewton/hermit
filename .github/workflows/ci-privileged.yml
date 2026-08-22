@@ -1,13 +1,6 @@
 name: CI (privileged)
 
 on:
-  # NO `pull_request` trigger (owner directive 2026-08-03): don't auto-fire the
-  # scarce self-hosted privileged PMU lane on PRs. It is a bonus signal, NOT a
-  # required merge-gate check, so removing its PR trigger cannot block landing.
-  # Run it on a PR MANUALLY via `workflow_dispatch` when a privileged smoke is
-  # actually needed.
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 # QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref); with
@@ -58,9 +51,10 @@ jobs:
     # capabilities + 210s occasional KVM probes) + an allowance for the steps
     # that carry no `timeout` of their own (job setup, checkout, and the two
     # artifact uploads measured 7s warm, but a cold checkout and a large
-    # artifact upload are far slower). ci/test_harness.sh derives all of those
-    # terms from THIS FILE and fails closed if this number is too small, so
-    # raise the step budgets and rerun `./ci/test_harness.sh validate` rather
+    # artifact upload are far slower). target/debug/test-harness reads the
+    # privileged launcher and DAG budgets from their deployed files and fails
+    # closed on their ordering drift, so
+    # raise the step budgets and rerun `target/debug/test-harness validate` rather
     # than guessing here.
     timeout-minutes: 22
     env:
@@ -102,35 +96,41 @@ jobs:
     # PMU skid is an instruction-space hardware property independent of
     # concurrency, so no determinism argument justifies serializing PMU work.
     # DIAGNOSTIC ONLY, and deliberately NOT `continue-on-error` — the script always exits 0, and
-    # ci/test_harness.sh asserts this workflow contains exactly one continue-on-error line (the
+    # target/debug/test-harness asserts this workflow contains exactly one continue-on-error line (the
     # occasional-KVM one), so a second would fail the DAG correspondence audit.
     #
     # Answers a question that has been ASSUMED for weeks rather than measured. safe-ci-dag-runner
     # skips cgroup boxing whenever $CI or $GITHUB_ACTIONS is set: cgroup.rs reexec_in_scope returns
     # its SUCCESS value without entering a scope, and the real capability probe sits after that
-    # early return, so it never executes on a runner. This lane therefore passes
-    # --allow-cgroup-failure and runs UNBOXED on the belief that a self-hosted runner cannot box —
-    # a belief nothing has tested. The step prints FACT1_SCOPE_CREATED and FACT2_ESCAPEE_KILLED and
-    # changes no default either way.
+    # early return, so it never executes on a runner. This lane therefore selects
+    # the runner's explicit unboxed mode only after proving that it is running in
+    # GitHub Actions. It must not use --allow-cgroup-failure: that flag accepts any
+    # boxing failure, including failures unrelated to the Actions policy skip. The
+    # step prints FACT1_SCOPE_CREATED and FACT2_ESCAPEE_KILLED and changes no
+    # default either way.
     - name: PROBE — can this runner actually box? (diagnostic, never gates)
       run: timeout --foreground --kill-after=10s 120s ./ci/probe-runner-boxing.sh
 
     - name: PMU, CPUID-faulting, and KVM smoke DAG
-      # --allow-cgroup-failure: at the advanced runner pin, `run` boxes fail-closed
-      # (exit 3) by default, but GitHub Actions (hosted AND self-hosted) sets
-      # $GITHUB_ACTIONS, which makes the runner deliberately SKIP the systemd
-      # --user scope; without this flag the skipped-boxing path would fail-close
-      # this self-hosted lane. Opt out to best-effort UNBOXED (process-group
-      # teardown only) — the pre-pin behavior — rather than regress the lane RED.
+      # GitHub Actions sets GITHUB_ACTIONS=true, which makes the runner's ordinary
+      # scope bring-up deliberately skip systemd --user. Select explicit unboxed
+      # execution only in that exact context. A copied/local invocation, or any
+      # boxing failure outside Actions, must fail closed instead of silently
+      # downgrading through --allow-cgroup-failure.
       # 720s, raised from 600s on 2026-08-09 after e2e.metadata's measured
       # 71.44-73.84s runtime required its node budget to rise from 60s to 180s.
       # This number is the SINGLE AUTHOR
-      # of the inner DAG budget: ci/test_harness.sh reads it back out of this
+      # of the inner DAG budget: target/debug/test-harness reads it back out of this
       # line instead of keeping its own copy, so it cannot drift out of sync
       # with the guard that checks it. It must exceed the privileged DAG's
       # critical path plus 30s of runner overhead; the harness recomputes that
       # path from ci/dag/privileged.json and fails closed.
-      run: timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+      run: |
+        if [[ ${GITHUB_ACTIONS:-} != true ]]; then
+          echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
+          exit 2
+        fi
+        timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
@@ -138,9 +138,9 @@ jobs:
         timeout --foreground --kill-after=10s 210s \
           env HERMIT_BIN="$PWD/target/debug/hermit" \
           bash -euo pipefail -c '
-            ./ci/test_harness.sh build --lane privileged --category applications \
+            target/debug/test-harness build --lane privileged --category applications \
               --ci-only --include-occasional
-            ./ci/test_harness.sh run --lane privileged --category applications \
+            target/debug/test-harness run --lane privileged --category applications \
               --ci-only --include-occasional --prebuilt \
               --results ignored/e2e/privileged/occasional/results.jsonl \
               --junit ignored/e2e/privileged/occasional/junit.xml

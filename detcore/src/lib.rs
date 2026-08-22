@@ -45,6 +45,7 @@ mod dirents;
 #[allow(missing_docs)]
 pub mod edit_distance;
 mod fd;
+mod io_buffers;
 #[allow(unused)]
 mod ivar;
 pub mod logdiff;
@@ -861,6 +862,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             // /proc/maps unless one of these flags is enabled.
             return Ok(());
         }
+        // ...and don't incur it when nothing would observe the record either.
+        //
+        // The hash below is an argument to `detlog!`, so `tracing` already skips
+        // it when INFO is disabled. Enumerating the maps is NOT: it happens
+        // before the macro, on every syscall, whether or not a record is ever
+        // written. Measured on a QEMU/Linux boot with `RUST_LOG` unset, where
+        // each run emitted 123 bytes of log in total: no flag 43.71s,
+        // `--detlog-stack` 190.37s (4.36x), `--detlog-heap` 207.90s (4.76x).
+        // `--detlog-regs` was already inert because everything it does before
+        // its own `detlog!` is trivial; this restores the same property here.
+        //
+        // Skipping is invisible to the guest: enumerating maps and hashing guest
+        // memory are host-side observations of the tracee that neither issue a
+        // guest syscall nor advance virtual time, so a run that skips them
+        // executes the same guest instruction stream as one that does not.
+        if !detlog_observed!() {
+            return Ok(());
+        }
         // Out-of-process backends (e.g. KVM) report their guest memory regions
         // directly, because `guest.pid()` is the host VMM process there and its
         // `/proc/<pid>/maps` describes the VMM, not the guest address space.
@@ -1049,8 +1068,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
                 Sysno::pselect6,
-                // TODO(T137258824): add proper Select
-                // Sysno::select,
+                // `select` is included by the Determinized sweep below;
+                // T137258824 tracks improving its implementation.
             ]);
 
             if do_sched {
@@ -1107,18 +1126,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-978): Keep the passthru-opt allow-list in sync
-            // with the deterministic-refusal boundary. Even under the performance
-            // opt-in, Detcore MUST still see every syscall it deterministically
-            // refuses with a fixed ENOSYS/EPERM; otherwise passthru_opt would let
-            // strict guests execute those syscalls natively against the host,
-            // exactly the leak the DBT copied-child path also had to close.
+            // with the complete Determinized classification. Even under the
+            // performance opt-in, Detcore must see every syscall that its audited
+            // policy says it models or deterministically refuses. Otherwise
+            // record/replay can bypass a Detcore handler and execute the syscall
+            // natively against the host.
             // NOTE: `all_pinned_syscalls()`, not `Sysno::iter()`. The latter
             // stops one short of the end of the table, which silently dropped
             // `lsm_list_modules` out of this sweep.
             subscription.syscalls(
-                syscall_classification::all_pinned_syscalls().filter(|sysno| {
-                    syscall_classification::is_deterministically_refused_syscall(*sysno)
-                }),
+                crate::all_pinned_syscalls().filter(|sysno| crate::is_determinized_syscall(*sysno)),
             );
 
             // Make sure we also intercept everything that the record-or-replay tool
@@ -1971,6 +1988,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Open(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Creat(o) => self.handle_openat(guest, o.into()).await,
                 Syscall::Close(s) => self.handle_close(guest, s).await,
+                Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_read(guest, s).await
+                }
                 Syscall::Read(s) => self.handle_read(guest, s).await,
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
@@ -1983,6 +2003,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::CopyFileRange(_) => Err(Error::Errno(Errno::ENOSYS)),
                 // TODO-HUMAN-REVIEW(#794): vectored scatter/gather I/O, mirroring
                 // read/pread64/pwrite64/writev.
+                Syscall::Readv(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_readv(guest, s).await
+                }
                 Syscall::Readv(s) => self.handle_readv(guest, s).await,
                 Syscall::Preadv(s) => self.handle_preadv(guest, s).await,
                 Syscall::Preadv2(s) => self.handle_preadv2(guest, s).await,
@@ -2293,6 +2316,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
+                // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
+                // a NETLINK_SOCK_DIAG dump exactly as recvmsg does. Until they
+                // were routed through the same sanitizer, four of the five
+                // usable receive syscalls returned raw host socket inode
+                // numbers, which made the determinization optional from the
+                // guest's point of view: `socket.recv()` alone was enough to
+                // skip it. Non-socket-diag descriptors take the same path as
+                // before; the predicate is checked inside.
+                Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_recvfrom(guest, s).await
+                }
                 Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
@@ -2309,6 +2343,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // timeout argument (deliberately ignored, see helpers.rs) does not
                 // introduce nondeterminism.
                 // TODO-HUMAN-REVIEW(PR-901): Review batched ancillary timestamp rewriting.
+                Syscall::Recvmmsg(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
+                    self.handle_sock_diag_recvmmsg(guest, s).await
+                }
                 Syscall::Recvmmsg(s) => self.handle_recvmmsg(guest, s).await,
                 Syscall::RtSigtimedwait(s) => self.handle_rt_sigtimedwait(guest, s).await,
                 Syscall::RtSigsuspend(s) => self.handle_rt_sigsuspend(guest, s).await,
@@ -2430,6 +2467,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.detlog_registers(guest, &control_point_regs, regs_seq);
         }
         self.detlog_memory_maps(guest)?;
+        // Same control point again, for the bytes this syscall moved through a guest buffer.
+        // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
+        // arguments, so it does not matter whether the buffer lives on the stack, in the brk
+        // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
+        // can see. Only successful calls moved anything.
+        if let Ok(ret) = &res
+            && self.cfg.detlog_io_buffers
+        {
+            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+        }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
             trace_schedevent(
@@ -2567,40 +2614,122 @@ mod subscription_tests {
         );
     }
 
-    /// CENSUS (measurement, not a policy assertion): how many `Determinized`
-    /// syscalls does each subscription path actually deliver to Detcore?
-    ///
-    /// `passthru_opt` is not a niche flag: `record_or_replay_config` turns it on
-    /// for every `hermit record` / `hermit replay`, so this census is the record
-    /// and replay coverage too.
     #[test]
-    fn census_determinized_syscalls_reaching_each_subscription_path() {
+    fn passthru_opt_subscribes_every_determinized_syscall() {
         let determinized: Vec<Sysno> = crate::all_pinned_syscalls()
             .filter(|sysno| crate::is_determinized_syscall(*sysno))
             .collect();
-        let m = determinized.len();
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
+        let missing = determinized
+            .iter()
+            .filter(|sysno| !delivered.contains(sysno))
+            .copied()
+            .collect::<Vec<_>>();
 
-        for passthru_opt in [false, true] {
-            let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(passthru_opt));
-            let delivered: Vec<Sysno> = subscriptions.iter_syscalls().collect();
-            let (reached, missing): (Vec<Sysno>, Vec<Sysno>) = determinized
+        assert!(
+            missing.is_empty(),
+            "passthru_opt let Determinized syscalls bypass Detcore: {}",
+            missing
                 .iter()
-                .partition(|sysno| delivered.contains(sysno));
-            println!(
-                "subscriptions passthru_opt={passthru_opt}: {}/{m} Determinized syscalls \
-                 delivered to Detcore; {} bypass it",
-                reached.len(),
-                missing.len()
-            );
-            println!(
-                "  bypassing: {}",
-                missing
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
+                .map(|sysno| sysno.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            delivered.contains(&Sysno::syslog),
+            "syslog must reach its deterministic Detcore handler"
+        );
+    }
+
+    #[test]
+    fn passthru_opt_leaves_unlisted_passthrough_syscalls_unsubscribed() {
+        assert_eq!(
+            syscall_classification::classify_syscall(Sysno::chdir),
+            syscall_classification::SyscallClassification::PassThrough
+        );
+
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        assert!(
+            !subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::chdir),
+            "chdir is PassThrough and must remain outside the partial subscription"
+        );
+    }
+
+    /// `--detlog-io-buffers` can only hash a syscall Detcore is subscribed to.
+    /// Under `--passthru-opt` the subscription narrows, so the check's coverage
+    /// narrows with it -- silently, because a syscall that never reaches
+    /// Detcore produces no record and no record is indistinguishable from a
+    /// syscall that moved no bytes.
+    ///
+    /// Measured 2026-08-21 on `f05bf04e4f`, one probe calling `getcwd`,
+    /// `recvmsg`, `readv` and `readlink`:
+    ///
+    /// ```text
+    /// hermit --log=info run                --detlog-io-buffers -- ./probe   12 [iobuf] records
+    /// hermit --log=info run --passthru-opt --detlog-io-buffers -- ./probe   11 [iobuf] records
+    /// ```
+    ///
+    /// The single lost syscall is `getcwd`, and the reason is structural: 9 of
+    /// the 20 are in the literal allow-list and 10 more arrive via the
+    /// unconditional Determinized sweep at the end of `subscriptions`, but
+    /// `getcwd` is classified `PassThrough`, so neither path picks it up.
+    ///
+    /// WHY THIS IS A TEST AND NOT A RUNTIME WARNING. The set is stable, so a
+    /// warning would print the same sentence on every `--passthru-opt` run
+    /// forever and be tuned out within a week. The exposure is not today's
+    /// one-syscall gap; it is that 19 of 20 holds only because two
+    /// INDEPENDENTLY MAINTAINED lists happen to agree -- the classification
+    /// table in `syscall_classification.rs` and the match arms in
+    /// `io_buffers.rs`. Reclassifying any one of those ten from `Determinized`
+    /// to `PassThrough` would drop it out of the sweep and out of io-buffers'
+    /// reach with nothing failing. This asserts the relationship so that edit
+    /// cannot land quietly.
+    ///
+    /// It is deliberately an EQUALITY, not a subset check, so it fails in both
+    /// directions: a nineteenth syscall going missing, and `getcwd` becoming
+    /// covered while this expectation still claims it is not.
+    #[test]
+    fn passthru_opt_leaves_io_buffer_hashing_blind_only_for_getcwd() {
+        let subscribed: Vec<Sysno> = <Detcore as Tool>::subscriptions(&strict_config(true))
+            .iter_syscalls()
+            .collect();
+        let unreachable: Vec<Sysno> = crate::io_buffers::HASHED_SYSCALLS
+            .iter()
+            .copied()
+            .filter(|sysno| !subscribed.contains(sysno))
+            .collect();
+
+        assert_eq!(
+            unreachable,
+            vec![Sysno::getcwd],
+            "--passthru-opt changes which syscalls `--detlog-io-buffers` can hash, and the set \
+             moved. {} of {} reachable. If a syscall was RECLASSIFIED out of Determinized, that \
+             silently shrank an enabled determinism check -- re-derive rather than editing this \
+             expectation to match.",
+            crate::io_buffers::HASHED_SYSCALLS.len() - unreachable.len(),
+            crate::io_buffers::HASHED_SYSCALLS.len()
+        );
+    }
+
+    /// The other direction, and the reason the check above is worth having:
+    /// with the default subscription every buffer-carrying syscall is
+    /// reachable, so there is nothing to report on an ordinary run.
+    #[test]
+    fn the_default_subscription_reaches_every_io_buffer_syscall() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(false));
+        let unreachable: Vec<Sysno> = crate::io_buffers::HASHED_SYSCALLS
+            .iter()
+            .copied()
+            .filter(|sysno| !subscriptions.iter_syscalls().any(|s| s == *sysno))
+            .collect();
+
+        assert!(
+            unreachable.is_empty(),
+            "without --passthru-opt every io-buffer syscall must be reachable; missing {unreachable:?}"
+        );
     }
 
     #[test]

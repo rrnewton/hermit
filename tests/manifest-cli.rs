@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Copyright (c) Meta Platforms, Inc. and affiliates.
 //! All rights reserved.
 //!
@@ -33,11 +33,15 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! toml = "0.8"
+//! serde = { version = "1", features = ["derive"] }
+//! serde_yaml = "0.9"
 //! ```
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude;
+
+#[path = "../ci/manifest-plan/src/manifest_value.rs"]
+mod manifest_value;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -46,11 +50,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
-use toml::Value;
+use manifest_value::Value;
 
 const MANIFEST_SCHEMA: i64 = 2;
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
+const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("manifest-cli: {}", message.as_ref());
@@ -117,6 +122,20 @@ fn integer_array(value: Option<&Value>, context: &str) -> Vec<i64> {
         .collect()
 }
 
+fn first_chaos_seed(spec: &Value, id: &str) -> Result<i64, String> {
+    integer_array(
+        spec.get("seeds"),
+        &format!("{id}.modes.chaos.seeds"),
+    )
+    .first()
+    .copied()
+    .ok_or_else(|| {
+        format!(
+            "{id}: chaos mode is unavailable because its manifest declares no seeds; no guest command can be printed or run"
+        )
+    })
+}
+
 fn test_id(test: &Value, bucket: &str) -> String {
     test.get("id")
         .and_then(Value::as_str)
@@ -131,6 +150,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
+        "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
+        "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "mkdir -p \"$cell/home\" \"$cell/xdg-config\" \"$cell/tmp\" \"$cell/fixtures\" \"$cell/captures\""
             .to_owned(),
         "if [ -d tests/e2e/xdg-config ]; then cp -a tests/e2e/xdg-config/. \"$cell/xdg-config/\"; fi"
@@ -234,15 +255,8 @@ fn hermit_command(
     extra: &[String],
     guest: &str,
 ) -> String {
-    let portable = lane == "portable";
-    let profile: Vec<String> = if portable {
-        vec![
-            "--no-virtualize-cpuid".to_owned(),
-            "--max-timeslice=disabled".to_owned(),
-        ]
-    } else {
-        Vec::new()
-    };
+    let _lane = lane;
+    let profile: Vec<String> = Vec::new();
     let be = shell_quote(backend);
     let run_extra_joined = {
         let mut all: Vec<String> = profile;
@@ -268,22 +282,22 @@ fn hermit_command(
     };
     let command = match mode {
         "verify" => {
-            let strict = if verify_bitwise_parity {
-                " --verify-strict"
-            } else {
-                ""
-            };
+            let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be} --strict --verify{strict} --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
             )
         }
         "replay" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} --backend {be} record start --strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout}{extra_joined} -- {guest}"
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log {log} --backend {be} record start --strict $record_verify_strict --verify --verify-json \"$cell/captures/verify.json\" --data-dir \"$cell/recording\" --record-timeout {timeout} {HERMIT_GUEST_ENV_ARGS}{extra_joined} -- {guest}"
         ),
-        "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict --chaos --sched-heuristic=random --seed={}{run_extra_joined} -- {guest}",
-            seed.unwrap_or(0)
-        ),
+        "chaos" => {
+            let seed = seed.unwrap_or_else(|| {
+                fail("internal error: chaos command construction requires a declared seed")
+            });
+            format!(
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+            )
+        }
         "custom" => {
             let mut args = mode_args.to_vec();
             args.extend(extra.iter().cloned());
@@ -302,10 +316,9 @@ fn hermit_command(
     format!("timeout --kill-after=10s {timeout}s {command}")
 }
 
-/// Default `--log` level per mode, matching the CI expansion (`off` for chaos,
-/// `info` otherwise).
-fn default_log(mode: &str) -> &'static str {
-    if mode == "chaos" { "off" } else { "info" }
+/// Default `--log` level per mode, matching the CI expansion.
+fn default_log(_mode: &str) -> &'static str {
+    "info"
 }
 
 struct Manifests {
@@ -319,7 +332,7 @@ fn load_manifests(root: &Path) -> Manifests {
         .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", dir.display())))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -333,7 +346,7 @@ fn load_manifests(root: &Path) -> Manifests {
             .unwrap_or_else(|e| fail(format!("cannot read {}: {e}", path.display())));
         let manifest: Value = source
             .parse()
-            .unwrap_or_else(|e| fail(format!("{}: invalid TOML: {e}", path.display())));
+            .unwrap_or_else(|e| fail(format!("{}: invalid YAML: {e}", path.display())));
         let schema = manifest.get("schema").and_then(Value::as_integer);
         if schema != Some(MANIFEST_SCHEMA) {
             fail(format!(
@@ -363,7 +376,10 @@ fn load_manifests(root: &Path) -> Manifests {
     Manifests { tests }
 }
 
-fn modes_table<'a>(test: &'a Value, id: &str) -> &'a toml::map::Map<String, Value> {
+fn modes_table<'a>(
+    test: &'a Value,
+    id: &str,
+) -> &'a std::collections::BTreeMap<String, Value> {
     test.get("modes")
         .and_then(Value::as_table)
         .unwrap_or_else(|| fail(format!("{id}: missing `modes`")))
@@ -645,11 +661,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     };
     let seed = if mode == "chaos" {
         let modes = modes_table(test, id);
-        let seeds = integer_array(
-            modes[&mode].get("seeds"),
-            &format!("{id}.modes.chaos.seeds"),
-        );
-        Some(seeds.first().copied().unwrap_or(0))
+        Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
     } else {
         None
     };
@@ -687,6 +699,9 @@ fn self_test() -> ExitCode {
         "guest",
     );
     assert!(replay.contains("--data-dir \"$cell/recording\" --record-timeout 60"));
+    assert!(replay.contains("--strict $record_verify_strict --verify"));
+    assert!(replay.contains("--verify-json \"$cell/captures/verify.json\""));
+    assert!(replay.contains(HERMIT_GUEST_ENV_ARGS));
     assert!(!replay.contains("--no-virtualize-cpuid"));
 
     let chaos = hermit_command(
@@ -697,12 +712,25 @@ fn self_test() -> ExitCode {
         Some(7),
         &[],
         false,
-        "off",
+        "info",
         &[],
         "guest",
     );
     assert!(chaos.contains("run --base-env=minimal"));
-    assert!(chaos.contains("--no-virtualize-cpuid --max-timeslice=disabled"));
+    assert!(chaos.contains("--verify --verify-allow=both"));
+    assert!(chaos.contains("--strict $run_verify_strict --verify"));
+    assert!(chaos.contains("--verify-json \"$cell/captures/verify-seed-7.json\""));
+    assert!(chaos.contains("--log=info"));
+    assert!(!chaos.contains("--no-virtualize-cpuid"));
+    assert!(!chaos.contains("--max-timeslice=disabled"));
+    let seeded_chaos: Value = "seeds: [7, 9]".parse().unwrap();
+    let no_seed_chaos = Value::Table(Default::default());
+    assert_eq!(first_chaos_seed(&seeded_chaos, "fixture").unwrap(), 7);
+    assert!(
+        first_chaos_seed(&no_seed_chaos, "fixture")
+            .unwrap_err()
+            .contains("declares no seeds")
+    );
 
     let custom = hermit_command(
         "custom",
@@ -732,7 +760,12 @@ fn self_test() -> ExitCode {
         &[],
         "guest",
     );
-    assert!(verify.contains("--verify-strict --verify-json \"$cell/captures/verify.json\""));
+    assert!(verify.contains("run --base-env=minimal"));
+    assert!(verify.contains(
+        "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+    ));
+    assert!(!verify.contains("--no-virtualize-cpuid"));
+    assert!(!verify.contains("--max-timeslice=disabled"));
     let weak_verify = hermit_command(
         "verify",
         "ptrace",
@@ -746,7 +779,7 @@ fn self_test() -> ExitCode {
         "guest",
     );
     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
-    assert!(!weak_verify.contains("--verify-strict"));
+    assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }
@@ -836,9 +869,10 @@ FILTERS (list):
 
 get/run:
   --mode/--backend/--lane pick the cell (defaults: verify mode, first enabled backend, test lane)
-  --log      override the --log= level (info|debug|trace|off); default info (off for chaos)
+  --log      override the --log= level (info|debug|trace|off); default info for every mode
   --all-modes (get only) print every enabled (mode,backend) command
   -- <flags> (run only) extra hermit flags injected before the `-- <guest>` separator
+  A chaos mode without declared seeds is unavailable; get/run refuse rather than invent seed 0.
 
 ENV:
   HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)"

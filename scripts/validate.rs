@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script --force
 //! Copyright (c) Meta Platforms, Inc. and affiliates.
 //! All rights reserved.
 //!
@@ -59,7 +59,7 @@
 #![recursion_limit = "512"]
 
 #[path = "lib/rust_script_prelude.rs"]
-mod rust_script_prelude; // rust-script cache-key: 088ae17fa4a1 (regen: scripts/lib/prelude-cache-key.sh --write)
+mod rust_script_prelude;
 
 #[path = "lib/validate_corpus.rs"]
 mod validate_corpus;
@@ -79,6 +79,9 @@ mod validate_receipt;
 #[path = "lib/validate_runtime.rs"]
 mod validate_runtime;
 
+#[path = "lib/safe_ci_scope.rs"]
+mod safe_ci_scope;
+
 #[path = "lib/validate_super.rs"]
 mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic args onto nextest.
 
@@ -88,17 +91,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::Arc;
-
-use safe_ci_dag_runner::cgroup::install_scope_teardown;
 use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
-use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
-use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
-use safe_ci_dag_runner::cgroup::CgroupManager;
-use safe_ci_dag_runner::cgroup::Cgroups;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
+use safe_ci_dag_runner::model::Step;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
@@ -120,10 +116,45 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
+const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationStepIdentity {
+    ManifestAudit,
+    ManifestRun,
+    Other,
+}
+
+fn validation_step_identity(step: &Step) -> ValidationStepIdentity {
+    let manifest_group = step.group == "e2e" || step.group.ends_with("-e2e");
+    if (step.group == "gate" && step.job == "manifest")
+        || (manifest_group && step.job == "metadata")
+    {
+        ValidationStepIdentity::ManifestAudit
+    } else if manifest_group && step.job.starts_with("manifest_") {
+        ValidationStepIdentity::ManifestRun
+    } else {
+        ValidationStepIdentity::Other
+    }
+}
 
 const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
+const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+const NESTED_SCOPE_OUTER: &str = "outer";
+const NESTED_SCOPE_INNER: &str = "inner";
+const NESTED_SCOPE_SIGNAL: &str = "signal";
+const NESTED_INNER_STEP_S: i64 = 2;
+const NESTED_INNER_RUN_S: i64 = 5;
+const NESTED_OUTER_CHILD_STEP_S: i64 = 10;
+const NESTED_OUTER_CHILD_RUN_S: i64 = 12;
+const NESTED_SIGNAL_STEP_S: i64 = 5;
+const NESTED_SIGNAL_RUN_S: i64 = 7;
+const NESTED_SURVIVOR_STEP_S: i64 = 2;
+const NESTED_SURVIVOR_RUN_S: i64 = 4;
+const NESTED_SCOPE_RUNTIME_S: i64 = 30;
+const NESTED_WRAPPER_TIMEOUT_S: i64 = 45;
 
 /// Standalone-only in-repo ledger directory.
 ///
@@ -277,11 +308,11 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking L2 app matrix.\n\
-     \x20 --portable-strict-compat-only Portable L2 matrix with bounded diagnostics.\n\
+     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
+     \x20 --portable-strict-compat-only Portable legacy stripped matrix with bounded diagnostics.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Gate the measured SaBRe matrix.\n\
-     \x20 --e9patch-compat-only         Gate core + installed e9patch L2 apps.\n\
+     \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
@@ -312,7 +343,8 @@ fn usage() -> &'static str {
      \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
      \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
      \x20 --show-plan      Print the boxed DAG plan (nodes, caps, deps) and exit.\n\
-     \x20 --self-test      Run the driver's inert policy/quoting brackets and exit.\n\
+     \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
+     \x20                  nested-cgroup check, then exit.\n\
      \x20 -h, --help       Show this help and exit.\n\
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR, VALIDATE_RUN_ON_DIRTY_TREE,\n\
@@ -576,6 +608,218 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
     !force_full || (level == Level::Full && focused.is_none())
 }
 
+/// The environment marker only routes an invocation that already parsed the
+/// explicit `--self-test` flag. An inherited or operator-supplied marker must
+/// never turn an ordinary validation into a small passing probe.
+fn nested_scope_probe_selected(self_test: bool, marker_present: bool) -> bool {
+    self_test && marker_present
+}
+
+fn nested_scope_probe_requested() -> bool {
+    std::env::var_os(NESTED_SCOPE_SELF_TEST_ENV).is_some()
+}
+
+/// Every local rung is strict, and the three sequential outer runs sum to
+/// 12 + 7 + 4 = 23s, below the disposable scope's 30s and wrapper's 45s.
+fn nested_scope_budgets_are_ordered() -> bool {
+    NESTED_INNER_STEP_S < NESTED_INNER_RUN_S
+        && NESTED_INNER_RUN_S < NESTED_OUTER_CHILD_STEP_S
+        && NESTED_OUTER_CHILD_STEP_S < NESTED_OUTER_CHILD_RUN_S
+        && NESTED_SIGNAL_STEP_S < NESTED_SIGNAL_RUN_S
+        && NESTED_SURVIVOR_STEP_S < NESTED_SURVIVOR_RUN_S
+        && NESTED_OUTER_CHILD_RUN_S + NESTED_SIGNAL_RUN_S + NESTED_SURVIVOR_RUN_S
+            < NESTED_SCOPE_RUNTIME_S
+        && NESTED_SCOPE_RUNTIME_S < NESTED_WRAPPER_TIMEOUT_S
+}
+
+fn nested_scope_probe_step(
+    job: &str,
+    cmd: String,
+    mode: Option<&str>,
+    timeout_s: i64,
+) -> safe_ci_dag_runner::model::Step {
+    let mut step = step_with_caps(
+        "safe_ci_scope_self_test", job, "Exercise nested per-step cgroup containment",
+        cmd, Vec::new(), timeout_s, timeout_s, 512 * 1024 * 1024,
+    );
+    if let Some(mode) = mode {
+        step.env.insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
+    }
+    step.env.insert("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS".into(), "1".into());
+    step.hint.preferred_inner_jobs = Some(1);
+    step.jobs_flag = Some(String::new());
+    step
+}
+
+fn run_one_nested_scope_probe_step(
+    cgroups: BoxedCgroups,
+    step: safe_ci_dag_runner::model::Step,
+    run_timeout_s: i64,
+) -> Result<(), String> {
+    let mut cfg = DagConfig::default();
+    cfg.description = "real nested safe-ci scope self-test".into();
+    cfg.steps.push(step);
+    let result = run_dag_boxed_deadline(
+        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+    );
+    if !result.ok || result.run_timed_out || !result.skipped.is_empty()
+        || result.outcomes.len() != 1 || !result.outcomes[0].ok
+    {
+        return Err(format!(
+            "nested cgroup step did not pass exactly once: ok={} timed_out={} outcomes={:?} skipped={:?}",
+            result.ok, result.run_timed_out, result.outcomes, result.skipped
+        ));
+    }
+    Ok(())
+}
+
+fn run_one_nested_scope_signal_step(
+    cgroups: BoxedCgroups,
+    step: safe_ci_dag_runner::model::Step,
+    run_timeout_s: i64,
+) -> Result<(), String> {
+    let mut cfg = DagConfig::default();
+    cfg.description = "real inherited-scope signal self-test".into();
+    cfg.steps.push(step);
+    let result = run_dag_boxed_deadline(
+        &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
+    );
+    if result.ok || result.run_timed_out || !result.skipped.is_empty()
+        || result.outcomes.len() != 1
+        || result.outcomes[0].ok
+        || result.outcomes[0].returncode != Some(-libc::SIGTERM as i64)
+    {
+        return Err(format!(
+            "nested signal step did not fail only by SIGTERM: ok={} timed_out={} \
+             outcomes={:?} skipped={:?}",
+            result.ok, result.run_timed_out, result.outcomes, result.skipped
+        ));
+    }
+    Ok(())
+}
+
+/// Exercise outer-scope verification from a real scheduler `step-*` child,
+/// then require that child to dispatch one further per-step cgroup.
+fn run_nested_scope_probe() -> Result<String, String> {
+    match std::env::var(NESTED_SCOPE_SELF_TEST_ENV).as_deref() {
+        Ok(NESTED_SCOPE_OUTER) => {
+            let cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested self-test outer", false, Some(NESTED_SCOPE_RUNTIME_S), true,
+            ).map_err(|code| format!("outer cgroup setup refused with exit {code}"))?;
+            let exe = std::env::current_exe()
+                .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+            let exe = exe.to_str()
+                .ok_or_else(|| "self-test executable path is not UTF-8".to_string())?;
+            let command = format!("{} --self-test", validate_plan::shell_quote(exe));
+            run_one_nested_scope_probe_step(
+                cgroups.clone(),
+                nested_scope_probe_step(
+                    "outer_child", command.clone(), Some(NESTED_SCOPE_INNER),
+                    NESTED_OUTER_CHILD_STEP_S,
+                ),
+                NESTED_OUTER_CHILD_RUN_S,
+            )?;
+            run_one_nested_scope_signal_step(
+                cgroups.clone(),
+                nested_scope_probe_step(
+                    "signal_child", command, Some(NESTED_SCOPE_SIGNAL), NESTED_SIGNAL_STEP_S,
+                ),
+                NESTED_SIGNAL_RUN_S,
+            )?;
+            run_one_nested_scope_probe_step(
+                cgroups,
+                nested_scope_probe_step(
+                    "surviving_sibling", "true".into(), None, NESTED_SURVIVOR_STEP_S,
+                ),
+                NESTED_SURVIVOR_RUN_S,
+            )?;
+            Ok(
+                "outer scope observed the nested SIGTERM failure and then ran a boxed sibling"
+                    .into(),
+            )
+        }
+        Ok(NESTED_SCOPE_INNER) => {
+            // This process inherited the outer scope's RuntimeMax; it did not
+            // request a second systemd unit. Every other limit stays mandatory.
+            let cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested self-test inner", false, None, false,
+            ).map_err(|code| format!("nested cgroup setup refused with exit {code}"))?;
+            run_one_nested_scope_probe_step(
+                cgroups,
+                nested_scope_probe_step(
+                    "inner_child", "true".into(), None, NESTED_INNER_STEP_S,
+                ),
+                NESTED_INNER_RUN_S,
+            )?;
+            Ok("nested child verified the outer scope and dispatched its own boxed step".into())
+        }
+        Ok(NESTED_SCOPE_SIGNAL) => {
+            // Remove validate's ordinary signal observer BEFORE resolve_cgroups.
+            // The fixed inherited path installs no replacement, so SIGTERM
+            // terminates only this child. The buggy path installs the outer-
+            // scope teardown handler, which instead kills the disposable scope
+            // and makes the bounded parent wrapper fail.
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            }
+            let _cgroups = safe_ci_scope::resolve_cgroups(
+                "safe-ci nested signal self-test", false, None, false,
+            ).map_err(|code| format!("nested signal cgroup setup refused with exit {code}"))?;
+            eprintln!("nested signal child resolved inherited cgroups; delivering SIGTERM");
+            let raised = unsafe { libc::raise(libc::SIGTERM) };
+            Err(format!("nested signal child survived SIGTERM (libc::raise rc={raised})"))
+        }
+        Ok(other) => Err(format!("unknown nested scope self-test mode {other:?}")),
+        Err(error) => Err(format!("nested scope self-test mode is unavailable: {error}")),
+    }
+}
+
+/// Launch the real nested topology in a bounded child. Clearing inherited
+/// scope sentinels forces that child to establish and observe a fresh scope.
+fn nested_scope_self_test() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+    let output = Command::new("timeout")
+        .arg("--kill-after=5s")
+        .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
+        .arg(exe).arg("--self-test")
+        .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
+        .env("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")
+        .env("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", "1")
+        .env_remove("SAFE_CI_IN_SCOPE")
+        .env_remove("SAFE_CI_SCOPE_UNIT")
+        .env_remove("SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("SAFE_CI_EXPECTED_RUNTIME_MAX_SEC")
+        .output()
+        .map_err(|error| format!("cannot launch bounded nested scope self-test: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "real nested scope self-test failed with {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        "nested child verified the outer scope and dispatched its own boxed step",
+        "safe-ci nested self-test inner: cgroup boxing ACTIVE",
+        "outer cgroup audit at ",
+        "safe_ci_scope_self_test.inner_child] ✓ PASS",
+        "safe_ci_scope_self_test.signal_child] ✗ FAIL",
+        "safe_ci_scope_self_test.surviving_sibling] ✓ PASS",
+        "outer scope observed the nested SIGTERM failure and then ran a boxed sibling",
+    ] {
+        if !stdout.contains(required) && !stderr.contains(required) {
+            return Err(format!(
+                "real nested scope self-test exited successfully without required evidence \
+                 {required:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -584,6 +828,26 @@ fn force_full_policy_allows(force_full: bool, level: Level, focused: Option<&str
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    if !nested_scope_probe_selected(true, true)
+        || nested_scope_probe_selected(false, true)
+        || nested_scope_probe_selected(true, false)
+        || nested_scope_probe_selected(false, false)
+    {
+        return Err(
+            "nested scope probe dispatch did not require both --self-test and its internal marker"
+                .into(),
+        );
+    }
+    if !nested_scope_budgets_are_ordered() {
+        return Err(format!(
+            "nested scope self-test budgets are inverted: inner={NESTED_INNER_STEP_S}/\
+             {NESTED_INNER_RUN_S}s outer-child={NESTED_OUTER_CHILD_STEP_S}/\
+             {NESTED_OUTER_CHILD_RUN_S}s signal={NESTED_SIGNAL_STEP_S}/\
+             {NESTED_SIGNAL_RUN_S}s survivor={NESTED_SURVIVOR_STEP_S}/\
+             {NESTED_SURVIVOR_RUN_S}s scope={NESTED_SCOPE_RUNTIME_S}s \
+             wrapper={NESTED_WRAPPER_TIMEOUT_S}s"
+        ));
+    }
     // CLI bracket: a real positive budget reaches the typed field, while zero,
     // negative, malformed, and missing values are all refused.
     let parsed = parse_argv(&["--run-timeout".into(), "600".into(), "--self-test".into()])
@@ -830,10 +1094,14 @@ fn self_test() -> Result<(), String> {
         rr_rows.len(),
         validate_corpus::RR_COMPAT_EXPECTED
     );
-    // Every ported subsystem brings its own two-sided brackets. They are inert:
-    // none of them runs a gate, publishes a label, writes the real ledger, or
-    // touches a PR — see each module's `self_test` doc for why that matters.
+    // Policy/data brackets are inert: none runs a gate, publishes a label,
+    // writes the real ledger, or touches a PR. The one deliberate exception is
+    // nested_scope_self_test: it uses a fresh disposable scope with strict
+    // inner/run/scope/wrapper bounds, then proves a nested signal cannot stop it.
     for line in [
+        safe_ci_scope::self_test()?,
+        nested_scope_self_test()?,
+        scheduler_accounting_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
@@ -851,6 +1119,7 @@ fn self_test() -> Result<(), String> {
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
     coverage_schema_bracket()?;
+    test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
@@ -920,13 +1189,54 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .filter(|s| s.cmd == "./ci/test_harness.sh validate")
+            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestAudit)
             .map(|s| s.tag())
             .collect();
         if manifest_nodes != vec!["gate.manifest"] {
             return Err(format!(
                 "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
             ));
+        }
+        let manifest_audit = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
+            .expect("manifest audit exists")
+            .clone();
+        let manifest_producer = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+            .ok_or("full-plan bracket: manifest-plan producer disappeared")?;
+        if manifest_producer.cmd != validate_plan::MANIFEST_PLAN_BUILD_COMMAND
+            || manifest_producer.deps != [PIN_GATE_TAG.to_string()]
+            || manifest_producer.deps.iter().any(|dependency| dependency == "gate.manifest")
+        {
+            return Err(format!(
+                "full-plan bracket: manifest-plan producer is not directly after the pin gate: cmd={} deps={:?}",
+                manifest_producer.cmd, manifest_producer.deps
+            ));
+        }
+        if manifest_audit.deps
+            != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
+        {
+            return Err(format!(
+                "full-plan bracket: manifest audit can run without its binary producer: deps={:?}",
+                manifest_audit.deps
+            ));
+        }
+        println!("  {}", manifest_producer_edge_bracket(&full.cfg)?);
+        let mut wrong_invocation = vec![manifest_audit];
+        wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
+        if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
+            || dedupe_identical(&mut wrong_invocation).is_ok()
+        {
+            return Err(
+                "full-plan bracket: manifest-audit identity depended on command text or accepted an unexpected invocation"
+                    .into(),
+            );
         }
         let pin_nodes: Vec<String> = full
             .cfg
@@ -986,10 +1296,17 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .filter(|s| s.cmd.contains("./ci/test_harness.sh run --lane "))
+            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestRun)
             .collect();
         if manifest_consumers.is_empty() {
             return Err("full-plan bracket: no manifest consumers were inspected".into());
+        }
+        let mut spelling_probe = (*manifest_consumers[0]).clone();
+        spelling_probe.cmd = "changed invocation text".into();
+        if validation_step_identity(&spelling_probe) != ValidationStepIdentity::ManifestRun {
+            return Err(
+                "full-plan bracket: manifest-run identity still depends on command text".into(),
+            );
         }
         for consumer in manifest_consumers {
             if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
@@ -1088,12 +1405,178 @@ cleared-caps refusal names {} starved step(s)",
             return Err("full-plan bracket: nested reuse accepted a label-capable invocation".into());
         }
         println!(
-            "  full plan: {} fused node(s), 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
+            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback + nested no-label reuse bracketed",
             full.cfg.steps.len()
         );
     }
 
     Ok(())
+}
+
+/// Execute the production manifest producer/audit dependency spine in both
+/// directions. The positive case starts with no output and requires the
+/// producer to create it before the audit runs. The negative case makes the
+/// producer fail and requires the scheduler to dependency-skip the audit.
+fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-manifest-producer-edge-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|error| format!("manifest producer bracket: cannot create {}: {error}", tmp.display()))?;
+
+    let result = (|| -> Result<(), String> {
+        let required = [
+            "pre.submodules",
+            PIN_GATE_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ];
+        let fixture = |producer_cmd: String, gate_cmd: String| -> Result<DagConfig, String> {
+            let mut steps = Vec::new();
+            for tag in required {
+                let source = cfg
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == tag)
+                    .ok_or_else(|| format!("manifest producer bracket: production plan lost {tag}"))?;
+                let mut step = step_with_caps(
+                    &source.group,
+                    &source.job,
+                    "manifest producer dependency fixture",
+                    match tag {
+                        "pre.submodules" | PIN_GATE_TAG => "true".to_string(),
+                        validate_plan::MANIFEST_PLAN_PRODUCER_TAG => producer_cmd.clone(),
+                        "gate.manifest" => gate_cmd.clone(),
+                        _ => unreachable!(),
+                    },
+                    source.deps.clone(),
+                    30,
+                    30,
+                    64 * 1024 * 1024,
+                );
+                step.deps.retain(|dependency| required.contains(&dependency.as_str()));
+                steps.push(step);
+            }
+            Ok(validate_plan::config_from(
+                steps,
+                "manifest producer dependency fixture",
+            ))
+        };
+
+        let output = tmp.join("target/debug/test-harness");
+        let gate_ran = tmp.join("gate-ran");
+        let output_parent = output
+            .parent()
+            .ok_or_else(|| format!("manifest producer bracket: {} has no parent", output.display()))?;
+        let positive = fixture(
+            format!(
+                "mkdir -p {parent} && printf '#!/bin/sh\\nexit 0\\n' > {output} && chmod +x {output}",
+                parent = validate_plan::shell_quote(&output_parent.to_string_lossy()),
+                output = validate_plan::shell_quote(&output.to_string_lossy()),
+            ),
+            format!(
+                "test -x {output} && {output} && : > {gate_ran}",
+                output = validate_plan::shell_quote(&output.to_string_lossy()),
+                gate_ran = validate_plan::shell_quote(&gate_ran.to_string_lossy()),
+            ),
+        )?;
+        let positive_result = run_lane_with_env_retries(
+            &positive,
+            2,
+            true,
+            0,
+            None,
+            &tmp.join("positive.log"),
+            None,
+            0,
+            false,
+        );
+        if !positive_result.complete
+            || !positive_result.ok
+            || positive_result.outcomes.len() != required.len()
+            || !positive_result.skipped.is_empty()
+            || !output.is_file()
+            || !gate_ran.is_file()
+        {
+            return Err(format!(
+                "manifest producer bracket: absent output was not produced before the gate: complete={} ok={} outcomes={:?} skipped={:?} output={} gate_ran={}",
+                positive_result.complete,
+                positive_result.ok,
+                positive_result
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.ok))
+                    .collect::<Vec<_>>(),
+                positive_result.skipped,
+                output.is_file(),
+                gate_ran.is_file()
+            ));
+        }
+
+        std::fs::remove_file(&output)
+            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", output.display()))?;
+        std::fs::remove_file(&gate_ran)
+            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", gate_ran.display()))?;
+        let negative = fixture(
+            "exit 23".to_string(),
+            format!(
+                ": > {}",
+                validate_plan::shell_quote(&gate_ran.to_string_lossy())
+            ),
+        )?;
+        let negative_result = run_lane_with_env_retries(
+            &negative,
+            2,
+            true,
+            0,
+            None,
+            &tmp.join("negative.log"),
+            None,
+            0,
+            false,
+        );
+        let producer_failed = negative_result.outcomes.iter().any(|outcome| {
+            outcome.tag == validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                && !outcome.ok
+                && outcome.returncode == Some(23)
+        });
+        if negative_result.complete
+            || negative_result.ok
+            || !producer_failed
+            || negative_result.skipped != ["gate.manifest".to_string()]
+            || gate_ran.exists()
+        {
+            return Err(format!(
+                "manifest producer bracket: failed producer did not block the gate: complete={} ok={} producer_failed={producer_failed} outcomes={:?} skipped={:?} gate_ran={}",
+                negative_result.complete,
+                negative_result.ok,
+                negative_result
+                    .outcomes
+                    .iter()
+                    .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.returncode))
+                    .collect::<Vec<_>>(),
+                negative_result.skipped,
+                gate_ran.exists()
+            ));
+        }
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp)
+        .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", tmp.display()));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(
+            "manifest producer edge: absent output built before gate; producer failure dependency-skips gate"
+                .into(),
+        ),
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => Err(format!(
+            "{problem}; cleanup also failed: {cleanup_problem}"
+        )),
+    }
 }
 
 /// Bind the current schema to the evidence the row actually carries.
@@ -1269,9 +1752,149 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
             sel2.unknown_tags
         ));
     }
+
+    // Exercise the real selector, not a hand-written keep set. A flaky-tests
+    // change reaches the chaos manifest cell through e2e.metadata and the
+    // shipped setup.manifest_plan producer. The producer is valid selector
+    // vocabulary even though plan composition satisfies it from preflight.
+    let selector = Command::new(root.join("ci").join("select-tests.rs"))
+        .args(["--files", "flaky-tests/Cargo.toml", "--format", "json"])
+        .output()
+        .map_err(|error| format!("selective bracket: cannot run real selector: {error}"))?;
+    if !selector.status.success() {
+        return Err(format!(
+            "selective bracket: real selector failed: {}",
+            String::from_utf8_lossy(&selector.stderr)
+        ));
+    }
+    let selected_json: serde_json::Value = serde_json::from_slice(&selector.stdout)
+        .map_err(|error| format!("selective bracket: real selector emitted invalid JSON: {error}"))?;
+    let selected: BTreeSet<String> = selected_json["nodes"]
+        .as_array()
+        .ok_or("selective bracket: real selector JSON has no nodes array")?
+        .iter()
+        .filter_map(|node| node.as_str().map(str::to_string))
+        .collect();
+    for required in [
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+        "e2e.metadata",
+        "e2e.manifest_chaos_c",
+    ] {
+        if !selected.contains(required) {
+            return Err(format!(
+                "selective bracket: flaky-tests/Cargo.toml did not select required node {required}: {selected:?}"
+            ));
+        }
+    }
+    let raw = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
+    let mut real = validate_plan::select_lane_nodes(raw, &selected);
+    if !real.unknown_tags.is_empty() {
+        return Err(format!(
+            "selective bracket: real selector named unknown shipped tags before producer reuse: {:?}",
+            real.unknown_tags
+        ));
+    }
+    if !validate_plan::reuse_preflight_manifest_producer(
+        &mut real.steps,
+        "real selective result",
+    )? {
+        return Err(
+            "selective bracket: real selector omitted its manifest-plan producer dependency"
+                .into(),
+        );
+    }
+    if real
+        .steps
+        .iter()
+        .any(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+    {
+        return Err("selective bracket: lane retained a duplicate manifest-plan producer".into());
+    }
+    let metadata = real
+        .steps
+        .iter()
+        .find(|step| step.tag() == "e2e.metadata")
+        .ok_or("selective bracket: real selector lost e2e.metadata")?;
+    if !metadata
+        .deps
+        .iter()
+        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+    {
+        return Err(
+            "selective bracket: e2e.metadata was not bound to the preflight manifest producer"
+            .into(),
+        );
+    }
+
+    // Exercise the same SelectDecision::Full branch used when no trustworthy
+    // baseline exists. The complete shipped lane must also reuse preflight's
+    // producer; otherwise composition creates two setup.manifest_plan nodes and
+    // the lane copy still points back at gate.manifest.
+    let full_lane = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
+    let full_total = full_lane.len();
+    let full_steps = apply_selective_decision(
+        full_lane,
+        full_total,
+        SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
+    )?;
+    let mut full_nodes = validate_plan::preflight_nodes(root, false);
+    full_nodes.extend(full_steps);
+    let producer_count = full_nodes
+        .iter()
+        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .count();
+    if producer_count != 1 {
+        return Err(format!(
+            "selective bracket: full/no-baseline fallback has {producer_count} manifest-plan producers, expected 1"
+        ));
+    }
+    let producer = full_nodes
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .expect("exactly one producer exists");
+    let gate = full_nodes
+        .iter()
+        .find(|step| step.tag() == "gate.manifest")
+        .ok_or("selective bracket: full/no-baseline fallback lost gate.manifest")?;
+    if producer.deps != [PIN_GATE_TAG.to_string()]
+        || gate.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
+    {
+        return Err(format!(
+            "selective bracket: full/no-baseline producer ordering is wrong: producer={:?} gate={:?}",
+            producer.deps, gate.deps
+        ));
+    }
+    let tags: BTreeSet<String> = full_nodes.iter().map(|step| step.tag()).collect();
+    if tags.len() != full_nodes.len() {
+        return Err("selective bracket: full/no-baseline fallback contains duplicate tags".into());
+    }
+    let mut completed = BTreeSet::new();
+    loop {
+        let ready: Vec<String> = full_nodes
+            .iter()
+            .filter(|step| !completed.contains(&step.tag()))
+            .filter(|step| step.deps.iter().all(|dependency| completed.contains(dependency)))
+            .map(|step| step.tag())
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        completed.extend(ready);
+    }
+    if completed.len() != full_nodes.len() {
+        let blocked: Vec<String> = full_nodes
+            .iter()
+            .filter(|step| !completed.contains(&step.tag()))
+            .map(|step| step.tag())
+            .collect();
+        return Err(format!(
+            "selective bracket: full/no-baseline fallback contains a dependency cycle or missing dependency: {blocked:?}"
+        ));
+    }
     println!(
         "  selective subset: kept {child} + its dep {parent} from the real portable lane \
-         ({} edge(s) pruned); 1 unknown-tag refusal",
+         ({} edge(s) pruned); flaky-tests selector reused its manifest producer; \
+         full/no-baseline fallback has one acyclic producer; 1 unknown-tag refusal",
         sel.pruned_edges
     );
     Ok(())
@@ -1556,72 +2179,29 @@ fn resolve_cgroups(
     run_timeout_s: Option<i64>,
     deadline_ns: Option<u64>,
 ) -> Result<BoxedCgroups, u8> {
-    if is_in_scope() {
-        // A RuntimeMaxSec request is only this invocation's backstop when the marker carries this
-        // invocation's absolute deadline. Nested validates inherit an outer scope and its env;
-        // treating that inherited request as the nested 660s rung would compare unrelated clocks.
-        if owns_scope_request(deadline_ns) {
-            let verified = expected_scope_runtime_max_s()
-                .is_some_and(verify_scope_runtime_max);
-            if !verified {
-                let msg = "this invocation's outer RuntimeMaxSec readback failed; the requested \
-                           scope backstop is not proven on the live unit";
-                if allow_failure {
-                    eprintln!(
-                        "validate: WARNING: {msg}; running UNBOXED (--allow-cgroup-failure)."
-                    );
-                    return Ok(None);
-                }
-                eprintln!("validate: ERROR: {msg}.");
-                return Err(3);
-            }
-        } else if run_timeout_s.is_some() {
-            eprintln!(
-                "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
-                 the anchored in-process deadline remains inside the enclosing DAG node limit"
-            );
-        }
-        let mgr = Cgroups::new();
-        if mgr.enabled() {
-            install_scope_teardown();
-            eprintln!(
-                "validate: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU \
-                 caps + setsid-proof teardown)."
-            );
-            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
-        }
-        if allow_failure {
-            eprintln!("validate: WARNING: per-step cgroup setup failed; running UNBOXED (--allow-cgroup-failure).");
-            return Ok(None);
-        }
+    let owns_request = owns_scope_request(deadline_ns);
+    if is_in_scope() && run_timeout_s.is_some() && !owns_request {
         eprintln!(
-            "validate: ERROR: inside a managed scope but per-step cgroups could not be set up; \
-             re-run with --allow-cgroup-failure to run UNBOXED."
+            "validate: inherited cgroup scope has no invocation-owned RuntimeMaxSec rung; \
+             the anchored in-process deadline remains inside the enclosing DAG node limit"
         );
-        return Err(3);
-    }
-    if allow_failure {
-        eprintln!(
-            "validate: WARNING: cgroup boxing not established (--allow-cgroup-failure); running \
-             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
-        );
-        return Ok(None);
     }
     let scope_runtime_s = run_timeout_s.and_then(|run| {
         remaining_budget_s(deadline_ns).map(|remaining| remaining + scope_grace_s(run))
     });
-    if let Some(deadline) = deadline_ns {
-        std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
-    } else {
-        std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+    if !allow_failure {
+        if let Some(deadline) = deadline_ns {
+            std::env::set_var(OWN_SCOPE_DEADLINE_ENV, deadline.to_string());
+        } else {
+            std::env::remove_var(OWN_SCOPE_DEADLINE_ENV);
+        }
     }
-    let attempt = attempt_scope_reexec(None, None, scope_runtime_s);
-    let detail = attempt.describe();
-    eprintln!(
-        "validate: ERROR: cgroup boxing could not be established: {detail}. Resource boxing is \
-         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
-    );
-    Err(3)
+    safe_ci_scope::propagate_result(safe_ci_scope::resolve_cgroups(
+        "validate",
+        allow_failure,
+        scope_runtime_s,
+        owns_request,
+    ))
 }
 
 // --------------------------------------------------------------------------- durable log
@@ -1672,7 +2252,7 @@ fn durable_log_path(root: &Path, profile: &str, sha: &str) -> PathBuf {
 
 /// Give every real validate invocation its own durable E2E result directory.
 ///
-/// `ci/test_harness.sh` already emits one schema-3 row per cell, but its local
+/// `target/debug/test-harness` already emits one schema-4 row per cell, but its local
 /// default is under the checkout. A canonical validate may run in a disposable
 /// scratch tree, so those rows disappeared at cleanup. Deriving the fallback
 /// from the durable log puts both artifacts under the same surviving root. A
@@ -2133,10 +2713,7 @@ fn attach_compatibility_scorecard(
 ) -> Result<(), String> {
     let mut deps = Vec::new();
     for step in steps.iter() {
-        if step.job.starts_with("manifest_")
-            && step.cmd.contains("./ci/test_harness.sh run ")
-            && step.cmd.contains("--ci-only")
-        {
+        if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
             deps.push(step.tag());
         }
     }
@@ -2208,7 +2785,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             // passed. Avoid rerunning that ~75 s exact-tree audit inside the
             // nested payload, but retain the cheap, independently observed
             // submodule and pin gates.
-            steps.retain(|s| s.tag() != gate);
+            steps.retain(|s| {
+                s.tag() != gate && s.tag() != validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+            });
             PIN_GATE_TAG
         } else {
             gate
@@ -2303,8 +2882,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", "./ci/test_harness.sh validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "./ci/test_harness.sh run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
+        add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -2379,7 +2958,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if lanes.len() == 2 && !args.merge_lanes {
         // Faithful reproduction of run_full_suite: portable lane, then privileged.
         let mut a = pre.clone();
-        a.extend(validate_plan::lane_nodes(root, lanes[0], "", gate)?);
+        a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
+            root, lanes[0], "", gate,
+        )?);
         let mut b = validate_plan::lane_nodes(root, lanes[1], "", gate)?;
         // The second run repeats preflight-free; its nodes hang off nothing.
         for s in b.iter_mut() {
@@ -2429,14 +3010,17 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         } else {
             String::new()
         };
-        steps.extend(validate_plan::lane_nodes(root, lane, &prefix, gate)?);
+        steps.extend(validate_plan::lane_nodes_reusing_manifest_producer(
+            root, lane, &prefix, gate,
+        )?);
     }
     // Fusing lanes can duplicate identical work. In particular, the always-on
     // gate.manifest and both lane e2e.metadata nodes run the exact same
-    // `test_harness.sh validate` tree audit. Drop later duplicates and repoint
+    // `test-harness validate` tree audit. Drop later duplicates and repoint
     // their dependents, so one full run pays that ~75 s audit exactly once. The
-    // dedup is exact-command based for this one audited command and is reported.
-    let removed = dedupe_identical(&mut steps);
+    // dedup is keyed by typed manifest-audit identity; an unexpected command is
+    // refused explicitly instead of silently ceasing to match.
+    let removed = dedupe_identical(&mut steps)?;
     if !removed.is_empty() {
         eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
     }
@@ -2704,6 +3288,57 @@ enum SelectDecision {
     Full(String),
 }
 
+/// Apply one selector result while preserving the shipped lane as the tag
+/// authority. Producer reuse happens once, after unknown-tag validation, so it
+/// covers both dependency-closed subsets and fail-safe full-lane fallbacks.
+fn apply_selective_decision(
+    all: Vec<safe_ci_dag_runner::model::Step>,
+    total: usize,
+    decision: SelectDecision,
+) -> Result<Vec<safe_ci_dag_runner::model::Step>, String> {
+    let mut steps = match decision {
+        SelectDecision::Skip => {
+            println!(
+                "Selective validation: no CI-relevant changes since baseline — nothing to run \
+                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
+                 zero planned test nodes, so this cannot be misread as a full pass."
+            );
+            Vec::new()
+        }
+        SelectDecision::Nodes(keep) => {
+            let sel = validate_plan::select_lane_nodes(all, &keep);
+            if !sel.unknown_tags.is_empty() {
+                return Err(format!(
+                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
+                     selector and the DAG disagree, so refusing to run a subset derived from a \
+                     stale mapping",
+                    sel.unknown_tags.len(),
+                    sel.unknown_tags.join(", ")
+                ));
+            }
+            println!(
+                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
+                 dependency edge(s) pruned to the selected set):\n  {}",
+                sel.steps.len(),
+                sel.pruned_edges,
+                keep.iter().cloned().collect::<Vec<_>>().join(" ")
+            );
+            sel.steps
+        }
+        SelectDecision::Full(why) => {
+            println!("Selective validation: {why} — running the FULL portable lane.");
+            all
+        }
+    };
+    if validate_plan::reuse_preflight_manifest_producer(
+        &mut steps,
+        "selective portable lane",
+    )? {
+        println!("Selective validation: setup.manifest_plan is supplied by preflight.");
+    }
+    Ok(steps)
+}
+
 /// Ask `ci/select-tests.rs` what to run.
 ///
 /// This is PLAN CONSTRUCTION, not a gate: the selector produces no verdict about
@@ -2792,46 +3427,17 @@ fn selective_plan(
         ),
     }
 
+    // Keep the shipped lane's complete tag vocabulary through selection. In
+    // particular, the selector may return setup.manifest_plan as part of a
+    // dependency-closed result; it is replaced by the preflight producer only
+    // after unknown-tag validation below.
     let all = validate_plan::lane_nodes(root, "portable", "", gate)?;
     let total = all.len();
     let decision = match &baseline {
         Some(b) => ask_selector(root, Some(b)),
         None => SelectDecision::Full("no trustworthy green baseline".into()),
     };
-    let steps: Vec<safe_ci_dag_runner::model::Step> = match decision {
-        SelectDecision::Skip => {
-            println!(
-                "Selective validation: no CI-relevant changes since baseline — nothing to run \
-                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
-                 zero planned test nodes, so this cannot be misread as a full pass."
-            );
-            Vec::new()
-        }
-        SelectDecision::Nodes(keep) => {
-            let sel = validate_plan::select_lane_nodes(all, &keep);
-            if !sel.unknown_tags.is_empty() {
-                return Err(format!(
-                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
-                     selector and the DAG disagree, so refusing to run a subset derived from a \
-                     stale mapping",
-                    sel.unknown_tags.len(),
-                    sel.unknown_tags.join(", ")
-                ));
-            }
-            println!(
-                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
-                 dependency edge(s) pruned to the selected set):\n  {}",
-                sel.steps.len(),
-                sel.pruned_edges,
-                keep.iter().cloned().collect::<Vec<_>>().join(" ")
-            );
-            sel.steps
-        }
-        SelectDecision::Full(why) => {
-            println!("Selective validation: {why} — running the FULL portable lane.");
-            all
-        }
-    };
+    let steps = apply_selective_decision(all, total, decision)?;
     let mut nodes = pre;
     nodes.extend(steps);
     let cfg = validate_plan::config_from(nodes, "selective portable subset");
@@ -2851,17 +3457,23 @@ fn selective_plan(
 /// the manifest audit (different tags, byte-identical command/tree) and the
 /// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
 /// root cwd). The observed preflight node survives in both cases.
-fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<String> {
+fn dedupe_identical(steps: &mut Vec<Step>) -> Result<Vec<String>, String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut keep = Vec::with_capacity(steps.len());
     let mut removed = Vec::new();
     for s in steps.drain(..) {
         let tag = s.tag();
-        let key = if s.cmd == "./ci/test_harness.sh validate" {
+        let key = if validation_step_identity(&s) == ValidationStepIdentity::ManifestAudit {
+            if s.cmd != MANIFEST_AUDIT_COMMAND {
+                return Err(format!(
+                    "manifest-audit node {tag} has unexpected invocation: {}",
+                    s.cmd
+                ));
+            }
             (
                 "exact-tree-manifest-audit".to_string(),
-                "./ci/test_harness.sh validate".to_string(),
+                MANIFEST_AUDIT_COMMAND.to_string(),
             )
         } else if [
             "pre.reverie_pin",
@@ -2903,7 +3515,7 @@ fn dedupe_identical(steps: &mut Vec<safe_ci_dag_runner::model::Step>) -> Vec<Str
         s.deps.dedup();
     }
     *steps = keep;
-    removed
+    Ok(removed)
 }
 
 /// Heavy compatibility preparation is the innermost bound in the validation ladder:
@@ -2976,7 +3588,7 @@ fn prepare_fixtures_node_dep(
 }
 
 /// `require_e9patch_artifacts`' files-only NSS fixture (validate.sh:4095): keeps
-/// host identity-daemon races out of the e9patch L2 measurement.
+/// host identity-daemon races out of the e9patch compatibility measurement.
 fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
     let entries = [
         "aliases", "automount", "ethers", "group", "gshadow", "hosts", "initgroups", "netgroup",
@@ -3116,7 +3728,7 @@ fn print_compat_summary(mode: CompatMode, outcomes: &[StepOutcome]) -> (usize, u
             blocking_failures.push(label.to_string());
         }
     }
-    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.assurance());
+    println!("\nCOMPATIBILITY SUMMARY ({measured} measured programs, mode {})", mode.display_name());
     println!("{:<22} | {:>8} | {:>9}", "Category", "Programs", "passing");
     println!("{}", "-".repeat(46));
     for cat in validate_corpus::CATEGORIES {
@@ -3184,6 +3796,13 @@ fn verdict_refusals(
         );
     }
     out
+}
+
+/// Execution completeness applies after profile-specific failure policy. A
+/// profile may allow a fully measured failing row, but no profile may turn a
+/// partial run into exit zero.
+fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
+    if execution_complete { exit_code } else { exit_code.max(1) }
 }
 
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
@@ -3342,6 +3961,14 @@ fn interrupted_by() -> Option<&'static str> {
 struct LaneResult {
     outcomes: Vec<StepOutcome>,
     skipped: Vec<String>,
+    /// Every non-intentional planned node completed with a non-aborted outcome,
+    /// and the whole-run clock did not cut the lane short. Dependency-skipped
+    /// and aborted nodes are known but unexecuted, so they are incomplete. This
+    /// is deliberately separate from node success: compat, super, and envelope
+    /// profiles may allow a fully measured failing row.
+    complete: bool,
+    /// Whether every reported node succeeded or was aborted after a peer failed.
+    /// This does not answer whether the planned lane was completely reported.
     ok: bool,
     /// How many retry ROUNDS this lane needed; recorded in the ledger so a green
     /// that only survived because the host was retried is never mistaken for a
@@ -3513,6 +4140,505 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
     })
 }
 
+/// Planned runnable steps absent from both scheduler result collections.
+fn unreported_non_intentional_steps(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+    skipped: &[String],
+) -> Vec<String> {
+    let skipped: BTreeSet<&str> = skipped.iter().map(String::as_str).collect();
+    cfg.steps
+        .iter()
+        .filter(|step| {
+            let tag = step.tag();
+            step.skip_reason.is_none()
+                && !by_tag.contains_key(&tag)
+                && !skipped.contains(tag.as_str())
+        })
+        .map(|step| step.tag())
+        .collect()
+}
+
+/// Keep only retry candidates whose prerequisites are either already complete
+/// and successful or will execute in the same retry. Removing one unsafe node
+/// can make its dependents unsafe too, so this must reach a fixed point before
+/// the retry DAG is built. Dependencies between retained nodes remain intact;
+/// only dependencies satisfied by a successful earlier outcome are dropped.
+fn retry_steps_with_satisfied_prerequisites(
+    cfg: &DagConfig,
+    by_tag: &BTreeMap<String, StepOutcome>,
+    mut keep: BTreeSet<String>,
+) -> Vec<safe_ci_dag_runner::model::Step> {
+    loop {
+        let remove: Vec<String> = cfg
+            .steps
+            .iter()
+            .filter(|step| keep.contains(&step.tag()))
+            .filter(|step| {
+                step.deps.iter().any(|dependency| {
+                    !keep.contains(dependency)
+                        && !by_tag
+                            .get(dependency)
+                            .is_some_and(|outcome| outcome.ok && !outcome.aborted)
+                })
+            })
+            .map(|step| step.tag())
+            .collect();
+        if remove.is_empty() {
+            break;
+        }
+        for tag in remove {
+            keep.remove(&tag);
+        }
+    }
+
+    cfg.steps
+        .iter()
+        .filter(|step| keep.contains(&step.tag()))
+        .map(|step| {
+            let mut step = step.clone();
+            step.deps.retain(|dependency| keep.contains(dependency));
+            step
+        })
+        .collect()
+}
+
+/// Fast front-door bracket for the scheduler result shape consumed below.
+fn scheduler_accounting_bracket() -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-scheduler-accounting-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|e| format!("scheduler accounting: cannot create {}: {e}", tmp.display()))?;
+
+    let result = (|| -> Result<(), String> {
+    let step = |job: &str, cmd: &str| {
+        step_with_caps(
+            "fixture",
+            job,
+            "validate scheduler accounting fixture",
+            cmd.to_string(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        )
+    };
+    let mut intentional_skip = step("intentional_skip", "exit 99");
+    intentional_skip.skip_reason = Some(
+        safe_ci_dag_runner::model::IntentionalSkipReason::EmptyManifestBucket,
+    );
+
+    // A complete runnable plan plus a typed intentional skip is complete and
+    // green. The skipped command is `exit 99`, so executing it cannot accidentally
+    // satisfy the positive case.
+    let complete_cfg = DagConfig {
+        steps: vec![step("pass", "true"), intentional_skip.clone()],
+        ..Default::default()
+    };
+    let complete = run_lane_with_env_retries(
+        &complete_cfg,
+        1,
+        true,
+        0,
+        None,
+        &tmp.join("complete.log"),
+        None,
+        1,
+        false,
+    );
+    if !complete.complete
+        || !complete.ok
+        || complete.env_retries != 0
+        || complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            != vec!["fixture.pass"]
+    {
+        return Err(format!(
+            "scheduler accounting: complete plan plus intentional skip was not accepted: complete={} ok={} retries={} outcomes={:?}",
+            complete.complete,
+            complete.ok,
+            complete.env_retries,
+            complete.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+        ));
+    }
+
+    // A genuine failure must not be reclassified or retried. With one worker,
+    // both independent peers remain runnable but unreported after fail-fast.
+    let failure_log = tmp.join("unclassified.log");
+    std::fs::write(
+        &failure_log,
+        "[fixture.fail] ----- detail -----\n[fixture.fail] ordinary test failure\n[fixture.fail] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", failure_log.display()))?;
+    let failed_cfg = DagConfig {
+        steps: vec![
+            step("fail", "exit 1"),
+            step("pending_a", "true"),
+            step("pending_b", "true"),
+        ],
+        ..Default::default()
+    };
+    let failed = run_lane_with_env_retries(
+        &failed_cfg,
+        1,
+        true,
+        0,
+        None,
+        &failure_log,
+        None,
+        1,
+        false,
+    );
+    if failed.complete
+        || failed.ok
+        || failed.env_retries != 0
+        || failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+            != vec!["fixture.fail"]
+        || exit_code_with_execution_completeness(0, failed.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: unclassified failure did not remain an incomplete red without retry: complete={} ok={} retries={} outcomes={:?}",
+            failed.complete,
+            failed.ok,
+            failed.env_retries,
+            failed.outcomes.iter().map(|o| o.tag.as_str()).collect::<Vec<_>>()
+        ));
+    }
+
+    // A dependency skip is named by the scheduler but still did not execute.
+    // It cannot satisfy required-node completeness.
+    let dependency_log = tmp.join("dependency-failure.log");
+    std::fs::write(
+        &dependency_log,
+        "[fixture.dependency_failure] ----- detail -----\n[fixture.dependency_failure] ordinary test failure\n[fixture.dependency_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            dependency_log.display()
+        )
+    })?;
+    let mut dependency_skipped = step("dependency_skipped", "true");
+    dependency_skipped.deps = vec!["fixture.dependency_failure".into()];
+    let dependency_cfg = DagConfig {
+        steps: vec![
+            step("dependency_failure", "exit 1"),
+            dependency_skipped,
+        ],
+        ..Default::default()
+    };
+    let dependency_result = run_lane_with_env_retries(
+        &dependency_cfg,
+        1,
+        true,
+        0,
+        None,
+        &dependency_log,
+        None,
+        1,
+        false,
+    );
+    if dependency_result.complete
+        || dependency_result.ok
+        || dependency_result.skipped != vec!["fixture.dependency_skipped"]
+        || exit_code_with_execution_completeness(0, dependency_result.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: dependency-skipped required node did not force incomplete execution: complete={} ok={} skipped={:?}",
+            dependency_result.complete, dependency_result.ok, dependency_result.skipped
+        ));
+    }
+
+    // Eager-exit reports a running peer as aborted. That typed outcome is not a
+    // completed required node and must likewise force a nonzero final exit.
+    let aborted_log = tmp.join("aborted-peer.log");
+    std::fs::write(
+        &aborted_log,
+        "[fixture.abort_failure] ----- detail -----\n[fixture.abort_failure] ordinary test failure\n[fixture.abort_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            aborted_log.display()
+        )
+    })?;
+    let aborted_cfg = DagConfig {
+        steps: vec![
+            step("abort_failure", "sleep 0.1; exit 1"),
+            step("aborted_peer", "sleep 5"),
+        ],
+        ..Default::default()
+    };
+    let aborted_result = run_lane_with_env_retries(
+        &aborted_cfg,
+        2,
+        false,
+        0,
+        None,
+        &aborted_log,
+        None,
+        1,
+        false,
+    );
+    let aborted_peer_reported = aborted_result
+        .outcomes
+        .iter()
+        .any(|outcome| outcome.tag == "fixture.aborted_peer" && outcome.aborted);
+    if aborted_result.complete
+        || aborted_result.ok
+        || !aborted_peer_reported
+        || exit_code_with_execution_completeness(0, aborted_result.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: aborted required node did not force incomplete execution: complete={} ok={} aborted_peer_reported={aborted_peer_reported} outcomes={:?}",
+            aborted_result.complete,
+            aborted_result.ok,
+            aborted_result
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.aborted))
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    // A fully reported failing row can be allowed by a profile's existing
+    // policy. Completeness must not silently turn every raw node failure into a
+    // blocking failure.
+    let allowed_log = tmp.join("allowed-failure.log");
+    std::fs::write(
+        &allowed_log,
+        "[fixture.allowed_failure] ----- detail -----\n[fixture.allowed_failure] expected measured failure\n[fixture.allowed_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", allowed_log.display()))?;
+    let allowed_cfg = DagConfig {
+        steps: vec![step("allowed_failure", "exit 1"), intentional_skip],
+        ..Default::default()
+    };
+    let allowed = run_lane_with_env_retries(
+        &allowed_cfg,
+        1,
+        true,
+        0,
+        None,
+        &allowed_log,
+        None,
+        1,
+        false,
+    );
+    if !allowed.complete
+        || allowed.ok
+        || allowed.env_retries != 0
+        || exit_code_with_execution_completeness(0, allowed.complete) != 0
+    {
+        return Err(format!(
+            "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={} retries={}",
+            allowed.complete, allowed.ok, allowed.env_retries
+        ));
+    }
+
+    // A classified one-time host failure retries itself and every peer omitted
+    // by fail-fast. The dependent is deliberately registered before its
+    // prerequisite and fails unless the retry preserves their edge.
+    let environmental_log = tmp.join("environmental.log");
+    let first_attempt = tmp.join("environmental-first-attempt");
+    let edge_ready = tmp.join("edge-ready");
+    let environmental_cmd = format!(
+        "if test ! -e {first}; then : > {first}; printf '%s\\n' \
+         '[fixture.environmental] ----- detail -----' \
+         '[fixture.environmental] An action was blocked on this server based on a security policy!' \
+         '[fixture.environmental] ----- end detail -----' > {log}; exit 1; fi",
+        first = validate_plan::shell_quote(&first_attempt.to_string_lossy()),
+        log = validate_plan::shell_quote(&environmental_log.to_string_lossy()),
+    );
+    let mut dependent = step(
+        "dependent",
+        &format!(
+            "test -f {}",
+            validate_plan::shell_quote(&edge_ready.to_string_lossy())
+        ),
+    );
+    dependent.deps = vec!["fixture.prerequisite".into()];
+    let environmental_cfg = DagConfig {
+        steps: vec![
+            step("environmental", &environmental_cmd),
+            dependent,
+            step(
+                "prerequisite",
+                &format!(
+                    ": > {}",
+                    validate_plan::shell_quote(&edge_ready.to_string_lossy())
+                ),
+            ),
+        ],
+        ..Default::default()
+    };
+    let retried = run_lane_with_env_retries(
+        &environmental_cfg,
+        1,
+        true,
+        0,
+        None,
+        &environmental_log,
+        None,
+        1,
+        false,
+    );
+    let retried_tags: BTreeSet<&str> =
+        retried.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect();
+    let expected_tags: BTreeSet<&str> = [
+        "fixture.environmental",
+        "fixture.dependent",
+        "fixture.prerequisite",
+    ]
+    .into_iter()
+    .collect();
+    if !retried.complete
+        || !retried.ok
+        || retried.env_retries != 1
+        || retried_tags != expected_tags
+        || !retried.skipped.is_empty()
+        || !edge_ready.is_file()
+    {
+        return Err(format!(
+            "scheduler accounting: environmental retry did not run every peer with its edge preserved: complete={} ok={} retries={} outcomes={retried_tags:?} skipped={:?} edge_ready={}",
+            retried.complete,
+            retried.ok,
+            retried.env_retries,
+            retried.skipped,
+            edge_ready.is_file()
+        ));
+    }
+
+    // An environmental failure may be retried alongside an ordinary failure,
+    // but a dependent of the ordinary failure must not become runnable merely
+    // because its failed prerequisite is outside the retry DAG. This uses the
+    // real scheduler path with both independent failures running concurrently.
+    let mixed_log = tmp.join("ordinary-and-environmental.log");
+    let ordinary_attempts = tmp.join("ordinary-attempts");
+    let mixed_environmental_first = tmp.join("mixed-environmental-first-attempt");
+    let mixed_environmental_passed = tmp.join("mixed-environmental-passed");
+    let unsafe_dependent_ran = tmp.join("unsafe-dependent-ran");
+    let unsafe_transitive_dependent_ran = tmp.join("unsafe-transitive-dependent-ran");
+    std::fs::write(
+        &mixed_log,
+        "[fixture.ordinary_failure] ----- detail -----\n\
+[fixture.ordinary_failure] ordinary test failure\n\
+[fixture.ordinary_failure] ----- end detail -----\n\
+[fixture.environmental_mixed] ----- detail -----\n\
+[fixture.environmental_mixed] An action was blocked on this server based on a security policy!\n\
+[fixture.environmental_mixed] ----- end detail -----\n",
+    )
+    .map_err(|e| {
+        format!(
+            "scheduler accounting: cannot write {}: {e}",
+            mixed_log.display()
+        )
+    })?;
+    let ordinary_cmd = format!(
+        "printf 'attempt\\n' >> {}; sleep 0.1; exit 1",
+        validate_plan::shell_quote(&ordinary_attempts.to_string_lossy())
+    );
+    let mixed_environmental_cmd = format!(
+        "if test ! -e {first}; then : > {first}; exit 1; fi; : > {passed}",
+        first = validate_plan::shell_quote(&mixed_environmental_first.to_string_lossy()),
+        passed = validate_plan::shell_quote(&mixed_environmental_passed.to_string_lossy()),
+    );
+    let mut unsafe_dependent = step(
+        "unsafe_dependent",
+        &format!(
+            ": > {}",
+            validate_plan::shell_quote(&unsafe_dependent_ran.to_string_lossy())
+        ),
+    );
+    unsafe_dependent.deps = vec!["fixture.ordinary_failure".into()];
+    let mut unsafe_transitive_dependent = step(
+        "unsafe_transitive_dependent",
+        &format!(
+            ": > {}",
+            validate_plan::shell_quote(&unsafe_transitive_dependent_ran.to_string_lossy())
+        ),
+    );
+    unsafe_transitive_dependent.deps = vec!["fixture.unsafe_dependent".into()];
+    let mixed_cfg = DagConfig {
+        steps: vec![
+            step("ordinary_failure", &ordinary_cmd),
+            step("environmental_mixed", &mixed_environmental_cmd),
+            unsafe_dependent,
+            unsafe_transitive_dependent,
+        ],
+        ..Default::default()
+    };
+    let mixed = run_lane_with_env_retries(
+        &mixed_cfg,
+        2,
+        true,
+        0,
+        None,
+        &mixed_log,
+        None,
+        1,
+        false,
+    );
+    let mixed_by_tag: BTreeMap<&str, &StepOutcome> = mixed
+        .outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect();
+    let ordinary_attempt_count = std::fs::read_to_string(&ordinary_attempts)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    if mixed.complete
+        || mixed.env_retries != 1
+        || ordinary_attempt_count != 1
+        || mixed_by_tag
+            .get("fixture.ordinary_failure")
+            .is_none_or(|outcome| outcome.ok || outcome.aborted)
+        || mixed_by_tag
+            .get("fixture.environmental_mixed")
+            .is_none_or(|outcome| !outcome.ok || outcome.aborted)
+        || !mixed_environmental_passed.is_file()
+        || unsafe_dependent_ran.exists()
+        || unsafe_transitive_dependent_ran.exists()
+        || mixed_by_tag.contains_key("fixture.unsafe_dependent")
+        || mixed_by_tag.contains_key("fixture.unsafe_transitive_dependent")
+        || exit_code_with_execution_completeness(0, mixed.complete) == 0
+    {
+        return Err(format!(
+            "scheduler accounting: environmental retry crossed an unsatisfied ordinary dependency: complete={} ok={} retries={} ordinary_attempts={ordinary_attempt_count} environmental_passed={} dependent_ran={} transitive_dependent_ran={} outcomes={:?}",
+            mixed.complete,
+            mixed.ok,
+            mixed.env_retries,
+            mixed_environmental_passed.is_file(),
+            unsafe_dependent_ran.exists(),
+            unsafe_transitive_dependent_ran.exists(),
+            mixed
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.aborted))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp)
+        .map_err(|e| format!("scheduler accounting: cannot remove {}: {e}", tmp.display()));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(
+            "scheduler accounting: complete and allowed-failure plans accepted; fail-fast, skipped, aborted, and environmental-retry cases bracketed"
+                .into(),
+        ),
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => Err(format!(
+            "{problem}; cleanup also failed: {cleanup_problem}"
+        )),
+    }
+}
+
 /// Run one lane, auto-retrying nodes whose failure is an ENVIRONMENTAL block.
 ///
 /// This is `run_check_with_timeout`'s retry loop (validate.sh:2119) moved to DAG
@@ -3532,10 +4658,11 @@ fn remaining_budget_s(deadline_ns: Option<u64>) -> Option<i64> {
 ///   attempts). A *persistent* breakage — a bad Reverie pin, a genuinely missing
 ///   header — fails every attempt and still leaves the run RED. It is never
 ///   silently greened, only relabelled from "test failure" to "environmental".
-/// * **Nodes that never ran because the blocked node failed are retried with
-///   it.** In the bash the retry happened INSIDE the gate, so downstream never
-///   got skipped; reproducing that here means the retry DAG carries the skipped
-///   and aborted nodes too, with dependencies restricted to the retry set.
+/// * **Nodes that never ran because the blocked node failed are retried only
+///   when their prerequisites remain valid.** Every prerequisite must either
+///   have completed successfully already or execute in the same retry. Internal
+///   dependency edges are preserved, and removing an unsafe prerequisite also
+///   removes its dependents before anything runs.
 fn run_lane_with_env_retries(
     cfg: &DagConfig,
     jobs: i64,
@@ -3544,8 +4671,9 @@ fn run_lane_with_env_retries(
     cgroups: BoxedCgroups,
     log_path: &Path,
     deadline: Option<u64>,
+    max: usize,
+    record_step_profiles: bool,
 ) -> LaneResult {
-    let max = validate_runtime::env_block_max_retries();
     if remaining_budget_s(deadline) == Some(0) {
         eprintln!(
             "validate: whole-run budget expired during setup; no DAG node will be started \
@@ -3554,6 +4682,7 @@ fn run_lane_with_env_retries(
         return LaneResult {
             outcomes: Vec::new(),
             skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            complete: false,
             ok: false,
             env_retries: 0,
             run_timed_out: true,
@@ -3569,7 +4698,9 @@ fn run_lane_with_env_retries(
         None,
         remaining_budget_s(deadline),
     );
-    forward_step_profiles(&first, jobs);
+    if record_step_profiles {
+        forward_step_profiles(&first, jobs);
+    }
     let mut run_timed_out = first.run_timed_out;
     let mut order: Vec<String> = first.outcomes.iter().map(|o| o.tag.clone()).collect();
     let mut by_tag: BTreeMap<String, StepOutcome> =
@@ -3602,33 +4733,29 @@ fn run_lane_with_env_retries(
         if blocked.is_empty() {
             break;
         }
+        // The retry set: the blocked nodes, plus everything that never ran (or was
+        // aborted) because of them. The scheduler's fail-fast result reports only
+        // dependency-skipped nodes; an independent runnable node can otherwise be
+        // absent from both outcomes and skipped.
+        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
+        keep.extend(skipped.iter().cloned());
+        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
+        keep.extend(unreported_non_intentional_steps(cfg, &by_tag, &skipped));
+        let steps = retry_steps_with_satisfied_prerequisites(cfg, &by_tag, keep);
+        let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
+        if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
+            eprintln!(
+                "validate: environmental failure has no safe retry because a prerequisite did \
+                 not complete successfully and is not part of the retry; NOT retrying."
+            );
+            break;
+        }
         env_retries += 1;
-        for (tag, class) in &blocked {
+        for (tag, class) in blocked.iter().filter(|(tag, _)| retry_tags.contains(tag)) {
             println!(
                 "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
                  failure — retrying (attempt {env_retries}/{max})"
             );
-        }
-        // The retry set: the blocked nodes, plus everything that never ran (or was
-        // aborted) because of them.
-        let mut keep: BTreeSet<String> = blocked.iter().map(|(t, _)| t.clone()).collect();
-        keep.extend(skipped.iter().cloned());
-        keep.extend(by_tag.values().filter(|o| o.aborted).map(|o| o.tag.clone()));
-        let steps: Vec<safe_ci_dag_runner::model::Step> = cfg
-            .steps
-            .iter()
-            .filter(|s| keep.contains(&s.tag()))
-            .map(|s| {
-                let mut s = s.clone();
-                // Dependencies already satisfied by the first pass are dropped;
-                // edges INSIDE the retry set are preserved so a re-run dependency
-                // still gates its dependents.
-                s.deps.retain(|d| keep.contains(d));
-                s
-            })
-            .collect();
-        if steps.is_empty() {
-            break;
         }
         let mut retry_cfg = cfg.clone();
         retry_cfg.description =
@@ -3654,7 +4781,9 @@ fn run_lane_with_env_retries(
             None,
             remaining_budget_s(deadline),
         );
-        forward_step_profiles(&again, jobs);
+        if record_step_profiles {
+            forward_step_profiles(&again, jobs);
+        }
         run_timed_out = run_timed_out || again.run_timed_out;
         for o in &again.outcomes {
             if !by_tag.contains_key(&o.tag) {
@@ -3685,11 +4814,24 @@ fn run_lane_with_env_retries(
 
     let outcomes: Vec<StepOutcome> =
         order.iter().filter_map(|t| by_tag.get(t).cloned()).collect();
-    // Eager-exit aborts after a genuine peer failure are neutral, but steps cut
-    // by the whole-run clock are not a green. Without the typed run bit here an
-    // entirely aborted tail satisfies `ok || aborted` and can falsely pass.
-    let ok = !run_timed_out && outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, ok, env_retries, run_timed_out }
+    let unreported = unreported_non_intentional_steps(cfg, &by_tag, &skipped);
+    if !unreported.is_empty() {
+        eprintln!(
+            "validate: ERROR: scheduler returned without an outcome or dependency-skip for {} \
+             non-intentional planned node(s): {}. The lane is incomplete and cannot be green.",
+            unreported.len(),
+            unreported.join(", ")
+        );
+    }
+    // Raw failure policy may still treat an aborted peer as neutral, but execution
+    // completeness may not: dependency-skipped, aborted, timed-out, or unreported
+    // required nodes did not finish and therefore cannot support a green run.
+    let complete = !run_timed_out
+        && unreported.is_empty()
+        && skipped.is_empty()
+        && outcomes.iter().all(|outcome| !outcome.aborted);
+    let ok = outcomes.iter().all(|o| o.ok || o.aborted);
+    LaneResult { outcomes, skipped, complete, ok, env_retries, run_timed_out }
 }
 
 /// Nodes the runner reported as killed by their wall or CPU budget. The runner's
@@ -3938,29 +5080,229 @@ fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>) {
     )
 }
 
-fn typed_libtest_count_bracket() -> Result<(), String> {
-    let outcome = |tag: &str, executed_tests, filtered_tests| StepOutcome {
+/// Correct only an incorrect zero classification from the parent finalizer when this
+/// driver's typed final outcome proves that the same planned node ran tests.
+/// The parent remains the plan/coverage authority. Every other classification,
+/// and every malformed or incomplete coverage object, is preserved fail-closed.
+fn correct_test_node_coverage(
+    mut coverage: serde_json::Value,
+    planned_test_nodes: &BTreeSet<String>,
+    outcomes: &[StepOutcome],
+) -> serde_json::Value {
+    let Some(planned_count) = coverage
+        .get("planned_test_nodes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return coverage;
+    };
+    let Some(executed_count) = coverage
+        .get("executed_test_nodes")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return coverage;
+    };
+    let strings = |field: &str| -> Option<Vec<String>> {
+        coverage
+            .get(field)?
+            .as_array()?
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+    let Some(zero_executed_nodes) = strings("zero_executed_nodes") else {
+        return coverage;
+    };
+    let Some(absent_nodes) = strings("absent_nodes") else {
+        return coverage;
+    };
+
+    let zero_set: BTreeSet<String> = zero_executed_nodes.iter().cloned().collect();
+    let absent_set: BTreeSet<String> = absent_nodes.iter().cloned().collect();
+    let shape_is_valid = planned_count == planned_test_nodes.len() as u64
+        && zero_set.len() == zero_executed_nodes.len()
+        && absent_set.len() == absent_nodes.len()
+        && zero_set.is_disjoint(&absent_set)
+        && zero_set.iter().chain(absent_set.iter()).all(|tag| planned_test_nodes.contains(tag))
+        && executed_count
+            .checked_add(zero_set.len() as u64)
+            .and_then(|count| count.checked_add(absent_set.len() as u64))
+            == Some(planned_count);
+    if !shape_is_valid {
+        return coverage;
+    }
+
+    let final_outcomes: BTreeMap<&str, &StepOutcome> =
+        outcomes.iter().map(|outcome| (outcome.tag.as_str(), outcome)).collect();
+    let corrected: BTreeSet<String> = zero_set
+        .iter()
+        .filter(|tag| {
+            final_outcomes
+                .get(tag.as_str())
+                .is_some_and(|outcome| {
+                    !outcome.ok
+                        && !outcome.aborted
+                        && outcome.executed_tests.is_some_and(|n| n > 0)
+                })
+        })
+        .cloned()
+        .collect();
+    if corrected.is_empty() {
+        return coverage;
+    }
+    let Some(new_executed_count) = executed_count.checked_add(corrected.len() as u64) else {
+        return coverage;
+    };
+    let remaining_zero: Vec<String> = zero_executed_nodes
+        .into_iter()
+        .filter(|tag| !corrected.contains(tag.as_str()))
+        .collect();
+    let Some(object) = coverage.as_object_mut() else {
+        return coverage;
+    };
+    object.insert("executed_test_nodes".into(), serde_json::json!(new_executed_count));
+    object.insert("zero_executed_nodes".into(), serde_json::json!(remaining_zero));
+    coverage
+}
+
+/// Two-sided bracket for the narrow zero-classification correction. It proves that a
+/// failed node with a positive typed count is corrected without changing its
+/// failure, while every unproved or malformed case remains byte-for-value.
+fn test_node_coverage_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, ok: bool, aborted: bool, executed_tests| StepOutcome {
         tag: tag.into(),
-        ok: true,
+        ok,
+        duration_s: 0.0,
+        summary: String::new(),
+        executed_tests,
+        filtered_tests: Some(0),
+        returncode: Some(if ok { 0 } else { 100 }),
+        reason: if ok { String::new() } else { "test failure".into() },
+        aborted,
+    };
+
+    let planned = BTreeSet::from(["test.ran_failed".to_string()]);
+    let parent_zero = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 0,
+        "zero_executed_nodes": ["test.ran_failed"],
+        "absent_nodes": [],
+    });
+    let ran_failed = outcome("test.ran_failed", false, false, Some(23));
+    let coverage = correct_test_node_coverage(
+        parent_zero.clone(),
+        &planned,
+        &[ran_failed.clone()],
+    );
+    if coverage
+        != serde_json::json!({
+            "planned_test_nodes": 1,
+            "executed_test_nodes": 1,
+            "zero_executed_nodes": [],
+            "absent_nodes": [],
+        })
+        || ran_failed.ok
+    {
+        return Err(
+            "test-node coverage: a 23-test failed node must be executed and remain failed".into(),
+        );
+    }
+
+    for (name, outcomes) in [
+        ("missing", Vec::new()),
+        ("zero", vec![outcome("test.ran_failed", true, false, Some(0))]),
+        ("passing", vec![outcome("test.ran_failed", true, false, Some(23))]),
+        ("count-unknown", vec![outcome("test.ran_failed", true, false, None)]),
+        ("aborted", vec![outcome("test.ran_failed", false, true, Some(23))]),
+        ("unplanned", vec![outcome("test.other", false, false, Some(23))]),
+    ] {
+        let unchanged = correct_test_node_coverage(parent_zero.clone(), &planned, &outcomes);
+        if unchanged != parent_zero {
+            return Err(format!(
+                "test-node coverage: {name} evidence must not change the parent's classification"
+            ));
+        }
+    }
+
+    let parent_absent = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 0,
+        "zero_executed_nodes": [],
+        "absent_nodes": ["test.ran_failed"],
+    });
+    if correct_test_node_coverage(parent_absent.clone(), &planned, &[ran_failed.clone()])
+        != parent_absent
+    {
+        return Err("test-node coverage: an absent classification must not be rewritten".into());
+    }
+    let parent_executed = serde_json::json!({
+        "planned_test_nodes": 1,
+        "executed_test_nodes": 1,
+        "zero_executed_nodes": [],
+        "absent_nodes": [],
+    });
+    if correct_test_node_coverage(parent_executed.clone(), &planned, &[ran_failed.clone()])
+        != parent_executed
+    {
+        return Err("test-node coverage: an already-executed classification must not change".into());
+    }
+    for malformed in [
+        serde_json::Value::Null,
+        serde_json::json!({"planned_test_nodes": 1}),
+        serde_json::json!({
+            "planned_test_nodes": 1,
+            "executed_test_nodes": 1,
+            "zero_executed_nodes": ["test.ran_failed"],
+            "absent_nodes": [],
+        }),
+    ] {
+        if correct_test_node_coverage(malformed.clone(), &planned, &[ran_failed.clone()])
+            != malformed
+        {
+            return Err("test-node coverage: malformed evidence must remain unchanged".into());
+        }
+    }
+
+    println!(
+        "  test-node coverage: one incorrect zero corrected; unproved and malformed cases unchanged"
+    );
+    Ok(())
+}
+
+fn typed_libtest_count_bracket() -> Result<(), String> {
+    let outcome = |tag: &str, ok: bool, executed_tests, filtered_tests| StepOutcome {
+        tag: tag.into(),
+        ok,
         duration_s: 0.0,
         summary: String::new(),
         executed_tests,
         filtered_tests,
-        returncode: Some(0),
-        reason: String::new(),
+        returncode: Some(if ok { 0 } else { 100 }),
+        reason: if ok { String::new() } else { "test failure".into() },
         aborted: false,
     };
-    let full = vec![outcome("test.a", Some(398), Some(0)), outcome("test.b", Some(475), Some(350))];
+    let full = vec![
+        outcome("test.a", true, Some(398), Some(0)),
+        outcome("test.b", true, Some(475), Some(350)),
+    ];
     if libtest_counts(&full) != (Some(873), Some(350)) {
         return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
     }
-    if libtest_counts(&[outcome("test.zero", Some(0), Some(0))]) != (Some(0), Some(0)) {
+    let failed = outcome("test.failed", false, Some(23), Some(5));
+    if libtest_counts(&[failed.clone()]) != (Some(23), Some(5)) || failed.ok {
+        return Err(
+            "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
+                .into(),
+        );
+    }
+    if libtest_counts(&[outcome("test.zero", true, Some(0), Some(0))]) != (Some(0), Some(0)) {
         return Err("typed libtest counts: demonstrated zero was not preserved".into());
     }
-    if libtest_counts(&[outcome("build.only", None, None)]) != (None, None) {
+    if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
-    println!("  typed libtest counts: 873/350 complete accepted; 0/0 preserved; unknown stayed null");
+    println!(
+        "  typed libtest counts: 873/350 pass and 23/5 failure counted; 0/0 preserved; unknown stayed null"
+    );
     Ok(())
 }
 
@@ -4471,6 +5813,21 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
+    if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
+        return match run_nested_scope_probe() {
+            Ok(detail) => RunSummary::new(
+                Verdict::SelfTest, 0, "nested safe-ci scope self-test", vec![detail],
+            ),
+            Err(error) => {
+                eprintln!("validate: NESTED SCOPE SELF-TEST FAILED: {error}");
+                RunSummary::new(
+                    Verdict::Fail, 2, "nested safe-ci scope self-test",
+                    vec![format!("nested scope self-test failed: {error}")],
+                )
+            }
+        };
+    }
+
     if args.self_test {
         return match self_test() {
             Ok(()) => RunSummary::new(
@@ -4482,8 +5839,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                      envelope scoring/comparison, ledger cache, receipt eligibility, and the \
                      selective subset builder all passed"
                         .into(),
-                    "every bracket is inert: none runs a gate, publishes a label, or writes the \
-                     real ledger"
+                    "policy/data brackets are inert; the cgroup bracket runs only inside a bounded \
+                     disposable scope and neither publishes nor writes the real ledger"
                         .into(),
                 ],
             ),
@@ -5080,6 +6437,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut ok = true;
+    let mut execution_complete = true;
     let mut env_retries = 0usize;
 
     // One clock for the whole invocation. Sequential lanes and retries spend
@@ -5094,6 +6452,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             cgroups.clone(),
             &log_path,
             deadline,
+            validate_runtime::env_block_max_retries(),
+            true,
         )
     };
     let mut run_timed_out = false;
@@ -5102,6 +6462,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     ok = ok && r.ok;
+    execution_complete = execution_complete && r.complete;
     env_retries += r.env_retries;
     run_timed_out = run_timed_out || r.run_timed_out;
 
@@ -5111,10 +6472,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
             ok = ok && r2.ok;
+            execution_complete = execution_complete && r2.complete;
             env_retries += r2.env_retries;
             run_timed_out = run_timed_out || r2.run_timed_out;
         } else {
-            eprintln!("validate: first lane failed; skipping the second lane (eager exit).");
+            eprintln!(
+                "validate: first lane failed; the second planned lane was not run (eager exit), \
+                 so validation is incomplete."
+            );
+            execution_complete = false;
         }
     }
 
@@ -5159,10 +6525,15 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Coverage and base identities come from the parent's single finalizer. A
-    // local reconstruction here would create a second receipt authority.
+    // The parent remains the plan/coverage authority. Correct only the one case
+    // it cannot see in a failed nextest log: a planned node it classified as zero
+    // whose typed final outcome carries a positive executed-test count.
     let receipt = receipt_evidence(parent.as_deref(), &root, &log_path, &commit);
-    let coverage = receipt.coverage.clone();
+    let coverage = correct_test_node_coverage(
+        receipt.coverage.clone(),
+        &plan.planned_test_nodes,
+        &outcomes,
+    );
 
     let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
         .unwrap_or_else(|| "0 0".into());
@@ -5280,14 +6651,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         };
         if let Some(f) = floor {
             if passed < f {
-                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.assurance());
+                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.display_name());
                 ok = false;
             } else {
-                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.assurance());
+                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.display_name());
             }
         }
         if !blocking.is_empty() {
-            println!("❌ {} blocking failures ({}): {}", mode.assurance(), blocking.len(), blocking.join(", "));
+            println!("❌ {} blocking failures ({}): {}", mode.display_name(), blocking.len(), blocking.join(", "));
         }
     }
 
@@ -5372,6 +6743,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
+    if !execution_complete {
+        eprintln!(
+            "validate: ERROR: not every required node completed with a non-aborted outcome; \
+             dependency-skipped, aborted, timed-out, and unreported work makes validation \
+             incomplete and cannot report PASS."
+        );
+    }
+    exit_code = exit_code_with_execution_completeness(exit_code, execution_complete);
 
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
@@ -5418,7 +6797,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             wall,
             exit_code,
             &log_path.to_string_lossy(),
-            plan.suite_complete,
+            plan.suite_complete && execution_complete,
             coverage,
         );
     }
@@ -5494,6 +6873,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     }
     if !skipped.is_empty() {
         detail.push(format!("{} node(s) never ran because a dependency failed", skipped.len()));
+    }
+    if !execution_complete {
+        detail.push(
+            "not every required node completed with a non-aborted outcome; dependency-skipped, \
+             aborted, timed-out, or unreported work made the run incomplete"
+                .into(),
+        );
     }
     for why in &refusals {
         detail.push(format!("REFUSED ON COMPLETENESS: {why}"));

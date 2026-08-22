@@ -40,7 +40,7 @@ impl Shebang {
             }
         }
 
-        let mut j = 1 + i;
+        let mut j = i;
         while j < buf.len() {
             if b" \t\r\n".contains(&buf[j]) {
                 break;
@@ -66,6 +66,14 @@ impl Shebang {
             .collect::<Vec<_>>();
 
         Some(Shebang { program, args })
+    }
+
+    /// Extract the interpreter path without checking whether it exists.
+    ///
+    /// Callers must resolve the path in the filesystem namespace that will
+    /// execute the script.
+    pub fn interpreter_from_buf(buf: &[u8]) -> Option<PathBuf> {
+        Self::from_buf(buf).map(|shebang| shebang.program)
     }
 
     /// Parse exe/interpreter from a script contains a shebang, whenever possible.
@@ -111,6 +119,17 @@ mod test {
     #[test]
     fn shebang_invalid_shebang() {
         assert_eq!(Shebang::from_buf(b"! /bin/bash"), None);
+    }
+
+    #[test]
+    fn shebang_empty_interpreter() {
+        for input in [b"#!".as_slice(), b"#!\n", b"#! \t\n"] {
+            assert_eq!(
+                Shebang::from_buf(input).map(|shebang| shebang.program),
+                Some(PathBuf::new()),
+                "input: {input:?}"
+            );
+        }
     }
 
     #[test]

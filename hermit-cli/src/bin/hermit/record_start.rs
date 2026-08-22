@@ -40,10 +40,12 @@ use super::container::IdentityGuard;
 use super::container::deterministic_container;
 use super::global_opts::GlobalOpts;
 use super::run::is_elf_file;
+use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
+use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
@@ -173,14 +175,26 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Enable strict deterministic recording. Recording is already strict; this flag is retained
-    /// for command-line compatibility with `hermit run --strict`.
+    /// Accepted and ignored, for command-line compatibility with `hermit run --strict`.
+    /// Recording does NOT run under `run --strict`'s configuration: see
+    /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
+    /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
+    /// `panic_on_unsupported_syscalls: false`. A recorded guest therefore reads the REAL
+    /// host clock, and two independent recordings of the same program observe different
+    /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
+    /// two independent recordings agree.
     #[clap(long = "strict")]
     _strict: bool,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
     args: Vec<String>,
+
+    /// Additionally append one or more environment variables to the recorded
+    /// guest environment. If a name is provided without a value, pass that
+    /// variable through from the host.
+    #[clap(short = 'e', long, value_parser = parse_assignment, value_name = "name[=val]")]
+    env: Vec<(String, Option<String>)>,
 
     /// Directory where recorded syscall data is stored.
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
@@ -256,6 +270,24 @@ impl StartOpts {
     fn record_timeout(&self) -> Option<Duration> {
         self.record_timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    fn guest_command(&self) -> Result<Command, Error> {
+        let mut command = Command::new(self.program());
+        command.args(&self.args);
+        for (name, value) in &self.env {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else if let Ok(value) = std::env::var(name) {
+                command.env(name, value);
+            } else {
+                anyhow::bail!(
+                    "Attempt to pass through env var {}, but it is not set in the host environment",
+                    name
+                );
+            }
+        }
+        Ok(command)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -375,9 +407,10 @@ impl StartOpts {
                     let data_path = data.path().to_path_buf();
                     let exit_status = container
                         .run(|| {
+                            // Namespace init: arm the stop guards before anything else.
+                            crate::container::arm_container_init_guards()?;
                             let _guard = global.init_tracing();
-                            let mut command = Command::new(self.program());
-                            command.args(&self.args);
+                            let command = self.guest_command().map_err(SerializableError::from)?;
                             with_recording_deadline(timeout, || {
                                 hermit::record_to(command, &data_path)
                             })
@@ -388,9 +421,10 @@ impl StartOpts {
                 }
                 None => container
                     .run(|| {
+                        // Namespace init: arm the stop guards before anything else.
+                        crate::container::arm_container_init_guards()?;
                         let _guard = global.init_tracing();
-                        let mut command = Command::new(self.program());
-                        command.args(&self.args);
+                        let command = self.guest_command().map_err(SerializableError::from)?;
                         hermit.record(command).map_err(SerializableError::from)
                     })
                     .context("Container exited unexpectedly")??,
@@ -434,10 +468,11 @@ impl StartOpts {
 
         let recording = recording_container
             .run(|| {
+                // Namespace init: arm the stop guards before anything else.
+                crate::container::arm_container_init_guards()?;
                 let _guard = global1.init_tracing();
 
-                let mut command = Command::new(self.program());
-                command.args(&self.args);
+                let command = self.guest_command().map_err(SerializableError::from)?;
 
                 match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
@@ -455,6 +490,8 @@ impl StartOpts {
         let (mut replay_container, _replay_identity_guard) = deterministic_container()?;
         let replay = replay_container
             .run(|| {
+                // Namespace init: arm the stop guards before anything else.
+                crate::container::arm_container_init_guards()?;
                 let _guard = global2.init_tracing();
                 hermit::replay_with_output(data_dir).map_err(SerializableError::from)
             })
@@ -470,12 +507,13 @@ impl StartOpts {
                 log: log2.into_temp_path(),
             },
             ComparisonOptions {
-                success_message: "Success: replay matched recording.",
-                failure_message: "Recording output did not match replay output!",
                 verbose: false,
                 strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
+                // Recording does not enable the syscall output-buffer hash, so
+                // a replay verdict here is not a content-parity claim either.
+                compare_io_buffers: false,
                 keep_logs: false,
             },
         )?;
@@ -487,6 +525,11 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_verification_json(path, &outcome)?;
         }
+        announce_verification_outcome(
+            &outcome,
+            "Success: replay matched recording.",
+            "Recording output did not match replay output!",
+        );
 
         outcome.into_exit_status()
     }
@@ -502,10 +545,11 @@ impl StartOpts {
 
         let _result = container
             .run(|| {
+                // Namespace init: arm the stop guards before anything else.
+                crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
 
-                let mut command = Command::new(self.program());
-                command.args(&self.args);
+                let command = self.guest_command().map_err(SerializableError::from)?;
 
                 match record_timeout {
                     Some(timeout) => {
@@ -559,6 +603,8 @@ impl StartOpts {
         let (mut container, _identity_guard) = deterministic_container()?;
         let result = container
             .run(|| {
+                // Namespace init: arm the stop guards before anything else.
+                crate::container::arm_container_init_guards()?;
                 let _guard = global.init_tracing();
                 hermit::replay_with_gdbserver(data_dir, gdbserver_port)
                     .map_err(SerializableError::from)
@@ -572,6 +618,64 @@ impl StartOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_report_is_published_before_success_is_announced() {
+        let source = include_str!("record_start.rs");
+        let verification = source
+            .split_once("let outcome = compare_two_runs(")
+            .expect("record/replay comparison")
+            .1;
+        let publish = verification
+            .find("write_verification_json(path, &outcome)")
+            .expect("verification report publication");
+        let announce = verification
+            .find("announce_verification_outcome(")
+            .expect("verification announcement");
+        assert!(publish < announce);
+    }
+
+    fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
+        StartOpts {
+            program: Some(PathBuf::from("/bin/true")),
+            _strict: false,
+            args: Vec::new(),
+            env,
+            data_dir: None,
+            record_timeout: None,
+            verify: false,
+            verify_json: None,
+            verify_strict: false,
+            gdbex: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_guest_command_applies_explicit_environment() {
+        let options = start_options(vec![("RECORD_ENV_FIXTURE".into(), Some("value".into()))]);
+        let command = options.guest_command().unwrap();
+        assert!(
+            command
+                .get_captured_envs()
+                .iter()
+                .any(|(name, value)| name == "RECORD_ENV_FIXTURE" && value == "value")
+        );
+    }
+
+    #[test]
+    fn record_guest_command_refuses_missing_passthrough_environment() {
+        let name = "HERMIT_RECORD_MISSING_ENV_FIXTURE_5E7D2C";
+        assert!(std::env::var_os(name).is_none());
+        let error = match start_options(vec![(name.into(), None)]).guest_command() {
+            Ok(_) => panic!("missing pass-through environment was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not set in the host environment")
+        );
+    }
 
     // A blocked SIGALRM (e.g. inherited from the parent) would leave the alarm
     // perpetually pending and silently disable the deadline. Arming must unblock
@@ -618,6 +722,7 @@ mod tests {
             program: Some(PathBuf::from("/proc/self/exe")),
             _strict: false,
             args: Vec::new(),
+            env: Vec::new(),
             data_dir: None,
             record_timeout: None,
             verify: false,

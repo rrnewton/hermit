@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::process::Output;
 
 const CASES: &[(&str, &str, &str)] = &[
     (
@@ -23,6 +24,62 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
     ("syslog_deterministic.c", "syslog-ok size=0", "syslog"),
 ];
+
+fn assert_syslog_interception(phase: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "syslog {phase} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("syslog-ok size=0"),
+        "syslog {phase} did not return Detcore's fixed result"
+    );
+
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        trace
+            .lines()
+            .any(|line| line.contains("inbound syscall: syslog(")),
+        "syslog {phase} bypassed Detcore's inbound syscall handler\nstderr:\n{trace}"
+    );
+    assert!(
+        trace
+            .lines()
+            .any(|line| { line.contains("finish syscall") && line.contains("syslog(") }),
+        "syslog {phase} bypassed Detcore's finished syscall handler\nstderr:\n{trace}"
+    );
+}
+
+fn record_and_replay_syslog(hermit: &str, guest: &Path) {
+    let data_dir = tempfile::tempdir().expect("failed to create syslog recording directory");
+
+    let record = Command::new("timeout")
+        .args(["--kill-after", "5s", "60s"])
+        .arg(hermit)
+        .args(["--log=trace", "record", "start", "--record-timeout=45"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(guest)
+        .output()
+        .expect("failed to record syslog guest");
+    assert_syslog_interception("recording", &record);
+
+    let replay = Command::new("timeout")
+        .args(["--kill-after", "5s", "60s"])
+        .arg(hermit)
+        .args(["--log=trace", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .output()
+        .expect("failed to replay syslog guest");
+    assert_syslog_interception("replay", &replay);
+    assert_eq!(
+        record.stdout, replay.stdout,
+        "syslog replay output differed from the recording"
+    );
+}
 
 #[test]
 fn clock_discipline_and_kernel_log_are_host_independent() {
@@ -108,5 +165,9 @@ fn clock_discipline_and_kernel_log_are_host_independent() {
             String::from_utf8_lossy(&combined).contains("Determinism verified"),
             "{source} omitted determinism marker"
         );
+
+        if *syscall == "syslog" {
+            record_and_replay_syslog(env!("CARGO_BIN_EXE_hermit"), &guest);
+        }
     }
 }
