@@ -42,25 +42,6 @@ fn read_bytes<M: MemoryAccess>(
     Ok(bytes)
 }
 
-fn read_iovecs<M: MemoryAccess>(
-    memory: &M,
-    message: &libc::msghdr,
-) -> Result<Vec<libc::iovec>, Errno> {
-    if message.msg_iovlen == 0 {
-        return Ok(Vec::new());
-    }
-    let address = Addr::from_raw(message.msg_iov as usize).ok_or(Errno::EFAULT)?;
-    let mut iovecs = vec![
-        libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        message.msg_iovlen
-    ];
-    memory.read_values(address, &mut iovecs)?;
-    Ok(iovecs)
-}
-
 impl Recorder {
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
@@ -207,7 +188,7 @@ impl Recorder {
                 let (name_capacity, control_capacity) = input?;
                 let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
                 let output: libc::msghdr = guest.memory().read_value(message_address)?;
-                let iovecs = read_iovecs(&guest.memory(), &output)?;
+                let iovecs = crate::read_iovecs(&guest.memory(), &output)?;
                 let mut remaining = usize::try_from(result).map_err(|_| Errno::EINVAL)?;
                 let mut buffers = Vec::with_capacity(iovecs.len());
                 for iovec in iovecs {
