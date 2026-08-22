@@ -286,7 +286,8 @@ impl AnalyzeOpts {
         if self.verbose {
             yellow_msg("[comparing] with log-diff command:");
             eprintln!(
-                "    hermit log-diff --ignore-lines=CHAOSRAND {} {}",
+                "    hermit log-diff --record-envelope=all-records-v1 \
+                 --ignore-lines=CHAOSRAND {} {}",
                 run1_log_path.display(),
                 run2_log_path.display(),
             );

@@ -45,7 +45,7 @@ if grep -s DESYNC "$log2".log; then
     exit 1
 fi
 
-"$hermit" log-diff "$log1".log "$log2".log
+"$hermit" log-diff --record-envelope=all-records-v1 "$log1".log "$log2".log
 
 event1_ip=$(jq -r ".frames[0].frame.ip" "$stack1")
 event2_ip=$(jq -r ".frames[0].frame.ip" "$stack2")

@@ -19,6 +19,42 @@ use serde::Serialize;
 use tempfile::NamedTempFile;
 
 use super::global_opts::GlobalOpts;
+use super::record_envelope::RecordEnvelope;
+use super::record_envelope::RecordEnvelopeArg;
+use super::record_envelope::RecordEnvelopePolicy;
+
+fn write_canonical_info(
+    file: &Path,
+    writer: &mut impl Write,
+    record_envelope: RecordEnvelope,
+) -> std::io::Result<usize> {
+    logdiff::write_canonical_info_with_filter(file, writer, record_envelope.predicate())
+}
+
+fn try_log_diff_with_records(
+    left: &Path,
+    right: &Path,
+    options: &logdiff::LogDiffOpts,
+    record_envelope: RecordEnvelope,
+) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize)> {
+    logdiff::try_log_diff_with_records_and_filter(left, right, options, record_envelope.predicate())
+}
+
+fn compare_complete_prefix(
+    left: &str,
+    right: &str,
+    options: &logdiff::LogDiffOpts,
+    writer: &mut impl Write,
+    record_envelope: RecordEnvelope,
+) -> std::io::Result<logdiff::PrefixComparison> {
+    logdiff::compare_complete_prefix_with_filter(
+        left,
+        right,
+        options,
+        writer,
+        record_envelope.predicate(),
+    )
+}
 
 /// Command-line options for the "logdiff" subcommand.
 #[derive(Debug, Parser)]
@@ -33,10 +69,17 @@ pub struct LogDiffCLIOpts {
     #[clap(long, value_name = "FILE")]
     json: Option<PathBuf>,
 
-    /// Compare the canonical full INFO stream used by --verify-strict. With
-    /// --json this comparison is mandatory and selected automatically.
+    /// Compare the canonical INFO stream used by --verify-strict within the
+    /// selected record envelope. With --json this comparison is mandatory and
+    /// selected automatically.
     #[clap(long)]
     canonical_info: bool,
+
+    /// Versioned record envelope applied before selecting messages. DBT logs
+    /// must opt into their transport envelope explicitly; the default preserves
+    /// every parsed record.
+    #[clap(long, value_enum, default_value = "all-records-v1")]
+    record_envelope: RecordEnvelopeArg,
 
     /// Compare two runs that are still being written, reporting divergence as
     /// soon as it appears instead of waiting for both to finish. Only records
@@ -71,6 +114,7 @@ impl LogDiffCLIOpts {
             file_b: Some(PathBuf::from(b)),
             json: None,
             canonical_info: false,
+            record_envelope: RecordEnvelopeArg::AllRecordsV1,
             follow: false,
             follow_interval_ms: 500,
             follow_timeout_secs: 300,
@@ -94,6 +138,11 @@ impl LogDiffCLIOpts {
 
     /// Print one log canonically or compare two logs.
     pub fn main(&self, _global: &GlobalOpts) -> ExitStatus {
+        let record_envelope = self.record_envelope.envelope();
+        eprintln!(
+            "hermit log-diff: record envelope {}",
+            record_envelope.policy().as_str()
+        );
         let Some(file_b) = &self.file_b else {
             if self.json.is_some() {
                 eprintln!("hermit log-diff: --json requires two input logs");
@@ -105,8 +154,11 @@ impl LogDiffCLIOpts {
                 );
                 return ExitStatus::Exited(2);
             }
-            return match logdiff::write_canonical_info(&self.file_a, &mut std::io::stdout().lock())
-            {
+            return match write_canonical_info(
+                &self.file_a,
+                &mut std::io::stdout().lock(),
+                record_envelope,
+            ) {
                 Ok(0) => {
                     eprintln!(
                         "hermit log-diff: {} contains no comparable INFO messages",
@@ -136,7 +188,10 @@ impl LogDiffCLIOpts {
         }
 
         if let Some(path) = &self.json
-            && let Err(error) = write_json(path, &pending_json_report(&options))
+            && let Err(error) = write_json(
+                path,
+                &pending_json_report(&options, record_envelope.policy()),
+            )
         {
             eprintln!(
                 "hermit log-diff: could not initialize JSON report at {}: {error}",
@@ -146,11 +201,11 @@ impl LogDiffCLIOpts {
         }
 
         if self.follow {
-            return self.follow_two_runs(file_b, &options);
+            return self.follow_two_runs(file_b, &options, record_envelope);
         }
 
         let (summary, records_left, records_right) =
-            match logdiff::try_log_diff_with_records(&self.file_a, file_b, &options) {
+            match try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope) {
                 Ok(result) => result,
                 Err(error) => {
                     eprintln!(
@@ -168,11 +223,19 @@ impl LogDiffCLIOpts {
             withheld_incomplete_tail: false,
         };
         eprintln!(
-            "hermit log-diff: compared {} records in full (left {} | right {})",
-            records.compared, records_left, records_right
+            "hermit log-diff: read {} records in full (left {} | right {}); selected {} | {} messages under {}",
+            records.compared,
+            records_left,
+            records_right,
+            summary.compared_left,
+            summary.compared_right,
+            record_envelope.policy().as_str(),
         );
         if let Some(path) = &self.json
-            && let Err(error) = write_json(path, &json_report(&summary, &options, records))
+            && let Err(error) = write_json(
+                path,
+                &json_report(&summary, &options, records, record_envelope.policy()),
+            )
         {
             eprintln!(
                 "hermit log-diff: could not write JSON report to {}: {error}",
@@ -200,7 +263,12 @@ impl LogDiffCLIOpts {
     /// * 1 -- a divergence was found; the record index bounding it is reported.
     /// * 2 -- the logs could not be read, or held nothing comparable.
     /// * 3 -- the timeout expired while at least one run was still writing.
-    fn follow_two_runs(&self, file_b: &Path, options: &logdiff::LogDiffOpts) -> ExitStatus {
+    fn follow_two_runs(
+        &self,
+        file_b: &Path,
+        options: &logdiff::LogDiffOpts,
+        record_envelope: RecordEnvelope,
+    ) -> ExitStatus {
         let interval = Duration::from_millis(self.follow_interval_ms.max(1));
         let settle_polls = self.follow_settle_polls.max(1);
         let deadline = (self.follow_timeout_secs > 0)
@@ -222,14 +290,19 @@ impl LogDiffCLIOpts {
             // Buffer the comparison transcript: printing it on every poll would
             // bury the one line that matters.
             let mut transcript = Vec::new();
-            let comparison =
-                match logdiff::compare_complete_prefix(&left, &right, options, &mut transcript) {
-                    Ok(comparison) => comparison,
-                    Err(error) => {
-                        eprintln!("hermit log-diff: comparison failed while following: {error}");
-                        return ExitStatus::Exited(2);
-                    }
-                };
+            let comparison = match compare_complete_prefix(
+                &left,
+                &right,
+                options,
+                &mut transcript,
+                record_envelope,
+            ) {
+                Ok(comparison) => comparison,
+                Err(error) => {
+                    eprintln!("hermit log-diff: comparison failed while following: {error}");
+                    return ExitStatus::Exited(2);
+                }
+            };
             let records = JsonRecords {
                 compared: comparison.records_compared,
                 available_left: comparison.records_available_left,
@@ -239,8 +312,13 @@ impl LogDiffCLIOpts {
 
             if records.compared != last_reported_records {
                 eprintln!(
-                    "hermit log-diff: identical so far over {} records (left has {} | right has {})",
-                    records.compared, records.available_left, records.available_right
+                    "hermit log-diff: checked {} complete records (left has {} | right has {}); selected {} | {} messages under {}",
+                    records.compared,
+                    records.available_left,
+                    records.available_right,
+                    comparison.summary.compared_left,
+                    comparison.summary.compared_right,
+                    record_envelope.policy().as_str(),
                 );
                 last_reported_records = records.compared;
             }
@@ -280,8 +358,10 @@ impl LogDiffCLIOpts {
                 if comparison.summary.matched_with_evidence() {
                     eprintln!(
                         "hermit log-diff: both logs unchanged for {settle_polls} polls; \
-                         identical over {} records compared",
-                        records.compared
+                         identical over {} | {} selected messages from {} complete records",
+                        comparison.summary.compared_left,
+                        comparison.summary.compared_right,
+                        records.compared,
                     );
                     return self.finish_follow(
                         options,
@@ -293,9 +373,11 @@ impl LogDiffCLIOpts {
                     );
                 }
                 eprintln!(
-                    "hermit log-diff: both logs unchanged for {settle_polls} polls but only {} \
-                     records were comparable; refusing to report a match",
-                    records.compared
+                    "hermit log-diff: both logs unchanged for {settle_polls} polls after reading {} \
+                     complete records, but selected {} | {} comparable messages; refusing to report a match",
+                    records.compared,
+                    comparison.summary.compared_left,
+                    comparison.summary.compared_right,
                 );
                 return self.finish_follow(
                     options,
@@ -309,9 +391,12 @@ impl LogDiffCLIOpts {
 
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 eprintln!(
-                    "hermit log-diff: timed out after {}s with {} records compared and at least \
-                     one run still writing; NOT a match -- the rest was never read",
-                    self.follow_timeout_secs, records.compared
+                    "hermit log-diff: timed out after {}s with {} complete records read and {} | {} \
+                     messages compared while at least one run was still writing; NOT a match -- the rest was never read",
+                    self.follow_timeout_secs,
+                    records.compared,
+                    comparison.summary.compared_left,
+                    comparison.summary.compared_right,
                 );
                 return self.finish_follow(
                     options,
@@ -339,7 +424,12 @@ impl LogDiffCLIOpts {
         let Some(path) = &self.json else {
             return status;
         };
-        let mut report = json_report(summary, options, records);
+        let mut report = json_report(
+            summary,
+            options,
+            records,
+            self.record_envelope.envelope().policy(),
+        );
         report.verdict = verdict;
         report.follow_stopped_because = Some(stopped_because);
         if let Err(error) = write_json(path, &report) {
@@ -409,6 +499,7 @@ struct JsonRecords {
 #[derive(Serialize)]
 struct JsonComparison<'a> {
     stream: &'static str,
+    record_envelope: RecordEnvelopePolicy,
     unsafe_strip_lines: bool,
     canonicalize_host_addresses: bool,
     ignored_line_substrings: &'a [String],
@@ -440,6 +531,7 @@ fn json_report<'a>(
     summary: &logdiff::LogDiffSummary,
     options: &'a logdiff::LogDiffOpts,
     records: JsonRecords,
+    record_envelope: RecordEnvelopePolicy,
 ) -> JsonReport<'a> {
     let verdict = if summary.diff_found {
         JsonVerdict::Diverged
@@ -473,6 +565,7 @@ fn json_report<'a>(
         first_divergent_record: summary.first_divergent_record,
         comparison: JsonComparison {
             stream,
+            record_envelope,
             unsafe_strip_lines: options.strip_lines,
             canonicalize_host_addresses: options.canonicalize_addresses,
             ignored_line_substrings: &options.ignore_lines,
@@ -486,7 +579,10 @@ fn json_report<'a>(
     }
 }
 
-fn pending_json_report(options: &logdiff::LogDiffOpts) -> JsonReport<'_> {
+fn pending_json_report(
+    options: &logdiff::LogDiffOpts,
+    record_envelope: RecordEnvelopePolicy,
+) -> JsonReport<'_> {
     let summary = logdiff::LogDiffSummary {
         diff_found: false,
         compared_left: 0,
@@ -495,7 +591,7 @@ fn pending_json_report(options: &logdiff::LogDiffOpts) -> JsonReport<'_> {
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
     };
-    let mut report = json_report(&summary, options, no_records());
+    let mut report = json_report(&summary, options, no_records(), record_envelope);
     report.verdict = JsonVerdict::NoResult;
     report
 }
@@ -574,6 +670,133 @@ mod tests {
     }
 
     #[test]
+    fn standalone_logdiff_refuses_transport_only_evidence_under_named_dbt_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
+
+        std::fs::write(&left, transport).unwrap();
+        std::fs::write(&right, transport).unwrap();
+        assert_eq!(
+            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
+            0
+        );
+        let (empty, records_left, records_right) =
+            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
+        assert!(!empty.matched_with_evidence());
+
+        let report = serde_json::to_value(json_report(
+            &empty,
+            &follow_options(),
+            JsonRecords {
+                compared: records_left.min(records_right),
+                available_left: records_left,
+                available_right: records_right,
+                withheld_incomplete_tail: false,
+            },
+            envelope.policy(),
+        ))
+        .unwrap();
+        assert_eq!(report["verdict"], "no_comparable_messages");
+        assert_eq!(report["selected_messages"]["left"], 0);
+        assert_eq!(report["selected_messages"]["right"], 0);
+        assert_eq!(report["records"]["available_left"], 1);
+        assert_eq!(report["records"]["available_right"], 1);
+        assert_eq!(
+            report["comparison"]["record_envelope"],
+            "dbt_evidence_transport_v1"
+        );
+    }
+
+    #[test]
+    fn standalone_default_does_not_silently_apply_the_dbt_envelope() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let envelope = RecordEnvelope::all_records_v1();
+
+        std::fs::write(&left, transport).unwrap();
+        std::fs::write(&right, transport).unwrap();
+        let (summary, _, _) =
+            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(summary.matched_with_evidence());
+    }
+
+    #[test]
+    fn standalone_logdiff_admits_one_real_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
+
+        std::fs::write(&left, real).unwrap();
+        std::fs::write(&right, real).unwrap();
+        assert_eq!(
+            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
+            1
+        );
+        let (one, _, _) =
+            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
+        assert_eq!((one.compared_left, one.compared_right), (1, 1));
+        assert!(one.matched_with_evidence());
+
+        let report = serde_json::to_value(json_report(
+            &one,
+            &follow_options(),
+            no_records(),
+            envelope.policy(),
+        ))
+        .unwrap();
+        assert_eq!(
+            report["comparison"]["record_envelope"],
+            "dbt_evidence_transport_v1"
+        );
+    }
+
+    #[test]
+    fn standalone_logdiff_drops_transport_beside_one_real_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
+
+        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
+        std::fs::write(&right, format!("{transport}\n{real}")).unwrap();
+        assert_eq!(
+            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
+            1
+        );
+        let (one, _, _) =
+            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
+        assert_eq!((one.compared_left, one.compared_right), (1, 1));
+        assert!(one.matched_with_evidence());
+    }
+
+    #[test]
+    fn standalone_logdiff_ignores_difference_confined_to_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
+
+        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
+        std::fs::write(&right, real).unwrap();
+        let (summary, _, _) =
+            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
+        assert!(!summary.diff_found);
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+    }
+
+    #[test]
     fn follow_reports_divergence_before_either_run_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let left = directory.path().join("left.log");
@@ -595,7 +818,8 @@ mod tests {
         options.json = Some(json.clone());
 
         let started = Instant::now();
-        let status = options.follow_two_runs(&right, &follow_options());
+        let status =
+            options.follow_two_runs(&right, &follow_options(), RecordEnvelope::all_records_v1());
         let elapsed = started.elapsed();
 
         assert!(
@@ -657,7 +881,8 @@ mod tests {
         options.follow_timeout_secs = 1;
         options.json = Some(json.clone());
 
-        let status = options.follow_two_runs(&right, &follow_options());
+        let status =
+            options.follow_two_runs(&right, &follow_options(), RecordEnvelope::all_records_v1());
         assert!(
             matches!(status, ExitStatus::Exited(3)),
             "an unfinished follow must not share an exit code with success, got {status:?}"
@@ -694,26 +919,41 @@ mod tests {
             available_right: 40,
             withheld_incomplete_tail: true,
         };
-        let value = serde_json::to_value(json_report(&summary, &options, records)).unwrap();
+        let value = serde_json::to_value(json_report(
+            &summary,
+            &options,
+            records,
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
         assert_eq!(value["records"]["compared"], 40);
         assert_eq!(value["records"]["available_left"], 41);
         assert_eq!(value["records"]["available_right"], 40);
+        assert_eq!(value["comparison"]["record_envelope"], "all_records_v1");
 
         // Even the placeholder written before any comparison names its zero.
-        let pending = serde_json::to_value(pending_json_report(&options)).unwrap();
+        let pending = serde_json::to_value(pending_json_report(
+            &options,
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
         assert_eq!(pending["verdict"], "no_result");
         assert_eq!(pending["records"]["compared"], 0);
+        assert_eq!(pending["comparison"]["record_envelope"], "all_records_v1");
     }
 
     #[test]
     fn one_log_and_two_log_json_forms_parse() {
         let one = LogDiffCLIOpts::try_parse_from(["log-diff", "run.log"]).unwrap();
         assert_eq!(one.file_b, None);
+        assert_eq!(one.record_envelope, RecordEnvelopeArg::AllRecordsV1);
 
         let two = LogDiffCLIOpts::try_parse_from([
             "log-diff",
             "left.log",
             "right.log",
+            "--record-envelope",
+            "dbt-evidence-transport-v1",
             "--print-logs",
             "--json",
             "diff.json",
@@ -722,6 +962,10 @@ mod tests {
         assert_eq!(two.file_b, Some(PathBuf::from("right.log")));
         assert!(two.more.print_logs);
         assert_eq!(two.json, Some(PathBuf::from("diff.json")));
+        assert_eq!(
+            two.record_envelope,
+            RecordEnvelopeArg::DbtEvidenceTransportV1
+        );
     }
 
     #[test]
@@ -735,7 +979,13 @@ mod tests {
             first_divergent_virtual_nanoseconds: Some(123),
             first_divergent_record: Some(9),
         };
-        let value = serde_json::to_value(json_report(&summary, &options, no_records())).unwrap();
+        let value = serde_json::to_value(json_report(
+            &summary,
+            &options,
+            no_records(),
+            RecordEnvelopePolicy::AllRecordsV1,
+        ))
+        .unwrap();
         assert_eq!(value["verdict"], "diverged");
         assert_eq!(value["selected_messages"]["left"], 8);
         assert_eq!(value["comparison"]["stream"], "deterministic");
@@ -749,7 +999,13 @@ mod tests {
             ..summary
         };
         assert_eq!(
-            serde_json::to_value(json_report(&matched, &options, no_records())).unwrap()["verdict"],
+            serde_json::to_value(json_report(
+                &matched,
+                &options,
+                no_records(),
+                RecordEnvelopePolicy::AllRecordsV1,
+            ))
+            .unwrap()["verdict"],
             "matched"
         );
 
@@ -759,7 +1015,13 @@ mod tests {
             ..matched
         };
         assert_eq!(
-            serde_json::to_value(json_report(&empty, &options, no_records())).unwrap()["verdict"],
+            serde_json::to_value(json_report(
+                &empty,
+                &options,
+                no_records(),
+                RecordEnvelopePolicy::AllRecordsV1,
+            ))
+            .unwrap()["verdict"],
             "no_comparable_messages"
         );
     }
@@ -777,7 +1039,7 @@ mod tests {
         ignored.ignore_lines.push("difference".to_owned());
         assert!(canonical_comparison_is_unrelaxed(&ignored).is_err());
 
-        let report = pending_json_report(&options);
+        let report = pending_json_report(&options, RecordEnvelopePolicy::AllRecordsV1);
         assert_eq!(
             serde_json::to_value(report).unwrap()["verdict"],
             "no_result"
@@ -790,7 +1052,11 @@ mod tests {
         let path = directory.path().join("comparison.json");
         let options = logdiff::LogDiffOpts::default();
 
-        write_json(&path, &pending_json_report(&options)).unwrap();
+        write_json(
+            &path,
+            &pending_json_report(&options, RecordEnvelopePolicy::AllRecordsV1),
+        )
+        .unwrap();
         let pending = std::fs::read_to_string(&path).unwrap();
         assert_eq!(pending.lines().count(), 1);
         assert_eq!(
@@ -806,7 +1072,16 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
         };
-        write_json(&path, &json_report(&summary, &options, no_records())).unwrap();
+        write_json(
+            &path,
+            &json_report(
+                &summary,
+                &options,
+                no_records(),
+                RecordEnvelopePolicy::AllRecordsV1,
+            ),
+        )
+        .unwrap();
         let terminal = std::fs::read_to_string(&path).unwrap();
         assert_eq!(terminal.lines().count(), 1);
         assert_eq!(

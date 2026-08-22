@@ -25,6 +25,8 @@ use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
 
 use super::global_opts::GlobalOpts;
+use super::record_envelope::RecordEnvelope;
+use super::record_envelope::RecordEnvelopePolicy;
 
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
@@ -58,6 +60,9 @@ pub(crate) struct ComparisonOptions {
     /// Keep both captured logs at their selected paths after comparison,
     /// whether the runs match or diverge.
     pub keep_logs: bool,
+    /// Typed, versioned record envelope applied before selecting messages.
+    /// Its policy identity is serialized beside the verdict.
+    pub record_envelope: RecordEnvelope,
 }
 
 /// How strictly two runs' internal logs are compared — the condition a
@@ -94,7 +99,8 @@ pub enum LogCompareStrictness {
     /// claim.
     Stripped,
     /// The parity mode (`BitwiseInfoV1`): `strip_lines = false` and
-    /// `canonicalize_addresses = true`, comparing the full captured INFO trace.
+    /// `canonicalize_addresses = true`, comparing every INFO record admitted by
+    /// the named record envelope.
     /// Only the real wall-clock timestamp prefix is stripped and host addresses
     /// are canonicalized to first-appearance ordinals; every other byte —
     /// virtual-time timestamps, raw syscall argument/result values, counts,
@@ -190,6 +196,10 @@ pub struct ComparisonSpec {
     /// The message envelope selected from the captured log. The compared-message
     /// counts refer exactly to this scope.
     pub log_scope: ComparedLogScope,
+    /// Versioned policy selecting which parsed records entered the message
+    /// envelope. A caller-defined predicate is disclosed but cannot qualify for
+    /// parity.
+    pub record_envelope: RecordEnvelopePolicy,
     /// Concrete: were numeric values, addresses, tmp paths, and timestamps
     /// normalized away wholesale before diffing (the lossy [`Stripped`] path)?
     ///
@@ -202,8 +212,9 @@ pub struct ComparisonSpec {
     pub canonicalize_addresses: bool,
     /// Concrete: was the complete parity observation envelope compared (vs. the
     /// legacy deterministic subset)? For `BitwiseInfoV1`, that complete envelope
-    /// is INFO and [`Self::log_scope`] records whether the explicit diagnostic
-    /// full-trace superset was requested.
+    /// is every INFO record admitted by [`Self::record_envelope`], and
+    /// [`Self::log_scope`] records whether the explicit diagnostic full-trace
+    /// superset was requested.
     pub full_trace: bool,
     /// Concrete: was everything OTHER than the stripped prefix and the
     /// canonicalized addresses compared exactly (virtual-time timestamps,
@@ -241,6 +252,7 @@ impl ComparisonSpec {
         compare_logs: bool,
         diagnostic_full_trace: bool,
         compare_io_buffers: bool,
+        record_envelope: RecordEnvelopePolicy,
     ) -> Self {
         // Map the strictness label onto the concrete diff flags AND the versioned
         // policy tokens in one place, so the flags the engine sees, the tokens
@@ -254,7 +266,8 @@ impl ComparisonSpec {
                     (true, false, false, false, ComparedLogScope::Deterministic)
                 }
                 // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
-                // canonicalize addresses, and compare every INFO message exactly.
+                // canonicalize addresses, and compare every INFO message admitted
+                // by the selected named record envelope exactly.
                 // The explicit verbose diagnostic mode compares the all-level
                 // superset without changing the canonicalization policy.
                 LogCompareStrictness::Canonical => (
@@ -283,6 +296,7 @@ impl ComparisonSpec {
             compare_logs,
             compare_io_buffers,
             log_scope,
+            record_envelope,
             strip_lines,
             canonicalize_addresses,
             full_trace,
@@ -313,17 +327,18 @@ impl ComparisonSpec {
     /// Does this comparison satisfy the `BitwiseInfoV1` parity contract a
     /// determinism / record-replay ratchet must require before it may read a
     /// `Matched` verdict as *true parity*? A bare `verified` is not enough:
-    /// `verified` can rest on a stripped compare, a filtered subset, or an
-    /// output-only fallback, all of which normalize or omit exactly the data
+    /// `verified` can rest on a stripped compare, an opaque filtered subset, or
+    /// an output-only fallback, all of which normalize or omit exactly the data
     /// (virtual-time timestamps, raw syscall argument/result values, whole event
     /// classes) that parity exists to check.
     ///
     /// This requires the EXACT `BitwiseInfoV1` policy shape, not merely
     /// "not stripped": a generic `strip_lines = false` is inadmissible on its
     /// own. All clauses must hold:
-    /// - the full INFO event stream (or the explicit all-level diagnostic
-    ///   superset) was compared ([`Self::full_trace`] and [`Self::log_scope`]),
-    ///   which carries exact virtual timestamps and syscall argument/result values;
+    /// - the full INFO event stream within the named record envelope (or the
+    ///   explicit all-level diagnostic superset) was compared
+    ///   ([`Self::full_trace`] and [`Self::log_scope`]), which carries exact
+    ///   virtual timestamps and syscall argument/result values;
     /// - no lossy wholesale normalization ran (`!strip_lines`) and the remainder
     ///   was compared exactly ([`Self::exact_remainder`]);
     /// - addresses were CANONICALIZED, not erased ([`Self::canonicalize_addresses`]),
@@ -331,7 +346,10 @@ impl ComparisonSpec {
     /// - the versioned policy tokens are exactly the parity set — only the
     ///   wall-clock prefix stripped, only address-ordinal canonicalization
     ///   applied — so a future extra strip/canonicalization cannot silently pass;
-    /// - no ignore/skip filter dropped any line or event class
+    /// - the record predicate is one of the explicitly named, versioned
+    ///   canonical envelopes ([`Self::record_envelope`]); an opaque
+    ///   caller-defined predicate cannot qualify;
+    /// - no ad hoc ignore/skip filter dropped any line or event class
     ///   (`!ignore_lines && !skip_commit && !skip_detlog`);
     /// - the internal log stream was actually compared, not skipped for an
     ///   output-only fallback ([`Self::compare_logs`]).
@@ -358,6 +376,7 @@ impl ComparisonSpec {
             && self.exact_remainder
             && self.stripped_prefixes == PARITY_STRIPPED_PREFIXES
             && self.canonicalizations == PARITY_CANONICALIZATIONS
+            && self.record_envelope.is_canonical()
             && !self.ignore_lines
             && !self.skip_commit
             && !self.skip_detlog
@@ -469,11 +488,11 @@ impl VerificationOutcome {
 /// verification result, `comparison` is the comparison that produced it, and
 /// `guest_exit_code`/`guest_signal` describe the guest's own termination. A
 /// consumer keys its decision on `verified` — but a *parity* consumer must not:
-/// `verified` under a stripped comparison, a filtered subset, or an output-only
-/// fallback is not a bitwise-parity claim. Such a consumer reads
+/// `verified` under a stripped comparison, an opaque filtered subset, or an
+/// output-only fallback is not a bitwise-parity claim. Such a consumer reads
 /// [`Self::bitwise_parity`] (or checks the `comparison` fields directly), which
-/// is `true` only when the verdict rests on a full-INFO, unfiltered, unstripped
-/// log comparison.
+/// is `true` only when the verdict rests on a full-INFO, named canonical record
+/// envelope and unstripped log comparison.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationReport {
     /// True iff the two runs matched (the verdict as a boolean).
@@ -776,6 +795,7 @@ fn compare_two_runs_with_unsupported_scan(
         options.compare_logs,
         options.diagnostic_full_trace,
         options.compare_io_buffers,
+        options.record_envelope.policy(),
     );
 
     if out1.stdout != out2.stdout {
@@ -837,8 +857,12 @@ fn compare_two_runs_with_unsupported_scan(
                 "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
             );
 
-            let summary =
-                logdiff::try_log_diff_detailed(log1.as_ref(), log2.as_ref(), &diff_options)?;
+            let summary = logdiff::try_log_diff_detailed_with_filter(
+                log1.as_ref(),
+                log2.as_ref(),
+                &diff_options,
+                options.record_envelope.predicate(),
+            )?;
             compared_log_messages = Some(ComparedLogCounts {
                 left: summary.compared_left,
                 right: summary.compared_right,
@@ -1065,6 +1089,24 @@ mod tests {
         right_log: TempPath,
         strictness: LogCompareStrictness,
     ) -> Result<VerificationOutcome, Error> {
+        compare_with_envelope(
+            left,
+            left_log,
+            right,
+            right_log,
+            strictness,
+            RecordEnvelope::all_records_v1(),
+        )
+    }
+
+    fn compare_with_envelope(
+        left: &Output,
+        left_log: TempPath,
+        right: &Output,
+        right_log: TempPath,
+        strictness: LogCompareStrictness,
+        record_envelope: RecordEnvelope,
+    ) -> Result<VerificationOutcome, Error> {
         compare_two_runs(
             ComparedRun {
                 output: left,
@@ -1081,6 +1123,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                record_envelope,
             },
         )
     }
@@ -1199,6 +1242,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                record_envelope: RecordEnvelope::all_records_v1(),
             },
         )
         .unwrap();
@@ -1237,7 +1281,13 @@ mod tests {
 
     #[test]
     fn comparison_spec_maps_strictness_to_concrete_flags() {
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false, false);
+        let stripped = ComparisonSpec::new(
+            LogCompareStrictness::Stripped,
+            true,
+            false,
+            false,
+            RecordEnvelopePolicy::AllRecordsV1,
+        );
         assert!(stripped.strip_lines);
         assert!(!stripped.full_trace);
         assert_eq!(
@@ -1245,7 +1295,13 @@ mod tests {
             LogComparisonMode::Deterministic
         );
 
-        let canonical = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false, true);
+        let canonical = ComparisonSpec::new(
+            LogCompareStrictness::Canonical,
+            true,
+            false,
+            true,
+            RecordEnvelopePolicy::AllRecordsV1,
+        );
         assert!(!canonical.strip_lines);
         assert!(canonical.canonicalize_addresses);
         assert!(canonical.exact_remainder);
@@ -1253,7 +1309,13 @@ mod tests {
         assert_eq!(canonical.log_scope, ComparedLogScope::Info);
         assert_eq!(canonical.log_comparison_mode(), LogComparisonMode::Info);
 
-        let diagnostic = ComparisonSpec::new(LogCompareStrictness::Canonical, true, true, true);
+        let diagnostic = ComparisonSpec::new(
+            LogCompareStrictness::Canonical,
+            true,
+            true,
+            true,
+            RecordEnvelopePolicy::AllRecordsV1,
+        );
         assert_eq!(diagnostic.log_scope, ComparedLogScope::FullTrace);
         assert_eq!(
             diagnostic.log_comparison_mode(),
@@ -1331,6 +1393,7 @@ mod tests {
                 diagnostic_full_trace: true,
                 compare_io_buffers: false,
                 keep_logs: false,
+                record_envelope: RecordEnvelope::all_records_v1(),
             },
         )
         .unwrap();
@@ -1427,6 +1490,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: false,
                     keep_logs,
+                    record_envelope: RecordEnvelope::all_records_v1(),
                 },
             )
             .unwrap();
@@ -1466,6 +1530,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                record_envelope: RecordEnvelope::all_records_v1(),
             },
             |_| Err(io::Error::other("injected unsupported-syscall scan error")),
         )
@@ -1524,6 +1589,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                record_envelope: RecordEnvelope::all_records_v1(),
             },
         );
 
@@ -1832,7 +1898,7 @@ mod tests {
         assert!(parsed["compared_log_messages"]["left"].as_u64().unwrap() > 0);
         assert!(parsed["compared_log_messages"]["right"].as_u64().unwrap() > 0);
         // The single boolean a parity ratchet keys on: a matched, full-INFO,
-        // unstripped, unfiltered comparison.
+        // unstripped comparison under a named canonical record envelope.
         assert_eq!(parsed["bitwise_parity"], serde_json::json!(true));
         assert_eq!(
             parsed["comparison"]["strictness"],
@@ -1844,6 +1910,10 @@ mod tests {
         );
         assert_eq!(parsed["comparison"]["full_trace"], serde_json::json!(true));
         assert_eq!(parsed["comparison"]["log_scope"], serde_json::json!("info"));
+        assert_eq!(
+            parsed["comparison"]["record_envelope"],
+            serde_json::json!("all_records_v1")
+        );
         assert_eq!(
             parsed["comparison"]["compare_logs"],
             serde_json::json!(true)
@@ -1865,25 +1935,43 @@ mod tests {
     }
 
     // The bitwise-parity acceptance contract: a consumer must accept a `Matched`
-    // as true bitwise parity ONLY under a full-INFO, unstripped, unfiltered,
-    // log-comparing spec — and reject it under every weaker one. This brackets
-    // both sides: the one qualifying spec fires, and each single-clause weakening
-    // (stripped, output-only, and each ignore/skip filter) is refused. Without
-    // this, three different facts (stripped compare, output-only fallback,
-    // filtered subset) would all masquerade as the same `verified == true`.
+    // as true bitwise parity ONLY under a full-INFO, unstripped, named canonical
+    // record envelope and reject every weaker or opaque policy. This brackets
+    // both sides: each canonical envelope fires, while stripped, output-only,
+    // caller-defined, and ad hoc ignore/skip variants are refused.
     #[test]
-    fn bitwise_parity_contract_accepts_only_full_unfiltered_comparison() {
+    fn bitwise_parity_contract_accepts_only_named_canonical_envelopes() {
         // Positive: the exact qualifying comparison the `--verify-strict` path
         // produces.
-        let full = ComparisonSpec::new(LogCompareStrictness::Canonical, true, false, true);
+        let full = ComparisonSpec::new(
+            LogCompareStrictness::Canonical,
+            true,
+            false,
+            true,
+            RecordEnvelopePolicy::AllRecordsV1,
+        );
         assert!(
             full.is_bitwise_parity(),
-            "a full-INFO unstripped unfiltered comparison must qualify"
+            "a full-INFO unstripped all-records comparison must qualify"
+        );
+        assert!(
+            ComparisonSpec {
+                record_envelope: RecordEnvelopePolicy::DbtEvidenceTransportV1,
+                ..full
+            }
+            .is_bitwise_parity(),
+            "the named DBT transport envelope is a disclosed canonical policy"
         );
 
         // Negatives: each independent weakening of the qualifying spec must be
         // refused, so no single relaxed dimension can pass as bitwise parity.
-        let stripped = ComparisonSpec::new(LogCompareStrictness::Stripped, true, false, false);
+        let stripped = ComparisonSpec::new(
+            LogCompareStrictness::Stripped,
+            true,
+            false,
+            false,
+            RecordEnvelopePolicy::AllRecordsV1,
+        );
         assert!(
             !stripped.is_bitwise_parity(),
             "a stripped comparison normalizes away the parity-relevant data"
@@ -1920,6 +2008,10 @@ mod tests {
                 log_scope: ComparedLogScope::Deterministic,
                 ..full
             },
+            ComparisonSpec {
+                record_envelope: RecordEnvelopePolicy::CallerDefined,
+                ..full
+            },
         ] {
             assert!(
                 !weakened.is_bitwise_parity(),
@@ -1938,6 +2030,98 @@ mod tests {
             first_divergent_virtual_nanoseconds: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
+    }
+
+    #[test]
+    fn dbt_transport_only_is_disclosed_and_cannot_qualify_as_parity() {
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = empty_logs();
+        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
+        fs::write(&left, transport).unwrap();
+        fs::write(&right, transport).unwrap();
+
+        let outcome = compare_with_envelope(
+            &output,
+            left,
+            &output,
+            right,
+            LogCompareStrictness::Canonical,
+            RecordEnvelope::dbt_evidence_transport_v1(),
+        )
+        .unwrap();
+        let report = VerificationReport::from(&outcome);
+
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(
+            outcome.compared_log_messages,
+            Some(ComparedLogCounts { left: 0, right: 0 })
+        );
+        assert_eq!(
+            outcome.comparison.record_envelope,
+            RecordEnvelopePolicy::DbtEvidenceTransportV1
+        );
+        assert!(!report.bitwise_parity);
+    }
+
+    #[test]
+    fn dbt_real_detcore_record_matches_under_the_disclosed_envelope() {
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = empty_logs();
+        let log = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n\
+2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)\n";
+        fs::write(&left, log).unwrap();
+        fs::write(&right, log).unwrap();
+
+        let outcome = compare_with_envelope(
+            &output,
+            left,
+            &output,
+            right,
+            LogCompareStrictness::Canonical,
+            RecordEnvelope::dbt_evidence_transport_v1(),
+        )
+        .unwrap();
+        let report = VerificationReport::from(&outcome);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            outcome.compared_log_messages,
+            Some(ComparedLogCounts { left: 1, right: 1 })
+        );
+        assert!(report.bitwise_parity);
+        assert_eq!(
+            json["comparison"]["record_envelope"],
+            "dbt_evidence_transport_v1"
+        );
+    }
+
+    #[test]
+    fn caller_defined_record_filter_is_disclosed_but_never_parity() {
+        fn keep_everything(_record: &str) -> bool {
+            true
+        }
+
+        let output = output(0, b"hello\n", b"");
+        let (left, right) = logs_with_identical_detlog();
+        let outcome = compare_with_envelope(
+            &output,
+            left,
+            &output,
+            right,
+            LogCompareStrictness::Canonical,
+            RecordEnvelope::caller_defined(keep_everything),
+        )
+        .unwrap();
+        let report = VerificationReport::from(&outcome);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert!(outcome.verified());
+        assert_eq!(
+            outcome.comparison.record_envelope,
+            RecordEnvelopePolicy::CallerDefined
+        );
+        assert!(!report.bitwise_parity);
+        assert_eq!(json["comparison"]["record_envelope"], "caller_defined");
     }
 
     // Binds the `ComparisonSpec::new` no-filter assumption (and the

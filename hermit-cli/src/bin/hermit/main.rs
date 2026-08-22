@@ -29,6 +29,7 @@ mod logdiff;
 mod oci;
 mod podman_store;
 mod record;
+mod record_envelope;
 mod record_start;
 mod remove;
 mod replay;

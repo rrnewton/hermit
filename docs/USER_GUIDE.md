@@ -304,11 +304,18 @@ durable directory. `--print-verify-logs` instead copies the first run's captured
 log to stderr; it does not retain either file.
 
 `hermit log-diff LOG` prints the canonical INFO stream from one retained log.
-`hermit log-diff LEFT RIGHT --json REPORT.json` compares the same canonical
-INFO stream and atomically records a one-line result, including the first
-divergent scheduler turn and virtual nanoseconds when the logs contain that
-position. An empty or unreadable comparison exits with an error rather than
-reporting a match.
+The default `--record-envelope=all-records-v1` preserves every parsed record.
+For a DBT evidence log, select
+`--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
+transport's self-description records. This is an offline inspection option;
+live `--backend=dbt run --verify` uses its dedicated DBT adapter and does not
+reach the generic comparator. If `--verify-json` is requested there, the receipt
+remains `no_result`. `hermit log-diff LEFT RIGHT --json REPORT.json` compares
+the same canonical INFO stream and atomically records a one-line result. Its
+`comparison.record_envelope` field names that versioned policy, alongside the
+first divergent scheduler turn and virtual nanoseconds when the logs contain
+that position. An empty or unreadable comparison exits with an error rather
+than reporting a match.
 
 For a two-log comparison, add `--print-logs` to print both selected streams to
 stderr exactly as the comparator receives them. The output names the active
