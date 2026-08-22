@@ -34,14 +34,18 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
     int ok = 0;
 
     char path[] = "/tmp/preadv2_flags.XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) {
-        printf("preadv2 ok=0\n");
-        return 0;
+        printf("preadv2 SETUP_FAIL [mkstemp]\n");
+        return 1;
     }
 
     char c0[6] = "AAAAA\n";
@@ -87,5 +91,18 @@ int main(void) {
     unlink(path);
 
     printf("preadv2 ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a pwritev2/preadv2 positional
+       or RWF_APPEND check stopped holding only lowered the printed number --
+       and under --verify both runs lower it identically, so the comparison
+       still matches and the cell stays green. The checks above are unchanged;
+       this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "preadv2 completed %d of %d checks\n",
+                ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }

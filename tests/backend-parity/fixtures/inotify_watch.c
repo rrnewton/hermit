@@ -17,6 +17,10 @@
 #include <sys/inotify.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 4
+
 int main(void) {
     int ok = 0;
 
@@ -39,5 +43,17 @@ int main(void) {
     }
 
     printf("ino ok=%d\n", ok);
+
+    /* Route a behavioural failure into the exit status. Without this the
+       guest exits 0 whatever `ok` reached, so a step of the inotify
+       watch-descriptor lifecycle stopped succeeding only lowered the printed
+       number -- and under --verify both runs lower it identically, so the
+       comparison still matches and the cell stays green. The checks above are
+       unchanged; this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "ino completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+        return 1;
+    }
+
     return 0;
 }

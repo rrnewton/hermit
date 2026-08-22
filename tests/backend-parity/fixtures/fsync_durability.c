@@ -17,14 +17,18 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
   int ok = 0;
 
   char path[] = "/tmp/fsyncXXXXXX";
   int fd = mkstemp(path);
   if (fd < 0) {
-    printf("sync ok=0\n");
-    return 0;
+    printf("sync SETUP_FAIL [mkstemp]\n");
+    return 1;
   }
 
   /* 1: a short write establishes dirty data to flush. */
@@ -61,5 +65,17 @@ int main(void) {
   unlink(path);
 
   printf("sync ok=%d\n", ok);
+
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a durability syscall or its EBADF
+     rejection stopped holding only lowered the printed number -- and under
+     --verify both runs lower it identically, so the comparison still matches
+     and the cell stays green. The checks above are unchanged; this only
+     requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "sync completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+    return 1;
+  }
+
   return 0;
 }
