@@ -47,6 +47,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::keep_all_log_records;
 use super::verify::setup_double_run;
 use super::verify::validate_log_level;
 use super::verify::write_pending_verification_json;
@@ -515,6 +516,7 @@ impl StartOpts {
                 // a replay verdict here is not a content-parity claim either.
                 compare_io_buffers: false,
                 keep_logs: false,
+                keep_log_record: keep_all_log_records,
             },
         )?;
 

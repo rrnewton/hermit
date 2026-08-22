@@ -59,6 +59,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::keep_all_log_records;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
@@ -69,6 +70,14 @@ use super::verify::write_verification_json;
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
+
+fn keep_log_record_for_backend(backend: Backend) -> fn(&str) -> bool {
+    match backend {
+        #[cfg(feature = "dbt")]
+        Backend::Dbt => super::logdiff::keep_dbt_evidence_record,
+        _ => keep_all_log_records,
+    }
+}
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -931,6 +940,17 @@ fn backend_values_parse_and_round_trip() {
         let normalized = format!(" --backend={value} -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
+}
+
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_verification_selects_the_backend_owned_evidence_filter() {
+    let transport = "INFO reverie_dbt::evidence: protected evidence initialized";
+    let real = "INFO detcore: DETLOG protected evidence initialized";
+
+    assert!(!keep_log_record_for_backend(Backend::Dbt)(transport));
+    assert!(keep_log_record_for_backend(Backend::Dbt)(real));
+    assert!(keep_log_record_for_backend(Backend::Ptrace)(transport));
 }
 
 #[test]
@@ -3176,6 +3196,7 @@ impl RunOpts {
             "Success: deterministic. Determinism verified."
         };
         let failure_message = "Failure: nondeterministic.";
+        let keep_log_record = keep_log_record_for_backend(self.selected_backend());
         let outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -3199,6 +3220,7 @@ impl RunOpts {
                 diagnostic_full_trace: self.verify_verbose,
                 compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
                 keep_logs: self.keep_logs,
+                keep_log_record,
             },
         )?;
 
