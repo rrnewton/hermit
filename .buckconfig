@@ -7,7 +7,7 @@
 hermit = .
 reverie = reverie
 gh_facebook_buck2_shims_meta = shim
-reverie_shim = reverie/shim
+reverie_shim = shim
 prelude = prelude
 none = none
 

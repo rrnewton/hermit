@@ -197,13 +197,31 @@ set in the table above is what the branch actually reproduces.
 
 ## Known stopping point
 
-The current build reaches `//hermit-cli:hermit` and then stops because the
-Hermit and Reverie cells compile separate copies of third-party Rust crates.
-Types crossing the cell boundary consequently have distinct trait identities,
-currently observed when Reverie's `Sysno` meets Hermit's `serde::Serialize` and
-`serde::Deserialize` traits in `detcore-model`. Resolving that requires an owner
-decision about one third-party graph versus Hermit's hermetic Reverie pin; this
-bootstrap deliberately does not choose one.
+**The two cells no longer compile separate copies of third-party crates.**
+`.buckconfig` maps the `reverie_shim` cell onto the Hermit shim cell, so
+Reverie's BUCK files resolve their third-party crates there and each crate is
+compiled once. The trait mismatch that used to stop `detcore-model` —
+Reverie's `Sysno` carrying `serde::Serialize` from one `serde_core-1.0.229`
+while `detcore-model` required the other — is gone. `reverie//:reverie-ptrace`
+still builds, and to the same artifact hash as before the change.
+
+Two things made this cheaper than expected. The two cells were never on
+different versions: both vendored byte-identical `serde_core-1.0.229`, so
+nothing needed rolling forward. And the only obstacle to sharing one cell was
+that Reverie's BUCK names crates without a version suffix (`thiserror`, the
+spelling Meta's internal build uses) while Reindeer emits such an alias only
+for the manifest's own direct dependencies. `shared-cell-aliases.txt` closes
+that gap; see the comment in that file.
+
+`//hermit-cli:hermit` now stops further along, on missing first-party BUCK
+targets rather than on any dependency-graph conflict. `hermit-cli:libhermit`
+needs `detcore_model`, `hermit_resources`, `addr2line`, `nix`, `object`,
+`reverie_kvm`, `reverie_liteinst` and `reverie_rpc_transport`. The first five
+are edges absent from `hermit-cli/BUCK`. The last three have no Buck target at
+all: `reverie/BUCK` defines seven targets and none of them is a KVM, LiteInst
+or RPC-transport library. `hermit-resources/` likewise has a `Cargo.toml` and
+`src/` but no `BUCK` file. Supplying those targets is the unfinished
+backend-target work, in both repositories, not a design question.
 
 No shared action-cache performance measurement has yet been made. A local
 successful build proves target compatibility only, not the vision's claimed
