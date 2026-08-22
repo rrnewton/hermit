@@ -41,6 +41,7 @@ use super::Replayer;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
+use crate::vectored_offset;
 
 #[repr(C)]
 struct UserSignalInfoHead {
@@ -463,14 +464,6 @@ fn read_write_bytes<M: MemoryAccess>(
             call.iov_len() as usize,
             length,
         ),
-    }
-}
-
-fn vectored_offset(low: u64, high: u64) -> i64 {
-    if std::mem::size_of::<usize>() == 8 {
-        low as i64
-    } else {
-        ((high << 32) | (low & u32::MAX as u64)) as i64
     }
 }
 

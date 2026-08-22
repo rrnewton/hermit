@@ -41,6 +41,7 @@ use crate::event::StatEvent;
 use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
+use crate::vectored_offset;
 
 /// Read the first `length` output bytes of a vectored read from the guest's
 /// `iovec` array, flattened in read order. `length` is the syscall return value,
@@ -102,14 +103,6 @@ fn consumed_sigpipe_count(pid: libc::pid_t, fd: libc::c_int, bytes: &[u8]) -> u6
         .count()
         .try_into()
         .expect("SIGPIPE signalfd record count overflow")
-}
-
-fn vectored_offset(low: u64, high: u64) -> i64 {
-    if std::mem::size_of::<usize>() == 8 {
-        low as i64
-    } else {
-        ((high << 32) | (low & u32::MAX as u64)) as i64
-    }
 }
 
 fn write_advances_output_offset(syscall: WriteFamily) -> bool {
