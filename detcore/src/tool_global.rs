@@ -2493,7 +2493,19 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    global_time_lower_bound(guest).await
+    let now = global_time_lower_bound(guest).await;
+    // Let this thread's own clock absorb the scheduler time charged to global
+    // time while it was parked.
+    //
+    // Global time is the sum of the threads' clocks PLUS `extra_time`, and
+    // `GlobalTime::add_scheduler_time` charges every scheduler turn to that
+    // global-only bucket. A thread-local reader -- `rdtsc` -- therefore never
+    // sees the scheduler bill that `clock_gettime` does, and the two drift
+    // apart by the whole of it. Pulling the local clock up to the global
+    // lower bound here costs no extra round trip, because the caller has just
+    // made one.
+    guest.thread_state_mut().thread_logical_time.advance_to(now);
+    now
 }
 
 /// Writes a structured json backtrace to a given file
