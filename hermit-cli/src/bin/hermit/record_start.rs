@@ -456,7 +456,14 @@ impl StartOpts {
                 let _guard = global2.init_tracing();
                 hermit::replay_with_output(data_dir).map_err(SerializableError::from)
             })
-            .context("Container exited unexpectedly")??;
+            .context("Container exited unexpectedly")?;
+        let replay = match replay {
+            Ok(replay) => replay,
+            Err(error) => {
+                let error = Error::from(error);
+                return super::replay_no_result(error);
+            }
+        };
 
         let outcome = compare_two_runs(
             ComparedRun {

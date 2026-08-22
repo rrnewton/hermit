@@ -100,6 +100,17 @@ pub use script::Shebang;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Process exit used when an invocation did not produce a trustworthy result.
+#[doc(hidden)]
+pub const NO_RESULT_EXIT_CODE: i32 = 75;
+
+/// Returns whether replay produced no trustworthy result because captured
+/// stdout or stderr could not be emitted to the caller.
+#[doc(hidden)]
+pub fn is_replay_output_emission_error(error: &Error) -> bool {
+    replayer::is_replay_output_emission_error(error)
+}
+
 enum KvmStdinReservation {
     Open(fs::File),
     Closed,

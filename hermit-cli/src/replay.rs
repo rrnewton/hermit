@@ -51,6 +51,7 @@ impl Replay {
         capture_output: bool,
         gdbserver: Option<u16>,
     ) -> Result<Self, Error> {
+        crate::replayer::reset_replay_output_emission_error();
         let metadata_path = dir.join(METADATA_NAME);
 
         let metadata: Metadata = serde_json::from_reader(
@@ -129,17 +130,27 @@ impl Replay {
 
     /// Waits for the replay to finish and returns its exit status.
     pub async fn wait(self) -> Result<ExitStatus, reverie::Error> {
-        let (exit_status, global_state) = self.tracer.wait().await?;
+        let result = self.tracer.wait().await;
+        let output_error = crate::replayer::take_replay_output_emission_error();
+        let (exit_status, global_state) = result?;
         self.chroot.remove()?;
         global_state.clean_up(false, &None).await;
+        if let Some(error) = output_error {
+            return Err(error);
+        }
         Ok(exit_status)
     }
 
     /// Waits for the replay to finish and collects its output.
     pub async fn wait_with_output(self) -> Result<Output, reverie::Error> {
-        let (output, global_state) = self.tracer.wait_with_output().await?;
+        let result = self.tracer.wait_with_output().await;
+        let output_error = crate::replayer::take_replay_output_emission_error();
+        let (output, global_state) = result?;
         self.chroot.remove()?;
         global_state.clean_up(false, &None).await;
+        if let Some(error) = output_error {
+            return Err(error);
+        }
         Ok(output)
     }
 }
