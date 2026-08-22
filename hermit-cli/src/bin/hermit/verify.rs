@@ -409,6 +409,109 @@ pub struct ComparedLogCounts {
     pub right: usize,
 }
 
+/// One pair of DBT counter values that participated in verification.
+///
+/// The values travel with the equality result so the JSON says what was
+/// observed on both runs instead of exposing only a bare boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComparedDbtValue<T> {
+    pub left: T,
+    pub right: T,
+    pub matched: bool,
+}
+
+impl<T> ComparedDbtValue<T>
+where
+    T: PartialEq,
+{
+    pub fn new(left: T, right: T) -> Self {
+        let matched = left == right;
+        Self {
+            left,
+            right,
+            matched,
+        }
+    }
+}
+
+/// The guest termination observed on one DBT run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DbtGuestStatus {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl From<ExitStatus> for DbtGuestStatus {
+    fn from(status: ExitStatus) -> Self {
+        Self {
+            code: status.code(),
+            signal: status.signal(),
+        }
+    }
+}
+
+/// The native Detcore summary values the DBT verifier compares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbtSummaryComparison {
+    pub syscalls: ComparedDbtValue<u64>,
+    pub rewritten: ComparedDbtValue<u64>,
+    pub stdin_reads: ComparedDbtValue<u64>,
+    pub memory_hash: ComparedDbtValue<String>,
+    /// The last-syscall branch count remains diagnostic telemetry. It is not an
+    /// execution digest and does not participate in the verdict.
+    pub last_syscall_branch_count_compared: bool,
+}
+
+impl DbtSummaryComparison {
+    fn matched(&self) -> bool {
+        self.syscalls.matched
+            && self.rewritten.matched
+            && self.stdin_reads.matched
+            && self.memory_hash.matched
+    }
+}
+
+/// The exact comparison performed by the dedicated DBT verification path.
+///
+/// DBT currently compares guest stdout, exact termination, and selected native
+/// Detcore summary values. It does not compare guest stderr or the internal log
+/// stream, so this record can support a matched/diverged verdict but never a
+/// bitwise-parity claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DbtComparison {
+    pub backend: &'static str,
+    /// The existing backend identity is the comparison label. The detailed
+    /// fields below state what that path compares; this is deliberately not a
+    /// `LogCompareStrictness` value because no log comparison ran.
+    pub strictness: &'static str,
+    pub compare_logs: bool,
+    pub guest_stdout: ComparedDbtValue<usize>,
+    pub guest_exit_status: ComparedDbtValue<DbtGuestStatus>,
+    pub detcore_summary: DbtSummaryComparison,
+    pub guest_stderr_compared: bool,
+    pub internal_log_messages_compared: bool,
+}
+
+impl DbtComparison {
+    pub fn matched(&self) -> bool {
+        self.guest_stdout.matched
+            && self.guest_exit_status.matched
+            && self.detcore_summary.matched()
+    }
+}
+
+/// The comparison attached to a verification verdict.
+///
+/// `untagged` preserves the existing JSON shape for the common DETLOG path;
+/// the DBT variant identifies itself through `backend: "dbt"` and records the
+/// different inputs its dedicated verifier actually consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum VerificationComparison {
+    Log(ComparisonSpec),
+    Dbt(DbtComparison),
+}
+
 impl ComparedLogCounts {
     /// True when both sides actually contributed messages to the comparison.
     pub fn is_nonzero(&self) -> bool {
@@ -490,7 +593,7 @@ pub struct VerificationReport {
     /// The comparison that produced the verdict. Without this a bitwise-parity
     /// consumer cannot distinguish a stripped match from a bitwise one. `null`
     /// when no verdict was reached (see [`Verdict::NoResult`]).
-    pub comparison: Option<ComparisonSpec>,
+    pub comparison: Option<VerificationComparison>,
     /// How many messages in [`ComparisonSpec::log_scope`] were actually compared.
     /// `null` means the log comparison did not run. A strict *configuration* is
     /// not proof that the configured comparison had data, so this count is what makes
@@ -545,12 +648,33 @@ impl From<&VerificationOutcome> for VerificationReport {
                     .compared_log_messages
                     .is_some_and(|counts| counts.is_nonzero()),
             verdict: outcome.verdict,
-            comparison: Some(outcome.comparison),
+            comparison: Some(VerificationComparison::Log(outcome.comparison)),
             compared_log_messages: outcome.compared_log_messages,
             guest_exit_code: outcome.guest_status.code(),
             guest_signal: outcome.guest_status.signal(),
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
+        }
+    }
+}
+
+impl VerificationReport {
+    /// Build the typed report for the dedicated DBT double-run comparison.
+    pub fn from_dbt(comparison: DbtComparison, guest_status: ExitStatus) -> Self {
+        let verified = comparison.matched();
+        VerificationReport {
+            verified,
+            // DBT's current path does not compare the internal DETLOG stream.
+            bitwise_parity: false,
+            verdict: if verified {
+                Verdict::Matched
+            } else {
+                Verdict::Diverged
+            },
+            comparison: Some(VerificationComparison::Dbt(comparison)),
+            compared_log_messages: None,
+            guest_exit_code: guest_status.code(),
+            guest_signal: guest_status.signal(),
         }
     }
 }
@@ -562,6 +686,19 @@ impl From<&VerificationOutcome> for VerificationReport {
 /// guest exited with.
 pub fn write_verification_json(path: &Path, outcome: &VerificationOutcome) -> Result<(), Error> {
     write_report_json(path, &VerificationReport::from(outcome))
+}
+
+/// Write the result of the dedicated DBT comparison without representing it as
+/// a DETLOG comparison that did not run.
+pub fn write_dbt_verification_json(
+    path: &Path,
+    comparison: DbtComparison,
+    guest_status: ExitStatus,
+) -> Result<(), Error> {
+    write_report_json(
+        path,
+        &VerificationReport::from_dbt(comparison, guest_status),
+    )
 }
 
 /// Publish an explicit NO-RESULT record to `path` *before* verification starts.
@@ -1166,10 +1303,13 @@ mod tests {
         assert_eq!(report.guest_exit_code, Some(3));
         assert_eq!(report.guest_signal, None);
         // The report also carries the comparison that produced the verdict.
-        assert_eq!(
-            report.comparison.unwrap().strictness,
-            LogCompareStrictness::Stripped
-        );
+        assert!(matches!(
+            report.comparison,
+            Some(VerificationComparison::Log(ComparisonSpec {
+                strictness: LogCompareStrictness::Stripped,
+                ..
+            }))
+        ));
         // Collapsing to the legacy exit convention still propagates the guest
         // code; the verdict channel above is what a caller keys on.
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(3));
@@ -1387,7 +1527,13 @@ mod tests {
         // can refuse to treat a stripped match as parity.
         let report = VerificationReport::from(&canonical);
         assert!(!report.verified);
-        assert!(!report.comparison.unwrap().strip_lines);
+        assert!(matches!(
+            report.comparison,
+            Some(VerificationComparison::Log(ComparisonSpec {
+                strip_lines: false,
+                ..
+            }))
+        ));
 
         assert!(path1.exists(), "divergent run-1 log must be retained");
         assert!(path2.exists(), "divergent run-2 log must be retained");

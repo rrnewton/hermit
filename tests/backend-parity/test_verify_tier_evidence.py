@@ -113,6 +113,41 @@ print("case GUEST — verified without comparing the log stream is guest-visible
 got = tier_of(record(bitwise=False, compare_logs=False, left=None))
 check("tier is 'guest'", got and got["tier"] == "guest", repr(got))
 
+print("case DBT — its typed dedicated comparison is consumed in both directions")
+dbt_comparison = {
+    "backend": "dbt", "strictness": "dbt", "compare_logs": False,
+    "guest_stdout": {"left": 4, "right": 4, "matched": True},
+    "guest_exit_status": {
+        "left": {"code": 0, "signal": None},
+        "right": {"code": 0, "signal": None},
+        "matched": True,
+    },
+    "detcore_summary": {
+        field: {"left": value, "right": value, "matched": True}
+        for field, value in {
+            "syscalls": 7, "rewritten": 6, "stdin_reads": 0,
+            "memory_hash": "cbf29ce484222325",
+        }.items()
+    },
+    "guest_stderr_compared": False,
+    "internal_log_messages_compared": False,
+}
+dbt_comparison["detcore_summary"]["last_syscall_branch_count_compared"] = False
+got = tier_of({
+    "verified": True, "bitwise_parity": False, "verdict": "matched",
+    "comparison": dbt_comparison, "compared_log_messages": None,
+})
+check("matched DBT report reaches guest-visible tier",
+      got and got["tier"] == "guest", repr(got))
+check("DBT comparison label reaches the scorecard",
+      got and got["verify_compare"] == "dbt", repr(got))
+got = tier_of({
+    "verified": False, "bitwise_parity": False, "verdict": "diverged",
+    "comparison": dbt_comparison, "compared_log_messages": None,
+})
+check("diverged DBT report remains a gap, never a pass",
+      got and got["tier"] == "gap", repr(got))
+
 print("case DIVERGED — an unverified record never claims a positive tier")
 got = tier_of(record(verified=False, verdict="diverged"))
 check("tier is 'gap'", got and got["tier"] == "gap", repr(got))
@@ -131,23 +166,23 @@ check("guest < stripped < bitwise",
       L2_RANK["guest"] < L2_RANK["stripped"] < L2_RANK["bitwise"], repr(L2_RANK))
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
 
-print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
-# Asserting bitwise before an INFO-tier comparator exists would red every
-# ptrace/DBT cell for a comparator limitation, not a guest defect.
+print("case CONTRACT — contracts match the comparison each backend performs")
+# Asserting bitwise before an INFO-tier comparator exists would red every ptrace
+# cell for a comparator limitation, not a guest defect.
 check("ptrace verify contract is 'stripped'",
       expectation("ptrace", "exit_status", True)[0] == "stripped")
-# `exit_status` is a declared dbt L2 gap, so it would report "gap" regardless of
-# tiering; use a case dbt is actually contracted for.
-check("dbt verify contract is 'stripped'",
-      expectation("dbt", "hello_stdout", True)[0] == "stripped")
+# DBT compares stdout/status/native summary values but not DETLOG. Calling it
+# stripped would assert a log selection that never ran.
+check("dbt verify contract is guest-visible",
+      expectation("dbt", "hello_stdout", True)[0] == "guest")
 check("a declared dbt L2 gap still reports 'gap'",
       expectation("dbt", "exit_status", True)[0] == "gap")
 check("kvm verify contract stays 'guest'",
       expectation("kvm", "exit_status", True)[0] == "guest")
 
 print("case FALLBACK — a run with no typed verdict must NOT issue a determinism positive")
-# DBT accepts --verify-json and writes nothing (measured: rc=0, no file). The old
-# behaviour emitted deterministic=1 beside a blank comparator and blank counts --
+# A legacy run with no usable typed verdict emitted deterministic=1 beside a
+# blank comparator and blank counts --
 # a positive whose required fields are empty, which a wired verifier must refuse.
 # Producing rows designed to be refused is not a contract, so the row is published
 # UNMEASURED instead.

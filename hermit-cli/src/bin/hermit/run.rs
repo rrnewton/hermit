@@ -2165,6 +2165,7 @@ impl RunOpts {
                     &self.args,
                     self.verify,
                     self.verify_allow,
+                    self.verify_json.as_deref(),
                     self.summary,
                     global.log,
                     &self.effective_det_config(),

@@ -285,9 +285,15 @@ Verification is an option to `run`, not a separate top-level command:
 hermit run --verify -- /bin/echo reproducible
 ```
 
-Hermit runs the guest twice and compares observable output, including stdout,
-stderr, and its internal deterministic execution log. Verification fails if
-the compared observations differ or if the guest exit status is not allowed.
+Hermit runs the guest twice. The ptrace path compares stdout, stderr, exact
+termination, and its internal deterministic execution log. The DBT path
+compares stdout, exact termination, and the native Detcore syscall, rewrite,
+stdin-read, and observed guest-memory-hash summary values; it does not currently
+compare guest stderr or the internal log. The machine-readable report records
+those facts under `comparison.backend: "dbt"`, leaves
+`compared_log_messages` null, and never claims `bitwise_parity`. Verification
+fails if the observations selected by the backend differ or if the guest exit
+status is not allowed.
 
 The default log comparison is `Stripped`: it can erase numbers, addresses,
 temporary paths, and time values from selected messages. It is a fast
