@@ -1201,6 +1201,17 @@ impl GuestClock {
     }
 }
 
+/// Linux's initial per-task timer slack, in nanoseconds.
+///
+/// Detcore uses the kernel default rather than inheriting the launcher's
+/// physical timer slack.  Guest writes are kept in virtual per-thread state so
+/// they cannot perturb the host-timed waits Detcore still uses internally.
+pub(crate) const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
+
+fn default_timer_slack_ns() -> u64 {
+    DEFAULT_TIMER_SLACK_NS
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -1257,6 +1268,19 @@ pub struct ThreadState<T> {
     /// Whether missing guest descriptors may be inspected in the current process.
     #[serde(default)]
     pub(crate) discover_live_file_metadata: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-2150): Review the per-thread timer-slack state
+    // and the creator-current-as-child-default inheritance rule.
+    /// Virtualized Linux timer slack for this thread.  Both prctl(2) and the
+    /// top-level `/proc/<tid>/timerslack_ns` interface use these fields; the
+    /// physical tracee value remains untouched.
+    #[serde(default = "default_timer_slack_ns")]
+    pub(crate) timer_slack_ns: u64,
+    /// Value restored by a zero timer-slack write.  Linux gives a new task the
+    /// creating thread's current value as both its current and its default.
+    #[serde(default = "default_timer_slack_ns")]
+    pub(crate) default_timer_slack_ns: u64,
 
     /// POSIX per-process timers created via `timer_create(2)`. Shared among the
     /// threads of a process (`CLONE_THREAD`) and not inherited across `fork`.
@@ -1640,6 +1664,8 @@ impl<T> ThreadState<T> {
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(file_metadata)),
             discover_live_file_metadata: cfg.discover_live_file_metadata,
+            timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+            default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),

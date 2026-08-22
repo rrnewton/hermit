@@ -23,6 +23,7 @@ use serde::Serialize;
 
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
+use crate::procfs::TimerSlackReadPreview;
 use crate::resources::ResourceID;
 use crate::stat::*;
 use crate::types::RawFd;
@@ -370,6 +371,52 @@ impl DetFd {
             .procfs
             .as_ref()
             .and_then(|procfs| procfs.take_at(offset, maximum))
+    }
+
+    /// Namespace-visible task id and stable proc inode bound at open time.
+    pub(crate) fn procfs_timer_slack_binding(&self) -> Option<(i32, u64, u64)> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(ProcfsFile::timer_slack_binding)
+    }
+
+    /// Preview bytes without consuming the snapshot shared by dup/fork aliases.
+    pub(crate) fn preview_procfs_timer_slack(
+        &self,
+        value: u64,
+        maximum: usize,
+    ) -> Option<TimerSlackReadPreview> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.preview_timer_slack(value, maximum))
+    }
+
+    /// Commit bytes only after their guest-memory copy succeeds.
+    pub(crate) fn commit_procfs_timer_slack_read(
+        &self,
+        preview: &TimerSlackReadPreview,
+        copied: usize,
+    ) {
+        self.description()
+            .procfs
+            .as_mut()
+            .expect("timer-slack procfs state disappeared")
+            .commit_timer_slack_read(preview, copied);
+    }
+
+    /// Read a fresh timer-slack value at an explicit offset.
+    pub(crate) fn take_procfs_timer_slack_at(
+        &self,
+        value: u64,
+        offset: usize,
+        maximum: usize,
+    ) -> Option<Vec<u8>> {
+        self.description()
+            .procfs
+            .as_ref()
+            .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.
