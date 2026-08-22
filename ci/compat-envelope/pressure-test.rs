@@ -41,6 +41,8 @@ use safe_ci_dag_runner::model::StepClass;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::model::effective_cpu_count;
 use safe_ci_dag_runner::model::effective_cpu_timeout;
+use safe_ci_dag_runner::cgroup::aggregate_slice_max_cpus;
+use safe_ci_dag_runner::container_core_budget;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
 use serde::Deserialize;
@@ -927,6 +929,13 @@ fn execute_typed_dag(
         }
 
         passes += 1;
+        // This graph clones the canonical build steps out of ci/dag/portable.json,
+        // including the two that bake a 32-wide cargo invocation into the command and
+        // therefore carry an empty jobs_flag. The runner refuses before any node
+        // starts if the CPU budget is narrower than such a step's declared width, and
+        // the budget defaults to `jobs`, so it must be passed explicitly here for the
+        // same reason as in scripts/validate.rs::scheduler_cpu_budget.
+        let cpu_budget = container_core_budget().min(aggregate_slice_max_cpus()).max(1);
         let result: RunResult = run_dag_boxed_deadline(
             &pass,
             jobs,
@@ -934,7 +943,7 @@ fn execute_typed_dag(
             1,
             cgroups.clone(),
             None,
-            None,
+            Some(cpu_budget),
             Some(remaining),
         );
         if result.run_timed_out {
