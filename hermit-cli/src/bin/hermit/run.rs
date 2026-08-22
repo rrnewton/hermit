@@ -176,6 +176,17 @@ pub struct RunOpts {
     )]
     strict: bool,
 
+    /// Forward unsupported syscalls to the host instead of refusing them.
+    ///
+    /// Refusing is the default: an unsupported syscall has no deterministic
+    /// handler, so forwarding it silently admits host nondeterminism into a run
+    /// whose whole purpose is to exclude it. This flag restores the old
+    /// forwarding behaviour for a caller who knowingly wants it, and it is
+    /// REQUIRED alongside `--passthru-opt`, which cannot coexist with
+    /// fail-closed handling.
+    #[clap(long, conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"])]
+    pub(crate) allow_unsupported_syscalls: bool,
+
     /// Disable deterministic sequential thread execution.
     #[clap(long)]
     pub(crate) no_sequentialize_threads: bool,
@@ -2297,13 +2308,20 @@ impl RunOpts {
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-644): Review explicit strict mode failing on unsupported syscalls.
-        if self.strict {
-            config.panic_on_unsupported_syscalls = true;
-        }
+        //
+        // Refusing an unsupported syscall is now the DEFAULT, not a strict-mode
+        // extra. `restart_syscall` is the sole `SyscallClassification::Unsupported`
+        // member, and forwarding it admits host nondeterminism into a run that
+        // exists to exclude it. Written in the same shape as the two lines above
+        // so all three defaults read the same way: strict forces it on, and the
+        // matching opt-out is the only way off.
+        config.panic_on_unsupported_syscalls =
+            self.strict || config.panic_on_unsupported_syscalls || !self.allow_unsupported_syscalls;
         if config.passthru_opt && config.panic_on_unsupported_syscalls {
             anyhow::bail!(
                 "--passthru-opt cannot be combined with fail-closed unsupported-syscall handling \
-                 (--strict or --panic-on-unsupported-syscalls)"
+                 (the default, --strict, or --panic-on-unsupported-syscalls); pass \
+                 --allow-unsupported-syscalls to forward them instead"
             );
         }
         config.shutdown_on_unsupported_syscall = config.panic_on_unsupported_syscalls;
