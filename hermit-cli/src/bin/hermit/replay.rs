@@ -42,8 +42,12 @@ pub struct ReplayOpts {
     #[clap(long, short)]
     autopilot: bool,
 
+    /// Serve the replay through the gdb remote protocol without launching gdb.
+    #[clap(long, conflicts_with = "autopilot")]
+    serve_only: bool,
+
     /// Additional gdb command passed by `-ex`
-    #[clap(long, value_delimiter = ';')]
+    #[clap(long, value_delimiter = ';', conflicts_with = "serve_only")]
     gdbex: Vec<String>,
 }
 
@@ -58,7 +62,7 @@ impl ReplayOpts {
                 .context("Failed to find last recording ID")?,
         };
 
-        if self.autopilot {
+        if self.autopilot || self.serve_only {
             let (mut container, _identity_guard) = deterministic_container()?;
             with_container(&mut container, || {
                 self.container_main(global, self.autopilot, &hermit, id)
