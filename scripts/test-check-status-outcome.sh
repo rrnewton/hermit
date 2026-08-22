@@ -9,7 +9,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SHELL_CLASSIFIER="$ROOT_DIR/scripts/classify-required-check.sh"
-PYTHON_CLASSIFIER="$ROOT_DIR/agent-utils/py/ci_hub_check_outcome.py"
+PYTHON_CLASSIFIER="$ROOT_DIR/scripts/check_outcome_adapter.py"
 
 check() {
     local expected=$1 status=$2 conclusion=$3 python_result shell_result
