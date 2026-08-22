@@ -6,7 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,9 +24,7 @@ use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::Displayable;
-use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Timespec;
@@ -31,7 +36,10 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::PipeIdentity;
+use crate::tool_global::PipeWriteStateOperation;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::pipe_write_state;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -182,16 +190,223 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2176): Audit controller-held pipe lifetime and blocking-write completion.
+    /// Hold the pipe object independently of the guest descriptor table while a logically
+    /// blocking write yields to another guest thread. Linux keeps the open file description
+    /// alive for an in-progress write even if another thread closes or reuses its descriptor;
+    /// opening the procfs descriptor link gives Detcore the same lifetime guarantee without
+    /// reserving a descriptor number in the guest.
+    pub(crate) async fn pin_pipe_writer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        tracks_fixed_capacity: bool,
+    ) -> Result<PinnedPipeWriter, Errno> {
+        let flags = guest
+            .inject_with_retry(
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(syscalls::FcntlCmd::F_GETFL),
+            )
+            .await? as i32;
+        if flags & libc::O_ACCMODE == libc::O_RDONLY {
+            return Err(Errno::EBADF);
+        }
+        let expected = self.inject_fstat(guest, fd).await?;
+        let path = format!("/proc/{}/fd/{fd}", guest.pid().as_raw());
+        let Ok(file) = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+        else {
+            tracing::warn!(%path, "backend cannot expose a controller handle for this guest pipe");
+            return Err(Errno::ENOSYS);
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Err(Errno::ENOSYS);
+        };
+        if !metadata.file_type().is_fifo()
+            || metadata.dev() != expected.st_dev
+            || metadata.ino() != expected.st_ino
+        {
+            tracing::warn!(
+                %path,
+                expected_device = expected.st_dev,
+                expected_inode = expected.st_ino,
+                observed_device = metadata.dev(),
+                observed_inode = metadata.ino(),
+                "refusing a controller pipe handle whose kernel identity does not match the guest descriptor"
+            );
+            return Err(Errno::ENOSYS);
+        }
+        if flags & libc::O_DIRECT != 0 {
+            // Opening a procfs fd link creates a new open-file description. Pipe packet mode is
+            // an OFD flag, so restore it explicitly on the controller handle; passing O_DIRECT
+            // to open(2) for the procfs link itself is rejected by Linux.
+            // SAFETY: file owns a valid descriptor, and F_SETFL does not dereference arg 3.
+            let result = unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_SETFL,
+                    libc::O_NONBLOCK | libc::O_DIRECT,
+                )
+            };
+            if result < 0 {
+                return Err(io_errno(std::io::Error::last_os_error()));
+            }
+        }
+        let identity = PipeIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let registered = pipe_write_state(guest, identity, PipeWriteStateOperation::Read)
+            .await
+            .is_some();
+        Ok(PinnedPipeWriter {
+            file,
+            identity,
+            tracks_fixed_capacity: tracks_fixed_capacity || registered,
+        })
+    }
+
+    async fn deliver_pipe_sigpipe<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        let tgid = guest.pid().as_raw();
+        let tid = guest.tid().as_raw();
+        guest
+            .inject_with_retry(
+                syscalls::Tgkill::new()
+                    .with_tgid(tgid)
+                    .with_tid(tid)
+                    .with_sig(libc::SIGPIPE),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Complete a logically blocking scalar pipe write after Hermit has made the guest's
+    /// descriptor physically nonblocking. Operations larger than PIPE_BUF are allowed to
+    /// interleave on Linux, so fixed PIPE_BUF-sized attempts preserve Linux's atomicity bound
+    /// while removing host pipe capacity from the guest-visible return value.
+    pub(crate) async fn execute_blocking_pipe_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Write,
+        mut pinned_pipe: PinnedPipeWriter,
+    ) -> Result<i64, Error> {
+        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        const PIPE_BUF: usize = 4096;
+
+        let target = call.len().min(MAX_RW_COUNT);
+        if target == 0 {
+            return Ok(0);
+        }
+        let buffer = call.buf();
+        tracing::trace!(
+            "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
+        );
+        let mut resources = Resources::new(guest.thread_state().dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.fyi(call.name());
+        let mut written_total = 0usize;
+
+        loop {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
+                break if written_total > 0 {
+                    Ok(written_total as i64)
+                } else {
+                    Err(call.signal_interrupt_errno().into())
+                };
+            }
+
+            let attempt_len = (target - written_total).min(PIPE_BUF);
+            let readiness = pipe_write_readiness(guest, &pinned_pipe, attempt_len).await;
+            let attempted_write = matches!(readiness, Ok(PipeWriteReadiness::Ready));
+            let result = match readiness {
+                Ok(PipeWriteReadiness::Ready) => match buffer.and_then(|buffer| {
+                    buffer
+                        .as_raw()
+                        .checked_add(written_total)
+                        .and_then(Addr::<u8>::from_raw)
+                }) {
+                    Some(attempt_buffer) => {
+                        write_guest_bytes(guest, &mut pinned_pipe.file, attempt_buffer, attempt_len)
+                    }
+                    None => Err(Errno::EFAULT),
+                },
+                Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
+                Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(written) if written > 0 && pinned_pipe.tracks_fixed_capacity => {
+                    let operation = if pinned_pipe.packet_mode()? {
+                        PipeWriteStateOperation::Invalidate
+                    } else {
+                        PipeWriteStateOperation::Advance(
+                            usize::try_from(written).map_err(|_| Errno::EIO)?,
+                        )
+                    };
+                    pipe_write_state(guest, pinned_pipe.identity, operation).await;
+                }
+                Err(Errno::EAGAIN) if attempted_write => {
+                    pipe_write_state(
+                        guest,
+                        pinned_pipe.identity,
+                        PipeWriteStateOperation::Invalidate,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+            if matches!(result, Err(Errno::EPIPE)) {
+                self.deliver_pipe_sigpipe(guest).await?;
+            }
+            match result {
+                Ok(written) if written > 0 => {
+                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
+                    if written > attempt_len {
+                        break Err(Errno::EIO.into());
+                    }
+                    written_total += written;
+                    if written_total == target {
+                        break Ok(written_total as i64);
+                    }
+                }
+                Ok(0) => break Ok(written_total as i64),
+                Err(Errno::EAGAIN) => {}
+                Err(error) => {
+                    break if written_total > 0 {
+                        Ok(written_total as i64)
+                    } else {
+                        Err(error.into())
+                    };
+                }
+                Ok(_) => break Err(Errno::EIO.into()),
+            }
+
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe write after {:?}: {}",
+                resources.poll_attempt,
+                result,
+                call.display(&guest.memory())
+            );
+            record_retry_event(guest, call).await;
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
     /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
     /// nonblocking. A positive short write is an implementation artifact here: without
     /// O_NONBLOCK, Linux blocks until the full vector is written unless a signal or error
     /// interrupts it. Atomic vectors retain a private iovec snapshot for every retry; larger
     /// vectors advance a positive short-write remainder through scalar writes.
-    pub async fn execute_blocking_pipe_writev<G: Guest<Self>>(
+    pub(crate) async fn execute_blocking_pipe_writev<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Writev,
+        mut pinned_pipe: PinnedPipeWriter,
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
@@ -199,12 +414,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux guarantees pipe writes through this size are atomic.
         const PIPE_BUF: usize = 4096;
 
-        let Some(iov_addr) = call.iov() else {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        };
-        if call.len() == 0 || call.len() > MAX_IOVECS {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        if call.len() == 0 {
+            return Ok(0);
         }
+        if call.len() > MAX_IOVECS {
+            return Err(Errno::EINVAL.into());
+        }
+        let iov_addr = call.iov().ok_or(Errno::EFAULT)?;
 
         let iovecs: Vec<(usize, usize)> = {
             let mut raw_iovecs = vec![
@@ -214,7 +430,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 call.len()
             ];
-            guest.memory().read_values(iov_addr, &mut raw_iovecs)?;
+            guest
+                .memory()
+                .read_values(iov_addr, &mut raw_iovecs)
+                .map_err(|_| Errno::EFAULT)?;
             raw_iovecs
                 .into_iter()
                 .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
@@ -228,25 +447,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let target = requested.min(MAX_RW_COUNT);
         if target == 0 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+            return Ok(0);
         }
 
         let atomic_pipe_write = target <= PIPE_BUF;
-
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi(call.name());
-        let subtool = self.cfg.recordreplay_modes.then_some(self);
-        let mut current = Syscall::Writev(call);
         let mut written_total = 0usize;
 
         loop {
-            if resources.poll_attempt > 0
-                && resource_request(guest, resources.clone()).await == ResumeStatus::Signaled
-            {
+            if resource_request(guest, resources.clone()).await == ResumeStatus::Signaled {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
@@ -254,15 +468,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
             }
 
-            let result = if atomic_pipe_write {
-                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
-                    .await
-            } else {
-                match subtool {
-                    Some(detcore) => detcore.record_or_replay(guest, current).await,
-                    None => guest.inject_with_retry(current).await,
-                }
+            let attempt_len = (target - written_total).min(PIPE_BUF);
+            let readiness = pipe_write_readiness(guest, &pinned_pipe, attempt_len).await;
+            let attempted_write = matches!(readiness, Ok(PipeWriteReadiness::Ready));
+            let result = match readiness {
+                Ok(PipeWriteReadiness::Ready) => write_guest_iovec_bytes(
+                    guest,
+                    &mut pinned_pipe.file,
+                    &iovecs,
+                    written_total,
+                    attempt_len,
+                ),
+                Ok(PipeWriteReadiness::Full) => Err(Errno::EAGAIN),
+                Ok(PipeWriteReadiness::Closed) => Err(Errno::EPIPE),
+                Err(error) => Err(error),
             };
+            match result {
+                Ok(written) if written > 0 && pinned_pipe.tracks_fixed_capacity => {
+                    let operation = if pinned_pipe.packet_mode()? {
+                        PipeWriteStateOperation::Invalidate
+                    } else {
+                        PipeWriteStateOperation::Advance(
+                            usize::try_from(written).map_err(|_| Errno::EIO)?,
+                        )
+                    };
+                    pipe_write_state(guest, pinned_pipe.identity, operation).await;
+                }
+                Err(Errno::EAGAIN) if attempted_write => {
+                    pipe_write_state(
+                        guest,
+                        pinned_pipe.identity,
+                        PipeWriteStateOperation::Invalidate,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+            if matches!(result, Err(Errno::EPIPE)) {
+                self.deliver_pipe_sigpipe(guest).await?;
+            }
             match result {
                 Ok(written) if written > 0 => {
                     let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
@@ -273,27 +517,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if atomic_pipe_write {
                         break Ok(written_total as i64);
                     }
-                    current = match remaining_writev_segment(
-                        call.fd(),
-                        &iovecs,
-                        written_total,
-                        target - written_total,
-                    ) {
-                        Ok(Some(write)) => Syscall::Write(write),
-                        Ok(None) => break Ok(written_total as i64),
-                        Err(_) => break Ok(written_total as i64),
-                    };
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Errno::EAGAIN) => {
-                    if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
-                        current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
-                            Ok(Some(write)) => Syscall::Write(write),
-                            Ok(None) => break Ok(0),
-                            Err(error) => break Err(error.into()),
-                        };
-                    }
-                }
+                Err(Errno::EAGAIN) => {}
                 Err(error) => {
                     break if written_total > 0 {
                         Ok(written_total as i64)
@@ -316,107 +542,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::Writev,
-        iovecs: &[(usize, usize)],
-    ) -> Result<i64, Errno> {
-        // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
-        // path is smaller; this covers common vectors without consuming guest VM mappings.
-        const STACK_IOVECS: usize = 32;
-        if iovecs.len() <= STACK_IOVECS {
-            let mut stack = guest.stack().await;
-            let scratch_array = {
-                let mut raw_iovecs = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; STACK_IOVECS];
-                for (raw, (base, length)) in raw_iovecs.iter_mut().zip(iovecs) {
-                    raw.iov_base = *base as *mut libc::c_void;
-                    raw.iov_len = *length;
-                }
-                stack.push(raw_iovecs)
-            };
-            let scratch_iov: Addr<libc::iovec> = scratch_array.cast();
-            let _guard = stack
-                .commit()
-                .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
-            let scratch_call = call.with_iov(Some(scratch_iov));
-            return if self.cfg.recordreplay_modes {
-                self.record_or_replay(guest, scratch_call).await
-            } else {
-                guest.inject_with_retry(scratch_call).await
-            };
-        }
-
-        let mapping_len = iovecs
-            .len()
-            .checked_mul(std::mem::size_of::<libc::iovec>())
-            .expect("validated iovec count cannot overflow scratch length");
-        let mapped = guest
-            .inject_with_retry(Syscall::Mmap(
-                syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(mapping_len)
-                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
-                    .with_fd(-1)
-                    .with_offset(0),
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("failed to map atomic writev scratch: {error}"));
-        let mapped = usize::try_from(mapped)
-            .unwrap_or_else(|_| panic!("atomic writev scratch mmap returned {mapped}"));
-        let scratch_iov = Addr::<libc::iovec>::from_raw(mapped)
-            .unwrap_or_else(|| panic!("atomic writev scratch mmap returned a null address"));
-        let mapping_addr: Addr<libc::c_void> = scratch_iov.cast();
-        let write_result = {
-            let raw_iovecs: Vec<libc::iovec> = iovecs
-                .iter()
-                .map(|(base, length)| libc::iovec {
-                    iov_base: *base as *mut libc::c_void,
-                    iov_len: *length,
-                })
-                .collect();
-            // SAFETY: the injected anonymous mapping is exclusively owned scratch space.
-            guest
-                .memory()
-                .write_values(unsafe { scratch_iov.into_mut() }, &raw_iovecs)
-        };
-        if let Err(write_error) = write_result {
-            guest
-                .inject_with_retry(Syscall::Munmap(
-                    syscalls::Munmap::new()
-                        .with_addr(Some(mapping_addr))
-                        .with_len(mapping_len),
-                ))
-                .await
-                .unwrap_or_else(|cleanup_error| {
-                    panic!(
-                        "failed to populate atomic writev scratch ({write_error}); cleanup failed ({cleanup_error})"
-                    )
-                });
-            panic!("failed to populate atomic writev scratch: {write_error}");
-        }
-
-        let scratch_call = call.with_iov(Some(scratch_iov));
-        let result = if self.cfg.recordreplay_modes {
-            self.record_or_replay(guest, scratch_call).await
-        } else {
-            guest.inject_with_retry(scratch_call).await
-        };
-        guest
-            .inject_with_retry(Syscall::Munmap(
-                syscalls::Munmap::new()
-                    .with_addr(Some(mapping_addr))
-                    .with_len(mapping_len),
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("failed to unmap atomic writev scratch: {error}"));
-        result
-    }
-
     /// Override physically_nonblocking to true for the file descriptor, if appropriate.
     pub fn maybe_set_nonblocking_fd<G: Guest<Self>>(&self, guest: &G, fd: i32) {
         if self.cfg.sequentialize_threads && !self.cfg.debug_externalize_sockets {
@@ -430,27 +555,224 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-fn remaining_writev_segment(
-    fd: i32,
-    iovecs: &[(usize, usize)],
-    mut consumed: usize,
-    remaining_limit: usize,
-) -> Result<Option<syscalls::Write>, Errno> {
-    for (base, length) in iovecs {
-        if consumed >= *length {
-            consumed -= *length;
+fn io_errno(error: std::io::Error) -> Errno {
+    Errno::new(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeWriteReadiness {
+    Ready,
+    Full,
+    Closed,
+}
+
+/// Controller-owned pipe handle and its kernel identity.
+pub(crate) struct PinnedPipeWriter {
+    pub(crate) file: File,
+    pub(crate) identity: PipeIdentity,
+    pub(crate) tracks_fixed_capacity: bool,
+}
+
+impl PinnedPipeWriter {
+    pub(crate) fn packet_mode(&self) -> Result<bool, Errno> {
+        // SAFETY: file owns a valid descriptor and F_GETFL ignores arg 3.
+        let flags = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            Err(io_errno(std::io::Error::last_os_error()))
+        } else {
+            Ok(flags & libc::O_DIRECT != 0)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipeKernelState {
+    Closed,
+    Open {
+        writable: bool,
+        packet_mode: bool,
+        capacity: usize,
+        unread: usize,
+    },
+}
+
+fn pipe_kernel_state(pipe: &File) -> Result<PipeKernelState, Errno> {
+    let mut descriptor = libc::pollfd {
+        fd: pipe.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let result = loop {
+        // SAFETY: descriptor points to one initialized pollfd for this call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result >= 0 {
+            break result;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(io_errno(error));
+        }
+    };
+    if descriptor.revents & libc::POLLNVAL != 0 {
+        return Err(Errno::EBADF);
+    }
+    if descriptor.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+        return Ok(PipeKernelState::Closed);
+    }
+
+    // SAFETY: pipe owns a valid descriptor, and these fcntl operations do not dereference
+    // their third argument.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    // SAFETY: as above; F_GETPIPE_SZ ignores the third argument.
+    let capacity = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    if capacity < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    let mut unread: libc::c_int = 0;
+    // SAFETY: unread points to one writable c_int for the duration of the ioctl.
+    let ioctl_result = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) };
+    if ioctl_result < 0 {
+        return Err(io_errno(std::io::Error::last_os_error()));
+    }
+    Ok(PipeKernelState::Open {
+        writable: result > 0 && descriptor.revents & libc::POLLOUT != 0,
+        packet_mode: flags & libc::O_DIRECT != 0,
+        capacity: usize::try_from(capacity).map_err(|_| Errno::EIO)?,
+        unread: usize::try_from(unread).map_err(|_| Errno::EIO)?,
+    })
+}
+
+async fn pipe_write_readiness<G, T>(
+    guest: &mut G,
+    pipe: &PinnedPipeWriter,
+    requested: usize,
+) -> Result<PipeWriteReadiness, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    loop {
+        let before = pipe_kernel_state(&pipe.file)?;
+        let PipeKernelState::Open {
+            writable,
+            packet_mode,
+            capacity,
+            unread,
+        } = before
+        else {
+            return Ok(PipeWriteReadiness::Closed);
+        };
+        if !pipe.tracks_fixed_capacity {
+            return Ok(if writable {
+                PipeWriteReadiness::Ready
+            } else {
+                PipeWriteReadiness::Full
+            });
+        }
+        if writable || unread == 0 {
+            pipe_write_state(guest, pipe.identity, PipeWriteStateOperation::Reset).await;
+            if pipe_kernel_state(&pipe.file)? == before {
+                return Ok(PipeWriteReadiness::Ready);
+            }
             continue;
         }
-        let base = base.checked_add(consumed).ok_or(Errno::EFAULT)?;
-        let buffer = Addr::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
-        return Ok(Some(
-            syscalls::Write::new()
-                .with_fd(fd)
-                .with_buf(Some(buffer))
-                .with_len((*length - consumed).min(remaining_limit)),
-        ));
+        if packet_mode {
+            return Ok(PipeWriteReadiness::Full);
+        }
+
+        // poll(2) reports POLLOUT only when the pipe has an unused buffer slot. A one-page
+        // stream pipe can nevertheless accept bytes into the tail of its existing buffer
+        // after a partial read. FIONREAD does not expose the consumed head offset or the
+        // kernel's buffer merge flag, so capacity minus unread bytes is not writable space.
+        // Use the write offset tracked by pipe identity across all ordinary descriptor
+        // aliases. Recheck the kernel after the awaited global lookup: no guest-memory byte
+        // is touched after a scheduling window without confirming the same pipe state again.
+        let tail = pipe_write_state(guest, pipe.identity, PipeWriteStateOperation::Read).await;
+        if pipe_kernel_state(&pipe.file)? != before {
+            continue;
+        }
+        let Some(Some(tail)) = tail else {
+            return Ok(PipeWriteReadiness::Full);
+        };
+        if unread > tail {
+            pipe_write_state(guest, pipe.identity, PipeWriteStateOperation::Invalidate).await;
+            return Ok(PipeWriteReadiness::Full);
+        }
+        return Ok(
+            if requested <= capacity.checked_sub(tail).ok_or(Errno::EIO)? {
+                PipeWriteReadiness::Ready
+            } else {
+                PipeWriteReadiness::Full
+            },
+        );
     }
-    Ok(None)
+}
+
+fn write_guest_bytes<G, T>(
+    guest: &G,
+    pipe: &mut File,
+    buffer: Addr<u8>,
+    length: usize,
+) -> Result<i64, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut bytes = vec![0; length];
+    guest
+        .memory()
+        .read_exact(buffer, &mut bytes)
+        .map_err(|_| Errno::EFAULT)?;
+    pipe.write(&bytes)
+        .map(|written| written as i64)
+        .map_err(io_errno)
+}
+
+fn write_guest_iovec_bytes<G, T>(
+    guest: &G,
+    pipe: &mut File,
+    iovecs: &[(usize, usize)],
+    mut consumed: usize,
+    length: usize,
+) -> Result<i64, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut bytes = vec![0; length];
+    let mut copied = 0usize;
+    for (base, iovec_len) in iovecs {
+        if consumed >= *iovec_len {
+            consumed -= *iovec_len;
+            continue;
+        }
+        let available = iovec_len - consumed;
+        let take = available.min(length - copied);
+        if take > 0 {
+            let address = base
+                .checked_add(consumed)
+                .and_then(Addr::<u8>::from_raw)
+                .ok_or(Errno::EFAULT)?;
+            guest
+                .memory()
+                .read_exact(address, &mut bytes[copied..copied + take])
+                .map_err(|_| Errno::EFAULT)?;
+            copied += take;
+        }
+        consumed = 0;
+        if copied == length {
+            break;
+        }
+    }
+    if copied != length {
+        return Err(Errno::EIO);
+    }
+    pipe.write(&bytes)
+        .map(|written| written as i64)
+        .map_err(io_errno)
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:

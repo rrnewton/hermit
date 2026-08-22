@@ -124,7 +124,7 @@ fn decimal_fd(component: &OsStr) -> Option<i32> {
 }
 
 /// Returns the optional numeric proc subject and the descriptor number.
-fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
+pub(crate) fn proc_fd_target(path: &Path) -> Option<(Option<u32>, i32)> {
     let parts = normalized_absolute_parts(path)?;
     match parts.as_slice() {
         [dev, fd_dir, fd] if *dev == "dev" && *fd_dir == "fd" => Some((None, decimal_fd(fd)?)),

@@ -152,6 +152,9 @@ pub enum ReplayFdKind {
     None,
     Eventfd,
     RegularFile,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2176): Audit replay of physical pipe state.
+    Pipe,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

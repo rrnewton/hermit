@@ -290,6 +290,11 @@ pub struct GlobalState {
     // Open file description to bound port.
     open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
+    /// Known write offset in the current page of each fixed-capacity pipe. The kernel pipe
+    /// identity, rather than a descriptor or open-file identity, joins aliases received via
+    /// dup, procfs, pidfd_getfd, or SCM_RIGHTS.
+    pipe_write_tails: Mutex<HashMap<PipeIdentity, Option<usize>>>,
+
     port_start_range: AtomicU16,
     port_end_range: AtomicU16,
 
@@ -403,6 +408,7 @@ impl GlobalState {
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
+            pipe_write_tails: Mutex::new(HashMap::new()),
             past_first_execve: AtomicBool::new(false),
             pending_exec_states: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
@@ -1034,6 +1040,31 @@ impl GlobalTool for GlobalState {
                     used_ports.remove(&port);
                 }
                 R::ReleasePort(port)
+            }
+            GlobalRequest::PipeWriteState(identity, operation) => {
+                let mut states = self.pipe_write_tails.lock().unwrap();
+                let state = match operation {
+                    PipeWriteStateOperation::Read => states.get(&identity).copied(),
+                    PipeWriteStateOperation::Reset => {
+                        states.insert(identity, Some(0));
+                        Some(Some(0))
+                    }
+                    PipeWriteStateOperation::Advance(written) => {
+                        match states.get(&identity).copied() {
+                            Some(current) => {
+                                let next = current.and_then(|tail| tail.checked_add(written));
+                                states.insert(identity, next);
+                                Some(next)
+                            }
+                            None => None,
+                        }
+                    }
+                    PipeWriteStateOperation::Invalidate => states
+                        .contains_key(&identity)
+                        .then(|| states.insert(identity, None))
+                        .map(|_| None),
+                };
+                R::PipeWriteState(state)
             }
         };
 
@@ -1972,6 +2003,31 @@ pub enum GlobalRequest {
 
     // Release the port when the last alias of its open file description closes.
     ReleasePort(OpenFileId),
+
+    /// Read or update fixed-capacity pipe state shared across every descriptor alias.
+    PipeWriteState(PipeIdentity, PipeWriteStateOperation),
+}
+
+/// Stable host-kernel identity of one pipe object within a run.
+#[derive(PartialEq, Debug, Eq, Hash, Clone, Copy, Serialize, Deserialize)]
+pub struct PipeIdentity {
+    /// Raw `st_dev` from fstat.
+    pub device: u64,
+    /// Raw `st_ino` from fstat.
+    pub inode: u64,
+}
+
+/// Mutation applied to the run-wide fixed-pipe write offset.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum PipeWriteStateOperation {
+    /// Read the known offset without changing it.
+    Read,
+    /// The pipe is empty, so its next page begins at offset zero.
+    Reset,
+    /// Advance after a successful ordinary write.
+    Advance(usize),
+    /// An unmodeled mutation means no offset is safe until the pipe empties.
+    Invalidate,
 }
 
 /// Responses from the global object
@@ -2023,6 +2079,26 @@ pub enum GlobalResponse {
     AddUsedPort,
     ReleasePort(Option<u16>),
     PortFull,
+    /// Outer option means registered fixed pipe; inner option means known write offset.
+    PipeWriteState(Option<Option<usize>>),
+}
+
+/// Read or update the fixed-pipe write offset shared across all guest processes.
+pub async fn pipe_write_state<G, T>(
+    guest: &mut G,
+    identity: PipeIdentity,
+    operation: PipeWriteStateOperation,
+) -> Option<Option<usize>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PipeWriteState(identity, operation)).await;
+    match response {
+        GlobalResponse::PipeWriteState(state) => state,
+        other => panic!("unexpected pipe-write-state response: {other:?}"),
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

@@ -325,4 +325,9 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x104)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
     }
+
+    #[test]
+    fn record_version_rejects_streams_without_pipe_side_effect_kinds() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
+    }
 }

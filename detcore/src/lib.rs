@@ -254,6 +254,10 @@ use crate::syscall_classification::is_unsupported_async_ipc_syscall;
 use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
+use crate::tool_global::PipeIdentity;
+use crate::tool_global::PipeWriteStateOperation;
+use crate::tool_global::pipe_write_state;
+use crate::tool_global::resource_release_all;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
@@ -1795,7 +1799,37 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 if panic_on_unsupported_syscalls {
                     Err(Error::Errno(Errno::ENOSYS))
                 } else {
-                    self.passthrough(guest, call).await
+                    let output_fd = match call {
+                        Syscall::Splice(splice) => Some(splice.fd_out()),
+                        Syscall::Tee(tee) => Some(tee.fd_out()),
+                        Syscall::Vmsplice(vmsplice) => Some(vmsplice.fd()),
+                        _ => None,
+                    };
+                    let pipe_identity = if let Some(fd) = output_fd {
+                        self.inject_fstat(guest, fd).await.ok().and_then(|stat| {
+                            (stat.st_mode & libc::S_IFMT == libc::S_IFIFO).then_some(PipeIdentity {
+                                device: stat.st_dev,
+                                inode: stat.st_ino,
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(identity) = pipe_identity {
+                        let request = guest
+                            .thread_state()
+                            .mk_request(ResourceID::InternalIOPolling, Permission::W);
+                        resource_request(guest, request).await;
+                        // Zero-copy operations can install nonmergeable pipe buffers. Invalidate
+                        // before the mutation so no ordinary writer can consult stale state.
+                        pipe_write_state(guest, identity, PipeWriteStateOperation::Invalidate)
+                            .await;
+                    }
+                    let result = self.passthrough(guest, call).await;
+                    if pipe_identity.is_some() {
+                        resource_release_all(guest).await;
+                    }
+                    result
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED

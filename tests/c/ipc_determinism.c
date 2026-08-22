@@ -10,12 +10,18 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -171,6 +177,16 @@ static void pipe_capacity(void) {
   if (capacity <= 0) {
     fail("fcntl(F_GETPIPE_SZ)");
   }
+  verify_blocking_flag_roundtrip(fds[1]);
+  errno = 0;
+  if (fcntl(fds[1], F_SETPIPE_SZ, capacity * 2) != -1 || errno != EPERM) {
+    fprintf(stderr, "scheduler-managed pipe unexpectedly grew beyond %d bytes\n",
+            capacity);
+    exit(1);
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 1) != capacity) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
   uint8_t *fill = malloc((size_t)capacity);
   if (fill == NULL) {
     fail("malloc");
@@ -202,6 +218,909 @@ static void pipe_capacity(void) {
   close(fds[0]);
   close(fds[1]);
   pthread_barrier_destroy(&barrier);
+}
+
+static void wait_for_child(pid_t child, const char *label) {
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    fail("waitpid");
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "%s: child status %d\n", label, status);
+    exit(1);
+  }
+}
+
+static uint8_t *large_pipe_payload(size_t length) {
+  uint8_t *bytes = malloc(length);
+  if (bytes == NULL) {
+    fail("malloc payload");
+  }
+  for (size_t i = 0; i < length; i++) {
+    bytes[i] = (uint8_t)(i * 17 + 3);
+  }
+  return bytes;
+}
+
+static void pipe_large_write(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  verify_blocking_flag_roundtrip(fds[1]);
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    close(fds[1]);
+    uint8_t *received = malloc(length);
+    if (received == NULL) {
+      fail("malloc child");
+    }
+    read_exact(fds[0], received, length);
+    if (memcmp(received, bytes, length) != 0) {
+      fprintf(stderr, "pipe-large-write: payload mismatch\n");
+      _exit(3);
+    }
+    _exit(0);
+  }
+  close(fds[0]);
+  ssize_t written = write(fds[1], bytes, length);
+  if (written != (ssize_t)length) {
+    fprintf(stderr, "pipe-large-write: wrote %zd of %zu\n", written, length);
+    exit(1);
+  }
+  close(fds[1]);
+  wait_for_child(child, "pipe-large-write");
+  printf("pipe-large-write:%zu\n", length);
+  free(bytes);
+}
+
+static void pipe_large_writev(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  verify_blocking_flag_roundtrip(fds[1]);
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    close(fds[1]);
+    uint8_t *received = malloc(length);
+    if (received == NULL) {
+      fail("malloc child");
+    }
+    read_exact(fds[0], received, length);
+    if (memcmp(received, bytes, length) != 0) {
+      fprintf(stderr, "pipe-large-writev: payload mismatch\n");
+      _exit(3);
+    }
+    _exit(0);
+  }
+  close(fds[0]);
+  struct iovec vectors[2] = {
+      {.iov_base = bytes, .iov_len = length / 2},
+      {.iov_base = bytes + length / 2, .iov_len = length - length / 2},
+  };
+  ssize_t written = writev(fds[1], vectors, 2);
+  if (written != (ssize_t)length) {
+    fprintf(stderr, "pipe-large-writev: wrote %zd of %zu\n", written, length);
+    exit(1);
+  }
+  close(fds[1]);
+  wait_for_child(child, "pipe-large-writev");
+  printf("pipe-large-writev:%zu\n", length);
+  free(bytes);
+}
+
+struct blocked_writer_args {
+  int fd;
+  uint8_t *bytes;
+  size_t length;
+  int vectored;
+  atomic_int started;
+  atomic_int finished;
+  ssize_t result;
+  int error;
+};
+
+static void *write_after_start_marker(void *opaque) {
+  struct blocked_writer_args *args = opaque;
+  atomic_store_explicit(&args->started, 1, memory_order_release);
+  if (args->vectored) {
+    struct iovec vector = {.iov_base = args->bytes, .iov_len = args->length};
+    args->result = writev(args->fd, &vector, 1);
+  } else {
+    args->result = write(args->fd, args->bytes, args->length);
+  }
+  args->error = errno;
+  atomic_store_explicit(&args->finished, 1, memory_order_release);
+  return NULL;
+}
+
+static void pipe_close_reuse(void) {
+  int original[2];
+  int replacement[2];
+  if (pipe(original) != 0 || pipe(replacement) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(original[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x6d, (size_t)capacity);
+  write_exact(original[1], fill, (size_t)capacity);
+
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  struct blocked_writer_args args = {
+      .fd = original[1],
+      .bytes = bytes,
+      .length = length,
+      .started = 0,
+      .result = -1,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  // Give the writer a deterministic scheduling opportunity to enter the full-pipe wait.
+  // The read below intentionally starts only after dup2 returns: waiting for the writer from
+  // dup2 would therefore deadlock, unlike Linux's open-file-description lifetime rule.
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (dup2(replacement[1], original[1]) != original[1]) {
+    fail("dup2 replacement");
+  }
+
+  read_exact(original[0], fill, (size_t)capacity);
+  uint8_t *received = malloc(length);
+  if (received == NULL) {
+    fail("malloc received");
+  }
+  read_exact(original[0], received, length);
+  pthread_join(writer, NULL);
+  if (args.result != (ssize_t)length || memcmp(received, bytes, length) != 0) {
+    fprintf(stderr, "pipe-close-reuse: wrote %zd of %zu or changed payload\n",
+            args.result, length);
+    exit(1);
+  }
+  int flags = fcntl(replacement[0], F_GETFL);
+  if (flags < 0 || fcntl(replacement[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl replacement O_NONBLOCK");
+  }
+  uint8_t unexpected = 0;
+  errno = 0;
+  if (read(replacement[0], &unexpected, 1) != -1 || errno != EAGAIN) {
+    fprintf(stderr, "pipe-close-reuse: blocked write followed reused fd\n");
+    exit(1);
+  }
+  printf("pipe-close-reuse:%zu\n", length);
+
+  free(received);
+  free(bytes);
+  free(fill);
+  close(original[0]);
+  close(original[1]);
+  close(replacement[0]);
+  close(replacement[1]);
+}
+
+static void assert_partial_pipe_write(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  uint8_t initial[100];
+  uint8_t consumed[50];
+  uint8_t appended[50];
+  memset(initial, 0x31, sizeof(initial));
+  memset(appended, 0x72, sizeof(appended));
+  write_exact(fds[1], initial, sizeof(initial));
+  read_exact(fds[0], consumed, sizeof(consumed));
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = appended,
+      .length = sizeof(appended),
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  pthread_join(writer, NULL);
+  if (args.result != (ssize_t)sizeof(appended)) {
+    fprintf(stderr, "pipe-partial-read-write: vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  uint8_t remaining[100];
+  read_exact(fds[0], remaining, sizeof(remaining));
+  if (memcmp(remaining, initial + sizeof(consumed), sizeof(consumed)) != 0 ||
+      memcmp(remaining + sizeof(consumed), appended, sizeof(appended)) != 0) {
+    fprintf(stderr, "pipe-partial-read-write: vectored=%d changed payload\n", vectored);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static int receive_pipe_writer_alias(int fd) {
+  int sockets[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0) {
+    fail("socketpair SCM_RIGHTS");
+  }
+  char byte = 'p';
+  struct iovec send_iov = {.iov_base = &byte, .iov_len = 1};
+  char send_control[CMSG_SPACE(sizeof(fd))];
+  memset(send_control, 0, sizeof(send_control));
+  struct msghdr send_message = {
+      .msg_iov = &send_iov,
+      .msg_iovlen = 1,
+      .msg_control = send_control,
+      .msg_controllen = sizeof(send_control),
+  };
+  struct cmsghdr *send_header = CMSG_FIRSTHDR(&send_message);
+  send_header->cmsg_level = SOL_SOCKET;
+  send_header->cmsg_type = SCM_RIGHTS;
+  send_header->cmsg_len = CMSG_LEN(sizeof(fd));
+  memcpy(CMSG_DATA(send_header), &fd, sizeof(fd));
+  if (sendmsg(sockets[0], &send_message, 0) != 1) {
+    fail("sendmsg SCM_RIGHTS");
+  }
+
+  char received_byte;
+  struct iovec receive_iov = {.iov_base = &received_byte, .iov_len = 1};
+  char receive_control[CMSG_SPACE(sizeof(fd))];
+  memset(receive_control, 0, sizeof(receive_control));
+  struct msghdr receive_message = {
+      .msg_iov = &receive_iov,
+      .msg_iovlen = 1,
+      .msg_control = receive_control,
+      .msg_controllen = sizeof(receive_control),
+  };
+  if (recvmsg(sockets[1], &receive_message, MSG_CMSG_CLOEXEC) != 1) {
+    fail("recvmsg SCM_RIGHTS");
+  }
+  struct cmsghdr *receive_header = CMSG_FIRSTHDR(&receive_message);
+  if (receive_header == NULL || receive_header->cmsg_level != SOL_SOCKET ||
+      receive_header->cmsg_type != SCM_RIGHTS) {
+    fail("SCM_RIGHTS control message");
+  }
+  int alias;
+  memcpy(&alias, CMSG_DATA(receive_header), sizeof(alias));
+  close(sockets[0]);
+  close(sockets[1]);
+  return alias;
+}
+
+static int duplicate_with_pidfd(int fd) {
+  int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (pidfd < 0) {
+    fail("pidfd_open self");
+  }
+  int alias = (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
+  if (alias < 0) {
+    fail("pidfd_getfd self");
+  }
+  close(pidfd);
+  return alias;
+}
+
+static int open_cross_process_pipe_writer_alias(int fd) {
+  int release_child[2];
+  if (pipe(release_child) != 0) {
+    fail("pipe cross-process alias synchronization");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork cross-process alias");
+  }
+  if (child == 0) {
+    close(release_child[1]);
+    uint8_t release;
+    read_exact(release_child[0], &release, sizeof(release));
+    close(release_child[0]);
+    _exit(0);
+  }
+
+  close(release_child[0]);
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long)child, fd);
+  int alias = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+  if (alias < 0) {
+    fail("open cross-process proc pipe writer alias");
+  }
+  uint8_t release = 1;
+  write_exact(release_child[1], &release, sizeof(release));
+  close(release_child[1]);
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    fail("waitpid cross-process alias");
+  }
+  return alias;
+}
+
+static int open_pipe_writer_alias(int fd, int alias_kind) {
+  if (alias_kind == 2) {
+    return open_cross_process_pipe_writer_alias(fd);
+  }
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+  int alias = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+  if (alias < 0) {
+    fail("open proc pipe writer alias");
+  }
+  return alias;
+}
+
+static void assert_nonblocking_then_blocking_tail(int vectored, int alias_kind) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  int flags = fcntl(fds[1], F_GETFL);
+  if (flags < 0) {
+    fail("fcntl get flags");
+  }
+  int write_fd = fds[1];
+  if (alias_kind) {
+    write_fd = open_pipe_writer_alias(fds[1], alias_kind);
+  } else if (fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl set O_NONBLOCK");
+  }
+  uint8_t initial[100];
+  uint8_t appended[50];
+  memset(initial, 0x24, sizeof(initial));
+  memset(appended, 0x75, sizeof(appended));
+  ssize_t written;
+  if (vectored) {
+    struct iovec vector = {.iov_base = initial, .iov_len = sizeof(initial)};
+    written = writev(write_fd, &vector, 1);
+  } else {
+    written = write(write_fd, initial, sizeof(initial));
+  }
+  if (written != (ssize_t)sizeof(initial)) {
+    fail("nonblocking initial pipe write");
+  }
+  if (alias_kind) {
+    close(write_fd);
+  } else if (fcntl(fds[1], F_SETFL, flags & ~O_NONBLOCK) != 0) {
+    fail("fcntl clear O_NONBLOCK");
+  }
+  if (vectored) {
+    struct iovec vector = {.iov_base = appended, .iov_len = sizeof(appended)};
+    written = writev(fds[1], &vector, 1);
+  } else {
+    written = write(fds[1], appended, sizeof(appended));
+  }
+  if (written != (ssize_t)sizeof(appended)) {
+    fprintf(stderr,
+            "pipe-partial-read-write: nonblocking-first vectored=%d result=%zd errno=%d\n",
+            vectored, written, errno);
+    exit(1);
+  }
+  uint8_t received[150];
+  read_exact(fds[0], received, sizeof(received));
+  if (memcmp(received, initial, sizeof(initial)) != 0 ||
+      memcmp(received + sizeof(initial), appended, sizeof(appended)) != 0) {
+    fail("nonblocking-first pipe payload");
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_partial_read_write(void) {
+  assert_partial_pipe_write(0);
+  assert_partial_pipe_write(1);
+  assert_nonblocking_then_blocking_tail(0, 0);
+  assert_nonblocking_then_blocking_tail(1, 0);
+  assert_nonblocking_then_blocking_tail(0, 1);
+  assert_nonblocking_then_blocking_tail(1, 1);
+  assert_nonblocking_then_blocking_tail(0, 2);
+  assert_nonblocking_then_blocking_tail(1, 2);
+  printf("pipe-partial-read-write:scalar,writev\n");
+}
+
+static void assert_unavailable_pipe_alias_status(int alias, const char *route) {
+  uint8_t byte = 0x61;
+  struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
+
+  errno = 0;
+  if (fcntl(alias, F_GETFL) != -1 || errno != ENOSYS) {
+    fprintf(stderr, "%s pipe F_GETFL did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
+  }
+  errno = 0;
+  if (fcntl(alias, F_SETFL, 0) != -1 || errno != ENOSYS) {
+    fprintf(stderr, "%s pipe F_SETFL did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
+  }
+  int disabled = 0;
+  errno = 0;
+  if (ioctl(alias, FIONBIO, &disabled) != -1 || errno != ENOSYS) {
+    fprintf(stderr, "%s pipe FIONBIO did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
+  }
+  errno = 0;
+  if (write(alias, &byte, sizeof(byte)) != -1 || errno != ENOSYS) {
+    fprintf(stderr, "%s pipe write did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
+  }
+  errno = 0;
+  if (writev(alias, &vector, 1) != -1 || errno != ENOSYS) {
+    fprintf(stderr, "%s pipe writev did not fail closed: errno=%d\n", route,
+            errno);
+    exit(1);
+  }
+
+  close(alias);
+}
+
+static void pipe_unavailable_alias_status(void) {
+  int fds[2];
+  if (pipe2(fds, O_NONBLOCK) != 0) {
+    fail("pipe2 unavailable alias status");
+  }
+  assert_unavailable_pipe_alias_status(receive_pipe_writer_alias(fds[1]),
+                                       "SCM_RIGHTS");
+  assert_unavailable_pipe_alias_status(duplicate_with_pidfd(fds[1]),
+                                       "pidfd_getfd");
+
+  int null_fd = open("/dev/null", O_WRONLY);
+  if (null_fd < 0) {
+    fail("open /dev/null");
+  }
+  int source_descriptor_flags = fcntl(null_fd, F_GETFD);
+  if (source_descriptor_flags < 0 || (source_descriptor_flags & FD_CLOEXEC)) {
+    fail("pidfd_getfd regular-fd source CLOEXEC control");
+  }
+  int null_alias = duplicate_with_pidfd(null_fd);
+  uint8_t byte = 0x62;
+  if (write(null_alias, &byte, sizeof(byte)) != (ssize_t)sizeof(byte)) {
+    fail("pidfd_getfd regular-fd positive control");
+  }
+  int descriptor_flags = fcntl(null_alias, F_GETFD);
+  if (descriptor_flags < 0 || !(descriptor_flags & FD_CLOEXEC)) {
+    fail("pidfd_getfd regular-fd CLOEXEC control");
+  }
+
+  close(null_alias);
+  close(null_fd);
+  close(fds[0]);
+  close(fds[1]);
+  printf("pipe-unavailable-alias-status:SCM_RIGHTS,pidfd_getfd,ENOSYS\n");
+}
+
+static void pipe_read_end_write(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  uint8_t byte = 0x5a;
+  errno = 0;
+  if (write(fds[0], &byte, sizeof(byte)) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: write result was not EBADF\n");
+    exit(1);
+  }
+  struct iovec vector = {.iov_base = &byte, .iov_len = sizeof(byte)};
+  errno = 0;
+  if (writev(fds[0], &vector, 1) != -1 || errno != EBADF) {
+    fprintf(stderr, "pipe-read-end-write: writev result was not EBADF\n");
+    exit(1);
+  }
+  printf("pipe-read-end-write:EBADF\n");
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_edge_write_results(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (write(fds[1], NULL, 0) != 0 || writev(fds[1], NULL, 0) != 0) {
+    fprintf(stderr, "pipe-edge-write-results: zero-length write changed result\n");
+    exit(1);
+  }
+  errno = 0;
+  if (writev(fds[1], NULL, 1) != -1 || errno != EFAULT) {
+    fprintf(stderr, "pipe-edge-write-results: NULL writev was not EFAULT\n");
+    exit(1);
+  }
+  uint8_t byte = 0x19;
+  struct iovec empty = {.iov_base = &byte, .iov_len = 0};
+  if (writev(fds[1], &empty, 1) != 0) {
+    fprintf(stderr, "pipe-edge-write-results: empty vector changed result\n");
+    exit(1);
+  }
+  errno = 0;
+  if (writev(fds[1], &empty, 1025) != -1 || errno != EINVAL) {
+    fprintf(stderr, "pipe-edge-write-results: oversized vector was not EINVAL\n");
+    exit(1);
+  }
+  printf("pipe-edge-write-results:0,EFAULT,EINVAL\n");
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void assert_pipe_packet_boundary(int vectored) {
+  int fds[2];
+  if (pipe2(fds, O_DIRECT) != 0) {
+    fail("pipe2(O_DIRECT)");
+  }
+  const char payload[] = "abc";
+  ssize_t written;
+  if (vectored) {
+    struct iovec vectors[2] = {
+        {.iov_base = (void *)payload, .iov_len = 1},
+        {.iov_base = (void *)(payload + 1), .iov_len = 2},
+    };
+    written = writev(fds[1], vectors, 2);
+  } else {
+    written = write(fds[1], payload, 3);
+  }
+  if (written != 3) {
+    fprintf(stderr, "pipe-packet-mode: vectored=%d wrote=%zd\n", vectored,
+            written);
+    exit(1);
+  }
+  char first;
+  if (read(fds[0], &first, 1) != 1 || first != 'a') {
+    fail("pipe packet first byte");
+  }
+  int flags = fcntl(fds[0], F_GETFL);
+  if (flags < 0 || fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl packet read O_NONBLOCK");
+  }
+  char remainder;
+  errno = 0;
+  if (read(fds[0], &remainder, 1) != -1 || errno != EAGAIN) {
+    fprintf(stderr, "pipe-packet-mode: vectored=%d retained packet remainder\n",
+            vectored);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_packet_mode(void) {
+  assert_pipe_packet_boundary(0);
+  assert_pipe_packet_boundary(1);
+  printf("pipe-packet-mode:scalar,writev\n");
+}
+
+static volatile sig_atomic_t sigpipe_count;
+static void count_sigpipe(int signal_number);
+
+static void assert_invalid_pipe_buffer_waits(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x47, (size_t)capacity);
+  write_exact(fds[1], fill, (size_t)capacity);
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = NULL,
+      .length = 1,
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&args.finished, memory_order_acquire)) {
+    fprintf(stderr, "pipe-invalid-buffer: returned before full pipe became writable\n");
+    exit(1);
+  }
+  read_exact(fds[0], fill, 4096);
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EFAULT) {
+    fprintf(stderr, "pipe-invalid-buffer: vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  free(fill);
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void assert_invalid_partial_pipe_buffer_waits(int vectored) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  uint8_t fill[4000];
+  uint8_t consumed[2000];
+  memset(fill, 0x58, sizeof(fill));
+  write_exact(fds[1], fill, sizeof(fill));
+  read_exact(fds[0], consumed, sizeof(consumed));
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = NULL,
+      .length = 100,
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&args.finished, memory_order_acquire)) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: partial vectored=%d touched NULL before space existed\n",
+            vectored);
+    exit(1);
+  }
+  read_exact(fds[0], consumed, sizeof(consumed));
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EFAULT) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: partial vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void assert_nonblocking_tail_invalid_buffer_waits(int vectored,
+                                                         int alias_kind) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  if (fcntl(fds[1], F_SETPIPE_SZ, 4096) != 4096) {
+    fail("fcntl(F_SETPIPE_SZ one page)");
+  }
+  uint8_t fill[4000];
+  uint8_t consumed[2096];
+  memset(fill, 0x59, sizeof(fill));
+  write_exact(fds[1], fill, sizeof(fill));
+  read_exact(fds[0], consumed, 2000);
+  int flags = fcntl(fds[1], F_GETFL);
+  if (flags < 0) {
+    fail("fcntl get flags");
+  }
+  int write_fd = fds[1];
+  if (alias_kind) {
+    write_fd = open_pipe_writer_alias(fds[1], alias_kind);
+  } else if (fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) != 0) {
+    fail("fcntl set O_NONBLOCK");
+  }
+  uint8_t appended[96];
+  memset(appended, 0x68, sizeof(appended));
+  ssize_t written;
+  if (vectored) {
+    struct iovec vector = {.iov_base = appended, .iov_len = sizeof(appended)};
+    written = writev(write_fd, &vector, 1);
+  } else {
+    written = write(write_fd, appended, sizeof(appended));
+  }
+  if (written != (ssize_t)sizeof(appended)) {
+    fail("nonblocking tail fill");
+  }
+  if (alias_kind) {
+    close(write_fd);
+  } else if (fcntl(fds[1], F_SETFL, flags & ~O_NONBLOCK) != 0) {
+    fail("fcntl clear O_NONBLOCK");
+  }
+
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = NULL,
+      .length = sizeof(appended),
+      .vectored = vectored,
+      .started = 0,
+      .finished = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  if (atomic_load_explicit(&args.finished, memory_order_acquire)) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: nonblocking-tail vectored=%d touched NULL early\n",
+            vectored);
+    exit(1);
+  }
+  read_exact(fds[0], consumed, sizeof(consumed));
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EFAULT) {
+    fprintf(stderr,
+            "pipe-invalid-buffer: nonblocking-tail vectored=%d result=%zd errno=%d\n",
+            vectored, args.result, args.error);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
+static void pipe_invalid_buffer_precedence(void) {
+  assert_invalid_pipe_buffer_waits(0);
+  assert_invalid_pipe_buffer_waits(1);
+  assert_invalid_partial_pipe_buffer_waits(0);
+  assert_invalid_partial_pipe_buffer_waits(1);
+  assert_nonblocking_tail_invalid_buffer_waits(0, 0);
+  assert_nonblocking_tail_invalid_buffer_waits(1, 0);
+  assert_nonblocking_tail_invalid_buffer_waits(0, 1);
+  assert_nonblocking_tail_invalid_buffer_waits(1, 1);
+  assert_nonblocking_tail_invalid_buffer_waits(0, 2);
+  assert_nonblocking_tail_invalid_buffer_waits(1, 2);
+  printf("pipe-invalid-buffer:EFAULT-after-wait\n");
+}
+
+static void pipe_invalid_buffer_sigpipe(void) {
+  struct sigaction action = {.sa_handler = count_sigpipe};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGPIPE, &action, NULL) != 0) {
+    fail("sigaction");
+  }
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  close(fds[0]);
+  sigpipe_count = 0;
+  errno = 0;
+  if (write(fds[1], NULL, 1) != -1 || errno != EPIPE) {
+    fprintf(stderr, "pipe-invalid-sigpipe: scalar was not EPIPE\n");
+    exit(1);
+  }
+  struct iovec vector = {.iov_base = NULL, .iov_len = 1};
+  errno = 0;
+  if (writev(fds[1], &vector, 1) != -1 || errno != EPIPE) {
+    fprintf(stderr, "pipe-invalid-sigpipe: writev was not EPIPE\n");
+    exit(1);
+  }
+  if (sigpipe_count != 2) {
+    fprintf(stderr, "pipe-invalid-sigpipe: signals=%d\n", (int)sigpipe_count);
+    exit(1);
+  }
+  printf("pipe-invalid-sigpipe:%d\n", (int)sigpipe_count);
+  close(fds[1]);
+}
+
+static void count_sigpipe(int signal_number) {
+  if (signal_number == SIGPIPE) {
+    sigpipe_count++;
+  }
+}
+
+static void pipe_sigpipe_after_wait(void) {
+  struct sigaction action = {.sa_handler = count_sigpipe};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGPIPE, &action, NULL) != 0) {
+    fail("sigaction");
+  }
+  int fds[2];
+  if (pipe(fds) != 0) {
+    fail("pipe");
+  }
+  int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+  if (capacity <= 0) {
+    fail("fcntl(F_GETPIPE_SZ)");
+  }
+  uint8_t *fill = malloc((size_t)capacity);
+  if (fill == NULL) {
+    fail("malloc fill");
+  }
+  memset(fill, 0x55, (size_t)capacity);
+  write_exact(fds[1], fill, (size_t)capacity);
+
+  size_t length = (size_t)capacity * 2 - 2;
+  uint8_t *bytes = large_pipe_payload(length);
+  struct blocked_writer_args args = {
+      .fd = fds[1],
+      .bytes = bytes,
+      .length = length,
+      .started = 0,
+      .result = -2,
+      .error = 0,
+  };
+  pthread_t writer;
+  sigpipe_count = 0;
+  if (pthread_create(&writer, NULL, write_after_start_marker, &args) != 0) {
+    fail("pthread_create");
+  }
+  while (!atomic_load_explicit(&args.started, memory_order_acquire)) {
+    sched_yield();
+  }
+  for (int i = 0; i < 100; i++) {
+    sched_yield();
+  }
+  close(fds[0]);
+  pthread_join(writer, NULL);
+  if (args.result != -1 || args.error != EPIPE || sigpipe_count != 1) {
+    fprintf(stderr, "pipe-sigpipe: result=%zd errno=%d signals=%d\n",
+            args.result, args.error, (int)sigpipe_count);
+    exit(1);
+  }
+  printf("pipe-sigpipe:%d\n", (int)sigpipe_count);
+  free(bytes);
+  free(fill);
+  close(fds[1]);
 }
 
 static void socketpair_order(void) {
@@ -404,6 +1323,28 @@ int main(int argc, char **argv) {
     pipe_order();
   } else if (strcmp(argv[1], "pipe-capacity") == 0) {
     pipe_capacity();
+  } else if (strcmp(argv[1], "pipe-large-write") == 0) {
+    pipe_large_write();
+  } else if (strcmp(argv[1], "pipe-large-writev") == 0) {
+    pipe_large_writev();
+  } else if (strcmp(argv[1], "pipe-close-reuse") == 0) {
+    pipe_close_reuse();
+  } else if (strcmp(argv[1], "pipe-partial-read-write") == 0) {
+    pipe_partial_read_write();
+  } else if (strcmp(argv[1], "pipe-unavailable-alias-status") == 0) {
+    pipe_unavailable_alias_status();
+  } else if (strcmp(argv[1], "pipe-read-end-write") == 0) {
+    pipe_read_end_write();
+  } else if (strcmp(argv[1], "pipe-edge-write-results") == 0) {
+    pipe_edge_write_results();
+  } else if (strcmp(argv[1], "pipe-packet-mode") == 0) {
+    pipe_packet_mode();
+  } else if (strcmp(argv[1], "pipe-invalid-buffer") == 0) {
+    pipe_invalid_buffer_precedence();
+  } else if (strcmp(argv[1], "pipe-invalid-sigpipe") == 0) {
+    pipe_invalid_buffer_sigpipe();
+  } else if (strcmp(argv[1], "pipe-sigpipe") == 0) {
+    pipe_sigpipe_after_wait();
   } else if (strcmp(argv[1], "socketpair") == 0) {
     socketpair_order();
   } else if (strcmp(argv[1], "eventfd") == 0) {

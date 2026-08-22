@@ -208,6 +208,10 @@ const SCM_TIMESTAMPNS_NEW: libc::c_int = 64;
 const SCM_TIMESTAMPING_NEW: libc::c_int = 65;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
+fn delivered_control_len(capacity: usize, returned: usize) -> usize {
+    capacity.min(MAX_CONTROL_BYTES).min(returned)
+}
+
 #[derive(Clone, Copy)]
 enum SocketTimestampKind {
     Timeval,
@@ -311,6 +315,43 @@ fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
         offset = next;
     }
     messages
+}
+
+fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
+    let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+    let mut descriptors = Vec::new();
+    let mut offset = 0usize;
+    while let Some(bytes) = control.get(offset..) {
+        let Some(header) = read_control_value::<libc::cmsghdr>(bytes) else {
+            break;
+        };
+        if header.cmsg_len < header_len {
+            break;
+        }
+        let Some(end) = offset.checked_add(header.cmsg_len) else {
+            break;
+        };
+        if end > control.len() {
+            break;
+        }
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            let data = &control[offset + header_len..end];
+            descriptors.extend(
+                data.as_chunks::<{ std::mem::size_of::<i32>() }>()
+                    .0
+                    .iter()
+                    .filter_map(|bytes| read_control_value::<i32>(bytes)),
+            );
+        }
+        let Some(next) = offset.checked_add(cmsg_align(header.cmsg_len)) else {
+            break;
+        };
+        if next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    descriptors
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1308,6 +1349,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(timestamp)
     }
 
+    async fn register_received_fixed_pipe_fds<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        control: &[u8],
+        close_on_exec: bool,
+    ) -> Result<(), Error> {
+        for fd in scm_rights_fds(control) {
+            let Ok(stat) = self.inject_fstat(guest, fd).await else {
+                // A replay backend may restore the recorded control bytes without a physical
+                // descriptor. Descriptor reconstruction remains the record/replay layer's
+                // responsibility; absence here must not turn a successful recvmsg into EBADF.
+                continue;
+            };
+            if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+                continue;
+            }
+            let identity = PipeIdentity {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            };
+            if pipe_write_state(guest, identity, PipeWriteStateOperation::Read)
+                .await
+                .is_none()
+            {
+                continue;
+            }
+            if guest.thread_state().with_detfd(fd, |_| ()).is_err() {
+                let flags = if close_on_exec {
+                    OFlag::O_CLOEXEC
+                } else {
+                    OFlag::empty()
+                };
+                self.add_fd(guest, fd, flags, FdType::Pipe).await?;
+            }
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.set_physically_nonblocking();
+                detfd.set_deterministic_pipe_capacity();
+                detfd.mark_pipe_status_flags_unknown();
+            })?;
+        }
+        Ok(())
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive one message and replace host socket timestamps with logical time.
@@ -1325,25 +1409,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.handle_sock_diag_recvmsg(guest, call).await;
         }
 
-        if !self.cfg.virtualize_time {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        }
-
         let Some(message_address) = call.msg() else {
-            return self
-                .handle_socket_receive(guest, call, call.sockfd(), true)
-                .await;
+            return if self.cfg.virtualize_time {
+                self.handle_socket_receive(guest, call, call.sockfd(), true)
+                    .await
+            } else {
+                self.execute_nonblockable_fd_syscall(guest, call).await
+            };
         };
-        // Snapshot every input field before the receive. Linux permits the
-        // control buffer to overlap this header, so rereading it afterward can
-        // turn a successful consuming receive into an artificial EFAULT.
+        let message_address_raw = message_address.as_raw();
+        // Snapshot every input field before the receive. The kernel updates
+        // msg_controllen, so after the receive only that returned bound decides
+        // how many ancillary bytes may be interpreted.
         let message: libc::msghdr = guest.memory().read_value(message_address)?;
         if message.msg_control.is_null() || message.msg_controllen == 0 {
-            return self
-                .handle_socket_receive(guest, call, call.sockfd(), true)
-                .await;
+            return if self.cfg.virtualize_time {
+                self.handle_socket_receive(guest, call, call.sockfd(), true)
+                    .await
+            } else {
+                self.execute_nonblockable_fd_syscall(guest, call).await
+            };
         }
-        let control_len = message.msg_controllen.min(MAX_CONTROL_BYTES);
+        let input_control_len = message.msg_controllen;
+        let control_len = input_control_len.min(MAX_CONTROL_BYTES);
         let control_address: AddrMut<'_, u8> =
             AddrMut::from_raw(message.msg_control as usize).ok_or(Errno::EFAULT)?;
         let mut control = vec![0; control_len];
@@ -1351,9 +1439,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.memory().read_exact(control_address, &mut control)?;
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
-        let now = self.observe_socket_receive(guest, call.sockfd()).await?;
-        let mut control = vec![0; control_len];
+        let now = if self.cfg.virtualize_time {
+            Some(self.observe_socket_receive(guest, call.sockfd()).await?)
+        } else {
+            None
+        };
+        let returned_message_address =
+            AddrMut::from_raw(message_address_raw).ok_or(Errno::EFAULT)?;
+        let returned_message: libc::msghdr = guest.memory().read_value(returned_message_address)?;
+        let returned_control_len =
+            delivered_control_len(input_control_len, returned_message.msg_controllen);
+        let mut control = vec![0; returned_control_len];
         guest.memory().read_exact(control_address, &mut control)?;
+        self.register_received_fixed_pipe_fds(
+            guest,
+            &control,
+            call.flags() & libc::MSG_CMSG_CLOEXEC != 0,
+        )
+        .await?;
+        let Some(now) = now else {
+            return Ok(result);
+        };
         if socket_timestamp_messages(&control).is_empty() {
             return Ok(result);
         }
@@ -1922,5 +2028,26 @@ mod tests {
         assert_eq!((first.tv_sec, first.tv_nsec), (0, 0));
         assert_eq!((second.tv_sec, second.tv_nsec), (2, 345_678_901));
         assert_eq!((third.tv_sec, third.tv_nsec), (2, 345_678_901));
+    }
+
+    #[test]
+    fn returned_control_length_excludes_stale_scm_rights_bytes() {
+        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let message_len = header_len + std::mem::size_of::<i32>();
+        let mut control = vec![0; cmsg_align(message_len)];
+        assert!(write_control_value(
+            &mut control,
+            libc::cmsghdr {
+                cmsg_len: message_len,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: libc::SCM_RIGHTS,
+            }
+        ));
+        assert!(write_control_value(&mut control[header_len..], 42_i32));
+        assert_eq!(scm_rights_fds(&control), vec![42]);
+
+        let delivered = delivered_control_len(control.len(), 0);
+        assert_eq!(delivered, 0);
+        assert!(scm_rights_fds(&control[..delivered]).is_empty());
     }
 }
