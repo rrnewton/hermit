@@ -149,6 +149,36 @@ Those four generation hashes were produced independently in three different
 checkouts, so generation is deterministic across clones and not merely
 repeatable in one worktree.
 
+**`14 incompatible targets skipped` is the number the pinned Buck2 reports. A
+different Buck2 binary running the identical command reports 23, and both are
+correct.** Meta-internal Buck2 `083174567c29` says 23 where the pinned public
+release 2026-08-01 says 14; the earlier validation of this branch used the
+internal binary, because the internal DotSlash could not run the pinned
+descriptor. Nothing else about the build differs between the two: same two
+failing compilation targets, same `winapi-0.3-build-script-run` analysis error,
+same nine `dep_only_incompatible_version_two` soft errors, `BUILD ERRORS (2)`
+either way. The two binaries bundle different preludes — `prelude` is a bundled
+external cell — so `prelude//platforms:default` configures differently and the
+two runs share no configuration hash at all.
+
+The difference of nine is accounted for by the nine per-platform
+`winapi-0.3-build-script-build-{linux-arm64, linux-riscv64, linux-x86_64,
+macos-arm64, macos-x86_64, wasi, wasm32, windows-gnu, windows-msvc}` targets,
+each of which is incompatible only because a transitive dep is, and each of
+which both binaries report identically as a soft error saying "will be error in
+future". The internal binary appears to count them in the skipped total; the
+pinned release appears to leave them to the soft-error channel.
+
+That account rests on arithmetic (23 − 14 = 9), on those nine soft-error names
+being identical in both logs, and on the printed list's first three and last
+three entries being unchanged between the two runs — `winapi` sorts before
+`windows`, so nine extra entries would land in the hidden middle. **It does not
+rest on an enumerated diff of the two lists**, because Buck2 truncates the
+printed list to first-three-and-last-three and `ctargets` fails on the same
+`winapi-0.3-build-script-run` analysis error. Nobody has read Buck2's source to
+confirm the counting change between the two versions. Quote 14 when following
+this document, since the pinned release is what it tells you to run.
+
 **The first `shim//third-party/rust/...` build in a cold checkout can report a
 third failure that is not real.** Once in five runs of that command, a freshly
 cloned tree additionally failed
