@@ -42,13 +42,13 @@ grep -Fq '[ "$job_found" != true ] && [ "$run_state" = FAILED ]' "$WORKFLOW" ||
     fail "a complete workflow failure must remain a failure fallback"
 grep -Fq '[ "$priv_job_found" != true ] && [ "$priv_run_state" = FAILED ]' "$WORKFLOW" ||
     fail "a complete privileged workflow failure must remain a failure fallback"
-grep -Fq 'agent-utils/py/ci_hub_check_outcome.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
+grep -Fq 'scripts/check_outcome_adapter.py' "$ROOT_DIR/scripts/classify-required-check.sh" ||
     fail "local shell adapter must delegate to the parent status authority"
-grep -Fq 'from ci_hub_check_outcome import' "$ROOT_DIR/scripts/pr_status.py" ||
+grep -Fq 'from check_outcome_adapter import' "$ROOT_DIR/scripts/pr_status.py" ||
     fail "PR rollup must import the parent-authority adapter"
 grep -Fq '"rrnewton/hermit": ("merge-gate-v4",)' "$ROOT_DIR/scripts/pr_status.py" ||
     fail "Hermit PR rollup must read the live versioned gate context"
-grep -Fq 'agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
+grep -Fq 'check_outcome_adapter.py" --annotate-rollups' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "lander rollup must call the parent-authority adapter"
 grep -Fq '[[ $REPO == rrnewton/hermit ]] && GATE_CONTEXT=merge-gate-v4' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "lander rollup must use Hermit's live versioned gate context"
@@ -56,6 +56,55 @@ grep -Fq 'latest_named($r; $gate_context)' "$ROOT_DIR/scripts/pr-dag-health.sh" 
     fail "lander rollup must select the repository-specific gate context"
 grep -Fq -- '--select-latest-rollup --head-sha "$MAIN_FULL_SHA"' "$ROOT_DIR/scripts/pr-dag-health.sh" ||
     fail "main-health rollup must select the latest check at the exact head"
+# The assertions above match literal strings inside Hermit's own scripts. A
+# string keeps matching long after the file it names is deleted: the reference
+# to agent-utils/py/ci_hub_check_outcome.py matched here for months after
+# agent-utils commit 5ef91c5 removed that file, so this lint stayed green while
+# the classifier it guards pointed at nothing. Resolve every classifier path
+# these scripts name, then run the classifier, so neither a rename nor a
+# command-line interface that quietly disappears can pass.
+for consumer in scripts/classify-required-check.sh scripts/pr-dag-health.sh \
+    scripts/test-check-status-outcome.sh scripts/pr_status.py; do
+    while read -r reference; do
+        [[ -n $reference ]] || continue
+        resolved=${reference//\$root_dir/$ROOT_DIR}
+        resolved=${resolved//\$SCRIPT_DIR/$ROOT_DIR/scripts}
+        resolved=${resolved//\$ROOT_DIR/$ROOT_DIR}
+        [[ -f $resolved ]] ||
+            fail "$consumer names check-status classifier '$reference', which does not resolve to a file ($resolved)"
+    done < <(grep -oE '"[^"]*check_outcome[^"]*\.py"' "$ROOT_DIR/$consumer" | tr -d '"')
+done
+
+CLASSIFIER="$ROOT_DIR/scripts/check_outcome_adapter.py"
+[[ -f $CLASSIFIER ]] || fail "the check-status adapter is missing at $CLASSIFIER"
+
+# Execute it. A Python library run as a program exits 0 having printed nothing,
+# so a path that resolves is still not evidence that a classifier answers.
+outcome=$(python3 "$CLASSIFIER" --status completed --conclusion success 2>&1) ||
+    fail "the check-status adapter failed to run: $outcome"
+[[ $outcome == PASSED ]] ||
+    fail "the check-status adapter must classify completed/success as PASSED, got '${outcome:-<no output>}'"
+outcome=$(python3 "$CLASSIFIER" --status completed --conclusion failure 2>&1) ||
+    fail "the check-status adapter failed to run: $outcome"
+[[ $outcome == FAILED ]] ||
+    fail "the check-status adapter must classify completed/success as FAILED, got '${outcome:-<no output>}'"
+outcome=$(printf '%s' '{"status":"completed","conclusion":"success"}' |
+    python3 "$CLASSIFIER" --annotate-rollups 2>&1) ||
+    fail "the check-status adapter failed on --annotate-rollups: $outcome"
+[[ $outcome == *'"_checkOutcome":"PASSED"'* ]] ||
+    fail "--annotate-rollups must stamp _checkOutcome, got '${outcome:-<no output>}'"
+outcome=$(printf '%s' '[]' | python3 "$CLASSIFIER" --select-latest-rollup --head-sha 0 2>&1) ||
+    fail "the check-status adapter failed on --select-latest-rollup: $outcome"
+[[ $outcome == '[]' ]] ||
+    fail "--select-latest-rollup must emit a JSON array, got '${outcome:-<no output>}'"
+python3 -c "
+import sys
+sys.path.insert(0, '$ROOT_DIR/scripts')
+import check_outcome_adapter as adapter
+adapter.classify_check, adapter.select_latest_checks
+" 2>/dev/null ||
+    fail "pr_status.py's imports must resolve: check_outcome_adapter must export classify_check and select_latest_checks"
+
 [[ ! -e $ROOT_DIR/scripts/check_outcome.jq ]] ||
     fail "duplicate jq status classifier must not exist"
 [[ ! -e $ROOT_DIR/scripts/check_status_outcome.py ]] ||
