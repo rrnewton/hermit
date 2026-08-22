@@ -1,20 +1,20 @@
-# Inventory paths that currently claim integration invocation without a
-# machine-resolvable tracked Rust caller. This list is shrink-only: repairing or
-# retiring a claim requires deleting its path, and new paths are refused.
-tests/shell/date.sh
-tests/shell/devrand.sh
-tests/shell/non_strict/curl.sh
-tests/shell/py_hello.sh
-tests/shell/race.sh
-tests/standalone/cat_proc_uptime.sh
-tests/standalone/curl_client_only.sh
-tests/standalone/env_var_passthru.sh
-tests/standalone/minimal_hello_backtraces.sh
-tests/standalone/replay_and_print_stacktraces.sh
-tests/standalone/replay_chaos_trace.sh
-tests/standalone/replay_trace.sh
-tests/standalone/stacktrace_signal.sh
-tests/standalone/strict_setitimer.sh
-tests/standalone/strict_timer_create.sh
-tests/standalone/test_no_networking_network_bind.sh
-tests/standalone/validate_race_example_properties.sh
+# Inventory path+runner claims that currently lack a machine-resolvable tracked
+# Rust caller. This list is shrink-only: repairing or retiring a claim requires
+# deleting that exact claim, and new or changed claims are refused.
+tests/shell/date.sh	hermit-cli shell integration targets
+tests/shell/devrand.sh	hermit-cli shell integration targets
+tests/shell/non_strict/curl.sh	hermit-cli shell integration targets
+tests/shell/py_hello.sh	hermit-cli shell integration targets
+tests/shell/race.sh	hermit-cli shell integration targets
+tests/standalone/cat_proc_uptime.sh	hermit-cli/tests integration targets
+tests/standalone/curl_client_only.sh	hermit-cli/tests integration targets
+tests/standalone/env_var_passthru.sh	hermit-cli/tests integration targets
+tests/standalone/minimal_hello_backtraces.sh	hermit-cli/tests integration targets
+tests/standalone/replay_and_print_stacktraces.sh	hermit-cli/tests integration targets
+tests/standalone/replay_chaos_trace.sh	hermit-cli/tests integration targets
+tests/standalone/replay_trace.sh	hermit-cli/tests integration targets
+tests/standalone/stacktrace_signal.sh	hermit-cli/tests integration targets
+tests/standalone/strict_setitimer.sh	hermit-cli/tests integration targets
+tests/standalone/strict_timer_create.sh	hermit-cli/tests integration targets
+tests/standalone/test_no_networking_network_bind.sh	hermit-cli/tests integration targets
+tests/standalone/validate_race_example_properties.sh	hermit-cli/tests integration targets

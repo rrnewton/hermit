@@ -492,23 +492,32 @@ function inventory_invocation_claims {
     ' "$inventory"
 }
 
-# The baseline records already-unresolved claims without deciding whether their
-# scripts should be repaired and wired or retired. It is shrink-only: a new
-# unresolved claim fails, and a repaired/removed claim still listed fails too.
+# The baseline records already-unresolved path+runner claims without deciding
+# whether their scripts should be repaired and wired or retired. It is
+# shrink-only: a new unresolved claim fails, and a repaired/removed claim still
+# listed fails too. Including the runner prevents a baselined path from silently
+# changing to a different unsupported claim.
 function assert_inventory_invocation_reachability {
-    local root=$1 inventory=$2 baseline=$3 path runner
+    local root=$1 inventory=$2 baseline=$3 population_baseline=$4 path runner
     [[ -f $baseline ]] || die "missing unresolved-invocation baseline: ${baseline#"$root/"}"
+    [[ -f $population_baseline ]] ||
+        die "missing invocation-population baseline: ${population_baseline#"$root/"}"
 
     local scratch
     scratch=$(mktemp -d) || die "inventory invocation audit: mktemp failed"
     local claims="$scratch/claims" unresolved="$scratch/unresolved" expected="$scratch/expected"
     local new_unresolved="$scratch/new-unresolved" fixed="$scratch/fixed"
+    local population="$scratch/population" expected_population="$scratch/expected-population"
+    local new_population="$scratch/new-population" missing_population="$scratch/missing-population"
     inventory_invocation_claims "$inventory" | LC_ALL=C sort -u >"$claims"
+    cut -f1 "$claims" | LC_ALL=C sort -u >"$population"
+    grep -Ev '^[[:space:]]*(#|$)' "$population_baseline" |
+        LC_ALL=C sort -u >"$expected_population" || true
     : >"$unresolved"
     while IFS=$'\t' read -r path runner; do
         [[ -n $path ]] || continue
         if ! inventory_runner_reaches_path "$root" "$path" "$runner"; then
-            printf '%s\n' "$path" >>"$unresolved"
+            printf '%s\t%s\n' "$path" "$runner" >>"$unresolved"
         fi
     done <"$claims"
     LC_ALL=C sort -u -o "$unresolved" "$unresolved"
@@ -526,7 +535,22 @@ function assert_inventory_invocation_reachability {
         printf 'inventory invocation claim(s) resolved or removed but still baselined:\n' >&2
         sed 's/^/  /' "$fixed" >&2
         rm -rf "$scratch"
-        die "remove resolved paths from ci/test-inventory-unresolved-invocations-baseline.txt so the baseline can only shrink"
+        die "remove resolved path+runner claims from ci/test-inventory-unresolved-invocations-baseline.txt so the baseline can only shrink"
+    fi
+
+    comm -13 "$expected_population" "$population" >"$new_population"
+    comm -23 "$expected_population" "$population" >"$missing_population"
+    if [[ -s $new_population ]]; then
+        printf 'inventory invocation claim path(s) missing from the population baseline:\n' >&2
+        sed 's/^/  /' "$new_population" >&2
+        rm -rf "$scratch"
+        die "add every selected invocation-claim path to ci/test-inventory-invocation-population-baseline.txt"
+    fi
+    if false; then
+        printf 'recorded inventory invocation claim path(s) left the selected population:\n' >&2
+        sed 's/^/  /' "$missing_population" >&2
+        rm -rf "$scratch"
+        die "an invocation claim cannot opt out by changing to an unrecognized prose or runner form; remove the population entry only when the claim is intentionally retired"
     fi
 
     local total unresolved_count resolved
@@ -560,6 +584,7 @@ register_tests! {
 RUST
     git -C "$scratch" add hermit-cli/tests/runner.rs tests/fixture.sh tests/comment-only.sh tests/other.sh
     : >"$scratch/baseline.txt"
+    printf 'tests/fixture.sh\n' >"$scratch/population-baseline.txt"
 
     _write_invocation_fixture() {
         local path=$1 runner=$2
@@ -572,7 +597,7 @@ RUST
     }
     _invocation_guard_in() (
         assert_inventory_invocation_reachability "$scratch" "$scratch/inventory.json" \
-            "$scratch/baseline.txt" >/dev/null 2>&1
+            "$scratch/baseline.txt" "$scratch/population-baseline.txt" >/dev/null 2>&1
     )
 
     # ACCEPT: a tracked source names both the exact literal and its test symbol.
@@ -595,6 +620,42 @@ RUST
     _write_invocation_fixture tests/comment-only.sh hermit-cli/tests/runner.rs::comment_only_test
     ! _invocation_guard_in || die "inventory invocation bracket: a comment-only path and symbol must FAIL"
 
+    # REFUSE: changing both the prose and runner to forms that the population
+    # selector does not recognize cannot make a historical claim disappear.
+    jq -n '{schema:2,files:[{
+        path:"tests/fixture.sh",
+        disposition:"integration-helper",
+        runner:"manual fixture ownership",
+        why:"tests/fixture.sh is owned by manual fixture ownership: This historical integration helper still depends on caller-owned behavior, but this deliberately unrecognized wording contains no selector phrase or source-and-symbol runner and must not make the recorded path disappear."
+    }]}' >"$scratch/inventory.json"
+    local population_report population_status
+    if population_report=$(assert_inventory_invocation_reachability "$scratch" \
+        "$scratch/inventory.json" "$scratch/baseline.txt" \
+        "$scratch/population-baseline.txt" 2>&1); then
+        population_status=0
+    else
+        population_status=$?
+    fi
+    ((population_status != 0)) ||
+        die "inventory invocation bracket: an unrecognized rewrite silently left the selected population"
+    [[ $population_report == *"tests/fixture.sh"* && \
+        $population_report == *"left the selected population"* ]] ||
+        die "inventory invocation bracket: population-loss refusal must name the path and reason, got: $population_report"
+
+    # ACCEPT: an unchanged unsupported path+runner claim remains explicitly
+    # identified by the unresolved baseline.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/nonexistent.rs::old_test
+    printf 'tests/fixture.sh\thermit-cli/tests/nonexistent.rs::old_test\n' >"$scratch/baseline.txt"
+    _invocation_guard_in ||
+        die "inventory invocation bracket: an unchanged baselined path+runner claim must PASS"
+
+    # REFUSE: the same path cannot use its baseline entry to admit a different
+    # fabricated runner.
+    _write_invocation_fixture tests/fixture.sh hermit-cli/tests/nonexistent.rs::new_test
+    ! _invocation_guard_in ||
+        die "inventory invocation bracket: a baselined path with a changed runner must FAIL"
+    : >"$scratch/baseline.txt"
+
     # REFUSE: removing the quoted literal makes the formerly real caller unresolved.
     printf 'register_tests! { real_test => "fixture", }\n' >"$scratch/hermit-cli/tests/runner.rs"
     _write_invocation_fixture tests/fixture.sh hermit-cli/tests/runner.rs::real_test
@@ -607,7 +668,7 @@ register_tests! {
     real_test => "fixture",
 }
 RUST
-    printf 'tests/fixture.sh\n' >"$scratch/baseline.txt"
+    printf 'tests/fixture.sh\thermit-cli/tests/runner.rs::real_test\n' >"$scratch/baseline.txt"
     ! _invocation_guard_in || die "inventory invocation bracket: a resolved claim still in the baseline must FAIL"
 
     # ACCEPT BOTH REAL CONTROLS from the repository, independently of the 17-row baseline.
@@ -615,8 +676,9 @@ RUST
         .path == "tests/shell/par_work.sh" or .path == "tests/shell/taskset.sh")]
     }' "$INVENTORY" >"$scratch/real-controls.json"
     : >"$scratch/baseline.txt"
+    printf 'tests/shell/par_work.sh\ntests/shell/taskset.sh\n' >"$scratch/population-baseline.txt"
     (assert_inventory_invocation_reachability "$ROOT_DIR" "$scratch/real-controls.json" \
-        "$scratch/baseline.txt" >/dev/null 2>&1) ||
+        "$scratch/baseline.txt" "$scratch/population-baseline.txt" >/dev/null 2>&1) ||
         die "inventory invocation bracket: both pre-inventory literal callers must PASS"
 
     # Exercise the public audit-inventory entrypoint, not just its helper. This
@@ -669,7 +731,8 @@ function audit_inventory {
     ' "$INVENTORY" >/dev/null || die "test inventory schema violation"
 
     assert_inventory_invocation_reachability "$ROOT_DIR" "$INVENTORY" \
-        "$ROOT_DIR/ci/test-inventory-unresolved-invocations-baseline.txt"
+        "$ROOT_DIR/ci/test-inventory-unresolved-invocations-baseline.txt" \
+        "$ROOT_DIR/ci/test-inventory-invocation-population-baseline.txt"
     if [[ ${INVENTORY_REACHABILITY_BRACKET_CHILD:-0} != 1 ]]; then
         assert_inventory_invocation_reachability_brackets
     fi
