@@ -29,6 +29,7 @@ mod logdiff;
 mod oci;
 mod podman_store;
 mod record;
+mod record_envelope;
 mod record_start;
 mod remove;
 mod replay;
@@ -483,9 +484,9 @@ mod tests {
         );
     }
 
-    /// TOP-LEVEL EXIT 2 -- the DBT arm of `RunOpts::main` RETURNS `run_dbt(..)`
-    /// and never reaches `verify()`, so a `--verify --verify-json` DBT run
-    /// cannot produce a verdict at all.
+    /// TOP-LEVEL EXIT 2 -- the real DBT arm of `RunOpts::main` RETURNS
+    /// `run_dbt(..)` before the generic `verify()` dispatch, so a
+    /// `--verify --verify-json` DBT run cannot produce a comparison verdict.
     ///
     /// Asserted STRUCTURALLY rather than by executing the arm. `run_dbt` takes
     /// `verify: bool` but no verdict-artifact path, in BOTH cfg arms
@@ -498,7 +499,41 @@ mod tests {
     /// its whole timeout. A test that cannot hang is worth more here than one
     /// that exercises the launch.
     #[test]
-    fn dbt_arm_has_no_channel_to_publish_a_verdict() {
+    fn dbt_dispatch_bypasses_the_generic_comparator_and_keeps_no_result() {
+        // Exercise the outer receipt stamp with a DBT invocation that exits at
+        // the first safe preflight. This replaces a planted green receipt with
+        // no_result without launching DynamoRIO or touching harness stdin.
+        assert_top_level_exit_leaves_no_result(
+            &[
+                "hermit",
+                "--log",
+                "warn",
+                "run",
+                "--verify",
+                "--backend=dbt",
+            ],
+            "DBT invocation before dedicated dispatch",
+        );
+
+        // Bind the structural half of the test to the actual production
+        // dispatch, not a backend-to-envelope selector that DBT never reaches.
+        let run_source = include_str!("run.rs");
+        let dbt_return = run_source
+            .find("return super::backends::run_dbt(")
+            .expect("RunOpts::main must return through the dedicated DBT adapter");
+        let generic_verify = run_source
+            .find("} else if self.verify {\n            self.verify(global)")
+            .expect("RunOpts::main generic verification dispatch");
+        assert!(
+            dbt_return < generic_verify,
+            "DBT must return before the generic comparator dispatch"
+        );
+        let obsolete_selector = ["record", "envelope", "for", "backend"].join("_");
+        assert!(
+            !run_source.contains(&obsolete_selector),
+            "do not present a backend envelope selector as live DBT wiring"
+        );
+
         let source = include_str!("backends.rs");
         let signatures: Vec<&str> = source
             .match_indices("fn run_dbt(")

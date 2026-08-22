@@ -1019,6 +1019,7 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
     let status = if run1.len() == 1 && run1[0].metadata().is_ok_and(|metadata| metadata.len() > 0) {
         let output = Command::new(hermit)
             .arg("log-diff")
+            .arg("--record-envelope=all-records-v1")
             .arg(&run1[0])
             .output()
             .map_err(|e| format!("cannot normalize {}: {e}", run1[0].display()))?;
@@ -2253,6 +2254,7 @@ backends_disabled:
             comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: "canonical".into(),
                 compare_logs: true,
+                record_envelope: crate::canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
             }),
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,

@@ -34,13 +34,13 @@ echo ":: Property 1: race.sh is invariant to changing --seed"
 run 0  1 "$log1" &
 run 10 1 "$log2" &
 wait
-"$hermit" log-diff --syscall-history=5 "$log1" "$log2"
+"$hermit" log-diff --record-envelope=all-records-v1 --syscall-history=5 "$log1" "$log2"
 
 echo ":: Property 2: race.sh is sensitive to changing --sched-seed"
 run 0 1 "$log3" &
 run 0 2 "$log4" &
 wait
-if "$hermit" log-diff --syscall-history=5 "$log3" "$log4"; then
+if "$hermit" log-diff --record-envelope=all-records-v1 --syscall-history=5 "$log3" "$log4"; then
     echo "ERROR: expected difference in $log3 $log4"
 fi
 
@@ -48,7 +48,7 @@ echo ":: Property 3: when both seeds are the same and we should see IDENTICAL ru
 run 0 1 "$log5" &
 run 0 1 "$log6" &
 wait
-"$hermit" log-diff --syscall-history=5 "$log5" "$log6"
+"$hermit" log-diff --record-envelope=all-records-v1 --syscall-history=5 "$log5" "$log6"
 
 echo ":: Cleanup."
 rm -rf "$dir"
