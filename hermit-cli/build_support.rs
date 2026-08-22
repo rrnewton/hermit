@@ -30,15 +30,13 @@ pub fn git_short_sha_in(root: &Path) -> String {
     if dirty { format!("{sha}-dirty") } else { sha }
 }
 
-/// Git metadata and tracked source files that can change the embedded revision
-/// or dirty state. Resolve these through Git so this also works from a nested
-/// crate and a worktree.
+/// Git metadata that can change the embedded revision or dirty state. Resolve
+/// these through Git so this also works from a nested crate and a worktree.
 pub fn git_watch_paths() -> Vec<PathBuf> {
     git_watch_paths_in(Path::new("."))
 }
 
 pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
-    let repository = git(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
     let mut names = vec![
         "HEAD".to_owned(),
         "index".to_owned(),
@@ -57,16 +55,6 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
             .map(PathBuf::from)
         })
         .collect();
-    if let Some(repository) = repository
-        && let Some(tracked) = git(&repository, &["ls-files", "--full-name"])
-    {
-        paths.extend(
-            tracked
-                .lines()
-                .filter(|path| !path.is_empty())
-                .map(|path| repository.join(path)),
-        );
-    }
     paths.sort();
     paths.dedup();
     paths
