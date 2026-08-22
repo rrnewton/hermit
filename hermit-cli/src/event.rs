@@ -96,6 +96,8 @@ pub enum SyscallEvent {
     FtruncateV2(FtruncateEvent),
     /// Destination length after a successful clone ioctl.
     FileClone(FileCloneEvent),
+    /// The result and mutable output fields of a raw `ppoll` call.
+    Ppoll(PpollEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -225,12 +227,7 @@ pub struct TimespecEvent {
     pub timespec: Timespec,
 }
 
-/// Records the guest-visible outputs of a `poll` or `ppoll` call. Both syscalls
-/// have identical output semantics (the updated `pollfd` array plus a return
-/// count), so they share this event. `ppoll`'s temporary signal mask only
-/// affects which signals can interrupt the wait; a resulting `EINTR` (or a
-/// timeout returning 0) is captured by the enclosing `Event`'s `Result` and
-/// return count respectively, so no extra fields are needed here.
+/// Records the guest-visible outputs of a `poll` call.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PollEvent {
     /// The complete list of file descriptors. Note that only the `revents` field
@@ -248,6 +245,33 @@ pub struct PollEvent {
     /// A value of 0 indicates that the call timed out and no file descriptors
     /// were ready.
     pub updated: usize,
+}
+
+/// Records every guest-visible output of a raw `ppoll` call.
+///
+/// Unlike `poll`, Linux treats the timeout as an in-out parameter. The pollfd
+/// and timeout copyouts are independent of the return value. Linux writes
+/// `revents` before attempting the remaining-time copyout and preserves the
+/// syscall result when that later write faults. Keep both output snapshots
+/// alongside the nested result so replay can restore the writes in kernel order
+/// before returning either success or the error.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PpollEvent {
+    /// The exact return value or errno observed while recording.
+    pub result: Result<i64, Errno>,
+
+    /// Whether the guest supplied a non-null pollfd pointer.
+    pub fds_pointer_present: bool,
+
+    /// The complete post-kernel pollfd output when the guest supplied a non-null
+    /// pollfd pointer and Linux reached pollfd copyout. Early errors retain the
+    /// pointer-presence field above but store no pollfd values.
+    pub fds: Option<Vec<PollFd>>,
+
+    /// The exact readable raw timeout value after the kernel call, or `None`
+    /// when the guest supplied a null timeout pointer. This may be present for
+    /// either a successful or error result.
+    pub timeout: Option<Timespec>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -11,6 +11,7 @@
 use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
@@ -19,11 +20,13 @@ use reverie::syscalls::Ppoll;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
 use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
+use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
@@ -59,6 +62,63 @@ fn read_iovecs<M: MemoryAccess>(
     ];
     memory.read_values(address, &mut iovecs)?;
     Ok(iovecs)
+}
+
+fn capture_ppoll_event<M: MemoryAccess>(
+    memory: &M,
+    fds_address: Option<AddrMut<'_, libc::pollfd>>,
+    timeout_address: Option<AddrMut<'_, Timespec>>,
+    nfds: usize,
+    result: Result<i64, Errno>,
+) -> Result<PpollEvent, Errno> {
+    let fds_pointer_present = fds_address.is_some();
+    let read_fds = |address: AddrMut<'_, libc::pollfd>| -> Result<Vec<PollFd>, Errno> {
+        let mut fds = vec![PollFd::default(); nfds];
+        memory.read_values(address.cast::<PollFd>().into(), &mut fds)?;
+        Ok(fds)
+    };
+    let fds = match result {
+        Ok(_) | Err(Errno::EINTR) => fds_address.map(read_fds).transpose()?,
+        // Linux writes `revents` entry by entry and can fault partway through
+        // the copy-out, so an EFAULT return may still leave earlier entries
+        // written. Those are guest-visible, so capture them or replay restores
+        // nothing and the guest keeps its pre-syscall values.
+        //
+        // BEST EFFORT, AND THAT IS LOAD-BEARING. The same EFAULT is also what a
+        // wholly bad `fds` pointer produces, and then this read fails too. `?`
+        // here would discard the WHOLE event -- including the captured timeout
+        // this function exists to preserve -- and record a bare `Err` instead.
+        // `fds_pointer_present` already distinguishes "no pointer" from "pointer
+        // we could not read", so `None` here is not ambiguous.
+        //
+        // NOT UNIT-TESTED, DELIBERATELY, AND THIS IS NOT AN OVERSIGHT: the unit
+        // tests use `LocalMemory`, which reads this process's own memory
+        // directly, so an unreadable address SEGFAULTS THE TEST BINARY instead
+        // of returning `Err` -- `.ok()` cannot catch that, and a test written
+        // that way crashes rather than failing. Guest memory in production goes
+        // through `process_vm_readv`, which does return `Err`. The policy is
+        // therefore covered end to end by `review-cases invalid-nfds` staying
+        // matched, not by a unit test.
+        //
+        // Note the predicate, not just the policy: errors other than EFAULT and
+        // EINTR must not read at all. An earlier attempt read on EVERY error and
+        // regressed `review-cases invalid-nfds`, which passes fds=(void*)1 with
+        // nfds over RLIMIT_NOFILE and gets EINVAL -- the read's own EFAULT(14)
+        // replaced the kernel's EINVAL(22) and flipped that case from matched to
+        // diverged.
+        Err(Errno::EFAULT) => fds_address.and_then(|address| read_fds(address).ok()),
+        _ => None,
+    };
+    let timeout = timeout_address
+        .map(|address| memory.read_value(address))
+        .transpose()?;
+
+    Ok(PpollEvent {
+        result,
+        fds_pointer_present,
+        fds,
+        timeout,
+    })
 }
 
 impl Recorder {
@@ -121,27 +181,27 @@ impl Recorder {
         syscall: Ppoll,
     ) -> Result<i64, Errno> {
         let len = syscall.nfds() as usize;
+        let timeout_is_zero = syscall
+            .timeout()
+            .and_then(|address| {
+                let timeout: Timespec = guest.memory().read_value(address).ok()?;
+                Some(timeout)
+            })
+            .is_some_and(|timeout| timeout.tv_sec == 0 && timeout.tv_nsec == 0);
+        tracing::trace!(
+            has_signal_mask = syscall.sigmask().is_some(),
+            timeout_is_zero,
+            "Recorder observed ppoll input"
+        );
         let result = guest.inject(syscall).await;
-
-        let event = result.and_then(|ret| {
-            let mut fds = vec![PollFd::default(); len];
-
-            // `ppoll` shares `poll`'s output semantics: the kernel writes the
-            // `revents` field of each pollfd. `Ppoll::fds()` is typed as
-            // `AddrMut<libc::pollfd>`, which is layout-compatible with the
-            // `PollFd` we store, so we cast the address and read the whole array.
-            //
-            // A NULL fds pointer (a pure `ppoll` sleep) leaves `fds` empty and
-            // records `updated == 0` on timeout.
-            if let Some(addr) = syscall.fds() {
-                guest
-                    .memory()
-                    .read_values(addr.cast::<PollFd>().into(), &mut fds)?;
-            }
-
-            let updated = ret as usize;
-            Ok(SyscallEvent::Poll(PollEvent { fds, updated }))
-        });
+        let event = capture_ppoll_event(
+            &guest.memory(),
+            syscall.fds(),
+            syscall.timeout(),
+            len,
+            result,
+        )
+        .map(SyscallEvent::Ppoll);
 
         self.record_event(guest, event);
 
@@ -260,4 +320,117 @@ impl Recorder {
     }
 
     // TODO: Add support for ppoll, epoll, and select here.
+}
+
+#[cfg(test)]
+mod tests {
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::PollFlags;
+
+    use super::*;
+
+    #[test]
+    fn capture_ppoll_preserves_exact_timeout_on_eintr() {
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 345_678_901,
+        };
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            None,
+            AddrMut::from_raw((&timeout as *const Timespec) as usize),
+            0,
+            Err(Errno::EINTR),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EINTR));
+        assert!(!event.fds_pointer_present);
+        assert!(event.fds.is_none());
+        assert_eq!(event.timeout, Some(timeout));
+    }
+
+    /// Linux can fault partway through the `revents` copy-out, leaving earlier
+    /// entries written and still returning EFAULT. Those writes are
+    /// guest-visible, so they must be captured or replay restores nothing and
+    /// the guest keeps its pre-syscall sentinels -- measured as a real
+    /// divergence: record `revents0=1` against replay `revents0=4660`, where
+    /// 4660 is 0x1234, the value the guest itself wrote before the call.
+    #[test]
+    fn capture_ppoll_keeps_the_partial_copyout_on_efault() {
+        let fds = [
+            PollFd {
+                fd: 3,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::POLLIN,
+            },
+            PollFd {
+                fd: 5,
+                events: PollFlags::POLLIN,
+                revents: PollFlags::empty(),
+            },
+        ];
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(fds.as_ptr() as usize),
+            None,
+            fds.len(),
+            Err(Errno::EFAULT),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EFAULT));
+        assert!(event.fds_pointer_present);
+        assert_eq!(
+            event.fds.as_deref(),
+            Some(&fds[..]),
+            "a partially completed copy-out must be captured, not discarded"
+        );
+    }
+
+    #[test]
+    fn capture_ppoll_preserves_ready_fds_and_unchanged_timeout() {
+        let fds = [PollFd {
+            fd: 7,
+            events: PollFlags::POLLIN,
+            revents: PollFlags::POLLIN,
+        }];
+        let timeout = Timespec {
+            tv_sec: 3,
+            tv_nsec: 456_789_123,
+        };
+
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(fds.as_ptr() as usize),
+            AddrMut::from_raw((&timeout as *const Timespec) as usize),
+            fds.len(),
+            Ok(1),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Ok(1));
+        assert!(event.fds_pointer_present);
+        assert_eq!(event.fds.unwrap()[0].revents, PollFlags::POLLIN);
+        assert_eq!(event.timeout, Some(timeout));
+    }
+
+    #[test]
+    fn capture_ppoll_early_error_does_not_read_or_allocate_pollfds() {
+        let event = capture_ppoll_event(
+            &LocalMemory::new(),
+            AddrMut::from_raw(1),
+            None,
+            usize::MAX,
+            Err(Errno::EINVAL),
+        )
+        .unwrap();
+
+        assert_eq!(event.result, Err(Errno::EINVAL));
+        assert!(event.fds_pointer_present);
+        assert!(event.fds.is_none());
+        assert!(event.timeout.is_none());
+    }
 }
