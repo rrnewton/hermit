@@ -6,56 +6,154 @@ generates its dependencies from its own root manifest and tracked lockfile.
 Generated Rust `BUCK` files and vendored crate sources remain ignored because
 they can be regenerated.
 
-From a fresh recursive checkout, run:
+## Prerequisites
+
+- Git, and enough network access to reach `github.com`, `index.crates.io`,
+  `static.rust-lang.org`, and the Buck2 GitHub release assets.
+- `rustup`. The build compiler is pinned by `rust-toolchain.toml`
+  (`nightly-2026-07-12`, rustc 1.99.0-nightly `be8e82435`); rustup installs it
+  on first use. `components = ["clippy", "rustfmt"]` is part of that pin
+  because rustup does not add them to a freshly installed dated toolchain
+  otherwise.
+- The open-source [DotSlash](https://dotslash-cli.com) launcher. **On a Meta
+  host, see "On a Meta host" below — the `dotslash` already on `PATH` is a
+  different program and will not work.**
+
+## Steps
+
+This work lives on the `revive/buck2-oss-901` branch, not on `main`. `main` has
+no `BUCK` files at all, so cloning the default branch leaves nothing for the
+procedure to act on and produces no error explaining why.
 
 ```sh
-git submodule update --init --recursive
+git clone --recursive --branch revive/buck2-oss-901 \
+    https://github.com/rrnewton/hermit.git
+cd hermit
 ./bootstrap/regenerate-rust-deps
-./bootstrap/buck2 build shim//third-party/rust/...
 ./bootstrap/buck2 build reverie//:reverie-ptrace
+./bootstrap/buck2 build --keep-going shim//third-party/rust/...
 ./bootstrap/buck2 build //hermit-cli:hermit
 ```
 
-At this revival checkpoint, the complete generated third-party target pattern
-is a diagnostic rather than a green gate. The Linux build still reports the
-historical Windows-only `winapi` analysis exception, and current optional
-`reverie-dbt` and `reverie-sabre` packages need their Cargo build-script outputs
-represented in Reindeer fixups. Neither optional package is on the default
-`//hermit-cli:hermit` dependency path.
+If you already have a checkout, `git submodule update --init --recursive`
+replaces the `--recursive` in the clone.
 
-Prerequisites are Git, rustup, and the open-source
-[DotSlash](https://dotslash-cli.com) launcher.
+`reverie//:reverie-ptrace` is the green gate. The complete generated
+third-party target pattern is a **diagnostic, not a gate**: it is expected to
+report the Windows-only `winapi-0.3-build-script-run` analysis exception plus
+`reverie-dbt-0.2` and `reverie-sabre-0.2`, whose Cargo build-script outputs are
+not yet represented in Reindeer fixups. Neither optional package is on the
+default `//hermit-cli:hermit` dependency path. `//hermit-cli:hermit` itself
+stops at a known architecture boundary described at the end of this document.
+
+## On a Meta host
+
+A Meta devserver needs five things the steps above do not mention. All five are
+host facts rather than repository defects; a machine with direct internet
+access and no internal `dotslash` needs none of them.
+
+**Every network-touching command needs `with-proxy`** — the clone, the
+crates.io index fetch, the Buck2 release download, and any rustup toolchain
+install.
+
+**`/usr/bin/dotslash` is the internal DotSlash2 and cannot read this
+descriptor.** `./bootstrap/buck2` fails with:
+
+```
+dotslash error: problem with .../bootstrap/buck2
+caused by: failed to parse DotSlash file
+caused by: missing field `scheme`
+```
+
+That is a launcher-dialect difference, not a defect in the pin. Internal
+descriptors carry a per-platform `scheme` field (for example `"scheme": "cas"`)
+and slash-form platform keys (`linux/x86_64`); the public schema has neither,
+using `providers[].url` and hyphen-form keys (`linux-x86_64`). Fetch a public
+launcher and invoke it explicitly rather than putting it on `PATH`, so nothing
+internal is shadowed:
+
+```sh
+with-proxy curl -sSL -o ds.tgz \
+  https://github.com/facebook/dotslash/releases/download/v0.5.9/dotslash-linux-musl.x86_64.v0.5.9.tar.gz
+tar xzf ds.tgz            # yields ./dotslash
+with-proxy ./dotslash ./bootstrap/buck2 build reverie//:reverie-ptrace
+```
+
+**`regenerate-rust-deps` needs two Cargo environment variables.** Without the
+first, the pinned Reindeer's bundled libcurl does not find the system CA bundle
+and fails with `[60] SSL peer certificate ... unable to get local issuer
+certificate`, even though system `curl` reaches `index.crates.io` normally.
+Without the second it fails with `[7] CONNECT tunnel failed, response 407`,
+because the host's `~/.cargo/config.toml` sets `proxy = "fwdproxy:8080"` with
+no URL scheme:
+
+```sh
+CARGO_HTTP_CAINFO=/etc/pki/tls/certs/ca-bundle.crt \
+CARGO_HTTP_PROXY=http://fwdproxy:8080 \
+  ./bootstrap/regenerate-rust-deps
+```
+
+## Pinned versions
 
 The wrappers use immutable versions rather than live branch tips:
 
-- Buck2 release `2026-08-01`, through Buck2's upstream DotSlash descriptor
-  with a BLAKE3 digest and size for each supported platform
+- Buck2 release `2026-08-01`, through Buck2's upstream DotSlash descriptor with
+  a BLAKE3 digest and size for each supported platform. The descriptor's size
+  and digest describe the compressed `.zst` artifact, not the decompressed
+  binary in the cache — those two numbers differing is expected.
 - Reindeer `e3d72748131d3a70378055f091e0647c1edad85e`
-- Reindeer's Rust toolchain `nightly-2026-05-22`
+- Reindeer's own Rust toolchain `nightly-2026-05-22`
+- The build compiler, `nightly-2026-07-12` in `rust-toolchain.toml`
 
-Hermit's own `rust-toolchain.toml` still selects floating `nightly`; this
-bootstrap does not make the product compiler reproducible.
+The compiler pin matters as much as the others. The shim uses
+`system_rust_toolchain`, which runs whatever `rustc` is on `PATH`; under rustup
+that resolves through `rust-toolchain.toml`. While that file said `nightly`, a
+reviewer building on a different day got a different compiler, which left every
+other pin here without effect.
 
-The first Reindeer invocation downloads the pinned source revision, installs
-the pinned Rust toolchain if needed, and compiles Reindeer into the user cache.
-Set `HERMIT_BUCK2_TOOL_CACHE` to place that cache elsewhere. DotSlash downloads
-and verifies the platform-specific Buck2 release binary.
+Note that `reverie/rust-toolchain.toml` pins a different nightly
+(`nightly-2026-07-29`) for its own reasons. Under Buck2 this is inert — actions
+run from the outer project root, so the Hermit pin governs the whole build —
+but a `cargo` command run from inside `reverie/` will use the Reverie pin.
+
+The first Reindeer invocation downloads the pinned source revision, installs the
+pinned Rust toolchain if needed, and compiles Reindeer into the user cache
+(about 1m25s cold). Set `HERMIT_BUCK2_TOOL_CACHE` to place that cache
+elsewhere. DotSlash downloads and verifies the platform-specific Buck2 release
+binary; `DOTSLASH_CACHE` relocates its cache.
 
 `regenerate-rust-deps` starts without generated dependency output, vendors the
-versions in each tracked `Cargo.lock`, generates each
-`shim/third-party/rust/BUCK` twice, and refuses the result if two consecutive
-outputs differ. It also refuses changes to either tracked lockfile. The
-repository-root `.gitignore` files exclude generated paths. Those patterns must
-not move into `shim/.gitignore`: pinned Reindeer reads ignore files through the
-shim cell root and would otherwise generate empty crates.
+versions in each tracked `Cargo.lock`, generates each `shim/third-party/rust/BUCK`
+twice, and refuses the result if two consecutive outputs differ. It also refuses
+changes to either tracked lockfile. The repository-root `.gitignore` files
+exclude generated paths. Those patterns must not move into `shim/.gitignore`:
+pinned Reindeer reads ignore files through the shim cell root and would
+otherwise generate empty crates.
+
+## What a reproduction should produce
+
+Measured 2026-08-21 from a fresh recursive clone at `e95ab8c9`, reverie
+`868d46cf`, on x86_64 Linux with cold DotSlash and tool caches:
+
+| Step | Result |
+|---|---|
+| `regenerate-rust-deps` | Hermit `Cargo.lock` `bf71543c…`, `BUCK` `493aa548…`; Reverie `Cargo.lock` `69960ec2…`, `BUCK` `fba4eb29…`; working tree clean |
+| `build reverie//:reverie-ptrace` | exit 0, 24.8s, `libreverie_ptrace-0229eb76.rmeta` |
+| `build --keep-going shim//third-party/rust/...` | exit 3, 1m31s; red on `reverie-dbt-0.2` and `reverie-sabre-0.2` plus the `winapi-0.3-build-script-run` analysis exception; 14 incompatible targets skipped |
+
+Those four generation hashes were produced independently in two different
+checkouts, so generation is deterministic across clones and not merely
+repeatable in one worktree.
+
+## Known stopping point
 
 The current build reaches `//hermit-cli:hermit` and then stops because the
 Hermit and Reverie cells compile separate copies of third-party Rust crates.
 Types crossing the cell boundary consequently have distinct trait identities,
-currently observed when Reverie's `Sysno` meets Hermit's `serde::Serialize`
-and `serde::Deserialize` traits in `detcore-model`. Resolving that requires an
-owner decision about one third-party graph versus Hermit's hermetic Reverie
-pin; this bootstrap deliberately does not choose one.
+currently observed when Reverie's `Sysno` meets Hermit's `serde::Serialize` and
+`serde::Deserialize` traits in `detcore-model`. Resolving that requires an owner
+decision about one third-party graph versus Hermit's hermetic Reverie pin; this
+bootstrap deliberately does not choose one.
 
 No shared action-cache performance measurement has yet been made. A local
 successful build proves target compatibility only, not the vision's claimed
