@@ -213,6 +213,14 @@ pub fn node(
         cpu_timeout,
         jobs_flag: None,
         skip_reason: None,
+        // `None` means "this step declares nothing", which is what every node here
+        // meant before the runner grew these fields. `Some(vec![])` would be the
+        // stronger claim that the step writes to none of the policy's protected
+        // domains, and nothing in this plan has established that. Hermit's DAGs set
+        // no write-domain policy, so `require_explicit` is false and an omitted
+        // declaration is accepted rather than silently treated as a guarantee.
+        write_domains: None,
+        write_domain_guarantee: None,
     }
 }
 
