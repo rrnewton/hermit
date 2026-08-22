@@ -219,6 +219,90 @@ hermit record start -- /bin/echo recorded
 hermit replay --autopilot
 ```
 
+### Debug Adapter Protocol
+
+Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
+`hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
+system root configured so GDB does not request shared libraries from Hermit's
+remote server. A GDB build with the DAP interpreter is required. Use `--gdb`
+when that executable is not `/usr/bin/gdb`:
+
+```bash
+cargo build -p hermit --bin hermit --bin hermit-dap
+target/debug/hermit run --gdbserver --gdbserver-port=1234 -- /path/to/program
+
+# Or serve the latest recording without launching GDB itself.
+target/debug/hermit replay --serve-only --gdbserver-port=1234
+```
+
+In another terminal, a DAP client can spawn `target/debug/hermit-dap` and send
+an `attach` request containing the executable and remote target. For example,
+[Dapper](https://github.com/facebookexperimental/dapper) can run this session
+from a JSON configuration:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap"
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  },
+  "breakpoints": [
+    {
+      "type": "source",
+      "path": "/path/to/program.c",
+      "line": 12
+    }
+  ],
+  "installDefaultExceptionBreakpoints": false
+}
+```
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap.json
+dapper debug --control-port 4711 continue 1
+dapper debug --control-port 4711 stack-trace 1
+dapper debug --control-port 4711 step over 1
+```
+
+The same adapter command can be used by an editor or another DAP client. To
+enable reverse execution for a recording, let the adapter manage the replay by
+adding the recording arguments to `spawnConfig`:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap",
+    "args": [
+      "--replay", "RECORDING_ID",
+      "--data-dir", "/path/to/recordings",
+      "--gdbserver-port", "1234"
+    ]
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  }
+}
+```
+
+In this mode the adapter advertises `supportsStepBack` and implements DAP
+`stepBack` and `reverseContinue` by restarting the deterministic replay and
+running forward to the requested earlier source position. This first
+implementation favors correctness over speed.
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap-replay.json
+dapper debug --control-port 4711 step back 1
+dapper debug --control-port 4711 reverse-continue 1
+```
+
 ### Chaos Mode Demonstration
 
 The `order_violation` guest reads shared state without ensuring that another
