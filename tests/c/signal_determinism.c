@@ -494,6 +494,96 @@ static int test_blocking_sigsuspend(void) {
   return 0;
 }
 
+static int test_pending_sigsuspend(void) {
+  suspend_deliveries = 0;
+
+  sigset_t blocked;
+  sigset_t previous;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
+    perror("sigprocmask");
+    return 1;
+  }
+
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = suspend_handler;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGUSR1, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (raise(SIGUSR1) != 0) {
+    perror("raise");
+    return 1;
+  }
+
+  sigset_t pending;
+  if (sigpending(&pending) != 0 || sigismember(&pending, SIGUSR1) != 1) {
+    fputs("SIGUSR1 was not pending before sigsuspend\n", stderr);
+    return 1;
+  }
+
+  sigset_t wait_mask = previous;
+  sigdelset(&wait_mask, SIGUSR1);
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  const int suspend_errno = errno;
+  const int restored = signal_is_blocked(SIGUSR1);
+  if (sigpending(&pending) != 0) {
+    perror("sigpending after sigsuspend");
+    return 1;
+  }
+  const int remains_pending = sigismember(&pending, SIGUSR1);
+
+  if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0) {
+    perror("sigprocmask restore");
+    return 1;
+  }
+  if (suspend_result != -1 || suspend_errno != EINTR) {
+    fprintf(
+        stderr,
+        "pending sigsuspend returned result=%d errno=%d\n",
+        suspend_result,
+        suspend_errno);
+    return 1;
+  }
+  if (suspend_deliveries != 1 || restored != 1 || remains_pending != 0) {
+    fprintf(
+        stderr,
+        "unexpected pending sigsuspend state: deliveries=%d restored=%d pending=%d\n",
+        (int)suspend_deliveries,
+        restored,
+        remains_pending);
+    return 1;
+  }
+
+  printf(
+      "pending sigsuspend restored=%d deliveries=%d pending=%d\n",
+      restored,
+      (int)suspend_deliveries,
+      remains_pending);
+  return 0;
+}
+
+static int test_blocking_sigsuspend_without_signal(void) {
+  sigset_t wait_mask;
+  sigfillset(&wait_mask);
+
+  static const char ready[] = "sigsuspend waiting without a signal\n";
+  write_message(ready, sizeof(ready) - 1);
+
+  errno = 0;
+  const int suspend_result = sigsuspend(&wait_mask);
+  fprintf(
+      stderr,
+      "unexpected sigsuspend return result=%d errno=%d\n",
+      suspend_result,
+      errno);
+  return 2;
+}
+
 static void* check_clone_mask(void* argument) {
   (void)argument;
   const int blocked = signal_is_blocked(SIGUSR1);
@@ -789,6 +879,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "blocking-sigsuspend") == 0) {
     return test_blocking_sigsuspend();
+  }
+  if (strcmp(argv[1], "pending-sigsuspend") == 0) {
+    return test_pending_sigsuspend();
+  }
+  if (strcmp(argv[1], "blocking-sigsuspend-no-signal") == 0) {
+    return test_blocking_sigsuspend_without_signal();
   }
   if (strcmp(argv[1], "masks-fork-clone") == 0) {
     return test_masks_across_fork_and_clone();

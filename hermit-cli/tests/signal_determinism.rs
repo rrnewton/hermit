@@ -7,15 +7,26 @@
  */
 
 use std::fs;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 const DETERMINISM_RUNS: usize = 5;
+const DEADLOCK_RUNS: usize = 3;
+const DEADLOCK_BOUND: Duration = Duration::from_secs(5);
+const DEADLOCK_CLEANUP_BOUND: Duration = Duration::from_secs(1);
+const DEADLOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 static HERMIT_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
 static SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -33,6 +44,91 @@ fn command_output(mut command: Command, label: &str) -> Output {
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn kill_created_process_group(pid: u32, label: &str) {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            panic!("failed to kill created {label} process group {pid}: {error}");
+        }
+    }
+}
+
+fn reap_killed_child(child: &mut std::process::Child, label: &str) -> std::process::ExitStatus {
+    let deadline = Instant::now() + DEADLOCK_CLEANUP_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() >= deadline => {
+                panic!(
+                    "created {label} process group did not exit within {DEADLOCK_CLEANUP_BOUND:?} after SIGKILL"
+                );
+            }
+            Ok(None) => std::thread::sleep(DEADLOCK_POLL_INTERVAL),
+            Err(error) => panic!("failed to reap killed {label}: {error}"),
+        }
+    }
+}
+
+fn bounded_command_output(mut command: Command, label: &str) -> (Output, bool, Duration) {
+    let mut stdout = tempfile::tempfile()
+        .unwrap_or_else(|error| panic!("failed to create {label} stdout capture: {error}"));
+    let mut stderr = tempfile::tempfile()
+        .unwrap_or_else(|error| panic!("failed to create {label} stderr capture: {error}"));
+    command
+        .process_group(0)
+        .stdout(Stdio::from(stdout.try_clone().unwrap_or_else(|error| {
+            panic!("failed to clone {label} stdout capture: {error}")
+        })))
+        .stderr(Stdio::from(stderr.try_clone().unwrap_or_else(|error| {
+            panic!("failed to clone {label} stderr capture: {error}")
+        })));
+    let rendered = format!("{command:?}");
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
+    let (status, process_timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (status, false),
+            Ok(None) if started.elapsed() >= DEADLOCK_BOUND => {
+                kill_created_process_group(child.id(), label);
+                break (reap_killed_child(&mut child, label), true);
+            }
+            Ok(None) => std::thread::sleep(DEADLOCK_POLL_INTERVAL),
+            Err(error) => {
+                kill_created_process_group(child.id(), label);
+                let _ = reap_killed_child(&mut child, label);
+                panic!("failed to poll {label}: {rendered}: {error}");
+            }
+        }
+    };
+    stdout
+        .seek(SeekFrom::Start(0))
+        .unwrap_or_else(|error| panic!("failed to rewind {label} stdout capture: {error}"));
+    stderr
+        .seek(SeekFrom::Start(0))
+        .unwrap_or_else(|error| panic!("failed to rewind {label} stderr capture: {error}"));
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .unwrap_or_else(|error| panic!("failed to read {label} stdout capture: {error}"));
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .unwrap_or_else(|error| panic!("failed to read {label} stderr capture: {error}"));
+    let elapsed = started.elapsed();
+    (
+        Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        },
+        process_timed_out || elapsed >= DEADLOCK_BOUND,
+        elapsed,
+    )
 }
 
 fn hermit_signal_lock() -> MutexGuard<'static, ()> {
@@ -168,6 +264,79 @@ fn blocking_sigsuspend_releases_the_scheduler() {
         "blocking-sigsuspend",
         "sigsuspend delivered\nsigsuspend restored=1 deliveries=1\n",
     );
+}
+
+#[test]
+fn pending_signal_completes_sigsuspend_and_restores_mask() {
+    run_signal_scenario(
+        "pending-sigsuspend",
+        "sigsuspend delivered\npending sigsuspend restored=1 deliveries=1 pending=0\n",
+    );
+}
+
+#[test]
+fn sigsuspend_without_signal_reports_terminal_deadlock() {
+    let _guard = hermit_signal_lock();
+    let mut baseline_stderr = None;
+
+    for iteration in 0..DEADLOCK_RUNS {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command.args([
+            "--log=off",
+            "run",
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--base-env=minimal",
+            "--",
+        ]);
+        command
+            .arg(signal_guest())
+            .arg("blocking-sigsuspend-no-signal");
+        let label = format!("no-signal sigsuspend scenario, iteration {}", iteration + 1);
+        let (output, timed_out, elapsed) = bounded_command_output(command, &label);
+        assert!(
+            !timed_out,
+            "{label} exceeded the {DEADLOCK_BOUND:?} host bound; the scheduler emitted no terminal verdict"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label} did not exit with the scheduler deadlock status in {elapsed:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            output.stdout, b"sigsuspend waiting without a signal\n",
+            "{label} did not reach rt_sigsuspend"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for expected in [
+            "Deadlock detected: thread(s) waiting in rt_sigsuspend with no possible signal, but no runnable threads left.",
+            "external IO blockers: none",
+            "rt_sigsuspend blockers (1), by dettid:",
+        ] {
+            assert!(
+                stderr.contains(expected),
+                "{label} missing {expected:?}:\n{stderr}"
+            );
+        }
+        assert!(
+            !stderr.contains("unexpected sigsuspend return"),
+            "{label} returned from sigsuspend instead of diagnosing the wait:\n{stderr}"
+        );
+
+        if let Some(first) = &baseline_stderr {
+            assert_eq!(
+                output.stderr,
+                *first,
+                "no-signal sigsuspend diagnostic changed on iteration {}",
+                iteration + 1
+            );
+        } else {
+            baseline_stderr = Some(output.stderr);
+        }
+    }
 }
 
 #[test]

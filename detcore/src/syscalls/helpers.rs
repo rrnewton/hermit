@@ -56,6 +56,40 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(guest, call, ResourceID::BlockingExternalIO(op_id))
+            .await
+    }
+
+    /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
+    /// its signal-only completion condition for the scheduler.
+    pub async fn record_or_replay_rt_sigsuspend<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigsuspend,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(
+            guest,
+            call.into(),
+            ResourceID::BlockingRtSigsuspend(op_id),
+        )
+        .await
+    }
+
+    async fn record_or_replay_blocking_resource<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        blocking_resource: ResourceID,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = match &blocking_resource {
+            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id) => {
+                *op_id
+            }
+            _ => unreachable!("blocking syscall helper requires a blocking resource"),
+        };
         // Internal-vs-external fd classification happens at the call sites that hold the
         // typed, nonblockize-able syscall (see execute_nonblockable_fd_syscall):
         // container-internal pipes are routed to the InternalIOPolling nonblockize-retry
@@ -78,7 +112,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             // With sequentialization enabled, only truly EXTERNAL endpoints reach here.
             // Without it, resource_request is a no-op and internal fds may block directly.
-            rsrcs.insert(ResourceID::BlockingExternalIO(op_id), Permission::RW);
+            rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
