@@ -1605,7 +1605,8 @@ pub fn run_with_backend(
 }
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
-fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+#[doc(hidden)]
+pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
     config.discover_live_file_metadata = backend == Backend::Sabre;
     config.use_thread_local_clock_reads = backend == Backend::Sabre;
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
