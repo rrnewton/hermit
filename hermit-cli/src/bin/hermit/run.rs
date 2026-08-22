@@ -2167,6 +2167,7 @@ impl RunOpts {
                     self.verify_allow,
                     self.summary,
                     global.log,
+                    global.log_file.as_deref(),
                     &self.effective_det_config(),
                     environment,
                 );
