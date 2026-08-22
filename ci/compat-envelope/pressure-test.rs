@@ -32,6 +32,7 @@ use std::time::UNIX_EPOCH;
 
 use safe_ci_dag_runner::io::dag_from_json;
 use safe_ci_dag_runner::io::dag_to_json;
+use safe_ci_dag_runner::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::ResourceHint;
 use safe_ci_dag_runner::model::RunResult;
@@ -40,6 +41,8 @@ use safe_ci_dag_runner::model::StepClass;
 use safe_ci_dag_runner::model::StepOutcome;
 use safe_ci_dag_runner::model::effective_cpu_count;
 use safe_ci_dag_runner::model::effective_cpu_timeout;
+use safe_ci_dag_runner::cgroup::aggregate_slice_max_cpus;
+use safe_ci_dag_runner::container_core_budget;
 use safe_ci_dag_runner::scheduler::BoxedCgroups;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
 use serde::Deserialize;
@@ -926,6 +929,13 @@ fn execute_typed_dag(
         }
 
         passes += 1;
+        // This graph clones the canonical build steps out of ci/dag/portable.json,
+        // including the two that bake a 32-wide cargo invocation into the command and
+        // therefore carry an empty jobs_flag. The runner refuses before any node
+        // starts if the CPU budget is narrower than such a step's declared width, and
+        // the budget defaults to `jobs`, so it must be passed explicitly here for the
+        // same reason as in scripts/validate.rs::scheduler_cpu_budget.
+        let cpu_budget = container_core_budget().min(aggregate_slice_max_cpus()).max(1);
         let result: RunResult = run_dag_boxed_deadline(
             &pass,
             jobs,
@@ -933,7 +943,7 @@ fn execute_typed_dag(
             1,
             cgroups.clone(),
             None,
-            None,
+            Some(cpu_budget),
             Some(remaining),
         );
         if result.run_timed_out {
@@ -2276,6 +2286,12 @@ fn write_plan_after_scorecard_check(
             cpu_timeout: wall * 2,
             jobs_flag: None,
             skip_reason: None,
+            // Undeclared. These cells already serialize their cargo writes through
+            // the `cargo_writer` resource cap above, and restating that as a write
+            // domain would change how the scheduler treats them rather than leaving
+            // the pressure DAG measuring what it measured before.
+            write_domains: None,
+            write_domain_guarantee: None,
         });
         preparation_tags.insert(test, tag);
     }
@@ -2430,6 +2446,8 @@ fn write_plan_after_scorecard_check(
                 cpu_timeout: wall * 2,
                 jobs_flag: None,
                 skip_reason: None,
+                write_domains: None,
+                write_domain_guarantee: None,
             });
             cell_tags.push(tag);
         }
@@ -2460,6 +2478,8 @@ fn write_plan_after_scorecard_check(
         cpu_timeout: 120,
         jobs_flag: None,
         skip_reason: None,
+        write_domains: None,
+        write_domain_guarantee: None,
     });
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
@@ -2641,8 +2661,20 @@ fn assert_plan_round_trip(expected: &DagConfig, actual: &DagConfig) -> Result<()
             || before.timeout != after.timeout
             || before.hint.hard_mem_max_bytes != after.hint.hard_mem_max_bytes
             || before.hint.resources != after.hint.resources
-            || effective_cpu_timeout(before, expected.default_step_cpu_timeout)
-                != effective_cpu_timeout(after, actual.default_step_cpu_timeout)
+            // The platform multiplier is caller policy and is deliberately NOT
+            // persisted with the graph, so the reparsed copy always carries the
+            // default. Scaling both sides by the SAME multiplier keeps this a
+            // comparison of the graph's caps; taking each config's own would make a
+            // lane that sets a multiplier fail a round trip that did not change.
+            || effective_cpu_timeout(
+                before,
+                expected.default_step_cpu_timeout,
+                expected.cpu_timeout_multiplier,
+            ) != effective_cpu_timeout(
+                after,
+                actual.default_step_cpu_timeout,
+                expected.cpu_timeout_multiplier,
+            )
             || effective_cpu_count(before, expected.default_step_cpu_count)
                 != effective_cpu_count(after, actual.default_step_cpu_count)
         {
@@ -4020,6 +4052,12 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         return Err("typed scheduler outcome retention changed exact cell identities".into());
     }
 
+    // Both fixtures declare no CPU budget (cpu_timed_out=false, cpu_timeout=0), so the
+    // three CPU-policy arguments are the inert triple: canonical 0, the default
+    // multiplier, and no platform label. That keeps `cpu_timeout_policy_suffix` silent
+    // and leaves both `reason` strings exactly what they were before the runner grew
+    // the arguments — this bracket is about telling a wall timeout from an OOM, not
+    // about CPU-budget scaling.
     let timeout = StepOutcome::failed(
         "cell.timeout".into(),
         1.0,
@@ -4031,6 +4069,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         1,
         false,
         0,
+        0,
+        DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+        "",
         false,
         None,
         None,
@@ -4046,6 +4087,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         1,
         false,
         0,
+        0,
+        DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+        "",
         false,
         None,
         None,
