@@ -91,11 +91,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use safe_ci_dag_runner::cgroup::aggregate_slice_max_cpus;
 use safe_ci_dag_runner::cgroup::is_in_scope;
 use safe_ci_dag_runner::model::DagConfig;
 use safe_ci_dag_runner::model::RunResult;
 use safe_ci_dag_runner::model::Step;
 use safe_ci_dag_runner::model::StepOutcome;
+use safe_ci_dag_runner::container_core_budget;
 use safe_ci_dag_runner::perflog::append_step_profiles;
 use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
 use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
@@ -649,6 +651,29 @@ fn nested_scope_probe_step(
     step.hint.preferred_inner_jobs = Some(1);
     step.jobs_flag = Some(String::new());
     step
+}
+
+/// Total CPU cores the scheduler may hand out across concurrently running steps.
+///
+/// This is a DIFFERENT quantity from `-j`, which bounds how many steps run at
+/// once, and the runner now takes both. Passing `None` defaults the CPU budget to
+/// the active-step width, and the runner then refuses before any node starts if a
+/// step declares a wider `preferred_inner_jobs` than the budget AND manages its own
+/// concurrency (an empty `jobs_flag`) — because clamping such a step's cgroup quota
+/// alone would leave its original worker count running inside a smaller box, which
+/// is a slowdown disguised as a limit. Four nodes are in exactly that position:
+/// `build.workspace` and `build.runtime_release` at 32, and
+/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All four
+/// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
+/// 2, cap 16) would refuse the entire run.
+///
+/// The value is the one the runner's own CLI defaults to: the ambient
+/// container/affinity budget, tightened by the shared aggregate slice's quota. On a
+/// host too small to satisfy a declared width the run still refuses, which is the
+/// intended fail-closed behavior — the fix there is the step's declaration, not a
+/// wider number here.
+fn scheduler_cpu_budget() -> i64 {
+    container_core_budget().min(aggregate_slice_max_cpus()).max(1)
 }
 
 fn run_one_nested_scope_probe_step(
@@ -4744,7 +4769,7 @@ fn run_lane_with_env_retries(
         verbosity,
         cgroups.clone(),
         None,
-        None,
+        Some(scheduler_cpu_budget()),
         remaining_budget_s(deadline),
     );
     if record_step_profiles {
@@ -4827,7 +4852,7 @@ fn run_lane_with_env_retries(
             verbosity,
             cgroups.clone(),
             None,
-            None,
+            Some(scheduler_cpu_budget()),
             remaining_budget_s(deadline),
         );
         if record_step_profiles {
