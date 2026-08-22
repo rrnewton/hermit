@@ -16,6 +16,13 @@ git submodule update --init --recursive
 ./bootstrap/buck2 build //hermit-cli:hermit
 ```
 
+At this revival checkpoint, the complete generated third-party target pattern
+is a diagnostic rather than a green gate. The Linux build still reports the
+historical Windows-only `winapi` analysis exception, and current optional
+`reverie-dbt` and `reverie-sabre` packages need their Cargo build-script outputs
+represented in Reindeer fixups. Neither optional package is on the default
+`//hermit-cli:hermit` dependency path.
+
 Prerequisites are Git, rustup, and the open-source
 [DotSlash](https://dotslash-cli.com) launcher.
 
@@ -42,12 +49,13 @@ repository-root `.gitignore` files exclude generated paths. Those patterns must
 not move into `shim/.gitignore`: pinned Reindeer reads ignore files through the
 shim cell root and would otherwise generate empty crates.
 
-The historical build reaches `//hermit-cli:hermit` and then stops because the
+The current build reaches `//hermit-cli:hermit` and then stops because the
 Hermit and Reverie cells compile separate copies of third-party Rust crates.
 Types crossing the cell boundary consequently have distinct trait identities,
-first observed when Reverie's `Sysno` met Hermit's `serde` traits. Resolving
-that requires an owner decision about one third-party graph versus Hermit's
-hermetic Reverie pin; this bootstrap deliberately does not choose one.
+currently observed when Reverie's `Sysno` meets Hermit's `serde::Serialize`
+and `serde::Deserialize` traits in `detcore-model`. Resolving that requires an
+owner decision about one third-party graph versus Hermit's hermetic Reverie
+pin; this bootstrap deliberately does not choose one.
 
 No shared action-cache performance measurement has yet been made. A local
 successful build proves target compatibility only, not the vision's claimed
