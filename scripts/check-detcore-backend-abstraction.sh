@@ -173,12 +173,6 @@ if [[ -z $backend_output ]]; then
     exit 2
 fi
 mapfile -t BACKEND_CRATES <<< "$backend_output"
-BACKEND_MODS_RE=""
-for backend in "${BACKEND_CRATES[@]}"; do
-    module=${backend//-/_}
-    BACKEND_MODS_RE+="${BACKEND_MODS_RE:+|}${module}"
-done
-readonly BACKEND_MODS_RE
 info "derived prohibited Reverie crates from workspace: ${BACKEND_CRATES[*]}"
 
 violations=0
@@ -234,8 +228,122 @@ fi
 
 # --- 2. library source: no backend imports -----------------------------------
 
-src_hits="$(grep -rnE "(^|[^A-Za-z0-9_])(${BACKEND_MODS_RE})([^A-Za-z0-9_]|$)" \
-    "$DETCORE_SRC" 2>/dev/null | grep -vE '^\s*[^:]+:[0-9]+:\s*//' || true)"
+src_hits="$(python3 - "$DETCORE_SRC" "${BACKEND_CRATES[@]}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source_root = Path(sys.argv[1])
+backend_modules = [crate.replace("-", "_") for crate in sys.argv[2:]]
+module_pattern = "|".join(re.escape(module) for module in backend_modules)
+identifier = rf"(?<![A-Za-z0-9_])(?:{module_pattern})(?![A-Za-z0-9_])"
+path_reference = re.compile(identifier + r"\s*::")
+extern_crate = re.compile(r"\bextern\s+crate\s+(?:" + module_pattern + r")\b")
+use_statement = re.compile(r"\buse\b(?P<body>[^;]*);", re.DOTALL)
+module_name = re.compile(identifier)
+
+
+def blank(chars, start, end):
+    for index in range(start, end):
+        if chars[index] != "\n":
+            chars[index] = " "
+
+
+def mask_comments_and_literals(source):
+    chars = list(source)
+    length = len(source)
+    index = 0
+    while index < length:
+        if source.startswith("//", index):
+            end = source.find("\n", index + 2)
+            if end == -1:
+                end = length
+            blank(chars, index, end)
+            index = end
+            continue
+
+        if source.startswith("/*", index):
+            depth = 1
+            end = index + 2
+            while end < length and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            blank(chars, index, end)
+            index = end
+            continue
+
+        raw = re.match(r'(?:br|cr|r)(?P<hashes>#{0,255})"', source[index:])
+        if raw and (index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_")):
+            terminator = '"' + raw.group("hashes")
+            end = source.find(terminator, index + raw.end())
+            end = length if end == -1 else end + len(terminator)
+            blank(chars, index, end)
+            index = end
+            continue
+
+        if source[index] == '"':
+            end = index + 1
+            escaped = False
+            while end < length:
+                char = source[end]
+                end += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    break
+            blank(chars, index, end)
+            index = end
+            continue
+
+        if source[index] == "'" and index + 2 < length:
+            if source[index + 1] == "\\":
+                end = index + 2
+                while end < length and source[end] != "\n":
+                    if source[end] == "'" and source[end - 1] != "\\":
+                        end += 1
+                        blank(chars, index, end)
+                        index = end
+                        break
+                    end += 1
+                else:
+                    index += 1
+                continue
+            if source[index + 2] == "'":
+                blank(chars, index, index + 3)
+                index += 3
+                continue
+
+        index += 1
+    return "".join(chars)
+
+
+for path in sorted(source_root.rglob("*.rs")):
+    source = path.read_text(encoding="utf-8")
+    code = mask_comments_and_literals(source)
+    hit_offsets = {match.start() for match in path_reference.finditer(code)}
+    hit_offsets.update(match.start() for match in extern_crate.finditer(code))
+    for statement in use_statement.finditer(code):
+        hit_offsets.update(
+            statement.start("body") + match.start()
+            for match in module_name.finditer(statement.group("body"))
+        )
+    lines = source.splitlines()
+    for offset in sorted(hit_offsets):
+        line_number = code.count("\n", 0, offset) + 1
+        print(f"{path}:{line_number}:{lines[line_number - 1]}")
+PY
+)" || {
+    err "failed to scan detcore Rust source"
+    exit 2
+}
 
 if [[ -n $src_hits ]]; then
     err "detcore/src references a non-core Reverie crate module:"
@@ -250,7 +358,7 @@ fi
 # control, not a mock: each recursive invocation re-derives its prohibited set
 # from the scratch workspace after the planted dependency is added.
 run_negative_controls() {
-    local scratch backend output status
+    local scratch backend module output status
     local -a control_crates=("${BACKEND_CRATES[@]}")
 
     # e9patch is not currently declared by a workspace member, so it cannot be
@@ -292,6 +400,77 @@ run_negative_controls() {
         fi
         ok "negative control: planted $backend dependency was rejected"
     done
+
+    backend=${BACKEND_CRATES[0]}
+    module=${backend//-/_}
+
+    if ! scratch=$(mktemp -d); then
+        err "source negative control could not create a scratch directory"
+        return 1
+    fi
+    if ! cp -a "$REPO_ROOT/detcore" "$scratch/detcore" ||
+       ! printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' \
+            > "$scratch/Cargo.toml" ||
+       ! printf '\n[target.'"'"'cfg(any())'"'"'.dev-dependencies]\n%s = "0.2.0"\n' \
+            "$backend" >> "$scratch/detcore/Cargo.toml" ||
+       ! printf 'extern crate %s;\nuse %s::CheckpointNegativeControl;\nfn source_path() { %s::checkpoint_negative_control(); }\n' \
+            "$module" "$module" "$module" \
+            > "$scratch/detcore/src/backend_abstraction_negative_control.rs"; then
+        err "source negative control could not prepare the scratch copy"
+        rm -rf -- "$scratch"
+        return 1
+    fi
+
+    output="$("${BASH_SOURCE[0]}" --repo-root "$scratch" \
+        --skip-negative-control 2>&1)"
+    status=$?
+    rm -rf -- "$scratch"
+
+    if ((status != 1)); then
+        err "source negative control returned $status, expected 1"
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    for expected in \
+        "backend_abstraction_negative_control.rs:1:extern crate $module;" \
+        "backend_abstraction_negative_control.rs:2:use $module::" \
+        "backend_abstraction_negative_control.rs:3:fn source_path() { $module::"; do
+        if ! grep -Fq "$expected" <<< "$output"; then
+            err "source negative control failed without identifying: $expected"
+            printf '%s\n' "$output" >&2
+            return 1
+        fi
+    done
+    ok "negative control: planted $module extern, import, and source path were rejected"
+
+    if ! scratch=$(mktemp -d); then
+        err "literal/comment control could not create a scratch directory"
+        return 1
+    fi
+    if ! cp -a "$REPO_ROOT/detcore" "$scratch/detcore" ||
+       ! printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' \
+            > "$scratch/Cargo.toml" ||
+       ! printf '\n[target.'"'"'cfg(any())'"'"'.dev-dependencies]\n%s = "0.2.0"\n' \
+            "$backend" >> "$scratch/detcore/Cargo.toml" ||
+       ! printf 'const NORMAL: &str = "%s::evidence";\nconst RAW: &str = r#"%s::evidence"#;\n// use %s::Comment;\n/* %s::Comment */\n' \
+            "$module" "$module" "$module" "$module" \
+            > "$scratch/detcore/src/backend_abstraction_literal_control.rs"; then
+        err "literal/comment control could not prepare the scratch copy"
+        rm -rf -- "$scratch"
+        return 1
+    fi
+
+    output="$("${BASH_SOURCE[0]}" --repo-root "$scratch" \
+        --skip-negative-control 2>&1)"
+    status=$?
+    rm -rf -- "$scratch"
+
+    if ((status != 0)); then
+        err "literal/comment control returned $status, expected 0"
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    ok "literal/comment control: $module text outside Rust code was accepted"
 }
 
 # --- summary -----------------------------------------------------------------
