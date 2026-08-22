@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af82f1b92a2762840dc5894984be5e1f5bfc5cb9 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie af82f1b92a2762840dc5894984be5e1f5bfc5cb9" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f2e9839e5316e31c377089ae7f789515ba9d2550 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie f2e9839e5316e31c377089ae7f789515ba9d2550" >&2
     return 2
 fi
 
@@ -513,10 +513,10 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
 #
-# CARRY TO af82f1b9 (2026-08-20), ACROSS SIX PINS IN ONE SEQUENCE. The
+# CARRY TO f2e9839e (2026-08-21), ACROSS SEVEN PINS IN ONE SEQUENCE. The
 # calibration carries unchanged and the RECIPE IDENTITY DOES NOT MOVE: this is
 # the 0384d673 case, not the c261050 case, because neither source_recipe_key()
-# file input differs at ANY of the six pins between c261050 and af82f1b9.
+# file input differs at ANY of the seven pins between c261050 and f2e9839e.
 #
 #   pin        reverie-dbt/vendor/dynamorio                  reverie-dbt/build.rs
 #   c261050c   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
@@ -526,6 +526,7 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 #   efb7b08c   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #   268a25b6   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #   af82f1b9   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   f2e9839e   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #
 # So the identity stays sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
 # and no derivation is needed; the entry above already validated that value.
@@ -542,6 +543,10 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # reverie-dbt files plus reverie-ptrace/src/tracer.rs at af82f1b9 are compiled by
 # Hermit, so this sequence requires REAL revalidation. This carry authorizes
 # reusing the budget, never reusing a receipt.
+#
+# f2e9839e changes only .github/workflows/ci.yml and
+# .github/workflows/merge-gate.yml. It changes neither recipe input nor any
+# source compiled by Hermit; the real Hermit validation still runs below.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
