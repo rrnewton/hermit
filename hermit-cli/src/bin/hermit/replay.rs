@@ -111,10 +111,11 @@ impl ReplayOpts {
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
 
-        if autopilot {
+        let replay = if autopilot {
             hermit.replay(id)
         } else {
             hermit.replay_with_gdbserver(id, self.gdbserver_port)
-        }
+        };
+        replay.or_else(super::replay_no_result)
     }
 }

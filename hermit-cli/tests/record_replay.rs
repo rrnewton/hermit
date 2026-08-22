@@ -8,11 +8,13 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -214,6 +216,7 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            ("c_write_ignore_output_error", "write_ignore_output_error.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -329,6 +332,54 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     assert_eq!(
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
+    );
+}
+
+#[test]
+fn replay_output_emission_failure_is_no_result() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create replay output recording directory");
+    let guest = workload("c_write_ignore_output_error");
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(&guest.path);
+    let record_output = command_output(record, "recording output-emission failure workload");
+    assert_eq!(record_output.stdout, b"captured-output\n");
+
+    let mut replay = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replay_output = command_output(replay, "successful output-emission replay control");
+    assert_eq!(replay_output.stdout, record_output.stdout);
+
+    let full = OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("failed to open /dev/full");
+    let mut replay_to_full = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    replay_to_full
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .stdout(Stdio::from(full));
+    let output = replay_to_full
+        .output()
+        .expect("failed to start replay with /dev/full output");
+    assert_eq!(
+        output.status.code(),
+        Some(hermit::NO_RESULT_EXIT_CODE),
+        "output emission failure must report no result, not guest success: stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("captured replay output could not be emitted"),
+        "missing output-emission diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

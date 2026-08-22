@@ -95,6 +95,61 @@ use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::normalize_unused_args;
 
+const REPLAY_OUTPUT_EMISSION_ERROR_PREFIX: &str = "captured replay output could not be emitted";
+
+#[derive(Debug)]
+pub(crate) struct ReplayOutputEmissionError(String);
+
+impl std::fmt::Display for ReplayOutputEmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{REPLAY_OUTPUT_EMISSION_ERROR_PREFIX}: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ReplayOutputEmissionError {}
+
+static REPLAY_OUTPUT_EMISSION_ERROR: OnceLock<Mutex<Option<ReplayOutputEmissionError>>> =
+    OnceLock::new();
+
+pub(crate) fn reset_replay_output_emission_error() {
+    *REPLAY_OUTPUT_EMISSION_ERROR
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+pub(crate) fn record_replay_output_emission_error(error: std::io::Error) {
+    let mut recorded = REPLAY_OUTPUT_EMISSION_ERROR
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if recorded.is_none() {
+        *recorded = Some(ReplayOutputEmissionError(error.to_string()));
+    }
+}
+
+pub(crate) fn take_replay_output_emission_error() -> Option<Error> {
+    REPLAY_OUTPUT_EMISSION_ERROR
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .map(|error| Error::Tool(anyhow::Error::new(error)))
+}
+
+pub(crate) fn is_replay_output_emission_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<ReplayOutputEmissionError>().is_some()
+            || cause
+                .to_string()
+                .starts_with(REPLAY_OUTPUT_EMISSION_ERROR_PREFIX)
+    })
+}
+
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Default, Serialize, Deserialize)]

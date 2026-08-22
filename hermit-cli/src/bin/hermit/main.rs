@@ -360,6 +360,15 @@ fn display_error(error: Error) {
     }
 }
 
+fn replay_no_result(error: Error) -> Result<ExitStatus, Error> {
+    if hermit::is_replay_output_emission_error(&error) {
+        display_error(error);
+        Ok(ExitStatus::Exited(hermit::NO_RESULT_EXIT_CODE))
+    } else {
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;

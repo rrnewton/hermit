@@ -38,6 +38,7 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::Replayer;
+use super::record_replay_output_emission_error;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
@@ -802,9 +803,11 @@ impl Replayer {
         };
         let _guard = output_lock.lock().await;
         let output = self.output_endpoint(output_fd);
-        emit_replay_output(output, &bytes, output_offset, advances_output_offset)
-            .await
-            .map_err(|error| Errno::from_io_error(error).unwrap_or(Errno::EIO))?;
+        if let Err(error) =
+            emit_replay_output(output, &bytes, output_offset, advances_output_offset).await
+        {
+            record_replay_output_emission_error(error);
+        }
         Ok(())
     }
 
