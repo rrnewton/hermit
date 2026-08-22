@@ -1,0 +1,23 @@
+# Inventory paths currently selected as integration-invocation claims. Every
+# selected claim must be recorded here, and every recorded path must remain in
+# the selected population. This prevents a claim from silently opting out by
+# changing to an unrecognized prose or runner form.
+tests/shell/date.sh
+tests/shell/devrand.sh
+tests/shell/non_strict/curl.sh
+tests/shell/par_work.sh
+tests/shell/py_hello.sh
+tests/shell/race.sh
+tests/shell/taskset.sh
+tests/standalone/cat_proc_uptime.sh
+tests/standalone/curl_client_only.sh
+tests/standalone/env_var_passthru.sh
+tests/standalone/minimal_hello_backtraces.sh
+tests/standalone/replay_and_print_stacktraces.sh
+tests/standalone/replay_chaos_trace.sh
+tests/standalone/replay_trace.sh
+tests/standalone/stacktrace_signal.sh
+tests/standalone/strict_setitimer.sh
+tests/standalone/strict_timer_create.sh
+tests/standalone/test_no_networking_network_bind.sh
+tests/standalone/validate_race_example_properties.sh
