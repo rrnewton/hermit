@@ -219,6 +219,57 @@ hermit record start -- /bin/echo recorded
 hermit replay --autopilot
 ```
 
+### Debug Adapter Protocol
+
+Hermit exposes a GDB remote target with `run --gdbserver` and `replay`.
+`hermit-dap` starts GDB's Debug Adapter Protocol interpreter with the local
+system root configured so GDB does not request shared libraries from Hermit's
+remote server. A GDB build with the DAP interpreter is required. Use `--gdb`
+when that executable is not `/usr/bin/gdb`:
+
+```bash
+cargo build -p hermit --bin hermit --bin hermit-dap
+target/debug/hermit run --gdbserver --gdbserver-port=1234 -- /path/to/program
+```
+
+In another terminal, a DAP client can spawn `target/debug/hermit-dap` and send
+an `attach` request containing the executable and remote target. For example,
+[Dapper](https://github.com/facebookexperimental/dapper) can run this session
+from a JSON configuration:
+
+```json
+{
+  "spawnConfig": {
+    "type": "stdio",
+    "cmd": "/path/to/hermit/target/debug/hermit-dap"
+  },
+  "debugRequest": {
+    "request": "attach",
+    "program": "/path/to/program",
+    "target": "127.0.0.1:1234"
+  },
+  "breakpoints": [
+    {
+      "type": "source",
+      "path": "/path/to/program.c",
+      "line": 12
+    }
+  ],
+  "installDefaultExceptionBreakpoints": false
+}
+```
+
+```bash
+dapper proxy --control-port 4711 from-config hermit-dap.json
+dapper debug --control-port 4711 continue 1
+dapper debug --control-port 4711 stack-trace 1
+dapper debug --control-port 4711 step over 1
+```
+
+The same adapter command can be used by an editor or another DAP client. The
+adapter reports GDB's capabilities; reverse execution is not advertised by
+Hermit's GDB server yet.
+
 ### Chaos Mode Demonstration
 
 The `order_violation` guest reads shared state without ensuring that another
