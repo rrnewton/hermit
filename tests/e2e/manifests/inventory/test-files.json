@@ -488,6 +488,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/backend-parity/fixtures/pipe_multiwriter_ordering.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (ptrace verify; ci=true)",
+      "why": "tests/backend-parity/fixtures/pipe_multiwriter_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml: canonical ptrace strict verification compares the guest-visible order of writes from five concurrent pipe writers and the corresponding wait order"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/backend-parity/fixtures/poll_readiness.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false)",
       "why": "tests/backend-parity/fixtures/poll_readiness.c is owned by target/debug/test-harness via tests/e2e/manifests/backend-parity-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
@@ -875,6 +881,12 @@
       "path": "tests/c/epoll_pwait_zero_timeout_progress.c",
       "runner": "hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs",
       "why": "tests/c/epoll_pwait_zero_timeout_progress.c is owned by hermit-cli/tests/epoll_pwait_zero_timeout_progress.rs: Producer/poller guest covering BOTH epoll_pwait scheduler defects in #1850, selected by an optional argv: no argument runs the zero-timeout case (must not STARVE its producer), 'blocking' runs the infinite-timeout case (must not DEADLOCK the scheduler). The blocking mode is the bracket for the headline fix and was added after review found that reverting the epoll_pwait routing left the whole suite green. The Rust integration test compiles it with cc and runs it under hermit, asserting PROGRESS rather than a syscall return value -- a return-value assertion passes while the producer starves. It issues the raw SYS_epoll_pwait with an explicitly NULL sigmask so it pins that exact routing rather than whatever glibc emits. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/errno_path_identity.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
+      "why": "tests/c/errno_path_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: exercises syscall failure cases chosen to fail for argument-intrinsic reasons and prints each errno, so verify's double run asserts that failure is as deterministic as success"
     },
     {
       "disposition": "manifest-test",
