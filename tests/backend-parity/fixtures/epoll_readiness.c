@@ -16,6 +16,10 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 6
+
 int main(void) {
   int ok = 0;
 
@@ -65,5 +69,14 @@ int main(void) {
   close(ep);
 
   printf("epoll ok=%d\n", ok);
+  /* Route a behavioural failure into the exit status. Without this the guest
+     exits 0 whatever `ok` reached, so a regression only lowered the printed
+     number -- and under --verify both runs lower it identically, so the
+     comparison still matches and the cell stays green. Every check above is
+     unchanged; this only requires all of them. */
+  if (ok != EXPECTED_CHECKS) {
+      fprintf(stderr, "epoll completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+      return 1;
+  }
   return 0;
 }
