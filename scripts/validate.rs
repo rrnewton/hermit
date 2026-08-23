@@ -144,6 +144,7 @@ const LEDGER_ENV: &str = "HERMIT_VALIDATE_LEDGER";
 const PARENT_ENV: &str = "DEV_HERMIT_PARENT";
 const OWN_SCOPE_DEADLINE_ENV: &str = "HERMIT_VALIDATE_SCOPE_DEADLINE_MONOTONIC_NS";
 const NESTED_SCOPE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_NESTED_SCOPE_SELF_TEST";
+const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_SELF_TEST";
 const NESTED_SCOPE_OUTER: &str = "outer";
 const NESTED_SCOPE_INNER: &str = "inner";
 const NESTED_SCOPE_SIGNAL: &str = "signal";
@@ -969,6 +970,42 @@ fn self_test() -> Result<(), String> {
                  {no_separator:?}"
             ));
         }
+    }
+
+    let final_command = "  tail -F -- $'/tmp/holder run.log'".to_string();
+    let mut refusal = RunSummary::refused(
+        3,
+        "self-test",
+        "the per-checkout invocation lock",
+        vec!["another validate is already running".into()],
+    )
+    .with_epilogue(vec![
+        "watch the holder's live log with:".into(),
+        final_command.clone(),
+    ]);
+    refusal.cpu_wall = Some((1.0, 0.1, 0.1));
+    let rendered = run_summary_lines(&refusal, std::time::Instant::now());
+    if rendered.last() != Some(&final_command) {
+        return Err(format!(
+            "summary: holder tail command must be the final CLI line, got {:?}",
+            rendered.last()
+        ));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("summary: cannot resolve self-test executable: {error}"))?;
+    let output = Command::new(exe)
+        .arg("--self-test")
+        .env(SUMMARY_EPILOGUE_SELF_TEST_ENV, "1")
+        .output()
+        .map_err(|error| format!("summary: cannot launch CLI output probe: {error}"))?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("summary: CLI output was not UTF-8: {error}"))?;
+    if output.status.code() != Some(3) || stdout.lines().last() != Some(final_command.as_str()) {
+        return Err(format!(
+            "summary: real refused CLI must exit 3 and end with the tail command; status={} last={:?}",
+            output.status,
+            stdout.lines().last()
+        ));
     }
 
     if !nested_scope_probe_selected(true, true)
@@ -6703,6 +6740,9 @@ struct RunSummary {
     exit_code: u8,
     /// One or more lines naming what happened; for a refusal, what and why.
     detail: Vec<String>,
+    /// Operator action rendered after the common footer. A refusal's pasteable
+    /// recovery command belongs here so it is the invocation's final line.
+    epilogue: Vec<String>,
     profile: String,
     commit: String,
     nodes_executed: usize,
@@ -6727,6 +6767,7 @@ impl RunSummary {
             verdict,
             exit_code,
             detail,
+            epilogue: Vec::new(),
             profile: profile.to_string(),
             commit: git_sha(),
             nodes_executed: 0,
@@ -6745,48 +6786,55 @@ impl RunSummary {
         detail.extend(why);
         RunSummary::new(Verdict::Refused, exit_code, profile, detail)
     }
+
+    fn with_epilogue(mut self, epilogue: Vec<String>) -> Self {
+        self.epilogue = epilogue;
+        self
+    }
 }
 
 /// The ONE summary renderer. Called from exactly one place.
 ///
 /// `started` is the process's own start instant, used only when a path stopped
 /// before cleanup could take the authoritative measurement.
-fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
+fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String> {
     if s.verdict == Verdict::Help {
-        return;
+        return Vec::new();
     }
-    println!();
-    println!(
-        "{} validate {} (exit {}) — profile {} @ {}",
-        s.verdict.marker(),
-        s.verdict.word(),
-        s.exit_code,
-        s.profile,
-        s.commit
-    );
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "{} validate {} (exit {}) — profile {} @ {}",
+            s.verdict.marker(),
+            s.verdict.word(),
+            s.exit_code,
+            s.profile,
+            s.commit
+        ),
+    ];
     for line in &s.detail {
-        println!("   {line}");
+        lines.push(format!("   {line}"));
     }
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
     // rather than an absent line a reader has to interpret.
     match s.wall_s {
-        Some(wall) => println!(
+        Some(wall) => lines.push(format!(
             "   nodes: {} executed, {} failed, {} skipped in {}{}",
             s.nodes_executed,
             s.nodes_failed,
             s.nodes_skipped,
             human_duration(wall),
             s.jobs.map(|j| format!(" at -j {j}")).unwrap_or_default()
-        ),
-        None => println!("   nodes: none executed (stopped before the DAG ran)"),
+        )),
+        None => lines.push("   nodes: none executed (stopped before the DAG ran)".into()),
     }
     match &s.log {
-        Some(p) => println!("   durable log: {}", p.display()),
-        None => println!("   durable log: (none — stopped before one was opened)"),
+        Some(p) => lines.push(format!("   durable log: {}", p.display())),
+        None => lines.push("   durable log: (none — stopped before one was opened)".into()),
     }
     if let Some(p) = &s.ledger {
-        println!("   ledger: {}", p.display());
+        lines.push(format!("   ledger: {}", p.display()));
     }
     // ALWAYS printed, on success, failure, refusal, timeout and interruption
     // alike (validate.sh:1751). Wall alone cannot tell a busy run from a wedged
@@ -6800,10 +6848,18 @@ fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
             (started.elapsed().as_secs_f64(), u, sy)
         });
     let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    println!(
+    lines.push(format!(
         "   {}",
         validate_runtime::cpu_wall_line(human_duration, wall, user, sys, host_cpus)
-    );
+    ));
+    lines.extend(s.epilogue.iter().cloned());
+    lines
+}
+
+fn print_run_summary(s: &RunSummary, started: std::time::Instant) {
+    for line in run_summary_lines(s, started) {
+        println!("{line}");
+    }
 }
 
 fn main() -> ExitCode {
@@ -6837,6 +6893,19 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             )
         }
     };
+
+    if args.self_test && std::env::var_os(SUMMARY_EPILOGUE_SELF_TEST_ENV).is_some() {
+        return RunSummary::refused(
+            3,
+            "self-test",
+            "the per-checkout invocation lock",
+            vec!["another validate is already running".into()],
+        )
+        .with_epilogue(vec![
+            "watch the holder's live log with:".into(),
+            "  tail -F -- $'/tmp/holder run.log'".into(),
+        ]);
+    }
 
     if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
         return match run_nested_scope_probe() {
@@ -6989,16 +7058,26 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // duplicating it here would give the fleet two admission controllers that can
     // disagree. `--show-plan` executes nothing, so it is not a second driver and
     // does not contend.
-    let _invocation_lock;
+    let mut invocation_lock;
     if !nesting.nested && !args.show_plan {
         match validate_runtime::acquire_invocation_lock(&root, &profile_name, &git_sha()) {
-            validate_runtime::LockOutcome::Acquired(l) => _invocation_lock = Some(l),
-            validate_runtime::LockOutcome::Busy(why) => {
-                eprintln!("validate: REFUSED — {}", why[0]);
-                for line in why.iter().skip(1) {
-                    eprintln!("  {line}");
-                }
-                return RunSummary::refused(3, &profile_name, "the per-checkout invocation lock", why);
+            validate_runtime::LockOutcome::Acquired(l) => invocation_lock = Some(l),
+            validate_runtime::LockOutcome::Busy { detail, epilogue } => {
+                return RunSummary::refused(
+                    3,
+                    &profile_name,
+                    "the per-checkout invocation lock",
+                    detail,
+                )
+                .with_epilogue(epilogue);
+            }
+            validate_runtime::LockOutcome::SafetyRefusal(error) => {
+                return RunSummary::refused(
+                    3,
+                    &profile_name,
+                    "the per-checkout invocation safety guard",
+                    vec![error],
+                );
             }
             validate_runtime::LockOutcome::Unavailable(e) => {
                 // Fail OPEN here, deliberately: refusing every run because a lock
@@ -7006,11 +7085,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 // concurrency it guards, and the condition is stated rather than
                 // swallowed.
                 eprintln!("validate: WARNING: per-checkout invocation lock unavailable ({e}); proceeding UNGUARDED.");
-                _invocation_lock = None;
+                invocation_lock = None;
             }
         }
     } else {
-        _invocation_lock = None;
+        invocation_lock = None;
     }
 
     // Dirty-tree gate, BEFORE any state is created, so a refusal leaves nothing
@@ -7382,6 +7461,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Safe: just assigned. Cloned so the summary and the ledger can both name it
     // without borrowing the live tee handle.
     let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    // Now that the log exists, tell the holder record where it is, so a validate
+    // REFUSED against this one can print a command to tail it. Gated on actually
+    // holding the lock: a nested payload must never rewrite the outer run's
+    // record, and an UNGUARDED run (lock unavailable) has no record to append to.
+    if let Some(lock) = invocation_lock.as_mut() {
+        validate_runtime::record_invocation_log_path(lock, &log_path);
+    }
     let e2e_result_root =
         match configure_e2e_result_root(&root, &log_path, &tmp.join("e2e-build")) {
             Ok(path) => path,
