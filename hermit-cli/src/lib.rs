@@ -120,6 +120,14 @@ fn read_iovecs<M: reverie::syscalls::MemoryAccess>(
     Ok(iovecs)
 }
 
+fn vectored_offset(low: u64, high: u64) -> i64 {
+    if std::mem::size_of::<usize>() == 8 {
+        low as i64
+    } else {
+        ((high << 32) | (low & u32::MAX as u64)) as i64
+    }
+}
+
 enum KvmStdinReservation {
     Open(fs::File),
     Closed,
