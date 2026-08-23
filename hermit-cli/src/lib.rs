@@ -26,6 +26,7 @@ pub mod instruction_map;
 mod interp;
 mod metadata;
 mod record;
+mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
