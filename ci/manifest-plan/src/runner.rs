@@ -25,6 +25,9 @@ use sha2::Digest;
 use sha2::Sha256;
 
 pub use crate::canonical_verdict::VerificationReport;
+use crate::ci_selection::CiDisabledReasonSpec;
+use crate::ci_selection::CiSelection;
+use crate::ci_selection::CiSelectionSpec;
 
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
@@ -87,8 +90,8 @@ pub struct Observation {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeRecipe {
-    pub ci: bool,
-    pub ci_disabled_reason: Option<String>,
+    pub ci: CiSelectionSpec,
+    pub ci_disabled_reason: Option<CiDisabledReasonSpec>,
     #[serde(default)]
     pub backends_enabled: Vec<String>,
     #[serde(default)]
@@ -216,14 +219,15 @@ impl ManifestSet {
                         .backends_enabled
                         .iter()
                         .any(|value| value == "native");
+                    let ci = ci_selection(recipe)?.selected("native");
                     let accepted = match population {
                         Population::Required => {
                             enabled
-                                && (recipe.ci
+                                && (ci
                                     || selection.mode.as_deref() == Some("naked")
                                     || selection.include_manual)
                         }
-                        other => population_accepts(other, recipe.ci, enabled),
+                        other => population_accepts(other, ci, enabled),
                     };
                     if selection
                         .backend
@@ -249,9 +253,7 @@ impl ManifestSet {
                     Population::Disabled => recipe.backends_disabled.keys().cloned().collect(),
                     _ => recipe.backends_enabled.clone(),
                 };
-                if population == Population::Required && !recipe.ci && !selection.include_manual {
-                    continue;
-                }
+                let ci = ci_selection(recipe)?;
                 for backend in backends {
                     if selection
                         .backend
@@ -261,7 +263,13 @@ impl ManifestSet {
                         continue;
                     }
                     let enabled = recipe.backends_enabled.contains(&backend);
-                    if !population_accepts(population, recipe.ci, enabled) {
+                    if population == Population::Required
+                        && !selection.include_manual
+                        && !ci.selected(&backend)
+                    {
+                        continue;
+                    }
+                    if !population_accepts(population, ci.selected(&backend), enabled) {
                         continue;
                     }
                     cells.push(SelectedCell {
@@ -343,22 +351,6 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
 }
 
 fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
-    if recipe.ci_disabled_reason.is_some() && recipe.ci {
-        return Err(format!(
-            "{id}: {mode} is ci=true but carries ci_disabled_reason"
-        ));
-    }
-    if !recipe.ci
-        && !recipe.backends_enabled.is_empty()
-        && recipe
-            .ci_disabled_reason
-            .as_deref()
-            .is_none_or(|reason| reason.trim().is_empty())
-    {
-        return Err(format!(
-            "{id}: {mode} enables cells with ci=false but has no ci_disabled_reason"
-        ));
-    }
     let expected: BTreeSet<&str> = if mode == "naked" {
         ["native"].into_iter().collect()
     } else {
@@ -383,6 +375,24 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
     {
         return Err(format!("{id}: {mode} has an empty backend-disabled reason"));
     }
+    let ci = CiSelection::validate(
+        &enabled
+            .iter()
+            .map(|backend| (*backend).to_string())
+            .collect(),
+        &disabled
+            .iter()
+            .map(|backend| (*backend).to_string())
+            .collect(),
+        &recipe.ci,
+        recipe.ci_disabled_reason.as_ref(),
+    )
+    .map_err(|error| format!("{id}: {mode} {error}"))?;
+    if mode == "naked" && ci.any_selected() {
+        return Err(format!(
+            "{id}: naked is opt-in meta-CI and must set ci=false"
+        ));
+    }
     for backend in recipe.guest_args.keys() {
         if !enabled.contains(backend.as_str()) {
             return Err(format!(
@@ -391,6 +401,15 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
         }
     }
     Ok(())
+}
+
+fn ci_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
+    CiSelection::validate(
+        &recipe.backends_enabled.iter().cloned().collect(),
+        &recipe.backends_disabled.keys().cloned().collect(),
+        &recipe.ci,
+        recipe.ci_disabled_reason.as_ref(),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1774,6 +1793,8 @@ fn execute_observed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci_selection::BackendCiDisabledReason;
+    use crate::ci_selection::CiDisabledResult;
 
     fn recipe(ci: bool) -> TestRecipe {
         let disabled = BTreeMap::from([
@@ -1783,8 +1804,9 @@ mod tests {
             ("liteinst".into(), "not qualified".into()),
         ]);
         let mode = ModeRecipe {
-            ci,
-            ci_disabled_reason: (!ci).then(|| "not selected yet".into()),
+            ci: CiSelectionSpec::Uniform(ci),
+            ci_disabled_reason: (!ci)
+                .then(|| CiDisabledReasonSpec::Uniform("not selected yet".into())),
             backends_enabled: vec!["ptrace".into()],
             backends_disabled: disabled,
             ..ModeRecipe::default()
@@ -1911,6 +1933,81 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn required_selection_is_per_backend_while_enabled_selection_keeps_the_failure_visible() {
+        let mut test = recipe(false);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled = vec!["ptrace".into(), "liteinst".into()];
+        mode.backends_disabled.remove("liteinst");
+        mode.ci = CiSelectionSpec::PerBackend(BTreeMap::from([
+            ("ptrace".into(), true),
+            ("liteinst".into(), false),
+        ]));
+        mode.ci_disabled_reason = Some(CiDisabledReasonSpec::PerBackend(BTreeMap::from([(
+            "liteinst".into(),
+            BackendCiDisabledReason {
+                result: CiDisabledResult::DeterminismFailure,
+                evidence: "ignored/results/liteinst.jsonl".into(),
+                reason: "canonical comparison diverged at scheduler turn 10".into(),
+            },
+        )])));
+        validate_mode("fixture/test", "verify", mode).unwrap();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), test))]),
+        };
+        let required = set
+            .select(&Selection {
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].id.backend.as_deref(), Some("ptrace"));
+        let enabled = set
+            .select(&Selection {
+                population: Some(Population::Enabled),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(enabled.len(), 2);
+        assert!(
+            enabled
+                .iter()
+                .any(|cell| cell.id.backend.as_deref() == Some("liteinst"))
+        );
+    }
+
+    #[test]
+    fn yaml_parses_structured_per_backend_selection() {
+        let mode: ModeRecipe = serde_yaml::from_str(
+            r#"
+ci:
+  ptrace: true
+  liteinst: false
+ci_disabled_reason:
+  liteinst:
+    result: determinism-failure
+    evidence: ignored/results/liteinst.jsonl
+    reason: canonical comparison diverged at scheduler turn 10
+backends_enabled: [ptrace, liteinst]
+backends_disabled:
+  dbt: unsupported
+  kvm: unsupported
+  sabre: unsupported
+"#,
+        )
+        .unwrap();
+        validate_mode("fixture/test", "verify", &mode).unwrap();
+        let policy = ci_selection(&mode).unwrap();
+        assert!(policy.selected("ptrace"));
+        assert!(!policy.selected("liteinst"));
+        assert_eq!(
+            policy.reason("liteinst").unwrap().result,
+            Some(CiDisabledResult::DeterminismFailure)
+        );
     }
 
     #[test]

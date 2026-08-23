@@ -96,6 +96,41 @@ strictness, log comparison, positive INFO counts on both runs, bitwise parity,
 and a matched verdict. Output-only, stripped, empty-log, malformed, or
 contradictory reports are infrastructure errors rather than product results.
 
+`ci` may also be a mapping when enabled backends have different validation
+status. The mapping must name every enabled backend and no disabled backend.
+Each `false` backend requires its own structured reason; a `true` backend must
+not carry one. The reason records an existing result class, retained evidence,
+and explanatory text. Placeholder text is rejected.
+
+```yaml
+test:
+  - id: example/mixed-backends
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: determinism-failure
+            evidence: ignored/results/liteinst.jsonl
+            reason: canonical comparison diverged at scheduler turn 10
+        backends_enabled: [ptrace, liteinst]
+        backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
+          kvm: KVM requires the privileged runner
+          sabre: SaBRe requires its external runtime
+```
+
+The false backend remains enabled, red, and available to pressure/manual
+measurement. Its reason is copied into `ci/compat-envelope/cells.json`; it is
+not made invisible by being omitted from ordinary validation.
+
+Use `unavailable` when the cell is executable but its required canonical
+evidence or positive verification contract is not available from the current
+product path. Reserve `infrastructure-error` for an identified host or harness
+infrastructure failure, such as a runner resource or artifact-publication fault.
+
 An enabled SaBRe cell has an additional execution-path contract. Every E2E
 Hermit execution writes structured evidence into the cell capture: the
 in-guest tool must have issued a coordinator RPC, and both
@@ -170,11 +205,13 @@ inventory is mechanically complete.
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
 
-A `ci = false` cell is never executed **and never compiled**, so its guest can
+A `ci = false` cell is never executed **and never compiled** by ordinary
+validation, so its guest can
 rot without any node noticing. Two mechanisms bound that. `manifest-plan`
-rejects every enabled mode with `ci = false` unless it has a non-empty
-`ci_disabled_reason`, and rejects a stale reason left behind on a `ci = true`
-mode. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
+rejects every enabled mode with boolean `ci = false` unless it has a non-empty
+shared `ci_disabled_reason`. For a per-backend mapping it instead requires the
+structured checks above. It rejects a stale reason left behind on a selected
+backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
 the bucket declares regardless of its `ci` flag; it is wired into the portable
 DAG for `backend-parity-c` and fails closed on zero compiled.
 

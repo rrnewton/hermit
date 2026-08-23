@@ -5718,7 +5718,14 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: false
+        ci_disabled_reason:
+          dbt:
+            result: unavailable
+            evidence: hermit-cli/src/bin/hermit/run.rs:2163
+            reason: DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green.
         backends_enabled:
           - ptrace
           - dbt
