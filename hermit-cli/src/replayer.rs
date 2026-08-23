@@ -38,6 +38,7 @@ use reverie::syscalls::EfdFlags;
 use reverie::syscalls::Eventfd2;
 use reverie::syscalls::Fchdir;
 use reverie::syscalls::FcntlCmd;
+use reverie::syscalls::Flock;
 use reverie::syscalls::OFlag;
 use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
@@ -249,7 +250,9 @@ impl Tool for Replayer {
             Syscall::Close(_) => self.handle_close(guest, syscall).await,
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#1742)
+            Syscall::Flock(call) => self.handle_flock(guest, call).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
             Syscall::Dup(_) => {
                 self.handle_replayed_side_effect(guest, syscall, "dup")
@@ -595,6 +598,67 @@ impl Replayer {
         } else {
             self.handle_simple(guest, syscall.into()).await
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// Replay `flock(2)` by taking the lock again, not by consuming its recorded
+    /// return value.
+    ///
+    /// `handle_simple` is only valid when nothing beyond the return value depends
+    /// on a call. `flock` is the opposite case: its entire product is kernel state
+    /// that a contender observes -- another process, or any other open file
+    /// description in the same lock domain. Consuming the recorded `Return`
+    /// without re-issuing the call makes a replayed run a program that merely
+    /// *claims* to hold locks, so replaying a lockfile-based workload excludes
+    /// nothing and a concurrent writer can corrupt what the recording protected.
+    ///
+    /// Only a descriptor that materialized in the replay root is a real kernel
+    /// descriptor; the others are eventfd placeholders standing in for opens that
+    /// replay serves from the log (see `handle_virtual_fd_create`). Locking a
+    /// placeholder would lock the wrong object, so those keep the
+    /// return-value-only path, exactly as `handle_fchdir` does.
+    ///
+    /// Unlike `handle_replayed_side_effect`, this re-issues the call even when
+    /// the recording FAILED, and that is the load-bearing part. A recorded
+    /// `EWOULDBLOCK` is the observable that proves the conflicting lock is
+    /// really held; skipping the attempt on a failed record would leave replay
+    /// unable to notice that no lock exists at all, because the only calls it
+    /// checked would be the ones that succeed whether or not the lock domain is
+    /// real. Re-issuing both outcomes makes the guest's own contention pattern
+    /// the check: if a replayed run had faked its locks, the contended probe
+    /// would come back `Ok` where the recording said `EWOULDBLOCK`.
+    ///
+    /// Consequence, stated rather than hidden: within the materialized set,
+    /// replay now depends on real lock state the same way recording does. If a
+    /// conflicting lock exists during replay but not during recording (or the
+    /// reverse), the re-issued call disagrees with the recording and this
+    /// reports the divergence instead of silently continuing. That is the
+    /// intended failure direction: replay is not faithful under a contender the
+    /// recording did not have, and saying so beats pretending. The exposure is
+    /// narrow in practice, because a pre-existing host file is exactly what
+    /// replay does NOT materialize -- the materialized set is dominated by
+    /// files the guest itself created inside the replay root.
+    async fn handle_flock<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Flock,
+    ) -> Result<i64, Errno> {
+        if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+            // A virtual placeholder standing in for an open replay serves from
+            // the log. There is no lock domain to act on, so locking it would
+            // be theater at best and would lock the wrong object at worst.
+            return self.handle_simple(guest, syscall.into()).await;
+        }
+        let call = Syscall::from(syscall);
+        let recorded = next_event!(guest, Return);
+        let actual = guest.inject_with_retry(call).await;
+        assert_eq!(
+            actual, recorded,
+            "flock side effects diverged: replay observed {actual:?} where the recording \
+             observed {recorded:?} for {call:?}"
+        );
+        recorded
     }
 
     async fn handle_unlinkat<G: Guest<Self>>(

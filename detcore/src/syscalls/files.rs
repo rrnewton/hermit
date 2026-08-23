@@ -28,9 +28,11 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
@@ -343,26 +345,197 @@ impl<T: RecordOrReplay> Detcore<T> {
         result.map_err(Error::from)
     }
 
-    /// flock under Hermit. `flock(2)` places an advisory whole-file lock. Detcore
-    /// serializes guest threads onto a single virtual CPU, so a lock is never
-    /// truly contended within the run: a blocking `LOCK_EX`/`LOCK_SH` would
-    /// otherwise leave the deterministic scheduler waiting on an external event.
-    /// Treat every operation (lock/unlock, with or without `LOCK_NB`) as a
-    /// deterministic no-op success, mirroring how sched_setaffinity/ioprio_set are
-    /// suppressed. Re-enables `flock` under --strict.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#791)
+    // TODO-HUMAN-REVIEW(#1742)
+    /// Advisory whole-file locks, forwarded to the kernel.
+    ///
+    /// This was previously an unconditional no-op success, justified by the
+    /// claim that "an advisory whole-file lock is never contended within the
+    /// serialized container". That is false: serializing guest threads stops
+    /// them EXECUTING simultaneously, it does not stop their lock HOLD
+    /// INTERVALS from overlapping. A holder that is descheduled -- because it
+    /// blocked, forked, or simply used up its timeslice -- keeps holding while
+    /// another process runs and observes the lock. Measured before this change,
+    /// on both ptrace and DBI, two processes held the same `LOCK_EX`
+    /// simultaneously while native correctly returned `EWOULDBLOCK`.
+    ///
+    /// A no-op is the wrong failure direction for a determinism tool. It is
+    /// deterministically wrong, so double-run verification cannot see it, and it
+    /// silently removes mutual exclusion from every guest that uses a lockfile.
+    ///
+    /// Forwarding is what `fcntl` already does for POSIX record locks, which is
+    /// why those work. The guest's descriptor is a real host descriptor, so the
+    /// kernel supplies the whole contract for free and consistently with itself:
+    /// shared vs exclusive, `LOCK_NB`, upgrade/downgrade (which Linux performs
+    /// non-atomically -- see below, this handler compensates), release on
+    /// `LOCK_UN`, release when the last descriptor for the open file
+    /// description is closed, and release on process exit.
+    ///
+    /// Determinism, scoped to what is actually true. When every contender is
+    /// inside the container the outcome is a function of which guest holds the
+    /// lock, and that is fixed by Detcore's deterministic schedule, so a given
+    /// program and seed produce the same acquisition outcome every run.
+    ///
+    /// The scope is not decoration. Because this forwards to the kernel, a
+    /// process OUTSIDE the container holding a lock on a guest-visible file
+    /// does change the guest's result -- measured: with a host `flock -x`
+    /// holder, a guest `LOCK_EX|LOCK_NB` returns `EWOULDBLOCK`, and acquires
+    /// without one. That is a host-state leak, it is faithful to Linux, and it
+    /// is the same leak `fcntl` record locks have always had here. Hermit
+    /// already declines to make a mutating external filesystem deterministic,
+    /// and lock state on a shared file is part of that state. Do not restate
+    /// this as "no host state enters the decision": it does, and the previous
+    /// bug in this very function came from writing down a determinism argument
+    /// that was broader than the truth.
+    ///
+    /// Note that the no-op this replaced was not host-independent in any useful
+    /// sense either -- it was host-independent by being wrong in all cases.
+    ///
+    /// # Why a blocking request is probed non-blockingly, and what that costs
+    ///
+    /// A guest thread parked inside a kernel `flock` is not visible to the
+    /// deterministic scheduler as blocked, so nothing runs to release the lock
+    /// and the whole container wedges -- measured: a four-way contention guest
+    /// that completes natively hung indefinitely under a plain forwarding
+    /// implementation. So a blocking operation is rewritten to `LOCK_NB` and,
+    /// if it turns out to be contended, refused rather than hung.
+    ///
+    /// That rewrite is not free, and the cost is a *lock the guest already
+    /// owns*. Linux converts an `flock` lock in place and the conversion is not
+    /// atomic: `flock_lock_inode` deletes this open file description's existing
+    /// lock **before** it scans for a conflict, so a contended `LOCK_SH` ->
+    /// `LOCK_EX` conversion leaves the caller holding nothing and then reports
+    /// `EWOULDBLOCK`. Natively the guest never observes that intermediate
+    /// state, because a *blocking* request would sleep and eventually acquire.
+    /// Under the rewrite it would: the guest asked to wait, got told "no", and
+    /// silently lost the shared lock it was already relying on.
+    ///
+    /// So this handler restores the prior mode before refusing a *blocking*
+    /// conversion, making the refusal side-effect-free. It deliberately does
+    /// **not** restore when the guest itself passed `LOCK_NB`: there the drop is
+    /// exactly what Linux does, and re-acquiring would be a divergence in the
+    /// other direction. `DetFd::flock_mode` is what makes the two cases
+    /// distinguishable -- it records the mode Detcore last saw the kernel grant
+    /// for this open file description, so a first acquisition (nothing to lose)
+    /// is not confused with a conversion (something to lose).
+    ///
+    /// That cache covers locks Detcore granted. A descriptor that entered the
+    /// container already holding an `flock` -- inherited from outside, never
+    /// passed through this handler -- is invisible to it, and a contended
+    /// blocking conversion on such a descriptor still loses the lock. The
+    /// restore path reports that loss loudly rather than pretending otherwise.
     pub async fn handle_flock<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
-        info!(
-            "flock(fd={}, operation={:#x}) treated as a deterministic no-op success",
-            call.fd(),
-            call.operation()
-        );
-        Ok(0)
+        const LOCK_NB: i32 = libc::LOCK_NB;
+        /// `LOCK_SH`/`LOCK_EX`/`LOCK_UN` with `LOCK_NB` (and any padding) masked off.
+        const MODE_MASK: i32 = libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN;
+
+        let (fd, operation) = (call.fd(), call.operation());
+        let requested = operation & MODE_MASK;
+        let caller_wants_nonblocking = operation & LOCK_NB != 0;
+        let releasing = requested == libc::LOCK_UN;
+        let dettid = guest.thread_state().dettid;
+
+        // The mode Detcore last saw the kernel grant this open file description.
+        // An unknown descriptor (EBADF) is reported by the kernel below, not here.
+        let held = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.flock_mode())
+            .unwrap_or(None);
+
+        // LOCK_UN cannot block, so it is forwarded exactly as the guest wrote it.
+        let probe_operation = if releasing {
+            operation
+        } else {
+            operation | LOCK_NB
+        };
+        let result = self
+            .record_or_replay(guest, call.with_operation(probe_operation))
+            .await;
+
+        match result {
+            Ok(value) => {
+                let granted = if releasing { None } else { Some(requested) };
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_flock_mode(granted));
+                trace!(
+                    "flock(fd={}, operation={:#x}) served, open file now holds {:?}",
+                    fd, operation, granted
+                );
+                Ok(value)
+            }
+            Err(Errno::EWOULDBLOCK) if caller_wants_nonblocking => {
+                // Exactly what the guest asked for, including Linux's own
+                // non-atomic conversion behavior: if this was a conversion, the
+                // kernel really did drop the prior lock on the way to failing,
+                // so the cache must forget it rather than claim a lock the
+                // guest no longer holds.
+                if held.is_some_and(|held| held != requested) {
+                    let _ = guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.set_flock_mode(None));
+                }
+                trace!("flock(fd={}, operation={:#x}) would block", fd, operation);
+                Err(Errno::EWOULDBLOCK.into())
+            }
+            Err(Errno::EWOULDBLOCK) => {
+                // The guest asked to wait, and Detcore substituted a probe.
+                // Undo the probe's collateral damage before refusing.
+                if let Some(previous) = held.filter(|previous| *previous != requested) {
+                    let restore = call.with_operation(previous | LOCK_NB);
+                    match self.record_or_replay(guest, restore).await {
+                        Ok(_) => {
+                            warn!(
+                                "[dtid {dettid}] contended blocking flock(fd={fd}, \
+                                 operation={operation:#x}) refused; restored this open file's \
+                                 prior {previous:#x} lock, which Linux's non-atomic conversion \
+                                 had dropped. The guest holds exactly what it held before the \
+                                 call."
+                            );
+                        }
+                        Err(err) => {
+                            let _ = guest
+                                .thread_state()
+                                .with_detfd(fd, |detfd| detfd.set_flock_mode(None));
+                            error!(
+                                "[dtid {dettid}] contended blocking flock(fd={fd}, \
+                                 operation={operation:#x}) refused, AND this open file's prior \
+                                 {previous:#x} lock could not be restored ({err}). Linux's \
+                                 non-atomic conversion dropped it and something outside this \
+                                 container took it in the interval. The guest has lost a lock \
+                                 it held; treat any mutual exclusion it was protecting as \
+                                 broken."
+                            );
+                        }
+                    }
+                }
+                // Waiting faithfully needs a wait queue owned by the
+                // deterministic scheduler, the way futexes are handled; until
+                // that exists, refuse loudly. Returning success would recreate
+                // the mutual-exclusion bug this handler was written to fix, and
+                // blocking in the kernel would deadlock the container.
+                error!(
+                    "[dtid {dettid}] blocking flock(fd={fd}, operation={operation:#x}) is \
+                     contended, and Detcore cannot yet park a thread on a file lock \
+                     deterministically. Refusing rather than granting a lock another guest \
+                     holds. Use LOCK_NB, or run without --strict to receive ENOLCK."
+                );
+                self.refuse_unserviceable_operation(guest, Sysno::flock, Errno::ENOLCK)
+                    .await
+            }
+            Err(err) => {
+                trace!(
+                    "flock(fd={}, operation={:#x}) refused: {}",
+                    fd, operation, err
+                );
+                Err(err.into())
+            }
+        }
     }
 
     async fn snapshot_procfs<G: Guest<Self>>(

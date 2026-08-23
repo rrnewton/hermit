@@ -41,6 +41,48 @@ use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// Apply the established unsupported-syscall refusal policy to a *supported*
+    /// syscall whose particular operation Detcore cannot serve deterministically.
+    ///
+    /// This exists so such a refusal cannot invent its own policy. Three separate
+    /// config knobs govern how a fail-closed run dies -- `shutdown_on_unsupported_syscall`
+    /// (hard `exit(1)` through `unrecoverable_shutdown`), `exit_on_unsupported_syscall`
+    /// (a typed `UnsupportedSyscallError` the backend terminates on without
+    /// unwinding), and the `panic!` fallback -- and `Detcore::handle_unsupported_syscall`
+    /// consults all three in that order. The normal `hermit run` CLI happens to set
+    /// `shutdown_on_unsupported_syscall = panic_on_unsupported_syscalls`, so reading
+    /// only the latter looks equivalent, but that coupling is a CLI default, not an
+    /// invariant: an embedder that sets just `exit_on_unsupported_syscall` would get a
+    /// process-wide `exit(1)` from a bespoke call site where the standard path returns
+    /// a catchable error.
+    ///
+    /// When the run is *not* fail-closed, the caller's `fallback` errno is returned,
+    /// because the operation itself is legal and the guest is entitled to a normal
+    /// failure code (`handle_unsupported_syscall` passes the call through instead,
+    /// which is not available here -- passing through is precisely the thing the
+    /// caller has determined it cannot do).
+    pub(crate) async fn refuse_unserviceable_operation<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        fallback: Errno,
+    ) -> Result<i64, Error> {
+        if !self.cfg.panic_on_unsupported_syscalls {
+            return Err(fallback.into());
+        }
+        if guest.config().shutdown_on_unsupported_syscall {
+            crate::tool_global::unrecoverable_shutdown(guest).await;
+        }
+        if guest.config().exit_on_unsupported_syscall {
+            return Err(Error::Tool(anyhow::Error::new(
+                crate::UnsupportedSyscallError(sysno),
+            )));
+        }
+        panic!("unserviceable operation on syscall: {sysno:?}");
+    }
+
     /// Record or replay a BLOCKING syscall without stalling the current thread (and thus
     /// deadlocking).  This uses a protocol of an extra resource request before/after the
     /// syscall to inform the scheduler that the thread is leaving/rejoining the runnable

@@ -44,7 +44,24 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
+//
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#1742)
+// 0x10a -> 0x10b: flock(2) stopped being a Detcore no-op and now reaches
+// `record_or_replay`, so a post-fix run emits a `Return` event per flock call
+// and the replayer re-issues the call to reproduce the kernel lock. A 0x10a
+// recording contains NO flock event at all -- the old handler returned Ok(0)
+// before ever reaching the recorder, even though flock was already classified
+// Determinized -- so replaying one under this build would read the *next*
+// thread's event for every flock and desynchronize the whole stream. There is
+// no compatibility path worth having (the recording simply lacks the data), so
+// the version check refuses it up front.
+//
+// NB the original form of this change bumped 0x109 -> 0x10a. That is stale:
+// 5dde81d08b ("Route Determinized syscalls through record and replay") has
+// since taken main to 0x10a for an unrelated reason, so the flock break needs
+// its own increment rather than reusing that one.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10b);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -317,6 +334,16 @@ mod tests {
                 "{phase} must leave unlisted PassThrough chdir unsubscribed"
             );
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#1742)
+    /// A 0x10a recording predates flock forwarding, so it carries no flock event
+    /// while this replayer expects one per call. Replaying it would consume some
+    /// other event and desynchronize; the version gate must refuse it instead.
+    #[test]
+    fn record_version_rejects_pre_flock_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
     }
 
     #[test]
