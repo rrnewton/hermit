@@ -82,19 +82,68 @@ fn sched_setattr_argument_handling_matches_the_host_kernel() {
     native_command.env_clear();
     let native = transcript(native_command, "the native sched_setattr probe");
 
-    let mut sandboxed = Command::new("timeout");
-    sandboxed
+    let sandboxed = run_under_hermit(&guest, "ptrace");
+    compare(&native, &sandboxed, "ptrace");
+
+    // SaBRe is the second backend this handler runs under, and the ABI it
+    // presents must not depend on which one is loaded. Skipped rather than
+    // failed when the loader and plugin are not built, the same convention
+    // `sabre_examples.rs` uses -- a missing third-party artifact is an
+    // environment fact, not a product verdict.
+    match sabre_artifacts() {
+        Some((loader, plugin)) => {
+            let sabre = run_under_hermit_sabre(&guest, &loader, &plugin);
+            compare(&native, &sabre, "sabre");
+        }
+        None => eprintln!(
+            "skipping the SaBRe arm of the sched_setattr ABI bracket: loader or plugin missing"
+        ),
+    }
+}
+
+fn run_under_hermit(guest: &Path, backend: &str) -> String {
+    let mut command = Command::new("timeout");
+    command
         .args(["--kill-after", "5s", "120s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args([
             "run",
-            "--backend=ptrace",
+            &format!("--backend={backend}"),
             "--strict",
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest);
-    let sandboxed = transcript(sandboxed, "the sandboxed sched_setattr probe");
+        .arg(guest);
+    transcript(command, &format!("the {backend} sched_setattr probe"))
+}
+
+fn sabre_artifacts() -> Option<(PathBuf, PathBuf)> {
+    let hermit = PathBuf::from(env!("CARGO_BIN_EXE_hermit"));
+    let executable_dir = hermit.parent()?;
+    let target_dir = executable_dir.parent()?;
+    let loader = std::env::var_os("HERMIT_SABRE_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target_dir.join("sabre/sabre"));
+    let plugin = executable_dir.join("libdetcore_sabre.so");
+    (loader.is_file() && plugin.is_file()).then_some((loader, plugin))
+}
+
+fn run_under_hermit_sabre(guest: &Path, loader: &Path, plugin: &Path) -> String {
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "5s", "120s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend=sabre", "--strict", "--base-env=minimal"])
+        .arg("--sabre")
+        .arg(loader)
+        .arg("--sabre-plugin")
+        .arg(plugin)
+        .arg("--")
+        .arg(guest);
+    transcript(command, "the sabre sched_setattr probe")
+}
+
+fn compare(native: &str, sandboxed: &str, backend: &str) {
 
     assert!(
         !native.trim().is_empty(),
@@ -102,6 +151,7 @@ fn sched_setattr_argument_handling_matches_the_host_kernel() {
     );
 
     if native != sandboxed {
+        eprintln!("backend under comparison: {backend}");
         let mut differing = String::new();
         for (native_line, sandboxed_line) in native.lines().zip(sandboxed.lines()) {
             if native_line != sandboxed_line {

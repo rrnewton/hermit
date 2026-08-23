@@ -183,9 +183,26 @@ int main(void) {
     r.tail_off = 4095;
     probe("page-sized, nonzero tail at 4095", r);
 
-    /* Policy validity. */
+    /* Policy validity.
+     *
+     * SCHED_EXT (7) IS DELIBERATELY SKIPPED, and skipping it is the point
+     * rather than an omission. Whether the kernel accepts policy 7 depends on
+     * whether it was built with CONFIG_SCHED_CLASS_EXT, so the NATIVE answer
+     * varies from machine to machine. This probe exists to be compared
+     * native-against-sandboxed, and a bracket whose expected value depends on
+     * the host is not a determinism test -- it would report a Hermit defect on
+     * one box and pass on the next, for a reason that has nothing to do with
+     * Hermit. The sandbox's own treatment of policy 7 is pinned by the unit
+     * test `sched_ext_is_a_valid_policy_and_sched_iso_is_not`, which is
+     * host-independent because it never asks the host.
+     *
+     * 8 is unassigned on every kernel, so it stays: it is the neighbour that
+     * proves the loop can still see a rejection. */
     for (uint32_t policy = 0; policy <= 8; policy++) {
         char name[64];
+        if (policy == 7) {
+            continue;
+        }
         snprintf(name, sizeof(name), "policy=%u", policy);
         r = base;
         r.policy = policy;
@@ -208,6 +225,14 @@ int main(void) {
     r.policy = 99;
     r.sched_flags = SCHED_FLAG_KEEP_POLICY;
     probe("policy=99 + KEEP_POLICY", r);
+    /* KEEP_POLICY does not switch the policy-dependent rules off; it makes them
+     * apply to the CURRENT policy. Started from a plain SCHED_OTHER thread, a
+     * nonzero priority is refused, and that refusal is the only thing that can
+     * tell "reuse the current policy" apart from "skip the checks". */
+    r = base;
+    r.sched_flags = SCHED_FLAG_KEEP_POLICY;
+    r.priority = 1;
+    probe("KEEP_POLICY with priority=1", r);
 
     /* sched_flags validity. */
     r = base;

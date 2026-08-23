@@ -49,6 +49,7 @@ use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
 use crate::tool_global::resolve_kill_targets;
+use crate::tool_global::thread_is_live;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -85,6 +86,96 @@ const SCHED_ATTR_KERNEL_SIZE: u32 = SCHED_ATTR_SIZE_VER1;
 /// `sched_copy_attr` refuses a buffer larger than one page. Hermit is x86-64
 /// only, where PAGE_SIZE is 4096.
 const SCHED_ATTR_MAX_SIZE: u32 = 4096;
+
+/// The scheduling policy Detcore presents as every thread's current one.
+///
+/// This is not a guess about the host. It is the value `handle_sched_getattr`
+/// writes back for every thread, so it is the policy a guest observes and the
+/// only policy `SCHED_FLAG_KEEP_POLICY` can be keeping.
+const VIRTUAL_CURRENT_POLICY: u32 = libc::SCHED_OTHER as u32;
+
+/// Outcome of scanning the bytes past the kernel's `struct sched_attr`.
+#[derive(Debug, Eq, PartialEq)]
+enum TailVerdict {
+    AllZero,
+    /// A byte the kernel does not understand was set: `copy_struct_from_user`
+    /// reports this as E2BIG, after storing its own size back.
+    NotZeroed,
+    /// Guest memory could not be read before any non-zero byte was seen.
+    Faulted,
+}
+
+/// Reads of eight bytes or fewer take safeptrace's `PTRACE_PEEKDATA` path,
+/// which reads a whole aligned word and BYPASSES GUEST PAGE PROTECTIONS. Only a
+/// read strictly larger than that reaches `process_vm_readv`, which honours
+/// them. Note this is not symmetric with the write side: `write` special-cases
+/// a length of exactly eight, so splitting a write in half escapes it, while
+/// `read` special-cases eight *or fewer* and splitting only makes it worse.
+const MIN_PROTECTION_RESPECTING_READ: usize = std::mem::size_of::<u64>() + 1;
+
+/// Scan `tail_len` bytes at `base + tail_off` the way `check_zeroed_user` does.
+///
+/// Two things here are load-bearing and neither is visible from the outcome
+/// alone, only from the ORDER the outcome is reached in.
+///
+/// First, Linux scans FORWARD and stops at the first thing it finds. A non-zero
+/// byte followed later by an unreadable page is E2BIG, because the scan never
+/// reaches the page; an unreadable page reached before any non-zero byte is
+/// EFAULT. Reading the whole tail up front and judging afterwards collapses
+/// both into EFAULT and silently changes the errno a guest sees.
+///
+/// Second, every read here is kept strictly larger than eight bytes, for the
+/// reason on [`MIN_PROTECTION_RESPECTING_READ`]. Where the remainder is
+/// smaller, the window is extended BACKWARDS over bytes already scanned rather
+/// than shortened; re-reading a byte is free and only the new bytes are judged.
+fn scan_tail_is_zeroed<M: MemoryAccess>(
+    memory: &M,
+    base: AddrMut<u8>,
+    tail_off: usize,
+    tail_len: usize,
+) -> TailVerdict {
+    const CHUNK: usize = 256;
+    let mut done = 0usize;
+    let mut buf = [0u8; CHUNK];
+    while done < tail_len {
+        let remaining = tail_len - done;
+        let want = remaining.min(CHUNK);
+        // Extend backwards when the remainder alone would be a small read.
+        // The window may reach back past the start of the tail into the
+        // `sched_attr` prefix: the kernel has already read those bytes, so they
+        // are readable, and only the new bytes are judged below. Clamping this
+        // to `done` alone left a 1-byte tail with nowhere to grow into and
+        // issued exactly the small read this constant exists to avoid.
+        let back = MIN_PROTECTION_RESPECTING_READ
+            .saturating_sub(want)
+            .min(done + tail_off);
+        let read_len = want + back;
+        let start = tail_off + done - back;
+        let Some(addr) = base
+            .as_raw()
+            .checked_add(start)
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            return TailVerdict::Faulted;
+        };
+        let got = match memory.read(addr, &mut buf[..read_len]) {
+            Ok(got) => got,
+            Err(_) => 0,
+        };
+        // Judge only the bytes that are genuinely new AND genuinely read.
+        let new_from = back.min(got);
+        if buf[new_from..got].iter().any(|byte| *byte != 0) {
+            return TailVerdict::NotZeroed;
+        }
+        if got < read_len {
+            // The scan stopped at an unreadable byte with nothing non-zero
+            // before it, which is `check_zeroed_user`'s -EFAULT.
+            return TailVerdict::Faulted;
+        }
+        done += want;
+    }
+    TailVerdict::AllZero
+}
 
 // Scheduling policies, from include/uapi/linux/sched.h.
 const SCHED_FIFO: u32 = 1;
@@ -232,11 +323,23 @@ fn validate_sched_attr_before_lookup(size: u32, attr: &SchedAttrFields) -> Resul
 fn validate_sched_attr_after_lookup(attr: &SchedAttrFields) -> Result<(), Errno> {
     // `sched_setattr` rewrites the policy to SETPARAM_POLICY (-1) when
     // KEEP_POLICY is set, and `__sched_setscheduler` then takes its
-    // `policy < 0` branch, reusing the task's current policy without ever
-    // calling `valid_policy()`. So under KEEP_POLICY the field is genuinely
-    // ignored and the policy-dependent rules below are skipped with it.
+    // `policy < 0` branch. That branch does not skip the policy-dependent
+    // rules -- it REUSES THE TASK'S CURRENT POLICY and applies them against
+    // that. `valid_policy()` is the only thing it skips, which is why an
+    // undefined value in the ignored field still passes.
+    //
+    // Detcore's current policy is not unknown: `handle_sched_getattr` reports
+    // SCHED_OTHER, nice 0, priority 0 for every thread, unconditionally, and
+    // that is the whole of the guest-visible scheduling state this sandbox
+    // exposes. So KEEP_POLICY substitutes SCHED_OTHER here. Treating it as
+    // "no policy" and skipping the rules accepted, for instance,
+    // KEEP_POLICY with sched_priority=1, which Linux refuses because a
+    // non-real-time current policy requires priority 0.
+    //
+    // These two sites must stay in step: if `handle_sched_getattr` ever
+    // reports a different virtual policy, this substitution follows it.
     let policy = if attr.sched_flags & SCHED_FLAG_KEEP_POLICY != 0 {
-        None
+        Some(VIRTUAL_CURRENT_POLICY)
     } else {
         if !is_valid_sched_policy(attr.policy) {
             return Err(Errno::EINVAL);
@@ -1428,19 +1531,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // scanning is EFAULT and skips the store back -- only the not-all-zero
         // verdict is E2BIG.
         if size > SCHED_ATTR_KERNEL_SIZE {
-            let tail_len = (size - SCHED_ATTR_KERNEL_SIZE) as usize;
-            let mut tail = vec![0u8; tail_len];
-            let tail_base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
-            // SAFETY: the guest declared a buffer of `size` bytes, so this
-            // offset is inside the region it asked the kernel to read.
-            let tail_addr = unsafe { tail_base.add(SCHED_ATTR_KERNEL_SIZE as usize) };
-            guest
-                .memory()
-                .read_exact(tail_addr, &mut tail)
-                .map_err(|_| Errno::EFAULT)?;
-            if tail.iter().any(|byte| *byte != 0) {
-                let back = call.attr().ok_or(Errno::EINVAL)?;
-                return Err(refuse_too_big(guest.memory(), back));
+            let base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
+            match scan_tail_is_zeroed(
+                &guest.memory(),
+                base,
+                SCHED_ATTR_KERNEL_SIZE as usize,
+                (size - SCHED_ATTR_KERNEL_SIZE) as usize,
+            ) {
+                TailVerdict::AllZero => {}
+                TailVerdict::NotZeroed => {
+                    let back = call.attr().ok_or(Errno::EINVAL)?;
+                    return Err(refuse_too_big(guest.memory(), back));
+                }
+                TailVerdict::Faulted => return Err(Errno::EFAULT.into()),
             }
         }
 
@@ -1478,11 +1581,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // does not exist. pid 0 means the calling thread, which always exists;
         // otherwise ask the scheduler's own task table, so the answer comes
         // from Detcore's state rather than from the host's process table.
-        if call.pid() != 0 {
-            let targets = resolve_kill_targets(guest, DetPid::from_raw(call.pid())).await;
-            if targets.is_empty() {
-                return Err(Errno::ESRCH.into());
-            }
+        // `find_task_by_vpid` resolves ANY LIVE TASK, not just a thread-group
+        // leader. The kill-target resolver is the wrong question here: it
+        // models `kill(2)`, whose first act is to refuse anything that is not a
+        // leader, so a perfectly live non-leader thread's tid reported ESRCH.
+        if call.pid() != 0 && !thread_is_live(guest, DetTid::from_raw(call.pid())).await {
+            return Err(Errno::ESRCH.into());
         }
 
         // And everything `__sched_setscheduler` decides after it.
@@ -2003,6 +2107,173 @@ mod tests {
         assert_ne!(
             SCHED_ATTR_KERNEL_SIZE as usize,
             std::mem::size_of::<libc::sched_attr>()
+        );
+    }
+
+    /// A `MemoryAccess` whose readable region ends at `readable_len`, recording
+    /// every read length it is asked for.
+    struct BoundedMemory {
+        bytes: Vec<u8>,
+        readable_len: usize,
+        reads: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl reverie::syscalls::MemoryAccess for BoundedMemory {
+        fn read_vectored(
+            &self,
+            read_from: &[std::io::IoSlice<'_>],
+            write_to: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            let start = read_from[0].as_ptr() as usize;
+            let want = read_from.iter().map(|slice| slice.len()).sum::<usize>();
+            self.reads.borrow_mut().push(want);
+            if start >= self.readable_len {
+                return Err(Errno::EFAULT);
+            }
+            let avail = (self.readable_len - start).min(want);
+            let mut copied = 0;
+            for out in write_to.iter_mut() {
+                if copied == avail {
+                    break;
+                }
+                let take = out.len().min(avail - copied);
+                out[..take].copy_from_slice(&self.bytes[start + copied..start + copied + take]);
+                copied += take;
+            }
+            Ok(copied)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[std::io::IoSlice<'_>],
+            _write_to: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            unimplemented!("this fixture never writes")
+        }
+    }
+
+    fn bounded(bytes: Vec<u8>, readable_len: usize) -> BoundedMemory {
+        BoundedMemory {
+            bytes,
+            readable_len,
+            reads: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn tail_base() -> AddrMut<'static, u8> {
+        AddrMut::<u8>::from_raw(1).expect("nonzero base")
+    }
+
+    /// ITEM 2 REGRESSION, ORDERING HALF: a non-zero byte BEFORE an unreadable
+    /// page is E2BIG, not EFAULT.
+    ///
+    /// `check_zeroed_user` scans forward and stops at the first thing it finds,
+    /// so it never reaches the fault. Reading the whole tail up front and
+    /// judging afterwards turns this into EFAULT and changes the errno the
+    /// guest sees.
+    #[test]
+    fn a_nonzero_byte_before_a_fault_is_e2big_not_efault() {
+        let off = SCHED_ATTR_KERNEL_SIZE as usize;
+        let mut bytes = vec![0u8; off + 4096];
+        bytes[off + 1] = 0xAA; // non-zero, well before the boundary
+        let readable = off + 512; // everything past this faults
+        let memory = bounded(bytes, readable);
+        assert_eq!(
+            scan_tail_is_zeroed(&memory, tail_base(), off, 4096),
+            TailVerdict::NotZeroed,
+            "a non-zero byte the scan reaches first must win over a later fault"
+        );
+    }
+
+    /// ITEM 2 REGRESSION, the other side of the same order: a fault with
+    /// nothing non-zero before it is EFAULT.
+    #[test]
+    fn a_fault_before_any_nonzero_byte_is_efault() {
+        let off = SCHED_ATTR_KERNEL_SIZE as usize;
+        let bytes = vec![0u8; off + 4096];
+        let memory = bounded(bytes, off + 512);
+        assert_eq!(
+            scan_tail_is_zeroed(&memory, tail_base(), off, 4096),
+            TailVerdict::Faulted,
+            "an unreadable byte reached before anything non-zero must be EFAULT"
+        );
+    }
+
+    /// ITEM 2 REGRESSION, PROTECTION HALF: never issue a read of eight bytes or
+    /// fewer.
+    ///
+    /// safeptrace serves those through `PTRACE_PEEKDATA`, which reads a whole
+    /// aligned word and bypasses guest page protections, so a small tail would
+    /// be readable under Hermit where Linux reports EFAULT. The assertion is on
+    /// the READ LENGTHS ASKED FOR, because that is the mechanism; the returned
+    /// verdict cannot show it.
+    #[test]
+    fn tail_reads_are_never_small_enough_to_bypass_guest_protection() {
+        let off = SCHED_ATTR_KERNEL_SIZE as usize;
+        for tail_len in 1..=16usize {
+            let bytes = vec![0u8; off + tail_len + 64];
+            let memory = bounded(bytes, off + tail_len + 64);
+            assert_eq!(
+                scan_tail_is_zeroed(&memory, tail_base(), off, tail_len),
+                TailVerdict::AllZero
+            );
+            let reads = memory.reads.borrow().clone();
+            assert!(!reads.is_empty(), "tail_len {tail_len} issued no read");
+            for length in reads {
+                assert!(
+                    length > std::mem::size_of::<u64>(),
+                    "tail_len {tail_len} issued a {length}-byte read, which safeptrace \
+                     serves with PTRACE_PEEKDATA and which therefore bypasses guest \
+                     page protections"
+                );
+            }
+        }
+    }
+
+    /// ITEM 3 REGRESSION: KEEP_POLICY reuses the CURRENT policy; it does not
+    /// switch the policy-dependent rules off.
+    ///
+    /// Detcore's current policy is the one `handle_sched_getattr` reports for
+    /// every thread, SCHED_OTHER, and a non-real-time policy requires priority
+    /// 0. Skipping the rules accepted this.
+    #[test]
+    fn keep_policy_validates_against_the_virtual_current_policy() {
+        let attr = SchedAttrFields {
+            policy: 99, // ignored under KEEP_POLICY, and deliberately invalid
+            sched_flags: SCHED_FLAG_KEEP_POLICY,
+            priority: 1,
+            runtime: 0,
+            deadline: 0,
+            period: 0,
+        };
+        assert_eq!(
+            validate_sched_attr_after_lookup(&attr),
+            Err(Errno::EINVAL),
+            "priority 1 under the virtual SCHED_OTHER current policy must be refused"
+        );
+
+        // The companion that must keep passing: the ignored policy field really
+        // is ignored, so the same request at priority 0 is accepted.
+        let ok = SchedAttrFields {
+            priority: 0,
+            ..attr
+        };
+        assert_eq!(
+            validate_sched_attr_after_lookup(&ok),
+            Ok(()),
+            "KEEP_POLICY must still ignore the policy field itself"
+        );
+    }
+
+    /// ITEM 3 COHERENCE: the substituted policy is the one the guest can
+    /// actually observe, so the two sites cannot drift apart silently.
+    #[test]
+    fn the_virtual_current_policy_is_what_sched_getattr_reports() {
+        assert_eq!(
+            VIRTUAL_CURRENT_POLICY,
+            libc::SCHED_OTHER as u32,
+            "handle_sched_getattr writes SCHED_OTHER into sched_policy for every thread; \
+             KEEP_POLICY must substitute that same value"
         );
     }
 }
