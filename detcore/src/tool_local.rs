@@ -30,6 +30,7 @@ use rand_distr::Distribution;
 use rand_distr::Exp;
 use rand_pcg::Pcg64Mcg;
 use reverie::Errno;
+use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls::CloneFlags;
 use reverie::syscalls::Syscall;
@@ -273,6 +274,26 @@ impl<T: RecordOrReplay> AsMut<T> for Detcore<T> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Delegate to the record/replay tool without collapsing a tool failure
+    /// into a guest-visible errno. Syscall errors remain [`Error::Errno`], while
+    /// failures of the record/replay machinery retain their non-errno variant.
+    pub(crate) async fn record_or_replay_preserving_tool_errors<G, S>(
+        &self,
+        guest: &mut G,
+        syscall: S,
+    ) -> Result<i64, Error>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall>,
+    {
+        preserve_record_or_replay_error(
+            self.record_or_replay
+                .handle_syscall_event(&mut guest.into_guest(), syscall.into())
+                .await,
+        )?
+        .map_err(Error::from)
+    }
+
     /// Helper function for delegating the injection of a syscall to the
     /// record_or_replay tool.
     ///
@@ -303,6 +324,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
             // TODO: Get rid of this and make this whole function use the Error type.
             .map_err(|err| err.into_errno().unwrap())
+    }
+}
+
+fn preserve_record_or_replay_error(
+    result: Result<i64, Error>,
+) -> Result<Result<i64, Errno>, Error> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(Error::Errno(error)) => Ok(Err(error)),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod record_or_replay_error_tests {
+    use super::*;
+
+    #[test]
+    fn errno_remains_a_guest_syscall_result() {
+        let result = preserve_record_or_replay_error(Err(Error::Errno(Errno::EBADF)))
+            .expect("guest errno must not abort the tool");
+        assert_eq!(result, Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn tool_failure_remains_an_outer_error() {
+        let failure =
+            preserve_record_or_replay_error(Err(Error::Tool(anyhow::anyhow!("restore failed"))))
+                .expect_err("tool failure must abort replay");
+        assert!(matches!(failure.into_errno(), Err(Error::Tool(_))));
     }
 }
 

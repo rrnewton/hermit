@@ -86,7 +86,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()
         );
-        let res = self.record_or_replay(guest, call).await;
+        let res = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release
         // explicitly here:
         {
@@ -95,7 +97,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.fyi(call.name());
             resource_request(guest, rsrcs).await;
         }
-        Ok(res?)
+        res
     }
 
     /// Executes a nonblockable syscall according to the following strategy:

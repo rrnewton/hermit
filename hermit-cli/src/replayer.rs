@@ -185,42 +185,45 @@ impl Tool for Replayer {
                 // should let it through.
                 self.let_through(guest, syscall).await
             }
-            Syscall::Read(syscall) => self.handle_read(guest, syscall).await,
+            Syscall::Read(syscall) => Ok(self.handle_read(guest, syscall).await?),
             Syscall::Pread64(syscall) => self.handle_pread64(guest, syscall).await,
-            Syscall::Readv(syscall) => {
-                self.handle_readv_family(
+            Syscall::Readv(syscall) => Ok(self
+                .handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.len(),
                     syscall.into(),
                 )
-                .await
-            }
-            Syscall::Preadv(syscall) => {
-                self.handle_readv_family(
+                .await?),
+            Syscall::Preadv(syscall) => Ok(self
+                .handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len(),
                     syscall.into(),
                 )
-                .await
-            }
-            Syscall::Preadv2(syscall) => {
-                self.handle_readv_family(
+                .await?),
+            Syscall::Preadv2(syscall) => Ok(self
+                .handle_readv_family(
                     guest,
                     syscall.iov().map(|a| a.as_raw()),
                     syscall.iov_len() as usize,
                     syscall.into(),
                 )
-                .await
-            }
+                .await?),
             Syscall::Recvfrom(syscall) => self.handle_recvfrom(guest, syscall).await,
             Syscall::Recvmsg(syscall) => self.handle_recvmsg(guest, syscall).await,
-            Syscall::Write(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Pwrite64(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Writev(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Pwritev(syscall) => self.handle_write_family(guest, syscall.into()).await,
-            Syscall::Pwritev2(syscall) => self.handle_write_family(guest, syscall.into()).await,
+            Syscall::Write(syscall) => Ok(self.handle_write_family(guest, syscall.into()).await?),
+            Syscall::Pwrite64(syscall) => {
+                Ok(self.handle_write_family(guest, syscall.into()).await?)
+            }
+            Syscall::Writev(syscall) => Ok(self.handle_write_family(guest, syscall.into()).await?),
+            Syscall::Pwritev(syscall) => {
+                Ok(self.handle_write_family(guest, syscall.into()).await?)
+            }
+            Syscall::Pwritev2(syscall) => {
+                Ok(self.handle_write_family(guest, syscall.into()).await?)
+            }
             Syscall::Access(_) => self.handle_simple(guest, syscall).await,
             Syscall::Lseek(_) => self.handle_optional_fd_position(guest, syscall).await,
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
