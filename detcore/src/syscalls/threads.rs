@@ -363,6 +363,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let res = maybe_res?;
 
+        if !flags.contains(CloneFlags::CLONE_THREAD) {
+            // Only a successful process clone can let another process mutate
+            // inherited open file descriptions. Failed clone-family calls leave
+            // the previously observed flock state authoritative.
+            guest.thread_state().forget_flock_modes();
+        }
+
         // Match ordinary clone: the parent consumes the priority entropy after
         // the child has inherited the parent state.
         if parent_blocks_for_child

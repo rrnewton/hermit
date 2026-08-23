@@ -1305,6 +1305,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
+    /// Sends one message and invalidates process-wide flock knowledge after success.
+    ///
+    /// The guest can mutate shared message and control memory while this helper
+    /// deschedules. Parsing before the syscall would not prove which descriptors the
+    /// kernel later transferred, so a successful unbound send conservatively makes
+    /// every cached open-file-description lock mode unknown.
+    pub async fn handle_sendmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendmsg,
+    ) -> Result<i64, Error> {
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        guest.thread_state().forget_flock_modes();
+        Ok(result)
+    }
+
+    /// Sends a message batch and invalidates process-wide flock knowledge when the
+    /// kernel reports at least one message sent. This intentionally includes
+    /// descriptors named only by an unsent tail message: the mutable guest array is
+    /// not stable across a possible deschedule, so narrower attribution is unsafe.
+    pub async fn handle_sendmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendmmsg,
+    ) -> Result<i64, Error> {
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        if result > 0 {
+            guest.thread_state().forget_flock_modes();
+        }
+        Ok(result)
+    }
+
     // TODO-HUMAN-REVIEW(PR-912): Review receive-time capture across socket aliases.
     async fn observe_socket_receive<G: Guest<Self>>(
         &self,
