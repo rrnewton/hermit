@@ -252,6 +252,11 @@ const PREFLIGHT: &[&str] = &[
     "check.skill_discovery",
     "check.backend_abstraction",
     "check.portability_paths",
+    // Unconditional on purpose: this node guards the merge-gate status
+    // classifier, so a selective run that skipped it would leave the gate that
+    // decides landing unguarded on exactly the changes least likely to look
+    // related to it. It is 5s and classified light.
+    "check.check_outcome_consumers",
     "check.script_sigpipe",
     "lint.rustfmt",
 ];

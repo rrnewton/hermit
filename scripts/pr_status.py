@@ -32,8 +32,8 @@ import sys
 from dataclasses import dataclass
 from typing import Sequence
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agent-utils" / "py"))
-from ci_hub_check_outcome import classify_check, select_latest_checks  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check_outcome_adapter import classify_check, select_latest_checks  # noqa: E402
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
