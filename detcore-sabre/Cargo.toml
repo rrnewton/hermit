@@ -13,9 +13,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.2.0", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" }
-reverie-memory = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" }
-reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" }
-reverie-sabre = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" }
-reverie-syscalls = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" }
+reverie = { package = "reverie-core", version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "b3811ea15a832ad84c6a52cf2e0e5aa84ed18f50" }
+reverie-memory = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "b3811ea15a832ad84c6a52cf2e0e5aa84ed18f50" }
+reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "b3811ea15a832ad84c6a52cf2e0e5aa84ed18f50" }
+reverie-sabre = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "b3811ea15a832ad84c6a52cf2e0e5aa84ed18f50" }
+reverie-syscalls = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "b3811ea15a832ad84c6a52cf2e0e5aa84ed18f50" }
 syscalls = { version = "0.6.7", features = ["serde"] }
