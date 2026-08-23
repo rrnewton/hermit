@@ -76,12 +76,16 @@ fn git_watch_paths_resolve_from_a_nested_crate() {
     let paths = build_support::git_watch_paths_in(&crate_dir);
     let git_dir = repo.path().join(".git");
     let reference = git(repo.path(), &["symbolic-ref", "HEAD"]);
+    let packed_refs = git_dir.join("packed-refs");
 
     assert!(paths.contains(&git_dir.join("HEAD")));
     assert!(paths.contains(&git_dir.join("index")));
     assert!(paths.contains(&git_dir.join(reference)));
-    assert!(paths.contains(&repo.path().join("tracked.txt")));
+    assert!(!packed_refs.exists());
+    assert!(!paths.contains(&packed_refs));
+    assert!(!paths.contains(&repo.path().join("tracked.txt")));
     assert!(paths.iter().all(|path| path.is_absolute()));
+    assert!(paths.iter().all(|path| path.exists()));
 }
 
 #[test]
@@ -117,7 +121,7 @@ fn tracked_worktree_and_index_changes_taint_version() {
 }
 
 #[test]
-fn cargo_rebuilds_provenance_after_an_unstaged_tracked_edit() {
+fn cargo_rebuilds_provenance_after_staging_a_tracked_edit() {
     let repo = initialized_repo();
     let crate_dir = repo.path().join("fixture");
     fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
@@ -189,6 +193,19 @@ fn main() {
     );
     assert_eq!(
         checked_output(&mut Command::new(&binary)),
-        format!("{expected}-dirty")
+        expected,
+        "an unstaged edit intentionally leaves embedded provenance unchanged"
+    );
+
+    git(repo.path(), &["add", "tracked.txt"]);
+    checked_output(
+        Command::new(&cargo)
+            .current_dir(&crate_dir)
+            .args(["build", "--quiet"]),
+    );
+    assert_eq!(
+        checked_output(&mut Command::new(&binary)),
+        format!("{expected}-dirty"),
+        "staging changes the watched index and must refresh embedded provenance"
     );
 }
