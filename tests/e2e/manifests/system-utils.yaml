@@ -141,7 +141,7 @@ test:
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
   - id: system-utils/example-date
-    description: The user-facing nanosecond date example repeats under every applicable backend
+    description: The user-facing nanosecond date example repeats canonically under ptrace
     lane: portable
     requires:
       - linux
@@ -164,15 +164,33 @@ test:
         backends_disabled:
           native: The existing date-nanoseconds test owns the native-variation assertion
       verify:
-        ci: false
+        ci:
+          ptrace: true
+          dbt: false
+          kvm: false
+          sabre: false
+        ci_disabled_reason:
+          dbt:
+            result: determinism-failure
+            evidence: 2b805d60d26bea9d50e11fe42aafd24b60f33cb9
+            reason: Legacy Stripped verification produced one unclassified deviation in 600 attempts, and no retained canonical positive-INFO result establishes L2 for DBT.
+          kvm:
+            result: unavailable
+            evidence: 2b805d60d26bea9d50e11fe42aafd24b60f33cb9
+            reason: The retained KVM run compared only status and output because KVM has no internal INFO-log comparison, so it cannot establish this cell's L2 contract.
+          sabre:
+            result: unavailable
+            evidence: 2b805d60d26bea9d50e11fe42aafd24b60f33cb9
+            reason: The prior review could not stage the SaBRe runtime and retains no execution result, so this backend has no evidence for this cell.
         backends_enabled:
           - ptrace
           - dbt
           - kvm
           - sabre
+        assert:
+          bitwise_parity: true
         backends_disabled:
           liteinst: The preload runtime cannot survive the date script's post-start exec
-        ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       replay:
         ci: false
         backends_enabled: []

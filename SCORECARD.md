@@ -8,23 +8,23 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 
 | Backend | Green | Red | Total |
 | --- | ---: | ---: | ---: |
-| `ptrace` | 219 | 795 | 1014 |
+| `ptrace` | 220 | 794 | 1014 |
 | `dbt` | 0 | 1014 | 1014 |
 | `kvm` | 0 | 1014 | 1014 |
 | `sabre` | 53 | 961 | 1014 |
 | `liteinst` | 0 | 1014 | 1014 |
 | `native` | 0 | 338 | 338 |
-| **Total** | **272** | **5136** | **5408** |
+| **Total** | **273** | **5135** | **5408** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 217 / 338 | 0 / 338 | 0 / 338 | 53 / 338 | 0 / 338 | — | 270 | 1420 | 1690 |
+| `verify` | 218 / 338 | 0 / 338 | 0 / 338 | 53 / 338 | 0 / 338 | — | 271 | 1419 | 1690 |
 | `replay` | 1 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | — | 1 | 1689 | 1690 |
 | `chaos` | 1 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | — | 1 | 1689 | 1690 |
 | `naked` | — | — | — | — | — | 0 / 338 | 0 | 338 | 338 |
-| **Total** | | | | | | | **272** | **5136** | **5408** |
+| **Total** | | | | | | | **273** | **5135** | **5408** |
 
 ## Cross-backend parity
 
@@ -47,7 +47,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `determinism-stress-c` | 7 / 11 | 0 / 11 | 0 / 11 | 7 | 33 |
 | `language-runtimes` | 18 / 19 | 0 / 19 | 0 / 19 | 18 | 57 |
 | `shared-futex-c` | 0 / 4 | 0 / 4 | 0 / 4 | 0 | 12 |
-| `system-utils` | 24 / 26 | 1 / 26 | 0 / 26 | 25 | 78 |
+| `system-utils` | 25 / 26 | 1 / 26 | 0 / 26 | 26 | 78 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 274 selected regression cells: the 272 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 275 selected regression cells: the 273 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

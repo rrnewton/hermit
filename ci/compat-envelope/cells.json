@@ -51314,7 +51314,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "determinism-failure",
+        "evidence": "2b805d60d26bea9d50e11fe42aafd24b60f33cb9",
+        "reason": "Legacy Stripped verification produced one unclassified deviation in 600 attempts, and no retained canonical positive-INFO result establishes L2 for DBT."
       },
       "observations": []
     },
@@ -51327,7 +51329,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "unavailable",
+        "evidence": "2b805d60d26bea9d50e11fe42aafd24b60f33cb9",
+        "reason": "The retained KVM run compared only status and output because KVM has no internal INFO-log comparison, so it cannot establish this cell's L2 contract."
       },
       "observations": []
     },
@@ -51348,10 +51352,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": []
     },
     {
@@ -51363,7 +51364,9 @@
       "enabled": true,
       "status": "red",
       "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
+        "result": "unavailable",
+        "evidence": "2b805d60d26bea9d50e11fe42aafd24b60f33cb9",
+        "reason": "The prior review could not stage the SaBRe runtime and retains no execution result, so this backend has no evidence for this cell."
       },
       "observations": []
     },
