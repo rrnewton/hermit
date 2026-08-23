@@ -50,6 +50,7 @@ use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
+use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
@@ -956,7 +957,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
 
             loop {
-                match self.record_or_replay(guest, call).await {
+                match self
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await
+                {
                     Ok(res) => {
                         remaining_buf -= res as usize;
                         total_written_bytes += res;
@@ -976,13 +980,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_len(remaining_buf)
                             .with_buf(Addr::<u8>::from_raw(old_ptr + res as usize));
                     }
-                    Err(e) => {
-                        break Err(e.into());
+                    Err(error) => {
+                        break finish_partial_record_or_replay_write(total_written_bytes, error);
                     }
                 }
             }
         } else {
-            Ok(self.record_or_replay(guest, call).await?)
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
         };
 
         resource_release_all(guest).await;
@@ -1065,8 +1070,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_len(remaining)
                             .with_offset(next_offset);
                     }
-                    Err(Error::Errno(_)) if total_written > 0 => break Ok(total_written),
-                    Err(error) => break Err(error),
+                    Err(error) => {
+                        break finish_partial_record_or_replay_write(total_written, error);
+                    }
                 }
             }
         } else {
@@ -1127,7 +1133,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else {
-            Ok(self.record_or_replay(guest, call).await?)
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
         };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {

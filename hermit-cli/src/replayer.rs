@@ -250,7 +250,7 @@ impl Tool for Replayer {
             Syscall::Fchdir(call) => self.handle_fchdir(guest, call).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall),
+            Syscall::Ftruncate(syscall) => Ok(self.handle_ftruncate(guest, syscall).await?),
             Syscall::Dup(_) => {
                 self.handle_replayed_side_effect(guest, syscall, "dup")
                     .await

@@ -36,6 +36,7 @@ use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
 use crate::tool_local::Detcore;
+use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
@@ -179,7 +180,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.name()
             );
             // Otherwise, the socket was already nonblocking, so we can safely execute it just once.
-            Ok(self.record_or_replay(guest, wrapped).await?)
+            self.record_or_replay_preserving_tool_errors(guest, wrapped)
+                .await
         }
     }
 
@@ -261,8 +263,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
             } else {
                 match subtool {
-                    Some(detcore) => detcore.record_or_replay(guest, current).await,
-                    None => guest.inject_with_retry(current).await,
+                    Some(detcore) => {
+                        detcore
+                            .record_or_replay_preserving_tool_errors(guest, current)
+                            .await
+                    }
+                    None => guest.inject_with_retry(current).await.map_err(Error::from),
                 }
             };
             match result {
@@ -287,7 +293,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Errno::EAGAIN) => {
+                Err(Error::Errno(Errno::EAGAIN)) => {
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
                         current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
                             Ok(Some(write)) => Syscall::Write(write),
@@ -297,21 +303,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
                 Err(error) => {
-                    break if written_total > 0 {
-                        Ok(written_total as i64)
-                    } else {
-                        Err(error.into())
-                    };
+                    break finish_partial_record_or_replay_write(written_total as i64, error);
                 }
                 Ok(_) => break Err(Errno::EIO.into()),
             }
 
             resources.poll_attempt += 1;
             tracing::trace!(
-                "Retry #{} for {}blocking pipe writev after {:?}: {}",
+                "Retry #{} for {}blocking pipe writev after EAGAIN: {}",
                 resources.poll_attempt,
                 if atomic_pipe_write { "atomic " } else { "" },
-                result,
                 call.display(&guest.memory())
             );
             record_retry_event(guest, call).await;
@@ -323,7 +324,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
         iovecs: &[(usize, usize)],
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
         // path is smaller; this covers common vectors without consuming guest VM mappings.
         const STACK_IOVECS: usize = 32;
@@ -346,9 +347,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
             let scratch_call = call.with_iov(Some(scratch_iov));
             return if self.cfg.recordreplay_modes {
-                self.record_or_replay(guest, scratch_call).await
+                self.record_or_replay_preserving_tool_errors(guest, scratch_call)
+                    .await
             } else {
-                guest.inject_with_retry(scratch_call).await
+                guest
+                    .inject_with_retry(scratch_call)
+                    .await
+                    .map_err(Error::from)
             };
         }
 
@@ -404,9 +409,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let scratch_call = call.with_iov(Some(scratch_iov));
         let result = if self.cfg.recordreplay_modes {
-            self.record_or_replay(guest, scratch_call).await
+            self.record_or_replay_preserving_tool_errors(guest, scratch_call)
+                .await
         } else {
-            guest.inject_with_retry(scratch_call).await
+            guest
+                .inject_with_retry(scratch_call)
+                .await
+                .map_err(Error::from)
         };
         guest
             .inject_with_retry(Syscall::Munmap(
@@ -1188,10 +1197,19 @@ where
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.
         let res = match subtool {
-            Some(detcore) => detcore.record_or_replay(guest, call).await,
-            None => guest.inject_with_retry(call).await,
+            Some(detcore) => {
+                detcore
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await
+            }
+            None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
-        if call.syscall_would_have_blocked(res) {
+        let syscall_result = match res {
+            Ok(value) => Ok(value),
+            Err(Error::Errno(error)) => Err(error),
+            Err(error) => return Err(error),
+        };
+        if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
                 let new_time = thread_observe_time(guest).await;
@@ -1206,7 +1224,7 @@ where
                     tracing::trace!(
                         "Retry #{} for syscall due to result {:?}, {} from timeout: {}",
                         rsrc.poll_attempt,
-                        res,
+                        syscall_result,
                         timeout - new_time,
                         call.display(&guest.memory())
                     );
@@ -1216,14 +1234,14 @@ where
                 tracing::trace!(
                     "Retry #{} for syscall due to result {:?}: {}",
                     rsrc.poll_attempt,
-                    res,
+                    syscall_result,
                     call.display(&guest.memory())
                 );
                 record_retry_event(guest, call).await;
             }
         } else {
             let res = call
-                .normalize_nonblocking_result(res, rsrc.poll_attempt > 0)
+                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
                 .map_err(|e| e.into());
             tracing::trace!(
                 "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",

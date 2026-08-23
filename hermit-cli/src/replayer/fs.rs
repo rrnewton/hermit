@@ -55,17 +55,12 @@ struct UserSignalInfoHead {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-696): Review lossless replay-output backpressure handling.
-async fn wait_for_replay_output(output_fd: RawFd) -> bool {
+async fn wait_for_replay_output(output_fd: RawFd) -> std::io::Result<bool> {
     // F_DUPFD_CLOEXEC keeps the endpoint alive while the bounded blocking task
     // polls it, without changing the shared open-file-description flags.
     let duplicate = unsafe { libc::fcntl(output_fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate == -1 {
-        tracing::debug!(
-            error = %std::io::Error::last_os_error(),
-            output_fd,
-            "could not duplicate replay output for readiness polling"
-        );
-        return false;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this task.
     let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
@@ -94,15 +89,10 @@ async fn wait_for_replay_output(output_fd: RawFd) -> bool {
     })
     .await;
     match readiness {
-        Ok(Ok(ready)) => ready,
-        Ok(Err(error)) => {
-            tracing::debug!(%error, output_fd, "could not wait for replay output capacity");
-            false
-        }
-        Err(error) => {
-            tracing::debug!(%error, output_fd, "could not monitor replay output capacity");
-            false
-        }
+        Ok(result) => result,
+        Err(error) => Err(std::io::Error::other(format!(
+            "replay output readiness task failed: {error}"
+        ))),
     }
 }
 
@@ -215,11 +205,24 @@ fn clear_clone_destination_range(
     Ok(())
 }
 
-fn write_replay_output_once(
+fn set_replay_output_flags(output_fd: RawFd, flags: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: the caller owns output_fd for the duration of the operation.
+    if unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn write_replay_output_once_with<F>(
     output_fd: RawFd,
     bytes: &[u8],
     file_offset: Option<i64>,
-) -> std::io::Result<usize> {
+    set_flags: &mut F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(RawFd, libc::c_int) -> std::io::Result<()>,
+{
     // Nonblocking mode is temporary and is restored before this function
     // returns. In particular, no async suspension may expose it through the
     // shared open-file description.
@@ -234,11 +237,7 @@ fn write_replay_output_once(
     };
     let changed_flags = temporary_flags != flags;
     if changed_flags {
-        // SAFETY: the descriptor remains open and this function does not
-        // suspend before restoring its flags.
-        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, temporary_flags) } == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
+        set_flags(output_fd, temporary_flags)?;
     }
 
     let written = match file_offset {
@@ -257,37 +256,58 @@ fn write_replay_output_once(
         Ok(written as usize)
     };
 
-    if changed_flags {
-        // SAFETY: restore the shared description before any async wait.
-        if unsafe { libc::fcntl(output_fd, libc::F_SETFL, flags) } == -1 {
-            tracing::debug!(
-                error = %std::io::Error::last_os_error(),
-                output_fd,
-                "could not restore replay output flags"
-            );
-        }
+    if changed_flags && let Err(restore_error) = set_flags(output_fd, flags) {
+        let write_detail = match result {
+            Ok(written) => format!("write completed with {written} byte(s)"),
+            Err(ref write_error) => format!("write failed: {write_error}"),
+        };
+        return Err(std::io::Error::other(format!(
+            "failed to restore replay output flags after {write_detail}: {restore_error}"
+        )));
     }
     result
 }
 
-async fn emit_replay_output(
+fn write_replay_output_once(
+    output_fd: RawFd,
+    bytes: &[u8],
+    file_offset: Option<i64>,
+) -> std::io::Result<usize> {
+    let mut set_flags = set_replay_output_flags;
+    write_replay_output_once_with(output_fd, bytes, file_offset, &mut set_flags)
+}
+
+async fn emit_replay_output_with<W>(
     output_fd: RawFd,
     bytes: &[u8],
     file_offset: Option<i64>,
     advances_output_offset: bool,
-) {
+    write_once: &mut W,
+) -> std::io::Result<()>
+where
+    W: FnMut(RawFd, &[u8], Option<i64>) -> std::io::Result<usize>,
+{
     if bytes.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut offset = 0;
     while offset < bytes.len() {
         let remaining = &bytes[offset..];
         let written = if let Some(file_offset) = file_offset {
-            let position = file_offset
-                .checked_add(offset as i64)
-                .expect("recorded output offset overflow");
-            write_replay_output_once(output_fd, remaining, Some(position))
+            let offset = i64::try_from(offset).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "recorded replay output offset does not fit in i64",
+                )
+            })?;
+            let position = file_offset.checked_add(offset).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "recorded replay output offset overflow",
+                )
+            })?;
+            write_once(output_fd, remaining, Some(position))
         } else {
             // send with MSG_NOSIGNAL handles sockets without risking a tracer
             // SIGPIPE. MSG_DONTWAIT is per-call and does not modify the shared
@@ -304,7 +324,7 @@ async fn emit_replay_output(
             if sent == -1 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ENOTSOCK) {
-                    write_replay_output_once(output_fd, remaining, None)
+                    write_once(output_fd, remaining, None)
                 } else {
                     Err(error)
                 }
@@ -321,31 +341,105 @@ async fn emit_replay_output(
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && wait_for_replay_output(output_fd).await
-                {
-                    continue;
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    match wait_for_replay_output(output_fd).await {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            return Err(std::io::Error::other(format!(
+                                "replay output fd {output_fd} became unavailable after {offset}/{} bytes",
+                                bytes.len()
+                            )));
+                        }
+                        Err(wait_error) => {
+                            return Err(std::io::Error::other(format!(
+                                "replay output fd {output_fd} remained blocked after {offset}/{} bytes: {error}; readiness check failed: {wait_error}",
+                                bytes.len()
+                            )));
+                        }
+                    }
                 }
-                tracing::debug!(%error, output_fd, "could not emit all replay output");
+                return Err(error);
             }
-            Ok(_) => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "replay output fd {output_fd} wrote zero bytes after {offset}/{} bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
         }
-        break;
     }
 
     if advances_output_offset {
-        let final_offset = file_offset
-            .expect("advancing captured output requires a recorded file offset")
-            .checked_add(bytes.len() as i64)
-            .expect("recorded output offset overflow");
+        let file_offset = file_offset.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "advancing captured output requires a recorded file offset",
+            )
+        })?;
+        let length = i64::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "recorded replay output length does not fit in i64",
+            )
+        })?;
+        let final_offset = file_offset.checked_add(length).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "recorded replay output offset overflow",
+            )
+        })?;
         // SAFETY: output_fd is an owned seekable output duplicate.
         let positioned = unsafe { libc::lseek(output_fd, final_offset, libc::SEEK_SET) };
-        assert_eq!(
-            positioned,
-            final_offset,
-            "failed to advance captured output fd position: {}",
-            std::io::Error::last_os_error()
-        );
+        if positioned == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if positioned != final_offset {
+            return Err(std::io::Error::other(format!(
+                "failed to advance captured output fd position to {final_offset}: positioned at {positioned}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn emit_replay_output(
+    output_fd: RawFd,
+    bytes: &[u8],
+    file_offset: Option<i64>,
+    advances_output_offset: bool,
+) -> std::io::Result<()> {
+    let mut write_once = write_replay_output_once;
+    emit_replay_output_with(
+        output_fd,
+        bytes,
+        file_offset,
+        advances_output_offset,
+        &mut write_once,
+    )
+    .await
+}
+
+fn truncate_replay_output(output_fd: RawFd, length: i64) -> Result<(), Error> {
+    // SAFETY: output_fd is an owned duplicate and length was accepted by the
+    // kernel while recording.
+    if unsafe { libc::ftruncate(output_fd, length) } == -1 {
+        Err(Error::Io(std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn successful_replay_write_count(result: Result<i64, Errno>) -> Result<Option<usize>, Error> {
+    match result {
+        Ok(count) => usize::try_from(count).map(Some).map_err(|_| {
+            Error::Tool(anyhow::anyhow!(
+                "recording contains successful write with invalid count {count}"
+            ))
+        }),
+        Err(_) => Ok(None),
     }
 }
 
@@ -582,31 +676,48 @@ impl Replayer {
         count: usize,
         offset: Option<i64>,
         advances_offset: bool,
-    ) -> Result<(), Errno> {
+    ) -> Result<(), Error> {
         if !self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
             return Ok(());
         }
-        let offset = offset.expect("recorded regular-file write is missing its offset");
-        let offset_u64 = u64::try_from(offset).expect("recorded write used a negative offset");
+        let offset = offset.ok_or_else(|| {
+            Error::Tool(anyhow::anyhow!(
+                "recorded regular-file write is missing its offset"
+            ))
+        })?;
+        let offset_u64 = u64::try_from(offset).map_err(|_| {
+            Error::Tool(anyhow::anyhow!(
+                "recorded regular-file write used negative offset {offset}"
+            ))
+        })?;
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
-        let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
-            .unwrap_or_else(|error| panic!("failed to duplicate replay file for write: {error}"));
+        let duplicate =
+            crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
-        file.write_all_at(&bytes, offset_u64)
-            .unwrap_or_else(|error| panic!("failed to materialize replay write: {error}"));
+        file.write_all_at(&bytes, offset_u64).map_err(Error::Io)?;
 
         if advances_offset {
             let next = offset
-                .checked_add(i64::try_from(count).expect("recorded write length exceeds i64"))
-                .expect("recorded write offset overflow");
+                .checked_add(i64::try_from(count).map_err(|_| {
+                    Error::Tool(anyhow::anyhow!(
+                        "recorded regular-file write length {count} exceeds i64"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "recorded regular-file write offset overflow"
+                    ))
+                })?;
             // SAFETY: file owns a duplicate of the guest open-file description.
             let result = unsafe { libc::lseek(file.as_raw_fd(), next, libc::SEEK_SET) };
-            assert_eq!(
-                result,
-                next,
-                "failed to advance replay file after write: {}",
-                std::io::Error::last_os_error()
-            );
+            if result == -1 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            if result != next {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "failed to advance replay file after write to {next}: positioned at {result}"
+                )));
+            }
         }
         Ok(())
     }
@@ -771,18 +882,26 @@ impl Replayer {
         Ok(())
     }
 
-    fn output_endpoint(&self, output_fd: libc::c_int) -> libc::c_int {
-        let (output, error) = match output_fd {
-            libc::STDOUT_FILENO => (&self.stdout, &self.stdout_error),
-            libc::STDERR_FILENO => (&self.stderr, &self.stderr_error),
-            _ => panic!("invalid recorded output descriptor {output_fd}"),
+    fn output_endpoint(
+        &self,
+        output_fd: libc::c_int,
+    ) -> Result<(&tokio::sync::Mutex<()>, RawFd), Error> {
+        let (lock, output, error) = match output_fd {
+            libc::STDOUT_FILENO => (&self.stdout_output_lock, &self.stdout, &self.stdout_error),
+            libc::STDERR_FILENO => (&self.stderr_output_lock, &self.stderr, &self.stderr_error),
+            _ => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "recording names invalid captured output descriptor {output_fd}"
+                )));
+            }
         };
-        output.as_ref().map(AsRawFd::as_raw_fd).unwrap_or_else(|| {
+        let output = output.as_ref().ok_or_else(|| {
             let reason = error.as_deref().unwrap_or("descriptor was closed");
-            panic!(
+            Error::Tool(anyhow::anyhow!(
                 "recording requires output fd {output_fd}, but replay could not duplicate it: {reason}"
-            )
-        })
+            ))
+        })?;
+        Ok((lock, output.as_raw_fd()))
     }
 
     async fn replay_output<G: Guest<Self>>(
@@ -793,16 +912,16 @@ impl Replayer {
         output_fd: i32,
         count: usize,
         output_offset: Option<i64>,
-    ) -> Result<(), Errno> {
+    ) -> Result<(), Error> {
+        // Faults while reading the guest's syscall arguments are Linux-visible
+        // syscall errors. Failures after that boundary are failures of Replay's
+        // host-side output machinery and must abort the tool instead.
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
-        let output_lock = match output_fd {
-            libc::STDOUT_FILENO => &self.stdout_output_lock,
-            libc::STDERR_FILENO => &self.stderr_output_lock,
-            _ => panic!("invalid recorded output descriptor {output_fd}"),
-        };
+        let (output_lock, output) = self.output_endpoint(output_fd)?;
         let _guard = output_lock.lock().await;
-        let output = self.output_endpoint(output_fd);
-        emit_replay_output(output, &bytes, output_offset, advances_output_offset).await;
+        emit_replay_output(output, &bytes, output_offset, advances_output_offset)
+            .await
+            .map_err(Error::Io)?;
         Ok(())
     }
 
@@ -814,6 +933,7 @@ impl Replayer {
         syscall: WriteFamily,
     ) -> Result<i64, Error> {
         let event = next_event!(guest, WriteV2)?;
+        let successful_count = successful_replay_write_count(event.result)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
                 let actual =
@@ -824,11 +944,11 @@ impl Replayer {
                 );
             }
             ReplayFdKind::RegularFile => {
-                if let Ok(count) = event.result {
+                if let Some(count) = successful_count {
                     self.replay_regular_file_write(
                         guest,
                         syscall,
-                        usize::try_from(count).expect("negative successful write count"),
+                        count,
                         event.replay_file_offset,
                         event.replay_file_advances_offset,
                     )?;
@@ -839,13 +959,13 @@ impl Replayer {
         if event.generated_sigpipe {
             self.replay_sigpipe(guest).await?;
         }
-        if let (Ok(count), Some(output_fd)) = (event.result, event.output_fd) {
+        if let (Some(count), Some(output_fd)) = (successful_count, event.output_fd) {
             self.replay_output(
                 guest,
                 event.advances_output_offset,
                 syscall,
                 output_fd,
-                count as usize,
+                count,
                 event.output_offset,
             )
             .await?;
@@ -854,42 +974,42 @@ impl Replayer {
     }
 
     // TODO-HUMAN-REVIEW(#557): Audit captured-output ftruncate replay.
-    pub(super) fn handle_ftruncate<G: Guest<Self>>(
+    pub(super) async fn handle_ftruncate<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Ftruncate,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let event = next_event!(guest, FtruncateV2)?;
         if event.result.is_ok() {
-            assert_eq!(event.length, syscall.length());
+            if event.length != syscall.length() {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "replayed ftruncate length diverged: recorded {}, requested {}",
+                    event.length,
+                    syscall.length()
+                )));
+            }
             if let Some(output_fd) = event.output_fd {
-                let output = self.output_endpoint(output_fd);
-                // SAFETY: output is an owned duplicate and event.length was
-                // accepted by the kernel during recording.
-                let truncated = unsafe { libc::ftruncate(output, event.length) };
-                assert_eq!(
-                    truncated,
-                    0,
-                    "failed to reproduce ftruncate on captured output fd {output_fd}: {}",
-                    std::io::Error::last_os_error()
-                );
+                let (output_lock, output) = self.output_endpoint(output_fd)?;
+                let _guard = output_lock.lock().await;
+                truncate_replay_output(output, event.length)?;
             }
             if event.replay_regular_file
                 && event.output_fd.is_none()
                 && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
             {
-                let duplicate = crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd())
-                    .unwrap_or_else(|error| {
-                        panic!("failed to duplicate replay file for ftruncate: {error}")
-                    });
+                let duplicate =
+                    crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).map_err(Error::Io)?;
                 let file = std::fs::File::from(duplicate);
-                file.set_len(
-                    u64::try_from(event.length).expect("successful ftruncate used negative length"),
-                )
-                .unwrap_or_else(|error| panic!("failed to materialize replay ftruncate: {error}"));
+                let length = u64::try_from(event.length).map_err(|_| {
+                    Error::Tool(anyhow::anyhow!(
+                        "recording contains successful ftruncate with negative length {}",
+                        event.length
+                    ))
+                })?;
+                file.set_len(length).map_err(Error::Io)?;
             }
         }
-        event.result
+        event.result.map_err(Error::from)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(
@@ -1095,6 +1215,8 @@ impl Replayer {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::fs::OpenOptions;
     use std::io::Read as _;
     use std::io::Seek as _;
     use std::io::Write as _;
@@ -1149,11 +1271,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn missing_or_invalid_output_endpoint_is_an_outer_tool_error() {
+        let mut replayer = Replayer::default();
+        replayer.stdout_error = Some("Too many open files".to_owned());
+        for output_fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, 9] {
+            let failure = match replayer.output_endpoint(output_fd) {
+                Ok(_) => panic!("unavailable replay output fd {output_fd} unexpectedly resolved"),
+                Err(error) => error,
+            };
+            if output_fd == libc::STDOUT_FILENO {
+                assert!(
+                    failure.to_string().contains("Too many open files"),
+                    "endpoint acquisition failure lost its recorded cause: {failure}"
+                );
+            }
+            assert!(
+                matches!(failure.into_errno(), Err(Error::Tool(_))),
+                "endpoint acquisition failure became guest-visible errno"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_output_sink_failure_is_an_outer_io_error() {
+        let output = OpenOptions::new().write(true).open("/dev/full").unwrap();
+
+        let failure = emit_replay_output(output.as_raw_fd(), b"LOST", None, false)
+            .await
+            .map_err(Error::Io)
+            .expect_err("full replay output device must abort replay");
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::ENOSPC)),
+            "replay output sink failure became guest-visible errno"
+        );
+    }
+
+    #[test]
+    fn replay_output_ftruncate_failure_is_an_outer_io_error() {
+        let failure = truncate_replay_output(-1, 0)
+            .expect_err("invalid captured output endpoint must abort replay");
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EBADF)),
+            "captured-output ftruncate failure became guest-visible errno"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_output_readiness_failure_is_an_outer_io_error() {
+        let failure = wait_for_replay_output(-1)
+            .await
+            .map_err(Error::Io)
+            .expect_err("invalid replay output must fail readiness acquisition");
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Io(error)) if error.raw_os_error() == Some(libc::EBADF)),
+            "readiness failure became guest-visible errno"
+        );
+    }
+
+    #[test]
+    fn malformed_successful_write_count_is_an_outer_tool_error() {
+        let failure = successful_replay_write_count(Ok(-1))
+            .expect_err("negative successful count must invalidate the recording");
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Tool(_))),
+            "invalid recorded count became guest-visible errno"
+        );
+        assert_eq!(
+            successful_replay_write_count(Err(Errno::EFAULT)).unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn replay_output_preserves_regular_file_offset() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"ONE", None, false).await;
-        emit_replay_output(file.as_raw_fd(), b"TWO", None, false).await;
+        emit_replay_output(file.as_raw_fd(), b"ONE", None, false)
+            .await
+            .unwrap();
+        emit_replay_output(file.as_raw_fd(), b"TWO", None, false)
+            .await
+            .unwrap();
         file.rewind().unwrap();
 
         let mut output = String::new();
@@ -1164,7 +1362,9 @@ mod tests {
     #[tokio::test]
     async fn replay_output_preserves_positioned_file_writes() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"X", Some(5), false).await;
+        emit_replay_output(file.as_raw_fd(), b"X", Some(5), false)
+            .await
+            .unwrap();
         file.rewind().unwrap();
 
         let mut output = Vec::new();
@@ -1175,7 +1375,9 @@ mod tests {
     #[tokio::test]
     async fn positioned_replay_advances_shared_offset_for_write() {
         let mut file = tempfile::tempfile().unwrap();
-        emit_replay_output(file.as_raw_fd(), b"X", Some(5), true).await;
+        emit_replay_output(file.as_raw_fd(), b"X", Some(5), true)
+            .await
+            .unwrap();
         assert_eq!(file.stream_position().unwrap(), 6);
         file.rewind().unwrap();
 
@@ -1198,7 +1400,7 @@ mod tests {
             -1
         );
 
-        emit_replay_output(fd, b"X", Some(1), false).await;
+        emit_replay_output(fd, b"X", Some(1), false).await.unwrap();
         file.rewind().unwrap();
         let mut output = String::new();
         file.read_to_string(&mut output).unwrap();
@@ -1213,11 +1415,105 @@ mod tests {
     #[tokio::test]
     async fn replay_output_supports_sockets() {
         let (output, mut peer) = UnixStream::pair().unwrap();
-        emit_replay_output(output.as_raw_fd(), b"SOCKET_OUT", None, false).await;
+        emit_replay_output(output.as_raw_fd(), b"SOCKET_OUT", None, false)
+            .await
+            .unwrap();
 
         let mut received = [0; 10];
         peer.read_exact(&mut received).unwrap();
         assert_eq!(&received, b"SOCKET_OUT");
+    }
+
+    #[tokio::test]
+    async fn replay_output_reports_closed_socket_failure() {
+        let (output, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+
+        let error = emit_replay_output(output.as_raw_fd(), b"LOST", None, false)
+            .await
+            .expect_err("closed replay output socket must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    #[tokio::test]
+    async fn replay_output_reports_full_device_failure() {
+        let output = OpenOptions::new().write(true).open("/dev/full").unwrap();
+
+        let error = emit_replay_output(output.as_raw_fd(), b"LOST", None, false)
+            .await
+            .expect_err("full replay output device must fail");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_output_does_not_retry_after_flag_restoration_failure() {
+        let mut pipe = [0; 2];
+        // SAFETY: pipe points to two writable integers.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: ownership of each open pipe descriptor transfers exactly once.
+        let _input = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+
+        // Fill the pipe while it is nonblocking, then restore blocking mode so
+        // replay has to change and restore the shared open-file-description flags.
+        let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1);
+        set_replay_output_flags(output.as_raw_fd(), flags | libc::O_NONBLOCK).unwrap();
+        let fill = [0_u8; 4096];
+        loop {
+            let written =
+                unsafe { libc::write(output.as_raw_fd(), fill.as_ptr().cast(), fill.len()) };
+            if written >= 0 {
+                continue;
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            break;
+        }
+        set_replay_output_flags(output.as_raw_fd(), flags).unwrap();
+
+        let set_flags_calls = Cell::new(0);
+        let mut set_flags = |fd, requested_flags| {
+            let call = set_flags_calls.get() + 1;
+            set_flags_calls.set(call);
+            if call == 2 {
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            } else {
+                set_replay_output_flags(fd, requested_flags)
+            }
+        };
+        let mut write_once = |fd, bytes: &[u8], offset| {
+            write_replay_output_once_with(fd, bytes, offset, &mut set_flags)
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(250),
+            emit_replay_output_with(output.as_raw_fd(), b"x", None, false, &mut write_once),
+        )
+        .await
+        .expect("flag restoration failure was incorrectly retried")
+        .expect_err("flag restoration failure must fail replay output");
+        assert_eq!(set_flags_calls.get(), 2);
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("failed to restore replay output flags"),
+            "missing restoration context: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("os error {}", libc::EBADF)),
+            "missing EBADF cause: {rendered}"
+        );
+        let failure = Error::Io(error);
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Io(_))),
+            "flag-restoration failure became guest-visible errno"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1281,7 +1577,9 @@ mod tests {
         });
 
         let actual = tokio::time::timeout(Duration::from_secs(2), async {
-            emit_replay_output(output.as_raw_fd(), &expected, None, false).await;
+            emit_replay_output(output.as_raw_fd(), &expected, None, false)
+                .await
+                .unwrap();
             assert_eq!(
                 unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
                 0,
