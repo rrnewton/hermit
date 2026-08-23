@@ -60,6 +60,14 @@ fn logical_clock_ticks(
     clock_t_from_ticks(ticks)
 }
 
+fn prlimit_targets_current_process(
+    target_pid: i32,
+    deterministic_pid: Option<i32>,
+    physical_pid: i32,
+) -> bool {
+    target_pid == 0 || target_pid == deterministic_pid.unwrap_or(physical_pid)
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -155,7 +163,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let pid = call.pid();
-        if pid != 0 && pid != guest.pid().as_raw() {
+        let deterministic_pid = guest.thread_state().detpid.map(|detpid| detpid.as_raw());
+        if !prlimit_targets_current_process(pid, deterministic_pid, guest.pid().as_raw()) {
             return Err(Errno::EPERM.into());
         }
 
@@ -392,6 +401,20 @@ mod tests {
         let now = boot + LogicalTime::from_millis(25);
 
         assert_eq!(logical_clock_ticks(now, boot, 120), 12_002);
+    }
+
+    #[test]
+    fn prlimit_self_target_prefers_deterministic_process_identity() {
+        assert!(prlimit_targets_current_process(3, Some(3), 10_003));
+        assert!(prlimit_targets_current_process(0, Some(3), 10_003));
+        assert!(!prlimit_targets_current_process(10_003, Some(3), 10_003));
+        assert!(!prlimit_targets_current_process(4, Some(3), 10_003));
+    }
+
+    #[test]
+    fn prlimit_self_target_falls_back_to_physical_identity_before_init() {
+        assert!(prlimit_targets_current_process(10_003, None, 10_003));
+        assert!(!prlimit_targets_current_process(3, None, 10_003));
     }
 
     #[test]

@@ -56,6 +56,11 @@ impl RecordVersion {
 // replaying one under this build would read the next thread event for every
 // flock and desynchronize the stream. The version gate must refuse it.
 //
+// TODO-HUMAN-REVIEW(#2370)
+// 0x10d -> 0x10e: record/replay now carries successful exec image/path state and
+// an explicit ppoll timeout-pointer shape. Older readers cannot interpret those
+// events without desynchronizing the stream, so the format advances once.
+//
 // TODO-HUMAN-REVIEW(#2272)
 // 0x10c -> 0x10d: `Ppoll` becomes its OWN event rather than sharing `Poll`'s,
 // because ppoll additionally copies out a timeout and must preserve it on
@@ -79,7 +84,7 @@ impl RecordVersion {
 // recording made here would claim 0x10c while containing a `Ppoll` event the
 // 0x10c reader does not know -- exactly the desynchronization the paragraph
 // above exists to prevent. The version must go FORWARD once more.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10d);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10e);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -319,6 +324,7 @@ mod tests {
     fn record_version_requires_an_exact_match() {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10c)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x105)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x110)));
     }

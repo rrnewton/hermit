@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -210,6 +211,19 @@ fn workloads() -> &'static [Workload] {
             ("c_pidfd_poll_self", "pidfd_poll_self.c"),
             ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
             ("c_record_replay_file_state", "record_replay_file_state.c"),
+            (
+                "c_record_replay_poll_partial_copyout",
+                "record_replay_poll_partial_copyout.c",
+            ),
+            (
+                "c_record_replay_execveat_paths",
+                "record_replay_execveat_paths.c",
+            ),
+            (
+                "c_record_replay_mkdir_eexist",
+                "record_replay_mkdir_eexist.c",
+            ),
+            ("c_clock_exec_continuity", "clock_exec_continuity.c"),
             ("c_lseek_seek_cur", "record_replay_lseek_seek_cur.c"),
             (
                 "c_timerslack_proc_record_replay",
@@ -314,6 +328,59 @@ fn record_replay_command_with_policy(
         );
     }
 }
+
+fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
+    let verdict_path = verdict_dir.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict_path.display()))
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    let output = command_output(command, &format!("canonical record/replay for {name}"));
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report deterministic replay for {name}:\n{combined_output}"
+    );
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict_path).expect("canonical record/replay omitted verify JSON"),
+    )
+    .expect("canonical record/replay verify JSON was invalid");
+    assert_eq!(report["verdict"], serde_json::json!("matched"));
+    assert_eq!(report["bitwise_parity"], serde_json::json!(true));
+    assert!(
+        report["compared_log_messages"]["left"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        report["compared_log_messages"]["right"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+}
+
 fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut record = Command::new("timeout");
@@ -338,6 +405,149 @@ fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
     assert_eq!(
         record_output.stdout, replay_output.stdout,
         "replayed guest stdout did not match the recording for {name}"
+    );
+}
+
+fn record_then_mutate_and_replay_command<F>(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    record_current_dir: Option<&Path>,
+    mutate_host_paths: F,
+) where
+    F: FnOnce(&Path),
+{
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    if let Some(current_dir) = record_current_dir {
+        record.current_dir(current_dir);
+    }
+    let record_output = command_output(record, &format!("recording for {name}"));
+
+    let recording_id =
+        fs::read_to_string(data_dir.path().join("last")).expect("recording did not publish its ID");
+    let recording_dir = data_dir.path().join(recording_id.trim());
+    mutate_host_paths(&recording_dir);
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replay_output = command_output(replay, &format!("replay for {name}"));
+
+    assert_eq!(
+        record_output.stdout, replay_output.stdout,
+        "replayed guest stdout did not match after host-path mutation for {name}"
+    );
+}
+
+#[test]
+fn replay_bootstrap_uses_snapshot_after_original_executable_is_removed() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create bootstrap replay fixture");
+    let executable = fixture.path().join("ephemeral-echo");
+    fs::copy("/bin/echo", &executable).expect("failed to copy ephemeral executable");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark ephemeral executable executable");
+    let removed = fixture.path().join("removed-echo");
+
+    record_then_mutate_and_replay_command(
+        "removed-bootstrap-executable",
+        &executable,
+        &[OsStr::new("snapshot-bootstrap")],
+        None,
+        |_| {
+            fs::rename(&executable, &removed).expect("failed to remove original executable path");
+        },
+    );
+}
+
+#[test]
+fn replay_bootstrap_uses_recorded_custom_interpreter_after_host_mutation() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create interpreter replay fixture");
+    let interpreter = fixture.path().join("ephemeral-interpreter");
+    fs::copy("/bin/sh", &interpreter).expect("failed to copy custom interpreter");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark custom interpreter executable");
+
+    let script = fixture.path().join("ephemeral-script");
+    fs::write(
+        &script,
+        format!("#!{}\nprintf '%s\\n' \"$0\"\n", interpreter.display()),
+    )
+    .expect("failed to write custom-interpreter script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark custom-interpreter script executable");
+
+    let removed_interpreter = fixture.path().join("removed-interpreter");
+    let removed_script = fixture.path().join("removed-script");
+    record_then_mutate_and_replay_command(
+        "removed-bootstrap-interpreter",
+        &script,
+        &[],
+        None,
+        |_| {
+            fs::rename(&script, &removed_script).expect("failed to remove original script path");
+            fs::rename(&interpreter, &removed_interpreter)
+                .expect("failed to remove original interpreter path");
+        },
+    );
+}
+
+#[test]
+fn replay_bootstrap_records_relative_interpreter_from_symlink_cwd() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create relative-interpreter fixture");
+    let real_cwd = fixture.path().join("real-cwd");
+    fs::create_dir(&real_cwd).expect("failed to create real guest cwd");
+    let linked_cwd = fixture.path().join("linked-cwd");
+    std::os::unix::fs::symlink("real-cwd", &linked_cwd)
+        .expect("failed to create guest cwd symlink");
+
+    let interpreter = real_cwd.join("interp");
+    fs::copy("/bin/sh", &interpreter).expect("failed to copy relative interpreter");
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark relative interpreter executable");
+    let script = real_cwd.join("script");
+    fs::write(&script, "#!interp\nprintf 'relative-interpreter\\n'\n")
+        .expect("failed to write relative-interpreter script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark relative-interpreter script executable");
+    let program = linked_cwd.join("script");
+    let removed_interpreter = real_cwd.join("removed-interpreter");
+
+    record_then_mutate_and_replay_command(
+        "relative-interpreter-symlink-cwd",
+        &program,
+        &[],
+        Some(&real_cwd),
+        |recording_dir| {
+            let metadata_path = recording_dir.join("metadata.json");
+            let mut metadata: serde_json::Value = serde_json::from_reader(
+                fs::File::open(&metadata_path).expect("failed to open recorded metadata"),
+            )
+            .expect("failed to parse recorded metadata");
+            metadata["current_dir"] =
+                serde_json::Value::String(linked_cwd.to_string_lossy().into_owned());
+            serde_json::to_writer_pretty(
+                fs::File::create(&metadata_path).expect("failed to rewrite recorded metadata"),
+                &metadata,
+            )
+            .expect("failed to serialize equivalent symlink cwd");
+            fs::rename(&interpreter, &removed_interpreter)
+                .expect("failed to remove relative interpreter path");
+        },
     );
 }
 
@@ -755,6 +965,58 @@ fn record_nested_mkdir_side_effects() {
     );
 }
 
+/// Exercises the replay-only distinction between an EEXIST directory and an
+/// EEXIST file/symlink, including Linux's symlink-before-`..` resolution order
+/// and mkdirat's absolute-path rule that ignores an unusable dirfd.
+#[test]
+fn record_mkdir_eexist_materialization_semantics() {
+    let _guard = hermit_record_lock();
+
+    let basic = tempfile::tempdir().expect("failed to create mkdir EEXIST fixture");
+    let existing_directory = basic.path().join("existing-directory");
+    let existing_file = basic.path().join("existing-file");
+    let existing_link = basic.path().join("existing-link");
+    let new_directory = basic.path().join("new-directory");
+    let missing_child = basic.path().join("missing-parent/child");
+    fs::create_dir(&existing_directory).expect("failed to create existing directory fixture");
+    fs::write(&existing_file, b"file\n").expect("failed to create existing file fixture");
+    std::os::unix::fs::symlink("existing-file", &existing_link)
+        .expect("failed to create existing symlink fixture");
+
+    let walk = tempfile::tempdir().expect("failed to create symlink walk fixture");
+    fs::create_dir_all(walk.path().join("real/deep"))
+        .expect("failed to create symlink target fixture");
+    fs::create_dir(walk.path().join("real/target"))
+        .expect("failed to create symlink parent target fixture");
+    let walk_link = walk.path().join("link");
+    let walk_path = walk.path().join("link/../target");
+
+    let unconfined = tempfile::tempdir().expect("failed to create unconfined dirfd fixture");
+    fs::create_dir(unconfined.path().join("relative-existing"))
+        .expect("failed to create relative mkdirat fixture");
+    let absolute = tempfile::tempdir().expect("failed to create absolute mkdirat fixture");
+    let absolute_directory = absolute.path().join("absolute-existing");
+    fs::create_dir(&absolute_directory).expect("failed to create absolute mkdirat directory");
+
+    record_replay_command(
+        "mkdir-eexist-materialization-semantics",
+        &workload("c_record_replay_mkdir_eexist").path,
+        &[
+            basic.path().as_os_str(),
+            existing_directory.as_os_str(),
+            existing_file.as_os_str(),
+            existing_link.as_os_str(),
+            walk.path().as_os_str(),
+            walk_link.as_os_str(),
+            walk_path.as_os_str(),
+            unconfined.path().as_os_str(),
+            absolute_directory.as_os_str(),
+            new_directory.as_os_str(),
+            missing_child.as_os_str(),
+        ],
+    );
+}
+
 #[test]
 fn record_writable_filesystem_side_effects() {
     let _guard = hermit_record_lock();
@@ -820,6 +1082,116 @@ fn record_shell_forked_external_command() {
         "shell-fork-exec",
         shell,
         &[OsStr::new("-c"), OsStr::new(&script)],
+    );
+}
+
+/// A relative child script is resolved against the recording-time guest cwd,
+/// but the replayed `execveat` must retain the original relative pathname. The
+/// recorder therefore snapshots the resolved script and its shebang/ELF
+/// interpreter chain at the corresponding absolute guest destination.
+#[test]
+fn record_shell_relative_child_script() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create relative exec fixture");
+    let script = fixture.path().join("relative-child.sh");
+    fs::write(&script, b"#!/bin/sh\nprintf 'relative-child-ok\\n'\n")
+        .expect("failed to write relative child script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("failed to mark relative child script executable");
+
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .current_dir(fixture.path())
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", "./relative-child.sh"]);
+    let output = command_output(command, "record/replay for relative child script");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Success: replay matched recording."),
+        "missing replay parity verdict:\n{combined}"
+    );
+}
+
+/// Linux follows an encountered symlink before applying a later `..`. A
+/// lexical collapse would incorrectly stage `a/prog`; the actual target here is
+/// `resolved/prog`.
+#[test]
+fn record_exec_symlink_before_parent_resolution() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create exec path fixture");
+    fs::create_dir_all(fixture.path().join("a")).unwrap();
+    fs::create_dir_all(fixture.path().join("resolved/deep")).unwrap();
+    let program = fixture.path().join("resolved/prog");
+    fs::write(&program, b"#!/bin/sh\nprintf 'symlink-parent-ok\\n'\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("../resolved/deep", fixture.path().join("a/link")).unwrap();
+
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .current_dir(fixture.path())
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", "./a/link/../prog"]);
+    let output = command_output(command, "record/replay for symlink-before-parent exec");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Success: replay matched recording."),
+        "missing replay parity verdict:\n{combined}"
+    );
+}
+
+/// Failed execs must not prepopulate a later pathname. The same pathname is
+/// then successfully executed twice with different contents, proving snapshots
+/// are associated with the matching successful event rather than globally.
+#[test]
+fn record_exec_failure_then_temporal_path_reuse() {
+    let _guard = hermit_record_lock();
+    let fixture = tempfile::tempdir().expect("failed to create exec chronology fixture");
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let script = r#"set -eu
+if ./later 2>/dev/null; then exit 91; fi
+printf '%s\n' '#!/bin/sh' "printf 'first-image\\n'" > later
+chmod 755 later
+./later
+printf '%s\n' '#!/bin/sh' "printf 'second-image\\n'" > later
+chmod 755 later
+./later
+"#;
+    let mut command = Command::new("timeout");
+    command
+        .current_dir(fixture.path())
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", script]);
+    let output = command_output(command, "record/replay for temporal exec path reuse");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Success: replay matched recording."),
+        "missing replay parity verdict:\n{combined}"
     );
 }
 
@@ -1253,19 +1625,33 @@ fn record_pidfd_open_modeled_descriptor_ops() {
     record_replay(workload("c_pidfd_poll_self"));
 }
 
-/// Replayer substitutes an eventfd for this proc descriptor. The Detcore
-/// procfs layer must bind the live task incarnation named by an absolute or
-/// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
-/// read/pread and pre-snapshot lseek must remain entirely virtual, then one
-/// timer-slack scalar must compose across proc read/write and prctl access in
-/// both phases.
 #[test]
-fn record_timer_slack_proc_read_write() {
+fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
-    record_replay_strict_command(
-        "timer-slack-proc-read-write",
-        &workload("c_timerslack_proc_record_replay").path,
-        &[],
+    canonical_record_replay_command(
+        "poll partial revents copyout",
+        &workload("c_record_replay_poll_partial_copyout").path,
+        &[OsStr::new("poll")],
+    );
+}
+
+#[test]
+fn record_ppoll_partial_revents_and_timeout_copyout() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "ppoll partial revents and timeout copyout",
+        &workload("c_record_replay_poll_partial_copyout").path,
+        &[OsStr::new("ppoll")],
+    );
+}
+
+#[test]
+fn record_poll_invalid_nfds_preserves_einval() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "poll and ppoll invalid nfds",
+        &workload("c_record_replay_poll_partial_copyout").path,
+        &[OsStr::new("invalid-nfds")],
     );
 }
 
@@ -1284,7 +1670,9 @@ record_replay_tests! {
     record_c_getsockopt_null => "c_getsockopt_null",
     record_c_setsockopt_replay => "c_setsockopt_replay",
     record_c_fd_reuse_after_close => "c_record_replay_fd_close",
+    record_c_execveat_paths => "c_record_replay_execveat_paths",
     record_c_sigpipe_siginfo => "c_sigpipe_siginfo",
+    record_c_clock_exec_continuity => "c_clock_exec_continuity",
     record_rs_clock_total_order => "rustbin_clock_total_order",
     record_rs_exit_group => "rustbin_exit_group",
     record_rs_sched_yield => "rustbin_sched_yield",
