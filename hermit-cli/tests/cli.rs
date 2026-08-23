@@ -553,25 +553,24 @@ fn run_dbt_verifies_simple_env_shebang() {
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review ptrace verification warning delivery.
 // After pidfd_send_signal/pidfd_getfd were determinized, restart_syscall is the
-// lone remaining Unsupported syscall. Under ptrace it is consumed by reverie's
-// syscall-restart machinery before Detcore classification, so it never surfaces
-// as a guest aggregate "used but not yet supported" warning. The ptrace verify
-// path therefore emits zero such warnings for this fixture; the DBT backend
-// (which routes it through Detcore classification) still aggregates it, covered
-// by run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them.
+// lone remaining Unsupported syscall. The current Reverie ptrace backend honors
+// the Tool's restart_syscall subscription, so each verify run routes it through
+// Detcore classification. Verification aggregates the two captured logs and
+// re-emits exactly one warning, matching the DBT aggregation contract covered by
+// run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them.
 #[test]
-fn run_ptrace_verify_emits_no_unsupported_syscall_warning() {
+fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
     let args = ["--log", "info", "run", "--verify", "--", program];
     let output = hermit(&args);
     assert_success(&output, &args);
-    let warning = "used but not yet supported";
+    let warning = "syscalls restart_syscall used but not yet supported";
     assert_eq!(
         stderr(&output).matches(warning).count(),
-        0,
-        "ptrace verify unexpectedly emitted an unsupported-syscall warning:\n{}",
+        1,
+        "ptrace verify did not re-emit exactly one aggregate warning:\n{}",
         stderr(&output)
     );
 }
