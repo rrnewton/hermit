@@ -213,8 +213,17 @@ fn is_full_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Discover the product checkout from the CURRENT DIRECTORY, never from an
+/// inherited `GIT_DIR`.
+///
+/// This runs isolated for the same reason the graph queries do. An inherited
+/// `GIT_DIR` wins over directory discovery, so a hook-invoked run would report
+/// the INVOKING repository as the Hermit root and then check that repository's
+/// pins. That is not hypothetical here: the same class of inheritance once
+/// redirected a fetch and left a Hermit checkout sitting at Reverie's HEAD with
+/// 3,615 apparently-dirty paths.
 fn git_root() -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = isolated_git_command()?
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|error| format!("could not run git rev-parse: {error}"))?;
@@ -700,9 +709,46 @@ fn git_local_env_vars() -> Result<&'static [OsString], String> {
     }
 }
 
+/// `git rev-parse --local-env-vars` reports two DIFFERENT kinds of variable and
+/// they must not be treated alike.
+///
+/// Most of them SELECT A REPOSITORY -- `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and friends -- and those are exactly
+/// what has to be cleared before aiming a subprocess at another repository.
+///
+/// But the list also contains the caller's CONFIGURATION, which selects nothing
+/// and is not ours to discard. `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`
+/// are the environment spellings of `git -c`. On this fleet the forward-proxy
+/// wrapper sets exactly those: `GIT_CONFIG_COUNT=3` with three
+/// `url.https://github.com/.insteadOf` rewrites in `GIT_CONFIG_KEY_n` /
+/// `GIT_CONFIG_VALUE_n`. Clearing `GIT_CONFIG_COUNT` does not merely drop one
+/// variable -- it ORPHANS the whole numbered set, because Git reads the count
+/// first and never looks at the keys. The fetch then bypasses the proxy and
+/// fails, or worse, silently reaches a different URL than the caller asked for.
+///
+/// Note that `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` are NOT in Git's local
+/// list, so they are never removed. That asymmetry is what makes the bug quiet:
+/// the keys survive, the count does not, and the overrides vanish with nothing
+/// to show for it.
+const CONFIG_OVERRIDE_ENV_VARS: [&str; 2] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
+
+/// Clear Git's repository-selecting environment, and PRESERVE the caller's
+/// configuration overrides across that clearing.
+///
+/// The preserved values are re-applied explicitly rather than merely skipped.
+/// Skipping would work today, since `Command` inherits the parent environment,
+/// but it would stop working the moment any caller adds `env_clear()`, and the
+/// intent would not be visible at the call site.
 fn clear_git_local_env(command: &mut Command) -> Result<(), String> {
+    let preserved: Vec<(&str, OsString)> = CONFIG_OVERRIDE_ENV_VARS
+        .iter()
+        .filter_map(|name| env::var_os(name).map(|value| (*name, value)))
+        .collect();
     for name in git_local_env_vars()? {
         command.env_remove(name);
+    }
+    for (name, value) in preserved {
+        command.env(name, value);
     }
     Ok(())
 }
@@ -755,13 +801,38 @@ struct GuardedGitRepo {
 }
 
 impl GuardedGitRepo {
+    /// Refuse any cache that shares a COMMON git-dir with the product repository.
+    ///
+    /// Comparing the cache's `--git-dir` against the product's `--git-common-dir`
+    /// is not enough, and the gap it leaves is the dangerous one. In a LINKED
+    /// WORKTREE `--git-dir` reports the per-worktree directory
+    /// `<common>/worktrees/<name>`, which never equals `<common>`, so the check
+    /// passes -- while every object written through that handle lands in the
+    /// PRODUCT REPOSITORY'S SHARED OBJECT STORE. A `fetch --force` into a name
+    /// like `refs/heads/main` then rewrites a product ref.
+    ///
+    /// `--git-common-dir` is the identity that actually answers "is this the same
+    /// repository": it is stable across a repository and all of its linked
+    /// worktrees. Both sides are resolved that way. The `--git-dir` equality is
+    /// kept as well, so a plain non-worktree alias is still named precisely in
+    /// the error.
     fn open(cache: &Path, product_root: &Path) -> Result<Self, String> {
         let cache_git_dir = canonical_git_path(cache, "--git-dir")?;
+        let cache_common_dir = canonical_git_path(cache, "--git-common-dir")?;
         let product_common_dir = canonical_git_path(product_root, "--git-common-dir")?;
         if cache_git_dir == product_common_dir {
             return Err(format!(
                 "REFUSING Reverie graph cache: cache git-dir {} resolves to the Hermit common git-dir {}",
                 cache_git_dir.display(),
+                product_common_dir.display()
+            ));
+        }
+        if cache_common_dir == product_common_dir {
+            return Err(format!(
+                "REFUSING Reverie graph cache: cache {} is a linked worktree of the Hermit \
+                 repository (shared common git-dir {}); writing there would mutate the product \
+                 object store",
+                cache.display(),
                 product_common_dir.display()
             ));
         }
@@ -780,8 +851,16 @@ impl GuardedGitRepo {
     }
 }
 
+/// Run Git against `dir`, with Git's repository-selecting environment cleared.
+///
+/// `-C` changes directory; it does NOT override an inherited `GIT_DIR`, which
+/// still selects the inherited repository after the chdir. Without this, an
+/// explicit `--repo PATH` is only as trustworthy as the environment the checker
+/// happened to be launched from -- the user names one repository and Git reads
+/// another. Every caller here aims at a specific checkout, so every caller wants
+/// the isolated form.
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    isolated_git_command()?
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1913,22 +1992,64 @@ mod tests {
         );
     }
 
+    /// Every REPOSITORY-SELECTING variable must be cleared, and a poisoned
+    /// config override must never reach the child either.
+    ///
+    /// This test previously asserted that EVERY name Git reports as local is
+    /// cleared, config overrides included. That is what erased the caller's
+    /// `-c` settings -- see `CONFIG_OVERRIDE_ENV_VARS`. The assertion is not
+    /// relaxed here so much as split: the selection variables are still checked
+    /// exactly as before, and the config variables gain a STRICTER check than
+    /// they had, because it is no longer enough for them to be absent or
+    /// present -- their value must be the PARENT's, never the poison.
     #[test]
     fn isolated_commands_clear_every_git_local_environment_variable() {
         let vars = git_local_env_vars().expect("enumerate Git local environment");
+        const POISON: &str = "poisoned-by-parent-git-process";
         let mut command = Command::new("env");
         for name in vars {
-            command.env(name, "poisoned-by-parent-git-process");
+            command.env(name, POISON);
         }
         clear_git_local_env(&mut command).expect("clear Git local environment");
         let output = command.output().expect("print child environment");
         assert!(output.status.success());
         let child_env = String::from_utf8_lossy(&output.stdout);
+        let value_of = |name: &str| -> Option<String> {
+            let assignment = format!("{name}=");
+            child_env
+                .lines()
+                .find(|line| line.starts_with(&assignment))
+                .map(|line| line[assignment.len()..].to_owned())
+        };
+
         for name in vars {
-            let assignment = format!("{}=", name.to_string_lossy());
+            let name = name.to_string_lossy().into_owned();
+            if CONFIG_OVERRIDE_ENV_VARS.contains(&name.as_str()) {
+                // Not a repository selection. It must carry the PARENT's value,
+                // or be absent when the parent has none -- but never the poison.
+                match (env::var(&name).ok(), value_of(&name)) {
+                    (Some(parent), Some(child)) => assert_eq!(
+                        child, parent,
+                        "{name} must reach the child as the parent's value, not {child}"
+                    ),
+                    (None, child) => assert_eq!(
+                        child, None,
+                        "{name} is unset in the parent, so nothing may reach the child"
+                    ),
+                    (Some(parent), None) => panic!(
+                        "{name} was set to {parent} in the parent and must be preserved"
+                    ),
+                }
+                assert_ne!(
+                    value_of(&name).as_deref(),
+                    Some(POISON),
+                    "{name} leaked the poisoned parent-Git value into the child"
+                );
+                continue;
+            }
             assert!(
-                !child_env.lines().any(|line| line.starts_with(&assignment)),
-                "isolated command retained {assignment}"
+                value_of(&name).is_none(),
+                "isolated command retained {name}, which selects a repository"
             );
         }
     }
@@ -2823,5 +2944,161 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    /// DEFECT 1 REGRESSION: a linked worktree of the product repository must be
+    /// refused as a graph cache.
+    ///
+    /// Old-fails / new-passes: with the previous check -- cache `--git-dir`
+    /// against product `--git-common-dir` -- a linked worktree reports
+    /// `<common>/worktrees/<name>` for its git-dir, which never equals
+    /// `<common>`, so `open` returned Ok and every subsequent `fetch --force`
+    /// wrote into the PRODUCT repository's shared object store.
+    #[test]
+    fn guarded_repo_refuses_a_linked_worktree_of_the_product() {
+        let base = std::env::temp_dir().join(format!(
+            "reverie-pin-worktree-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let product = base.join("product");
+        fs::create_dir_all(&product).expect("create product repository");
+        assert!(
+            git_in(&product, &["init", "-q"]).unwrap().status.success(),
+            "init product"
+        );
+        assert!(
+            git_in(&product, &["config", "user.email", "pin-test@example.com"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&product, &["config", "user.name", "Reverie Pin Test"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(product.join("seed"), "seed\n").expect("seed file");
+        assert!(git_in(&product, &["add", "seed"]).unwrap().status.success());
+        assert!(
+            git_in(&product, &["commit", "-qm", "seed"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let linked = base.join("linked");
+        let added = git_in(
+            &product,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                linked.to_str().expect("utf-8 worktree path"),
+            ],
+        )
+        .expect("run git worktree add");
+        assert!(
+            added.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+
+        // Precondition that makes this test meaningful: the linked worktree's
+        // git-dir really is DIFFERENT from the product common dir, which is
+        // exactly why the old single comparison let it through.
+        let linked_git_dir = canonical_git_path(&linked, "--git-dir").expect("linked git-dir");
+        let product_common =
+            canonical_git_path(&product, "--git-common-dir").expect("product common dir");
+        assert_ne!(
+            linked_git_dir, product_common,
+            "precondition: a linked worktree's git-dir must differ from the common dir, \
+             otherwise this test cannot discriminate the old behaviour"
+        );
+
+        let error = GuardedGitRepo::open(&linked, &product)
+            .expect_err("a linked worktree of the product must be refused as a graph cache");
+        assert!(
+            error.contains("linked worktree"),
+            "unexpected refusal text: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// DEFECT 2 REGRESSION: repository-selecting variables must be cleared.
+    ///
+    /// Old-fails / new-passes for `git_root`/`git_in` is asserted structurally
+    /// rather than by mutating the process environment, because these tests run
+    /// in parallel threads and `set_var` would race every other test in the
+    /// file.
+    #[test]
+    fn isolated_command_clears_repository_selecting_env() {
+        let command = isolated_git_command().expect("build isolated git command");
+        let removed: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for required in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+            assert!(
+                removed.contains(required),
+                "{required} must be cleared for a command aimed at another repository; \
+                 cleared set was {removed:?}"
+            );
+        }
+    }
+
+    /// DEFECT 3 REGRESSION: the caller's config overrides must survive.
+    ///
+    /// Old-fails / new-passes: the previous `clear_git_local_env` removed every
+    /// name Git reported, and Git reports `GIT_CONFIG_COUNT` and
+    /// `GIT_CONFIG_PARAMETERS` among them. Removing the count orphans the
+    /// `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs, which Git never reports and
+    /// so never removes -- the overrides disappear with nothing left to show it.
+    /// On this fleet that silently drops the forward proxy's three
+    /// `url.https://github.com/.insteadOf` rewrites.
+    #[test]
+    fn isolated_command_preserves_config_overrides() {
+        let reported = git_local_env_vars().expect("enumerate git local env vars");
+        let reported: BTreeSet<String> = reported
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        // Precondition: without it this test proves nothing on a Git that does
+        // not report the config names as local.
+        assert!(
+            reported.contains("GIT_CONFIG_COUNT") || reported.contains("GIT_CONFIG_PARAMETERS"),
+            "precondition: this Git does not report config overrides as local env vars, \
+             so the erasure this test guards cannot occur; reported: {reported:?}"
+        );
+
+        let command = isolated_git_command().expect("build isolated git command");
+        let removed: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        let kept: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_some())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for preserved in CONFIG_OVERRIDE_ENV_VARS {
+            // Only a variable the parent actually sets can be observed as
+            // preserved; removing one the parent never set is a no-op and
+            // asserting on it would make this test depend on the shell.
+            if env::var_os(preserved).is_none() {
+                continue;
+            }
+            assert!(
+                kept.contains(preserved) && !removed.contains(preserved),
+                "{preserved} carries the caller's configuration, not a repository selection, \
+                 and must survive isolation; kept {kept:?}, cleared {removed:?}"
+            );
+        }
     }
 }
