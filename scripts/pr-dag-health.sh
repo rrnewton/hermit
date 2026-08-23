@@ -77,7 +77,7 @@ RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
     --json number,title,headRefName,headRefOid,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
     || die "gh pr list failed (is the proxy/auth configured?)"
 [ -n "$RAW" ] || die "gh returned no data"
-RAW="$(printf '%s' "$RAW" | python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" --annotate-rollups)" \
+RAW="$(printf '%s' "$RAW" | python3 "$SCRIPT_DIR/check_outcome_adapter.py" --annotate-rollups)" \
     || die "check-status annotation failed"
 GATE_CONTEXT=merge-gate
 [[ $REPO == rrnewton/hermit ]] && GATE_CONTEXT=merge-gate-v4
@@ -190,12 +190,12 @@ MAIN_FULL_SHA="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH" --jq '.sha' 2>/dev/n
 MAIN_SHA="${MAIN_FULL_SHA:0:12}"
 MAIN_CHECKS="$(gh_ api "repos/$REPO/commits/$MAIN_BRANCH/check-runs" 2>/dev/null)"
 MAIN_CI="$(printf '%s' "$MAIN_CHECKS" \
-    | python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" \
+    | python3 "$SCRIPT_DIR/check_outcome_adapter.py" \
         --select-latest-rollup --head-sha "$MAIN_FULL_SHA" \
     | jq -r '[.[] | select(.name=="Regular tests (GitHub-managed portable)")] | (.[0].conclusion // "none")')"
 [ -n "$MAIN_SHA" ] || MAIN_SHA="unknown"
 [ -n "$MAIN_CI" ]  || MAIN_CI="unknown"
-MAIN_OUTCOME="$(python3 "$SCRIPT_DIR/../agent-utils/py/ci_hub_check_outcome.py" \
+MAIN_OUTCOME="$(python3 "$SCRIPT_DIR/check_outcome_adapter.py" \
     --status COMPLETED --conclusion "$MAIN_CI")" || die "main check-status classification failed"
 
 # ---------------------------------------------------------------------------
