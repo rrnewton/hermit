@@ -57,6 +57,15 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check", "job": "check_outcome_consumers",
+      "desc": "Run the check-outcome consumer regression and the merge-gate policy lint",
+      "description": "These two scripts guard the merge-gate status classifier, and until 2026-08-23 NO DAG NODE RAN EITHER OF THEM. PR #2363's test plan cited check.script_sigpipe as their coverage; that node is a SIGPIPE and rust-script compile guard and both of these are plain bash, so it never executed them and the coverage claim was false. A guard nothing runs is indistinguishable from a guard that passes, which is the defect class the classifier change itself was fixing. Measured 2026-08-23: with the classifier mutated to report a failing check as PASSED, this node exits 1 on `mismatch: completed/failure expected=FAILED python=PASSED shell=PASSED`, while the DAG without this node stays green because nothing runs either script.",
+      "cmd": "./scripts/test-check-status-outcome.sh && ./scripts/check-merge-gate-policy.sh",
+      "timeout": 120,
+      "hint": {"est_duration_s": 5, "rss_baseline_bytes": 67108864,
+               "hard_mem_max_bytes": 536870912, "classification": "light"}
+    },
+    {
       "group": "check", "job": "script_sigpipe",
       "desc": "Standalone scripts exit cleanly on downstream SIGPIPE, and every rust-script compiles",
       "description": "MEASURED 2026-08-20 when this node gained the compile sweep. rust-scripts are not Cargo workspace members, so no cargo gate compiles them and this node is the only one that does. Sweeping all 14 tracked entrypoints via `rust-script --package` + `cargo check` measured 25.6s warm and 29.8s with fresh package and target directories, against 0.67s when every generated package is already built. Peak RSS of a cold `cargo check` of the heaviest script (ci/compat-envelope/scorecard.rs) was 278MB, so the former 512MB hard cap left only 1.8x margin and is raised to 1GiB. The former 60s timeout is raised to 300s: 10x the cold measurement, so a real hang still terminates well inside the job while normal variance cannot trip it.",
