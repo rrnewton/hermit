@@ -69,6 +69,113 @@ const IOPRIO_BE_NORM: libc::c_int = 4;
 const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
     (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
 
+// sched_attr wire contract, from include/uapi/linux/sched/types.h. These are
+// spelled out rather than derived from `size_of::<libc::sched_attr>()`: the
+// value the kernel reports back on the E2BIG paths and the offset past which
+// trailing bytes must be zero are properties of the KERNEL's struct, which is
+// larger than the libc crate's 48-byte mirror. Deriving either from a Rust type
+// would silently re-point the contract if that type ever grows a field.
+const SCHED_ATTR_SIZE_VER0: u32 = 48; // first published struct
+const SCHED_ATTR_SIZE_VER1: u32 = 56; // adds sched_util_{min,max}
+/// The kernel's own `sizeof(struct sched_attr)`. Two things key off it: bytes at
+/// or beyond this offset must be zero, and it is the value written back into
+/// `uattr->size` when the request is refused with E2BIG.
+const SCHED_ATTR_KERNEL_SIZE: u32 = SCHED_ATTR_SIZE_VER1;
+/// `sched_copy_attr` refuses a buffer larger than one page. Hermit is x86-64
+/// only, where PAGE_SIZE is 4096.
+const SCHED_ATTR_MAX_SIZE: u32 = 4096;
+
+// Byte offsets of the fields this handler inspects. Taken from the UAPI struct
+// rather than from a Rust mirror, for the reason given above.
+const SCHED_ATTR_OFF_POLICY: usize = 4;
+const SCHED_ATTR_OFF_FLAGS: usize = 8;
+
+// sched_attr.sched_flags bits, from include/uapi/linux/sched.h.
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+const SCHED_FLAG_RECLAIM: u64 = 0x02;
+const SCHED_FLAG_DL_OVERRUN: u64 = 0x04;
+const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+const SCHED_FLAG_UTIL_CLAMP: u64 = SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_UTIL_CLAMP_MAX;
+const SCHED_FLAG_ALL: u64 = SCHED_FLAG_RESET_ON_FORK
+    | SCHED_FLAG_RECLAIM
+    | SCHED_FLAG_DL_OVERRUN
+    | SCHED_FLAG_KEEP_POLICY
+    | SCHED_FLAG_KEEP_PARAMS
+    | SCHED_FLAG_UTIL_CLAMP;
+
+/// Whether Linux accepts `policy` as a scheduling policy for `sched_setattr`.
+/// This is the kernel's `valid_policy()`: idle, fair, rt, deadline or ext. Note
+/// the gap at 4 -- SCHED_ISO is reserved and never valid -- and that 7 is
+/// SCHED_EXT, which `valid_policy()` accepts on a kernel built with
+/// CONFIG_SCHED_CLASS_EXT.
+fn is_valid_sched_policy(policy: u32) -> bool {
+    const SCHED_DEADLINE: u32 = 6;
+    const SCHED_EXT: u32 = 7;
+    matches!(
+        policy,
+        // SCHED_OTHER/NORMAL, FIFO, RR, BATCH
+        0 | 1 | 2 | 3
+        // SCHED_IDLE
+        | 5
+        | SCHED_DEADLINE
+        | SCHED_EXT
+    )
+}
+
+/// Apply `sched_copy_attr`'s size rules to the `size` the guest declared.
+///
+/// `Ok(n)` is the effective size to copy with; `Err(())` means the request is
+/// refused with E2BIG *and* the kernel first writes its own struct size back
+/// into `uattr->size`, so the caller owes that store.
+///
+/// The zero case is not a mistake: the kernel carries an explicit ABI
+/// compatibility quirk, `if (!size) size = SCHED_ATTR_SIZE_VER0;`, so a
+/// zero-sized request is a well-formed VER0 request and succeeds.
+fn sched_attr_effective_size(declared: u32) -> Result<u32, ()> {
+    let size = if declared == 0 {
+        SCHED_ATTR_SIZE_VER0
+    } else {
+        declared
+    };
+    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&size) {
+        return Err(());
+    }
+    Ok(size)
+}
+
+/// The checks the kernel applies once the descriptor has been copied in.
+///
+/// `size` is the effective size from [`sched_attr_effective_size`], so the
+/// util-clamp rule can be stated in the same terms the kernel uses.
+fn validate_sched_attr_body(size: u32, policy: u32, sched_flags: u64) -> Result<(), Errno> {
+    // `sched_copy_attr`: util-clamp lives past the VER0 tail, so asking for it
+    // with a VER0 buffer is incoherent.
+    if sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 && size < SCHED_ATTR_SIZE_VER1 {
+        return Err(Errno::EINVAL);
+    }
+    // `sched_setattr`: the policy is compared as a *signed* int, so the sign
+    // bit is refused before the KEEP_POLICY substitution below can hide it.
+    if (policy as i32) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    // `__sched_setscheduler`: no undefined sched_flags bits.
+    if sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // `sched_setattr` rewrites the policy to SETPARAM_POLICY (-1) when
+    // KEEP_POLICY is set, and `__sched_setscheduler` then takes its
+    // `policy < 0` branch and reuses the task's current policy without ever
+    // calling `valid_policy()`. So the policy field is genuinely ignored here,
+    // and a value Linux would otherwise refuse is accepted.
+    if sched_flags & SCHED_FLAG_KEEP_POLICY == 0 && !is_valid_sched_policy(policy) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-881)
 fn virtual_ioprio(which: libc::c_int) -> Result<i64, Errno> {
@@ -1126,13 +1233,106 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
     /// Linux scheduler attributes cannot affect Detcore's replacement
-    /// scheduler. Accept the request as a deterministic no-op, matching the
-    /// existing sched_setscheduler and sched_setparam policy.
+    /// scheduler, so a *well-formed* request is accepted as a deterministic
+    /// no-op, matching the existing sched_setscheduler and sched_setparam
+    /// policy.
+    ///
+    /// Suppressing the effect is not the same as accepting arguments Linux
+    /// refuses. The argument checks below run first, so a malformed request
+    /// fails exactly as it does natively; otherwise a guest probing for
+    /// EINVAL/E2BIG observes a success the kernel never returns. Every check is
+    /// a pure function of the guest's own arguments, so it consumes no host
+    /// state and is identical across `--verify` runs and record/replay.
+    ///
+    /// The order below is the kernel's, and the order is observable when two
+    /// arguments are wrong at once: `sched_setattr()` screens `uattr`, `pid` and
+    /// `flags` together, then `sched_copy_attr()` handles the size and the
+    /// trailing bytes, and only then is the descriptor's own content judged.
+    ///
+    /// Not emulated, deliberately: the kernel resolves `pid` against the live
+    /// process table and returns ESRCH for an unknown one. That is a lookup
+    /// rather than argument validation, it needs Detcore's task table rather
+    /// than anything in the request, and it sits *after* the copy in the
+    /// kernel's order -- so a request that is malformed in any of the ways
+    /// above still fails the same way here as natively. A well-formed request
+    /// naming a pid that does not exist is the one remaining case where Hermit
+    /// returns success and Linux returns ESRCH.
     pub async fn handle_sched_setattr<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::SchedSetattr,
     ) -> Result<i64, Error> {
+        // `if (!uattr || pid < 0 || flags)` -- one clause in the kernel, so all
+        // three are EINVAL and none of them is ordered against the others. A
+        // null pointer is EINVAL rather than EFAULT because it is refused
+        // before any access is attempted.
+        if call.flags() != 0 || call.pid() < 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let attr = call.attr().ok_or(Errno::EINVAL)?;
+
+        // `get_user(size, &uattr->size)` -- the declared size is read before
+        // anything else, and a fault here is EFAULT with no store back.
+        // `AddrMut` is not `Copy` and `cast` consumes it, so each access below
+        // re-derives the address from the syscall argument.
+        let declared: u32 = guest.memory().read_value(attr.cast())?;
+
+        // Both E2BIG exits below run the kernel's `err_size` path, which stores
+        // the kernel's own struct size into `uattr->size` before returning. A
+        // guest that reads the field back learns the size it should have sent,
+        // which is the entire point of the store; the kernel ignores whether it
+        // succeeds, and so do we.
+        fn refuse_too_big<S: MemoryAccess>(mut memory: S, attr: AddrMut<libc::c_void>) -> Error {
+            let _ = memory.write_value(attr.cast::<u32>(), &SCHED_ATTR_KERNEL_SIZE);
+            Errno::E2BIG.into()
+        }
+
+        let size = match sched_attr_effective_size(declared) {
+            Ok(size) => size,
+            Err(()) => {
+                let back = call.attr().ok_or(Errno::EINVAL)?;
+                return Err(refuse_too_big(guest.memory(), back));
+            }
+        };
+
+        // `copy_struct_from_user` with a user size past the kernel's struct:
+        // every trailing byte must be zero, or the guest is sending a field
+        // this kernel does not know and must not silently drop. A fault while
+        // scanning is EFAULT and skips the store back -- only the not-all-zero
+        // verdict is E2BIG.
+        if size > SCHED_ATTR_KERNEL_SIZE {
+            let tail_len = (size - SCHED_ATTR_KERNEL_SIZE) as usize;
+            let mut tail = vec![0u8; tail_len];
+            let tail_base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
+            // SAFETY: the guest declared a buffer of `size` bytes, so this
+            // offset is inside the region it asked the kernel to read.
+            let tail_addr = unsafe { tail_base.add(SCHED_ATTR_KERNEL_SIZE as usize) };
+            guest.memory().read_exact(tail_addr, &mut tail)?;
+            if tail.iter().any(|byte| *byte != 0) {
+                let back = call.attr().ok_or(Errno::EINVAL)?;
+                return Err(refuse_too_big(guest.memory(), back));
+            }
+        }
+
+        // Copy the interoperable prefix, zero-filling anything the guest's
+        // buffer is too short to carry, exactly as `copy_struct_from_user`
+        // does for a short read.
+        let copied = std::cmp::min(size, SCHED_ATTR_KERNEL_SIZE) as usize;
+        let mut raw = [0u8; SCHED_ATTR_KERNEL_SIZE as usize];
+        let base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
+        guest.memory().read_exact(base, &mut raw[..copied])?;
+        let policy = u32::from_ne_bytes(
+            raw[SCHED_ATTR_OFF_POLICY..SCHED_ATTR_OFF_POLICY + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let sched_flags = u64::from_ne_bytes(
+            raw[SCHED_ATTR_OFF_FLAGS..SCHED_ATTR_OFF_FLAGS + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        validate_sched_attr_body(size, policy, sched_flags)?;
+
         info!(
             "Suppressing sched_setattr(pid={}, flags={}); Linux scheduler attributes are virtual",
             call.pid(),
@@ -1344,6 +1544,156 @@ mod tests {
                 },
             ),
             Err(Errno::EINVAL)
+        );
+    }
+
+    // The expectations below are not guesses at the kernel's behaviour: each is
+    // a row measured natively on this host (Linux 6.19, x86-64) with a raw
+    // `sched_setattr` probe. Where a row differs from what the handler used to
+    // do, the difference is called out.
+
+    #[test]
+    fn size_zero_is_a_well_formed_ver0_request() {
+        // ABI compatibility quirk: `if (!size) size = SCHED_ATTR_SIZE_VER0;`.
+        // Measured native: ret 0. The previous handler returned E2BIG.
+        assert_eq!(sched_attr_effective_size(0), Ok(SCHED_ATTR_SIZE_VER0));
+    }
+
+    #[test]
+    fn size_below_ver0_or_past_a_page_is_too_big() {
+        // Measured native: size 1, 47 and 4097 all give E2BIG.
+        assert_eq!(sched_attr_effective_size(1), Err(()));
+        assert_eq!(sched_attr_effective_size(SCHED_ATTR_SIZE_VER0 - 1), Err(()));
+        assert_eq!(sched_attr_effective_size(SCHED_ATTR_MAX_SIZE + 1), Err(()));
+    }
+
+    #[test]
+    fn size_from_ver0_through_one_page_is_accepted_unchanged() {
+        // Measured native: 48, 56, 57 and 4096 all give ret 0.
+        for size in [
+            SCHED_ATTR_SIZE_VER0,
+            SCHED_ATTR_SIZE_VER1,
+            SCHED_ATTR_SIZE_VER1 + 1,
+            SCHED_ATTR_MAX_SIZE,
+        ] {
+            assert_eq!(sched_attr_effective_size(size), Ok(size), "size {}", size);
+        }
+    }
+
+    #[test]
+    fn sched_ext_is_a_valid_policy_and_sched_iso_is_not() {
+        // Measured native: policy 7 gives ret 0; policy 4 gives EINVAL. The
+        // previous handler refused 7.
+        assert!(is_valid_sched_policy(7), "SCHED_EXT must be accepted");
+        assert!(!is_valid_sched_policy(4), "SCHED_ISO is reserved");
+        for policy in [0, 1, 2, 3, 5, 6] {
+            assert!(is_valid_sched_policy(policy), "policy {}", policy);
+        }
+        // Measured native: policy 8 and 99 both give EINVAL.
+        for policy in [8, 99] {
+            assert!(!is_valid_sched_policy(policy), "policy {}", policy);
+        }
+    }
+
+    #[test]
+    fn keep_policy_makes_the_policy_field_irrelevant() {
+        // Measured native: policy 99 alone is EINVAL, but policy 99 with
+        // SCHED_FLAG_KEEP_POLICY is ret 0 -- the kernel overwrites the field
+        // with SETPARAM_POLICY and never runs valid_policy(). The previous
+        // handler refused it.
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 99, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 99, SCHED_FLAG_KEEP_POLICY),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_negative_policy_is_refused_even_under_keep_policy() {
+        // Measured native: 0x8000_0000 is EINVAL with and without KEEP_POLICY,
+        // because the kernel's signed check runs before the substitution.
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0x8000_0000, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0x8000_0000, SCHED_FLAG_KEEP_POLICY),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn undefined_sched_flags_bits_are_refused() {
+        // Measured native: sched_flags 0x80 gives EINVAL; RESET_ON_FORK,
+        // KEEP_PARAMS, KEEP_ALL, RECLAIM and DL_OVERRUN are all ret 0 at
+        // size 48. The previous handler ignored sched_flags entirely.
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0, 0x80),
+            Err(Errno::EINVAL)
+        );
+        for flag in [
+            SCHED_FLAG_RESET_ON_FORK,
+            SCHED_FLAG_RECLAIM,
+            SCHED_FLAG_DL_OVERRUN,
+            SCHED_FLAG_KEEP_PARAMS,
+            SCHED_FLAG_KEEP_POLICY,
+        ] {
+            assert_eq!(
+                validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0, flag),
+                Ok(()),
+                "flag {:#x}",
+                flag
+            );
+        }
+        // The whole mask at once is *not* accepted, and the reason is the rule
+        // in the test below rather than the mask: SCHED_FLAG_ALL carries the
+        // util-clamp bits, which a VER0 buffer cannot express. Measured native:
+        // EINVAL at size 48. At size 56 this host answers EOPNOTSUPP, for the
+        // host-configuration reason explained below.
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0, SCHED_FLAG_ALL),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER1, 0, SCHED_FLAG_ALL),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn util_clamp_needs_a_ver1_buffer() {
+        // Measured native: UTIL_CLAMP_MIN with size 48 is EINVAL. With size 56
+        // this host answers EOPNOTSUPP, but only because it is built without
+        // CONFIG_UCLAMP_TASK -- that answer is a property of the host kernel's
+        // configuration rather than of the ABI, so Hermit does not reproduce it
+        // and accepts the well-formed request as the same no-op as any other.
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER0, 0, SCHED_FLAG_UTIL_CLAMP_MIN),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER1, 0, SCHED_FLAG_UTIL_CLAMP_MIN),
+            Ok(())
+        );
+        assert_eq!(
+            validate_sched_attr_body(SCHED_ATTR_SIZE_VER1, 0, SCHED_FLAG_UTIL_CLAMP_MAX),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_size_written_back_on_refusal_is_the_kernel_struct_not_the_libc_mirror() {
+        // Measured native: every E2BIG row leaves uattr->size holding 56, not
+        // 48. Deriving that from the libc crate's `sched_attr` would report 48
+        // and tell the guest to retry with a size the kernel already accepted.
+        assert_eq!(SCHED_ATTR_KERNEL_SIZE, 56);
+        assert_eq!(std::mem::size_of::<libc::sched_attr>(), 48);
+        assert_ne!(
+            SCHED_ATTR_KERNEL_SIZE as usize,
+            std::mem::size_of::<libc::sched_attr>()
         );
     }
 }
