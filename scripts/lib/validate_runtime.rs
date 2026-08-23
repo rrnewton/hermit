@@ -41,14 +41,19 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
+use std::io;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ------------------------------------------------------------------ environmental blocks
 
@@ -485,14 +490,21 @@ pub fn claim_active_marker() {
 /// A held, kernel-backed exclusive lock on this checkout's validate slot.
 pub struct InvocationLock {
     _file: File,
+    guard: File,
     holder: PathBuf,
+    record: InvocationHolderRecord,
 }
 
 impl Drop for InvocationLock {
     fn drop(&mut self) {
-        // Remove the descriptive record; the LOCK itself is released by the
-        // kernel when the fd closes, which is the whole point of using flock.
-        let _ = std::fs::remove_file(&self.holder);
+        // Serialize the record removal and lock handoff. A new holder cannot
+        // acquire the invocation lock and expose a predecessor record to a
+        // contender while this guard is held.
+        if flock_exclusive(self.guard.as_raw_fd()).is_ok() {
+            let _ = std::fs::remove_file(&self.holder);
+            flock_unlock(self._file.as_raw_fd());
+            flock_unlock(self.guard.as_raw_fd());
+        }
     }
 }
 
@@ -500,8 +512,12 @@ impl Drop for InvocationLock {
 pub enum LockOutcome {
     /// Claimed. Hold the value for the lifetime of the run.
     Acquired(InvocationLock),
-    /// Another validate holds it. The lines are the typed refusal message.
-    Busy(Vec<String>),
+    /// Another validate holds it. `detail` belongs in the common summary;
+    /// `epilogue` is rendered after that summary so an action stays last.
+    Busy { detail: Vec<String>, epilogue: Vec<String> },
+    /// The metadata guard itself could not be established. Proceeding would
+    /// disable the primary exclusion guarantee, so the caller must fail closed.
+    SafetyRefusal(String),
     /// The lock could not be created at all (unwritable `target/`); the caller
     /// proceeds, because refusing every run over a lock-file hiccup would be a
     /// worse outage than the concurrency it guards.
@@ -510,6 +526,34 @@ pub enum LockOutcome {
 
 fn flock_nb(fd: i32) -> bool {
     unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+fn flock_nb_result(fd: i32) -> io::Result<bool> {
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn flock_exclusive(fd: i32) -> io::Result<()> {
+    loop {
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn flock_unlock(fd: i32) {
+    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
 }
 
 /// Claim the exclusive per-checkout validate slot, or produce a typed refusal.
@@ -523,13 +567,240 @@ fn flock_nb(fd: i32) -> bool {
 /// a LIVENESS CHECK, so a record left by an earlier run can never be presented as
 /// a live process. The lock is `flock`, so the "holder died with the lock held"
 /// case does not exist to be reclaimed.
+/// The descriptive record beside the per-checkout invocation lock. ONE
+/// definition, so the writer, the refusal reader, and the log-path update
+/// cannot drift onto different files.
+fn invocation_holder_path(root: &Path) -> PathBuf {
+    root.join("target/validation").join("validate-invocation.holder")
+}
+
+fn invocation_holder_guard_path(root: &Path) -> PathBuf {
+    root.join("target/validation").join("validate-invocation-holder.lock")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InvocationHolderRecord {
+    pid: i32,
+    started_at: String,
+    commit: String,
+    profile: String,
+    checkout: PathBuf,
+    log: Option<PathBuf>,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        })
+        .collect()
+}
+
+fn encode_text(value: &str) -> String {
+    hex_encode(value.as_bytes())
+}
+
+fn decode_text(value: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex_decode(value)?).ok()?;
+    (!decoded.chars().any(char::is_control)).then_some(decoded)
+}
+
+fn encode_path(path: &Path) -> String {
+    hex_encode(path.as_os_str().as_bytes())
+}
+
+fn decode_path(value: &str) -> Option<PathBuf> {
+    let bytes = hex_decode(value)?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+impl InvocationHolderRecord {
+    fn serialize(&self) -> String {
+        let mut record = format!(
+            "version=1\npid={}\nstarted_at_hex={}\ncommit_hex={}\nprofile_hex={}\ncheckout_hex={}\n",
+            self.pid,
+            encode_text(&self.started_at),
+            encode_text(&self.commit),
+            encode_text(&self.profile),
+            encode_path(&self.checkout),
+        );
+        if let Some(log) = &self.log {
+            record.push_str(&format!("log_hex={}\n", encode_path(log)));
+        }
+        record
+    }
+
+    fn parse(record: &str) -> Option<Self> {
+        if !record.ends_with('\n') {
+            return None;
+        }
+        let mut fields = BTreeMap::new();
+        for line in record.lines() {
+            let (key, value) = line.split_once('=')?;
+            if value.is_empty() || fields.insert(key, value).is_some() {
+                return None;
+            }
+        }
+        let allowed = [
+            "version",
+            "pid",
+            "started_at_hex",
+            "commit_hex",
+            "profile_hex",
+            "checkout_hex",
+            "log_hex",
+        ];
+        if fields.keys().any(|key| !allowed.contains(key))
+            || fields.get("version") != Some(&"1")
+        {
+            return None;
+        }
+        let pid = fields.get("pid")?.parse().ok()?;
+        if pid <= 0 {
+            return None;
+        }
+        Some(Self {
+            pid,
+            started_at: decode_text(fields.get("started_at_hex")?)?,
+            commit: decode_text(fields.get("commit_hex")?)?,
+            profile: decode_text(fields.get("profile_hex")?)?,
+            checkout: decode_path(fields.get("checkout_hex")?)?,
+            log: match fields.get("log_hex") {
+                Some(value) => Some(decode_path(value)?),
+                None => None,
+            },
+        })
+    }
+}
+
+static HOLDER_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+fn write_invocation_holder(path: &Path, record: &InvocationHolderRecord) -> io::Result<()> {
+    let sequence = HOLDER_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("holder.{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)?;
+        file.write_all(record.serialize().as_bytes())?;
+        file.flush()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Quote an arbitrary Unix path as one Bash ANSI-C argv word.
+///
+/// Unlike display quoting, this preserves non-UTF-8 bytes and renders embedded
+/// newlines as `\n`, keeping the advertised command on one physical line.
+fn shell_quote_path(path: &Path) -> String {
+    let mut quoted = String::from("$'");
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b'\\' => quoted.push_str("\\\\"),
+            b'\'' => quoted.push_str("\\'"),
+            b'\n' => quoted.push_str("\\n"),
+            b'\r' => quoted.push_str("\\r"),
+            b'\t' => quoted.push_str("\\t"),
+            0x20..=0x7e => quoted.push(byte as char),
+            _ => quoted.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// Record where this run's durable log lives, so a later validate that is
+/// REFUSED can print a command to tail it.
+///
+/// The lock is claimed BEFORE the durable log exists, so the holder record is
+/// necessarily written without one and atomically replaced once the path is
+/// known. Only the process holding the lock may call this. Readers therefore
+/// see either the complete startup record or the complete record with a log,
+/// never a partially rewritten command payload.
+pub fn record_invocation_log_path(lock: &mut InvocationLock, log: &Path) {
+    if flock_exclusive(lock.guard.as_raw_fd()).is_ok() {
+        lock.record.log = Some(log.to_path_buf());
+        let _ = write_invocation_holder(&lock.holder, &lock.record);
+        flock_unlock(lock.guard.as_raw_fd());
+    }
+}
+
 pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> LockOutcome {
+    acquire_invocation_lock_with_hook(root, profile, commit, || {})
+}
+
+fn acquire_invocation_lock_with_hook(
+    root: &Path,
+    profile: &str,
+    commit: &str,
+    after_lock_acquired: impl FnOnce(),
+) -> LockOutcome {
     let dir = root.join("target/validation");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return LockOutcome::Unavailable(format!("cannot create {}: {e}", dir.display()));
     }
     let lock_path = dir.join("validate-invocation.lock");
-    let holder = dir.join("validate-invocation.holder");
+    let holder = invocation_holder_path(root);
+    let guard_path = invocation_holder_guard_path(root);
+    let guard = match std::fs::OpenOptions::new().create(true).append(true).open(&guard_path) {
+        Ok(file) => file,
+        Err(error) => {
+            return LockOutcome::SafetyRefusal(format!(
+                "cannot open holder metadata guard {}: {error}; refusing rather than running \
+                 without primary invocation exclusion",
+                guard_path.display(),
+            ))
+        }
+    };
+    match flock_nb_result(guard.as_raw_fd()) {
+        Ok(true) => {}
+        Ok(false) => return LockOutcome::Busy {
+            detail: vec![
+                "another validate is already running or changing ownership in THIS checkout"
+                    .into(),
+                format!("checkout: {root:?}"),
+                "holder metadata is transitioning; no holder identity or watch command is safe \
+                 to publish yet"
+                    .into(),
+                "this is an immediate refusal, not a wait; retry after the transition completes"
+                    .into(),
+            ],
+            epilogue: Vec::new(),
+        },
+        Err(error) => {
+            return LockOutcome::SafetyRefusal(format!(
+                "cannot lock holder metadata guard {}: {error}; refusing rather than running \
+                 without primary invocation exclusion",
+                guard_path.display(),
+            ))
+        }
+    }
     let file = match std::fs::OpenOptions::new().create(true).append(true).open(&lock_path) {
         Ok(f) => f,
         Err(e) => {
@@ -539,26 +810,53 @@ pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> Lock
     if !flock_nb(file.as_raw_fd()) {
         let mut msg = vec![
             "another validate is already running in THIS checkout".to_string(),
-            format!("checkout: {}", root.display()),
+            format!("checkout: {root:?}"),
         ];
-        let record = std::fs::read_to_string(&holder).unwrap_or_default();
-        let holder_pid = record
-            .lines()
-            .find_map(|l| l.strip_prefix("pid="))
-            .and_then(|v| v.trim().parse::<i32>().ok());
-        match holder_pid {
-            Some(pid) if unsafe { libc::kill(pid, 0) } == 0 => {
+        let record = std::fs::read_to_string(&holder)
+            .ok()
+            .and_then(|record| InvocationHolderRecord::parse(&record));
+        // Only a LIVE holder has a log worth watching; a stale record's log
+        // describes a run that already ended. Held back and pushed LAST so the
+        // refusal ends with something directly pastable.
+        let mut watch: Vec<String> = Vec::new();
+        match record {
+            Some(record) if unsafe { libc::kill(record.pid, 0) } == 0 => {
+                let pid = record.pid;
                 msg.push(format!("holder (pid {pid} is LIVE):"));
-                msg.extend(record.lines().map(|l| format!("  {l}")));
+                msg.push(format!("  started_at={}", record.started_at));
+                msg.push(format!("  commit={}", record.commit));
+                msg.push(format!("  profile={}", record.profile));
+                msg.push(format!("  checkout={:?}", record.checkout));
+                match record.log {
+                    // `-F` not `-f`: the holder may rotate or recreate the file,
+                    // and it may finish between this refusal and the paste.
+                    Some(path) => {
+                        msg.push(format!("  log={path:?}"));
+                        watch.push("watch the holder's live log with:".into());
+                        watch.push(format!("  tail -F -- {}", shell_quote_path(&path)));
+                    }
+                    // Say so rather than printing a guessed path: the lock is
+                    // claimed before the durable log is opened, so a holder that
+                    // is still starting up genuinely has no log yet.
+                    None => watch.push(
+                        "the holder has not opened its durable log yet, so there is nothing to \
+                         tail; re-run this command in a moment to get the path"
+                            .into(),
+                    ),
+                }
             }
-            Some(pid) => {
+            Some(record) => {
+                let pid = record.pid;
                 msg.push(format!(
                     "holder: the lock IS held, but the recorded pid {pid} is NOT alive, so this \
-                     record is STALE and does not describe the current holder:"
+                     record is STALE and does not describe the current holder"
                 ));
-                msg.extend(record.lines().map(|l| format!("  {l}")));
             }
-            None => msg.push("holder: (lock held, but no holder record was readable)".into()),
+            None => msg.push(
+                "holder: (lock held, but the holder record was unreadable or incomplete; no \
+                 watch command was emitted)"
+                    .into(),
+            ),
         }
         msg.push(
             "this is a refusal, not a wait: two validates in one checkout share target/ and the \
@@ -566,16 +864,25 @@ pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> Lock
                 .into(),
         );
         msg.push("wait for the holder to finish, or run in a different checkout".into());
-        return LockOutcome::Busy(msg);
+        return LockOutcome::Busy { detail: msg, epilogue: watch };
     }
-    let record = format!(
-        "pid={}\nstarted_at={}\ncommit={commit}\nprofile={profile}\ncheckout={}\n",
-        std::process::id(),
-        crate::utc_now(),
-        root.display()
-    );
-    let _ = std::fs::write(&holder, record);
-    LockOutcome::Acquired(InvocationLock { _file: file, holder })
+    after_lock_acquired();
+    // The holder guard spans invocation-lock acquisition and record
+    // publication. A contender cannot read a predecessor record during this
+    // handoff: it waits for the guard, then observes this holder's complete
+    // atomically published record.
+    let _ = std::fs::remove_file(&holder);
+    let record = InvocationHolderRecord {
+        pid: std::process::id() as i32,
+        started_at: crate::utc_now(),
+        commit: commit.to_owned(),
+        profile: profile.to_owned(),
+        checkout: root.to_path_buf(),
+        log: None,
+    };
+    let _ = write_invocation_holder(&holder, &record);
+    flock_unlock(guard.as_raw_fd());
+    LockOutcome::Acquired(InvocationLock { _file: file, guard, holder, record })
 }
 
 // ------------------------------------------------------------------ box-wide live-run registry
@@ -1021,29 +1328,310 @@ pub fn self_test() -> Result<String, String> {
     std::fs::create_dir_all(&sandbox).map_err(|e| format!("lock bracket: {e}"))?;
     let mut lock_accept = 0usize;
     let mut lock_refuse = 0usize;
+    let mut lock_safety_refuse = 0usize;
     {
-        let first = match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
+        let mut first = match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
             LockOutcome::Acquired(l) => {
                 lock_accept += 1;
                 l
             }
-            LockOutcome::Busy(m) => return Err(format!("lock: a free slot must be granted: {m:?}")),
+            LockOutcome::Busy { detail, epilogue } => {
+                return Err(format!(
+                    "lock: a free slot must be granted: detail={detail:?} epilogue={epilogue:?}"
+                ))
+            }
+            LockOutcome::SafetyRefusal(e) => {
+                return Err(format!("lock: sandbox safety guard refused: {e}"))
+            }
             LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
         };
         // NEGATIVE: a concurrent claim, from a real second fd, must be REFUSED and
         // must name the live holder.
         match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
-            LockOutcome::Busy(msg) => {
+            LockOutcome::Busy { detail, epilogue } => {
                 lock_refuse += 1;
-                let joined = msg.join("\n");
+                let joined = detail
+                    .iter()
+                    .chain(&epilogue)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if !joined.contains("is LIVE") || !joined.contains(&std::process::id().to_string()) {
                     return Err(format!("lock: refusal must name the LIVE holder pid: {joined}"));
+                }
+                // Before the holder records a log there is nothing to tail, and
+                // the refusal must SAY so rather than print a guessed path.
+                if !joined.contains("has not opened its durable log yet") {
+                    return Err(format!(
+                        "lock: with no recorded log the refusal must say so, not guess: {joined}"
+                    ));
+                }
+                if joined.contains("tail -F") {
+                    return Err(format!(
+                        "lock: refusal offered a tail command with no recorded log: {joined}"
+                    ));
                 }
             }
             _ => return Err("lock: a second concurrent claim MUST be refused".into()),
         }
+        // With a log recorded, the refusal must END with a command that a Bash
+        // user can paste without the path being split, expanded, or executed.
+        // Exercise each dangerous class independently so removing any one escape
+        // has a causal failing case.
+        for name in [
+            "holder run.log",
+            "holder'quote.log",
+            "holder;$(touch HOLDER_QUOTE_INJECTION)&|*.log",
+            "holder\nnewline.log",
+        ] {
+            let fake_log = sandbox.join(name);
+            std::fs::write(&fake_log, "holder log\n")
+                .map_err(|e| format!("lock bracket: {e}"))?;
+            record_invocation_log_path(&mut first, &fake_log);
+            match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
+                LockOutcome::Busy { detail: _, epilogue } => {
+                    lock_refuse += 1;
+                    let quoted = shell_quote_path(&fake_log);
+                    let want = format!("  tail -F -- {quoted}");
+                    if epilogue.last().map(String::as_str) != Some(want.as_str()) {
+                        return Err(format!(
+                            "lock: refusal must END with `{want}`, got: {:?}",
+                            epilogue.last()
+                        ));
+                    }
+                    let probe = std::process::Command::new("bash")
+                        .current_dir(&sandbox)
+                        .arg("-c")
+                        .arg(format!("set -- {quoted}; printf %s \"$1\""))
+                        .output()
+                        .map_err(|e| format!("lock quote probe: {e}"))?;
+                    if !probe.status.success()
+                        || probe.stdout.as_slice() != fake_log.as_os_str().as_bytes()
+                    {
+                        return Err(format!(
+                            "lock: tail path did not survive shell parsing: {:?}",
+                            fake_log
+                        ));
+                    }
+                    if sandbox.join("HOLDER_QUOTE_INJECTION").exists() {
+                        return Err("lock: shell metacharacters executed from the tail hint".into());
+                    }
+                }
+                _ => return Err("lock: a second concurrent claim MUST be refused".into()),
+            }
+        }
+
+        // A reader racing an incomplete or malformed record must fail closed:
+        // it may report that the lock is held, but it must not publish a command
+        // assembled from untrusted fragments.
+        let holder_path = invocation_holder_path(&sandbox);
+        let nul_path_record = InvocationHolderRecord {
+            pid: std::process::id() as i32,
+            started_at: "now".into(),
+            commit: "0000000".into(),
+            profile: "self-test".into(),
+            checkout: sandbox.clone(),
+            log: Some(PathBuf::from(OsString::from_vec(
+                b"/tmp/before\0after".to_vec(),
+            ))),
+        }
+        .serialize();
+        let complete_without_final_newline = {
+            let mut record = InvocationHolderRecord {
+                pid: std::process::id() as i32,
+                started_at: "now".into(),
+                commit: "0000000".into(),
+                profile: "self-test".into(),
+                checkout: sandbox.clone(),
+                log: Some(sandbox.join("complete-but-truncated.log")),
+            }
+            .serialize();
+            if record.pop() != Some('\n') {
+                return Err("lock: serialized holder record lost its final newline".into());
+            }
+            record
+        };
+        for malformed in [
+            format!("version=1\npid={}\nstarted_at_hex=00", std::process::id()),
+            format!(
+                "pid={}\nlog=/tmp/holder; touch HOLDER_RECORD_INJECTION\n",
+                std::process::id()
+            ),
+            nul_path_record,
+            complete_without_final_newline,
+        ] {
+            std::fs::write(&holder_path, malformed)
+                .map_err(|e| format!("lock malformed-record bracket: {e}"))?;
+            match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
+                LockOutcome::Busy { detail, epilogue } => {
+                    lock_refuse += 1;
+                    let joined = detail
+                        .iter()
+                        .chain(&epilogue)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !joined.contains("unreadable or incomplete")
+                        || joined.contains("tail -F")
+                        || !epilogue.is_empty()
+                    {
+                        return Err(format!(
+                            "lock: malformed holder record must fail closed without a command: {joined}"
+                        ));
+                    }
+                }
+                _ => return Err("lock: a second concurrent claim MUST be refused".into()),
+            }
+        }
         drop(first);
     }
+
+    // HANDOFF: leave a predecessor record behind as a crashed process can, then
+    // pause the next holder after it owns the invocation lock but before it
+    // publishes its record. A third independently-opened fd must refuse
+    // immediately without attributing the predecessor's record to the new lock
+    // owner; after publication, the next refusal must name the new holder.
+    let predecessor = InvocationHolderRecord {
+        pid: std::process::id() as i32,
+        started_at: "predecessor".into(),
+        commit: "predecessor-commit".into(),
+        profile: "self-test".into(),
+        checkout: sandbox.clone(),
+        log: Some(sandbox.join("predecessor.log")),
+    };
+    write_invocation_holder(&invocation_holder_path(&sandbox), &predecessor)
+        .map_err(|e| format!("lock handoff predecessor: {e}"))?;
+    let (new_locked_tx, new_locked_rx) = std::sync::mpsc::sync_channel(0);
+    let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(0);
+    let new_root = sandbox.clone();
+    let new_holder = std::thread::spawn(move || {
+        acquire_invocation_lock_with_hook(&new_root, "self-test", "new-holder-commit", || {
+            new_locked_tx.send(()).expect("handoff receiver exists");
+            publish_rx.recv().expect("handoff publisher exists");
+        })
+    });
+    new_locked_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("lock handoff did not reach publication seam: {e}"))?;
+    let (contender_started_tx, contender_started_rx) = std::sync::mpsc::sync_channel(0);
+    let (contender_tx, contender_rx) = std::sync::mpsc::sync_channel(0);
+    let contender_root = sandbox.clone();
+    let contender = std::thread::spawn(move || {
+        contender_started_tx.send(()).expect("handoff receiver exists");
+        let outcome = acquire_invocation_lock(&contender_root, "self-test", "contender-commit");
+        contender_tx.send(outcome).expect("handoff receiver exists");
+    });
+    contender_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|e| format!("lock handoff contender did not start: {e}"))?;
+    let transition_outcome = match contender_rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = publish_tx.send(());
+            if let Ok(LockOutcome::Acquired(lock)) = new_holder.join() {
+                drop(lock);
+            }
+            let _ = contender_rx.recv_timeout(Duration::from_secs(2));
+            let _ = contender.join();
+            return Err(format!(
+                "lock handoff: contender did not refuse immediately during publication: {error}"
+            ));
+        }
+    };
+    contender.join().map_err(|_| "lock handoff contender panicked")?;
+    match transition_outcome {
+        LockOutcome::Busy { detail, epilogue } => {
+            lock_refuse += 1;
+            let joined = detail.iter().chain(&epilogue).cloned().collect::<Vec<_>>().join("\n");
+            if !joined.contains("metadata is transitioning")
+                || joined.contains("predecessor-commit")
+                || joined.contains("tail -F")
+                || !epilogue.is_empty()
+            {
+                return Err(format!(
+                    "lock handoff: transition refusal exposed unsafe holder data: {joined}"
+                ));
+            }
+        }
+        LockOutcome::Acquired(_) => {
+            return Err("lock handoff: contender acquired during publication".into())
+        }
+        LockOutcome::SafetyRefusal(error) => {
+            return Err(format!("lock handoff: transition safety-refused unexpectedly: {error}"))
+        }
+        LockOutcome::Unavailable(error) => {
+            return Err(format!("lock handoff: transition became unguarded: {error}"))
+        }
+    }
+    publish_tx.send(()).map_err(|e| format!("lock handoff publish release: {e}"))?;
+    let new_lock = match new_holder.join().map_err(|_| "lock handoff new holder panicked")? {
+        LockOutcome::Acquired(lock) => lock,
+        LockOutcome::Busy { detail, epilogue } => {
+            return Err(format!(
+                "lock handoff: new holder was refused: detail={detail:?} epilogue={epilogue:?}"
+            ))
+        }
+        LockOutcome::SafetyRefusal(error) => {
+            return Err(format!("lock handoff: new holder safety-refused: {error}"))
+        }
+        LockOutcome::Unavailable(error) => {
+            return Err(format!("lock handoff: new holder unavailable: {error}"))
+        }
+    };
+    match acquire_invocation_lock(&sandbox, "self-test", "post-publication-contender") {
+        LockOutcome::Busy { detail, epilogue } => {
+            lock_refuse += 1;
+            let joined = detail
+                .iter()
+                .chain(&epilogue)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !joined.contains("new-holder-commit") || joined.contains("predecessor-commit") {
+                return Err(format!(
+                    "lock handoff: contender did not observe the new holder record: {joined}"
+                ));
+            }
+        }
+        LockOutcome::Acquired(_) => {
+            return Err("lock handoff: contender acquired while new holder was live".into())
+        }
+        LockOutcome::SafetyRefusal(error) => {
+            return Err(format!("lock handoff: contender safety-refused: {error}"))
+        }
+        LockOutcome::Unavailable(error) => {
+            return Err(format!("lock handoff: contender unavailable: {error}"))
+        }
+    }
+    drop(new_lock);
+
+    // A broken metadata guard must not fall through the caller's explicitly
+    // unguarded compatibility path. Make the guard path unopenable while the
+    // primary lock is free and require the distinct fail-closed outcome.
+    let guard_path = invocation_holder_guard_path(&sandbox);
+    std::fs::remove_file(&guard_path).map_err(|e| format!("lock guard failure cleanup: {e}"))?;
+    std::fs::create_dir(&guard_path).map_err(|e| format!("lock guard failure setup: {e}"))?;
+    match acquire_invocation_lock(&sandbox, "self-test", "guard-failure") {
+        LockOutcome::SafetyRefusal(error) if error.contains("cannot open holder metadata guard") => {
+            lock_safety_refuse += 1;
+        }
+        LockOutcome::SafetyRefusal(error) => {
+            return Err(format!("lock guard failure named the wrong cause: {error}"))
+        }
+        LockOutcome::Unavailable(error) => {
+            return Err(format!("lock guard failure incorrectly permitted unguarded execution: {error}"))
+        }
+        LockOutcome::Busy { detail, epilogue } => {
+            return Err(format!(
+                "lock guard failure was misreported as contention: detail={detail:?} epilogue={epilogue:?}"
+            ))
+        }
+        LockOutcome::Acquired(_) => {
+            return Err("lock guard failure incorrectly acquired the invocation lock".into())
+        }
+    }
+    std::fs::remove_dir(&guard_path).map_err(|e| format!("lock guard failure teardown: {e}"))?;
+
     // POSITIVE, and the one that matters most: after the holder releases, the
     // NEXT sequential run must succeed.
     match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
@@ -1051,8 +1639,13 @@ pub fn self_test() -> Result<String, String> {
             lock_accept += 1;
             drop(l);
         }
-        LockOutcome::Busy(m) => {
-            return Err(format!("lock: a SEQUENTIAL re-claim must succeed, got refusal: {m:?}"))
+        LockOutcome::Busy { detail, epilogue } => {
+            return Err(format!(
+                "lock: a SEQUENTIAL re-claim must succeed, got refusal: detail={detail:?} epilogue={epilogue:?}"
+            ))
+        }
+        LockOutcome::SafetyRefusal(e) => {
+            return Err(format!("lock: sequential safety guard refused: {e}"))
         }
         LockOutcome::Unavailable(e) => return Err(format!("lock: sandbox unusable: {e}")),
     }
@@ -1106,7 +1699,8 @@ pub fn self_test() -> Result<String, String> {
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
          (incl. the 2 NEW classes), node-detail extraction 1 hit / 1 miss, CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
-         {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse, \
+         {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
+         {lock_safety_refuse} safety-refuse, \
          registry census 1 live / 1 stale-reaped / 1 cpu-active"
     ))
 }
