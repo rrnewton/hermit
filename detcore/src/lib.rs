@@ -323,7 +323,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        self.record_or_replay_preserving_tool_errors(guest, call)
+            .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
