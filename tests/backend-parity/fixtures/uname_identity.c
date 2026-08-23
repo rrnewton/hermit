@@ -29,6 +29,22 @@
 #define PINNED_RELEASE "5.2.0"
 #define PINNED_NODENAME "hermetic-container.local"
 
+/* Number of behavioural checks this fixture must complete UNDER HERMIT; a lower
+   count is a failure, not a smaller success. Native reaches fewer because it
+   does not pin the virtualized identity this fixture reads.
+
+   CONSEQUENCE TO WEIGH BEFORE ENABLING ANOTHER CELL. The only enabled cell is
+   verify/ptrace, and 4 is measured correct there. This file's header above also
+   records that the DBT backend forwards the host nodename and so reaches only 3.
+   MEASURED 2026-08-23 on hermit 485a0ad4 built with third-party-backends, that is
+   no longer what DBT does: `--backend=dbt` reaches 4 and exits 0, i.e. all four
+   pinned values including nodename matched. The header's claim looks stale rather
+   than wrong-at-the-time; it is left in place because confirming when the leak
+   closed is not this change's job. Either way the gate reports what it observes,
+   so a backend that does leak the nodename exits 1 instead of passing quietly.
+*/
+#define EXPECTED_CHECKS_UNDER_HERMIT 4
+
 int main(void) {
     int ok = 0;
     struct utsname u;
@@ -50,5 +66,14 @@ int main(void) {
     }
 
     printf("uname ok=%d\n", ok);
+    /* Route a behavioural failure into the exit status. Without this the guest
+       exits 0 whatever `ok` reached, so a regression only lowered the printed
+       number -- and under --verify both runs lower it identically, so the
+       comparison still matches and the cell stays green. Every check above is
+       unchanged; this only requires all of them. */
+    if (ok != EXPECTED_CHECKS_UNDER_HERMIT) {
+        fprintf(stderr, "uname completed %d of %d checks\n", ok, EXPECTED_CHECKS_UNDER_HERMIT);
+        return 1;
+    }
     return 0;
 }

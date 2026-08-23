@@ -44,8 +44,14 @@ void __attribute__((optnone)) spin() {
 }
 
 void* thread1(void* vargp) {
+  (void)vargp;
   struct sysinfo info;
-  sysinfo(&info);
+  /* PRODUCER: the printf and the atomic_store below read this struct. */
+  if (sysinfo(&info) != 0) {
+    fprintf(stderr, "thread1: sysinfo failed\n");
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+  }
   printf("thread1-> uptime: %lu sec\n", info.uptime);
 
   /*
@@ -55,7 +61,11 @@ void* thread1(void* vargp) {
    might get false positive as uptimes from both threads will be equal
    */
   spin();
-  sysinfo(&info);
+  if (sysinfo(&info) != 0) {
+    fprintf(stderr, "thread1: second sysinfo failed\n");
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+  }
   atomic_store(&uptime_1, info.uptime);
   printf("thread1-> uptime: %lu sec\n", info.uptime);
   pthread_mutex_unlock(&mutex);
@@ -63,9 +73,14 @@ void* thread1(void* vargp) {
 }
 
 void* thread2(void* vargp) {
+  (void)vargp;
   pthread_mutex_lock(&mutex);
   struct sysinfo info;
-  sysinfo(&info);
+  /* PRODUCER: every printf below reads this struct. */
+  if (sysinfo(&info) != 0) {
+    fprintf(stderr, "thread2: sysinfo failed\n");
+    return NULL;
+  }
   atomic_store(&uptime_2, info.uptime);
   printf("thread2-> uptime: %lu sec\n", info.uptime);
 
@@ -92,8 +107,28 @@ int main() {
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
   pthread_t thread[2];
   pthread_mutex_lock(&mutex);
-  pthread_create(&thread[0], NULL, thread1, NULL);
-  pthread_create(&thread[1], NULL, thread2, NULL);
+  /* pthread_create is a PRODUCER. Unchecked, a failure left thread[i]
+     indeterminate and the pthread_join below was handed a value that names no
+     thread -- undefined, and undefined in a way that depends on stack contents.
+     On a partial failure the threads already created must still be joined
+     before main returns, because they write to objects with static storage and
+     the process must not tear down around a live thread. */
+  int created = 0;
+  if (pthread_create(&thread[0], NULL, thread1, NULL) == 0) {
+    created = 1;
+    if (pthread_create(&thread[1], NULL, thread2, NULL) == 0) {
+      created = 2;
+    }
+  }
+  if (created < 2) {
+    fprintf(stderr, "sysinfo_uptime: pthread_create failed after %d thread(s)\n",
+            created);
+    pthread_mutex_unlock(&mutex);
+    for (int i = 0; i < created; ++i) {
+      pthread_join(thread[i], NULL);
+    }
+    return 1;
+  }
   pthread_join(thread[0], NULL);
   pthread_join(thread[1], NULL);
   if (atomic_load(&uptime_1) > atomic_load(&uptime_2)) {

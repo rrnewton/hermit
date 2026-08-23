@@ -35,9 +35,42 @@ SOFTWARE.
 #include <sys/syscall.h>
 #include <unistd.h>
 
+/* Both values Detcore pins, so both are asserted.
+ *
+ * detcore/src/syscalls/misc.rs handle_getcpu writes 0 to the cpu word ("Always
+ * set the CPU to 0") AND 0 to the node word ("Always set the NUMA node to 0").
+ * Node therefore has exactly as documented a contract as cpu does. It used to
+ * be printed and not asserted, which made this a cell no wrong answer could
+ * turn red: if node virtualisation regressed, cpu == 0 still held, the guest
+ * still exited 0, and under --verify both runs printed the same wrong node
+ * identically so the comparison still matched.
+ *
+ * The syscall's own result is checked too. Unchecked, a getcpu that failed left
+ * both initialisers untouched at 0 and the fixture reported the pinned values
+ * it never actually observed -- a false pass rather than a wrong answer.
+ */
+#define EXPECTED_CHECKS 3
+
 int main() {
-  int cpu = 0;
-  int node = 0;
-  syscall(SYS_getcpu, &cpu, &node, NULL);
+  int cpu = -1;
+  int node = -1;
+  int ok = 0;
+
+  if (syscall(SYS_getcpu, &cpu, &node, NULL) == 0) {
+    ok++;
+  }
   printf("CPU %d, Node %d\n", cpu, node);
+  if (cpu == 0) {
+    ok++;
+  }
+  if (node == 0) {
+    ok++;
+  }
+
+  if (ok != EXPECTED_CHECKS) {
+    fprintf(stderr, "getCpu completed %d of %d checks (cpu=%d node=%d)\n", ok,
+            EXPECTED_CHECKS, cpu, node);
+    return 1;
+  }
+  return 0;
 }

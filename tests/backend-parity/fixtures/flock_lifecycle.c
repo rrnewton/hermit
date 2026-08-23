@@ -23,6 +23,10 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success. */
+#define EXPECTED_CHECKS 5
+
 int main(void) {
   int ok = 0;
 
@@ -30,7 +34,7 @@ int main(void) {
   int fd = mkstemp(path);
   if (fd < 0) {
     printf("flock ok=%d\n", ok);
-    return 0;
+    return 1;
   }
 
   if (flock(fd, LOCK_EX) == 0) {
@@ -52,5 +56,14 @@ int main(void) {
   close(fd);
   unlink(path);
   printf("flock ok=%d\n", ok);
-  return 0;
+  /* Route a behavioural failure into the exit status. Without this the guest
+       exits 0 whatever `ok` reached, so a regression only lowered the printed
+       number -- and under --verify both runs lower it identically, so the
+       comparison still matches and the cell stays green. Every check above is
+       unchanged; this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "flock completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+        return 1;
+    }
+    return 0;
 }
