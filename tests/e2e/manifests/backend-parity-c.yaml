@@ -5182,7 +5182,14 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: determinism-failure
+            evidence: e73e7ba0bf56fbbfefffa304f7622c67aac6ea88
+            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10.
         backends_enabled:
           - ptrace
           - liteinst

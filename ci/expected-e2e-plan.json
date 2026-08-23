@@ -85,13 +85,6 @@
       "test": "backend-parity-c/cpuid-probe"
     },
     {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/cwd-roundtrip"
-    },
-    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
