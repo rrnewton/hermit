@@ -158,13 +158,19 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 **Outer** — how many gates may co-run:
 
 - `resource_caps` gates *scarce* resources. `portable.json` keeps
-  `{"hermit_guest": 1}` for legacy guest gates, so they run **one at a time**
-  (they share the working filesystem, are mutually nondeterministic, and on a
-  PMU host contend for the counter). Manifest buckets use disjoint cell trees
-  and portable timing relaxations, so they use a separate
-  `{"manifest_guest": 4}` pool after the shared build barrier. Non-guest gates
-  carry no scarce resource and parallelize freely. `privileged.json` caps only
-  `{"kvm": 1}`. The PMU is **not** a scarce resource and carries no cap: reverie
+  `{"hermit_guest": 1, "manifest_guest": 8}`. Legacy guest gates request the
+  single `hermit_guest` slot, so they run **one at a time** (they share the
+  working filesystem, are mutually nondeterministic, and on a PMU host contend
+  for the counter). Ordinary manifest buckets use disjoint cell trees and
+  request one `manifest_guest` slot after the shared build barrier. The two
+  high-width buckets, `backend-parity-c` and `c-programs`, request all eight
+  `manifest_guest` slots plus the portable `hermit_guest` slot, so neither can
+  overlap another manifest bucket or legacy Hermit guest gate. Reducing their
+  blocking width from 20 to 8 deliberately removes 20-way manifest pressure
+  coverage from ordinary validation; it does not change the selected cells or
+  their strict comparator. Non-guest gates carry no scarce resource and
+  parallelize freely. `privileged.json` caps only `{"kvm": 1}`. The PMU is
+  **not** a scarce resource and carries no cap: reverie
   measures retired conditional branches with per-task (`cpu = -1`) counters that
   the kernel context-switches, so only the running task's counters need be
   resident; 32 concurrent `run --strict --verify` processes pinned to one core

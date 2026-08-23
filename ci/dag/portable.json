@@ -1,5 +1,5 @@
 {
-  "resource_caps": {"hermit_guest": 1, "manifest_guest": 20},
+  "resource_caps": {"hermit_guest": 1, "manifest_guest": 8},
   "mem_cap_factor": 1.25,
   "mem_cap_floor_bytes": 8589934592,
   "outer_mem_safety_factor": 1.0,
@@ -158,15 +158,15 @@
     {
       "group": "e2e", "job": "manifest_backend_parity_c",
       "desc": "Portable manifest bucket: backend-parity-c",
-      "description": "MEASURED 2026-08-17: the serial Rust harness produced only 33 of 80 required rows in 582.4s before this node's inherited 600s bound killed it. At roughly 17.6s per row, serial execution requires about 1408s and can never fit the bound. The host pressure test sustained 20-way execution at 80.57 cells/min with no load-induced failures, so this node reserves all 20 manifest_guest slots and passes the same width to the harness. The 600s bound is retained as a hang detector rather than raised to hide serial throughput.",
+      "description": "MEASURED 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 79 selected strict rows in 175.9s with 79 canonical matches and no no_result, leaving a measured 424.1s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged.",
       "manifest": {"lane": "portable", "category": "backend-parity-c"},
-      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 20",
+      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"manifest_guest": 20}, "est_duration_s": 120,
+      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 180,
                "rss_baseline_bytes": 17179869184, "hard_mem_max_bytes": 34359738368,
-               "classification": "latency-bound", "preferred_inner_jobs": 20}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "e2e", "job": "audit_compile_backend_parity_c",
@@ -192,15 +192,15 @@
     {
       "group": "e2e", "job": "manifest_c_programs",
       "desc": "Portable manifest bucket: c-programs",
-      "description": "MEASURED 2026-08-17: the serial Rust harness produced only 36 of 136 required rows in 586.7s before this node's inherited 600s bound killed it. At roughly 17.6s per row, serial execution requires about 2394s and can never fit the bound. The host pressure test sustained 20-way execution at 80.57 cells/min with no load-induced failures, so this node reserves all 20 manifest_guest slots and passes the same width to the harness. The 600s bound is retained as a hang detector rather than raised to hide serial throughput.",
+      "description": "MEASURED 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots plus the exclusive hermit_guest slot and passes the same width to the harness. Tradeoff: blocking validation no longer exercises the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged.",
       "manifest": {"lane": "portable", "category": "c-programs"},
-      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 20",
+      "cmd": "./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8",
       "jobs_flag": "",
       "deps": ["build.e2e_artifact", "build.manifest_guests", "e2e.metadata"],
       "timeout": 600,
-      "hint": {"resources": {"manifest_guest": 20}, "est_duration_s": 180,
+      "hint": {"resources": {"hermit_guest": 1, "manifest_guest": 8}, "est_duration_s": 300,
                "rss_baseline_bytes": 17179869184, "hard_mem_max_bytes": 34359738368,
-               "classification": "latency-bound", "preferred_inner_jobs": 20}
+               "classification": "latency-bound", "preferred_inner_jobs": 8}
     },
     {
       "group": "e2e", "job": "manifest_chaos_c",

@@ -594,8 +594,8 @@ pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
 /// file, kept its steps, and threw its configuration away. That is not a
 /// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
 /// `ci/dag/portable.json` declares `resource_caps {hermit_guest: 1,
-/// manifest_guest: 20}`; dropping them left `res_free` evaluating
-/// `unwrap_or(0) >= 1` for the 16 steps demanding `hermit_guest` and the 13
+/// manifest_guest: 8}`; dropping them left `res_free` evaluating
+/// `unwrap_or(0) >= 1` for the 18 steps demanding `hermit_guest` and the 13
 /// demanding `manifest_guest`, so none could ever be admitted. The scheduler's
 /// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with
 /// work neither runnable nor accounted it slept at 50 ms forever -- no error, no

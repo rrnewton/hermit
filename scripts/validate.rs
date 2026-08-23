@@ -663,7 +663,7 @@ fn nested_scope_probe_step(
 /// alone would leave its original worker count running inside a smaller box, which
 /// is a slowdown disguised as a limit. Four nodes are in exactly that position:
 /// `build.workspace` and `build.runtime_release` at 32, and
-/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 20. All four
+/// `e2e.manifest_backend_parity_c` and `e2e.manifest_c_programs` at 8. All four
 /// bake their measured width into the command itself, so `-j` (host_cpus/8, floor
 /// 2, cap 16) would refuse the entire run.
 ///
