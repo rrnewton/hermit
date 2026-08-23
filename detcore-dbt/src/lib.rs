@@ -1137,6 +1137,29 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     0
 }
 
+/// Applies the result of a native process-clone syscall after the kernel returns.
+///
+/// Successful process clones share inherited open file descriptions, while the
+/// copied DBT runtime can mutate their locks independently. Invalidate both the
+/// parent and child copies only after success; a failed clone leaves the known
+/// lock state unchanged.
+///
+/// # Safety
+///
+/// `scratch` must name initialized per-thread storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
+    scratch: *mut c_void,
+    result: i64,
+) {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if result >= 0 && !scratch.runtime_state.is_null() {
+        unsafe { &mut *scratch.runtime_state }
+            .state
+            .forget_flock_modes();
+    }
+}
+
 /// Releases Detcore state owned by a DynamoRIO application thread.
 ///
 /// # Safety
@@ -1388,6 +1411,19 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
+    if sysnum == libc::SYS_vfork
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_known_flock_lock()
+    {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork while an open file description holds a flock\n",
+        );
+        return -1;
+    }
+
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
@@ -2553,6 +2589,12 @@ mod tests {
                 "unconditional refusal must fail closed for syscall {sysnum}"
             );
         }
+
+        assert_eq!(
+            copied_child_action(libc::SYS_flock),
+            0,
+            "an ordinary copied fork child may release an inherited flock",
+        );
 
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
     }

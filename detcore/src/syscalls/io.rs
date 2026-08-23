@@ -21,6 +21,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
@@ -321,6 +322,65 @@ fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
         offset = next;
     }
     messages
+}
+
+fn scm_rights_fds(control: &[u8]) -> Option<Vec<RawFd>> {
+    let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+    let mut fds = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < control.len() {
+        let header_bytes = &control[offset..];
+        let header = read_control_value::<libc::cmsghdr>(header_bytes)?;
+        if header.cmsg_len < header_len {
+            return None;
+        }
+        let end = offset.checked_add(header.cmsg_len)?;
+        if end > control.len() {
+            return None;
+        }
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            let data_start = offset + header_len;
+            let (chunks, _) =
+                control[data_start..end].as_chunks::<{ std::mem::size_of::<RawFd>() }>();
+            fds.extend(
+                chunks
+                    .iter()
+                    .map(|bytes| RawFd::from_ne_bytes(*bytes))
+                    .filter(|fd| *fd >= 0),
+            );
+        }
+        let alignment = std::mem::size_of::<usize>();
+        if end == control.len() {
+            break;
+        }
+        let aligned_len = header
+            .cmsg_len
+            .checked_add(alignment - 1)
+            .map(|len| len & !(alignment - 1))?;
+        let next = offset.checked_add(aligned_len)?;
+        if next <= offset || next > control.len() {
+            return None;
+        }
+        offset = next;
+    }
+    Some(fds)
+}
+
+fn message_scm_rights_fds<M: MemoryAccess>(
+    memory: M,
+    message: &libc::msghdr,
+) -> Option<Vec<RawFd>> {
+    if message.msg_control.is_null() || message.msg_controllen == 0 {
+        return Some(Vec::new());
+    }
+    if message.msg_controllen > MAX_CONTROL_BYTES {
+        return None;
+    }
+    let address = Addr::<u8>::from_raw(message.msg_control as usize)?;
+    let mut control = vec![0; message.msg_controllen];
+    memory.read_exact(address, &mut control).ok()?;
+    scm_rights_fds(&control)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1305,6 +1365,82 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
+    fn invalidate_transferred_flock_modes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        transferred: Option<&[RawFd]>,
+    ) {
+        let Some(fds) = transferred else {
+            guest.thread_state().forget_flock_modes();
+            return;
+        };
+        for &fd in fds {
+            if guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.forget_flock_mode())
+                .is_err()
+            {
+                // An untracked slot can still alias a tracked open file
+                // description. Without its provenance, invalidate every cache
+                // entry in this process rather than leave a stale known mode.
+                guest.thread_state().forget_flock_modes();
+                return;
+            }
+        }
+    }
+
+    /// Sends one message and invalidates flock knowledge for successfully
+    /// transferred SCM_RIGHTS open file descriptions.
+    pub async fn handle_sendmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendmsg,
+    ) -> Result<i64, Error> {
+        let transferred = call.msg().and_then(|address| {
+            let message = guest.memory().read_value(address).ok()?;
+            message_scm_rights_fds(guest.memory(), &message)
+        });
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        self.invalidate_transferred_flock_modes(guest, transferred.as_deref());
+        Ok(result)
+    }
+
+    /// Sends a message batch and invalidates flock knowledge only for the
+    /// SCM_RIGHTS entries in messages the kernel reports as sent.
+    pub async fn handle_sendmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendmmsg,
+    ) -> Result<i64, Error> {
+        let transferred = call.msgvec().and_then(|base| {
+            if call.vlen() > libc::UIO_MAXIOV as u32 {
+                return None;
+            }
+            let mut messages = Vec::with_capacity(call.vlen() as usize);
+            for index in 0..call.vlen() as usize {
+                let raw = base
+                    .as_raw()
+                    .checked_add(index.checked_mul(std::mem::size_of::<libc::mmsghdr>())?)?;
+                let address = Addr::<libc::mmsghdr>::from_raw(raw)?;
+                let message = guest.memory().read_value(address).ok()?;
+                messages.push(message_scm_rights_fds(guest.memory(), &message.msg_hdr));
+            }
+            Some(messages)
+        });
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        let delivered = usize::try_from(result).unwrap_or(0);
+        match transferred {
+            Some(messages) => {
+                for message in messages.into_iter().take(delivered) {
+                    self.invalidate_transferred_flock_modes(guest, message.as_deref());
+                }
+            }
+            None if delivered > 0 => self.invalidate_transferred_flock_modes(guest, None),
+            None => {}
+        }
+        Ok(result)
+    }
+
     // TODO-HUMAN-REVIEW(PR-912): Review receive-time capture across socket aliases.
     async fn observe_socket_receive<G: Guest<Self>>(
         &self,
@@ -1808,6 +1944,40 @@ mod tests {
             }),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn scm_rights_parser_returns_descriptors_and_rejects_malformed_control() {
+        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let payload_len = 2 * std::mem::size_of::<RawFd>();
+        let message_len = header_len + payload_len;
+        let mut control = vec![0; message_len];
+        assert!(write_control_value(
+            &mut control,
+            libc::cmsghdr {
+                cmsg_len: message_len,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: libc::SCM_RIGHTS,
+            },
+        ));
+        assert!(write_control_value(&mut control[header_len..], 7_i32));
+        assert!(write_control_value(
+            &mut control[header_len + std::mem::size_of::<RawFd>()..],
+            9_i32,
+        ));
+        assert_eq!(scm_rights_fds(&control), Some(vec![7, 9]));
+
+        let mut overflowing = vec![0; header_len];
+        assert!(write_control_value(
+            &mut overflowing,
+            libc::cmsghdr {
+                cmsg_len: usize::MAX,
+                cmsg_level: libc::SOL_SOCKET,
+                cmsg_type: libc::SCM_RIGHTS,
+            },
+        ));
+        assert_eq!(scm_rights_fds(&overflowing), None);
+        assert_eq!(scm_rights_fds(&control[..header_len - 1]), None);
     }
 
     #[test]
