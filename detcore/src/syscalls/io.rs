@@ -106,6 +106,16 @@ fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
     Ok(nfds.div_ceil(bits_per_word) * std::mem::size_of::<libc::c_ulong>())
 }
 
+fn pselect6_probe_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
+    match result {
+        // The injected syscall runs outside the guest's original restart frame.
+        // Do not expose this kernel-internal restart instruction at the
+        // rewritten pselect6 call site.
+        Err(Errno::ERESTARTSYS) => Err(Errno::EINTR),
+        result => result,
+    }
+}
+
 fn read_pselect6_fd_set<T, G>(
     guest: &mut G,
     address: Option<AddrMut<'_, libc::fd_set>>,
@@ -566,7 +576,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
             write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-            let result = guest.inject(probe).await;
+            let result = pselect6_probe_result(guest.inject(probe).await);
             if result != Ok(0) {
                 let copy_result = if result.is_ok() {
                     self.copy_pselect6_results(guest, probe, call, len)
@@ -1757,6 +1767,23 @@ mod tests {
         assert_eq!(pselect6_fd_set_len(1), Ok(8));
         assert_eq!(pselect6_fd_set_len(65), Ok(16));
         assert_eq!(pselect6_fd_set_len(libc::FD_SETSIZE as i32), Ok(128));
+    }
+
+    #[test]
+    fn pselect6_probe_result_maps_only_erestartsys_to_eintr() {
+        assert_eq!(
+            pselect6_probe_result(Err(Errno::ERESTARTSYS)),
+            Err(Errno::EINTR)
+        );
+
+        assert_eq!(pselect6_probe_result(Ok(0)), Ok(0));
+        assert_eq!(pselect6_probe_result(Ok(1)), Ok(1));
+        assert_eq!(pselect6_probe_result(Err(Errno::EBADF)), Err(Errno::EBADF));
+        assert_eq!(
+            pselect6_probe_result(Err(Errno::EINVAL)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(pselect6_probe_result(Err(Errno::EINTR)), Err(Errno::EINTR));
     }
 
     #[test]
