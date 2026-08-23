@@ -17,12 +17,13 @@
 //! ~47-NODE DAG run must never be readable as a 47-TEST pass (see `write_ledger`
 //! in `validate.rs`).
 //!
-//! So the predicate is dispatched on the row's own `producer` field: a
-//! `validate.rs` row must carry `executed_tests > 0`, `executed_nodes > 0`,
-//! **and** a satisfied coverage record; a bash row must carry
-//! `executed_tests > 0`. That is one verifier per authority rather than one
-//! generic field test, and a Rust row cannot substitute its node count for test
-//! evidence.
+//! So the predicate is dispatched on the row's own `producer` field: a Rust
+//! validate row must carry `executed_tests > 0`, `executed_nodes > 0`,
+//! **and** a satisfied coverage record; the versioned Git-provenance producer
+//! must additionally carry its complete, landing-qualified frozen Git snapshot;
+//! a bash row must carry `executed_tests > 0`. That is one verifier per
+//! authority rather than one generic field test, and a Rust row cannot
+//! substitute its node count for test evidence.
 //!
 //! # Fail-open, never fail-hit
 //!
@@ -125,6 +126,85 @@ fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     }
 }
 
+fn rust_producer(producer: &str) -> bool {
+    matches!(
+        producer,
+        "validate.rs" | "hermit-validate-rs" | "hermit-validate-rs-git-provenance-v1"
+    )
+}
+
+const GIT_PROVENANCE_PRODUCER: &str = "hermit-validate-rs-git-provenance-v1";
+
+fn sha40(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The versioned writer promises a complete frozen Git snapshot. A cache hit
+/// skips the real validator, so it must enforce the same landing-qualified
+/// evidence as the canonical receipt consumer rather than trusting the slug.
+fn git_provenance_cache_ok(row: &serde_json::Value) -> bool {
+    if row.get("git_provenance_version").and_then(|v| v.as_u64()) != Some(1)
+        || !row
+            .get("git_depth")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v > 0)
+        || row.get("git_is_shallow").and_then(|v| v.as_bool()) != Some(false)
+        || s(row, "git_comparison_ref") != "origin/main"
+        || row.get("git_ahead").and_then(|v| v.as_u64()).is_none()
+        || row.get("git_behind").and_then(|v| v.as_u64()) != Some(0)
+    {
+        return false;
+    }
+    let comparison = s(row, "git_comparison_sha");
+    let base = s(row, "base_sha");
+    sha40(comparison) && comparison == base
+}
+
+fn legacy_rust_coverage_cache_ok(row: &serde_json::Value) -> bool {
+    match row.get("coverage") {
+        None => false,
+        Some(coverage) => {
+            let absent = coverage
+                .get("absent_nodes")
+                .and_then(|value| value.as_array())
+                .map(Vec::len);
+            let executed = coverage
+                .get("executed_test_nodes")
+                .and_then(|value| value.as_i64());
+            matches!(absent, Some(0)) && executed.is_some()
+        }
+    }
+}
+
+/// The capability-bearing writer always emits the complete canonical coverage
+/// object. Reusing its PASS requires that exact positive claim: a nonempty plan,
+/// every planned test node accounted as executed, and both explicit failure
+/// arrays present and empty. Legacy Rust slugs retain their historical reader.
+fn versioned_rust_coverage_cache_ok(row: &serde_json::Value) -> bool {
+    let Some(coverage) = row.get("coverage").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let Some(planned) = coverage.get("planned_test_nodes").and_then(|value| value.as_u64()) else {
+        return false;
+    };
+    let Some(executed) = coverage.get("executed_test_nodes").and_then(|value| value.as_u64()) else {
+        return false;
+    };
+    let explicit_empty = |field: &str| {
+        coverage
+            .get(field)
+            .and_then(|value| value.as_array())
+            .is_some_and(Vec::is_empty)
+    };
+    planned > 0
+        && executed == planned
+        && explicit_empty("zero_executed_nodes")
+        && explicit_empty("absent_nodes")
+}
+
 /// Does this PASS row carry everything a reuse needs?
 ///
 /// Dispatched on `producer`; an unrecognized producer is REFUSED rather than
@@ -138,23 +218,23 @@ fn pass_row_qualifies(row: &serde_json::Value) -> bool {
         return false;
     }
     match s(row, "producer") {
-        "validate.rs" => {
+        producer if rust_producer(producer) => {
             if i(row, "executed_tests").unwrap_or(0) <= 0 {
                 return false;
             }
             if i(row, "executed_nodes").unwrap_or(0) <= 0 {
                 return false;
             }
-            // Coverage is a first-class part of the claim: a run that PLANNED
-            // test nodes and did not execute some of them is not a full pass, so
-            // its result must not be reused as one.
-            match row.get("coverage") {
-                None => false,
-                Some(c) => {
-                    let absent = c.get("absent_nodes").and_then(|a| a.as_array()).map(|a| a.len());
-                    let executed = c.get("executed_test_nodes").and_then(|v| v.as_i64());
-                    matches!(absent, Some(0)) && executed.is_some()
-                }
+            if producer == GIT_PROVENANCE_PRODUCER && !git_provenance_cache_ok(row) {
+                return false;
+            }
+            // Coverage is a first-class part of the claim. The new capability
+            // slug is held to its complete canonical shape; historical Rust
+            // rows retain the evidence contract their writers actually made.
+            if producer == GIT_PROVENANCE_PRODUCER {
+                versioned_rust_coverage_cache_ok(row)
+            } else {
+                legacy_rust_coverage_cache_ok(row)
             }
         }
         // A validate.sh-era row has no typed node/coverage evidence, so its
@@ -206,7 +286,7 @@ pub fn cache_lookup(
     }
     let row = best?;
     let producer = s(row, "producer");
-    let (executed, unit) = if producer == "validate.rs" {
+    let (executed, unit) = if rust_producer(producer) {
         (i(row, "executed_nodes").unwrap_or(0), "node(s)")
     } else {
         (i(row, "executed_tests").unwrap_or(0), "test(s)")
@@ -373,17 +453,38 @@ pub fn self_test() -> Result<String, String> {
     // POSITIVE, both producers. A predicate that refuses everything would look
     // correct with negatives alone, so each authority gets a counted accept.
     let rs_pass = base(serde_json::json!({
-        "producer": "validate.rs", "executed_tests": 873, "executed_nodes": 47,
+        "producer": "hermit-validate-rs-git-provenance-v1", "executed_tests": 873, "executed_nodes": 47,
         "gates_expected": 47, "gates_run": 47,
-        "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+        "coverage": {
+            "planned_test_nodes": 20,
+            "executed_test_nodes": 20,
+            "zero_executed_nodes": [],
+            "absent_nodes": []
+        },
+        "git_provenance_version": 1, "git_depth": 1881, "git_is_shallow": false,
+        "git_comparison_ref": "origin/main",
+        "git_comparison_sha": "1111111111111111111111111111111111111111",
+        "git_ahead": 1, "git_behind": 0,
+        "base_sha": "1111111111111111111111111111111111111111",
     }));
     let sh_pass = base(serde_json::json!({
         "producer": "validate.sh", "executed_tests": 1234, "gates_expected": 12, "gates_run": 12,
     }));
     let mut accepted = 0usize;
-    for (why, row) in [("validate.rs row", &rs_pass), ("validate.sh row", &sh_pass)] {
+    for (why, row) in [("versioned Rust row", &rs_pass), ("validate.sh row", &sh_pass)] {
         if cache_lookup(std::slice::from_ref(row), "pass", &key).is_none() {
             return Err(format!("cache: a fully qualifying {why} must be a HIT"));
+        }
+        accepted += 1;
+    }
+    for producer in ["validate.rs", "hermit-validate-rs"] {
+        let legacy = base(serde_json::json!({
+            "producer": producer, "executed_tests": 873, "executed_nodes": 47,
+            "gates_expected": 47, "gates_run": 47,
+            "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+        }));
+        if cache_lookup(std::slice::from_ref(&legacy), "pass", &key).is_none() {
+            return Err(format!("cache: legacy Rust producer {producer} must remain readable"));
         }
         accepted += 1;
     }
@@ -422,11 +523,121 @@ pub fn self_test() -> Result<String, String> {
         refused += 1;
     }
 
+    // The current producer's complete extension is part of cache authority.
+    // Remove each field independently, then mutate the most dangerous
+    // legal-looking values: shallow checkout, a different base, and behind.
+    for field in [
+        "git_provenance_version",
+        "git_depth",
+        "git_is_shallow",
+        "git_comparison_ref",
+        "git_comparison_sha",
+        "git_ahead",
+        "git_behind",
+        "base_sha",
+    ] {
+        let mut row = rs_pass.clone();
+        row.as_object_mut().unwrap().remove(field);
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: versioned Rust row missing {field} must NOT be a hit"
+            ));
+        }
+        refused += 1;
+    }
+    for (why, field, value) in [
+        ("zero Git depth", "git_depth", serde_json::json!(0)),
+        (
+            "shallow Git checkout",
+            "git_is_shallow",
+            serde_json::json!(true),
+        ),
+        (
+            "wrong Git comparison ref",
+            "git_comparison_ref",
+            serde_json::json!("refs/remotes/origin/main"),
+        ),
+        (
+            "malformed Git comparison SHA",
+            "git_comparison_sha",
+            serde_json::json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        ),
+        (
+            "Git comparison/base mismatch",
+            "git_comparison_sha",
+            serde_json::json!("2222222222222222222222222222222222222222"),
+        ),
+        ("negative Git ahead", "git_ahead", serde_json::json!(-1)),
+        ("nonzero Git behind", "git_behind", serde_json::json!(1)),
+    ] {
+        let mut row = rs_pass.clone();
+        row.as_object_mut().unwrap().insert(field.into(), value);
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: versioned Rust row with {why} must NOT be a hit"
+            ));
+        }
+        refused += 1;
+    }
+
+    for field in [
+        "planned_test_nodes",
+        "executed_test_nodes",
+        "zero_executed_nodes",
+        "absent_nodes",
+    ] {
+        let mut row = rs_pass.clone();
+        row.get_mut("coverage")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove(field);
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: versioned Rust coverage missing {field} must NOT be a hit"
+            ));
+        }
+        refused += 1;
+    }
+    for (why, field, value) in [
+        (
+            "zero planned test nodes",
+            "planned_test_nodes",
+            serde_json::json!(0),
+        ),
+        (
+            "executed/planned mismatch",
+            "executed_test_nodes",
+            serde_json::json!(19),
+        ),
+        (
+            "nonempty zero-executed failures",
+            "zero_executed_nodes",
+            serde_json::json!(["test.zero"]),
+        ),
+        (
+            "nonempty absent failures",
+            "absent_nodes",
+            serde_json::json!(["test.absent"]),
+        ),
+    ] {
+        let mut row = rs_pass.clone();
+        row.get_mut("coverage")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(field.into(), value);
+        if cache_lookup(std::slice::from_ref(&row), "pass", &key).is_some() {
+            return Err(format!(
+                "cache: versioned Rust coverage with {why} must NOT be a hit"
+            ));
+        }
+        refused += 1;
+    }
+
     // The reused count must never be relabelled: a node count must print as
     // node(s) and a test count as test(s).
     let hit = cache_lookup(std::slice::from_ref(&rs_pass), "pass", &key).unwrap();
     if hit.executed_unit != "node(s)" || hit.executed != 47 {
-        return Err("cache: a validate.rs hit must report 47 node(s), not tests".into());
+        return Err("cache: a Rust validate hit must report 47 node(s), not tests".into());
     }
     let hit = cache_lookup(std::slice::from_ref(&sh_pass), "pass", &key).unwrap();
     if hit.executed_unit != "test(s)" || hit.executed != 1234 {

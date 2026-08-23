@@ -113,7 +113,9 @@ const COVERAGE_LEDGER_SCHEMA_VERSION: i64 = 5;
 
 /// Recorded in each row so a version-aware reader can tell which driver produced
 /// it without inference.
-const LEDGER_PRODUCER: &str = "hermit-validate-rs";
+const LEDGER_PRODUCER: &str = "hermit-validate-rs-git-provenance-v1";
+const GIT_PROVENANCE_VERSION: u64 = 1;
+const GIT_COMPARISON_REF: &str = "origin/main";
 
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
@@ -1028,19 +1030,7 @@ fn self_test() -> Result<(), String> {
     {
         return Err("prebuilt strict-compat path stopped being a lightweight existence check".into());
     }
-    if parse_git_depth(" 42\n")? != 42 {
-        return Err("git-depth parser changed the measured value".into());
-    }
-    for bad in ["", "0", "-1", "not-a-depth", "1 2"] {
-        if parse_git_depth(bad).is_ok() {
-            return Err(format!("git-depth parser accepted invalid measurement {bad:?}"));
-        }
-    }
-    let head = git_sha();
-    let depth = measure_git_depth(&head)?;
-    if depth == 0 {
-        return Err("git-depth measurement accepted an impossible zero".into());
-    }
+    git_provenance_self_test()?;
     // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
     // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
     // missing, future, and contradictory sources are refused.
@@ -2559,6 +2549,54 @@ fn git_sha() -> String {
     sh("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitProvenance {
+    commit: String,
+    tree: String,
+    depth: u64,
+    is_shallow: bool,
+    comparison_ref: String,
+    comparison_sha: String,
+    behind: u64,
+    ahead: u64,
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot execute git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "git {} failed with {}{}",
+            args.join(" "),
+            output.status,
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git {} returned non-UTF-8 output: {error}", args.join(" ")))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("git {} returned an empty value", args.join(" ")));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_sha40(label: &str, raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.len() != 40
+        || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{label} is not a lowercase 40-hex commit SHA: {raw:?}"));
+    }
+    Ok(value.to_string())
+}
+
 fn parse_git_depth(raw: &str) -> Result<u64, String> {
     let depth = raw
         .trim()
@@ -2570,30 +2608,231 @@ fn parse_git_depth(raw: &str) -> Result<u64, String> {
     Ok(depth)
 }
 
-/// Measure the exact quantity carried by the historical `git_depth` field.
-/// Failure is a refusal, never a fabricated zero or an omitted JSON key.
-fn measure_git_depth(commit: &str) -> Result<u64, String> {
-    let output = Command::new("git")
-        .args(["rev-list", "--count", commit])
-        .output()
-        .map_err(|error| format!("cannot execute git rev-list --count {commit}: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!(
-            "git rev-list --count {commit} failed with {}{}",
-            output.status,
-            if detail.is_empty() { String::new() } else { format!(": {detail}") }
-        ));
+fn parse_git_counts(raw: &str) -> Result<(u64, u64), String> {
+    let mut fields = raw.split_whitespace();
+    let behind = fields
+        .next()
+        .ok_or_else(|| format!("git rev-list returned no behind count: {raw:?}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("git rev-list returned an invalid behind count {raw:?}: {error}"))?;
+    let ahead = fields
+        .next()
+        .ok_or_else(|| format!("git rev-list returned no ahead count: {raw:?}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("git rev-list returned an invalid ahead count {raw:?}: {error}"))?;
+    if fields.next().is_some() {
+        return Err(format!("git rev-list returned extra count fields: {raw:?}"));
     }
-    parse_git_depth(&String::from_utf8_lossy(&output.stdout))
+    Ok((behind, ahead))
 }
 
-/// Content-addressed identity of exactly what validate builds and tests: the root
-/// tree object. It hashes tracked file content AND submodule gitlink SHAs, but not
-/// commit metadata — so a rebase or amend that leaves content byte-identical
-/// yields the SAME tree. This, not the commit SHA, is the result-cache key.
-fn git_tree() -> String {
-    sh("git", &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|| "unknown".into())
+/// Capture every Git fact used by freshness and the receipt in one fail-closed
+/// probe. The comparison ref is resolved once, then counts are computed against
+/// that immutable SHA so a moving `origin/main` cannot change their meaning.
+fn probe_git_provenance(root: &Path, comparison_ref: &str) -> Result<GitProvenance, String> {
+    let commit = parse_sha40(
+        "HEAD",
+        &git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])?
+    )?;
+    let tree = parse_sha40(
+        "HEAD tree",
+        &git_output(
+            root,
+            &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+        )?
+    )?;
+    let depth = parse_git_depth(&git_output(root, &["rev-list", "--count", &commit])?)?;
+    let is_shallow = match git_output(root, &["rev-parse", "--is-shallow-repository"])?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("git returned an invalid shallow-state value {other:?}")),
+    };
+    let comparison_expr = format!("{comparison_ref}^{{commit}}");
+    let comparison_sha = parse_sha40(
+        comparison_ref,
+        &git_output(root, &["rev-parse", "--verify", &comparison_expr])?
+    )?;
+    let range = format!("{comparison_sha}...{commit}");
+    let (behind, ahead) = parse_git_counts(&git_output(
+        root,
+        &["rev-list", "--left-right", "--count", &range],
+    )?)?;
+    Ok(GitProvenance {
+        commit,
+        tree,
+        depth,
+        is_shallow,
+        comparison_ref: comparison_ref.to_string(),
+        comparison_sha,
+        behind,
+        ahead,
+    })
+}
+
+/// Single call seam for normal and stop paths. The mutation test replaces this
+/// exact expression in a temporary source copy to prove a plausible-zero
+/// fallback would be caught by real receipt execution.
+fn required_git_provenance(root: &Path) -> Result<GitProvenance, String> {
+    probe_git_provenance(root, GIT_COMPARISON_REF)
+}
+
+/// Re-read only HEAD and its tree immediately before receipt minting. The
+/// comparison ref deliberately is not touched: its frozen SHA and counts remain
+/// the meaning of this run. A clean checkout can move while gates are running,
+/// so cleanliness alone is not enough to bind their result to the recorded
+/// commit.
+fn frozen_snapshot_still_current(
+    root: &Path,
+    provenance: &GitProvenance,
+) -> Result<(), String> {
+    let current_commit = parse_sha40(
+        "current HEAD",
+        &git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])?
+    )?;
+    let current_tree = parse_sha40(
+        "current HEAD tree",
+        &git_output(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{current_commit}^{{tree}}"),
+            ],
+        )?
+    )?;
+    if current_commit != provenance.commit || current_tree != provenance.tree {
+        return Err(format!(
+            "frozen Git snapshot moved before receipt minting: recorded commit/tree {}/{}; current HEAD/tree {current_commit}/{current_tree}",
+            provenance.commit, provenance.tree
+        ));
+    }
+    Ok(())
+}
+
+fn git_provenance_self_test() -> Result<(), String> {
+    if parse_git_depth(" 42\n")? != 42 {
+        return Err("git-depth parser changed the measured value".into());
+    }
+    for bad in ["", "0", "-1", "not-a-depth", "1 2"] {
+        if parse_git_depth(bad).is_ok() {
+            return Err(format!("git-depth parser accepted invalid measurement {bad:?}"));
+        }
+    }
+    if parse_git_counts("2 3")? != (2, 3) {
+        return Err("git ahead/behind parser changed the measured values".into());
+    }
+    for bad in ["", "0", "-1 0", "0 -1", "0 0 0", "not-counts"] {
+        if parse_git_counts(bad).is_ok() {
+            return Err(format!("git count parser accepted invalid measurement {bad:?}"));
+        }
+    }
+
+    let fixture = std::env::temp_dir().join(format!(
+        "hermit-git-provenance-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    let result = (|| -> Result<(), String> {
+        let source = fixture.join("source");
+        let origin = fixture.join("origin.git");
+        let full = fixture.join("full");
+        let shallow = fixture.join("depth1");
+        std::fs::create_dir_all(&fixture)
+            .map_err(|error| format!("cannot create git-provenance fixture: {error}"))?;
+        let run = |cwd: &Path, args: &[&str]| -> Result<(), String> {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .map_err(|error| format!("cannot execute fixture git {}: {error}", args.join(" ")))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "fixture git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        };
+        std::fs::create_dir_all(&source)
+            .map_err(|error| format!("cannot create fixture source: {error}"))?;
+        run(&source, &["init", "-q", "-b", "main"])?;
+        run(&source, &["config", "user.name", "validate self-test"])?;
+        run(&source, &["config", "user.email", "validate@example.invalid"])?;
+        for n in 1..=3 {
+            std::fs::write(source.join("payload"), format!("commit {n}\n"))
+                .map_err(|error| format!("cannot write fixture payload: {error}"))?;
+            run(&source, &["add", "payload"])?;
+            run(&source, &["commit", "-qm", &format!("fixture {n}")])?;
+        }
+        let clone = |args: &[&str]| -> Result<(), String> {
+            let output = Command::new("git")
+                .args(args)
+                .output()
+                .map_err(|error| format!("cannot execute fixture git clone: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "fixture git clone failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        };
+        clone(&["clone", "-q", "--bare", &source.to_string_lossy(), &origin.to_string_lossy()])?;
+        clone(&["clone", "-q", &origin.to_string_lossy(), &full.to_string_lossy()])?;
+        let origin_url = format!("file://{}", origin.display());
+        clone(&[
+            "clone",
+            "-q",
+            "--depth=1",
+            &origin_url,
+            &shallow.to_string_lossy(),
+        ])?;
+
+        let full_probe = probe_git_provenance(&full, GIT_COMPARISON_REF)?;
+        let shallow_probe = probe_git_provenance(&shallow, GIT_COMPARISON_REF)?;
+        if full_probe.commit != shallow_probe.commit
+            || full_probe.comparison_sha != shallow_probe.comparison_sha
+            || full_probe.depth != 3
+            || shallow_probe.depth != 1
+            || full_probe.is_shallow
+            || !shallow_probe.is_shallow
+            || (full_probe.behind, full_probe.ahead) != (0, 0)
+            || (shallow_probe.behind, shallow_probe.ahead) != (0, 0)
+        {
+            return Err(format!(
+                "full/depth-1 provenance semantics diverged: full={full_probe:?}, shallow={shallow_probe:?}"
+            ));
+        }
+
+        // A clean HEAD move is not visible to `git status`. Use an empty commit
+        // so the tree stays byte-identical while the commit changes, then prove
+        // the final receipt binding refuses it and accepts the restored frozen
+        // snapshot. This is the race the pre-mint check exists to close.
+        run(&full, &["config", "user.name", "validate self-test"])?;
+        run(&full, &["config", "user.email", "validate@example.invalid"])?;
+        run(&full, &["commit", "--allow-empty", "-qm", "clean HEAD move"])?;
+        if frozen_snapshot_still_current(&full, &full_probe).is_ok() {
+            return Err(
+                "receipt snapshot binding accepted a clean commit move with an unchanged tree"
+                    .into(),
+            );
+        }
+        run(&full, &["checkout", "-q", "--detach", &full_probe.commit])?;
+        frozen_snapshot_still_current(&full, &full_probe).map_err(|error| {
+            format!("receipt snapshot binding refused the restored frozen snapshot: {error}")
+        })?;
+        run(&shallow, &["update-ref", "-d", "refs/remotes/origin/main"])?;
+        if probe_git_provenance(&shallow, GIT_COMPARISON_REF).is_ok() {
+            return Err("git provenance probe accepted a missing comparison ref".into());
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&fixture);
+    result
 }
 
 fn repo_root() -> PathBuf {
@@ -2808,31 +3047,33 @@ fn cache_state(root: &Path) -> &'static str {
 /// stops describing anything landable. Validating a stale base spends the
 /// box-exclusive validate slot producing evidence that is already invalid.
 ///
-/// Only ERRORS when the local `origin/main` ref genuinely contains commits this
-/// head lacks. It does NOT fetch (that would make an offline run fail for a
-/// network reason) and it does not fire when the ref is absent — an unknown base
-/// is reported as unknown, never silently treated as fresh.
-fn rebase_freshness(force: bool) -> Result<String, String> {
-    if sh("git", &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]).is_none() {
-        return Ok("base: origin/main not present locally; freshness UNKNOWN (not asserted)".into());
-    }
-    let counts = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0\t0".into());
-    let mut it = counts.split_whitespace();
-    let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+/// The Git probe is strict and already resolved the configured comparison ref
+/// to an immutable SHA. A missing ref or malformed count refuses before this
+/// function; freshness can never silently degrade to plausible zeroes.
+fn rebase_freshness(force: bool, provenance: &GitProvenance) -> Result<String, String> {
+    let behind = provenance.behind;
+    let ahead = provenance.ahead;
     if behind == 0 {
-        return Ok(format!("base: up to date with origin/main (ahead {ahead}, behind 0)"));
+        return Ok(format!(
+            "base: up to date with {} at {} (ahead {ahead}, behind 0)",
+            provenance.comparison_ref, provenance.comparison_sha
+        ));
     }
     let msg = format!(
-        "HEAD is {behind} commit(s) BEHIND origin/main (ahead {ahead}).\n  \
+        "HEAD is {behind} commit(s) BEHIND {} at {} (ahead {ahead}).\n  \
          A receipt minted here is keyed to a SHA that main has already moved past, so it cannot \
          authorize a landing and will have to be rebuilt after the rebase it is missing.\n  \
-         Rebase first:  git rebase origin/main\n  \
-         To validate a deliberately stale base anyway, pass --run-on-dirty-tree."
+         Rebase first:  git rebase {}\n  \
+         To validate a deliberately stale base anyway, pass --run-on-dirty-tree.",
+        provenance.comparison_ref,
+        provenance.comparison_sha,
+        provenance.comparison_ref,
     );
     if force {
-        Ok(format!("base: STALE, {behind} behind origin/main — forced past the freshness gate"))
+        Ok(format!(
+            "base: STALE, {behind} behind {} at {} — forced past the freshness gate",
+            provenance.comparison_ref, provenance.comparison_sha
+        ))
     } else {
         Err(msg)
     }
@@ -5240,8 +5481,11 @@ struct LedgerCtx {
     commit: String,
     tree: String,
     git_depth: u64,
-    git_ahead: i64,
-    git_behind: i64,
+    git_is_shallow: bool,
+    git_comparison_ref: String,
+    git_comparison_sha: String,
+    git_ahead: u64,
+    git_behind: u64,
     commit_anchored: bool,
     tree_dirty: bool,
     dag_jobs: i64,
@@ -5756,7 +6000,11 @@ fn write_ledger(
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
         "tree": ctx.tree,
+        "git_provenance_version": GIT_PROVENANCE_VERSION,
         "git_depth": ctx.git_depth,
+        "git_is_shallow": ctx.git_is_shallow,
+        "git_comparison_ref": ctx.git_comparison_ref,
+        "git_comparison_sha": ctx.git_comparison_sha,
         "git_ahead": ctx.git_ahead,
         "git_behind": ctx.git_behind,
         "commit_anchored": ctx.commit_anchored,
@@ -5894,6 +6142,49 @@ fn write_ledger(
         },
         Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
     }
+}
+
+/// Final receipt boundary shared by completed, interrupted, and stop-test rows.
+///
+/// The expensive run used `provenance` as its identity. Recheck only HEAD and
+/// the tree derived from that HEAD immediately before serialization; never
+/// re-resolve the moving comparison ref. Any error or mismatch makes the row
+/// unanchored, so neither the canonical qualifier nor label publication can
+/// attest the frozen commit after the checkout moved cleanly underneath us.
+#[allow(clippy::too_many_arguments)]
+fn write_snapshot_bound_ledger(
+    root: &Path,
+    provenance: &GitProvenance,
+    ledger: &Path,
+    ctx: &mut LedgerCtx,
+    outcomes: &[StepOutcome],
+    skipped: &[String],
+    wall_s: f64,
+    exit_code: u8,
+    log_file: &str,
+    suite_complete: bool,
+    coverage: serde_json::Value,
+) {
+    let dirty_at_mint = tree_dirty();
+    ctx.tree_dirty = dirty_at_mint;
+    if dirty_at_mint {
+        ctx.commit_anchored = false;
+    }
+    if let Err(error) = frozen_snapshot_still_current(root, provenance) {
+        eprintln!("validate: ERROR: {error}; writing an unanchored non-qualifying row");
+        ctx.commit_anchored = false;
+    }
+    write_ledger(
+        ledger,
+        ctx,
+        outcomes,
+        skipped,
+        wall_s,
+        exit_code,
+        log_file,
+        suite_complete,
+        coverage,
+    );
 }
 
 /// SHORT hostname, never an FQDN.
@@ -6396,22 +6687,6 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
-    // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
-    // payload inherits the outer run's verdict on the very same checkout; it also
-    // must not spend a network round trip inside a budgeted DAG node.
-    match rebase_freshness(args.run_on_dirty_tree || nesting.nested) {
-        Ok(msg) => eprintln!("validate: {msg}"),
-        Err(msg) => {
-            eprintln!("validate: refusing to validate a stale base.\n  {msg}");
-            return RunSummary::refused(
-                2,
-                &level_name,
-                "the rebase-freshness gate",
-                msg.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
-            );
-        }
-    }
-
     // Run state lives under target/, never under HERMIT_DIR (a user setting).
     let tmp = root.join("target/validation").join(format!("run-{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&tmp) {
@@ -6583,6 +6858,44 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
 
+    // One fail-closed snapshot supplies every Git fact used below. It is taken
+    // after the plan-only exit but before cache lookup, boxing, logging, or any
+    // product gate. No later code re-resolves the moving comparison ref.
+    let git_provenance = match required_git_provenance(&root) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            return RunSummary::refused(
+                2,
+                &plan.profile,
+                "the Git provenance probe",
+                vec![
+                    error,
+                    "receipt Git provenance is required; refusing instead of omitting fields or inventing zero counts"
+                        .into(),
+                ],
+            )
+        }
+    };
+
+    // Rebase freshness consumes the same frozen comparison SHA that the receipt
+    // will record. A nested payload inherits the force decision but not a second
+    // measurement with potentially different meaning.
+    match rebase_freshness(args.run_on_dirty_tree || nesting.nested, &git_provenance) {
+        Ok(msg) => eprintln!("validate: {msg}"),
+        Err(msg) => {
+            eprintln!("validate: refusing to validate a stale base.\n  {msg}");
+            return RunSummary::refused(
+                2,
+                &level_name,
+                "the rebase-freshness gate",
+                msg.lines()
+                    .map(|line| line.trim().to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect(),
+            );
+        }
+    }
+
     // ---- tree-keyed result cache (validate.sh:620/655) -------------------
     //
     // Runs BEFORE boxing and before the durable log, so a hit leaves no partial
@@ -6594,7 +6907,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // part of the key.
     let ledger = ledger_path(&root);
     let ledger_rows = validate_history::read_rows(&ledger);
-    let tree = git_tree();
+    let tree = git_provenance.tree.clone();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
     let cache = cache_state(&root);
@@ -6616,7 +6929,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
             println!("# ============================================================");
             println!("# validate CACHE HIT for tree {tree}");
-            println!("#   (commit {})", git_sha());
+            println!("#   (commit {})", git_provenance.commit);
             println!(
                 "#   passed {} (wall {}, CPU {}, {} {} executed)",
                 hit.finished_at,
@@ -6704,22 +7017,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             }
         };
 
-    let commit = git_sha();
-    let git_depth = match measure_git_depth(&commit) {
-        Ok(depth) => depth,
-        Err(error) => {
-            return RunSummary::refused(
-                2,
-                &plan.profile,
-                "git depth measurement",
-                vec![
-                    error,
-                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
-                        .into(),
-                ],
-            )
-        }
-    };
+    let commit = git_provenance.commit.clone();
     match setup_durable_log(&root, &plan.profile, &commit) {
         Ok(d) => *durable_slot = Some(d),
         Err(code) => {
@@ -6930,17 +7228,12 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         &outcomes,
     );
 
-    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0 0".into());
-    let mut ba = behind_ahead.split_whitespace();
-    let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let dirty_now = tree_dirty();
-    let commit_anchored = commit != "unknown" && !dirty_now;
+    let commit_anchored = !dirty_now;
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
-    let ctx = LedgerCtx {
+    let mut ctx = LedgerCtx {
         started_at,
         host: host.clone(),
         toolchain: toolchain.clone(),
@@ -6950,10 +7243,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         selection_mode: plan.selection_mode.into(),
         cache_state: cache.into(),
         commit: commit.clone(),
-        tree: git_tree(),
-        git_depth,
-        git_ahead,
-        git_behind,
+        tree: git_provenance.tree.clone(),
+        git_depth: git_provenance.depth,
+        git_is_shallow: git_provenance.is_shallow,
+        git_comparison_ref: git_provenance.comparison_ref.clone(),
+        git_comparison_sha: git_provenance.comparison_sha.clone(),
+        git_ahead: git_provenance.ahead,
+        git_behind: git_provenance.behind,
         commit_anchored,
         tree_dirty: dirty_now,
         dag_jobs: jobs,
@@ -6993,9 +7289,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // through to the normal verdict below.
     if let Some(sig) = &interruption {
         if !nesting.nested {
-            write_ledger(
+            write_snapshot_bound_ledger(
+                &root,
+                &git_provenance,
                 &ledger,
-                &ctx,
+                &mut ctx,
                 &outcomes,
                 &skipped,
                 wall,
@@ -7185,9 +7483,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
     if !nesting.nested {
-        write_ledger(
+        write_snapshot_bound_ledger(
+            &root,
+            &git_provenance,
             &ledger,
-            &ctx,
+            &mut ctx,
             &outcomes,
             &skipped,
             wall,
@@ -7207,8 +7507,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         exit_code,
         effective_failures,
         args.label_pr && !nesting.nested,
-        commit_anchored,
-        dirty_now,
+        ctx.commit_anchored,
+        ctx.tree_dirty,
         &plan.profile,
     ) {
         Ok(()) => {
@@ -7362,22 +7662,22 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let outcomes =
         vec![synth("stop-test completed gate 1", !prior_failure), synth("stop-test completed gate 2", true)];
 
-    let commit = git_sha();
-    let git_depth = match measure_git_depth(&commit) {
-        Ok(depth) => depth,
+    let git_provenance = match required_git_provenance(root) {
+        Ok(provenance) => provenance,
         Err(error) => {
             return RunSummary::refused(
                 2,
                 profile,
-                "git depth measurement",
+                "the Git provenance probe",
                 vec![
                     error,
-                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
+                    "receipt Git provenance is required; refusing instead of omitting fields or inventing zero counts"
                         .into(),
                 ],
             )
         }
     };
+    let commit = git_provenance.commit.clone();
 
     validate_runtime::stop_test_announce();
     let exit = validate_runtime::stop_test_park(interrupted_by);
@@ -7398,7 +7698,7 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     let ledger = ledger_path(root);
     let host = short_hostname();
     let lock_admitted = canonical_validate_lock_admission(parent, &commit, &host);
-    let ctx = LedgerCtx {
+    let mut ctx = LedgerCtx {
         started_at,
         host,
         toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
@@ -7408,10 +7708,13 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
         selection_mode: "full".into(),
         cache_state: cache_state(root).into(),
         commit,
-        tree: git_tree(),
-        git_depth,
-        git_ahead: 0,
-        git_behind: 0,
+        tree: git_provenance.tree.clone(),
+        git_depth: git_provenance.depth,
+        git_is_shallow: git_provenance.is_shallow,
+        git_comparison_ref: git_provenance.comparison_ref.clone(),
+        git_comparison_sha: git_provenance.comparison_sha.clone(),
+        git_ahead: git_provenance.ahead,
+        git_behind: git_provenance.behind,
         commit_anchored: false,
         tree_dirty: tree_dirty(),
         dag_jobs: 0,
@@ -7436,7 +7739,19 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    write_snapshot_bound_ledger(
+        root,
+        &git_provenance,
+        &ledger,
+        &mut ctx,
+        &outcomes,
+        &[],
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(

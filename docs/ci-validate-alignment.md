@@ -100,6 +100,24 @@ checks unique node IDs, dependency references, Rust harness commands, and the
 typed manifest bucket selectors in both DAGs. It also compares the required cells with
 `ci/expected-e2e-plan.json`, so the blocking denominator cannot silently shrink.
 
+## Receipt Git provenance
+
+The Rust validator probes Git once before product execution and records the
+checkout-visible commit depth, whether the repository is shallow, the configured
+comparison ref (`origin/main`), and the exact commit SHA to which that ref resolved.
+Its ahead/behind counts are computed against that frozen comparison SHA, not by
+re-reading a moving remote-tracking ref after the run. Every field is required for
+the versioned `hermit-validate-rs-git-provenance-v1` producer; an absent ref, a
+failed command, malformed output, or a zero depth refuses validation instead of
+emitting an omitted field or a legal-looking zero. Landing qualification additionally
+requires a non-shallow checkout, while shallow receipts retain their truthful depth
+and shallow flag for diagnostics. Immediately before every normal or stop-path
+ledger append, the writer rechecks that current `HEAD` and the tree derived from it
+still match the frozen snapshot; a clean branch move therefore produces an
+unanchored, non-qualifying row. Tree-cache reuse for this producer also requires the
+canonical complete coverage object: a positive plan, an equal executed-node count,
+and explicit empty zero-executed and absent-node lists.
+
 ## Reconciliation checklist
 
 When adding or changing an E2E test:
