@@ -14,5 +14,5 @@ if (($# != 2)); then
 fi
 
 root_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-exec python3 "$root_dir/agent-utils/py/ci_hub_check_outcome.py" \
+exec python3 "$root_dir/scripts/check_outcome_adapter.py" \
     --status "$1" --conclusion "$2"
