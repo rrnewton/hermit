@@ -30,15 +30,13 @@ pub fn git_short_sha_in(root: &Path) -> String {
     if dirty { format!("{sha}-dirty") } else { sha }
 }
 
-/// Git metadata and tracked source files that can change the embedded revision
-/// or dirty state. Resolve these through Git so this also works from a nested
-/// crate and a worktree.
+/// Git metadata that can change the embedded revision or dirty state. Resolve
+/// these through Git so this also works from a nested crate and a worktree.
 pub fn git_watch_paths() -> Vec<PathBuf> {
     git_watch_paths_in(Path::new("."))
 }
 
 pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
-    let repository = git(root, &["rev-parse", "--show-toplevel"]).map(PathBuf::from);
     let mut names = vec![
         "HEAD".to_owned(),
         "index".to_owned(),
@@ -55,18 +53,12 @@ pub fn git_watch_paths_in(root: &Path) -> Vec<PathBuf> {
                 &["rev-parse", "--path-format=absolute", "--git-path", &name],
             )
             .map(PathBuf::from)
+            // Cargo treats a missing `rerun-if-changed` path as perpetually
+            // dirty. Fresh repositories commonly have no `packed-refs`, so
+            // only emit metadata paths that currently exist.
+            .filter(|path| path.exists())
         })
         .collect();
-    if let Some(repository) = repository
-        && let Some(tracked) = git(&repository, &["ls-files", "--full-name"])
-    {
-        paths.extend(
-            tracked
-                .lines()
-                .filter(|path| !path.is_empty())
-                .map(|path| repository.join(path)),
-        );
-    }
     paths.sort();
     paths.dedup();
     paths
@@ -109,6 +101,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .ok()?;
