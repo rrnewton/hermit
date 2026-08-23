@@ -582,14 +582,25 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         | Sysno::readlinkat
         // ===== BATCH 51: fail-closed utility syscalls with no deterministic effect =====
-        // These three previously fail-closed --strict (aborting real programs such
-        // as chrt, ionice, and flock) even though none can change guest-visible
-        // computation under Hermit. Detcore replaces the Linux scheduler, presents a
-        // single virtual CPU, and serializes guest threads, so a thread's I/O
-        // priority (ioprio_get/ioprio_set) and its Linux scheduling attributes (sched_getattr)
-        // are inert, and an advisory whole-file lock (flock) is never contended
-        // within the serialized container. They are determinized to fixed,
-        // host-independent results; see the handlers in lib.rs.
+        // These previously fail-closed --strict (aborting real programs such as
+        // chrt, ionice, and flock) even though a thread's I/O priority
+        // (ioprio_get/ioprio_set) and its Linux scheduling attributes
+        // (sched_getattr) cannot change guest-visible computation under Hermit:
+        // Detcore replaces the Linux scheduler, presents a single virtual CPU,
+        // and serializes guest threads, so those two are genuinely inert and are
+        // determinized to fixed, host-independent results.
+        //
+        // flock is NOT inert and is no longer treated as such. This comment used
+        // to claim "an advisory whole-file lock is never contended within the
+        // serialized container", and that is false: serializing guest threads
+        // stops them EXECUTING simultaneously, it does not stop their lock HOLD
+        // INTERVALS from overlapping. A holder that is descheduled -- because it
+        // blocked, forked, or used up its timeslice -- keeps holding while
+        // another process runs and observes the lock. Under the old no-op,
+        // measured on both ptrace and DBI, two processes held the same LOCK_EX
+        // at once where native returned EWOULDBLOCK. flock is now forwarded to
+        // the kernel (see handle_flock), exactly as fcntl already forwards POSIX
+        // record locks.
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#791)
         | Sysno::flock
