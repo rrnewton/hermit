@@ -891,7 +891,6 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
             "liteinst",
             "--strict",
             "--base-env=minimal",
-            "--no-namespace",
             "--",
             "/bin/sh",
             "-c",
@@ -923,7 +922,11 @@ fn liteinst_abnormal_exit_after_registration_does_not_hang() {
     stderr
         .read_to_string(&mut diagnostics)
         .expect("read LiteInst diagnostics");
-    assert_eq!(status.signal(), Some(libc::SIGKILL), "{output:?}");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "{output:?}\nstderr={diagnostics}"
+    );
     assert_eq!(output.status, status);
     assert!(
         diagnostics.contains("[scheduler] guest in queue"),
