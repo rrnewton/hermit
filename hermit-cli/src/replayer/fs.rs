@@ -13,6 +13,7 @@ use std::os::fd::RawFd;
 use std::os::unix::fs::FileExt;
 
 use reverie::Errno;
+use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
@@ -476,35 +477,84 @@ fn vectored_offset(low: u64, high: u64) -> i64 {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#662): Audit temporary blocking and restoration for replay side effects.
+fn replay_side_effect_tool_error(
+    fd: libc::c_int,
+    operation: &str,
+    outcome: impl std::fmt::Display,
+) -> Error {
+    Error::Tool(anyhow::anyhow!(
+        "failed to {operation} for replay fd {fd}: {outcome}"
+    ))
+}
+
+fn require_replay_fcntl_success(
+    fd: libc::c_int,
+    operation: &str,
+    result: Result<i64, Errno>,
+) -> Result<(), Error> {
+    match result {
+        Ok(0) => Ok(()),
+        Ok(value) => Err(replay_side_effect_tool_error(
+            fd,
+            operation,
+            format!("F_SETFL returned {value}"),
+        )),
+        Err(error) => Err(replay_side_effect_tool_error(fd, operation, error)),
+    }
+}
+
+fn require_replay_fcntl_value(
+    fd: libc::c_int,
+    operation: &str,
+    result: Result<i64, Errno>,
+) -> Result<i64, Error> {
+    result.map_err(|error| replay_side_effect_tool_error(fd, operation, error))
+}
+
+fn finish_kernel_side_effect(
+    fd: libc::c_int,
+    result: Result<i64, Errno>,
+    restored: Result<i64, Errno>,
+) -> Result<Result<i64, Errno>, Error> {
+    require_replay_fcntl_success(fd, "restore descriptor flags", restored)?;
+    // Keep the injected syscall result nested so callers can still compare it
+    // exactly with the recording after the descriptor was restored.
+    Ok(result)
+}
+
 async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     guest: &mut G,
     fd: libc::c_int,
     syscall: Syscall,
-) -> Result<i64, Errno> {
+) -> Result<Result<i64, Errno>, Error> {
     let result = guest.inject(syscall).await;
     if result != Err(Errno::EAGAIN) {
-        return result;
+        return Ok(result);
     }
 
-    let flags = guest
-        .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFL))
-        .await? as libc::c_int;
+    let flags = require_replay_fcntl_value(
+        fd,
+        "read descriptor flags",
+        guest
+            .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_GETFL))
+            .await,
+    )? as libc::c_int;
     if flags & libc::O_NONBLOCK == 0 {
-        return result;
+        return Ok(result);
     }
-    guest
+    let cleared = guest
         .inject(
             Fcntl::new()
                 .with_fd(fd)
                 .with_cmd(FcntlCmd::F_SETFL(flags & !libc::O_NONBLOCK)),
         )
-        .await?;
+        .await;
+    require_replay_fcntl_success(fd, "temporarily clear O_NONBLOCK", cleared)?;
     let result = guest.inject(syscall).await;
     let restored = guest
         .inject(Fcntl::new().with_fd(fd).with_cmd(FcntlCmd::F_SETFL(flags)))
         .await;
-    assert_eq!(restored, Ok(0), "failed to restore replay fd flags");
-    result
+    finish_kernel_side_effect(fd, result, restored)
 }
 
 impl Replayer {
@@ -571,7 +621,7 @@ impl Replayer {
         iov_addr: Option<usize>,
         iovcnt: usize,
         syscall: Syscall,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let event = next_event!(guest, ReadvV2)?;
         let (fd, advances_offset) = match syscall {
             Syscall::Readv(call) => (call.fd(), true),
@@ -583,7 +633,7 @@ impl Replayer {
         };
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, fd, syscall).await;
+                let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
@@ -607,11 +657,11 @@ impl Replayer {
         &self,
         guest: &mut G,
         syscall: Read,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await;
+                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
                 assert_eq!(
                     actual,
                     Ok(event.bytes.len() as i64),
@@ -762,12 +812,12 @@ impl Replayer {
         &self,
         guest: &mut G,
         syscall: WriteFamily,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let event = next_event!(guest, WriteV2)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
                 let actual =
-                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await;
+                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await?;
                 assert_eq!(
                     actual, event.result,
                     "replayed eventfd write side effect diverged"
@@ -800,7 +850,7 @@ impl Replayer {
             )
             .await?;
         }
-        event.result
+        event.result.map_err(Error::from)
     }
 
     // TODO-HUMAN-REVIEW(#557): Audit captured-output ftruncate replay.
@@ -1055,6 +1105,49 @@ mod tests {
     use tokio::io::unix::AsyncFd;
 
     use super::*;
+
+    #[test]
+    fn successful_kernel_side_effect_restore_preserves_the_injected_result() {
+        assert_eq!(finish_kernel_side_effect(4, Ok(7), Ok(0)).unwrap(), Ok(7));
+        assert_eq!(
+            finish_kernel_side_effect(4, Err(Errno::EAGAIN), Ok(0)).unwrap(),
+            Err(Errno::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn kernel_side_effect_restore_failure_is_not_a_guest_errno() {
+        for restored in [Err(Errno::EBADF), Ok(1)] {
+            let failure = finish_kernel_side_effect(4, Ok(7), restored)
+                .expect_err("restoration failure must abort replay");
+            assert!(
+                matches!(failure.into_errno(), Err(Error::Tool(_))),
+                "restoration failure became guest-visible errno"
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_flag_change_failure_is_not_a_guest_errno() {
+        for result in [Err(Errno::EBADF), Ok(1)] {
+            let failure = require_replay_fcntl_success(4, "temporarily clear O_NONBLOCK", result)
+                .expect_err("flag setup failure must abort replay");
+            assert!(
+                matches!(failure.into_errno(), Err(Error::Tool(_))),
+                "flag setup failure became guest-visible errno"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_flag_read_failure_is_not_a_guest_errno() {
+        let failure = require_replay_fcntl_value(4, "read descriptor flags", Err(Errno::EBADF))
+            .expect_err("flag read failure must abort replay");
+        assert!(
+            matches!(failure.into_errno(), Err(Error::Tool(_))),
+            "flag read failure became guest-visible errno"
+        );
+    }
 
     #[tokio::test]
     async fn replay_output_preserves_regular_file_offset() {
