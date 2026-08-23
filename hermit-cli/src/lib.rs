@@ -40,6 +40,7 @@ mod metadata;
 /// changing it a one-line edit in a place a reader can find.
 pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
 mod record;
+mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
