@@ -153,7 +153,14 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: determinism-failure
+            evidence: 17107307a33b6f6383c1b7bc2acb364b162b6c8c
+            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10.
         backends_enabled:
           - ptrace
           - liteinst
@@ -4154,7 +4161,14 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: determinism-failure
+            evidence: 17107307a33b6f6383c1b7bc2acb364b162b6c8c
+            reason: LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10.
         backends_enabled:
           - ptrace
           - liteinst

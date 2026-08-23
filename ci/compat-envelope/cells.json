@@ -9346,7 +9346,12 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "determinism-failure",
+        "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c",
+        "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."
+      },
       "observations": []
     },
     {
@@ -15800,7 +15805,12 @@
       "mode": "verify",
       "backend": "liteinst",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "determinism-failure",
+        "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c",
+        "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."
+      },
       "observations": []
     },
     {

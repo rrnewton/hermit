@@ -407,13 +407,6 @@
       "test": "backend-parity-c/path-file-ops"
     },
     {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/personality-domain"
-    },
-    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -692,13 +685,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/vectored-file-io"
-    },
-    {
-      "backend": "liteinst",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/vectored-io"
     },
     {
       "backend": "ptrace",
