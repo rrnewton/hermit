@@ -319,7 +319,8 @@ static long lo_up(void) {
   return r;
 }
 
-void _start(void) {
+/* Linux enters the ELF entry point without a caller-provided return address. */
+__attribute__((force_align_arg_pointer)) void _start(void) {
   char line[256];
   int pos;
 
