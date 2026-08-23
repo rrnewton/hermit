@@ -44,7 +44,7 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10a);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10b);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -249,7 +249,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         detlog_io_buffers: false,
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
-        memory: 1024 * 1024 * 1024,
+        memory: default_config.memory,
         interrupt_at: vec![],
         happens_before: None,
         fuzz_futexes: false,
@@ -288,6 +288,16 @@ mod tests {
     }
 
     #[test]
+    fn record_and_replay_use_run_default_memory() {
+        let run_default = detcore::Config::default();
+        assert_eq!(run_default.memory, 1_000_000_000);
+        assert_eq!(
+            record_or_replay_config(Path::new("replay-data")).memory,
+            run_default.memory
+        );
+    }
+
+    #[test]
     fn record_and_replay_subscribe_every_determinized_syscall() {
         let config = record_or_replay_config(Path::new("replay-data"));
         let record = <detcore::Detcore<crate::recorder::Recorder> as Tool>::subscriptions(&config);
@@ -317,6 +327,13 @@ mod tests {
                 "{phase} must leave unlisted PassThrough chdir unsubscribed"
             );
         }
+    }
+
+    #[test]
+    fn record_version_rejects_previous_memory_configuration() {
+        // Metadata does not persist the memory configuration, so a recording made with the
+        // previous hardcoded value cannot be replayed compatibly with the corrected default.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10a)));
     }
 
     #[test]
