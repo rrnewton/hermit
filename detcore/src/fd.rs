@@ -132,6 +132,28 @@ struct OpenFileDescription {
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2373)
+    /// The `flock(2)` mode this open file description currently holds, as the
+    /// bare `LOCK_SH`/`LOCK_EX` constant, or `None` when it holds no lock.
+    ///
+    /// `flock` locks are a property of the open file description, not of the
+    /// descriptor slot and not of the inode, which is exactly the granularity
+    /// this struct models: `dup`/`fork` aliases share one lock, two separate
+    /// `open`s of the same file contend with each other.
+    ///
+    /// Detcore tracks this only so `handle_flock` can tell a first acquisition
+    /// (where a failed `LOCK_NB` probe changes nothing) from a *conversion* of
+    /// an already-held lock (where Linux drops the old lock before it can fail).
+    /// It is a cache of what Detcore itself granted, never an authority: it is
+    /// written only after the kernel reports success.
+    #[serde(default)]
+    flock_mode: Option<i32>,
+    /// Whether `flock_mode` describes the kernel state. Descriptors created by
+    /// an intercepted syscall start known-unlocked; descriptors discovered
+    /// after entering the guest can already carry a lock.
+    #[serde(default)]
+    flock_mode_known: bool,
 }
 
 impl PartialEq for DetFd {
@@ -176,6 +198,8 @@ impl DetFd {
                 socket_receive_timestamp: None,
                 sock_diag: false,
                 loopback_peer: false,
+                flock_mode: None,
+                flock_mode_known: true,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -463,6 +487,41 @@ impl DetFd {
     pub(crate) fn is_loopback_peer(&self) -> bool {
         self.description().loopback_peer
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2373)
+    /// Return the known `flock(2)` state for this open file description.
+    ///
+    /// The outer `None` means Detcore did not observe the descriptor's history.
+    /// `Some(None)` means known-unlocked; `Some(Some(mode))` means the kernel
+    /// granted `LOCK_SH` or `LOCK_EX` through this handler.
+    pub(crate) fn known_flock_mode(&self) -> Option<Option<i32>> {
+        let description = self.description();
+        description
+            .flock_mode_known
+            .then_some(description.flock_mode)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2373)
+    /// Record the `flock(2)` mode this open file description now holds. Every
+    /// `dup`/`fork` alias observes the change, matching the kernel, where one
+    /// `flock` lock belongs to the whole open file description.
+    pub(crate) fn set_flock_mode(&self, mode: Option<i32>) {
+        let mut description = self.description();
+        if description.flock_mode_known {
+            description.flock_mode = mode;
+        }
+    }
+
+    /// Mark the kernel lock state unknown without changing the kernel lock.
+    /// This is required for live-discovered and externally received file
+    /// descriptions, whose history Detcore did not observe.
+    pub(crate) fn forget_flock_mode(&self) {
+        let mut description = self.description();
+        description.flock_mode = None;
+        description.flock_mode_known = false;
+    }
 }
 
 impl fmt::Display for DetFd {
@@ -527,6 +586,62 @@ mod tests {
         assert!(
             !duplicate.is_loopback_peer(),
             "reconnects through one alias must clear loopback state for every alias"
+        );
+    }
+
+    /// `flock(2)` locks belong to the open file description, so every `dup`
+    /// alias must see one lock, while a separate `open` of the same file is a
+    /// distinct contender with its own state.
+    #[test]
+    fn flock_mode_is_shared_by_dup_aliases_and_private_to_separate_opens() {
+        let owner = DetTid::from_raw(10);
+        let original = DetFd::new(
+            3,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(owner, 0),
+        );
+        let duplicate = original.clone().with_fd(4);
+        let separate_open = DetFd::new(
+            5,
+            OFlag::empty(),
+            FdType::Regular,
+            OpenFileId::new(owner, 1),
+        );
+
+        assert_eq!(original.known_flock_mode(), Some(None));
+        original.set_flock_mode(Some(libc::LOCK_SH));
+        assert_eq!(
+            duplicate.known_flock_mode(),
+            Some(Some(libc::LOCK_SH)),
+            "a dup alias shares the open file description's flock lock"
+        );
+        assert_eq!(
+            separate_open.known_flock_mode(),
+            Some(None),
+            "a separate open of the same file is an independent flock contender"
+        );
+
+        duplicate.set_flock_mode(Some(libc::LOCK_EX));
+        assert_eq!(original.known_flock_mode(), Some(Some(libc::LOCK_EX)));
+        duplicate.set_flock_mode(None);
+        assert_eq!(
+            original.known_flock_mode(),
+            Some(None),
+            "LOCK_UN through one alias releases the whole open file description"
+        );
+
+        duplicate.forget_flock_mode();
+        assert_eq!(
+            original.known_flock_mode(),
+            None,
+            "unknown state must be shared by every alias of the open file description"
+        );
+        original.set_flock_mode(Some(libc::LOCK_SH));
+        assert_eq!(
+            duplicate.known_flock_mode(),
+            None,
+            "a later call cannot make externally mutable lock state reliable again"
         );
     }
 
