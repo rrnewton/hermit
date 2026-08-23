@@ -1213,6 +1213,38 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created_v2(
     0
 }
 
+fn successful_process_clone_result(sysnum: i64, result: i64) -> bool {
+    result >= 0
+        && matches!(
+            sysnum,
+            libc::SYS_fork | libc::SYS_vfork | libc::SYS_clone | libc::SYS_clone3
+        )
+}
+
+/// Applies the result of a native process-clone syscall after the kernel returns.
+///
+/// Successful process clones share inherited open file descriptions, while the
+/// copied DBT runtime can mutate their locks independently. Invalidate both the
+/// parent and child copies only after success; a failed clone leaves the known
+/// lock state unchanged.
+///
+/// # Safety
+///
+/// `scratch` must name initialized per-thread storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_process_clone_result(
+    scratch: *mut c_void,
+    sysnum: i64,
+    result: i64,
+) {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if successful_process_clone_result(sysnum, result) && !scratch.runtime_state.is_null() {
+        unsafe { &mut *scratch.runtime_state }
+            .state
+            .forget_flock_modes();
+    }
+}
+
 /// Releases Detcore state owned by a DynamoRIO application thread.
 ///
 /// # Safety
@@ -1280,6 +1312,21 @@ pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, 
 // TODO-HUMAN-REVIEW(PR-644): Review fork-safe policy enforcement before copied children bypass.
 // TODO-HUMAN-REVIEW(PR-978): Review extending the copied-child gate from the
 // Unsupported set to the full deterministic-refusal boundary.
+fn copied_child_flock_action(operation: Option<i32>) -> i32 {
+    let Some(operation) = operation else {
+        return -libc::ENOLCK;
+    };
+    let known_flags = libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN | libc::LOCK_NB;
+    let base = operation & !libc::LOCK_NB;
+    let valid = operation & !known_flags == 0
+        && matches!(base, libc::LOCK_SH | libc::LOCK_EX | libc::LOCK_UN);
+    if !valid || base == libc::LOCK_UN || operation & libc::LOCK_NB != 0 {
+        0
+    } else {
+        -libc::ENOLCK
+    }
+}
+
 /// Applies the deterministic-refusal policy in a copied pre-exec DBT child.
 ///
 /// A copied pre-exec child runs natively on the DynamoRIO client stack with no
@@ -1337,6 +1384,13 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // Detcore mediation. This ABI has neither syscall arguments nor a memory
     // writer, so a copied child must fail closed rather than expose native
     // pipe/socket inode identities.
+    // A copied pre-exec child has no Detcore Tool. Preserve kernel handling
+    // for malformed operations, nonblocking locks, and unlock; only blocking
+    // acquisitions can strand the child behind a parent that is waiting for it.
+    if sysno == Sysno::flock {
+        let operation = (!args.is_null()).then(|| unsafe { args.add(1).read() as i32 });
+        return copied_child_flock_action(operation);
+    }
     if matches!(
         sysno,
         Sysno::recvmsg | Sysno::recvmmsg | Sysno::readlink | Sysno::readlinkat
@@ -1464,6 +1518,19 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
+    if sysnum == libc::SYS_vfork
+        && !scratch.runtime_state.is_null()
+        && unsafe { &*scratch.runtime_state }
+            .state
+            .has_unsafe_vfork_flock_state()
+    {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork while an open file description may hold a flock\n",
+        );
+        return -1;
+    }
+
     // clone(2) and clone3(2) return in both the parent and child. Injecting
     // either from this callback makes the child return on the client stack.
     if requires_native_lifecycle(sysnum) {
@@ -1757,6 +1824,32 @@ mod tests {
         assert!(protected_evidence_capture_ready(0, false));
         assert!(protected_evidence_capture_ready(3, true));
         assert!(!protected_evidence_capture_ready(3, false));
+    }
+
+    #[test]
+    fn process_clone_result_invalidates_only_for_successful_clone_family_calls() {
+        for sysnum in [
+            libc::SYS_fork,
+            libc::SYS_vfork,
+            libc::SYS_clone,
+            libc::SYS_clone3,
+        ] {
+            assert!(successful_process_clone_result(sysnum, 0));
+            assert!(successful_process_clone_result(sysnum, 42));
+            assert!(!successful_process_clone_result(
+                sysnum,
+                -libc::EINVAL as i64
+            ));
+        }
+
+        for sysnum in [libc::SYS_getuid, libc::SYS_read, libc::SYS_execve] {
+            assert!(!successful_process_clone_result(sysnum, 0));
+            assert!(!successful_process_clone_result(sysnum, 42));
+            assert!(!successful_process_clone_result(
+                sysnum,
+                -libc::EINVAL as i64
+            ));
+        }
     }
 
     #[test]
@@ -2131,6 +2224,9 @@ mod tests {
     /// existing precedent: a `Determinized` metadata mutator acknowledged as
     /// running natively here. This row shrinks when the copied-child ABI can
     /// carry an emulated identity, not before.
+    // `flock` remains in this syscall-level register because the zero-argument
+    // census represents a malformed operation, which intentionally reaches the
+    // kernel for `EINVAL`. Dedicated argument tests prove blocking modes refuse.
     const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
         "accept",
         "accept4",
@@ -2686,6 +2782,37 @@ mod tests {
                 "unconditional refusal must fail closed for syscall {sysnum}"
             );
         }
+
+        for operation in [libc::LOCK_SH, libc::LOCK_EX] {
+            let mut args = [0; 6];
+            args[1] = operation as u64;
+            assert_eq!(
+                copied_child_action_with_args(libc::SYS_flock, args),
+                -libc::ENOLCK,
+                "a copied child must not enter a blocking flock operation",
+            );
+        }
+        for operation in [
+            0,
+            libc::LOCK_SH | libc::LOCK_EX,
+            libc::LOCK_SH | libc::LOCK_NB,
+            libc::LOCK_EX | libc::LOCK_NB,
+            libc::LOCK_UN,
+            libc::LOCK_UN | libc::LOCK_NB,
+        ] {
+            let mut args = [0; 6];
+            args[1] = operation as u64;
+            assert_eq!(
+                copied_child_action_with_args(libc::SYS_flock, args),
+                0,
+                "operation {operation} must retain kernel validation or safe nonblocking behavior",
+            );
+        }
+        assert_eq!(
+            unsafe { reverie_dbt_runtime_copied_syscall(libc::SYS_flock, std::ptr::null()) },
+            -libc::ENOLCK,
+            "missing copied-child flock arguments must fail closed",
+        );
 
         COPIED_PANIC_ON_UNSUPPORTED.store(previous, Ordering::Release);
     }
