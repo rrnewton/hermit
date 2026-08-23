@@ -1,5 +1,6 @@
 schema: 2
 bucket: util-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: util-c/pmu-skid
     description: Strict verification for tests/util/pmu_skid.c

@@ -1,5 +1,6 @@
 schema: 2
 bucket: applications
+ci_disabled_reason_default: backends-disabled
 test:
   - id: applications/timed-progress-bar
     description: A time-driven Python application completes identically under verification

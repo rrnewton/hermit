@@ -1,5 +1,6 @@
 schema: 2
 bucket: system-utils
+ci_disabled_reason_default: backends-disabled
 test:
   - id: system-utils/clock-determinism
     description: clock_gettime/gettimeofday output is identical across repeated Hermit runs

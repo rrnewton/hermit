@@ -25,9 +25,11 @@ use sha2::Digest;
 use sha2::Sha256;
 
 pub use crate::canonical_verdict::VerificationReport;
+use crate::ci_selection::CiDisabledReasonDefault;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::ci_selection::effective_ci_disabled_reason;
 
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
@@ -38,6 +40,7 @@ pub const CELL_RESULT_SCHEMA: u64 = 4;
 pub struct ManifestDocument {
     pub schema: u64,
     pub bucket: String,
+    pub ci_disabled_reason_default: Option<CiDisabledReasonDefault>,
     pub test: Vec<TestRecipe>,
 }
 
@@ -176,9 +179,10 @@ impl ManifestSet {
         for path in paths {
             let source = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let document: ManifestDocument = serde_yaml::from_str(&source)
+            let mut document: ManifestDocument = serde_yaml::from_str(&source)
                 .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))?;
             let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
+            apply_ci_disabled_reason_default(&mut document)?;
             validate_document(&document, stem, root)?;
             for test in &document.test {
                 if tests
@@ -294,6 +298,29 @@ impl ManifestSet {
             .values()
             .map(|(category, test)| (category.as_str(), test))
     }
+}
+
+fn apply_ci_disabled_reason_default(document: &mut ManifestDocument) -> Result<(), String> {
+    let Some(default) = document.ci_disabled_reason_default else {
+        return Ok(());
+    };
+    for test in &mut document.test {
+        for (mode, recipe) in &mut test.modes {
+            if recipe.ci_disabled_reason.is_some() {
+                continue;
+            }
+            let enabled = recipe.backends_enabled.iter().cloned().collect();
+            recipe.ci_disabled_reason = effective_ci_disabled_reason(
+                &enabled,
+                &recipe.ci,
+                None,
+                Some(default),
+                &recipe.backends_disabled,
+            )
+            .map_err(|error| format!("{}: {mode} {error}", test.id))?;
+        }
+    }
+    Ok(())
 }
 
 fn population_accepts(population: Population, ci: bool, enabled: bool) -> bool {
@@ -1805,8 +1832,11 @@ mod tests {
         ]);
         let mode = ModeRecipe {
             ci: CiSelectionSpec::Uniform(ci),
-            ci_disabled_reason: (!ci)
-                .then(|| CiDisabledReasonSpec::Uniform("not selected yet".into())),
+            ci_disabled_reason: (!ci).then(|| {
+                CiDisabledReasonSpec::Uniform(
+                    "This fixture is excluded from ordinary validation".into(),
+                )
+            }),
             backends_enabled: vec!["ptrace".into()],
             backends_disabled: disabled,
             ..ModeRecipe::default()
@@ -1831,6 +1861,34 @@ mod tests {
             slow_reason: None,
             preprocessors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn manifest_default_materializes_each_cells_backend_reason_provenance() {
+        let mut test = recipe(false);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.ci_disabled_reason = None;
+        mode.backends_enabled.clear();
+        mode.backends_disabled.insert(
+            "ptrace".into(),
+            "No ptrace verification contract has been established".into(),
+        );
+        for reason in mode.backends_disabled.values_mut() {
+            if reason == "not qualified" {
+                *reason = "This backend has no qualified verification contract".into();
+            }
+        }
+        let mut document = ManifestDocument {
+            schema: 2,
+            bucket: "fixture".into(),
+            ci_disabled_reason_default: Some(CiDisabledReasonDefault::BackendsDisabled),
+            test: vec![test],
+        };
+        apply_ci_disabled_reason_default(&mut document).unwrap();
+        assert!(matches!(
+            document.test[0].modes["verify"].ci_disabled_reason,
+            Some(CiDisabledReasonSpec::Uniform(_))
+        ));
     }
 
     #[test]

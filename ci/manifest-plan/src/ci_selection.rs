@@ -26,6 +26,12 @@ pub enum CiDisabledReasonSpec {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum CiDisabledReasonDefault {
+    BackendsDisabled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CiDisabledResult {
     NotMeasured,
     DeterminismFailure,
@@ -84,7 +90,7 @@ impl CiSelection {
                         return Err("ci=true must not carry ci_disabled_reason".into());
                     }
                     (false, false, Some(CiDisabledReasonSpec::Uniform(reason))) => {
-                        let reason = nonempty_legacy_reason(reason)?;
+                        let reason = validate_reason_text("ci_disabled_reason", reason)?;
                         enabled
                             .iter()
                             .cloned()
@@ -106,13 +112,13 @@ impl CiSelection {
                         );
                     }
                     (false, false, None) => {
-                        return Err(
-                            "ci=false with enabled backends requires ci_disabled_reason".into()
-                        );
+                        return Err("ci=false requires ci_disabled_reason".into());
                     }
-                    (false, true, None) => BTreeMap::new(),
+                    (false, true, None) => {
+                        return Err("ci=false requires ci_disabled_reason".into());
+                    }
                     (false, true, Some(CiDisabledReasonSpec::Uniform(reason))) => {
-                        nonempty_legacy_reason(reason)?;
+                        validate_reason_text("ci_disabled_reason", reason)?;
                         BTreeMap::new()
                     }
                     (false, true, Some(CiDisabledReasonSpec::PerBackend(_))) => {
@@ -127,6 +133,9 @@ impl CiSelection {
                 })
             }
             CiSelectionSpec::PerBackend(selected) => {
+                if enabled.is_empty() {
+                    return Err("per-backend ci requires at least one enabled backend".into());
+                }
                 for backend in selected.keys() {
                     if disabled.contains(backend) {
                         return Err(format!(
@@ -225,22 +234,44 @@ impl CiSelection {
     }
 }
 
-fn nonempty_legacy_reason(reason: &str) -> Result<String, String> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err("ci_disabled_reason must be a non-empty string".into());
+pub fn effective_ci_disabled_reason(
+    enabled: &BTreeSet<String>,
+    selection: &CiSelectionSpec,
+    explicit: Option<&CiDisabledReasonSpec>,
+    default: Option<CiDisabledReasonDefault>,
+    disabled_reasons: &BTreeMap<String, String>,
+) -> Result<Option<CiDisabledReasonSpec>, String> {
+    if let Some(explicit) = explicit {
+        return Ok(Some(explicit.clone()));
     }
-    Ok(reason.to_string())
+    if !matches!(selection, CiSelectionSpec::Uniform(false)) || !enabled.is_empty() {
+        return Ok(None);
+    }
+    let Some(CiDisabledReasonDefault::BackendsDisabled) = default else {
+        return Ok(None);
+    };
+    if disabled_reasons.is_empty() {
+        return Err(
+            "ci_disabled_reason default backends-disabled requires backend-disabled reasons".into(),
+        );
+    }
+    let mut parts = Vec::with_capacity(disabled_reasons.len());
+    for (backend, reason) in disabled_reasons {
+        let reason =
+            validate_reason_text(&format!("backends_disabled reason for {backend}"), reason)?;
+        parts.push(format!("{backend}: {reason}"));
+    }
+    Ok(Some(CiDisabledReasonSpec::Uniform(parts.join("; "))))
 }
 
-fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> Result<(), String> {
-    let detail = reason.reason.trim();
-    if detail.len() < 16 || detail.split_whitespace().count() < 3 {
+fn validate_reason_text(label: &str, reason: &str) -> Result<String, String> {
+    let reason = reason.trim();
+    if reason.len() < 16 || reason.split_whitespace().count() < 3 {
         return Err(format!(
-            "ci_disabled_reason for {backend} must explain the result in at least three words"
+            "{label} must explain why CI is disabled in at least three words"
         ));
     }
-    let normalized = detail.to_ascii_lowercase();
+    let normalized = reason.to_ascii_lowercase();
     if [
         "not yet validated",
         "not yet qualified",
@@ -251,9 +282,14 @@ fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> R
     .any(|placeholder| normalized.contains(placeholder))
     {
         return Err(format!(
-            "ci_disabled_reason for {backend} must state the measured result, not placeholder text"
+            "{label} must state the measured result, not placeholder text"
         ));
     }
+    Ok(reason.to_string())
+}
+
+fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> Result<(), String> {
+    validate_reason_text(&format!("ci_disabled_reason for {backend}"), &reason.reason)?;
     let evidence = reason.evidence.trim();
     let evidence_is_locator = evidence.len() >= 8
         && (evidence.contains('/')
@@ -332,6 +368,76 @@ mod tests {
     }
 
     #[test]
+    fn uniform_false_requires_a_named_reason_with_or_without_enabled_backends() {
+        for enabled in [enabled(), BTreeSet::new()] {
+            let error = CiSelection::validate(
+                &enabled,
+                &disabled(),
+                &CiSelectionSpec::Uniform(false),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(error, "ci=false requires ci_disabled_reason");
+        }
+    }
+
+    #[test]
+    fn uniform_false_rejects_an_explanation_below_the_substance_floor() {
+        let error = CiSelection::validate(
+            &enabled(),
+            &disabled(),
+            &CiSelectionSpec::Uniform(false),
+            Some(&CiDisabledReasonSpec::Uniform("not selected".into())),
+        )
+        .unwrap_err();
+        assert!(error.contains("at least three words"));
+    }
+
+    #[test]
+    fn explicit_backend_reason_provenance_derives_a_uniform_reason() {
+        let disabled_reasons = BTreeMap::from([
+            (
+                "dbt".into(),
+                "DBT does not implement this execution mode".into(),
+            ),
+            (
+                "ptrace".into(),
+                "The guest has no schedule-diversity oracle".into(),
+            ),
+        ]);
+        let effective = effective_ci_disabled_reason(
+            &BTreeSet::new(),
+            &CiSelectionSpec::Uniform(false),
+            None,
+            Some(CiDisabledReasonDefault::BackendsDisabled),
+            &disabled_reasons,
+        )
+        .unwrap();
+        let policy = CiSelection::validate(
+            &BTreeSet::new(),
+            &disabled_reasons.keys().cloned().collect(),
+            &CiSelectionSpec::Uniform(false),
+            effective.as_ref(),
+        )
+        .unwrap();
+        assert!(!policy.any_selected());
+    }
+
+    #[test]
+    fn derived_backend_reason_must_meet_the_substance_floor() {
+        let error = effective_ci_disabled_reason(
+            &BTreeSet::new(),
+            &CiSelectionSpec::Uniform(false),
+            None,
+            Some(CiDisabledReasonDefault::BackendsDisabled),
+            &BTreeMap::from([("ptrace".into(), "unsupported".into())]),
+        )
+        .unwrap_err();
+        assert!(error.contains("backends_disabled reason for ptrace"));
+        assert!(error.contains("at least three words"));
+    }
+
+    #[test]
     fn accepts_mixed_backend_selection_and_preserves_the_failure_reason() {
         let policy = CiSelection::validate(
             &enabled(),
@@ -364,6 +470,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("omits enabled backend liteinst"));
+    }
+
+    #[test]
+    fn rejects_empty_per_backend_selection_without_an_enabled_backend() {
+        let error = CiSelection::validate(
+            &BTreeSet::new(),
+            &disabled(),
+            &CiSelectionSpec::PerBackend(BTreeMap::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("requires at least one enabled backend"));
     }
 
     #[test]

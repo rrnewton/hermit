@@ -1,5 +1,6 @@
 schema: 2
 bucket: determinism-stress-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: determinism-stress-c/fork-tree
     description: Strict verification for tests/e2e/determinism-stress/fork_tree.c

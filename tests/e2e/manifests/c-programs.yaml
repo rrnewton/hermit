@@ -1,5 +1,6 @@
 schema: 2
 bucket: c-programs
+ci_disabled_reason_default: backends-disabled
 test:
   - id: c-programs/acct-refusal-probe
     description: Strict verification for tests/c/acct_refusal_probe.c

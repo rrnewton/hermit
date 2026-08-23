@@ -96,6 +96,22 @@ strictness, log comparison, positive INFO counts on both runs, bitwise parity,
 and a matched verdict. Output-only, stripped, empty-log, malformed, or
 contradictory reports are infrastructure errors rather than product results.
 
+Every scalar `ci: false` mode needs a meaningful `ci_disabled_reason`, including
+a mode with no enabled backend. A manifest whose fully disabled modes already
+carry specific reasons in every `backends_disabled` entry may declare shared
+provenance once:
+
+```yaml
+ci_disabled_reason_default: backends-disabled
+```
+
+For an all-disabled mode with no local `ci_disabled_reason`, the planner then
+derives the effective explanation from that mode's own backend-specific reasons.
+It is not stock fallback text: each contributing reason must still contain at
+least 16 characters and three words and must not be placeholder language. The
+default never supplies a reason for an enabled backend, and a local reason takes
+precedence.
+
 `ci` may also be a mapping when enabled backends have different validation
 status. The mapping must name every enabled backend and no disabled backend.
 Each `false` backend requires its own structured reason; a `true` backend must
@@ -161,8 +177,9 @@ Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
-with no enabled backend remains visible with `ci = false` and a reason for
-every disabled backend. Regular CI executes only cells with `ci = true`;
+with no enabled backend remains visible with `ci = false`, a reason for every
+disabled backend, and either a local CI-disabled reason or the declared shared
+provenance above. Regular CI executes only cells with `ci = true`;
 run one enabled manual cell with explicit test and mode filters:
 
 ```sh
@@ -208,10 +225,11 @@ updated in the same review.
 A `ci = false` cell is never executed **and never compiled** by ordinary
 validation, so its guest can
 rot without any node noticing. Two mechanisms bound that. `manifest-plan`
-rejects every enabled mode with boolean `ci = false` unless it has a non-empty
-shared `ci_disabled_reason`. For a per-backend mapping it instead requires the
-structured checks above. It rejects a stale reason left behind on a selected
-backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
+rejects every mode with boolean `ci = false` unless it has a substantive shared
+`ci_disabled_reason` or, for an all-disabled mode, the manifest explicitly
+derives that reason from its substantive backend exclusions. For a per-backend
+mapping it instead requires the structured checks above. It rejects a stale
+reason left behind on a selected backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
 the bucket declares regardless of its `ci` flag; it is wired into the portable
 DAG for `backend-parity-c` and fails closed on zero compiled.
 

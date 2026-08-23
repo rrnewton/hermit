@@ -1,5 +1,6 @@
 schema: 2
 bucket: shared-futex-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: shared-futex-c/qemu-exec-init
     description: Strict verification for tests/shared-futex-verify/qemu_exec_init.c

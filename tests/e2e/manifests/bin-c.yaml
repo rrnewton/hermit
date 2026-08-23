@@ -1,5 +1,6 @@
 schema: 2
 bucket: bin-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: bin-c/posix-timer-test
     description: Strict verification for tests/bin/posix_timer_test.c

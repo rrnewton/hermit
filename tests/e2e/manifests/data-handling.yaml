@@ -1,5 +1,6 @@
 schema: 2
 bucket: data-handling
+ci_disabled_reason_default: backends-disabled
 test:
   - id: data-handling/archive-roundtrip
     description: Create, extract, and verify a normalized tar archive

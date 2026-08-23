@@ -1,5 +1,6 @@
 schema: 2
 bucket: determinism-stress
+ci_disabled_reason_default: backends-disabled
 test:
   - id: determinism-stress/thread-output
     description: Concurrent shell writers produce repeatable output under strict verification

@@ -1,5 +1,6 @@
 schema: 2
 bucket: debugger-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: debugger-c/debuggee
     description: Strict verification for tests/debugger/guests/debuggee.c

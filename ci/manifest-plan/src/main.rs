@@ -19,9 +19,11 @@ use std::path::PathBuf;
 use std::process::exit;
 
 use hermit_manifest_plan::ci_selection::CiDisabledReasonData;
+use hermit_manifest_plan::ci_selection::CiDisabledReasonDefault;
 use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+use hermit_manifest_plan::ci_selection::effective_ci_disabled_reason;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -123,12 +125,20 @@ fn main() {
             .parse()
             .unwrap_or_else(|error| die(format!("{}: invalid YAML: {error}", path.display())));
         let location = path.file_name().unwrap().to_string_lossy().to_string();
-        ensure_keys(&document, &["schema", "bucket", "test"], &location);
+        ensure_keys(
+            &document,
+            &["schema", "bucket", "ci_disabled_reason_default", "test"],
+            &location,
+        );
 
         if document.get("schema").and_then(Value::as_integer) != Some(2) {
             die(format!("{location}: schema must be 2"));
         }
         let bucket = required_string(&document, "bucket", &location);
+        let ci_disabled_reason_default: Option<CiDisabledReasonDefault> =
+            document.get("ci_disabled_reason_default").map(|value| {
+                parse_schema_value(value, &format!("{location}.ci_disabled_reason_default"))
+            });
         let stem = path.file_stem().unwrap().to_string_lossy();
         if bucket != stem {
             die(format!(
@@ -146,6 +156,7 @@ fn main() {
                 bucket,
                 &location,
                 &repo_root,
+                ci_disabled_reason_default,
                 &mut seen_ids,
                 &mut seen_programs,
                 &mut rows,
@@ -479,6 +490,7 @@ fn validate_and_expand(
     bucket: &str,
     location: &str,
     repo_root: &Path,
+    ci_disabled_reason_default: Option<CiDisabledReasonDefault>,
     seen_ids: &mut BTreeSet<String>,
     seen_programs: &mut BTreeSet<String>,
     rows: &mut Vec<PlanRow>,
@@ -607,13 +619,13 @@ fn validate_and_expand(
 
     let row_start = rows.len();
     for mode in MODES {
-        validate_mode(
+        validate_mode_with_default(
             &id,
-            bucket,
             lane,
             mode,
             timeout_seconds,
             modes.get(mode).unwrap(),
+            ci_disabled_reason_default,
             rows,
         );
     }
@@ -654,15 +666,16 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
-fn validate_mode(
+fn validate_mode_with_default(
     id: &str,
-    bucket: &str,
     lane: &str,
     mode: &str,
     timeout_seconds: i64,
     spec: &Value,
+    ci_disabled_reason_default: Option<CiDisabledReasonDefault>,
     rows: &mut Vec<PlanRow>,
 ) {
+    let bucket = id.split_once('/').map(|(bucket, _)| bucket).unwrap_or(id);
     let spec_value = spec;
     let spec = spec_value
         .as_table()
@@ -724,13 +737,20 @@ fn validate_mode(
                 "{id}: modes.{mode}.backends_disabled must be a table"
             ))
         });
-    for (backend, reason) in disabled {
-        if reason.as_str().is_none_or(str::is_empty) {
-            die(format!(
-                "{id}: modes.{mode}.backends_disabled.{backend} needs a reason"
-            ));
-        }
-    }
+    let disabled_reasons: std::collections::BTreeMap<String, String> = disabled
+        .iter()
+        .map(|(backend, reason)| {
+            let reason = reason
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or_else(|| {
+                    die(format!(
+                        "{id}: modes.{mode}.backends_disabled.{backend} needs a reason"
+                    ))
+                });
+            (backend.clone(), reason.to_string())
+        })
+        .collect();
 
     let expected: BTreeSet<&str> = if mode == "naked" {
         ["native"].into_iter().collect()
@@ -752,11 +772,19 @@ fn validate_mode(
             expected
         ));
     }
+    let effective_reason = effective_ci_disabled_reason(
+        &enabled.iter().cloned().collect(),
+        &ci_spec,
+        ci_disabled_reason.as_ref(),
+        ci_disabled_reason_default,
+        &disabled_reasons,
+    )
+    .unwrap_or_else(|error| die(format!("{id}: modes.{mode} {error}")));
     let ci = CiSelection::validate(
         &enabled.iter().cloned().collect(),
         &disabled.keys().cloned().collect(),
         &ci_spec,
-        ci_disabled_reason.as_ref(),
+        effective_reason.as_ref(),
     )
     .unwrap_or_else(|error| die(format!("{id}: modes.{mode} {error}")));
     if let Some(guest_args) = spec.get("guest_args") {
@@ -966,6 +994,20 @@ fn validate_mode(
     }
 }
 
+#[cfg(test)]
+fn validate_mode(
+    id: &str,
+    bucket: &str,
+    lane: &str,
+    mode: &str,
+    timeout_seconds: i64,
+    spec: &Value,
+    rows: &mut Vec<PlanRow>,
+) {
+    assert!(id.starts_with(&format!("{bucket}/")));
+    validate_mode_with_default(id, lane, mode, timeout_seconds, spec, None, rows);
+}
+
 fn optional_positive_integer(
     table: &std::collections::BTreeMap<String, Value>,
     key: &str,
@@ -1085,7 +1127,7 @@ mod tests {
         let spec = parse_mode(
             r#"
 ci = false
-ci_disabled_reason = "not selected"
+ci_disabled_reason = "This fixture is excluded from ordinary validation"
 backends_enabled = ["ptrace"]
 
 [backends_disabled]
@@ -1215,7 +1257,7 @@ sabre = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "must explain the result in at least three words")]
+    #[should_panic(expected = "must explain why CI is disabled in at least three words")]
     fn rejects_placeholder_per_backend_reason() {
         let spec = parse_mode(
             r#"
@@ -1392,7 +1434,7 @@ backends_enabled = []
         let spec = parse_mode(
             r#"
 ci = false
-ci_disabled_reason = "not selected"
+ci_disabled_reason = "This fixture is excluded from ordinary validation"
 backends_enabled = ["ptrace"]
 guest_args = { kvm = ["--kvm"] }
 
@@ -1415,8 +1457,8 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "ci=false with enabled backends requires ci_disabled_reason")]
-    fn rejects_enabled_cell_silently_disabled_from_ci() {
+    #[should_panic(expected = "ci=false requires ci_disabled_reason")]
+    fn rejects_enabled_cell_even_with_backend_reason_default() {
         let spec = parse_mode(
             r#"
 ci = false
@@ -1429,15 +1471,61 @@ sabre = "unsupported"
 liteinst = "unsupported"
 "#,
         );
+        validate_mode_with_default(
+            "bucket/test",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            Some(CiDisabledReasonDefault::BackendsDisabled),
+            &mut Vec::new(),
+        );
+    }
+
+    fn fully_disabled_verify_spec() -> Value {
+        parse_mode(
+            r#"
+ci = false
+backends_enabled = []
+
+[backends_disabled]
+ptrace = "No ptrace verification contract has been established"
+dbt = "DBT does not implement this execution mode"
+kvm = "KVM does not implement this execution mode"
+sabre = "SaBRe does not implement this execution mode"
+liteinst = "LiteInst does not implement this execution mode"
+"#,
+        )
+    }
+
+    #[test]
+    #[should_panic(expected = "ci=false requires ci_disabled_reason")]
+    fn rejects_all_backends_disabled_without_explicit_or_shared_reason() {
         validate_mode(
             "bucket/test",
             "bucket",
             "portable",
             "verify",
             90,
-            &spec,
+            &fully_disabled_verify_spec(),
             &mut Vec::new(),
         );
+    }
+
+    #[test]
+    fn shared_backend_reason_provenance_covers_an_all_disabled_mode() {
+        let mut rows = Vec::new();
+        validate_mode_with_default(
+            "bucket/test",
+            "portable",
+            "verify",
+            90,
+            &fully_disabled_verify_spec(),
+            Some(CiDisabledReasonDefault::BackendsDisabled),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|row| !row.enabled && !row.ci));
     }
 
     #[test]

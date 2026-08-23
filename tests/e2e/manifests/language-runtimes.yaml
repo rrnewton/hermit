@@ -1,5 +1,6 @@
 schema: 2
 bucket: language-runtimes
+ci_disabled_reason_default: backends-disabled
 test:
   - id: language-runtimes/bash-loop-pipe-time
     description: Bash file I/O, loops, pipelines, hashing, and time repeat under Hermit

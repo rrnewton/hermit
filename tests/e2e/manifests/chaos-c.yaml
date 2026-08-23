@@ -1,5 +1,6 @@
 schema: 2
 bucket: chaos-c
+ci_disabled_reason_default: backends-disabled
 test:
   - id: chaos-c/lock-granularity
     description: Strict verification for tests/chaos/lock_granularity.c
