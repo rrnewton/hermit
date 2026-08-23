@@ -2291,14 +2291,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::SchedGetparam(s) => self.handle_sched_getparam(guest, s).await,
                 Syscall::SchedRrGetInterval(s) => self.handle_sched_rr_get_interval(guest, s).await,
 
-                // ===== BATCH 51: fail-closed utility syscalls with no deterministic
-                // effect under Hermit. Detcore replaces the Linux scheduler, exposes a
-                // single virtual CPU, and serializes guest threads, so a thread's
-                // Linux scheduling attributes (sched_getattr) and I/O priority
-                // (ioprio_set) are inert, and an advisory whole-file lock (flock) is
-                // never contended inside the serialized container. Emulated to fixed,
-                // host-independent results (see syscall_classification.rs); re-enables
-                // chrt, ionice, and flock under --strict.
+                // ===== BATCH 51: fail-closed utility syscalls, re-enabling chrt,
+                // ionice, and flock under --strict. Detcore replaces the Linux
+                // scheduler, exposes a single virtual CPU, and serializes guest
+                // threads, so a thread's Linux scheduling attributes (sched_getattr)
+                // and I/O priority (ioprio_set) are inert: those two have no
+                // deterministic effect and are emulated to fixed, host-independent
+                // results (see syscall_classification.rs).
+                //
+                // flock is NOT in that inert group and is not emulated. This comment
+                // used to claim it "is never contended inside the serialized
+                // container"; that was measured false -- two open file descriptions
+                // in ONE process both held the same LOCK_EX under the old no-op,
+                // where native Linux excluded the second -- and the no-op was
+                // removed. Serializing THREADS does not make a whole-file lock
+                // uncontended, because flock conflicts are between OPEN FILE
+                // DESCRIPTIONS. flock is now forwarded to the kernel, like fcntl's
+                // POSIX record locks; handle_flock carries the determinism argument
+                // and the one case Detcore refuses (a contended BLOCKING request,
+                // which it cannot park a thread on deterministically).
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#791)
                 Syscall::SchedGetattr(s) => self.handle_sched_getattr(guest, s).await,
@@ -2312,7 +2323,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-881): Review virtual ioprio_get defaults.
                 Syscall::IoprioGet(s) => self.handle_ioprio_get(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#791)
+                // TODO-HUMAN-REVIEW(#2373)
                 Syscall::Flock(s) => self.handle_flock(guest, s).await,
 
                 // TODO-HUMAN-REVIEW(PR-1064): recvfrom/read/readv/recvmmsg reach
@@ -2331,8 +2342,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 // TODO-HUMAN-REVIEW(PR-901)
                 Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
                 Syscall::Sendto(s) => self.handle_sendrecv(guest, s).await,
-                Syscall::Sendmsg(s) => self.handle_sendrecv(guest, s).await,
-                Syscall::Sendmmsg(s) => self.handle_sendrecv(guest, s).await,
+                Syscall::Sendmsg(s) => self.handle_sendmsg(guest, s).await,
+                Syscall::Sendmmsg(s) => self.handle_sendmmsg(guest, s).await,
 
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#788): recvmmsg is the multi-message form of
