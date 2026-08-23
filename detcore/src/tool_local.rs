@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
-use nix::fcntl::AtFlags;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
@@ -1417,26 +1416,6 @@ impl<T> AsRef<T> for ThreadState<T> {
 impl<T> AsMut<T> for ThreadState<T> {
     fn as_mut(&mut self) -> &mut T {
         &mut self.record_or_replay
-    }
-}
-
-#[allow(dead_code)]
-fn into_atflags(flags: OFlag) -> AtFlags {
-    // NB: we're only interested with stat* with this fd.
-    if flags.contains(OFlag::O_NOFOLLOW) {
-        AtFlags::AT_SYMLINK_NOFOLLOW
-    } else {
-        AtFlags::empty()
-    }
-}
-
-#[allow(dead_code)]
-fn from_atflags(flags: AtFlags) -> OFlag {
-    // NB: we're only interested with stat* with this fd.
-    if flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW) {
-        OFlag::O_PATH | OFlag::O_NOFOLLOW
-    } else {
-        OFlag::O_PATH
     }
 }
 
