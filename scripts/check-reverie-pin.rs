@@ -84,10 +84,13 @@ mod rust_script_prelude;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
+use std::sync::OnceLock;
 
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie.git";
 const MAIN_REF: &str = "refs/heads/main";
@@ -210,8 +213,17 @@ fn is_full_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Discover the product checkout from the CURRENT DIRECTORY, never from an
+/// inherited `GIT_DIR`.
+///
+/// This runs isolated for the same reason the graph queries do. An inherited
+/// `GIT_DIR` wins over directory discovery, so a hook-invoked run would report
+/// the INVOKING repository as the Hermit root and then check that repository's
+/// pins. That is not hypothetical here: the same class of inheritance once
+/// redirected a fetch and left a Hermit checkout sitting at Reverie's HEAD with
+/// 3,615 apparently-dirty paths.
 fn git_root() -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = isolated_git_command()?
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|error| format!("could not run git rev-parse: {error}"))?;
@@ -438,12 +450,88 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
 /// The cache is reused across invocations and re-fetched every time: a stale
 /// cache would silently answer with an old main, which is the failure mode this
 /// whole change exists to remove.
-fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
-    let cache = root.join("target/ci/reverie-graph.git");
-    if !cache.join("HEAD").is_file() {
+/// Resolve the cache path to the object that will actually be written, and
+/// refuse anything that is reached through a symbolic link.
+///
+/// ORDER IS THE WHOLE POINT HERE. The previous shape tested
+/// `cache.join("HEAD").is_file()` -- which FOLLOWS links -- and then ran
+/// `git init --bare <cache>` before any validation. A symlink at `cache`, or at
+/// any component of the path beneath the checkout, means `git init` creates a
+/// repository at the link's TARGET while the later guard inspects whatever it
+/// finds afterwards. The check and the operation then apply to different
+/// objects, which is the same defect class this whole file exists to close.
+///
+/// So: resolve first, refuse links, and only then create or open. A symlinked
+/// graph cache has no legitimate use -- the path is a build artifact under
+/// `target/` that this script owns -- so refusing outright is both sound and
+/// simpler than reasoning about where the link points.
+fn resolve_cache_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    // Canonicalize the deepest EXISTING ancestor, then re-append the components
+    // below it. Canonicalizing the whole path is not possible before creation,
+    // and canonicalizing nothing would leave every intermediate link unchecked.
+    let mut resolved = fs::canonicalize(root).map_err(|error| {
+        format!(
+            "could not canonicalize the Hermit checkout {}: {error}",
+            root.display()
+        )
+    })?;
+    for component in Path::new(relative).components() {
+        let name = match component {
+            std::path::Component::Normal(name) => name,
+            other => {
+                return Err(format!(
+                    "refusing a graph cache path with a non-literal component {other:?}"
+                ));
+            }
+        };
+        let candidate = resolved.join(name);
+        // `symlink_metadata` does NOT follow the final component, which is what
+        // makes this a link check rather than a target check.
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "REFUSING Reverie graph cache: {} is a symbolic link. The cache is a build \
+                     artifact this script creates under target/; a link there would let `git \
+                     init` write to the link's target while validation inspected something else.",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => {
+                resolved = fs::canonicalize(&candidate).map_err(|error| {
+                    format!(
+                        "could not canonicalize graph cache component {}: {error}",
+                        candidate.display()
+                    )
+                })?;
+            }
+            // Does not exist yet: nothing to follow, and nothing below it can
+            // exist either, so the remaining components are appended literally.
+            Err(_) => resolved = candidate,
+        }
+    }
+    Ok(resolved)
+}
+
+fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
+    // Resolved BEFORE anything is created, so `git init` and the guard below
+    // both act on the same object.
+    let cache = resolve_cache_path(root, "target/ci/reverie-graph.git")?;
+    // `HEAD` is checked without following a link for the same reason.
+    let head = cache.join("HEAD");
+    let head_is_file = fs::symlink_metadata(&head)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false);
+    if !head_is_file {
+        // Refuse an alias BEFORE creating anything in it. Without this, an
+        // existing directory that is a linked worktree of the product -- or the
+        // product git dir itself -- would be initialised into first and judged
+        // second.
+        if cache.exists() {
+            GuardedGitRepo::open(&cache, root)?;
+        }
         fs::create_dir_all(cache.parent().unwrap_or(&cache))
             .map_err(|error| format!("could not create the Reverie graph cache: {error}"))?;
-        let init = Command::new("git")
+        let init = isolated_git_command()?
             .args(["init", "--bare", "--quiet"])
             .arg(&cache)
             .output()
@@ -455,6 +543,7 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
             ));
         }
     }
+    let graph = GuardedGitRepo::open(&cache, root)?;
     // `--filter=blob:none` is a BANDWIDTH optimization, not a correctness
     // requirement: ancestry needs commits, never blobs. It is also not
     // universally supported -- a local-PATH remote rejects it outright
@@ -468,24 +557,21 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
     // poisons any retry. Both were observed -- the promisor poisoning as an
     // intermittent bracket failure. Measured unfiltered: 1.4s / 12 MB, far
     // inside this node's 120s timeout. A gate should buy robustness with that.
-    let fetch = git_in(
-        &cache,
-        &[
-            "fetch",
-            "--no-tags",
-            "--quiet",
-            "--force",
-            remote,
-            "+refs/heads/main:refs/heads/main",
-        ],
-    )?;
+    let fetch = graph.run(&[
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        "--force",
+        remote,
+        "+refs/heads/main:refs/heads/main",
+    ])?;
     if !fetch.status.success() {
         return Err(format!(
             "could not fetch the Reverie commit graph from {remote}: {}",
             String::from_utf8_lossy(&fetch.stderr).trim()
         ));
     }
-    Ok(cache)
+    Ok(graph)
 }
 
 /// Is `ancestor` reachable from `descendant`?
@@ -505,25 +591,25 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<PathBuf, String> {
 /// Treating the second as an ERROR would turn a genuine violation into a
 /// checker crash; treating it as "not reachable" is both true and fail-closed.
 /// Anything else is still a real error and is still raised.
-fn is_ancestor(graph: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+fn is_ancestor(graph: &GuardedGitRepo, ancestor: &str, descendant: &str) -> Result<bool, String> {
     // ABSENT ANCESTOR is a genuine verdict: the graph has main, and the pin is
     // not in it, so the pin is not reachable. ABSENT DESCENDANT is NOT a
     // verdict -- it means the graph we fetched does not even contain main, so
     // we cannot tell, and answering "false" there produces a FALSE REFUSAL.
     // That bug was live: the harness reported "Hermit pin: X / Reverie main: X"
     // -- identical -- while claiming X was not reachable from main.
-    let main_present = git_in(graph, &["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
+    let main_present = graph.run(&["cat-file", "-e", &format!("{descendant}^{{commit}}")])?;
     if !main_present.status.success() {
         return Err(format!(
             "the fetched Reverie graph does not contain {descendant}; cannot judge \
              reachability (incomplete fetch, not a pin violation)"
         ));
     }
-    let pin_present = git_in(graph, &["cat-file", "-e", &format!("{ancestor}^{{commit}}")])?;
+    let pin_present = graph.run(&["cat-file", "-e", &format!("{ancestor}^{{commit}}")])?;
     if !pin_present.status.success() {
         return Ok(false);
     }
-    let output = git_in(graph, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+    let output = graph.run(&["merge-base", "--is-ancestor", ancestor, descendant])?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -622,7 +708,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     if env::var(ACK_ENV).map(|value| value == "1").unwrap_or(false) {
         return Ok(0); // CASE 3, acknowledged.
     }
-    let behind = git_in(&graph, &["rev-list", "--count", &format!("{candidate}..{main}")])?;
+    let behind = graph.run(&["rev-list", "--count", &format!("{candidate}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     loud_header("REVERIE PIN ADVANCED BELOW THE MAIN TIP - ACKNOWLEDGEMENT");
     eprintln!("Previous pin: {head}");
@@ -641,7 +727,7 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
 }
 
 fn query_main(remote: &str) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = isolated_git_command()?
         .args(["ls-remote", "--exit-code", remote, MAIN_REF])
         .output()
         .map_err(|error| format!("could not run git ls-remote: {error}"))?;
@@ -662,8 +748,227 @@ fn query_main(remote: &str) -> Result<String, String> {
     Ok(sha)
 }
 
+/// Git deliberately exports repository-local variables to hooks. `git -C`
+/// does not override them: an inherited `GIT_DIR` still selects that repository
+/// after changing directory. Any command aimed at a different repository must
+/// therefore clear Git's complete, version-specific local environment first.
+fn git_local_env_vars() -> Result<&'static [OsString], String> {
+    static LOCAL_ENV_VARS: OnceLock<Result<Vec<OsString>, String>> = OnceLock::new();
+    let vars = LOCAL_ENV_VARS.get_or_init(|| {
+        let output = Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .map_err(|error| format!("could not enumerate Git local environment variables: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git rev-parse --local-env-vars failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let vars: Vec<OsString> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|name| !name.is_empty())
+            .map(OsString::from)
+            .collect();
+        for required in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            if !vars.iter().any(|name| name == required) {
+                return Err(format!(
+                    "git rev-parse --local-env-vars omitted required variable {required}; refusing to run an isolated Git command"
+                ));
+            }
+        }
+        Ok(vars)
+    });
+    match vars {
+        Ok(vars) => Ok(vars),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// `git rev-parse --local-env-vars` reports two DIFFERENT kinds of variable and
+/// they must not be treated alike.
+///
+/// Most of them SELECT A REPOSITORY -- `GIT_DIR`, `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and friends -- and those are exactly
+/// what has to be cleared before aiming a subprocess at another repository.
+///
+/// But the list also contains the caller's CONFIGURATION, which selects nothing
+/// and is not ours to discard. `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS`
+/// are the environment spellings of `git -c`. On this fleet the forward-proxy
+/// wrapper sets exactly those: `GIT_CONFIG_COUNT=3` with three
+/// `url.https://github.com/.insteadOf` rewrites in `GIT_CONFIG_KEY_n` /
+/// `GIT_CONFIG_VALUE_n`. Clearing `GIT_CONFIG_COUNT` does not merely drop one
+/// variable -- it ORPHANS the whole numbered set, because Git reads the count
+/// first and never looks at the keys. The fetch then bypasses the proxy and
+/// fails, or worse, silently reaches a different URL than the caller asked for.
+///
+/// Note that `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n` are NOT in Git's local
+/// list, so they are never removed. That asymmetry is what makes the bug quiet:
+/// the keys survive, the count does not, and the overrides vanish with nothing
+/// to show for it.
+const CONFIG_OVERRIDE_ENV_VARS: [&str; 2] = ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"];
+
+/// Clear Git's repository-selecting environment, and PRESERVE the caller's
+/// configuration overrides across that clearing.
+///
+/// The preserved values are re-applied explicitly rather than merely skipped.
+/// Skipping would work today, since `Command` inherits the parent environment,
+/// but it would stop working the moment any caller adds `env_clear()`, and the
+/// intent would not be visible at the call site.
+fn clear_git_local_env(command: &mut Command) -> Result<(), String> {
+    let preserved: Vec<(&str, OsString)> = CONFIG_OVERRIDE_ENV_VARS
+        .iter()
+        .filter_map(|name| env::var_os(name).map(|value| (*name, value)))
+        .collect();
+    for name in git_local_env_vars()? {
+        command.env_remove(name);
+    }
+    for (name, value) in preserved {
+        command.env(name, value);
+    }
+    Ok(())
+}
+
+fn isolated_git_command() -> Result<Command, String> {
+    let mut command = Command::new("git");
+    clear_git_local_env(&mut command)?;
+    Ok(command)
+}
+
+fn isolated_git_in(dir: &Path, args: &[&str]) -> Result<Output, String> {
+    isolated_git_command()?
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+}
+
+fn canonical_git_path(repo: &Path, selector: &str) -> Result<PathBuf, String> {
+    let output = isolated_git_in(repo, &["rev-parse", selector])?;
+    if !output.status.success() {
+        return Err(format!(
+            "git -C {} rev-parse {selector} failed: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let path = if reported.is_absolute() {
+        reported
+    } else {
+        repo.join(reported)
+    };
+    fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "could not canonicalize Git path {} reported for {}: {error}",
+            path.display(),
+            repo.display()
+        )
+    })
+}
+
+/// A bare repository proven distinct from the product repository. Keeping the
+/// validated git-dir in this type makes every later graph query use the same
+/// isolated command path instead of relying on each caller to remember it.
+#[derive(Debug)]
+struct GuardedGitRepo {
+    git_dir: PathBuf,
+}
+
+impl GuardedGitRepo {
+    /// Refuse any cache that shares a COMMON git-dir with the product repository.
+    ///
+    /// Comparing the cache's `--git-dir` against the product's `--git-common-dir`
+    /// is not enough, and the gap it leaves is the dangerous one. In a LINKED
+    /// WORKTREE `--git-dir` reports the per-worktree directory
+    /// `<common>/worktrees/<name>`, which never equals `<common>`, so the check
+    /// passes -- while every object written through that handle lands in the
+    /// PRODUCT REPOSITORY'S SHARED OBJECT STORE. A `fetch --force` into a name
+    /// like `refs/heads/main` then rewrites a product ref.
+    ///
+    /// `--git-common-dir` is the identity that actually answers "is this the same
+    /// repository": it is stable across a repository and all of its linked
+    /// worktrees. Both sides are resolved that way. The `--git-dir` equality is
+    /// kept as well, so a plain non-worktree alias is still named precisely in
+    /// the error.
+    fn open(cache: &Path, product_root: &Path) -> Result<Self, String> {
+        let cache_git_dir = canonical_git_path(cache, "--git-dir")?;
+        let cache_common_dir = canonical_git_path(cache, "--git-common-dir")?;
+        let product_common_dir = canonical_git_path(product_root, "--git-common-dir")?;
+        if cache_git_dir == product_common_dir {
+            return Err(format!(
+                "REFUSING Reverie graph cache: cache git-dir {} resolves to the Hermit common git-dir {}",
+                cache_git_dir.display(),
+                product_common_dir.display()
+            ));
+        }
+        if cache_common_dir == product_common_dir {
+            return Err(format!(
+                "REFUSING Reverie graph cache: cache {} is a linked worktree of the Hermit \
+                 repository (shared common git-dir {}); writing there would mutate the product \
+                 object store",
+                cache.display(),
+                product_common_dir.display()
+            ));
+        }
+        // A NON-BARE cache is the precondition for the incident this file
+        // exists to prevent, not a style preference. A repository with a
+        // worktree has a checked-out HEAD, and `fetch --force
+        // +refs/heads/main:refs/heads/main` -- which this script runs -- will
+        // move a checked-out branch. That is how a foreign fetch once updated a
+        // checked-out `main` in this repository and left a Hermit checkout
+        // sitting at Reverie's HEAD, reporting 3,615 apparently-dirty paths.
+        // Nothing above proves bareness: distinctness from the product only
+        // establishes that it is a DIFFERENT repository, not a safe one.
+        let bare = isolated_git_command()?
+            .arg("--git-dir")
+            .arg(&cache_git_dir)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .map_err(|error| format!("could not query the graph cache repository kind: {error}"))?;
+        if !bare.status.success() {
+            return Err(format!(
+                "could not determine whether the Reverie graph cache {} is bare: {}",
+                cache_git_dir.display(),
+                String::from_utf8_lossy(&bare.stderr).trim()
+            ));
+        }
+        let bare = String::from_utf8_lossy(&bare.stdout).trim().to_owned();
+        if bare != "true" {
+            return Err(format!(
+                "REFUSING Reverie graph cache: {} is not a bare repository \
+                 (rev-parse --is-bare-repository reported {bare:?}). A cache with a worktree has \
+                 a checked-out HEAD that this script's `fetch --force` into refs/heads/main can \
+                 move.",
+                cache_git_dir.display()
+            ));
+        }
+        Ok(Self {
+            git_dir: cache_git_dir,
+        })
+    }
+
+    fn run(&self, args: &[&str]) -> Result<Output, String> {
+        isolated_git_command()?
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not run isolated git {}: {error}", args.join(" ")))
+    }
+}
+
+/// Run Git against `dir`, with Git's repository-selecting environment cleared.
+///
+/// `-C` changes directory; it does NOT override an inherited `GIT_DIR`, which
+/// still selects the inherited repository after the chdir. Without this, an
+/// explicit `--repo PATH` is only as trustworthy as the environment the checker
+/// happened to be launched from -- the user names one repository and Git reads
+/// another. Every caller here aims at a specific checkout, so every caller wants
+/// the isolated form.
 fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    isolated_git_command()?
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1440,7 +1745,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         }
     }
 
-    let behind = git_in(&graph, &["rev-list", "--count", &format!("{pin}..{main}")])?;
+    let behind = graph.run(&["rev-list", "--count", &format!("{pin}..{main}")])?;
     let lag = String::from_utf8_lossy(&behind.stdout).trim().to_string();
     if pin == main {
         println!(
@@ -1793,6 +2098,262 @@ mod tests {
                 .status
                 .success()
         );
+    }
+
+    /// Every REPOSITORY-SELECTING variable must be cleared, and a poisoned
+    /// config override must never reach the child either.
+    ///
+    /// This test previously asserted that EVERY name Git reports as local is
+    /// cleared, config overrides included. That is what erased the caller's
+    /// `-c` settings -- see `CONFIG_OVERRIDE_ENV_VARS`. The assertion is not
+    /// relaxed here so much as split: the selection variables are still checked
+    /// exactly as before, and the config variables gain a STRICTER check than
+    /// they had, because it is no longer enough for them to be absent or
+    /// present -- their value must be the PARENT's, never the poison.
+    #[test]
+    fn isolated_commands_clear_every_git_local_environment_variable() {
+        let vars = git_local_env_vars().expect("enumerate Git local environment");
+        const POISON: &str = "poisoned-by-parent-git-process";
+        let mut command = Command::new("env");
+        for name in vars {
+            command.env(name, POISON);
+        }
+        clear_git_local_env(&mut command).expect("clear Git local environment");
+        let output = command.output().expect("print child environment");
+        assert!(output.status.success());
+        let child_env = String::from_utf8_lossy(&output.stdout);
+        let value_of = |name: &str| -> Option<String> {
+            let assignment = format!("{name}=");
+            child_env
+                .lines()
+                .find(|line| line.starts_with(&assignment))
+                .map(|line| line[assignment.len()..].to_owned())
+        };
+
+        for name in vars {
+            let name = name.to_string_lossy().into_owned();
+            if CONFIG_OVERRIDE_ENV_VARS.contains(&name.as_str()) {
+                // Not a repository selection. It must carry the PARENT's value,
+                // or be absent when the parent has none -- but never the poison.
+                match (env::var(&name).ok(), value_of(&name)) {
+                    (Some(parent), Some(child)) => assert_eq!(
+                        child, parent,
+                        "{name} must reach the child as the parent's value, not {child}"
+                    ),
+                    (None, child) => assert_eq!(
+                        child, None,
+                        "{name} is unset in the parent, so nothing may reach the child"
+                    ),
+                    (Some(parent), None) => panic!(
+                        "{name} was set to {parent} in the parent and must be preserved"
+                    ),
+                }
+                assert_ne!(
+                    value_of(&name).as_deref(),
+                    Some(POISON),
+                    "{name} leaked the poisoned parent-Git value into the child"
+                );
+                continue;
+            }
+            assert!(
+                value_of(&name).is_none(),
+                "isolated command retained {name}, which selects a repository"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_git_dir_imports_foreign_main_but_cleared_fetch_is_safe() {
+        let root = temp_path("git-env-victim");
+        let remote = temp_path("git-env-foreign");
+        let cache = root.join("target/ci/raw-cache.git");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+
+        let victim_main = commit_file(&root, "victim", "Hermit\n");
+        assert!(
+            git_in(&root, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let foreign_main = commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::create_dir_all(&cache).expect("create raw cache directory");
+
+        // This is the exact incident shape. `-C cache` changes directory, but
+        // inherited GIT_DIR still selects the product repository. core.bare
+        // removes Git's checked-out-branch refusal, so the foreign main lands
+        // in the product repository.
+        assert!(
+            git_in(&root, &["config", "core.bare", "true"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let victim_git_dir = root.join(".git");
+        let vulnerable = Command::new("git")
+            .env("GIT_DIR", &victim_git_dir)
+            .arg("-C")
+            .arg(&cache)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--force",
+                remote.to_str().expect("UTF-8 fixture path"),
+                "+refs/heads/main:refs/heads/main",
+            ])
+            .output()
+            .expect("run vulnerable fetch");
+        assert!(
+            vulnerable.status.success(),
+            "the regression bracket must reproduce the import: {}",
+            String::from_utf8_lossy(&vulnerable.stderr)
+        );
+        let imported = Command::new("git")
+            .arg("--git-dir")
+            .arg(&victim_git_dir)
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .expect("read imported main");
+        assert_eq!(
+            String::from_utf8_lossy(&imported.stdout).trim(),
+            foreign_main,
+            "the raw command must demonstrate the foreign-ref import"
+        );
+
+        // Restore only the disposable fixture, then run the same fetch after
+        // applying the production environment isolation. The foreign ref must
+        // land in the cache and the product main must remain unchanged.
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&victim_git_dir)
+                .args(["update-ref", "refs/heads/main", &victim_main])
+                .status()
+                .expect("restore fixture main")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&victim_git_dir)
+                .args(["config", "core.bare", "false"])
+                .status()
+                .expect("restore fixture core.bare")
+                .success()
+        );
+        let init = isolated_git_command()
+            .expect("build isolated init")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&cache)
+            .output()
+            .expect("initialize cache");
+        assert!(init.status.success());
+
+        let mut safe = Command::new("git");
+        safe.env("GIT_DIR", &victim_git_dir);
+        clear_git_local_env(&mut safe).expect("isolate cache fetch");
+        let safe_fetch = safe
+            .arg("--git-dir")
+            .arg(&cache)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--force",
+                remote.to_str().expect("UTF-8 fixture path"),
+                "+refs/heads/main:refs/heads/main",
+            ])
+            .output()
+            .expect("run isolated fetch");
+        assert!(safe_fetch.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&root, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            victim_main,
+            "isolated cache fetch must not move product main"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &isolated_git_in(&cache, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            foreign_main,
+            "isolated fetch must still update the intended cache"
+        );
+
+        fs::remove_dir_all(root).expect("remove victim fixture");
+        fs::remove_dir_all(remote).expect("remove foreign fixture");
+    }
+
+    #[test]
+    fn reverie_graph_refuses_cache_that_resolves_to_product_common_git_dir() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("same-gitdir-victim");
+        let remote = temp_path("same-gitdir-foreign");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        let victim_main = commit_file(&root, "victim", "Hermit\n");
+        assert!(
+            git_in(&root, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let cache = root.join("target/ci/reverie-graph.git");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        symlink(root.join(".git"), &cache).expect("point cache at product git-dir");
+
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+            .expect_err("cache resolving to product common git-dir must be refused");
+        // This fixture builds the alias with a SYMLINK, so the symlink guard is
+        // the one that fires, and it fires EARLIER than the identity guard did
+        // -- before `git init` runs at all, which is the point of resolving
+        // before acting. The safety assertion below is unchanged, and the
+        // identity guard keeps its own coverage in
+        // `reverie_graph_refuses_a_real_directory_aliasing_the_product` and in
+        // `guarded_repo_refuses_a_linked_worktree_of_the_product`.
+        assert!(
+            error.contains("REFUSING Reverie graph cache")
+                && (error.contains("is a symbolic link")
+                    || error.contains("resolves to the Hermit common git-dir")),
+            "refusal must identify a violated cache guard: {error}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&root, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            victim_main,
+            "the refusal must fire before any foreign ref update"
+        );
+
+        fs::remove_dir_all(root).expect("remove victim fixture");
+        fs::remove_dir_all(remote).expect("remove foreign fixture");
     }
 
     /// NEGATIVE SIDE: plant a checkout that is strictly behind `origin/main`
@@ -2499,5 +3060,337 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    /// DEFECT 1 REGRESSION: a linked worktree of the product repository must be
+    /// refused as a graph cache.
+    ///
+    /// Old-fails / new-passes: with the previous check -- cache `--git-dir`
+    /// against product `--git-common-dir` -- a linked worktree reports
+    /// `<common>/worktrees/<name>` for its git-dir, which never equals
+    /// `<common>`, so `open` returned Ok and every subsequent `fetch --force`
+    /// wrote into the PRODUCT repository's shared object store.
+    #[test]
+    fn guarded_repo_refuses_a_linked_worktree_of_the_product() {
+        let base = std::env::temp_dir().join(format!(
+            "reverie-pin-worktree-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let product = base.join("product");
+        fs::create_dir_all(&product).expect("create product repository");
+        assert!(
+            git_in(&product, &["init", "-q"]).unwrap().status.success(),
+            "init product"
+        );
+        assert!(
+            git_in(&product, &["config", "user.email", "pin-test@example.com"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            git_in(&product, &["config", "user.name", "Reverie Pin Test"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::write(product.join("seed"), "seed\n").expect("seed file");
+        assert!(git_in(&product, &["add", "seed"]).unwrap().status.success());
+        assert!(
+            git_in(&product, &["commit", "-qm", "seed"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let linked = base.join("linked");
+        let added = git_in(
+            &product,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                linked.to_str().expect("utf-8 worktree path"),
+            ],
+        )
+        .expect("run git worktree add");
+        assert!(
+            added.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+
+        // Precondition that makes this test meaningful: the linked worktree's
+        // git-dir really is DIFFERENT from the product common dir, which is
+        // exactly why the old single comparison let it through.
+        let linked_git_dir = canonical_git_path(&linked, "--git-dir").expect("linked git-dir");
+        let product_common =
+            canonical_git_path(&product, "--git-common-dir").expect("product common dir");
+        assert_ne!(
+            linked_git_dir, product_common,
+            "precondition: a linked worktree's git-dir must differ from the common dir, \
+             otherwise this test cannot discriminate the old behaviour"
+        );
+
+        let error = GuardedGitRepo::open(&linked, &product)
+            .expect_err("a linked worktree of the product must be refused as a graph cache");
+        assert!(
+            error.contains("linked worktree"),
+            "unexpected refusal text: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// DEFECT 2 REGRESSION: repository-selecting variables must be cleared.
+    ///
+    /// Old-fails / new-passes for `git_root`/`git_in` is asserted structurally
+    /// rather than by mutating the process environment, because these tests run
+    /// in parallel threads and `set_var` would race every other test in the
+    /// file.
+    #[test]
+    fn isolated_command_clears_repository_selecting_env() {
+        let command = isolated_git_command().expect("build isolated git command");
+        let removed: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for required in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+            assert!(
+                removed.contains(required),
+                "{required} must be cleared for a command aimed at another repository; \
+                 cleared set was {removed:?}"
+            );
+        }
+    }
+
+    /// DEFECT 3 REGRESSION: the caller's config overrides must survive.
+    ///
+    /// Old-fails / new-passes: the previous `clear_git_local_env` removed every
+    /// name Git reported, and Git reports `GIT_CONFIG_COUNT` and
+    /// `GIT_CONFIG_PARAMETERS` among them. Removing the count orphans the
+    /// `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs, which Git never reports and
+    /// so never removes -- the overrides disappear with nothing left to show it.
+    /// On this fleet that silently drops the forward proxy's three
+    /// `url.https://github.com/.insteadOf` rewrites.
+    #[test]
+    fn isolated_command_preserves_config_overrides() {
+        let reported = git_local_env_vars().expect("enumerate git local env vars");
+        let reported: BTreeSet<String> = reported
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        // Precondition: without it this test proves nothing on a Git that does
+        // not report the config names as local.
+        assert!(
+            reported.contains("GIT_CONFIG_COUNT") || reported.contains("GIT_CONFIG_PARAMETERS"),
+            "precondition: this Git does not report config overrides as local env vars, \
+             so the erasure this test guards cannot occur; reported: {reported:?}"
+        );
+
+        let command = isolated_git_command().expect("build isolated git command");
+        let removed: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        let kept: BTreeSet<String> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_some())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for preserved in CONFIG_OVERRIDE_ENV_VARS {
+            // Only a variable the parent actually sets can be observed as
+            // preserved; removing one the parent never set is a no-op and
+            // asserting on it would make this test depend on the shell.
+            if env::var_os(preserved).is_none() {
+                continue;
+            }
+            assert!(
+                kept.contains(preserved) && !removed.contains(preserved),
+                "{preserved} carries the caller's configuration, not a repository selection, \
+                 and must survive isolation; kept {kept:?}, cleared {removed:?}"
+            );
+        }
+    }
+
+    /// FINDING 2 COMPANION: the identity guard must still be reachable when no
+    /// symbolic link is involved, so that the new symlink refusal has not
+    /// quietly become the only thing being tested.
+    ///
+    /// The alias here is a REAL DIRECTORY -- a linked worktree of the product
+    /// created at the cache path -- so `resolve_cache_path` has nothing to
+    /// refuse and the common-dir comparison is what stops it.
+    #[test]
+    fn reverie_graph_refuses_a_real_directory_aliasing_the_product() {
+        let root = temp_path("real-alias-victim");
+        let remote = temp_path("real-alias-foreign");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        let victim_main = commit_file(&root, "victim", "Hermit\n");
+        assert!(
+            git_in(&root, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+
+        let cache = root.join("target/ci/reverie-graph.git");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        let added = git_in(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                cache.to_str().expect("UTF-8 cache path"),
+            ],
+        )
+        .expect("run git worktree add");
+        assert!(
+            added.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        assert!(
+            !fs::symlink_metadata(&cache)
+                .expect("stat cache")
+                .file_type()
+                .is_symlink(),
+            "precondition: this fixture must not involve a symlink, or it would \
+             exercise the wrong guard"
+        );
+
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+            .expect_err("a real directory aliasing the product must be refused");
+        assert!(
+            error.contains("REFUSING Reverie graph cache")
+                && error.contains("linked worktree"),
+            "refusal must identify the identity guard: {error}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&root, &["rev-parse", "refs/heads/main"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            victim_main,
+            "the refusal must fire before any foreign ref update"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// FINDING 1 REGRESSION: a distinct but NON-BARE cache must be refused.
+    ///
+    /// Distinctness from the product only proves it is a different repository,
+    /// not a safe one. A cache with a worktree has a checked-out HEAD, and this
+    /// script fetches `--force +refs/heads/main:refs/heads/main`, which moves a
+    /// checked-out branch.
+    #[test]
+    fn guarded_repo_refuses_a_non_bare_cache() {
+        let product = temp_path("nonbare-product");
+        let cache = temp_path("nonbare-cache");
+        init_fixture_repo(&product);
+        commit_file(&product, "seed", "seed\n");
+        init_fixture_repo(&cache);
+        commit_file(&cache, "seed", "seed\n");
+
+        // Precondition: distinct repositories, so only bareness can refuse it.
+        let cache_common = canonical_git_path(&cache, "--git-common-dir").expect("cache common");
+        let product_common =
+            canonical_git_path(&product, "--git-common-dir").expect("product common");
+        assert_ne!(
+            cache_common, product_common,
+            "precondition: the fixtures must be distinct repositories"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&cache, &["rev-parse", "--is-bare-repository"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim(),
+            "false",
+            "precondition: the cache fixture must not be bare"
+        );
+
+        let error = GuardedGitRepo::open(&cache, &product)
+            .expect_err("a non-bare cache must be refused");
+        assert!(
+            error.contains("is not a bare repository"),
+            "unexpected refusal text: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&product);
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// FINDING 2 REGRESSION, and the one that discriminates ORDER rather than
+    /// outcome: nothing may be created through the link before validation.
+    ///
+    /// The other symlink fixture points at the product git-dir, where the
+    /// identity guard would also have refused -- after `git init` had already
+    /// run. This one points somewhere the identity guard has no opinion about,
+    /// so the only thing that can stop a write is resolving before acting. The
+    /// assertion is on the FILESYSTEM, not on the error text: the link target
+    /// must still be empty afterwards.
+    #[test]
+    fn reverie_graph_creates_nothing_through_a_symlinked_cache() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("symlink-order-victim");
+        let remote = temp_path("symlink-order-foreign");
+        let elsewhere = temp_path("symlink-order-target");
+        init_fixture_repo(&root);
+        init_fixture_repo(&remote);
+        commit_file(&root, "victim", "Hermit\n");
+        commit_file(&remote, "foreign", "Reverie\n");
+        assert!(
+            git_in(&remote, &["branch", "-M", "main"])
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::create_dir_all(&elsewhere).expect("create link target");
+
+        let cache = root.join("target/ci/reverie-graph.git");
+        fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
+        symlink(&elsewhere, &cache).expect("point cache outside the checkout");
+
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+            .expect_err("a symlinked cache must be refused");
+        assert!(
+            error.contains("is a symbolic link"),
+            "unexpected refusal text: {error}"
+        );
+
+        let created: Vec<_> = fs::read_dir(&elsewhere)
+            .expect("read link target")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        assert!(
+            created.is_empty(),
+            "git init ran through the symlink before validation and created {created:?} in {}",
+            elsewhere.display()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&remote);
+        let _ = fs::remove_dir_all(&elsewhere);
     }
 }
