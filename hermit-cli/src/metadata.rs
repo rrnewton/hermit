@@ -44,7 +44,18 @@ impl RecordVersion {
 /// hermit record/replay version.
 // NB: Increase the version number when there are breaking changes, i.e.:
 // when new syscalls or event schemas are added.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10b);
+//
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#2373)
+// 0x10b -> 0x10c: flock(2) stopped being a Detcore no-op and now reaches
+// `record_or_replay`, so a post-fix run emits a `Return` event per flock call.
+// Replay re-issues calls for materialized descriptors and fails closed when it
+// cannot reproduce the lock side effect. A 0x10b recording contains NO flock
+// event at all -- the old handler returned Ok(0) before ever reaching the
+// recorder, even though flock was already classified Determinized -- so
+// replaying one under this build would read the next thread event for every
+// flock and desynchronize the stream. The version gate must refuse it.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10c);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -327,6 +338,16 @@ mod tests {
                 "{phase} must leave unlisted PassThrough chdir unsubscribed"
             );
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#2373)
+    /// A 0x10b recording predates flock forwarding, so it carries no flock event
+    /// while this replayer expects one per call. Replaying it would consume some
+    /// other event and desynchronize; the version gate must refuse it instead.
+    #[test]
+    fn record_version_rejects_pre_flock_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10b)));
     }
 
     #[test]
