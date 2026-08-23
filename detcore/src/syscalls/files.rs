@@ -1024,7 +1024,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut remaining = call.len();
 
             loop {
-                match self.record_or_replay(guest, call).await {
+                match self
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await
+                {
                     Ok(written) => {
                         let Ok(written) = usize::try_from(written) else {
                             break Err(Errno::EIO.into());
@@ -1062,12 +1065,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_len(remaining)
                             .with_offset(next_offset);
                     }
-                    Err(_) if total_written > 0 => break Ok(total_written),
-                    Err(error) => break Err(error.into()),
+                    Err(Error::Errno(_)) if total_written > 0 => break Ok(total_written),
+                    Err(error) => break Err(error),
                 }
             }
         } else {
-            self.record_or_replay(guest, call).await.map_err(Into::into)
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
         };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
@@ -1219,9 +1223,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = self.record_or_replay(guest, call).await;
+        let res = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
         resource_release_all(guest).await;
-        Ok(res?)
+        res
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1249,9 +1255,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = self.record_or_replay(guest, call).await;
+        let res = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
         resource_release_all(guest).await;
-        Ok(res?)
+        res
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1288,7 +1296,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+        let result = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
@@ -1330,7 +1340,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let result = self.record_or_replay(guest, call).await.map_err(Into::into);
+        let result = self
+            .record_or_replay_preserving_tool_errors(guest, call)
+            .await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
