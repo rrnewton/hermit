@@ -17,6 +17,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+/* Number of behavioural checks this fixture must complete; a lower count is a
+   failure, not a smaller success.
+
+   CONSEQUENCE TO WEIGH BEFORE ENABLING ANOTHER CELL: the KVM ElfExecutor
+   personality returns deterministic ENOSYS for syncfs and so reaches 5, as this
+   file's own header records. The only enabled cell is verify/ptrace, where 6 is
+   correct. Enabling verify/kvm would make this fixture exit 1 until that gap is
+   closed -- which is the honest report, not a reason to lower the constant.
+*/
+#define EXPECTED_CHECKS 6
+
 int main(void) {
   int ok = 0;
 
@@ -24,7 +35,7 @@ int main(void) {
   int fd = mkstemp(path);
   if (fd < 0) {
     printf("sync ok=0\n");
-    return 0;
+    return 1;
   }
 
   /* 1: a short write establishes dirty data to flush. */
@@ -61,5 +72,14 @@ int main(void) {
   unlink(path);
 
   printf("sync ok=%d\n", ok);
-  return 0;
+  /* Route a behavioural failure into the exit status. Without this the guest
+       exits 0 whatever `ok` reached, so a regression only lowered the printed
+       number -- and under --verify both runs lower it identically, so the
+       comparison still matches and the cell stays green. Every check above is
+       unchanged; this only requires all of them. */
+    if (ok != EXPECTED_CHECKS) {
+        fprintf(stderr, "sync completed %d of %d checks\n", ok, EXPECTED_CHECKS);
+        return 1;
+    }
+    return 0;
 }
