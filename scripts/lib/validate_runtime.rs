@@ -523,13 +523,38 @@ fn flock_nb(fd: i32) -> bool {
 /// a LIVENESS CHECK, so a record left by an earlier run can never be presented as
 /// a live process. The lock is `flock`, so the "holder died with the lock held"
 /// case does not exist to be reclaimed.
+/// The descriptive record beside the per-checkout invocation lock. ONE
+/// definition, so the writer, the refusal reader, and the log-path update
+/// cannot drift onto different files.
+fn invocation_holder_path(root: &Path) -> PathBuf {
+    root.join("target/validation").join("validate-invocation.holder")
+}
+
+/// Record where this run's durable log lives, so a later validate that is
+/// REFUSED can print a command to tail it.
+///
+/// The lock is claimed BEFORE the durable log exists, so the holder record is
+/// necessarily written without one; this appends the path once it is known.
+/// Only the process holding the lock may call this. Appends rather than
+/// rewrites: the pid/started_at/commit/profile/checkout lines are how a reader
+/// identifies the holder, and losing them to a partial rewrite would be worse
+/// than having no log line. Does not create the file - if the record is gone
+/// the lock is no longer ours to describe.
+pub fn record_invocation_log_path(root: &Path, log: &Path) {
+    use std::io::Write;
+    let holder = invocation_holder_path(root);
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&holder) {
+        let _ = writeln!(f, "log={}", log.display());
+    }
+}
+
 pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> LockOutcome {
     let dir = root.join("target/validation");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return LockOutcome::Unavailable(format!("cannot create {}: {e}", dir.display()));
     }
     let lock_path = dir.join("validate-invocation.lock");
-    let holder = dir.join("validate-invocation.holder");
+    let holder = invocation_holder_path(root);
     let file = match std::fs::OpenOptions::new().create(true).append(true).open(&lock_path) {
         Ok(f) => f,
         Err(e) => {
@@ -546,10 +571,35 @@ pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> Lock
             .lines()
             .find_map(|l| l.strip_prefix("pid="))
             .and_then(|v| v.trim().parse::<i32>().ok());
+        // Only a LIVE holder has a log worth watching; a stale record's log
+        // describes a run that already ended. Held back and pushed LAST so the
+        // refusal ends with something directly pastable.
+        let mut watch: Vec<String> = Vec::new();
         match holder_pid {
             Some(pid) if unsafe { libc::kill(pid, 0) } == 0 => {
                 msg.push(format!("holder (pid {pid} is LIVE):"));
                 msg.extend(record.lines().map(|l| format!("  {l}")));
+                match record
+                    .lines()
+                    .find_map(|l| l.strip_prefix("log="))
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                {
+                    // `-F` not `-f`: the holder may rotate or recreate the file,
+                    // and it may finish between this refusal and the paste.
+                    Some(path) => {
+                        watch.push("watch the holder's live log with:".into());
+                        watch.push(format!("  tail -F {path}"));
+                    }
+                    // Say so rather than printing a guessed path: the lock is
+                    // claimed before the durable log is opened, so a holder that
+                    // is still starting up genuinely has no log yet.
+                    None => watch.push(
+                        "the holder has not opened its durable log yet, so there is nothing to \
+                         tail; re-run this command in a moment to get the path"
+                            .into(),
+                    ),
+                }
             }
             Some(pid) => {
                 msg.push(format!(
@@ -566,6 +616,7 @@ pub fn acquire_invocation_lock(root: &Path, profile: &str, commit: &str) -> Lock
                 .into(),
         );
         msg.push("wait for the holder to finish, or run in a different checkout".into());
+        msg.extend(watch);
         return LockOutcome::Busy(msg);
     }
     let record = format!(
@@ -1038,6 +1089,36 @@ pub fn self_test() -> Result<String, String> {
                 let joined = msg.join("\n");
                 if !joined.contains("is LIVE") || !joined.contains(&std::process::id().to_string()) {
                     return Err(format!("lock: refusal must name the LIVE holder pid: {joined}"));
+                }
+                // Before the holder records a log there is nothing to tail, and
+                // the refusal must SAY so rather than print a guessed path.
+                if !joined.contains("has not opened its durable log yet") {
+                    return Err(format!(
+                        "lock: with no recorded log the refusal must say so, not guess: {joined}"
+                    ));
+                }
+                if joined.contains("tail -F") {
+                    return Err(format!(
+                        "lock: refusal offered a tail command with no recorded log: {joined}"
+                    ));
+                }
+            }
+            _ => return Err("lock: a second concurrent claim MUST be refused".into()),
+        }
+        // With a log recorded, the refusal must END with a pastable command
+        // naming that exact path. This is the whole point of the record.
+        let fake_log = sandbox.join("holder-run.log");
+        std::fs::write(&fake_log, "holder log\n").map_err(|e| format!("lock bracket: {e}"))?;
+        record_invocation_log_path(&sandbox, &fake_log);
+        match acquire_invocation_lock(&sandbox, "self-test", "0000000") {
+            LockOutcome::Busy(msg) => {
+                lock_refuse += 1;
+                let want = format!("  tail -F {}", fake_log.display());
+                if msg.last().map(String::as_str) != Some(want.as_str()) {
+                    return Err(format!(
+                        "lock: refusal must END with `{want}`, got: {:?}",
+                        msg.last()
+                    ));
                 }
             }
             _ => return Err("lock: a second concurrent claim MUST be refused".into()),

@@ -6560,6 +6560,13 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Safe: just assigned. Cloned so the summary and the ledger can both name it
     // without borrowing the live tee handle.
     let log_path = durable_slot.as_ref().map(|d| d.path.clone()).unwrap_or_default();
+    // Now that the log exists, tell the holder record where it is, so a validate
+    // REFUSED against this one can print a command to tail it. Gated on actually
+    // holding the lock: a nested payload must never rewrite the outer run's
+    // record, and an UNGUARDED run (lock unavailable) has no record to append to.
+    if _invocation_lock.is_some() {
+        validate_runtime::record_invocation_log_path(&root, &log_path);
+    }
     let e2e_result_root =
         match configure_e2e_result_root(&root, &log_path, &tmp.join("e2e-build")) {
             Ok(path) => path,
