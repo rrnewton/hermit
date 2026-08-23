@@ -11,20 +11,20 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `ptrace` | 219 | 795 | 1014 |
 | `dbt` | 0 | 1014 | 1014 |
 | `kvm` | 0 | 1014 | 1014 |
-| `sabre` | 53 | 961 | 1014 |
+| `sabre` | 54 | 960 | 1014 |
 | `liteinst` | 0 | 1014 | 1014 |
 | `native` | 0 | 338 | 338 |
-| **Total** | **272** | **5136** | **5408** |
+| **Total** | **273** | **5135** | **5408** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 217 / 338 | 0 / 338 | 0 / 338 | 53 / 338 | 0 / 338 | — | 270 | 1420 | 1690 |
+| `verify` | 217 / 338 | 0 / 338 | 0 / 338 | 54 / 338 | 0 / 338 | — | 271 | 1419 | 1690 |
 | `replay` | 1 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | — | 1 | 1689 | 1690 |
 | `chaos` | 1 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | 0 / 338 | — | 1 | 1689 | 1690 |
 | `naked` | — | — | — | — | — | 0 / 338 | 0 | 338 | 338 |
-| **Total** | | | | | | | **272** | **5136** | **5408** |
+| **Total** | | | | | | | **273** | **5135** | **5408** |
 
 ## Cross-backend parity
 
@@ -50,4 +50,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 24 / 26 | 1 / 26 | 0 / 26 | 25 | 78 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 274 selected regression cells: the 272 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 275 selected regression cells: the 273 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

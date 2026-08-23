@@ -1454,10 +1454,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - sabre
+        assert:
+          bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
-          sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
         ci: false
