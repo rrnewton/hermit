@@ -133,31 +133,31 @@ grep -oE 'detcore[a-z_:]*'      /tmp/h.log | sort | uniq -c | sort -rn    # subs
 
 ## 2. Finding a nondeterminism / divergence point
 
-When `hermit run --strict --verify --verify-strict` reports
+When `hermit run --strict --verify` reports
 "nondeterministic", Hermit already ran twice and compared exact
 exit/stdout/stderr plus INFO events under `BitwiseInfoV1`. To localize the
-divergence yourself, capture two runs and use the **built-in log differ**. Its
-more aggressive normalization of hex pointers, tmp paths, `/proc/<pid>/`, and
-elapsed-time fields makes it a diagnostic aid only. The final non-KVM fix must
+divergence yourself, capture two runs and use the **built-in log differ**. It
+uses the same canonical INFO comparison by default: only the leading wall-clock
+prefix and explicitly marked host addresses are canonicalized. The final fix on a supported canonical evidence path must
 produce `bitwise_parity: true` through `--verify-json`; KVM's output-only
 fallback is not full L2 INFO parity.
 
 ```bash
 hermit --log info run -- <program> 2>/tmp/a.log
 hermit --log info run -- <program> 2>/tmp/b.log
-hermit log-diff /tmp/a.log /tmp/b.log        # compares COMMIT + DETLOG only
+hermit log-diff /tmp/a.log /tmp/b.log        # compares every INFO message
 ```
 
 Useful `log-diff` flags (`detcore/src/logdiff.rs`):
 
 | Flag | Effect |
 | --- | --- |
-| `--unsafe-strip-lines` | **Non-parity diagnostic only.** Erases timestamps and syscall values; using it to make a failing parity diff pass is cheating. |
 | `--syscall-history <N>` | Print the N completed syscalls *before* each divergence — the context that tells you what led up to it. |
-| `--ignore-lines <substr>` | Drop lines containing a substring before comparing (repeatable). |
-| `--skip-commit` / `--skip-detlog` | Compare only DETLOG, or only COMMIT, to tell a *scheduling* divergence from a *syscall/data* divergence. |
-| `--include-detlogs syscall,syscallresult,other` | Narrow which DETLOG classes count. |
 | `--limit 0` | Don't elide after 20 diffs; show all. |
+| `--no-color` | Emit a plain-text diff suitable for retained logs. |
+
+The old line-stripping, ignore, COMMIT/DETLOG skipping, and DETLOG-subset flags
+were deleted because they changed comparison semantics.
 
 **Interpretation:** the *first* divergence is the one that matters; everything
 after it is downstream noise. If the first diff is a **COMMIT** line
@@ -211,9 +211,16 @@ Per `AGENTS.md`, never say "works". State the level, backend, log level, and
 relaxations:
 
 - **L1** deterministic: `hermit run --strict` completes.
-- **L2** non-KVM canonical full-observation parity:
-  `hermit run --strict --verify --verify-strict --verify-json <path> -- ...`,
+- **L2** canonical full-observation parity on a supported evidence path:
+  `hermit run --strict --verify --verify-json <path> -- ...`,
   with JSON `bitwise_parity: true`.
+- **DBT L2**: bare `--verify --verify-json` is canonical only when protected
+  framed evidence is present and nonempty, authenticates and validates
+  successfully, contains nonzero INFO records for both runs, and the JSON
+  reports `bitwise_parity: true`. Missing, empty, or invalid evidence fails
+  closed and is not L2.
+- **KVM current limit**: output/status-only verification is not full L2 INFO
+  parity.
 - **L3** memory determinism: add `--detlog-heap --detlog-stack` to L2.
 - **L4** stress-hardened: L2/L3 repeated ~20x with no divergence.
 
@@ -224,8 +231,8 @@ relaxations: none)".
 
 - `detcore/src/scheduler.rs` — the sched loop; `[scheduler]`, `[sched-step*]`,
   and COMMIT emission (`info!`/`debug!`/`trace!`). The COMMIT point is step 4.
-- `detcore/src/logdiff.rs` — the log comparator: `strip_log_entry`
-  normalization, `is_commit`/`is_detlog`, `LogComparisonMode`, `LogDiffOpts`.
+- `detcore/src/logdiff.rs` — canonical INFO parsing, marked-address
+  canonicalization, `LogComparisonMode`, and `LogDiffOpts`.
 - `detcore-model/src/time.rs` — `LogicalTime`, `DetTime`, `GlobalTime`, and the
   RCB↔nanosecond conversions.
 - `detcore/src/syscalls/` — per-syscall handlers (`files.rs`, etc.).

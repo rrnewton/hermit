@@ -44,13 +44,17 @@ KVM changes also contain `Relationship to gVisor`; a triggered PR contains
 `Human Review Required` naming the numbered triggers. A determinism proof
 explains the model, not only tests.
 
-For non-KVM L2 evidence, use `--verify --verify-strict --verify-json` and require
-`bitwise_parity: true`. Exit status/stdout/stderr are byte-equal; INFO events use
-the declared `BitwiseInfoV1` envelope (only the wall-clock prefix is removed and
-host addresses are ordinalized, while virtual time, branch counts, syscall
-values, sizes, flags, and other payloads remain exact). Default `--verify` is
-lossy, and KVM is output/status-only, so neither is full L2 INFO parity.
-First-sample agreement is not proof of a continuously evolving clock.
+For L2 evidence on a non-KVM canonical evidence path, use bare
+`--verify --verify-json` and require `bitwise_parity: true`. Exit
+status/stdout/stderr are byte-equal; INFO events use the declared
+`BitwiseInfoV1` envelope (only the wall-clock prefix is removed and host
+addresses are ordinalized, while virtual time, branch counts, syscall values,
+sizes, flags, and other payloads remain exact). DBT may claim L2 only when its
+protected framed evidence is present and nonempty, authenticates and validates
+successfully, and contains nonzero INFO records for both runs. Missing, empty,
+or invalid DBT evidence fails closed and is not L2. KVM is output/status-only,
+so it is not full L2 INFO parity. First-sample agreement is not proof of a
+continuously evolving clock.
 
 ## Close precondition
 
