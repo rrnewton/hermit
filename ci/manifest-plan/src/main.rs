@@ -32,6 +32,7 @@ use manifest_value::Value;
 const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
+const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
 #[derive(Debug)]
@@ -155,6 +156,7 @@ fn main() {
     }
 
     validate_front_door(&repo_root, &documents);
+    validate_ci_reason_baseline(&repo_root, &documents);
 
     rows.sort_by(|left, right| {
         (&left.bucket, &left.id, &left.mode, &left.backend).cmp(&(
@@ -344,6 +346,124 @@ fn enforce_exact_ratchet(label: &str, actual: &BTreeSet<String>, baseline: &BTre
     if !unexpected.is_empty() || !stale.is_empty() {
         die(format!(
             "matrix symmetry {label} changed; unexpected={unexpected:?}, stale_baseline={stale:?}. New compatibility coverage must enter a shared schema-v2 YAML manifest, establish ptrace first, and declare every backend/mode cell; remove migrated debt from {MATRIX_SYMMETRY_BASELINE}"
+        ));
+    }
+}
+
+/// Every `ci = false` mode that states no reason and enables no backend, named
+/// `<test id>::<mode>`.
+///
+/// WHY THIS IS NOT ALREADY COVERED. `ci_selection.rs` refuses a reasonless
+/// `ci = false` mode -- but only when the mode still enables a backend. Its
+/// match arm `(false, true, None)` returns an empty map, so a mode that is off
+/// for every backend needs no reason at all. Measured on this corpus, 932 of
+/// 1467 `ci = false` modes are in exactly that state: switched off, and silent
+/// about why. Those are the ones nobody can audit, because there is nothing
+/// written down to audit.
+///
+/// A COUNT WOULD NOT DO. Recording how many exist per bucket lets a change add
+/// one unreasoned cell and write a reason for a different cell in the same
+/// bucket: the count is unchanged and validation passes. Naming each cell is
+/// what makes that swap visible, which is why the baseline is a set.
+fn unreasoned_ci_false_cells(documents: &[Value]) -> BTreeSet<String> {
+    let mut silent = BTreeSet::new();
+    for document in documents {
+        for test in document
+            .get("test")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = test.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(modes) = test.get("modes").and_then(Value::as_table) else {
+                continue;
+            };
+            for mode in MODES {
+                let Some(spec) = modes.get(mode).and_then(Value::as_table) else {
+                    continue;
+                };
+                if spec.get("ci").and_then(Value::as_bool) != Some(false) {
+                    continue;
+                }
+                let enables_a_backend = spec
+                    .get("backends_enabled")
+                    .and_then(Value::as_array)
+                    .is_some_and(|backends| !backends.is_empty());
+                if enables_a_backend {
+                    // ci_selection.rs already refuses this one without a reason.
+                    continue;
+                }
+                let states_a_reason = match spec.get("ci_disabled_reason") {
+                    None => false,
+                    // A structured per-backend reason counts as stated; a plain
+                    // string only counts when it actually says something.
+                    Some(reason) => match reason.as_str() {
+                        Some(text) => !text.trim().is_empty(),
+                        None => true,
+                    },
+                };
+                if !states_a_reason {
+                    silent.insert(format!("{id}::{mode}"));
+                }
+            }
+        }
+    }
+    silent
+}
+
+/// Ratchet the silent default-off cells: the recorded set and the observed set
+/// must match exactly.
+///
+/// Exact match in BOTH directions is deliberate. A new silent cell is refused
+/// by name, and writing a reason for a recorded one is refused until the
+/// baseline is updated too -- which is what stops a compensating swap from
+/// passing unnoticed.
+fn validate_ci_reason_baseline(repo_root: &Path, documents: &[Value]) {
+    let baseline_path = repo_root.join(CI_REASON_BASELINE);
+    let baseline_text = std::fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| die(format!("cannot read {}: {error}", baseline_path.display())));
+    let baseline: JsonValue = serde_json::from_str(&baseline_text).unwrap_or_else(|error| {
+        die(format!(
+            "{}: invalid JSON: {error}",
+            baseline_path.display()
+        ))
+    });
+    let baseline_keys: BTreeSet<_> = baseline
+        .as_object()
+        .unwrap_or_else(|| die(format!("{CI_REASON_BASELINE}: expected an object")))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let expected_keys: BTreeSet<_> = ["schema", "unreasoned_ci_false_cells"]
+        .into_iter()
+        .collect();
+    if baseline_keys != expected_keys {
+        die(format!(
+            "{CI_REASON_BASELINE}: keys must be exactly {expected_keys:?}, got {baseline_keys:?}"
+        ));
+    }
+    if baseline.get("schema").and_then(JsonValue::as_u64) != Some(1) {
+        die(format!("{CI_REASON_BASELINE}: schema must be 1"));
+    }
+    let recorded = json_string_set(&baseline, "unreasoned_ci_false_cells", CI_REASON_BASELINE);
+    let observed = unreasoned_ci_false_cells(documents);
+    let added: Vec<_> = observed.difference(&recorded).cloned().collect();
+    let removed: Vec<_> = recorded.difference(&observed).cloned().collect();
+    if !added.is_empty() {
+        die(format!(
+            "a `ci = false` mode states no ci_disabled_reason and enables no backend: {added:?}. \
+             Every default-off cell must say why it is off, in its own entry. If this is \
+             deliberate and temporary, say so in ci_disabled_reason; do not add it to \
+             {CI_REASON_BASELINE}, which records existing debt only."
+        ));
+    }
+    if !removed.is_empty() {
+        die(format!(
+            "these cells now state a reason and must be removed from {CI_REASON_BASELINE}: \
+             {removed:?}. The baseline is an exact set so that adding one silent cell while \
+             fixing another cannot pass unnoticed."
         ));
     }
 }
