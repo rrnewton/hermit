@@ -337,6 +337,20 @@ fn preserve_record_or_replay_error(
     }
 }
 
+/// Linux reports a positive byte count when a later guest-visible write error
+/// follows partial progress. An error in the record/replay tool is different:
+/// replay itself failed, so it must remain fatal even after earlier bytes were
+/// accepted.
+pub(crate) fn finish_partial_record_or_replay_write(
+    written: i64,
+    error: Error,
+) -> Result<i64, Error> {
+    match error {
+        Error::Errno(_) if written > 0 => Ok(written),
+        error => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod record_or_replay_error_tests {
     use super::*;
@@ -354,6 +368,32 @@ mod record_or_replay_error_tests {
             preserve_record_or_replay_error(Err(Error::Tool(anyhow::anyhow!("restore failed"))))
                 .expect_err("tool failure must abort replay");
         assert!(matches!(failure.into_errno(), Err(Error::Tool(_))));
+    }
+
+    #[test]
+    fn partial_write_suppresses_only_guest_errno() {
+        assert_eq!(
+            finish_partial_record_or_replay_write(7, Error::Errno(Errno::EPIPE)).unwrap(),
+            7
+        );
+
+        let io_failure = finish_partial_record_or_replay_write(
+            7,
+            Error::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+        )
+        .expect_err("host replay-output failure must not become a partial guest write");
+        assert!(matches!(io_failure.into_errno(), Err(Error::Io(_))));
+
+        let tool_failure = finish_partial_record_or_replay_write(
+            7,
+            Error::Tool(anyhow::anyhow!("replay endpoint disappeared")),
+        )
+        .expect_err("tool failure must not become a partial guest write");
+        assert!(matches!(tool_failure.into_errno(), Err(Error::Tool(_))));
+
+        let guest_failure = finish_partial_record_or_replay_write(0, Error::Errno(Errno::EPIPE))
+            .expect_err("zero-progress guest failure must remain guest-visible");
+        assert_eq!(guest_failure.into_errno().unwrap(), Errno::EPIPE);
     }
 }
 

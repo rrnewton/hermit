@@ -8,11 +8,14 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
@@ -214,6 +217,11 @@ fn workloads() -> &'static [Workload] {
             ("c_sysinfo", "sysinfo.c"),
             ("c_wait_on_child", "wait_on_child.c"),
             ("c_nanosleep_parallel", "nanosleep-par.c"),
+            (
+                "c_ftruncate_ignore_output_error",
+                "ftruncate_ignore_output_error.c",
+            ),
+            ("c_write_ignore_output_error", "write_ignore_output_error.c"),
         ];
         let mut workloads = c_sources
             .into_iter()
@@ -329,6 +337,168 @@ fn record_strict_direct_cli_records_and_replays_echo() {
     assert_eq!(
         replay_output.stdout, b"hello\n",
         "replayed guest stdout did not match recording"
+    );
+}
+
+#[test]
+fn replay_output_sink_failure_aborts_once_without_guest_retry() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_write_ignore_output_error");
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--strict", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path);
+    let record_output = command_output(record, "recording output-sink failure fixture");
+    assert_eq!(record_output.stdout, b"captured-output\n");
+
+    let mut control = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    control
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let control_output = command_output(control, "successful replay-output control");
+    assert_eq!(control_output.stdout, record_output.stdout);
+
+    let full = OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("/dev/full is required for replay output failure coverage");
+    let started = Instant::now();
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=2s", "10s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path())
+        .stdout(Stdio::from(full));
+    let rendered = format!("{replay:?}");
+    let replay_output = replay
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start replay: {rendered}: {error}"));
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&replay_output.stderr);
+
+    assert_eq!(
+        replay_output.status.code(),
+        Some(1),
+        "replay output failure did not terminate as one tool error: {rendered}\n\
+         elapsed: {elapsed:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "replay output failure retried until the watchdog: {elapsed:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("No space left on device"),
+        "replay did not report the output sink cause:\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("Error:"))
+            .count(),
+        1,
+        "replay output failure was not reported exactly once:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("desync") && !stderr.contains("expected"),
+        "replay output failure escaped as a panic or stream divergence:\n{stderr}"
+    );
+}
+
+#[test]
+fn replay_captured_output_ftruncate_failure_aborts_without_panicking() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let guest = workload("c_ftruncate_ignore_output_error");
+    let mut recorded_stdout = tempfile::tempfile().expect("failed to create regular stdout");
+    recorded_stdout
+        .write_all(b"must be truncated")
+        .expect("failed to seed regular stdout");
+
+    let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    record
+        .args(["--log=off", "record", "--strict", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&guest.path)
+        .stdout(Stdio::from(
+            recorded_stdout
+                .try_clone()
+                .expect("failed to clone regular stdout"),
+        ));
+    command_output(record, "recording captured-output ftruncate fixture");
+    assert_eq!(
+        recorded_stdout.metadata().unwrap().len(),
+        0,
+        "recording did not exercise a successful ftruncate on captured stdout"
+    );
+
+    let mut control_stdout = tempfile::tempfile().expect("failed to create replay stdout");
+    control_stdout
+        .write_all(b"must also be truncated")
+        .expect("failed to seed replay stdout");
+    let mut control = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    control
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path())
+        .stdout(Stdio::from(
+            control_stdout
+                .try_clone()
+                .expect("failed to clone replay stdout"),
+        ));
+    command_output(
+        control,
+        "successful captured-output ftruncate replay control",
+    );
+    assert_eq!(
+        control_stdout.metadata().unwrap().len(),
+        0,
+        "replay did not reproduce ftruncate on a compatible captured stdout"
+    );
+
+    let started = Instant::now();
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=2s", "10s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data_dir.path());
+    let rendered = format!("{replay:?}");
+    let replay_output = replay
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start replay: {rendered}: {error}"));
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&replay_output.stderr);
+
+    assert_eq!(
+        replay_output.status.code(),
+        Some(1),
+        "captured-output ftruncate failure did not terminate as one tool error: {rendered}\n\
+         elapsed: {elapsed:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "captured-output ftruncate failure reached the watchdog: {elapsed:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid argument"),
+        "replay did not report the host ftruncate cause:\n{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("Error:"))
+            .count(),
+        1,
+        "captured-output ftruncate failure was not reported exactly once:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("desync") && !stderr.contains("expected"),
+        "captured-output ftruncate escaped as a panic or stream divergence:\n{stderr}"
     );
 }
 
