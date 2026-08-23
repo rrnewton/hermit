@@ -12,21 +12,44 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-void allocateMemory(int size) {
-  char* ptr;
-  ptr = (char*)malloc(size);
+void* allocateMemory(int size) {
+  char* ptr = (char*)malloc(size);
+  if (ptr == NULL) {
+    return NULL;
+  }
   for (int i = 0; i < size; ++i) {
     ptr[i] = 64;
   }
+  return ptr;
 }
 const int MB = 1024 * 1024;
 int main() {
   struct sysinfo info;
   sleep(5);
 
-  allocateMemory(1 * MB); // allocating 1Mb of memory to check in sysinfo result
+  void* allocation =
+      allocateMemory(1 * MB); // allocating 1Mb of memory to check in sysinfo result
+  if (allocation == NULL) {
+    perror("malloc");
+    return EXIT_FAILURE;
+  }
 
-  sysinfo(&info);
+  enum { EXPECTED_CHECKS = 2 };
+  /* Hermit's documented virtual container identity: 1,000,000,000 bytes.
+     freeram is deliberately NOT asserted; it tracks RSS and is the subject
+     of separate determinism work. */
+  const unsigned long VIRT_TOTALRAM = 1000000000UL;
+  int ok = 0;
+
+  if (sysinfo(&info) != 0) {
+    perror("sysinfo");
+    free(allocation);
+    return EXIT_FAILURE;
+  }
+  ok++;
+  if (info.totalram == VIRT_TOTALRAM) {
+    ok++;
+  }
 
   setlocale(LC_NUMERIC, ""); // Print large numbers with commas.
   printf("uptime: %lu sec\n", info.uptime);
@@ -44,4 +67,6 @@ int main() {
   printf("\n");
   printf("mem_unit: %u\n", info.mem_unit);
   printf("Total - free = used: %'lu\n", info.totalram - info.freeram);
+  free(allocation);
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -23,6 +23,7 @@
 #include <time.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     char dir[] = "/tmp/utimensat_determinism.XXXXXX";
     if (!mkdtemp(dir)) {
         printf("utimensat MKDTEMP_FAIL\n");
@@ -44,7 +45,13 @@ int main(void) {
     if (utimensat(AT_FDCWD, path, ts, 0) == 0) ok++;
 
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        unlink(path);
+        rmdir(dir);
+        printf("utimensat FSTAT1_FAIL\n");
+        return EXIT_FAILURE;
+    }
     long a = st.st_atim.tv_sec;
     long m = st.st_mtim.tv_sec;
     // (2) Determinized: both timestamp fields collapse to one value.
@@ -58,7 +65,13 @@ int main(void) {
     if (utimensat(AT_FDCWD, path, ts2, 0) == 0) ok++;
 
     struct stat st2;
-    fstat(fd, &st2);
+    if (fstat(fd, &st2) != 0) {
+        close(fd);
+        unlink(path);
+        rmdir(dir);
+        printf("utimensat FSTAT2_FAIL\n");
+        return EXIT_FAILURE;
+    }
     long a2 = st2.st_atim.tv_sec;
     long m2 = st2.st_mtim.tv_sec;
     // (5) Determinized: fields still collapse and the new mtime was overridden.
@@ -68,5 +81,5 @@ int main(void) {
     unlink(path);
     rmdir(dir);
     printf("utimensat ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

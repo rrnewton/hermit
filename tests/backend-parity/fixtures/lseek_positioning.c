@@ -96,6 +96,7 @@ static int all_zero(const char *buf, size_t from, size_t to) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 11 };
   char template[] = "/tmp/lseek_positioning_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -162,5 +163,5 @@ int main(void) {
 
   printf("lseek_positioning size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

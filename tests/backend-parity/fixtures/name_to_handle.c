@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -34,6 +35,7 @@ union handle_storage {
 };
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
   int ok = 0;
 
   union handle_storage storage;
@@ -88,5 +90,5 @@ int main(void) {
   }
 
   printf("name_to_handle ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

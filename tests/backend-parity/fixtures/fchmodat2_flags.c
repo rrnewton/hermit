@@ -35,6 +35,7 @@ static unsigned mode_of(const char *p) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     char dir[] = "/tmp/fchmodat2_flags.XXXXXX";
     if (!mkdtemp(dir)) {
         printf("fchmodat2 MKDTEMP_FAIL\n");
@@ -71,5 +72,5 @@ int main(void) {
     unlink(path);
     rmdir(dir);
     printf("fchmodat2 ok=%d\n", ok);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

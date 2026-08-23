@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/sem.h>
@@ -28,6 +29,7 @@
  */
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 3 };
   int ok = 0;
 
   errno = 0;
@@ -58,5 +60,5 @@ int main(void) {
   }
 
   printf("sysvipc ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -49,6 +49,7 @@ static int slurp(const char *path, char *buf, size_t cap) {
 }
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 4 };
     char root[] = "/tmp/rn2XXXXXX";
     if (!mkdtemp(root)) {
         perror("mkdtemp");
@@ -91,5 +92,5 @@ int main(void) {
     unlink(a);
     unlink(b);
     rmdir(root);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

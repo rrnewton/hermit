@@ -43,6 +43,7 @@
 #endif
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
   int ok = 0;
 
   char tmpl[] = "/tmp/parity_syncrange_XXXXXX";
@@ -105,5 +106,5 @@ int main(void) {
   close(fd);
   unlink(tmpl);
   printf("syncrange ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
