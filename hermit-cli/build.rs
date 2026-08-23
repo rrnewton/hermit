@@ -32,9 +32,10 @@ fn main() {
     println!("cargo:rustc-env=HERMIT_BUILD_GIT_SHA={sha}");
     println!("cargo:rustc-env=HERMIT_BUILD_DATE={date}");
 
-    // Re-run when the revision, index, or a tracked worktree file changes so
-    // the embedded provenance stays accurate. Untracked generated output is
-    // deliberately excluded by build_support.
+    // Re-run when the checked-out revision or index moves. Arbitrary tracked
+    // worktree files are intentionally not added as explicit watches: avoiding
+    // one Cargo dependency per file keeps incremental builds fast, and staging
+    // an edit refreshes the embedded dirty marker through the watched index.
     for path in git_watch_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
