@@ -46,6 +46,7 @@ static long fsize(const char *path) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 4 };
   char root[ROOT_CAP] = "/tmp/rename_ops_XXXXXX";
   if (mkdtemp(root) == NULL) {
     perror("mkdtemp");
@@ -114,5 +115,5 @@ int main(void) {
   rmdir(root);
 
   printf("rename_ops ok=%d\n", ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

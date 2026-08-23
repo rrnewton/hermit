@@ -56,6 +56,7 @@ static off_t fd_size(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/openat_flags_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -113,7 +114,7 @@ int main(void) {
   int fin = open(template, O_RDONLY);
   if (fin < 0)
     fail("open final");
-  char last[2];
+  char last[2] = {0, 0};
   if (pread(fin, last, sizeof(last), 0) == 2 && memcmp(last, "hi", 2) == 0 &&
       fd_size(fin) == 2)
     ok++;
@@ -129,5 +130,5 @@ int main(void) {
 
   printf("openat_flags size=%ld checksum=%ld ok=%d\n", (long)final_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

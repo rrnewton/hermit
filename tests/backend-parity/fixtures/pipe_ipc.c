@@ -116,5 +116,24 @@ int main(void) {
   int reaped = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : 0;
 
   printf("pipe_ipc bytes=%ld checksum=%ld reaped=%d\n", bytes, checksum, reaped);
-  return 0;
+
+  /* Every expected value below is fixed by this fixture's own constants:
+     the producer writes STREAM_BYTES bytes with stream[i] = (uint8_t)i, so
+     the checksum is the sum of 0..STREAM_BYTES-1, and a producer that exits
+     cleanly is reaped with status 0. Previously all three were printed and
+     discarded, so a truncated, corrupted, or failed transfer still exited 0. */
+  enum { EXPECTED_CHECKS = 3 };
+  long expected_checksum = 0;
+  for (int i = 0; i < STREAM_BYTES; ++i)
+    expected_checksum += (uint8_t)i;
+
+  int ok = 0;
+  if (bytes == (long)STREAM_BYTES)
+    ok++;
+  if (checksum == expected_checksum)
+    ok++;
+  if (reaped == 1)
+    ok++;
+
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

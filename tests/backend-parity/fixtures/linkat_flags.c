@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 int main(void) {
+    enum { EXPECTED_CHECKS = 5 };
     char root[] = "/tmp/linkatXXXXXX";
     if (!mkdtemp(root)) {
         perror("mkdtemp");
@@ -71,5 +72,5 @@ int main(void) {
     unlink(s);
     unlink(b);
     rmdir(root);
-    return 0;
+    return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

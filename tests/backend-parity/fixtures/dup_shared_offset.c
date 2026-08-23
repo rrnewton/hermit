@@ -84,6 +84,7 @@ static void pread_exact(int fd, char *buf, size_t n, off_t off) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 6 };
   char template[] = "/tmp/dup_shared_offset_XXXXXX";
   int fd = mkstemp(template);
   if (fd < 0)
@@ -145,5 +146,5 @@ int main(void) {
 
   printf("dup_shared_offset size=%ld checksum=%ld ok=%d\n", (long)st.st_size,
          checksum, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }

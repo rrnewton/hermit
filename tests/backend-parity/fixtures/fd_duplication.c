@@ -65,6 +65,7 @@ static int cloexec_set(int fd) {
 }
 
 int main(void) {
+  enum { EXPECTED_CHECKS = 11 };
   char template[] = "/tmp/fd_dup_XXXXXX";
   int base = mkstemp(template);
   if (base < 0)
@@ -144,5 +145,5 @@ int main(void) {
     fail("close base");
 
   printf("fd_dup offset=%ld ok=%d\n", (long)offset, ok);
-  return 0;
+  return ok == EXPECTED_CHECKS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
