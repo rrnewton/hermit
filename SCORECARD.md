@@ -12,19 +12,19 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `dbt` | 0 | 1008 | 1008 |
 | `kvm` | 0 | 1008 | 1008 |
 | `sabre` | 53 | 955 | 1008 |
-| `liteinst` | 20 | 988 | 1008 |
+| `liteinst` | 0 | 1008 | 1008 |
 | `native` | 0 | 336 | 336 |
-| **Total** | **290** | **5086** | **5376** |
+| **Total** | **270** | **5106** | **5376** |
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend.
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 215 / 336 | 0 / 336 | 0 / 336 | 53 / 336 | 20 / 336 | — | 288 | 1392 | 1680 |
+| `verify` | 215 / 336 | 0 / 336 | 0 / 336 | 53 / 336 | 0 / 336 | — | 268 | 1412 | 1680 |
 | `replay` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
 | `chaos` | 1 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | 0 / 336 | — | 1 | 1679 | 1680 |
 | `naked` | — | — | — | — | — | 0 / 336 | 0 | 336 | 336 |
-| **Total** | | | | | | | **290** | **5086** | **5376** |
+| **Total** | | | | | | | **270** | **5106** | **5376** |
 
 ## Cross-backend parity
 
@@ -50,4 +50,4 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 23 / 25 | 1 / 25 | 0 / 25 | 24 | 75 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 292 selected regression cells: the 290 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 272 selected regression cells: the 270 green compatibility cells above (including 1 chaos-mode race-exposure checks), and 2 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.

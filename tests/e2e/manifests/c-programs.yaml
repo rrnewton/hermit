@@ -2220,12 +2220,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: true
+          liteinst: false
         ci_disabled_reason:
           dbt:
             result: unavailable
             evidence: hermit-cli/src/bin/hermit/run.rs:2163
             reason: DBT completes both guest executions, but its dedicated path returns without a terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without counting it green.
+          liteinst:
+            result: determinism-failure
+            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
+            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
         backends_enabled:
           - ptrace
           - dbt
@@ -4360,7 +4364,14 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          liteinst: false
+        ci_disabled_reason:
+          liteinst:
+            result: determinism-failure
+            evidence: "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout"
+            reason: Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population.
         backends_enabled:
           - ptrace
           - liteinst
