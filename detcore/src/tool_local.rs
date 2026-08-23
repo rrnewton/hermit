@@ -436,7 +436,20 @@ impl FileMetadata {
         self.file_handles.values().any(DetFd::is_loopback_peer)
     }
 
+    fn has_unsafe_vfork_flock_state(&self) -> bool {
+        self.file_handles
+            .values()
+            .any(|detfd| detfd.known_flock_mode() != Some(None))
+    }
+
+    fn forget_flock_modes(&self) {
+        for detfd in self.file_handles.values() {
+            detfd.forget_flock_mode();
+        }
+    }
+
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
+        self.forget_flock_modes();
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
@@ -554,6 +567,12 @@ impl FileMetadata {
         .with_stat(stat)
         .with_resource(ResourceID::Device(Device::ContainerStderr));
 
+        // These descriptors existed before Detcore began observing the guest,
+        // so they may already carry flock state that we cannot query.
+        stdin.forget_flock_mode();
+        stdout.forget_flock_mode();
+        stderr.forget_flock_mode();
+
         self.add_detfd(stdin);
         self.add_detfd(stdout);
         self.add_detfd(stderr);
@@ -592,6 +611,7 @@ impl FileMetadata {
             flags.insert(OFlag::O_CLOEXEC);
         }
         self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        self.with_detfd(fd, |detfd| detfd.forget_flock_mode())?;
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
@@ -842,6 +862,63 @@ mod file_metadata_tests {
                 .with_detfd(fd, |detfd| detfd.ty())
                 .expect("discovered descriptor should be tracked"),
             FdType::Regular
+        );
+        assert_eq!(
+            metadata
+                .with_detfd(fd, |detfd| detfd.known_flock_mode())
+                .expect("discovered descriptor should be tracked"),
+            None,
+            "a live descriptor may already hold a flock that Detcore did not observe"
+        );
+    }
+
+    #[test]
+    fn fork_makes_inherited_flock_state_unknown_in_parent_and_child() {
+        let owner = DetTid::from_raw(9);
+        let child = DetTid::from_raw(10);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("register descriptor");
+        metadata
+            .with_detfd(3, |detfd| detfd.set_flock_mode(Some(libc::LOCK_SH)))
+            .expect("registered descriptor");
+
+        let mut child_metadata = metadata.fork_for(child);
+        assert_eq!(
+            metadata
+                .with_detfd(3, |detfd| detfd.known_flock_mode())
+                .expect("parent descriptor should remain tracked"),
+            None,
+            "parent cache must not become stale when the child changes the shared open file description"
+        );
+        assert_eq!(
+            child_metadata
+                .with_detfd(3, |detfd| detfd.known_flock_mode())
+                .expect("child descriptor should be inherited"),
+            None,
+            "child starts with the same deliberately unknown shared state"
+        );
+    }
+
+    #[test]
+    fn exec_preserves_known_flock_mode_for_surviving_descriptors() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("register descriptor");
+        metadata
+            .with_detfd(3, |detfd| detfd.set_flock_mode(Some(libc::LOCK_SH)))
+            .expect("registered descriptor");
+
+        let mut after_exec = metadata.for_exec(DetTid::from_raw(10));
+        assert_eq!(
+            after_exec
+                .with_detfd(3, |detfd| detfd.known_flock_mode())
+                .expect("non-cloexec descriptor should survive"),
+            Some(Some(libc::LOCK_SH)),
+            "exec must preserve known flock state for a surviving open file description"
         );
     }
 
@@ -1883,6 +1960,18 @@ impl<T> ThreadState<T> {
     /// Whether this task owns a socket that attempted a loopback connection.
     pub(crate) fn has_loopback_peer(&self) -> bool {
         self.metadata().has_loopback_peer()
+    }
+
+    /// Whether any open file description is held or not proven unlocked.
+    pub fn has_unsafe_vfork_flock_state(&self) -> bool {
+        self.metadata().has_unsafe_vfork_flock_state()
+    }
+
+    /// A new process can change every inherited open file description through
+    /// a separately hosted tool state, so neither side may keep treating its
+    /// cached flock mode as authoritative after fork.
+    pub fn forget_flock_modes(&self) {
+        self.metadata().forget_flock_modes();
     }
 
     /// remove a rawfd

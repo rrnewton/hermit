@@ -895,6 +895,12 @@
       "why": "tests/c/file_timestamp_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: creates files and directories, prints their stat and statx metadata including atime/mtime/ctime/btime and the mtime ORDERING between them, and exercises utimensat fixed and UTIME_NOW, so verify's double run asserts guest-created file timestamps are reproducible without freezing them"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/flock_exclusion.c",
+      "runner": "cargo test -p hermit --test flock_exclusion",
+      "why": "tests/c/flock_exclusion.c is compiled and exercised by hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking upgrades of known and SCM_RIGHTS-received lock state, safe cross-process inherited-lock state, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fp_reduction_nondeterminism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
