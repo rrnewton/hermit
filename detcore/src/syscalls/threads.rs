@@ -425,6 +425,23 @@ fn canonicalize_waitid_siginfo(info: &mut libc::siginfo_t) {
     sigchld.stime = 0;
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum WaitidPollDecision {
+    ChildReady,
+    Interrupted,
+    Retry,
+}
+
+fn waitid_poll_decision(child_pid: libc::pid_t, signaled: bool) -> WaitidPollDecision {
+    if child_pid != 0 {
+        WaitidPollDecision::ChildReady
+    } else if signaled {
+        WaitidPollDecision::Interrupted
+    } else {
+        WaitidPollDecision::Retry
+    }
+}
+
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
     let pgrp = Process::new(pid.as_raw())
         .and_then(|process| process.stat())
@@ -1134,6 +1151,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#274): Review waitid polling and compatibility boundaries.
+    // TODO-HUMAN-REVIEW(#2246): Review waitid progress and child-ready signal precedence.
     /// waitid system call
     /// This is handled by the scheduler and not passed to the record/replay layer.
     pub async fn handle_waitid<G: Guest<Self>>(
@@ -1235,41 +1253,80 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(value);
         }
 
-        let poll_call = call.with_options(call.options() | libc::WNOHANG);
-        let mut first_poll = true;
-        loop {
-            let signaled = !first_poll
-                && resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
-            first_poll = false;
+        // A signal can arrive after the scheduler wakes this logical wait but
+        // before the zero-timeout kernel probe that resolves Linux's
+        // child-ready-versus-interrupt precedence. Keep ordinary signals pending
+        // across that probe, then restore the guest's exact mask before returning.
+        // The tracer's private preemption signal must remain unblocked.
+        let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigfillset(&mut blocked_mask);
+            libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+        }
+        let mut stack = guest.stack().await;
+        let blocked_mask_addr = stack.push(blocked_mask);
+        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let _mask_guard = stack.commit()?;
+        let block_signals = syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_SETMASK)
+            .with_set(Some(blocked_mask_addr))
+            .with_oldset(Some(old_mask_addr))
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(block_signals).await?;
 
-            guest.memory().write_value(info, &empty_info)?;
-            let result = guest.inject_with_retry(poll_call).await;
+        let poll_call = call.with_options(call.options() | libc::WNOHANG);
+        let result: Result<i64, Error> = loop {
+            // Match the polling protocol used by wait4: the first request with
+            // poll_attempt zero establishes an ordinary runnable turn, while later
+            // nonzero attempts receive the scheduler's poller backoff. Omitting the
+            // first request starts directly as a poller and can keep the run queue
+            // nonempty forever, preventing logical time from reaching a pending
+            // signal's deadline.
+            //
+            // Do not return on Signaled yet. Linux lets an already-waitable child
+            // status win over an interrupt, so the zero-timeout kernel probe below
+            // remains authoritative when readiness and a signal coincide.
+            let signaled = resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled;
+
+            if let Err(error) = guest.memory().write_value(info, &empty_info) {
+                break Err(error.into());
+            }
+            let result = guest.inject(poll_call).await;
             match result {
                 Ok(value) => {
-                    let mut info_value: libc::siginfo_t = guest.memory().read_value(info)?;
+                    let mut info_value: libc::siginfo_t = match guest.memory().read_value(info) {
+                        Ok(value) => value,
+                        Err(error) => break Err(error.into()),
+                    };
                     // waitid writes the SIGCHLD variant of siginfo_t. A zeroed
                     // structure is used only for the no-event WNOHANG result.
                     let child_pid = unsafe { info_value.si_pid() };
-                    if child_pid != 0 {
-                        canonicalize_waitid_siginfo(&mut info_value);
-                        guest.memory().write_value(info, &info_value)?;
-                        if call.options() & libc::WNOWAIT == 0
-                            && waitid_code_is_termination(info_value.si_code)
-                        {
-                            guest
-                                .thread_state_mut()
-                                .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+                    match waitid_poll_decision(child_pid, signaled) {
+                        WaitidPollDecision::ChildReady => {
+                            canonicalize_waitid_siginfo(&mut info_value);
+                            if let Err(error) = guest.memory().write_value(info, &info_value) {
+                                break Err(error.into());
+                            }
+                            if call.options() & libc::WNOWAIT == 0
+                                && waitid_code_is_termination(info_value.si_code)
+                            {
+                                guest
+                                    .thread_state_mut()
+                                    .reap_child_process_cpu_time(DetPid::from_raw(child_pid));
+                            }
+                            if let Some(rusage) = call.rusage() {
+                                // Host CPU and scheduling counters are not deterministic.
+                                let usage: libc::rusage = unsafe { std::mem::zeroed() };
+                                if let Err(error) = guest.memory().write_value(rusage, &usage) {
+                                    break Err(error.into());
+                                }
+                            }
+                            break Ok(value);
                         }
-                        if let Some(rusage) = call.rusage() {
-                            // Host CPU and scheduling counters are not deterministic.
-                            let usage: libc::rusage = unsafe { std::mem::zeroed() };
-                            guest.memory().write_value(rusage, &usage)?;
+                        WaitidPollDecision::Interrupted => {
+                            break Err(Errno::ERESTARTSYS.into());
                         }
-                        return Ok(value);
-                    }
-
-                    if signaled {
-                        return Err(Errno::ERESTARTSYS.into());
+                        WaitidPollDecision::Retry => {}
                     }
                     rsrc.poll_attempt += 1;
                     trace!(
@@ -1278,9 +1335,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     record_retry_event(guest, poll_call).await;
                 }
-                Err(errno) => return Err(errno.into()),
+                Err(Errno::ERESTARTSYS) if signaled => break Err(Errno::EINTR.into()),
+                Err(errno) => break Err(errno.into()),
             }
-        }
+        };
+
+        let restore_signals = syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_SETMASK)
+            .with_set(Some(old_mask_addr.into()))
+            .with_oldset(None)
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(restore_signals).await?;
+        result
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1657,6 +1723,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waitid_ready_child_wins_when_scheduler_also_reports_a_signal() {
+        assert_eq!(
+            waitid_poll_decision(123, true),
+            WaitidPollDecision::ChildReady
+        );
+        assert_eq!(
+            waitid_poll_decision(0, true),
+            WaitidPollDecision::Interrupted
+        );
+        assert_eq!(waitid_poll_decision(0, false), WaitidPollDecision::Retry);
+    }
 
     #[test]
     fn ioprio_query_reports_fixed_raw_and_effective_defaults() {
