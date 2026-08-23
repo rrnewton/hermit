@@ -119,9 +119,9 @@ impl CompatMode {
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "legacy stripped verify",
-            CompatMode::Sabre => "SaBRe",
-            CompatMode::E9patch => "e9patch legacy stripped verify",
+            CompatMode::Strict | CompatMode::PortableStrict => "legacy below-L2 stripped verify",
+            CompatMode::Sabre => "SaBRe legacy below-L2 stripped verify",
+            CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
             CompatMode::Rr => "rr",
         }
     }

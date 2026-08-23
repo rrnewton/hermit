@@ -845,6 +845,51 @@ fn nested_scope_self_test() -> Result<String, String> {
     Ok("safe-ci scope: real outer -> step child -> nested boxed step passed".into())
 }
 
+/// The literal flag that enables Hermit's strict execution mode.
+///
+/// Spelled out here, in the CONSUMER, on purpose. Deriving it from
+/// `CompatMode::run_args` — the code being checked — would make the check agree
+/// with whatever that code happens to emit, which is exactly the defect this
+/// constant exists to catch: deleting `--strict` from the rendered plans left
+/// `--self-test` exiting 0 and printing success, because nothing compared the
+/// rendered command against an independently stated expectation.
+///
+/// This flag alone does NOT establish canonical L2 evidence. The modes checked
+/// below use the legacy lossy `--verify` comparator and remain explicitly
+/// below-L2 unless their argv also adopts `--verify-strict` and the surrounding
+/// evidence policy is updated.
+const STRICT_EXECUTION_FLAG: &str = "--strict";
+
+/// Legacy below-L2 compatibility modes whose Hermit-option prefix must carry
+/// [`STRICT_EXECUTION_FLAG`].
+///
+/// `CompatMode::Rr` is deliberately absent rather than overlooked: it renders
+/// `record start --verify --verify-strict`, a different path with a different
+/// evidence policy and no `--strict` marker, so folding it into this list would
+/// assert something untrue about it.
+const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 4] = [
+    CompatMode::Strict,
+    CompatMode::PortableStrict,
+    CompatMode::Sabre,
+    CompatMode::E9patch,
+];
+
+/// Whether a rendered plan is missing the literal strict flag from Hermit's
+/// option prefix.
+///
+/// The first `--` ends Hermit's options and begins the guest argv. A guest is
+/// free to receive an argument spelled `--strict`; accepting that occurrence as
+/// a Hermit option would make the policy check vacuous for exactly the malformed
+/// command it is meant to refuse. A missing separator is malformed too.
+fn strict_flag_missing_from(argv: &[String]) -> bool {
+    let Some(guest_separator) = argv.iter().position(|arg| arg == "--") else {
+        return true;
+    };
+    !argv[..guest_separator]
+        .iter()
+        .any(|arg| arg == STRICT_EXECUTION_FLAG)
+}
+
 /// Inert brackets for the policy predicate and the shell quoter.
 ///
 /// These cannot launch a run or authorize a receipt — they only prove the
@@ -853,6 +898,79 @@ fn nested_scope_self_test() -> Result<String, String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // Strict-execution bracket for the legacy below-L2 compatibility modes.
+    // `--strict` must be a Hermit option before the first guest `--`; these
+    // modes still use lossy `--verify`, so this does not call them L2. The
+    // bracket accepts the real prefix, rejects deletion, and rejects the subtle
+    // goalpost move of putting the same spelling in guest argv.
+    for mode in LEGACY_BELOW_L2_STRICT_MODES {
+        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf");
+        let guest_separator = rendered
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| format!("{mode:?} rendered no guest argv separator: {rendered:?}"))?;
+        if strict_flag_missing_from(&rendered) {
+            return Err(format!(
+                "{mode:?} rendered a compatibility plan WITHOUT the literal \
+                 {STRICT_EXECUTION_FLAG} in Hermit's option prefix, so the \
+                 legacy below-L2 run would not use strict execution: {rendered:?}"
+            ));
+        }
+        if rendered[..guest_separator]
+            .iter()
+            .any(|arg| arg == "--verify-strict")
+            || !mode.display_name().contains("below-L2")
+        {
+            return Err(format!(
+                "{mode:?} is governed by the legacy below-L2 policy, so its Hermit prefix must \
+                 omit --verify-strict and its rendered description must say below-L2: \
+                 argv={rendered:?}, description={:?}",
+                mode.display_name()
+            ));
+        }
+        let stripped: Vec<String> = rendered
+            .iter()
+            .filter(|arg| *arg != STRICT_EXECUTION_FLAG)
+            .cloned()
+            .collect();
+        if stripped.len() == rendered.len() {
+            return Err(format!(
+                "{mode:?}: removing {STRICT_EXECUTION_FLAG} changed nothing, so the \
+                 refusing direction below would be vacuous"
+            ));
+        }
+        if !strict_flag_missing_from(&stripped) {
+            return Err(format!(
+                "the strict-flag check did not notice {STRICT_EXECUTION_FLAG} missing \
+                 from a {mode:?} plan, so it cannot detect its deletion"
+            ));
+        }
+        let stripped_separator = stripped
+            .iter()
+            .position(|arg| arg == "--")
+            .ok_or_else(|| format!("{mode:?} rendered no guest argv separator: {rendered:?}"))?;
+        let mut misplaced = stripped.clone();
+        misplaced.insert(stripped_separator + 1, STRICT_EXECUTION_FLAG.into());
+        if !strict_flag_missing_from(&misplaced) {
+            return Err(format!(
+                "the strict-flag check accepted {STRICT_EXECUTION_FLAG} after the first guest \
+                 separator in a {mode:?} plan, so guest argv could forge the Hermit option: \
+                 {misplaced:?}"
+            ));
+        }
+        let no_separator: Vec<String> = rendered
+            .iter()
+            .filter(|arg| arg.as_str() != "--")
+            .cloned()
+            .collect();
+        if !strict_flag_missing_from(&no_separator) {
+            return Err(format!(
+                "the strict-flag check accepted a {mode:?} plan with no guest argv separator: \
+                 {no_separator:?}"
+            ));
+        }
+    }
+
     if !nested_scope_probe_selected(true, true)
         || nested_scope_probe_selected(false, true)
         || nested_scope_probe_selected(true, false)
