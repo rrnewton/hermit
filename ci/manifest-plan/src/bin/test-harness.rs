@@ -48,6 +48,35 @@ struct Args {
     jobs: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct AuditStep {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+const VALIDATE_AUDITS: &[AuditStep] = &[
+    AuditStep {
+        program: "target/debug/generate-test-footprints",
+        args: &["--check"],
+    },
+    AuditStep {
+        program: "tests/backend-parity/split_asymmetric_pr.py",
+        args: &["--self-test"],
+    },
+    AuditStep {
+        program: "tests/manifest-cli.rs",
+        args: &["self-test"],
+    },
+    AuditStep {
+        program: "ci/compat-envelope/pressure-test.rs",
+        args: &["self-test"],
+    },
+    AuditStep {
+        program: "scripts/validate.rs",
+        args: &["--self-test"],
+    },
+];
+
 fn parse(mut values: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         format: "text".into(),
@@ -217,32 +246,14 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // the expected-plan comparison during the shell removal.
     audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
-    run_audit(
-        root,
-        &root.join("target/debug/generate-test-footprints"),
-        &["--check"],
-    );
-    run_audit(
-        root,
-        &root.join("tests/backend-parity/split_asymmetric_pr.py"),
-        &["--self-test"],
-    );
-    run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/scorecard.rs"),
-        &["self-test-and-check"],
-    );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/pressure-test.rs"),
-        &["self-test"],
-    );
+    audit_manifest_scorecard_work(root, VALIDATE_AUDITS).unwrap_or_else(|error| fail(error));
     // The removed shell front door accumulated plan/scheduler/receipt guards
     // that now belong to the Rust validate driver.  Exercise those brackets
     // here without executing the validation DAG; otherwise deleting the shell
     // would also silently delete its protection against incomplete plans.
-    run_audit(root, &root.join("scripts/validate.rs"), &["--self-test"]);
+    for audit in VALIDATE_AUDITS {
+        run_audit(root, &root.join(audit.program), audit.args);
+    }
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
     println!(
@@ -251,6 +262,71 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
         cells
     );
     ExitCode::SUCCESS
+}
+
+fn audit_manifest_scorecard_work(root: &Path, audits: &[AuditStep]) -> Result<(), String> {
+    let pressure_source_path = root.join("ci/compat-envelope/pressure-test.rs");
+    let pressure_source = fs::read_to_string(&pressure_source_path)
+        .map_err(|error| format!("cannot read {}: {error}", pressure_source_path.display()))?;
+    audit_manifest_scorecard_work_source(audits, &pressure_source)?;
+    println!(
+        "manifest scorecard work: outer=0 pressure-self-test=1 full-scorecard-self-test=1 cached-plan-cases=7"
+    );
+    Ok(())
+}
+
+fn audit_manifest_scorecard_work_source(
+    audits: &[AuditStep],
+    pressure_source: &str,
+) -> Result<(), String> {
+    let direct_scorecard = audits
+        .iter()
+        .filter(|audit| audit.program == "ci/compat-envelope/scorecard.rs")
+        .count();
+    let pressure_self_test = audits
+        .iter()
+        .filter(|audit| {
+            audit.program == "ci/compat-envelope/pressure-test.rs" && audit.args == ["self-test"]
+        })
+        .count();
+    let self_test = pressure_source
+        .split_once("fn self_test(root: &Path) -> Result<(), String> {")
+        .map(|(_, body)| body)
+        .ok_or("pressure-test source has no self_test implementation")?;
+    let full_scorecard_self_test = self_test
+        .matches("let checked_scorecard = check_scorecard_with_self_test(root)?;")
+        .count();
+    let downgraded_scorecard_check = self_test
+        .matches("let checked_scorecard = check_scorecard(root)?;")
+        .count();
+    let cached_plan_cases = self_test
+        .matches("write_plan_after_scorecard_check(")
+        .count();
+    let repeated_plan_checks = self_test.matches("write_plan(").count();
+    let full_helper = pressure_source
+        .matches("check_scorecard_command(root, \"self-test-and-check\")")
+        .count();
+    let ordinary_helper = pressure_source
+        .matches("check_scorecard_command(root, \"check\")")
+        .count();
+
+    if direct_scorecard != 0
+        || pressure_self_test != 1
+        || full_scorecard_self_test != 1
+        || downgraded_scorecard_check != 0
+        || full_helper != 1
+        || ordinary_helper != 1
+    {
+        return Err(format!(
+            "manifest validation must run exactly one full scorecard self-test through the pressure self-test: direct-scorecard={direct_scorecard} pressure-self-test={pressure_self_test} full-scorecard-self-test={full_scorecard_self_test} downgraded-check={downgraded_scorecard_check} full-helper={full_helper} ordinary-helper={ordinary_helper}"
+        ));
+    }
+    if cached_plan_cases != 7 || repeated_plan_checks != 0 {
+        return Err(format!(
+            "pressure self-test must reuse one checked scorecard across seven plan cases: cached={cached_plan_cases} repeated-checks={repeated_plan_checks}"
+        ));
+    }
+    Ok(())
 }
 
 fn audit_cli_brackets(root: &Path) {
@@ -1164,14 +1240,19 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use super::AuditStep;
+    use super::VALIDATE_AUDITS;
+    use super::audit_manifest_scorecard_work_source;
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
     use super::for_each_parallel;
+    use super::root;
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
         if [[ ${GITHUB_ACTIONS:-} != true ]]; then
@@ -1251,5 +1332,40 @@ mod tests {
         ] {
             assert!(command_jobs(command).is_err(), "accepted {command}");
         }
+    }
+
+    #[test]
+    fn manifest_scorecard_route_keeps_one_full_self_test() {
+        let pressure_source =
+            fs::read_to_string(root().join("ci/compat-envelope/pressure-test.rs")).unwrap();
+        audit_manifest_scorecard_work_source(VALIDATE_AUDITS, &pressure_source).unwrap();
+    }
+
+    #[test]
+    fn manifest_scorecard_route_refuses_duplicate_downgrade_and_omission_mutations() {
+        let pressure_source =
+            fs::read_to_string(root().join("ci/compat-envelope/pressure-test.rs")).unwrap();
+
+        let mut duplicated = VALIDATE_AUDITS.to_vec();
+        duplicated.push(AuditStep {
+            program: "ci/compat-envelope/scorecard.rs",
+            args: &["self-test-and-check"],
+        });
+        assert!(audit_manifest_scorecard_work_source(&duplicated, &pressure_source).is_err());
+
+        let downgraded = pressure_source.replacen(
+            "let checked_scorecard = check_scorecard_with_self_test(root)?;",
+            "let checked_scorecard = check_scorecard(root)?;",
+            1,
+        );
+        assert_ne!(downgraded, pressure_source);
+        assert!(audit_manifest_scorecard_work_source(VALIDATE_AUDITS, &downgraded).is_err());
+
+        let omitted = VALIDATE_AUDITS
+            .iter()
+            .copied()
+            .filter(|audit| audit.program != "ci/compat-envelope/pressure-test.rs")
+            .collect::<Vec<AuditStep>>();
+        assert!(audit_manifest_scorecard_work_source(&omitted, &pressure_source).is_err());
     }
 }

@@ -1622,9 +1622,12 @@ struct CheckedScorecard<'a> {
     root: &'a Path,
 }
 
-fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
+fn check_scorecard_command<'a>(
+    root: &'a Path,
+    command: &str,
+) -> Result<CheckedScorecard<'a>, String> {
     let status = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
-        .arg("check")
+        .arg(command)
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot run scorecard check: {e}"))?;
@@ -1633,6 +1636,14 @@ fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
     } else {
         Err("tracked scorecard is stale; update it before generating a pressure run".into())
     }
+}
+
+fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
+    check_scorecard_command(root, "check")
+}
+
+fn check_scorecard_with_self_test(root: &Path) -> Result<CheckedScorecard<'_>, String> {
+    check_scorecard_command(root, "self-test-and-check")
 }
 
 fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCells, String> {
@@ -4111,7 +4122,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     safe_ci_scope::self_test()?;
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
-    let checked_scorecard = check_scorecard(root)?;
+    let checked_scorecard = check_scorecard_with_self_test(root)?;
     let explicit_null = decode_budgets(
         br#"[{"test":"fixture/test","mode":"chaos","timeout_seconds":90,"attempts":null}]"#,
     )?;
