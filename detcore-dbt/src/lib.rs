@@ -1337,6 +1337,34 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let process_clone = match sysnum {
+        libc::SYS_fork | libc::SYS_vfork => true,
+        libc::SYS_clone => raw_args[0] & (libc::CLONE_THREAD as u64) == 0,
+        libc::SYS_clone3 => {
+            let mut flags = 0_u64;
+            raw_args[0] == 0
+                || raw_args[1] < std::mem::size_of_val(&flags) as u64
+                || unsafe {
+                    read_memory(
+                        raw_args[0] as usize,
+                        (&mut flags as *mut u64).cast(),
+                        std::mem::size_of_val(&flags),
+                    ) == 0
+                }
+                || flags & (libc::CLONE_THREAD as u64) == 0
+        }
+        _ => false,
+    };
+    if process_clone && !scratch.runtime_state.is_null() {
+        // TODO-HUMAN-REVIEW(#2373): A process clone shares kernel open file
+        // descriptions, but the copied DBT process can change their flock
+        // state without entering the parent's Rust tool state. Invalidate the
+        // parent's cache before the native syscall so neither branch can later
+        // restore a lock that the other branch released.
+        unsafe { &mut *scratch.runtime_state }
+            .state
+            .forget_flock_modes();
+    }
     translate_self_identity_targets(
         sysnum,
         &mut dispatch_args,

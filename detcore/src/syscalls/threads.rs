@@ -281,6 +281,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
         ts.clone_flags = Some(flags);
+        if !flags.contains(CloneFlags::CLONE_THREAD) {
+            // A forked process can change any inherited flock through a tool
+            // state that some backends host separately. Keep both sides safe
+            // by no longer trusting cached modes for the shared open file
+            // descriptions.
+            ts.forget_flock_modes();
+        }
 
         let parent_dettid = ts.dettid;
         let child_priority_entropy = if parent_blocks_for_child
