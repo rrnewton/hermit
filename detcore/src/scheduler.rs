@@ -2165,6 +2165,21 @@ impl Scheduler {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Return the scheduler's live threads for a positive process ID.
+    /// Is `dettid` a live thread, leader or not?
+    ///
+    /// `process_signal_targets` answers a DIFFERENT question and must not be
+    /// reused for this one: it models `kill(2)`, so it returns nothing unless
+    /// the id names a thread-group LEADER. `sched_setattr(2)` and its relatives
+    /// resolve through `find_task_by_vpid`, which finds any live task, so a
+    /// non-leader thread's tid is a perfectly good target there. Answering that
+    /// question with the kill resolver reports ESRCH for a thread that exists.
+    ///
+    /// Liveness is `next_turns`, the same membership `process_signal_targets`
+    /// filters its own result by, so the two agree about what "live" means.
+    pub fn thread_is_live(&self, dettid: DetTid) -> bool {
+        self.next_turns.contains_key(&dettid)
+    }
+
     pub fn process_signal_targets(&mut self, detpid: DetPid) -> Vec<DetTid> {
         if !self.thread_tree.thread_group_leaders.contains(&detpid) {
             return Vec::new();
@@ -4340,6 +4355,53 @@ mod test {
     /// applied through `remove_tid`'s `tentative_selection.is_none()` guard, and
     /// a pending-removal thread whose `next_turns` entry is already gone must not
     /// crash `are_all_quiesced`. The removal lands at the next drain.
+    /// ITEM 1 REGRESSION: a NON-LEADER thread is live, even though it is not a
+    /// kill target.
+    ///
+    /// `process_signal_targets` models `kill(2)`, whose first act is to refuse
+    /// anything that is not a thread-group leader. `sched_setattr(2)` and its
+    /// relatives resolve through `find_task_by_vpid`, which finds any live
+    /// task. Answering the second question with the first resolver reports
+    /// ESRCH for a thread that is plainly running, so the two must stay
+    /// distinguishable -- this test fails the moment `thread_is_live` is
+    /// reduced to the kill resolver.
+    #[test]
+    fn a_non_leader_thread_is_live_without_being_a_kill_target() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(11);
+        let member = DetTid::from_raw(12);
+        let stranger = DetTid::from_raw(13);
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, member, false);
+        register_known_thread(&mut sched, leader);
+        register_known_thread(&mut sched, member);
+
+        assert!(
+            sched.thread_is_live(leader),
+            "the leader is obviously live"
+        );
+        assert!(
+            sched.thread_is_live(member),
+            "a non-leader thread of a live group is live; sched_setattr must reach it"
+        );
+        assert!(
+            !sched.thread_is_live(stranger),
+            "a tid that was never registered is not live"
+        );
+
+        // The distinction being preserved: the kill resolver still declines the
+        // non-leader, which is correct for kill(2) and wrong for sched_setattr.
+        assert!(
+            sched.process_signal_targets(member).is_empty(),
+            "kill(2) semantics: a non-leader is not a signal target, which is \
+             exactly why it is the wrong resolver for a tid lookup"
+        );
+        assert!(
+            !sched.process_signal_targets(leader).is_empty(),
+            "the leader is a signal target, so the fixture is wired correctly"
+        );
+    }
+
     #[test]
     fn deferred_removal_survives_tentative_window_and_drains() {
         let mut sched = Scheduler::new(&Config::default());

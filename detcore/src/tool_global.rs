@@ -990,6 +990,9 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ResolveKillTargets(dpid) => {
                 R::ResolveKillTargets(self.sched.lock().unwrap().process_signal_targets(dpid))
             }
+            GlobalRequest::ThreadIsLive(dtid) => {
+                R::ThreadIsLive(self.sched.lock().unwrap().thread_is_live(dtid))
+            }
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -1960,6 +1963,8 @@ pub enum GlobalRequest {
     // TODO-HUMAN-REVIEW(#663)
     /// Query live threads before translating process-directed signal delivery.
     ResolveKillTargets(DetPid),
+    /// Liveness of one tid, leader or not; see [`thread_is_live`].
+    ThreadIsLive(DetTid),
 
     /// The container is shutting down.  Exit the scheduler "thread".
     UnrecoverableShutdown,
@@ -2016,6 +2021,7 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
+    ThreadIsLive(bool),
     // TODO: use void_send_rpc, and remove this bogus response:
     UnrecoverableShutdown(()),
 
@@ -2681,6 +2687,24 @@ pub async fn register_posix_timer<G, T>(
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
 /// Return the scheduler's live threads for a positive process ID.
+/// Does a live thread with this tid exist, leader or not?
+///
+/// Distinct from [`resolve_kill_targets`], which models `kill(2)` and therefore
+/// only recognises thread-group leaders. Syscalls that resolve a task through
+/// `find_task_by_vpid` -- `sched_setattr` among them -- must use this instead,
+/// or a non-leader thread reports ESRCH while it is plainly running.
+pub async fn thread_is_live<G, T>(guest: &mut G, dettid: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
+    match response.1 {
+        GlobalResponse::ThreadIsLive(live) => live,
+        _ => unreachable!(),
+    }
+}
+
 pub async fn resolve_kill_targets<G, T>(guest: &mut G, detpid: DetPid) -> Vec<DetTid>
 where
     G: Guest<Detcore<T>>,
