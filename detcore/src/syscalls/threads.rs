@@ -48,6 +48,7 @@ use crate::tool_global::cancel_exec;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
+use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -68,6 +69,202 @@ const IOPRIO_CLASS_BE: libc::c_int = 2;
 const IOPRIO_BE_NORM: libc::c_int = 4;
 const IOPRIO_DEFAULT_EFFECTIVE: libc::c_int =
     (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORM;
+
+// sched_attr wire contract, from include/uapi/linux/sched/types.h. These are
+// spelled out rather than derived from `size_of::<libc::sched_attr>()`: the
+// value the kernel reports back on the E2BIG paths and the offset past which
+// trailing bytes must be zero are properties of the KERNEL's struct, which is
+// larger than the libc crate's 48-byte mirror. Deriving either from a Rust type
+// would silently re-point the contract if that type ever grows a field.
+const SCHED_ATTR_SIZE_VER0: u32 = 48; // first published struct
+const SCHED_ATTR_SIZE_VER1: u32 = 56; // adds sched_util_{min,max}
+/// The kernel's own `sizeof(struct sched_attr)`. Two things key off it: bytes at
+/// or beyond this offset must be zero, and it is the value written back into
+/// `uattr->size` when the request is refused with E2BIG.
+const SCHED_ATTR_KERNEL_SIZE: u32 = SCHED_ATTR_SIZE_VER1;
+/// `sched_copy_attr` refuses a buffer larger than one page. Hermit is x86-64
+/// only, where PAGE_SIZE is 4096.
+const SCHED_ATTR_MAX_SIZE: u32 = 4096;
+
+// Scheduling policies, from include/uapi/linux/sched.h.
+const SCHED_FIFO: u32 = 1;
+const SCHED_RR: u32 = 2;
+const SCHED_DEADLINE: u32 = 6;
+const SCHED_EXT: u32 = 7;
+/// The kernel's `MAX_RT_PRIO`; valid real-time priorities are 1..=99.
+const MAX_RT_PRIO: u32 = 100;
+
+// Byte offsets of the fields this handler inspects. Taken from the UAPI struct
+// rather than from a Rust mirror, for the reason given above.
+const SCHED_ATTR_OFF_POLICY: usize = 4;
+const SCHED_ATTR_OFF_FLAGS: usize = 8;
+const SCHED_ATTR_OFF_PRIORITY: usize = 20;
+const SCHED_ATTR_OFF_RUNTIME: usize = 24;
+const SCHED_ATTR_OFF_DEADLINE: usize = 32;
+const SCHED_ATTR_OFF_PERIOD: usize = 40;
+
+// sched_attr.sched_flags bits, from include/uapi/linux/sched.h.
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+const SCHED_FLAG_RECLAIM: u64 = 0x02;
+const SCHED_FLAG_DL_OVERRUN: u64 = 0x04;
+const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
+const SCHED_FLAG_UTIL_CLAMP: u64 = SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_UTIL_CLAMP_MAX;
+const SCHED_FLAG_ALL: u64 = SCHED_FLAG_RESET_ON_FORK
+    | SCHED_FLAG_RECLAIM
+    | SCHED_FLAG_DL_OVERRUN
+    | SCHED_FLAG_KEEP_POLICY
+    | SCHED_FLAG_KEEP_PARAMS
+    | SCHED_FLAG_UTIL_CLAMP;
+
+/// Whether Linux accepts `policy` as a scheduling policy for `sched_setattr`.
+/// This is the kernel's `valid_policy()`: idle, fair, rt, deadline or ext. Note
+/// the gap at 4 -- SCHED_ISO is reserved and never valid -- and that 7 is
+/// SCHED_EXT, which `valid_policy()` accepts on a kernel built with
+/// CONFIG_SCHED_CLASS_EXT.
+fn is_valid_sched_policy(policy: u32) -> bool {
+    matches!(
+        policy,
+        // SCHED_OTHER/NORMAL, FIFO, RR, BATCH
+        0 | 1 | 2 | 3
+        // SCHED_IDLE
+        | 5
+        | SCHED_DEADLINE
+        | SCHED_EXT
+    )
+}
+
+/// The kernel's `rt_policy()`: the two fixed-priority real-time policies.
+fn is_rt_policy(policy: u32) -> bool {
+    policy == SCHED_FIFO || policy == SCHED_RR
+}
+
+/// The kernel's `__checkparam_dl()`, restricted to the parts that are pure ABI.
+///
+/// The kernel's final test compares the period against
+/// `sysctl_sched_dl_period_{min,max}`, which are runtime-tunable. That bound is
+/// a property of the host's configuration rather than of the interface, so it
+/// is deliberately not reproduced here -- see the handler's doc comment for the
+/// other cases in that class.
+fn deadline_params_are_valid(runtime: u64, deadline: u64, period: u64) -> bool {
+    // deadline != 0
+    if deadline == 0 {
+        return false;
+    }
+    // The kernel truncates DL_SCALE (10) bits, so runtime must be at least that
+    // big to survive the truncation.
+    if runtime < (1u64 << 10) {
+        return false;
+    }
+    // The MSB is reserved for wrap-around and sign handling.
+    if deadline & (1u64 << 63) != 0 || period & (1u64 << 63) != 0 {
+        return false;
+    }
+    // A zero period means "same as the deadline".
+    let period = if period == 0 { deadline } else { period };
+    // runtime <= deadline <= period
+    runtime <= deadline && deadline <= period
+}
+
+/// Apply `sched_copy_attr`'s size rules to the `size` the guest declared.
+///
+/// `Ok(n)` is the effective size to copy with; `Err(())` means the request is
+/// refused with E2BIG *and* the kernel first writes its own struct size back
+/// into `uattr->size`, so the caller owes that store.
+///
+/// The zero case is not a mistake: the kernel carries an explicit ABI
+/// compatibility quirk, `if (!size) size = SCHED_ATTR_SIZE_VER0;`, so a
+/// zero-sized request is a well-formed VER0 request and succeeds.
+fn sched_attr_effective_size(declared: u32) -> Result<u32, ()> {
+    let size = if declared == 0 {
+        SCHED_ATTR_SIZE_VER0
+    } else {
+        declared
+    };
+    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&size) {
+        return Err(());
+    }
+    Ok(size)
+}
+
+/// The descriptor fields this handler inspects, decoded from the guest's bytes.
+#[derive(Clone, Copy, Debug)]
+struct SchedAttrFields {
+    policy: u32,
+    sched_flags: u64,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+}
+
+/// The checks that run in `sched_copy_attr` and in the `sched_setattr` wrapper,
+/// i.e. everything the kernel decides *before* it looks the target pid up.
+///
+/// `size` is the effective size from [`sched_attr_effective_size`], so the
+/// util-clamp rule can be stated in the same terms the kernel uses.
+///
+/// Measured: with a pid that does not exist, both of these still report their
+/// own errno rather than ESRCH, which is what places them on this side of the
+/// lookup.
+fn validate_sched_attr_before_lookup(size: u32, attr: &SchedAttrFields) -> Result<(), Errno> {
+    // `sched_copy_attr`: util-clamp lives past the VER0 tail, so asking for it
+    // with a VER0 buffer is incoherent.
+    if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 && size < SCHED_ATTR_SIZE_VER1 {
+        return Err(Errno::EINVAL);
+    }
+    // `sched_setattr`: the policy is compared as a *signed* int, and this test
+    // sits above the KEEP_POLICY substitution below, so the sign bit is refused
+    // even when the policy field is otherwise ignored.
+    if (attr.policy as i32) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// The checks inside `__sched_setscheduler`, i.e. everything the kernel decides
+/// *after* it has resolved the target pid.
+///
+/// Measured: with a pid that does not exist, every rule here reports ESRCH
+/// instead, which is what places them on this side of the lookup.
+fn validate_sched_attr_after_lookup(attr: &SchedAttrFields) -> Result<(), Errno> {
+    // `sched_setattr` rewrites the policy to SETPARAM_POLICY (-1) when
+    // KEEP_POLICY is set, and `__sched_setscheduler` then takes its
+    // `policy < 0` branch, reusing the task's current policy without ever
+    // calling `valid_policy()`. So under KEEP_POLICY the field is genuinely
+    // ignored and the policy-dependent rules below are skipped with it.
+    let policy = if attr.sched_flags & SCHED_FLAG_KEEP_POLICY != 0 {
+        None
+    } else {
+        if !is_valid_sched_policy(attr.policy) {
+            return Err(Errno::EINVAL);
+        }
+        Some(attr.policy)
+    };
+    // No undefined sched_flags bits.
+    if attr.sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // Valid priorities are 1..=MAX_RT_PRIO-1 for the real-time policies and
+    // exactly 0 for every other policy, so the priority and the policy have to
+    // agree; the kernel states that as `rt_policy(policy) != (prio != 0)`.
+    if attr.priority > MAX_RT_PRIO - 1 {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(policy) = policy {
+        if is_rt_policy(policy) != (attr.priority != 0) {
+            return Err(Errno::EINVAL);
+        }
+        if policy == SCHED_DEADLINE
+            && !deadline_params_are_valid(attr.runtime, attr.deadline, attr.period)
+        {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok(())
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-881)
@@ -1126,13 +1323,171 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review virtual sched_setattr no-op policy.
     /// Linux scheduler attributes cannot affect Detcore's replacement
-    /// scheduler. Accept the request as a deterministic no-op, matching the
-    /// existing sched_setscheduler and sched_setparam policy.
+    /// scheduler, so a *well-formed* request is accepted as a deterministic
+    /// no-op, matching the existing sched_setscheduler and sched_setparam
+    /// policy.
+    ///
+    /// Suppressing the effect is not the same as accepting arguments Linux
+    /// refuses, nor as refusing arguments Linux accepts. Both directions are
+    /// guest-visible: a probe that expects EINVAL and sees success takes the
+    /// wrong branch, and so does one that expects success and sees E2BIG.
+    ///
+    /// The order below is the kernel's, and it is guest-visible when two
+    /// arguments are wrong at once, because the kernel returns the *first*
+    /// applicable error. `sched_setattr()` screens `uattr`, `pid` and `flags`
+    /// together; `sched_copy_attr()` then handles the size, the trailing bytes
+    /// and the util-clamp size rule; the signed-policy test follows; the target
+    /// pid is resolved *there*, in the middle; and only then does
+    /// `__sched_setscheduler()` judge the policy, the flags, the priority and
+    /// the deadline parameters. Putting any of that last group before the pid
+    /// lookup makes a request against a nonexistent pid report EINVAL where
+    /// Linux reports ESRCH.
+    ///
+    /// # Determinism
+    ///
+    /// Every check is a pure function of the guest's own arguments. The one
+    /// piece of state consulted is the pid lookup, which asks the scheduler's
+    /// own task table via [`resolve_kill_targets`] -- Detcore state, replayed
+    /// identically -- rather than the host's process table, which would leak
+    /// unrelated host processes into a guest-visible answer.
+    ///
+    /// # Deliberately not emulated
+    ///
+    /// Three behaviours are excluded, under one rule: **an answer that depends
+    /// on the host's kernel configuration or the caller's privileges is not
+    /// reproduced, because a deterministic sandbox must not vary with the
+    /// machine underneath it.** Each was measured natively and would differ on
+    /// a differently-built or differently-privileged host:
+    ///
+    /// * EPERM for a real-time priority, a SCHED_DEADLINE admission, or a
+    ///   negative nice, which depends on `CAP_SYS_NICE` and `RLIMIT_RTPRIO`.
+    /// * EOPNOTSUPP for util-clamp on a VER1 buffer, which depends on
+    ///   `CONFIG_UCLAMP_TASK`.
+    /// * The `sysctl_sched_dl_period_{min,max}` bound on SCHED_DEADLINE
+    ///   periods, which is runtime-tunable.
+    ///
+    /// In all three Hermit accepts the request as the same no-op as any other
+    /// well-formed one. The same rule is why SCHED_EXT (policy 7) is accepted
+    /// unconditionally even though `valid_policy()` admits it only with
+    /// `CONFIG_SCHED_CLASS_EXT`: picking one answer keeps the sandbox stable
+    /// across hosts, and accepting is the choice consistent with suppressing
+    /// the effect rather than refusing the request.
+    ///
+    /// The bracketed regression test in `hermit-cli/tests/sched_setattr_abi.rs`
+    /// compares Hermit against the running kernel case by case, and therefore
+    /// deliberately omits exactly these cases -- including them would make its
+    /// verdict depend on the host it runs on.
     pub async fn handle_sched_setattr<G: Guest<Self>>(
         &self,
-        _guest: &mut G,
+        guest: &mut G,
         call: syscalls::SchedSetattr,
     ) -> Result<i64, Error> {
+        // `if (!uattr || pid < 0 || flags)` -- one clause in the kernel, so all
+        // three are EINVAL and none of them is ordered against the others. A
+        // null pointer is EINVAL rather than EFAULT because it is refused
+        // before any access is attempted.
+        if call.flags() != 0 || call.pid() < 0 {
+            return Err(Errno::EINVAL.into());
+        }
+        let attr = call.attr().ok_or(Errno::EINVAL)?;
+
+        // `get_user(size, &uattr->size)` -- the declared size is read before
+        // anything else, and a fault here is EFAULT with no store back.
+        // `AddrMut` is not `Copy` and `cast` consumes it, so each access below
+        // re-derives the address from the syscall argument.
+        // A fault reading guest memory is EFAULT for this syscall. The
+        // backend's memory layer reports a failed peek as EIO, which is not an
+        // errno `sched_setattr` can return, so it is mapped here; measured
+        // native, an unmapped `uattr` gives EFAULT.
+        let declared: u32 = guest
+            .memory()
+            .read_value(attr.cast())
+            .map_err(|_| Errno::EFAULT)?;
+
+        // Both E2BIG exits below run the kernel's `err_size` path, which stores
+        // the kernel's own struct size into `uattr->size` before returning. A
+        // guest that reads the field back learns the size it should have sent,
+        // which is the entire point of the store; the kernel ignores whether it
+        // succeeds, and so do we.
+        fn refuse_too_big<S: MemoryAccess>(mut memory: S, attr: AddrMut<libc::c_void>) -> Error {
+            let _ = memory.write_value(attr.cast::<u32>(), &SCHED_ATTR_KERNEL_SIZE);
+            Errno::E2BIG.into()
+        }
+
+        let size = match sched_attr_effective_size(declared) {
+            Ok(size) => size,
+            Err(()) => {
+                let back = call.attr().ok_or(Errno::EINVAL)?;
+                return Err(refuse_too_big(guest.memory(), back));
+            }
+        };
+
+        // `copy_struct_from_user` with a user size past the kernel's struct:
+        // every trailing byte must be zero, or the guest is sending a field
+        // this kernel does not know and must not silently drop. A fault while
+        // scanning is EFAULT and skips the store back -- only the not-all-zero
+        // verdict is E2BIG.
+        if size > SCHED_ATTR_KERNEL_SIZE {
+            let tail_len = (size - SCHED_ATTR_KERNEL_SIZE) as usize;
+            let mut tail = vec![0u8; tail_len];
+            let tail_base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
+            // SAFETY: the guest declared a buffer of `size` bytes, so this
+            // offset is inside the region it asked the kernel to read.
+            let tail_addr = unsafe { tail_base.add(SCHED_ATTR_KERNEL_SIZE as usize) };
+            guest
+                .memory()
+                .read_exact(tail_addr, &mut tail)
+                .map_err(|_| Errno::EFAULT)?;
+            if tail.iter().any(|byte| *byte != 0) {
+                let back = call.attr().ok_or(Errno::EINVAL)?;
+                return Err(refuse_too_big(guest.memory(), back));
+            }
+        }
+
+        // Copy the interoperable prefix, zero-filling anything the guest's
+        // buffer is too short to carry, exactly as `copy_struct_from_user`
+        // does for a short read.
+        let copied = std::cmp::min(size, SCHED_ATTR_KERNEL_SIZE) as usize;
+        let mut raw = [0u8; SCHED_ATTR_KERNEL_SIZE as usize];
+        let base: AddrMut<u8> = call.attr().ok_or(Errno::EINVAL)?.cast();
+        guest
+            .memory()
+            .read_exact(base, &mut raw[..copied])
+            .map_err(|_| Errno::EFAULT)?;
+        let field32 = |offset: usize| -> u32 {
+            u32::from_ne_bytes(raw[offset..offset + 4].try_into().expect("4 bytes"))
+        };
+        let field64 = |offset: usize| -> u64 {
+            u64::from_ne_bytes(raw[offset..offset + 8].try_into().expect("8 bytes"))
+        };
+        let fields = SchedAttrFields {
+            policy: field32(SCHED_ATTR_OFF_POLICY),
+            sched_flags: field64(SCHED_ATTR_OFF_FLAGS),
+            priority: field32(SCHED_ATTR_OFF_PRIORITY),
+            runtime: field64(SCHED_ATTR_OFF_RUNTIME),
+            deadline: field64(SCHED_ATTR_OFF_DEADLINE),
+            period: field64(SCHED_ATTR_OFF_PERIOD),
+        };
+
+        // Everything the kernel decides before it resolves the pid.
+        validate_sched_attr_before_lookup(size, &fields)?;
+
+        // `find_process_by_pid()` sits here, between the two groups of checks,
+        // and the position is guest-visible: a request that is malformed only
+        // in a way judged below reports ESRCH rather than EINVAL when the pid
+        // does not exist. pid 0 means the calling thread, which always exists;
+        // otherwise ask the scheduler's own task table, so the answer comes
+        // from Detcore's state rather than from the host's process table.
+        if call.pid() != 0 {
+            let targets = resolve_kill_targets(guest, DetPid::from_raw(call.pid())).await;
+            if targets.is_empty() {
+                return Err(Errno::ESRCH.into());
+            }
+        }
+
+        // And everything `__sched_setscheduler` decides after it.
+        validate_sched_attr_after_lookup(&fields)?;
+
         info!(
             "Suppressing sched_setattr(pid={}, flags={}); Linux scheduler attributes are virtual",
             call.pid(),
@@ -1344,6 +1699,310 @@ mod tests {
                 },
             ),
             Err(Errno::EINVAL)
+        );
+    }
+
+    // The expectations below are not guesses at the kernel's behaviour: each is
+    // a row measured natively on this host (Linux 6.19, x86-64) with a raw
+    // `sched_setattr` probe. Where a row differs from what the handler used to
+    // do, the difference is called out.
+
+    /// A well-formed VER0 SCHED_OTHER descriptor, as the decoded fields.
+    fn plain_attr() -> SchedAttrFields {
+        SchedAttrFields {
+            policy: 0,
+            sched_flags: 0,
+            priority: 0,
+            runtime: 0,
+            deadline: 0,
+            period: 0,
+        }
+    }
+
+    #[test]
+    fn size_zero_is_a_well_formed_ver0_request() {
+        // ABI compatibility quirk: `if (!size) size = SCHED_ATTR_SIZE_VER0;`.
+        // Measured native: ret 0. PR #2288 returned E2BIG.
+        assert_eq!(sched_attr_effective_size(0), Ok(SCHED_ATTR_SIZE_VER0));
+    }
+
+    #[test]
+    fn size_below_ver0_or_past_a_page_is_too_big() {
+        // Measured native: size 1, 47 and 4097 all give E2BIG.
+        assert_eq!(sched_attr_effective_size(1), Err(()));
+        assert_eq!(sched_attr_effective_size(SCHED_ATTR_SIZE_VER0 - 1), Err(()));
+        assert_eq!(sched_attr_effective_size(SCHED_ATTR_MAX_SIZE + 1), Err(()));
+    }
+
+    #[test]
+    fn size_from_ver0_through_one_page_is_accepted_unchanged() {
+        // Measured native: 48, 56, 57 and 4096 all give ret 0.
+        for size in [
+            SCHED_ATTR_SIZE_VER0,
+            SCHED_ATTR_SIZE_VER1,
+            SCHED_ATTR_SIZE_VER1 + 1,
+            SCHED_ATTR_MAX_SIZE,
+        ] {
+            assert_eq!(sched_attr_effective_size(size), Ok(size), "size {}", size);
+        }
+    }
+
+    #[test]
+    fn sched_ext_is_a_valid_policy_and_sched_iso_is_not() {
+        // Measured native: policy 7 gives ret 0; policy 4 gives EINVAL. PR
+        // #2288 refused 7.
+        assert!(is_valid_sched_policy(SCHED_EXT), "SCHED_EXT is accepted");
+        assert!(!is_valid_sched_policy(4), "SCHED_ISO is reserved");
+        for policy in [0, 1, 2, 3, 5, 6] {
+            assert!(is_valid_sched_policy(policy), "policy {}", policy);
+        }
+        // Measured native: policy 8 and 99 both give EINVAL.
+        for policy in [8, 99] {
+            assert!(!is_valid_sched_policy(policy), "policy {}", policy);
+        }
+    }
+
+    // ---- which side of the pid lookup each rule falls on --------------------
+    // The kernel resolves the pid between `sched_setattr()` and
+    // `__sched_setscheduler()`, so a request naming a nonexistent pid reports
+    // ESRCH for every rule on the far side and its own errno for every rule on
+    // the near side. Measured natively with pid 0x3fffffff:
+    //     bad sched_flags    -> ESRCH    (far side)
+    //     bad priority       -> ESRCH    (far side)
+    //     negative policy    -> EINVAL   (near side)
+    //     util-clamp size 48 -> EINVAL   (near side)
+    // The split between the two functions below is exactly that boundary.
+
+    #[test]
+    fn util_clamp_size_rule_is_decided_before_the_pid_lookup() {
+        // Measured native: EINVAL even with a nonexistent pid.
+        let mut attr = plain_attr();
+        attr.sched_flags = SCHED_FLAG_UTIL_CLAMP_MIN;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &attr),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER1, &attr),
+            Ok(())
+        );
+        // ...and it is not re-decided on the far side.
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Ok(()));
+    }
+
+    #[test]
+    fn a_negative_policy_is_decided_before_the_pid_lookup() {
+        // Measured native: EINVAL even with a nonexistent pid, and EINVAL with
+        // KEEP_POLICY too -- the signed test sits above the substitution.
+        let mut attr = plain_attr();
+        attr.policy = 0x8000_0000;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &attr),
+            Err(Errno::EINVAL)
+        );
+        attr.sched_flags = SCHED_FLAG_KEEP_POLICY;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &attr),
+            Err(Errno::EINVAL),
+            "KEEP_POLICY must not hide a negative policy"
+        );
+    }
+
+    #[test]
+    fn policy_and_flag_rules_are_decided_after_the_pid_lookup() {
+        // Measured native: with a nonexistent pid both of these report ESRCH,
+        // so neither may be decided on the near side.
+        let mut bad_policy = plain_attr();
+        bad_policy.policy = 99;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &bad_policy),
+            Ok(()),
+            "an undefined policy must survive the near side so ESRCH can win"
+        );
+        assert_eq!(
+            validate_sched_attr_after_lookup(&bad_policy),
+            Err(Errno::EINVAL)
+        );
+
+        let mut bad_flag = plain_attr();
+        bad_flag.sched_flags = 0x80;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &bad_flag),
+            Ok(()),
+            "an undefined sched_flags bit must survive the near side"
+        );
+        assert_eq!(
+            validate_sched_attr_after_lookup(&bad_flag),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn keep_policy_makes_the_policy_field_irrelevant() {
+        // Measured native: policy 99 alone is EINVAL, but policy 99 with
+        // SCHED_FLAG_KEEP_POLICY is ret 0 -- the kernel overwrites the field
+        // with SETPARAM_POLICY and never runs valid_policy(). PR #2288 refused
+        // it.
+        let mut attr = plain_attr();
+        attr.policy = 99;
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Err(Errno::EINVAL));
+        attr.sched_flags = SCHED_FLAG_KEEP_POLICY;
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Ok(()));
+    }
+
+    #[test]
+    fn defined_sched_flags_bits_are_accepted_and_undefined_ones_are_not() {
+        // Measured native: sched_flags 0x80 gives EINVAL; RESET_ON_FORK,
+        // KEEP_PARAMS, KEEP_ALL, RECLAIM and DL_OVERRUN are all ret 0 at
+        // size 48. PR #2288 ignored sched_flags entirely.
+        let mut attr = plain_attr();
+        attr.sched_flags = 0x80;
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Err(Errno::EINVAL));
+        for flag in [
+            SCHED_FLAG_RESET_ON_FORK,
+            SCHED_FLAG_RECLAIM,
+            SCHED_FLAG_DL_OVERRUN,
+            SCHED_FLAG_KEEP_PARAMS,
+            SCHED_FLAG_KEEP_POLICY,
+        ] {
+            let mut ok = plain_attr();
+            ok.sched_flags = flag;
+            assert_eq!(
+                validate_sched_attr_after_lookup(&ok),
+                Ok(()),
+                "flag {:#x}",
+                flag
+            );
+        }
+        // The whole mask at once is refused on the NEAR side, and for the
+        // util-clamp size reason rather than the flag-validity one: measured
+        // native EINVAL at size 48.
+        let mut all = plain_attr();
+        all.sched_flags = SCHED_FLAG_ALL;
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER0, &all),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_sched_attr_before_lookup(SCHED_ATTR_SIZE_VER1, &all),
+            Ok(())
+        );
+        assert_eq!(validate_sched_attr_after_lookup(&all), Ok(()));
+    }
+
+    #[test]
+    fn priority_must_agree_with_the_policy() {
+        // The kernel states this as `rt_policy(policy) != (prio != 0)`.
+        // Measured native, all EINVAL: OTHER/BATCH/IDLE with priority 1, and
+        // FIFO/RR with priority 0. PR #2288 accepted every one of them.
+        for policy in [0u32, 3, 5] {
+            let mut attr = plain_attr();
+            attr.policy = policy;
+            attr.priority = 1;
+            assert_eq!(
+                validate_sched_attr_after_lookup(&attr),
+                Err(Errno::EINVAL),
+                "policy {} with priority 1",
+                policy
+            );
+            attr.priority = 0;
+            assert_eq!(
+                validate_sched_attr_after_lookup(&attr),
+                Ok(()),
+                "policy {} with priority 0",
+                policy
+            );
+        }
+        for policy in [SCHED_FIFO, SCHED_RR] {
+            let mut attr = plain_attr();
+            attr.policy = policy;
+            attr.priority = 0;
+            assert_eq!(
+                validate_sched_attr_after_lookup(&attr),
+                Err(Errno::EINVAL),
+                "rt policy {} with priority 0",
+                policy
+            );
+            // A real-time priority is accepted here; whether the *caller* may
+            // ask for it is EPERM, which depends on privilege and is not
+            // emulated.
+            attr.priority = 1;
+            assert_eq!(validate_sched_attr_after_lookup(&attr), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_priority_past_max_rt_prio_is_refused() {
+        // Measured native: FIFO with priority 100 is EINVAL rather than the
+        // EPERM that priorities 1..=99 give, so the range test runs first.
+        let mut attr = plain_attr();
+        attr.policy = SCHED_FIFO;
+        attr.priority = MAX_RT_PRIO;
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Err(Errno::EINVAL));
+        attr.priority = MAX_RT_PRIO - 1;
+        assert_eq!(validate_sched_attr_after_lookup(&attr), Ok(()));
+    }
+
+    #[test]
+    fn deadline_parameters_are_checked() {
+        // Measured native: SCHED_DEADLINE with all-zero parameters is EINVAL,
+        // and with runtime > deadline is EINVAL. PR #2288 accepted both.
+        let mut zeroed = plain_attr();
+        zeroed.policy = SCHED_DEADLINE;
+        assert_eq!(
+            validate_sched_attr_after_lookup(&zeroed),
+            Err(Errno::EINVAL),
+            "all-zero deadline parameters"
+        );
+
+        let mut inverted = plain_attr();
+        inverted.policy = SCHED_DEADLINE;
+        inverted.runtime = 90_000_000;
+        inverted.deadline = 30_000_000;
+        inverted.period = 30_000_000;
+        assert_eq!(
+            validate_sched_attr_after_lookup(&inverted),
+            Err(Errno::EINVAL),
+            "runtime > deadline"
+        );
+
+        // Sane parameters pass the ABI rules. Natively this host answers EPERM,
+        // which is a privilege question rather than an ABI one.
+        let mut sane = plain_attr();
+        sane.policy = SCHED_DEADLINE;
+        sane.runtime = 10_000_000;
+        sane.deadline = 30_000_000;
+        sane.period = 30_000_000;
+        assert_eq!(validate_sched_attr_after_lookup(&sane), Ok(()));
+    }
+
+    #[test]
+    fn deadline_parameter_edges_follow_checkparam_dl() {
+        // deadline == 0 is refused whatever else is set.
+        assert!(!deadline_params_are_valid(1 << 20, 0, 0));
+        // runtime below the DL_SCALE truncation floor (1 << 10) is refused.
+        assert!(!deadline_params_are_valid((1 << 10) - 1, 1 << 20, 1 << 20));
+        assert!(deadline_params_are_valid(1 << 10, 1 << 20, 1 << 20));
+        // The MSB is reserved on both deadline and period.
+        assert!(!deadline_params_are_valid(1 << 20, 1 << 63, 0));
+        assert!(!deadline_params_are_valid(1 << 20, 1 << 20, 1 << 63));
+        // A zero period means "same as the deadline", so this is runtime <=
+        // deadline <= deadline and is accepted.
+        assert!(deadline_params_are_valid(1 << 20, 1 << 21, 0));
+        // deadline > period is refused.
+        assert!(!deadline_params_are_valid(1 << 20, 1 << 22, 1 << 21));
+    }
+
+    #[test]
+    fn the_size_written_back_on_refusal_is_the_kernel_struct_not_the_libc_mirror() {
+        // Measured native: every E2BIG row leaves uattr->size holding 56, not
+        // 48. Deriving that from the libc crate's `sched_attr` would report 48
+        // and tell the guest to retry with a size the kernel already accepted.
+        assert_eq!(SCHED_ATTR_KERNEL_SIZE, 56);
+        assert_eq!(std::mem::size_of::<libc::sched_attr>(), 48);
+        assert_ne!(
+            SCHED_ATTR_KERNEL_SIZE as usize,
+            std::mem::size_of::<libc::sched_attr>()
         );
     }
 }
