@@ -28,7 +28,9 @@
 //!
 //! Run under both namespace configurations, because the pre-#1849 failure mode
 //! was different in each: `EPERM` for everything with `--no-namespace`, and
-//! `EINVAL` for an unmapped uid under the default one-uid `uid_map`.
+//! `EINVAL` for an unmapped uid under the default one-uid `uid_map`. Only the
+//! default configuration adds `--strict`; `run_guest` documents why the
+//! `--no-namespace` case cannot.
 
 use std::fs;
 use std::path::Path;
@@ -87,7 +89,21 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-fn run_guest(tag: &str, extra: &[&str]) {
+/// `strict` is per-case, not a constant, because `hermit run` refuses
+/// `--strict` together with anything that forces host networking, and
+/// `--no-namespace` is one of those things (`hermit-cli/src/bin/hermit/run.rs`:
+/// "--strict is fail-closed deterministic mode and cannot be combined with
+/// --no-namespace, which forces host networking"). That refusal is deliberate
+/// and its own message names the remedy: re-run without `--strict`.
+///
+/// Dropping it costs this test nothing. `--strict` is about failing closed on
+/// operations hermit cannot determinize; the ownership contract below is
+/// enforced by the guest's own per-call checks, which run identically either
+/// way. In particular the identity half still discriminates: with no user
+/// namespace and no emulation, the family reaches the host as the real
+/// unprivileged uid and returns `EPERM`, so the guest fails exactly as it did
+/// before #1849.
+fn run_guest(tag: &str, strict: bool, extra: &[&str]) {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
@@ -98,8 +114,11 @@ fn run_guest(tag: &str, extra: &[&str]) {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--no-virtualize-metadata",
-            "--strict",
-        ])
+        ]);
+    if strict {
+        command.arg("--strict");
+    }
+    command
         .args(extra)
         .arg("--")
         .arg(guest())
@@ -130,14 +149,17 @@ fn run_guest(tag: &str, extra: &[&str]) {
 /// Before #1849 this returned `EINVAL` for any uid other than 0.
 #[test]
 fn chown_family_keeps_virtual_root_identity_and_real_errors() {
-    run_guest("default", &[]);
+    run_guest("default", true, &[]);
 }
 
 /// No user namespace at all. Before #1849 the whole family returned `EPERM`
 /// here, including `chown(path, 0, 0)` — the configuration in which the old
 /// model was most visibly incoherent (`getuid` reported 0 while `stat`
 /// reported the real host uid).
+///
+/// Runs without `--strict`; see `run_guest` for why that is required here and
+/// why it does not weaken the assertion.
 #[test]
 fn chown_family_keeps_virtual_root_identity_without_a_user_namespace() {
-    run_guest("no-namespace", &["--no-namespace"]);
+    run_guest("no-namespace", false, &["--no-namespace"]);
 }
