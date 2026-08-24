@@ -44837,12 +44837,12 @@
       "enabled": false,
       "status": "red",
       "last_tested": {
-        "hermit_sha": "ffe9ed4c065296a760e837ee642c43630a378e0f",
+        "hermit_sha": "4237532dcc9c8bf955143e84da1f55408ac576b8",
         "detcore_tree": "34226bf3aaf149ed604d8d8ef1f23c1e9fd7bdc9",
         "depth": {
           "hermit": {
-            "commits": 1930,
-            "first_parent": 1855
+            "commits": 1931,
+            "first_parent": 1856
           },
           "reverie": {
             "commits": 934,
@@ -44865,12 +44865,121 @@
             }
           },
           "hermit_shas": [
+            "4237532dcc9c8bf955143e84da1f55408ac576b8",
             "ffe9ed4c065296a760e837ee642c43630a378e0f"
           ],
           "results": [
             "determinism-failure"
           ],
           "invocations": [
+            {
+              "hermit_sha": "4237532dcc9c8bf955143e84da1f55408ac576b8",
+              "run_id": "portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre",
+              "result": "determinism-failure",
+              "argv": [
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "sabre",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "--env",
+                "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/tmp/hermit-e2e",
+                "--env",
+                "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "--",
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "--run"
+              ],
+              "guest_argv": [
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                "--run"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+              },
+              "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
+              "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "FAIL",
+                  "status": 1,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "sabre",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/tmp/hermit-e2e",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "--",
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "--run"
+                  ],
+                  "guest_argv": [
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh",
+                    "--run"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_SABRE_PATH_EVIDENCE": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl",
+                    "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config"
+                  },
+                  "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
+                  "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_SABRE_PATH_EVIDENCE=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/captures/verify-1.sabre-path.jsonl HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend sabre --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pcamp-exact-4/runs/portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre/data-handling-sqlite-query-determinism-verify-sabre/fixtures -- /home/newton/work/dev-hermit/worktrees/003/hermit/tests/e2e/data-handling/sqlite-query-determinism.sh --run"
+                }
+              ]
+            },
             {
               "hermit_sha": "ffe9ed4c065296a760e837ee642c43630a378e0f",
               "run_id": "portable-data-handling-data-handling-sqlite-query-determinism-verify-sabre",
@@ -44982,18 +45091,18 @@
           ],
           "first_divergent_scheduler_turn": {
             "earliest": 68,
-            "latest": 68,
-            "samples": 1
+            "latest": 69,
+            "samples": 2
           },
           "first_divergent_virtual_nanoseconds": {
             "earliest": 1767225600051317250,
-            "latest": 1767225600051317250,
-            "samples": 1
+            "latest": 1767225600052354000,
+            "samples": 2
           },
           "first_divergent_record": {
             "earliest": 93,
-            "latest": 93,
-            "samples": 1
+            "latest": 94,
+            "samples": 2
           },
           "first_divergent_syscall": null
         }
