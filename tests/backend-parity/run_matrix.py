@@ -491,16 +491,15 @@ def case_catalog(
 # New cases are green contracts by default.  Only stable, diagnosed exceptions
 # belong here; live pass/fail evidence is written to the outer scorecard.
 L1_GAPS = {
-    ("dbt", "file_metadata"): (
-        "PR #1549 determinizes credential queries (getuid/getgid/getresuid/"
-        "getresgid) to virtual-root identity 0; DBT forwards fchown(fd,0,0) to "
-        "the real kernel with no CLONE_NEWUSER uid map, so the guest performs an "
-        "unprivileged chown-to-root and gets EPERM, whereas ptrace remaps it "
-        "through the user namespace. fchown is not correctly implemented under "
-        "DBT, and an assertion against a half-implemented syscall could pass by "
-        "accident and prove nothing; declared a gap until DBT determinizes "
-        "fchown (see the determinize_fchown_under_dbt TODO)"
-    ),
+    # ("dbt", "file_metadata") was retired by PR #1851
+    # (https://github.com/rrnewton/hermit/pull/1851).  Its stated exit condition
+    # was "declared a gap until DBT determinizes fchown"; that PR moves chown,
+    # fchown, fchownat and lchown from PassThrough to Determinized in the shared
+    # classification, so the unprivileged chown-to-root EPERM this cell existed
+    # for no longer occurs.  Confirmed with this harness's own probe at that
+    # head: `run_matrix.py --backend dbt --probe-gaps` reports
+    # "XPASS dbt/file_metadata: candidate for promotion from gap: 3/3 runs
+    # matched".  The L2 row for the same case is NOT retired; see L2_GAPS.
     ("dbt", "pthread_lifecycle"): (
         "Portable release DynamoRIO can stall or exit during native pthread "
         "startup before Detcore readiness"
@@ -512,9 +511,21 @@ L1_GAPS = {
 }
 L2_GAPS = {
     ("dbt", "file_metadata"): (
-        "Inherited from the L1 DBT file_metadata gap: the fchown EPERM aborts "
-        "the guest before any --verify double-run, so no L2 determinism witness "
-        "can be produced"
+        "NOT inherited from the L1 gap any more -- that L1 gap was retired by "
+        "PR #1851 (https://github.com/rrnewton/hermit/pull/1851) and the old "
+        "reason here, 'the fchown EPERM aborts the guest before any --verify "
+        "double-run', is no longer true: the guest now runs to completion and "
+        "prints 'syscall-file-metadata-ok count=20'.  The row still fails, for "
+        "an unrelated and pre-existing reason, so the cell stays declared with "
+        "its cause corrected.  Measured at that head: with the runner's exact "
+        "flags the L2 double-run SUCCEEDS ('Success: deterministic. Determinism "
+        "verified', DBT guest-memory hashes equal) -- EXCEPT that adding "
+        "--verify-json makes it exit 1 with 'DBT canonical evidence contained "
+        "no INFO records'.  That failure is not specific to this case or to "
+        "chown: bisected to --verify-json alone, and reproduced on /bin/true, "
+        "which issues no chown at all.  It affects every DBT case the runner "
+        "probes under --verify, so the --verify dbt ratchet is currently "
+        "measuring that defect rather than per-case determinism"
     ),
     ("dbt", "exit_status"): (
         "hermit --verify runs the DBT guest only once when the first run exits "
