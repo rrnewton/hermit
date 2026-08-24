@@ -13,19 +13,34 @@
 # actually ran. The digest belongs in the receipt next to the flake.lock: the
 # digest says what ran, the lock says how to rebuild it. See README.md.
 #
-#   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] -- CMD...
+#   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
+#                                [--src-rw] [--cargo-home DIR] -- CMD...
+#
+# --src-rw mounts the source WRITABLE. The default is read-only and stays that
+# way, but a test phase legitimately writes into its own tree (target/ci,
+# ignored/e2e/build), exactly as a GitHub shard job writes into its checkout.
+# Read-only is the right default for a one-shot command; it is not a property
+# the test phase can satisfy.
+#
+# --cargo-home mounts an already-populated CARGO_HOME. The test phase has no
+# network BY DESIGN, so cargo must find its registry and git database already
+# present or it cannot even resolve the dependency graph. This is the local
+# equivalent of the shard jobs' `Swatinem/rust-cache` restore, not a workaround:
+# in both cases the cache is an input carried across the phase boundary.
 
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
-src=""; out=""; digest=""
+src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --src) src=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --digest) digest=$2; shift 2 ;;
+        --src-rw) src_mode="ro=false"; shift ;;
+        --cargo-home) cargo_home=$2; shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
     esac
@@ -58,6 +73,18 @@ fi
 
 mkdir -p "$out/target" "$out/home"
 
+cargo_mount=(); cargo_home_in=/build/.cargo
+if [[ -n "$cargo_home" ]]; then
+    [[ -d "$cargo_home" ]] || {
+        echo "run-in-pinned-root: --cargo-home '$cargo_home' is not a directory." >&2
+        echo "  It must be populated BEFORE this runs -- there is no network in here" >&2
+        echo "  to populate it from. Run the build phase first." >&2
+        exit 2
+    }
+    cargo_mount=(--mount "type=bind,source=$cargo_home,destination=/cargo")
+    cargo_home_in=/cargo
+fi
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
@@ -65,11 +92,12 @@ exec podman run --rm \
     --privileged \
     --device /dev/kvm \
     --network=none \
-    --mount "type=bind,source=$src,destination=/src,ro=true" \
+    --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/out/target" \
     --mount "type=bind,source=$out/home,destination=/build" \
+    "${cargo_mount[@]}" \
     -e HOME=/build \
-    -e CARGO_HOME=/build/.cargo \
+    -e CARGO_HOME="$cargo_home_in" \
     -e CARGO_TARGET_DIR=/out/target \
     -w /src \
     "$digest" \
