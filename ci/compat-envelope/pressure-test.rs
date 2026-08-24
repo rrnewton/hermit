@@ -830,6 +830,13 @@ struct VerificationEvidence {
     /// aggregates RETAINED reports, including ones written before this field
     /// existed, so there absence has to mean "older report" rather than "broken
     /// producer".
+    ///
+    /// NEVER READ, AND THAT IS THE POINT -- so `#[allow(dead_code)]` rather than
+    /// deletion. The assertion this field makes happens at DESERIALIZATION: a
+    /// report missing the key fails to parse. Removing the field to satisfy
+    /// dead_code would delete the check while leaving the doc above claiming it
+    /// exists, which is the failure mode this whole test guards against.
+    #[allow(dead_code)]
     first_divergent_record: RequiredNullableU64,
 }
 
