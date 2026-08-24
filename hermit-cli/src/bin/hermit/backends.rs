@@ -889,9 +889,9 @@ pub(super) fn run_dbt(
         "Success: deterministic. Determinism verified."
     } else {
         "Success: deterministic. Determinism verified. NOTE: syscall \
-         output-buffer CONTENT was not compared, so a divergence confined to \
-         a buffer whose length is stable would not have been seen; add \
-         --detlog-io-buffers to include it."
+         output-buffer CONTENT was not compared because --no-detlog-io-buffers \
+         was given, so a divergence confined to a buffer whose length is stable \
+         would not have been seen; drop that flag to include it."
     };
     announce_verification_outcome(&outcome, success_message, "Failure: nondeterministic.");
     if !outcome.verified() {
