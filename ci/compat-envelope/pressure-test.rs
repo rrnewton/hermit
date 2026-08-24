@@ -1,5 +1,5 @@
 #!/usr/bin/env -S rust-script --force
-//! Safely retry red compatibility cells and repeat one committed green cell.
+//! Safely retry red compatibility cells and repeat one committed tracked cell.
 //!
 //! ```cargo
 //! [dependencies]
@@ -30,6 +30,8 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::container_core_budget;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
@@ -41,8 +43,6 @@ use dagrun::model::StepClass;
 use dagrun::model::StepOutcome;
 use dagrun::model::effective_cpu_count;
 use dagrun::model::effective_cpu_timeout;
-use dagrun::cgroup::aggregate_slice_max_cpus;
-use dagrun::container_core_budget;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use serde::Deserialize;
@@ -133,11 +133,11 @@ fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String
 const USAGE: &str = r#"Hermit compatibility pressure test
 
 Ordinary `validate` reruns the committed green compatibility cells and fails on
-regressions. This tool either probes currently red cells or repeats enabled
-green cells to measure flakiness. Every check runs under safe-ci resource and
+regressions. This tool either probes currently red cells or repeats one tracked
+cell to measure flakiness. Every check runs under safe-ci resource and
 time limits and retains its raw evidence under ignored/. Red cells remain red
 unless a later reviewed scorecard change deliberately promotes them; repeated
-green results never edit the scorecard.
+results never edit the scorecard.
 
 Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
@@ -155,8 +155,9 @@ Commands:
       is ignored/compat-envelope/pressure-<SHA>-<time>. A red chaos cell whose
       manifest declares no seeds remains red but is unavailable: exact requests
       refuse it, while batches report and omit it rather than inventing a run.
-      Add --repetitions N to an exact currently green cell to run N independent
-      boxed checks against the same clean committed source. Use --green with
+      Add --repetitions N to an exact tracked red or enabled green cell to run N
+      independent boxed checks against the same clean committed source. Use
+      --green with
       --repetitions to select every enabled green cell in one shared-build DAG;
       --mode and --sample may narrow that green population. Existing resource
       caps allow at most four manifest guests at once and at most one KVM guest.
@@ -181,8 +182,8 @@ Exact-cell options (run and plan):
   --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
   --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
                            an exact cell or --sample
-  --repetitions COUNT      Repeat one exact currently green cell in independent
-                           boxed jobs. COUNT must be positive. Plan and run
+  --repetitions COUNT      Repeat one exact tracked red or enabled green cell
+                           in independent boxed jobs. COUNT must be positive. Plan and run
                            require a clean commit. At most four manifest guests
                            run at once, and KVM remains limited to one.
 
@@ -216,7 +217,8 @@ Examples:
   ./ci/compat-envelope/pressure-test.rs run \
     --sample 10 --seed 42 --cell-timeout 60
 
-  # Check one committed green cell 100 times under the same boxed limits.
+  # Check one tracked red or committed green cell 100 times under the same
+  # boxed limits.
   # The DAG admits at most four manifest guests at once (one for KVM).
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
@@ -240,7 +242,7 @@ How it runs:
   budgets from the typed manifest tool. The in-memory graph then reuses the
   canonical Hermit/resource build commands from ci/dag/portable.json without
   recursively running the full validation metadata audit. Fixture preparation
-  is serialized. Every selected red cell, or every selected green-cell
+  is serialized. Every selected red cell, or every selected repeated-cell
   repetition, then runs in its own safe-ci cgroup. Existing resource caps admit
   four manifest guests at once and one KVM guest. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
@@ -270,6 +272,11 @@ struct TrackedCells {
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
+    enabled: bool,
+    status: String,
+}
+
+struct ExpectedCell {
     enabled: bool,
     status: String,
 }
@@ -310,12 +317,12 @@ impl CellSelection {
         self.test.is_some() && self.mode.is_some() && self.backend.is_some()
     }
 
-    fn repeats_green_cell(&self) -> bool {
-        self.repetitions.is_some()
+    fn selects_green_cells(&self) -> bool {
+        self.green
     }
 
     fn uses_shared_preparation(&self) -> bool {
-        !self.is_exact() || self.repeats_green_cell()
+        !self.is_exact() || self.repetitions.is_some()
     }
 
     fn run_count(&self) -> usize {
@@ -327,7 +334,7 @@ impl CellSelection {
     }
 
     fn allows_dirty_source(&self) -> bool {
-        self.is_exact() && !self.repeats_green_cell()
+        self.is_exact() && self.repetitions.is_none()
     }
 }
 
@@ -943,7 +950,9 @@ fn execute_typed_dag(
         // starts if the CPU budget is narrower than such a step's declared width, and
         // the budget defaults to `jobs`, so it must be passed explicitly here for the
         // same reason as in scripts/validate.rs::scheduler_cpu_budget.
-        let cpu_budget = container_core_budget().min(aggregate_slice_max_cpus()).max(1);
+        let cpu_budget = container_core_budget()
+            .min(aggregate_slice_max_cpus())
+            .max(1);
         let result: RunResult = run_dag_boxed_deadline(
             &pass,
             jobs,
@@ -1689,7 +1698,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.repeats_green_cell() => {
+            "red" if selected && !selection.selects_green_cells() => {
                 let budget = budgets
                     .get(&(cell.id.test.clone(), cell.id.mode.clone()))
                     .ok_or_else(|| {
@@ -1710,7 +1719,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
-            "green" if selected && selection.repeats_green_cell() && cell.enabled => {
+            "green"
+                if selected
+                    && selection.repetitions.is_some()
+                    && cell.enabled
+                    && (selection.selects_green_cells() || selection.is_exact()) =>
+            {
                 let budget = budgets
                     .get(&(cell.id.test.clone(), cell.id.mode.clone()))
                     .ok_or_else(|| {
@@ -1745,9 +1759,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selection.mode.as_deref(),
                 selection.backend.as_deref(),
             ) {
-                if selection.repeats_green_cell() {
+                if selection.repetitions.is_some() {
                     format!(
-                        "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
+                        "{test}/{mode}/{backend} is not a tracked red or enabled green cell; use the scorecard or manifest CLI to inspect it"
                     )
                 } else {
                     format!(
@@ -1755,12 +1769,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     )
                 }
             } else if let Some(mode) = selection.mode.as_deref() {
-                if selection.repeats_green_cell() {
+                if selection.selects_green_cells() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
                 } else {
                     format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
-            } else if selection.repeats_green_cell() {
+            } else if selection.selects_green_cells() {
                 "tracked scorecard has no enabled green cells".into()
             } else {
                 "tracked scorecard has no red cells".into()
@@ -1770,7 +1784,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let eligible_cells = selected_cells.len();
     if let Some(count) = selection.sample {
         if count > selected_cells.len() {
-            return Err(if selection.repeats_green_cell() {
+            return Err(if selection.selects_green_cells() {
                 format!(
                     "--sample {count} exceeds the {} enabled green cells in the selected population",
                     selected_cells.len()
@@ -2190,7 +2204,8 @@ fn write_plan_after_scorecard_check(
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build = exact_cell.is_some()
+            let direct_backend_build = tag == "build.runtime_release"
+                && exact_cell.is_some()
                 && matches!(selection.backend.as_deref(), Some("ptrace" | "kvm"));
             let command = if direct_backend_build {
                 "CARGO_BUILD_JOBS=8 cargo build --release --locked -p hermit --bin hermit".into()
@@ -2424,7 +2439,7 @@ fn write_plan_after_scorecard_check(
                 job: slug,
                 desc: if let Some(number) = repetition {
                     format!(
-                        "Repeat green cell {}/{}/{}@{} ({number}/{})",
+                        "Repeat tracked cell {}/{}/{}@{} ({number}/{})",
                         cell.test,
                         cell.mode,
                         cell.backend,
@@ -2464,9 +2479,8 @@ fn write_plan_after_scorecard_check(
     steps.push(Step {
         group: "pressure".into(),
         job: "summarize".into(),
-        desc: if selection.repeats_green_cell() {
-            "Wait for every repeated green-cell check before reading retained runner evidence"
-                .into()
+        desc: if selection.repetitions.is_some() {
+            "Wait for every repeated-cell check before reading retained runner evidence".into()
         } else {
             "Wait for every red-cell attempt before reading retained runner evidence".into()
         },
@@ -2699,7 +2713,7 @@ fn validate_run_contract(
     results: &Path,
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
-) -> Result<BTreeMap<CellId, bool>, String> {
+) -> Result<BTreeMap<CellId, ExpectedCell>, String> {
     if metadata.source_tree_dirty && !allow_dirty_exact_cell {
         return Err("pressure run metadata claims a dirty source tree".into());
     }
@@ -2713,7 +2727,7 @@ fn validate_run_contract(
         return Err("dirty pressure results are accepted only for one exact red cell".into());
     }
     if metadata.source_tree_dirty && metadata.repetitions.is_some() {
-        return Err("repeated green-cell results require a clean committed source tree".into());
+        return Err("repeated-cell results require a clean committed source tree".into());
     }
     if metadata.sample.is_some() != metadata.seed.is_some() {
         return Err("retained sampled run must record both --sample and its seed".into());
@@ -2775,7 +2789,16 @@ fn validate_run_contract(
     let expected_cells = pressure_cells.selected;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
-        if expected.insert(tracked.id, tracked.enabled).is_some() {
+        if expected
+            .insert(
+                tracked.id,
+                ExpectedCell {
+                    enabled: tracked.enabled,
+                    status: tracked.status,
+                },
+            )
+            .is_some()
+        {
             return Err("tracked scorecard contains a duplicate red-cell identity".into());
         }
     }
@@ -2993,9 +3016,7 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
         && !runner.ok
         && runner.oom
         && !runner.timed_out
-        && harness_status.is_some_and(|status| {
-            !matches!(status, 0 | PREPARATION_FAILED_STATUS)
-        })
+        && harness_status.is_some_and(|status| !matches!(status, 0 | PREPARATION_FAILED_STATUS))
 }
 
 fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -3006,8 +3027,7 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
             !matches!(
                 status,
                 INCOMPLETE_ATTEMPT_STATUS | PREPARATION_FAILED_STATUS
-            )
-                && runner.ok == (status == 0)
+            ) && runner.ok == (status == 0)
         })
 }
 
@@ -3170,6 +3190,121 @@ fn repeated_batch_result_description(
     } else {
         "one or more repeated checks failed"
     }
+}
+
+fn wilson95(successes: usize, total: usize) -> (f64, f64) {
+    if total == 0 {
+        return (0.0, 1.0);
+    }
+    let z = 1.959_963_984_540_054_f64;
+    let n = total as f64;
+    let proportion = successes as f64 / n;
+    let denominator = 1.0 + z * z / n;
+    let centre = (proportion + z * z / (2.0 * n)) / denominator;
+    let half =
+        z * ((proportion * (1.0 - proportion) / n + z * z / (4.0 * n * n)).sqrt()) / denominator;
+    let lower = if successes == 0 {
+        0.0
+    } else {
+        (centre - half).max(0.0)
+    };
+    let upper = if successes == total {
+        1.0
+    } else {
+        (centre + half).min(1.0)
+    };
+    (lower, upper)
+}
+
+fn configured_cell_width(metadata: &RunMetadata) -> usize {
+    let jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
+    let resource_width = if metadata.backend.as_deref() == Some("kvm") {
+        1
+    } else {
+        4
+    };
+    jobs.min(resource_width)
+        .min(metadata.repetitions.unwrap_or(1))
+}
+
+fn coordinate_distribution(rows: &[JsonValue], field: &str, repetitions: usize) -> JsonValue {
+    let mut values = Vec::new();
+    let mut histogram = BTreeMap::<u64, usize>::new();
+    let mut minimum = None;
+    let mut minimum_last_changed_at_repetition = None;
+    for row in rows {
+        if row["verification"]["verdict"].as_str() != Some("diverged") {
+            continue;
+        }
+        let Some(value) = row["verification"][field].as_u64() else {
+            continue;
+        };
+        let repetition = row["repetition"].as_u64().map(|value| value as usize);
+        values.push(value);
+        *histogram.entry(value).or_default() += 1;
+        if minimum.is_none_or(|current| value < current) {
+            minimum = Some(value);
+            minimum_last_changed_at_repetition = repetition;
+        }
+    }
+    let maximum = values.iter().max().copied();
+    json!({
+        "observations": values.len(),
+        "minimum": minimum,
+        "maximum": maximum,
+        "distinct": histogram.len(),
+        "histogram": histogram,
+        "minimum_last_changed_at_repetition": minimum_last_changed_at_repetition,
+        "minimum_changed_at_n": minimum_last_changed_at_repetition == Some(repetitions),
+    })
+}
+
+fn repeated_distribution(metadata: &RunMetadata, rows: &[JsonValue]) -> Option<JsonValue> {
+    let repetitions = metadata.repetitions?;
+    if metadata.cells.len() != 1 {
+        return None;
+    }
+    let mut outcomes = BTreeMap::<String, usize>::new();
+    let mut matched = 0usize;
+    let mut diverged = 0usize;
+    for row in rows {
+        if let Some(result) = row["result"].as_str() {
+            *outcomes.entry(result.to_string()).or_default() += 1;
+        }
+        match row["verification"]["verdict"].as_str() {
+            Some("matched") => matched += 1,
+            Some("diverged") => diverged += 1,
+            _ => {}
+        }
+    }
+    let terminal_verdicts = matched + diverged;
+    let (lower, upper) = wilson95(diverged, terminal_verdicts);
+    let width = configured_cell_width(metadata);
+    Some(json!({
+        "requested_repetitions": repetitions,
+        "scheduler_jobs": metadata.jobs,
+        "configured_cell_width": width,
+        "scheduling_mode": if width == 1 { "sequential" } else { "concurrent" },
+        "cell_mode": metadata.cells[0].mode,
+        "hermit_sha": metadata.hermit_sha,
+        "detcore_tree": metadata.detcore_tree,
+        "outcomes": outcomes,
+        "divergence_rate": {
+            "diverged": diverged,
+            "terminal_verdicts": terminal_verdicts,
+            "wilson_95_lower": lower,
+            "wilson_95_upper": upper,
+            "requested_repetitions": repetitions,
+            "configured_cell_width": width,
+            "scheduling_mode": if width == 1 { "sequential" } else { "concurrent" },
+            "cell_mode": metadata.cells[0].mode,
+            "hermit_sha": metadata.hermit_sha,
+            "detcore_tree": metadata.detcore_tree,
+        },
+        "first_divergent_record": coordinate_distribution(rows, "first_divergent_record", repetitions),
+        "first_divergent_scheduler_turn": coordinate_distribution(rows, "first_divergent_scheduler_turn", repetitions),
+        "first_divergent_virtual_nanoseconds": coordinate_distribution(rows, "first_divergent_virtual_nanoseconds", repetitions),
+    }))
 }
 
 fn top_level_repeated_result_description(
@@ -3346,7 +3481,12 @@ fn read_verification_report(
     let evidence: VerificationEvidence = serde_json::from_value(report.clone())
         .map_err(|e| format!("incomplete verification report {}: {e}", path.display()))?;
     let canonical = canonical_verdict::VerificationReport::from_json_value(report.clone())
-        .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
+        .map_err(|e| {
+            format!(
+                "incomplete canonical verification report {}: {e}",
+                path.display()
+            )
+        })?;
     match (evidence.verdict.as_str(), evidence.verified) {
         ("matched", true) | ("diverged" | "no_result", false) => {}
         (verdict, verified) => {
@@ -3399,7 +3539,8 @@ fn read_verification_report(
         })?;
     }
     if evidence.verdict != "diverged"
-        && (evidence.first_divergent_scheduler_turn.0.is_some()
+        && (evidence.first_divergent_record.0.is_some()
+            || evidence.first_divergent_scheduler_turn.0.is_some()
             || evidence.first_divergent_virtual_nanoseconds.0.is_some())
     {
         return Err(format!(
@@ -3433,6 +3574,14 @@ fn summarize(
         ));
     }
     let expected = validate_run_contract(root, results, &metadata, allow_dirty_exact_cell)?;
+    let repeated_cell_status = (metadata.repetitions.is_some() && metadata.cells.len() == 1)
+        .then(|| {
+            expected
+                .get(&metadata.cells[0])
+                .map(|tracked| tracked.status.as_str())
+        })
+        .flatten();
+    let repeated_red = repeated_cell_status == Some("red");
     let loaded_runner_evidence = if typed_runner_evidence.is_some() {
         None
     } else if let Some(evidence) = load_retained_runner_evidence(results)? {
@@ -3541,7 +3690,7 @@ fn summarize(
                                         &slug,
                                         &metadata,
                                         cell,
-                                        expected.get(cell).copied().unwrap_or(false),
+                                        expected.get(cell).is_some_and(|tracked| tracked.enabled),
                                         harness_status,
                                     );
                                     let runner_completed =
@@ -3558,7 +3707,13 @@ fn summarize(
                                                     "shell_command": row.shell_command,
                                                     "attempts": attempts,
                                                 });
-                                                (row.outcome, true, row.reason, row.error_kind, Some(invocation))
+                                                (
+                                                    row.outcome,
+                                                    true,
+                                                    row.reason,
+                                                    row.error_kind,
+                                                    Some(invocation),
+                                                )
                                             }
                                             Err(error) => {
                                                 evidence_errors.push(format!(
@@ -3708,7 +3863,10 @@ fn summarize(
         }
     }
     if metadata.repetitions.is_some() {
-        println!("# Repeated green-cell results");
+        println!(
+            "# Repeated {}-cell results",
+            if repeated_red { "red" } else { "green" }
+        );
     } else {
         println!("# Red-cell pressure-test results");
     }
@@ -3776,6 +3934,56 @@ fn summarize(
         }
         println!();
     }
+    let distribution = repeated_distribution(&metadata, &rows);
+    if let Some(distribution) = &distribution {
+        let rate = &distribution["divergence_rate"];
+        println!(
+            "Repeat cost: {} boxed cell runs, one shared build/preparation, configured width {} ({}), manifest mode {}.",
+            distribution["requested_repetitions"],
+            distribution["configured_cell_width"],
+            distribution["scheduling_mode"]
+                .as_str()
+                .unwrap_or("unknown"),
+            distribution["cell_mode"].as_str().unwrap_or("unknown"),
+        );
+        println!(
+            "Divergence distribution: {}/{} terminal verdicts diverged; Wilson 95% interval {:.1}%..{:.1}% (N={}, width={}, scheduling={}, mode={}, Hermit {}, Detcore {}).",
+            rate["diverged"],
+            rate["terminal_verdicts"],
+            rate["wilson_95_lower"].as_f64().unwrap_or(0.0) * 100.0,
+            rate["wilson_95_upper"].as_f64().unwrap_or(1.0) * 100.0,
+            rate["requested_repetitions"],
+            rate["configured_cell_width"],
+            rate["scheduling_mode"].as_str().unwrap_or("unknown"),
+            rate["cell_mode"].as_str().unwrap_or("unknown"),
+            rate["hermit_sha"].as_str().unwrap_or("unknown"),
+            rate["detcore_tree"].as_str().unwrap_or("unknown"),
+        );
+        for field in [
+            "first_divergent_record",
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+        ] {
+            let values = &distribution[field];
+            if values["observations"].as_u64().unwrap_or(0) > 0 {
+                println!(
+                    "  {field}: min={} max={} distinct={} histogram={} minimum last changed at repetition {}; changed at N={}",
+                    values["minimum"],
+                    values["maximum"],
+                    values["distinct"],
+                    values["histogram"],
+                    values["minimum_last_changed_at_repetition"],
+                    values["minimum_changed_at_n"],
+                );
+            } else {
+                println!(
+                    "  {field}: no divergence observations, so no minimum exists; changed at N=false"
+                );
+            }
+        }
+        println!();
+    }
+
     let mut repeated_cells = Vec::new();
     let repeated_result = if metadata.repetitions.is_some() && !metadata.green {
         let result =
@@ -3853,6 +4061,7 @@ fn summarize(
         "selected_cells": metadata.cells.len(),
         "repeated_result": repeated_result,
         "repeated_cells": repeated_cells,
+        "distribution": distribution,
         "attempted": rows.len(),
         "pass_candidates": passing,
         "rows": rows,
@@ -3869,7 +4078,7 @@ fn summarize(
             totals[6]
         ));
     }
-    if metadata.repetitions.is_some() && totals[0] != totals[7] {
+    if metadata.repetitions.is_some() && !repeated_red && totals[0] != totals[7] {
         return Err(format!(
             "only {}/{} repeated green-cell checks passed; the retained summary classifies every non-pass",
             totals[0], totals[7]
@@ -3895,11 +4104,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn literal_shell_command(
-    cwd: &str,
-    env: &BTreeMap<String, String>,
-    argv: &[String],
-) -> String {
+fn literal_shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut words = vec![
         "cd".into(),
         recorded_shell_quote(cwd),
@@ -4010,13 +4215,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         STEP_TIMEOUT_SECONDS * i64::try_from(cell_waves + 2).unwrap();
     let run_timeout_seconds = declared_critical_path_seconds + STEP_TIMEOUT_SECONDS;
     let execution = with_execution_root(scratch, || {
-        execute_typed_dag(
-            &dag,
-            jobs,
-            None,
-            Instant::now(),
-            run_timeout_seconds,
-        )
+        execute_typed_dag(&dag, jobs, None, Instant::now(), run_timeout_seconds)
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -4227,7 +4426,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     validate_repetition_selection(&two_repetitions)
         .map_err(|e| format!("two repeated checks were refused: {e}"))?;
     if CellSelection::default().scheduler_jobs() != default_jobs() {
-        return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
+        return Err(
+            "pressure scheduler default diverged from the host-adaptive validate policy".into(),
+        );
     }
     let mut jobs_args = vec![
         "--results".to_string(),
@@ -4321,9 +4522,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         || selected_cell_dependencies(true, false, "naked", "native", None)
             != ["setup.manifest_plan".to_string()]
         || selected_cell_dependencies(true, false, "verify", "ptrace", None)
-            != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.runtime_release".to_string(),
+            ]
         || selected_cell_dependencies(true, false, "verify", "liteinst", None)
-            != ["setup.manifest_plan".to_string(), "build.liteinst_runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.liteinst_runtime_release".to_string(),
+            ]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
@@ -4921,8 +5128,94 @@ fn self_test(root: &Path) -> Result<(), String> {
         repetitions: Some(3),
         ..CellSelection::default()
     };
-    if pressure_cells(root, &repeated_red_selection).is_ok() {
-        return Err("repeated green-cell selection accepted a red cell".into());
+    let scorecard_before_repeated_red = fs::read(root.join(TRACKED_CELLS))
+        .map_err(|e| format!("cannot snapshot tracked cells before repeated-red plan: {e}"))?;
+    let repeated_red_cells = pressure_cells(root, &repeated_red_selection)?;
+    if repeated_red_cells.selected.len() != 1
+        || repeated_red_cells.selected[0].id != exact_id
+        || repeated_red_cells.selected[0].status != "red"
+    {
+        return Err("exact repeated-red selection did not retain its tracked red cell".into());
+    }
+    let repeated_red_results = scratch.join("repeated-red-plan");
+    let (repeated_red_metadata, repeated_red_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &repeated_red_results,
+        &repeated_red_results.join("dag.json"),
+        &repeated_red_selection,
+    )?;
+    if repeated_red_metadata.green
+        || repeated_red_metadata.cells != [exact_id.clone()]
+        || repeated_red_metadata.repetitions != Some(3)
+        || repeated_red_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .count()
+            != 3
+        || fs::read(root.join(TRACKED_CELLS))
+            .map_err(|e| format!("cannot re-read tracked cells after repeated-red plan: {e}"))?
+            != scorecard_before_repeated_red
+    {
+        return Err(
+            "repeated-red plan changed its tracked identity, run count, or scorecard".into(),
+        );
+    }
+
+    let repeated_red_rows = vec![
+        json!({
+            "repetition": 1,
+            "result": "determinism-failure",
+            "verification": {
+                "verdict": "diverged",
+                "first_divergent_record": 20,
+                "first_divergent_scheduler_turn": 200,
+                "first_divergent_virtual_nanoseconds": 2_000,
+            },
+        }),
+        json!({
+            "repetition": 2,
+            "result": "pass",
+            "verification": {
+                "verdict": "matched",
+                "first_divergent_record": null,
+                "first_divergent_scheduler_turn": null,
+                "first_divergent_virtual_nanoseconds": null,
+            },
+        }),
+        json!({
+            "repetition": 3,
+            "result": "determinism-failure",
+            "verification": {
+                "verdict": "diverged",
+                "first_divergent_record": 10,
+                "first_divergent_scheduler_turn": 100,
+                "first_divergent_virtual_nanoseconds": 1_000,
+            },
+        }),
+    ];
+    let repeated_red_distribution =
+        repeated_distribution(&repeated_red_metadata, &repeated_red_rows)
+            .ok_or("repeated-red result produced no divergence distribution")?;
+    let rate = &repeated_red_distribution["divergence_rate"];
+    if rate["diverged"] != 2
+        || rate["terminal_verdicts"] != 3
+        || rate["requested_repetitions"] != 3
+        || rate["configured_cell_width"] != 3
+        || rate["scheduling_mode"] != "concurrent"
+        || rate["cell_mode"] != exact_id.mode
+        || rate["hermit_sha"] != repeated_red_metadata.hermit_sha
+        || rate["detcore_tree"] != repeated_red_metadata.detcore_tree
+        || rate["wilson_95_lower"].as_f64().is_none()
+        || rate["wilson_95_upper"].as_f64().is_none()
+        || repeated_red_distribution["first_divergent_record"]["minimum"] != 10
+        || repeated_red_distribution["first_divergent_record"]["minimum_last_changed_at_repetition"]
+            != 3
+        || repeated_red_distribution["first_divergent_record"]["minimum_changed_at_n"] != true
+    {
+        return Err(format!(
+            "repeated-red divergence distribution lost its outcomes, bound context, or moving-minimum evidence: {repeated_red_distribution}"
+        ));
     }
 
     let repeated_results = scratch.join("repeated-plan");
@@ -4971,11 +5264,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.tag() == "build.runtime_release")
         .collect();
-    let recursive_metadata_tags = [
-        "e2e.metadata",
-        "build.workspace",
-        "build.e2e_artifact",
-    ];
+    let manifest_plan_steps: Vec<_> = repeated_dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "setup.manifest_plan")
+        .collect();
+    let recursive_metadata_tags = ["e2e.metadata", "build.workspace", "build.e2e_artifact"];
     let repeated_jobs: BTreeSet<_> = repeated_cell_steps
         .iter()
         .map(|step| step.job.clone())
@@ -4987,6 +5281,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         || repeated_jobs != expected_repeated_jobs
         || preparation_steps.len() != 1
         || runtime_build_steps.len() != 1
+        || manifest_plan_steps.len() != 1
+        || !manifest_plan_steps[0]
+            .cmd
+            .contains("cargo build -p hermit-manifest-plan --bins")
         || repeated_dag
             .steps
             .iter()
@@ -5005,7 +5303,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let preparation_tag = preparation_steps[0].tag();
     if preparation_steps[0].deps
-        != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+        != [
+            "setup.manifest_plan".to_string(),
+            "build.runtime_release".to_string(),
+        ]
     {
         return Err("repeated exact preparation does not depend on its direct Hermit build".into());
     }
@@ -5275,9 +5576,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
-                BTreeSet::from(["build.workspace", "build.runtime_release"])
-            }
+            "build.e2e_artifact" => BTreeSet::from(["build.workspace", "build.runtime_release"]),
             "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
@@ -5287,8 +5586,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 tag
             ));
         }
-        if tag == "build.e2e_artifact"
-            && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
+        if tag == "build.e2e_artifact" && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
         {
             return Err("green batch replaced the canonical prebuilt artifact publisher".into());
         }
@@ -5316,7 +5614,10 @@ fn self_test(root: &Path) -> Result<(), String> {
             .filter(|step| step.group == "prepare")
             .any(|step| {
                 step.deps
-                    != ["setup.manifest_plan".to_string(), "build.e2e_artifact".to_string()]
+                    != [
+                        "setup.manifest_plan".to_string(),
+                        "build.e2e_artifact".to_string(),
+                    ]
             })
         || green_batch_dag
             .steps
@@ -5325,9 +5626,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             .any(|step| {
                 !step.deps.contains(&"build.e2e_artifact".to_string())
                     || !step.deps.contains(&"setup.manifest_plan".to_string())
-                    || !step.cmd.contains(
-                        "./ci/run-with-hermit-e2e-artifact.sh --require-install",
-                    )
+                    || !step
+                        .cmd
+                        .contains("./ci/run-with-hermit-e2e-artifact.sh --require-install")
             })
     {
         return Err(
@@ -5869,11 +6170,12 @@ fn self_test(root: &Path) -> Result<(), String> {
         true,
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
-        return Err("a result row whose shell command does not encode argv/env was accepted".into());
+        return Err(
+            "a result row whose shell command does not encode argv/env was accepted".into(),
+        );
     }
     result_row.shell_command = "cd /repo && env LC_ALL=C hermit run".into();
-    result_row.attempts[0]["shell_command"] =
-        json!("cd /repo && env LC_ALL=C hermit run");
+    result_row.attempts[0]["shell_command"] = json!("cd /repo && env LC_ALL=C hermit run");
     result_row.hermit_sha = "foreign".into();
     if result_row_matches_cell(
         &result_row,
@@ -6022,7 +6324,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact red/green and batch repetitions, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }

@@ -109,6 +109,22 @@ investigation, probe one exact red cell with a tight wall-clock cap:
   --mode verify --backend ptrace --cell-timeout 60
 ```
 
+Repeat that same tracked red cell without changing its scorecard state:
+
+```console
+./ci/compat-envelope/pressure-test.rs run \
+  --test applications/example-timed-progress-bar \
+  --mode verify --backend ptrace --repetitions 20 --jobs 4 --cell-timeout 60
+```
+
+The repeated summary retains the outcome distribution, the divergence-rate
+Wilson interval, and histograms for each published first-divergence coordinate.
+Every bound names N, configured cell width, scheduling mode, manifest mode, and
+the exact Hermit and Detcore trees. It also reports the repetition at which each
+observed minimum last changed, including whether it changed at N. Repetition
+uses one shared build and fixture preparation followed by N independent boxed
+cell nodes; it never writes the tracked scorecard.
+
 For a reproducible bounded sample across verify, replay, and chaos, run:
 
 ```console
