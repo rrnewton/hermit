@@ -1000,10 +1000,33 @@ fn run_once_with_terminal_input(
 ///
 /// The discriminator is `ErrorKind`. A real spawn failure surfaces the OS error
 /// (`NotFound` when drrun is absent, `PermissionDenied` when it is not
-/// executable, `ExecutableFileBusy`); everything raised after the child exists
-/// arrives as `Other`, including the evidence errors, which are built with
-/// `io::Error::other`. Where the kind does not prove a spawn failure this
-/// deliberately does NOT claim one.
+/// executable, `ExecutableFileBusy`). Where the kind does not prove a spawn
+/// failure this deliberately does NOT claim one.
+///
+/// THE RESIDUAL, STATED BECAUSE IT IS NOT FIXED HERE. Most post-launch failures
+/// arrive as `Other` -- including the evidence-finalization error that motivated
+/// this function, which is built with `io::Error::other` -- but NOT all of them.
+/// `reverie-dbt` launcher.rs, in the `(Ok(status), Err(error))` arm, re-emits the
+/// inner evidence error's OWN kind rather than forcing `Other`:
+///
+///     (Ok(status), Err(error)) => Err(io::Error::new(error.kind(), ...))
+///
+/// and the evidence layer can produce spawn-shaped kinds after the guest is
+/// already running: `PermissionDenied` from its peer-credential checks, and
+/// `NotFound` from a bare `?` on `/proc/<pid>/stat` when the peer exits before
+/// it is read. Both still misreport here as launch failures.
+///
+/// That `NotFound` case is the sharpest one, and worth naming so nobody has to
+/// rediscover it: the pid exists ONLY because the guest launched, so the error
+/// that most conclusively proves a successful launch is the one that would be
+/// blamed on the binary.
+///
+/// This is narrower than what it replaces -- previously EVERY post-launch error
+/// claimed a launch failure -- but it is not zero. The fix belongs in
+/// reverie-dbt, whose arm already holds `Ok(status)` and therefore knows the
+/// guest ran: it should not re-emit a spawn-shaped kind at all. Do NOT patch it
+/// here by matching on the message text; classifying a typed error by its
+/// display string is the shape this project removes elsewhere.
 #[cfg(feature = "dbt")]
 fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
     use std::io::ErrorKind;
