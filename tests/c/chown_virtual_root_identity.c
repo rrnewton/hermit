@@ -98,11 +98,18 @@ int main(void) {
     return 1;
   }
 
-  /* Arm a host-visible side-effect canary. Linux chown_common() strips these
-   * privilege bits even when both requested ids are -1, so a validating chown
-   * is not a no-op. The determinized path must not enter setattr at all. */
-  if (fchmod(fd, 04755) != 0) {
-    perror("fchmod(setuid canary)");
+  /* Arm the privilege bits Linux strips on a successful chown. chown_common()
+   * sets ATTR_KILL_SUID|ATTR_KILL_SGID for every non-directory and ATTR_CTIME
+   * unconditionally, so this happens even when both requested ids are -1. A
+   * determinized chown that skips setattr entirely would leave a setuid binary
+   * setuid where the kernel disarms it, so the guest asserts the kernel's
+   * outcome, not the implementation's convenience.
+   *
+   * 06755 is chosen because it exercises both bits at once and the file is
+   * group-executable, which is the condition Linux requires before it clears
+   * S_ISGID. The non-group-executable case is checked separately below. */
+  if (fchmod(fd, 06755) != 0) {
+    perror("fchmod(set-id canary)");
     return 1;
   }
   struct stat before;
@@ -111,8 +118,8 @@ int main(void) {
     return 1;
   }
   const mode_t mode_before = before.st_mode & 07777;
-  if (mode_before != 04755) {
-    printf("FAIL     %-42s expected mode=4755, got mode=%04o\n", "setuid canary armed",
+  if (mode_before != 06755) {
+    printf("FAIL     %-42s expected mode=6755, got mode=%04o\n", "set-id canary armed",
            mode_before);
     return 1;
   }
@@ -178,22 +185,91 @@ int main(void) {
     printf("ok       %-42s owner unchanged (%u:%u), as documented\n", "stat(file) read-back",
            (unsigned)st.st_uid, (unsigned)st.st_gid);
   }
+  /* Set-id clearing is a privilege-containment mechanism, not bookkeeping, and
+   * Linux has applied it to root like any other user since 2.2.13. Measured
+   * natively: 06755 -> 0755 for chown(path, -1, -1). */
   const mode_t mode_after = st.st_mode & 07777;
-  if (mode_after != mode_before) {
-    printf("FAIL     %-42s mode changed %04o -> %04o\n", "stat(file) mode read-back", mode_before,
-           mode_after);
+  if (mode_after != 0755) {
+    printf("FAIL     %-42s expected set-id cleared %04o -> 0755, got %04o\n",
+           "stat(file) mode read-back", mode_before, mode_after);
     failures++;
   } else {
-    printf("ok       %-42s mode unchanged (%04o)\n", "stat(file) mode read-back", mode_after);
+    printf("ok       %-42s set-id cleared %04o -> %04o, as Linux does\n",
+           "stat(file) mode read-back", mode_before, mode_after);
   }
-  if (st.st_ctim.tv_sec != before.st_ctim.tv_sec || st.st_ctim.tv_nsec != before.st_ctim.tv_nsec) {
-    printf("FAIL     %-42s ctime changed %lld.%09ld -> %lld.%09ld\n", "stat(file) ctime read-back",
+  /* ATTR_CTIME is set unconditionally, so ctime moves even when there was
+   * nothing to clear and even for a directory. */
+  if (st.st_ctim.tv_sec == before.st_ctim.tv_sec && st.st_ctim.tv_nsec == before.st_ctim.tv_nsec) {
+    printf("FAIL     %-42s ctime did not move (%lld.%09ld); Linux always sets ATTR_CTIME\n",
+           "stat(file) ctime read-back", (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+    failures++;
+  } else {
+    printf("ok       %-42s ctime moved %lld.%09ld -> %lld.%09ld\n", "stat(file) ctime read-back",
            (long long)before.st_ctim.tv_sec, before.st_ctim.tv_nsec, (long long)st.st_ctim.tv_sec,
            st.st_ctim.tv_nsec);
-    failures++;
-  } else {
-    printf("ok       %-42s ctime unchanged (%lld.%09ld)\n", "stat(file) ctime read-back",
-           (long long)st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+  }
+
+  /* The condition on S_ISGID, which a "clear both bits always" implementation
+   * gets wrong: Linux clears it only when the file is also group-executable.
+   * Measured natively: 02644 stays 02644, while 02755 becomes 0755. */
+  {
+    const char* sgid_path = "chown_virtual_root_sgid_no_xgrp";
+    int sgid_fd = open(sgid_path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (sgid_fd < 0) {
+      perror("open(sgid canary)");
+      return 1;
+    }
+    if (fchmod(sgid_fd, 02644) != 0) {
+      perror("fchmod(sgid canary)");
+      return 1;
+    }
+    expect_ok("chown(sgid, no x-grp, -1, -1)", chown(sgid_path, (uid_t)-1, (gid_t)-1));
+    struct stat sgid_st;
+    if (stat(sgid_path, &sgid_st) != 0) {
+      perror("stat(sgid canary)");
+      return 1;
+    }
+    const mode_t sgid_mode = sgid_st.st_mode & 07777;
+    if (sgid_mode != 02644) {
+      printf("FAIL     %-42s S_ISGID must survive without S_IXGRP: 2644 -> %04o\n",
+             "stat(sgid no-x-grp) mode read-back", sgid_mode);
+      failures++;
+    } else {
+      printf("ok       %-42s S_ISGID preserved (%04o), no S_IXGRP\n",
+             "stat(sgid no-x-grp) mode read-back", sgid_mode);
+    }
+    close(sgid_fd);
+    unlink(sgid_path);
+  }
+
+  /* Directories are exempt from the clearing entirely (the !S_ISDIR guard in
+   * chown_common). Measured natively: a directory at 06755 stays 06755. */
+  {
+    const char* dir_path = "chown_virtual_root_dir";
+    if (mkdir(dir_path, 0755) != 0 && errno != EEXIST) {
+      perror("mkdir(dir canary)");
+      return 1;
+    }
+    if (chmod(dir_path, 06755) != 0) {
+      perror("chmod(dir canary)");
+      return 1;
+    }
+    expect_ok("chown(directory, -1, -1)", chown(dir_path, (uid_t)-1, (gid_t)-1));
+    struct stat dir_st;
+    if (stat(dir_path, &dir_st) != 0) {
+      perror("stat(dir canary)");
+      return 1;
+    }
+    const mode_t dir_mode = dir_st.st_mode & 07777;
+    if (dir_mode != 06755) {
+      printf("FAIL     %-42s directories are exempt: 6755 -> %04o\n",
+             "stat(directory) mode read-back", dir_mode);
+      failures++;
+    } else {
+      printf("ok       %-42s set-id preserved on directory (%04o)\n",
+             "stat(directory) mode read-back", dir_mode);
+    }
+    rmdir(dir_path);
   }
 
   close(fd);
