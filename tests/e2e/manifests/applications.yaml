@@ -13,7 +13,7 @@ test:
     timeout_seconds: 120
     occasional: false
     direct:
-      - ./examples/timed-progress-bar.py
+      - $E2E_REPO_ROOT/examples/timed-progress-bar.py
     observation:
       status: true
       stdout: true
@@ -73,7 +73,7 @@ test:
     timeout_seconds: 120
     occasional: false
     direct:
-      - ./examples/timed-progress-bar.py
+      - $E2E_REPO_ROOT/examples/timed-progress-bar.py
     observation:
       status: true
       stdout: true

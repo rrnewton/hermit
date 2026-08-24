@@ -151,7 +151,7 @@ test:
       - date
     timeout_seconds: 60
     occasional: false
-    direct: ./examples/date.sh
+    direct: $E2E_REPO_ROOT/examples/date.sh
     observation:
       status: true
       stdout: true
@@ -211,7 +211,7 @@ test:
       - hexdump
     timeout_seconds: 60
     occasional: false
-    direct: ./examples/devrand.sh
+    direct: $E2E_REPO_ROOT/examples/devrand.sh
     observation:
       status: true
       stdout: true
@@ -1221,7 +1221,7 @@ test:
       - /usr/bin/du
       - -sb
       - --
-      - tests/e2e
+      - $E2E_REPO_ROOT/tests/e2e
     observation:
       status: true
       stdout: true
@@ -1282,7 +1282,7 @@ test:
     occasional: false
     direct:
       - /usr/bin/find
-      - tests/e2e
+      - $E2E_REPO_ROOT/tests/e2e
       - -mindepth
       - '1'
       - -maxdepth
