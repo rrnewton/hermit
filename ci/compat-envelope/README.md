@@ -99,9 +99,57 @@ Every manifest cell outside the green set is red, including cells that have not
 run and cells that cannot currently run. That conservative classification is
 intentional: absence of evidence is not green.
 
-The per-cell `observations` arrays are written only from completed, clean
-pressure-test summaries. Ordinary validation never changes them. During
-investigation, probe one exact red cell with a tight wall-clock cap:
+## Divergence positions: where a cell diverged, and how well you know it
+
+A red cell should say WHERE it diverged, not only that it did. Each observation
+carries the position as a range per coordinate:
+
+```json
+"first_divergent_scheduler_turn": { "earliest": 1, "latest": 4, "samples": 2 }
+```
+
+**`samples` is the number of runs that LOCATED a position**, and it is stored
+rather than derived because the plausible denominators disagree. In the
+scorecard's own self-test bracket, five folded rows collapse to four distinct
+invocations of which only three located anything: a passing run and a timing-out
+run contribute no bound. "Earliest 80, latest 500" is a different claim over two
+runs than over fifty, so the bounds are not interpretable without it. A range
+with `samples: 1` is a POINT, not a distribution.
+
+**`provenance` says which mechanism produced the bounds**, and the two are never
+merged:
+
+| provenance | what it runs | what its bounds mean |
+|---|---|---|
+| `pressure-test` | a cell repeatedly at one tree | the flake distribution — what a yellow-cell floor should be derived from |
+| `validate` | a cell once per commit | a point; the regression signal a floor is checked against |
+
+Merging them would give one number that moves for two unrelated causes — "the
+code changed" and "this varies run to run". Observations are therefore keyed by
+`(detcore_tree, provenance)`. Keying by tree already stopped bounds mixing
+across code changes; provenance closes the remaining axis.
+
+Both coordinates above are the position of the PRECEDING scheduler COMMIT, so
+they **bound** the divergence rather than locating it: in a 131-line log with
+six COMMIT records, every divergence between two of them reports the same turn.
+
+### Writing observations
+
+Two commands write these arrays, both explicit and opt-in. **Ordinary validation
+still changes no tracked scorecard file.**
+
+```console
+./ci/compat-envelope/scorecard.rs update-observations --summary FILE   # pressure test
+./ci/compat-envelope/scorecard.rs observe-results --results DIR        # validate
+```
+
+`observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
+in one invocation — which is how a validate-side range widens beyond a point.
+Both refuse a dirty tracked tree and refuse rows that are not clean at `HEAD`.
+`ERROR` rows are refused rather than recorded: an infrastructure fault is not
+product behaviour. Neither command can change which cells are green.
+
+During investigation, probe one exact red cell with a tight wall-clock cap:
 
 ```console
 ./ci/compat-envelope/pressure-test.rs run \
