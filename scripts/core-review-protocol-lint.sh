@@ -36,9 +36,28 @@
 set -euo pipefail
 
 pr="${PR_NUMBER:-unknown}"
-labels="${PR_LABELS-}"
-body="${PR_BODY-}"
 is_kvm="${PR_IS_KVM:-false}"
+
+# UNSET IS NOT THE SAME STATE AS EMPTY, AND ONLY ONE OF THEM IS AN ANSWER.
+#
+# This previously read `labels="${PR_LABELS-}"`, which collapses "the caller
+# never supplied the labels" into "the PR has no labels". The second is a fact
+# about the PR; the first is a fact about the invocation. Collapsed together,
+# a hand spot-check that forgot the variable took the not-applicable fast path
+# and printed a PASS having checked NOTHING -- the gate answered a question it
+# had not been given the inputs to answer.
+#
+# CI is unaffected either way: .github/workflows/merge-gate.yml sets PR_LABELS
+# and PR_BODY explicitly. The silent pass only ever reached a human running
+# this by hand, which is exactly the reader least able to notice.
+if [ -z "${PR_LABELS+set}" ]; then
+    echo "::error::PR #${pr}: PR_LABELS is not set. This gate cannot decide anything" >&2
+    echo "  without the PR's labels, and it will not report a pass it did not establish." >&2
+    echo "  Pass PR_LABELS as newline-separated label names; pass an EMPTY string to" >&2
+    echo "  mean the PR genuinely has no labels. Those are different states." >&2
+    exit 2
+fi
+labels="$PR_LABELS"
 
 # The valid adversarial-review round labels, per reviewer (rounds 1..4).
 readonly REVIEW_ROUND_RANGE='[1-4]'
@@ -65,9 +84,30 @@ has_section() {
 }
 
 if ! has_label post-facto-human-review; then
-    echo "PR #${pr}: no post-facto-human-review label; core-review protocol not applicable."
+    # Report the genuinely-empty case distinctly from "has labels, but not this
+    # one". Both are correct passes, and a reader who cannot tell them apart
+    # cannot tell a real not-applicable from a lost label set.
+    if [ -z "$labels" ]; then
+        echo "PR #${pr}: the PR has NO labels at all (empty set, supplied); \
+core-review protocol not applicable."
+    else
+        echo "PR #${pr}: no post-facto-human-review label; core-review protocol not applicable."
+    fi
     exit 0
 fi
+
+# Only now is the body load-bearing, so only now is its absence an error --
+# validating it earlier would refuse callers on the not-applicable fast path
+# that never read it. Same distinction as above: unset is a broken invocation,
+# empty is a PR with no description (which then legitimately fails (c) below).
+if [ -z "${PR_BODY+set}" ]; then
+    echo "::error::PR #${pr}: PR_BODY is not set, and this PR is labeled" >&2
+    echo "  post-facto-human-review, so the required-section checks below cannot run." >&2
+    echo "  Refusing rather than reporting five phantom 'missing section' errors for a" >&2
+    echo "  body that was never supplied. Pass an EMPTY string for a PR with no body." >&2
+    exit 2
+fi
+body="$PR_BODY"
 
 echo "PR #${pr}: post-facto-human-review present; enforcing the core-change review protocol."
 
