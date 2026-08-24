@@ -84,12 +84,16 @@ type Emitter = reverie_dbt::RuntimeEmitter;
 type Idler = reverie_dbt::RuntimeIdler;
 
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DbtSubscriber {
     emit: Emitter,
     level: DbtLogLevel,
+    canonical: bool,
 }
+
+const DBT_LOG_RECORD_PREFIX: &str = "1970-01-01T00:00:00.000000Z ";
 
 impl Subscriber for DbtSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
@@ -108,11 +112,11 @@ impl Subscriber for DbtSubscriber {
         let metadata = event.metadata();
         let mut visitor = DbtEventVisitor::default();
         event.record(&mut visitor);
-        let line = format!(
-            "{} {}: {}\n",
-            metadata.level(),
+        let line = format_dbt_log_record(
+            metadata.level().as_str(),
             metadata.target(),
-            visitor.fields
+            &visitor.fields,
+            self.canonical,
         );
         unsafe { (self.emit)(line.as_ptr(), line.len()) };
     }
@@ -127,6 +131,22 @@ struct DbtEventVisitor {
     fields: String,
 }
 
+fn format_dbt_log_record(level: &str, target: &str, fields: &str, canonical: bool) -> String {
+    let prefix = if canonical { DBT_LOG_RECORD_PREFIX } else { "" };
+    format!("{prefix}{level} {target}: {fields}\n")
+}
+
+fn push_escaped_record_text(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            _ => output.push(character),
+        }
+    }
+}
+
 impl DbtEventVisitor {
     fn push(&mut self, field: &Field, value: String) {
         if !self.fields.is_empty() {
@@ -136,7 +156,7 @@ impl DbtEventVisitor {
             self.fields.push_str(field.name());
             self.fields.push('=');
         }
-        self.fields.push_str(&value);
+        push_escaped_record_text(&mut self.fields, &value);
     }
 }
 
@@ -191,42 +211,65 @@ fn emit_lifecycle_marker(emit: Emitter, message: &'static [u8]) {
 }
 
 fn info_logging_enabled() -> bool {
-    matches!(
-        std::env::var("HERMIT_LOG")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "info" | "debug" | "trace"
-    )
+    matches!(effective_dbt_log_level(), 3..=5)
 }
 
-fn dbt_log_level() -> Option<DbtLogLevel> {
+fn effective_dbt_log_level() -> i32 {
+    let protected = DBT_EVIDENCE_LOG_LEVEL.load(Ordering::Acquire);
+    if protected != 0 {
+        return protected;
+    }
     match std::env::var("HERMIT_LOG")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
     {
-        "error" => Some(DbtLogLevel::Error),
-        "warn" => Some(DbtLogLevel::Warn),
-        "info" => Some(DbtLogLevel::Info),
-        "debug" => Some(DbtLogLevel::Debug),
-        "trace" => Some(DbtLogLevel::Trace),
+        "error" => 1,
+        "warn" => 2,
+        "info" => 3,
+        "debug" => 4,
+        "trace" => 5,
+        _ => 0,
+    }
+}
+
+fn dbt_log_level_from_code(code: i32) -> Option<DbtLogLevel> {
+    match code {
+        1 => Some(DbtLogLevel::Error),
+        2 => Some(DbtLogLevel::Warn),
+        3 => Some(DbtLogLevel::Info),
+        4 => Some(DbtLogLevel::Debug),
+        5 => Some(DbtLogLevel::Trace),
         _ => None,
     }
 }
 
-fn init_dbt_tracing(emit: Emitter) -> bool {
+fn dbt_log_level() -> Option<DbtLogLevel> {
+    dbt_log_level_from_code(effective_dbt_log_level())
+}
+
+fn init_dbt_tracing(emit: Emitter, canonical: bool) -> bool {
     if DBT_TRACING_ACTIVE.load(Ordering::Acquire) {
         return true;
     }
     let Some(level) = dbt_log_level() else {
         return false;
     };
-    if tracing::subscriber::set_global_default(DbtSubscriber { emit, level }).is_err() {
+    if tracing::subscriber::set_global_default(DbtSubscriber {
+        emit,
+        level,
+        canonical,
+    })
+    .is_err()
+    {
         return false;
     }
     DBT_TRACING_ACTIVE.store(true, Ordering::Release);
     true
+}
+
+fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) -> bool {
+    protected_level == 0 || tracing_active
 }
 
 /// Environment variable through which `hermit run --backend dbt` hands the
@@ -817,27 +860,51 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
 pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
-    let emit = callbacks.emit;
+    let emit_diagnostic = callbacks.emit;
+    let emit_evidence = callbacks.emit_evidence;
+    let protected_level = callbacks.evidence_log_level;
+    DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
     RUNTIME_PAUSED.store(false, Ordering::Release);
-    emit_lifecycle_marker(emit, b"detcore-dbt: background client thread entered\n");
-    let tracing_active = init_dbt_tracing(emit);
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background client thread entered\n",
+    );
+    let protected_evidence_requested = protected_level != 0;
+    let tracing_active = init_dbt_tracing(
+        if protected_evidence_requested {
+            emit_evidence
+        } else {
+            emit_diagnostic
+        },
+        protected_evidence_requested,
+    );
+    if !protected_evidence_capture_ready(protected_level, tracing_active) {
+        emit_marker(
+            emit_diagnostic,
+            b"detcore-dbt: ERROR protected evidence subscriber installation failed\n",
+        );
+        unsafe { libc::_exit(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE) };
+    }
     let runtime = {
         let mut slot = RUNTIME.write().expect("Detcore DBT runtime lock poisoned");
         if slot.is_none() {
-            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore Config\n");
+            emit_lifecycle_marker(
+                emit_diagnostic,
+                b"detcore-dbt: constructing Detcore Config\n",
+            );
             let (mut config, source) = load_dbt_config();
             match source {
                 ConfigSource::Cli => {
-                    emit_lifecycle_marker(emit, b"detcore-dbt: using CLI-provided Detcore Config\n")
+                    emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: using CLI-provided Detcore Config\n")
                 }
                 ConfigSource::ParseFallback => emit_marker(
-                    emit,
+                    emit_diagnostic,
                     b"detcore-dbt: WARNING could not parse HERMIT_DBT_DETCONFIG; using strict default\n",
                 ),
                 ConfigSource::Default => {
-                    emit_lifecycle_marker(emit, b"detcore-dbt: using strict default Detcore Config\n")
+                    emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: using strict default Detcore Config\n")
                 }
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
@@ -871,9 +938,12 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
                 report_fd_is_available().then_some(UNSUPPORTED_SYSCALL_REPORT_FD);
             config.validate();
 
-            emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore GlobalState\n");
+            emit_lifecycle_marker(
+                emit_diagnostic,
+                b"detcore-dbt: initializing Detcore GlobalState\n",
+            );
             let global = GlobalState::init_for_external_scheduler(&config);
-            emit_lifecycle_marker(emit, b"detcore-dbt: GlobalState initialized\n");
+            emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
                 config,
                 global,
@@ -883,20 +953,26 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c
         }
         Arc::clone(slot.as_ref().expect("Detcore DBT runtime was initialized"))
     };
-    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler ready\n");
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background scheduler ready\n",
+    );
     READY_IMAGE.store(image_generation, Ordering::SeqCst);
     let log_scheduler = info_logging_enabled() && !tracing_active;
     let observer = Arc::new(move |event: &'static str| {
         if log_scheduler {
             let line = format!("INFO detcore::scheduler: {event}\n");
-            unsafe { emit(line.as_ptr(), line.len()) };
+            unsafe { emit_diagnostic(line.as_ptr(), line.len()) };
         }
     });
     run_cooperative(
         runtime.global.run_external_scheduler(observer),
         callbacks.idle,
     );
-    emit_lifecycle_marker(emit, b"detcore-dbt: background scheduler completed\n");
+    emit_lifecycle_marker(
+        emit_diagnostic,
+        b"detcore-dbt: background scheduler completed\n",
+    );
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -1647,6 +1723,41 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_dbt_log_records_have_timestamp_and_one_line() {
+        let mut fields = String::new();
+        push_escaped_record_text(&mut fields, "first\\second\nthird\rfourth");
+        assert_eq!(fields, "first\\\\second\\nthird\\rfourth");
+        assert_eq!(
+            format_dbt_log_record("INFO", "detcore::scheduler", &fields, true),
+            "1970-01-01T00:00:00.000000Z INFO detcore::scheduler: \
+             first\\\\second\\nthird\\rfourth\n"
+        );
+        assert_eq!(
+            format_dbt_log_record("INFO", "detcore::scheduler", "ready", false),
+            "INFO detcore::scheduler: ready\n"
+        );
+    }
+
+    #[test]
+    fn protected_evidence_level_selects_the_expected_filter() {
+        let info = dbt_log_level_from_code(3).expect("INFO code");
+        assert!(info.enables(&tracing::Level::ERROR));
+        assert!(info.enables(&tracing::Level::WARN));
+        assert!(info.enables(&tracing::Level::INFO));
+        assert!(!info.enables(&tracing::Level::DEBUG));
+        assert!(!info.enables(&tracing::Level::TRACE));
+        assert!(dbt_log_level_from_code(0).is_none());
+        assert!(dbt_log_level_from_code(6).is_none());
+    }
+
+    #[test]
+    fn requested_protected_evidence_requires_an_installed_subscriber() {
+        assert!(protected_evidence_capture_ready(0, false));
+        assert!(protected_evidence_capture_ready(3, true));
+        assert!(!protected_evidence_capture_ready(3, false));
+    }
 
     #[test]
     fn child_rng_entropy_is_stable_and_partitioned() {
