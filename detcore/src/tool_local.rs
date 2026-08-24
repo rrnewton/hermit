@@ -630,6 +630,15 @@ impl FileMetadata {
         Ok(f(detfd))
     }
 
+    /// Capture the exact open file description currently installed at `fd`.
+    ///
+    /// The returned `DetFd` owns an `Arc` reference to that description, so a
+    /// later close or reuse of the numeric descriptor slot cannot change which
+    /// open file description a completed kernel operation is modeled as using.
+    fn capture_fd(&mut self, fd: RawFd) -> Result<DetFd, Errno> {
+        self.with_detfd(fd, |detfd| detfd.clone())
+    }
+
     /// add a detfd
     fn add_detfd(&mut self, detfd: DetFd) {
         let fd = detfd.fd;
@@ -684,9 +693,26 @@ impl FileMetadata {
             return Ok(None);
         }
 
-        let detfd = self.with_detfd(oldfd, |old_detfd| {
-            old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
-        })?;
+        let captured = self.capture_fd(oldfd)?;
+        self.install_captured_fd(captured, newfd, flags)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Install a previously captured open file description at a returned fd.
+    ///
+    /// Unlike [`Self::dup_fd`], this never looks up the source fd again. That is
+    /// required after an awaited syscall: another task may have closed or reused
+    /// the source descriptor slot while the kernel operation was in flight.
+    fn install_captured_fd(
+        &mut self,
+        captured: DetFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, (Errno, DetFd)> {
+        if newfd < 0 {
+            return Err((Errno::EBADF, captured));
+        }
+        let detfd = captured.with_fd(newfd).with_fd_flags(flags);
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
@@ -920,6 +946,80 @@ mod file_metadata_tests {
             Some(Some(libc::LOCK_SH)),
             "exec must preserve known flock state for a surviving open file description"
         );
+    }
+
+    #[test]
+    fn captured_fd_install_retains_source_identity_across_slot_reuse() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("register original descriptor");
+        metadata
+            .with_detfd(3, |detfd| detfd.set_flock_mode(Some(libc::LOCK_SH)))
+            .expect("original descriptor");
+        let original_id = metadata
+            .with_detfd(3, |detfd| detfd.open_file_id())
+            .expect("original descriptor");
+        let captured = metadata.capture_fd(3).expect("capture source descriptor");
+
+        metadata.remove_fd(3);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("reuse source descriptor slot");
+        metadata
+            .with_detfd(3, |detfd| detfd.set_flock_mode(Some(libc::LOCK_EX)))
+            .expect("replacement descriptor");
+        let replacement_id = metadata
+            .with_detfd(3, |detfd| detfd.open_file_id())
+            .expect("replacement descriptor");
+
+        metadata
+            .install_captured_fd(captured, 4, OFlag::O_CLOEXEC)
+            .expect("install captured alias");
+        assert_eq!(
+            metadata
+                .with_detfd(4, |detfd| detfd.open_file_id())
+                .expect("installed descriptor"),
+            original_id,
+            "the result must alias the pre-await source, not the reused numeric slot"
+        );
+        assert_ne!(original_id, replacement_id);
+        assert_eq!(
+            metadata
+                .with_detfd(4, |detfd| detfd.known_flock_mode())
+                .expect("installed descriptor"),
+            Some(Some(libc::LOCK_SH))
+        );
+        assert!(
+            metadata
+                .with_detfd(4, |detfd| detfd.is_cloexec())
+                .expect("installed descriptor")
+        );
+        assert_eq!(
+            metadata
+                .with_detfd(3, |detfd| detfd.known_flock_mode())
+                .expect("replacement descriptor"),
+            Some(Some(libc::LOCK_EX))
+        );
+
+        let captured = metadata.capture_fd(3).expect("capture replacement");
+        assert_eq!(
+            metadata.remove_fd(3),
+            None,
+            "the temporary capture defers final-resource release"
+        );
+        let (error, returned) = metadata
+            .install_captured_fd(captured, -1, OFlag::empty())
+            .expect_err("an invalid returned fd must not be installed");
+        assert_eq!(error, Errno::EBADF);
+        assert_eq!(returned.open_file_id(), replacement_id);
+        assert_eq!(
+            returned.open_file_alias_count(),
+            1,
+            "the failed install returns the final capture so the caller can release its resource"
+        );
+        assert!(!metadata.file_handles.contains_key(&-1));
     }
 
     #[test]
@@ -1996,6 +2096,26 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, oldfd)?;
         }
         metadata.dup_fd(oldfd, newfd, flags)
+    }
+
+    /// Capture the exact open file description currently installed at `fd`.
+    pub(crate) fn capture_fd(&self, fd: RawFd) -> Result<DetFd, Errno> {
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            metadata.discover_fd_from_current_process(self.dettid, fd)?;
+        }
+        metadata.capture_fd(fd)
+    }
+
+    /// Install an alias from a pre-await descriptor capture without looking the
+    /// source numeric fd up a second time.
+    pub(crate) fn install_captured_fd(
+        &self,
+        captured: DetFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, (Errno, DetFd)> {
+        self.metadata().install_captured_fd(captured, newfd, flags)
     }
 
     /// get thread prng, note this rng is deterministic and should not be used

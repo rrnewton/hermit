@@ -8,6 +8,7 @@
 
 //! System calls for dealing with the file system.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
@@ -59,6 +60,30 @@ use crate::types::*;
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
     OFlag::from_bits_truncate(s_bits & (libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ReturnedFdModelingError<E> {
+    Modeling(E),
+    Cleanup { modeling: E, cleanup: Errno },
+}
+
+/// Run fd cleanup exactly when post-syscall modeling fails.
+async fn cleanup_returned_fd_on_model_error<T, E, C, F>(
+    modeled: Result<T, E>,
+    cleanup: C,
+) -> Result<T, ReturnedFdModelingError<E>>
+where
+    C: FnOnce() -> F,
+    F: Future<Output = Result<i64, Errno>>,
+{
+    match modeled {
+        Ok(value) => Ok(value),
+        Err(modeling) => match cleanup().await {
+            Ok(_) => Err(ReturnedFdModelingError::Modeling(modeling)),
+            Err(cleanup) => Err(ReturnedFdModelingError::Cleanup { modeling, cleanup }),
+        },
+    }
 }
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
@@ -186,6 +211,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         match response.1 {
             GlobalResponse::ReleasePort(port) => port,
             other => panic!("unexpected release-port response: {other:?}"),
+        }
+    }
+
+    /// Drop a temporary descriptor capture and release its global resource if
+    /// the capture became the final modeled alias while an awaited syscall was
+    /// in flight.
+    async fn release_uninstalled_captured_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        captured: DetFd,
+    ) {
+        let released = (captured.open_file_alias_count() == 1).then(|| captured.open_file_id());
+        drop(captured);
+        if let Some(open_file_id) = released {
+            self.release_port_for_open_file(guest, open_file_id).await;
         }
     }
 
@@ -2791,7 +2831,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// runs), and the operation executes inside this thread's serialized turn, so
     /// the result is deterministic. Detcore fails closed with `EBADF` unless it
     /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
-    /// to be zero (`EINVAL` otherwise).
+    /// to be zero (`EINVAL` otherwise). The source model is captured before the
+    /// awaited kernel call and installed directly after success; a post-success
+    /// modeling failure closes the returned kernel descriptor before the error is
+    /// exposed to the guest.
     ///
     /// For a pidfd that names this process, `targetfd` is in this descriptor table,
     /// so the returned descriptor is modeled as a real alias of the source open
@@ -2827,16 +2870,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EOPNOTSUPP.into());
         }
 
-        // Prove the source model before the kernel call. A successful self
-        // pidfd_getfd aliases this exact descriptor; if Detcore cannot identify
-        // it, permitting the call would create mutable OFD state with no sound
-        // cache relationship.
-        guest.thread_state().with_detfd(targetfd, |_| ())?;
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+        // Capture the exact source OFD before the awaited kernel call. A second
+        // lookup afterwards could observe a closed or reused numeric slot and
+        // attach the returned kernel fd to the wrong DetFd.
+        let source = guest.thread_state().capture_fd(targetfd)?;
+        let fd = match self.record_or_replay(guest, call).await {
+            Ok(fd) => fd as RawFd,
+            Err(error) => {
+                self.release_uninstalled_captured_fd(guest, source).await;
+                return Err(error.into());
+            }
+        };
         // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
-        let replaced = guest
-            .thread_state_mut()
-            .dup_fd(targetfd, fd, OFlag::O_CLOEXEC)?;
+        let modeled = guest
+            .thread_state()
+            .install_captured_fd(source, fd, OFlag::O_CLOEXEC);
+        let replaced = match cleanup_returned_fd_on_model_error(modeled, || async {
+            guest
+                .inject_with_retry(syscalls::Close::new().with_fd(fd))
+                .await
+        })
+        .await
+        {
+            Ok(replaced) => replaced,
+            Err(ReturnedFdModelingError::Modeling((modeling, source))) => {
+                self.release_uninstalled_captured_fd(guest, source).await;
+                return Err(modeling.into());
+            }
+            Err(ReturnedFdModelingError::Cleanup { modeling, cleanup }) => {
+                let (modeling, source) = modeling;
+                self.release_uninstalled_captured_fd(guest, source).await;
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "pidfd_getfd returned fd {fd}, Detcore could not model it ({modeling}), and cleanup failed ({cleanup})"
+                )));
+            }
+        };
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
@@ -2981,10 +3049,17 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod test {
-    use nix::fcntl::OFlag;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
+    use nix::fcntl::OFlag;
+    use reverie::syscalls::Errno;
+
+    use super::ReturnedFdModelingError;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
+    use super::cleanup_returned_fd_on_model_error;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
@@ -2996,6 +3071,51 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[tokio::test]
+    async fn returned_fd_model_error_runs_cleanup_and_preserves_failure() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&cleanup_calls);
+        let result = cleanup_returned_fd_on_model_error(
+            Result::<(), Errno>::Err(Errno::EBADF),
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            },
+        )
+        .await;
+        assert_eq!(result, Err(ReturnedFdModelingError::Modeling(Errno::EBADF)));
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&cleanup_calls);
+        let result = cleanup_returned_fd_on_model_error(
+            Result::<(), Errno>::Err(Errno::EBADF),
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(Errno::EIO)
+            },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err(ReturnedFdModelingError::Cleanup {
+                modeling: Errno::EBADF,
+                cleanup: Errno::EIO,
+            })
+        );
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&cleanup_calls);
+        let result = cleanup_returned_fd_on_model_error(Ok::<_, Errno>(17), move || async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        })
+        .await;
+        assert_eq!(result, Ok(17));
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
