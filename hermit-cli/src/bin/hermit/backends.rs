@@ -701,7 +701,7 @@ pub(super) fn run_dbt(
         if stdin_is_terminal {
             let status = runner
                 .status(&guest)
-                .map_err(|error| launch_error(&drrun, error))?;
+                .map_err(|error| dbt_run_error(&drrun, error))?;
             if summary {
                 eprintln!(
                     ":: DBT summary: see the `reverie-dbt: tool=Detcore ...` line above \
@@ -965,7 +965,7 @@ fn run_once<R: Read + Send + 'static>(
 ) -> Result<Output, Error> {
     runner
         .output_with_detached_reader(guest, input)
-        .map_err(|error| launch_error(drrun, error))
+        .map_err(|error| dbt_run_error(drrun, error))
 }
 
 #[cfg(feature = "dbt")]
@@ -976,15 +976,51 @@ fn run_once_with_terminal_input(
 ) -> Result<Output, Error> {
     runner
         .output_with_inherited_stdin(guest)
-        .map_err(|error| launch_error(drrun, error))
+        .map_err(|error| dbt_run_error(drrun, error))
 }
 
+/// Name the stage that actually failed.
+///
+/// This used to be `launch_error`, and it announced EVERY `io::Error` from a
+/// DBT run as "failed to launch drrun ({path})". But the calls it wraps --
+/// `output_with_detached_reader` and `output_with_inherited_stdin` -- run the
+/// whole lifecycle: spawn, wait, collect output, and finalize the protected
+/// evidence session. A failure in any later stage was reported as a failure of
+/// the first one.
+///
+/// Measured cost of that: a campaign agent hit
+/// `"failed to launch drrun (target/install_pkg/rsrcs/dynamorio/bin64/drrun):
+/// DBT guest exited with status S..."`, correctly observed that drrun was a
+/// real 737 KB ELF matching the build cache, and could not proceed. The inner
+/// text is the giveaway -- it comes from `reverie-dbt`'s
+/// `(Ok(status), Err(error))` arm, so the guest HAD RUN AND EXITED and the
+/// failure was in evidence finalization. A binary that failed to launch cannot
+/// produce an exit status. The wrapper had renamed a post-run failure into a
+/// missing-binary hunt.
+///
+/// The discriminator is `ErrorKind`. A real spawn failure surfaces the OS error
+/// (`NotFound` when drrun is absent, `PermissionDenied` when it is not
+/// executable, `ExecutableFileBusy`); everything raised after the child exists
+/// arrives as `Other`, including the evidence errors, which are built with
+/// `io::Error::other`. Where the kind does not prove a spawn failure this
+/// deliberately does NOT claim one.
 #[cfg(feature = "dbt")]
-fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
-    Error::msg(format!(
-        "failed to launch drrun ({}): {error}",
-        drrun.display()
-    ))
+fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::ExecutableFileBusy => {
+            Error::msg(format!(
+                "failed to launch drrun ({}): {error}",
+                drrun.display()
+            ))
+        }
+        _ => Error::msg(format!(
+            "drrun started ({}) and the DBT run then failed: {error} \
+             -- this is NOT a launch failure; the drrun binary is not implicated. \
+             Read the text after the last ':' for the stage that actually failed.",
+            drrun.display()
+        )),
+    }
 }
 
 #[cfg(feature = "dbt")]
@@ -1446,5 +1482,55 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
+    }
+
+    /// A real spawn failure -- drrun absent or not executable -- must still say
+    /// so, because that is when the operator SHOULD go and look at the binary.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_spawn_failure_still_names_the_launch() {
+        let drrun = Path::new("/nonexistent/dynamorio/bin64/drrun");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let rendered = dbt_run_error(drrun, std::io::Error::new(kind, "boom")).to_string();
+            assert!(
+                rendered.contains("failed to launch drrun"),
+                "a {kind:?} spawn failure must be reported as a launch failure: {rendered}"
+            );
+        }
+    }
+
+    /// The regression this function exists for. A post-launch failure -- the
+    /// evidence-finalization error is the real-world one -- must NOT be
+    /// reported as a launch failure. It sent a campaign agent hunting a 737 KB
+    /// drrun that was correct and working, and the inner text proves the guest
+    /// had already exited.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_post_launch_failure_does_not_blame_the_binary() {
+        let drrun = Path::new("/real/dynamorio/bin64/drrun");
+        let inner = "DBT guest exited with status Some(1) while protected evidence failed: \
+                     DBT evidence collector thread panicked";
+        let rendered = dbt_run_error(drrun, std::io::Error::other(inner)).to_string();
+        assert!(
+            !rendered.contains("failed to launch drrun"),
+            "a post-launch failure must not be reported as a launch failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("drrun started"),
+            "the message must say the launch succeeded: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT a launch failure"),
+            "the message must rule the binary out explicitly: {rendered}"
+        );
+        // The cause must survive verbatim. Truncating it here is what cost the
+        // original investigation its answer.
+        assert!(
+            rendered.contains("protected evidence failed"),
+            "the underlying error must be preserved in full: {rendered}"
+        );
     }
 }
