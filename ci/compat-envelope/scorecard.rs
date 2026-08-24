@@ -114,6 +114,10 @@ struct TrackedCell {
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
+    /// Last recorded exercise of this cell. See [`LastTested`] -- absence means
+    /// no writer recorded one, NOT that the cell was never run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_tested: Option<LastTested>,
     /// Divergence evidence, keyed by `(detcore_tree, provenance)`.
     ///
     /// ORDINARY VALIDATE STILL NEVER CHANGES THIS ARRAY. Two commands write it,
@@ -186,6 +190,20 @@ struct Observation {
     /// validate-sourced would be wrong even with nothing to relabel.)
     #[serde(default = "default_provenance")]
     provenance: ObservationProvenance,
+    /// Depth at which this observation was taken, KEYED BY REPOSITORY.
+    ///
+    /// Per-repo because hermit depth and reverie depth are DIFFERENT KEYSPACES
+    /// and a bare integer would be read against whichever one the reader had in
+    /// mind. Measured at the time of writing: hermit 1927, reverie 931. Those
+    /// numbers are not comparable to each other in any way.
+    ///
+    /// A repository whose depth could not be resolved is ABSENT from the map
+    /// rather than present with a zero or a guess. Hermit is always resolvable
+    /// because the tool runs inside it; reverie is only resolvable when a
+    /// checkout is reachable, which is a property of the workspace layout
+    /// rather than of the measurement.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    depth: BTreeMap<String, SourceDepth>,
     hermit_shas: BTreeSet<String>,
     results: BTreeSet<ObservedResult>,
     invocations: BTreeSet<ObservedInvocation>,
@@ -272,6 +290,61 @@ impl ObservedResult {
     }
 }
 
+/// How deep in a repository's history an observation was taken, so staleness is
+/// SUBTRACTABLE -- "measured 47 commits ago" rather than a stare at two opaque
+/// forty-hex shas.
+///
+/// BOTH COUNTS ARE RECORDED BECAUSE THEY DISAGREE, and by a lot. Measured on
+/// this repository at the time of writing: `git rev-list --count HEAD` is 1927
+/// while `--first-parent` is 1852, a 75-commit gap, because hermit's history
+/// contains merges. The plain count is TOTAL REACHABLE ANCESTRY -- every commit
+/// that was ever merged in, including whole side branches -- and is NOT a
+/// distance along the mainline. `first_parent` is the mainline distance and is
+/// the one that matches what "N commits ago" means to a reader. Recording only
+/// one would guarantee it eventually gets read as the other.
+///
+/// SUBTRACTION IS ONLY MEANINGFUL ALONG ANCESTRY. Two commits on divergent
+/// branches can carry identical depths while being unrelated, so a difference
+/// is a distance only once one commit is known to be an ancestor of the other.
+/// Depth complements the recorded tree and sha; it does not replace them.
+/// When a cell was last ACTUALLY EXERCISED, by sha and depth. No timestamp: a
+/// date cannot tell you whether the code under test changed, and the tree hash
+/// and depth can.
+///
+/// ⚠️ ABSENCE MEANS "NO WRITER HAS RECORDED ONE", NOT "NEVER TESTED". The two
+/// are easy to confuse and the difference matters. Only the two explicit fold
+/// commands write this field, and validate only ever runs the ~282 selected
+/// cells, so every red cell will carry NOTHING here until a pressure-test
+/// campaign covers it -- not because it was never exercised, but because
+/// nothing was ever asked to record that it was. `scorecard.rs show` prints how
+/// many cells carry the field precisely so this emptiness stays visible instead
+/// of being read as evidence.
+///
+/// This is recorded for EVERY tested cell, including passing ones, which is why
+/// it is on the cell row rather than inside `observations`: an observation only
+/// exists where a divergence was located, so a green cell that stays green
+/// would otherwise leave no trace of having been checked at all.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LastTested {
+    hermit_sha: String,
+    /// The staleness key. Content-addressed, so comparing it to `HEAD:detcore`
+    /// says whether the result still describes the current code regardless of
+    /// how old or recent the run was.
+    detcore_tree: String,
+    /// Keyed by repository: hermit depth and reverie depth are different
+    /// keyspaces and a bare number would be read against the wrong one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    depth: BTreeMap<String, SourceDepth>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SourceDepth {
+    /// `git rev-list --count HEAD`: total reachable ancestry, merges included.
+    commits: u64,
+    /// `git rev-list --count --first-parent HEAD`: mainline distance.
+    first_parent: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct ObservedRange {
     earliest: u64,
@@ -306,6 +379,20 @@ struct PressureSummary {
 #[derive(Clone, Debug, Deserialize)]
 struct PressureSummaryRow {
     cell: CellId,
+    /// Which repeat of this cell the row describes.
+    ///
+    /// ⚠️ THIS FIELD IS WHY THE RANGES WERE UNFILLABLE. `pressure-test.rs run
+    /// --repetitions N` emits ONE ROW PER REPETITION, each stamped with its
+    /// repetition and carrying its own verification report. This consumer had
+    /// no such field and treated the second row for a cell as a DUPLICATE,
+    /// refusing the whole summary -- so the one workflow that can produce a
+    /// distribution could never reach the scorecard, and `samples` could never
+    /// exceed one.
+    ///
+    /// Repeats are now distinguished, and the duplicate guard is keyed on
+    /// `(cell, repetition)` so a genuinely repeated row is still refused.
+    #[serde(default)]
+    repetition: Option<u64>,
     result: String,
     #[serde(default)]
     verification: Option<PressureVerification>,
@@ -569,6 +656,7 @@ fn run() -> Result<(), String> {
             no_more(&mut args)?;
             let derived = derive(&root)?;
             print!("{}", render_scorecard(&derived));
+            print!("{}", render_evidence_coverage(&root)?);
         }
         "check" => {
             no_more(&mut args)?;
@@ -1050,6 +1138,10 @@ fn tracked_from(
                 .get(&id)
                 .map(|cell| cell.observations.clone())
                 .unwrap_or_default();
+            // Preserved, like observations, for the same reason: ordinary
+            // derivation recomputes STATUS from the manifest and the plan, and
+            // must not discard measured evidence while doing so.
+            let last_tested = previous.get(&id).and_then(|cell| cell.last_tested.clone());
             let status = if derived.green.contains(&id) {
                 CellStatus::Green
             } else {
@@ -1062,6 +1154,7 @@ fn tracked_from(
                 enabled,
                 status,
                 ci_disabled_reason,
+                last_tested,
                 observations,
             }
         })
@@ -1137,6 +1230,141 @@ fn update_tracked(
     Ok(())
 }
 
+/// Resolve `git rev-list` depths for one repository, or `None` if it is not a
+/// resolvable git checkout.
+fn repo_depth(root: &Path) -> Option<SourceDepth> {
+    let count = |args: &[&str]| -> Option<u64> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()?.trim().parse::<u64>().ok()
+    };
+    Some(SourceDepth {
+        commits: count(&["rev-list", "--count", "HEAD"])?,
+        first_parent: count(&["rev-list", "--count", "--first-parent", "HEAD"])?,
+    })
+}
+
+/// Depths for every repository whose history is part of what was measured.
+///
+/// Hermit is mandatory -- the tool runs inside it, so a failure there is a
+/// genuine fault rather than a layout difference. Reverie is best-effort: it is
+/// a pinned git dependency, not a checkout hermit owns, so whether a clone is
+/// reachable depends on the surrounding workspace. When it is not, the key is
+/// OMITTED and the caller says so, rather than a zero being recorded as if it
+/// were a measurement.
+fn source_depths(root: &Path) -> Result<BTreeMap<String, SourceDepth>, String> {
+    let mut depths = BTreeMap::new();
+    let hermit = repo_depth(root)
+        .ok_or("cannot read hermit git depth; this tool runs inside that repository")?;
+    depths.insert("hermit".to_string(), hermit);
+    // Sibling first, then the dev-hermit parent layout where hermit checkouts
+    // live under worktrees/<slot>/hermit and reverie sits at the top level.
+    // Best-effort by design: the absence of a reverie clone is a property of
+    // the workspace, not a fault, so it is reported and omitted rather than
+    // guessed at.
+    for candidate in [
+        "../reverie",
+        "../../reverie",
+        "../../../reverie",
+        "../../../../reverie",
+    ] {
+        let path = root.join(candidate);
+        if path.join(".git").exists() {
+            if let Some(depth) = repo_depth(&path) {
+                depths.insert("reverie".to_string(), depth);
+                break;
+            }
+        }
+    }
+    Ok(depths)
+}
+
+/// Report how much of the grid carries recorded evidence, and how much of that
+/// evidence still describes the CURRENT code.
+///
+/// This exists so an empty field is never mistaken for a measurement. Absence of
+/// `last_tested` means NO WRITER RECORDED ONE, not that the cell was never
+/// exercised, and the only way to keep that honest is to state the coverage out
+/// loud every time the table is printed.
+fn render_evidence_coverage(root: &Path) -> Result<String, String> {
+    let Some(tracked) = load_existing(root)? else {
+        return Ok(String::new());
+    };
+    let head_tree = git_rev_parse(root, "HEAD:detcore").ok();
+    let total = tracked.cells.len();
+    let stamped = tracked
+        .cells
+        .iter()
+        .filter(|cell| cell.last_tested.is_some())
+        .count();
+    let (mut current, mut stale) = (0usize, 0usize);
+    for cell in &tracked.cells {
+        let Some(last) = &cell.last_tested else {
+            continue;
+        };
+        match head_tree.as_deref() {
+            Some(head) if head == last.detcore_tree => current += 1,
+            Some(_) => stale += 1,
+            None => {}
+        }
+    }
+    let observed = tracked
+        .cells
+        .iter()
+        .filter(|cell| !cell.observations.is_empty())
+        .count();
+    let stale_observations = tracked
+        .cells
+        .iter()
+        .flat_map(|cell| cell.observations.iter())
+        .filter(|observation| {
+            head_tree
+                .as_deref()
+                .is_some_and(|head| head != observation.detcore_tree)
+        })
+        .count();
+
+    let mut out = String::new();
+    out.push_str("\nRecorded evidence (not part of the green/red verdict)\n");
+    out.push_str(&format!(
+        "  cells with a recorded last test : {stamped} of {total}\n"
+    ));
+    if stamped < total {
+        out.push_str(concat!(
+            "      the remainder have NO RECORD, which is not the same as never tested:\n",
+            "      only the two explicit fold commands write it, and validate runs only\n",
+            "      the selected plan, so red cells stay blank until a pressure-test\n",
+            "      campaign covers them.\n",
+        ));
+    }
+    if head_tree.is_some() && stamped > 0 {
+        out.push_str(&format!(
+            "      of those, {current} still match HEAD:detcore and {stale} are STALE\n"
+        ));
+        if stale > 0 {
+            out.push_str(concat!(
+                "      a stale record describes code that has since changed; do not act\n",
+                "      on its divergence point without re-measuring.\n",
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  cells with a divergence range   : {observed} of {total}\n"
+    ));
+    if stale_observations > 0 {
+        out.push_str(&format!(
+            "      {stale_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
+        ));
+    }
+    Ok(out)
+}
+
 fn default_provenance() -> ObservationProvenance {
     ObservationProvenance::PressureTest
 }
@@ -1169,6 +1397,7 @@ fn apply_pressure_summary(
     summary: &PressureSummary,
     head: &str,
     detcore_tree: &str,
+    depth: &BTreeMap<String, SourceDepth>,
 ) -> Result<usize, String> {
     if summary.schema != PRESSURE_SUMMARY_SCHEMA {
         return Err(format!(
@@ -1205,10 +1434,14 @@ fn apply_pressure_summary(
     let mut seen = BTreeSet::new();
     let mut prepared = Vec::new();
     for row in &summary.rows {
-        if !seen.insert(row.cell.clone()) {
+        // Keyed on (cell, repetition): repeats of one cell are the POINT of a
+        // stress campaign, while two rows claiming the same repetition are
+        // still a malformed summary that would double-count.
+        if !seen.insert((row.cell.clone(), row.repetition)) {
             return Err(format!(
-                "pressure summary contains duplicate cell {}",
-                display_id(&row.cell)
+                "pressure summary contains duplicate cell {} at repetition {:?}",
+                display_id(&row.cell),
+                row.repetition
             ));
         }
         if !row.evidence_errors.is_empty() {
@@ -1301,6 +1534,14 @@ fn apply_pressure_summary(
     }
 
     for (index, result, turn, virtual_nanoseconds, divergent_record, invocation) in prepared {
+        // Every row here is a cell the pressure test actually exercised,
+        // whatever its result, so it gets the same stamp the validate fold
+        // applies. This is the ONLY writer that reaches red cells.
+        tracked.cells[index].last_tested = Some(LastTested {
+            hermit_sha: summary.hermit_sha.clone(),
+            detcore_tree: summary.detcore_tree.clone(),
+            depth: depth.clone(),
+        });
         let observations = &mut tracked.cells[index].observations;
         // Keyed by tree AND provenance. Keying by tree alone would let a
         // validate point and a pressure-test distribution fall into one range.
@@ -1314,6 +1555,7 @@ fn apply_pressure_summary(
                 observations.push(Observation {
                     detcore_tree: summary.detcore_tree.clone(),
                     provenance: ObservationProvenance::PressureTest,
+                    depth: depth.clone(),
                     hermit_shas: BTreeSet::new(),
                     results: BTreeSet::new(),
                     invocations: BTreeSet::new(),
@@ -1351,7 +1593,13 @@ fn apply_pressure_summary(
                 .then(left.provenance.cmp(&right.provenance))
         });
     }
-    Ok(seen.len())
+    // DISTINCT CELLS, not rows. `seen` is keyed on (cell, repetition) now, so
+    // its length is the number of runs folded; the caller reports cells.
+    Ok(seen
+        .iter()
+        .map(|(cell, _)| cell)
+        .collect::<BTreeSet<_>>()
+        .len())
 }
 
 /// Classify one validate row into the observed-result taxonomy.
@@ -1402,6 +1650,7 @@ fn apply_validate_results(
     rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
     hermit_sha: &str,
     detcore_tree: &str,
+    depth: &BTreeMap<String, SourceDepth>,
 ) -> Result<usize, String> {
     let mut updated = 0usize;
     for (id, candidates) in rows {
@@ -1410,6 +1659,16 @@ fn apply_validate_results(
         };
         for candidate in candidates {
             let row = &candidate.row;
+            // Stamped BEFORE the divergence check below, deliberately. A cell
+            // that PASSED was still exercised, and if this only ran for
+            // diverging cells then "green and checked" would be indistinguishable
+            // from "never checked" -- which is the exact confusion this field
+            // exists to remove.
+            tracked.cells[index].last_tested = Some(LastTested {
+                hermit_sha: hermit_sha.to_string(),
+                detcore_tree: detcore_tree.to_string(),
+                depth: depth.clone(),
+            });
             // Nothing to record. Skipping rather than folding a no-op keeps a
             // cell that has only ever passed free of an empty observation,
             // which would otherwise be indistinguishable from one that was
@@ -1421,6 +1680,34 @@ fn apply_validate_results(
                 continue;
             }
             let result = validate_row_result(row)?;
+            // Same integrity check the pressure path applies to its
+            // invocations. A shell_command that does not reconstruct from cwd,
+            // env and argv is not a pasteable reproduction, and recording it as
+            // one would be worse than recording nothing.
+            if row.shell_command != literal_shell_command(&row.cwd, &row.env, &row.argv) {
+                return Err(format!(
+                    "{}: shell_command does not reconstruct from cwd, env and argv",
+                    display_id(id)
+                ));
+            }
+            let attempt_invocations = row
+                .attempts
+                .iter()
+                .map(|attempt| {
+                    serde_json::from_value::<ObservedAttemptInvocation>(attempt.clone()).map_err(
+                        |e| format!("{}: unreadable attempt record: {e}", display_id(id)),
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            // A row that located a divergence but recorded no attempt is
+            // self-contradictory: something ran to produce that position. The
+            // pressure path refuses the same shape.
+            if attempt_invocations.is_empty() {
+                return Err(format!(
+                    "{} located a divergence but recorded no attempt",
+                    display_id(id)
+                ));
+            }
             if !result.carries_divergence_position() {
                 return Err(format!(
                     "{} reports {} yet carries a divergence position",
@@ -1439,6 +1726,7 @@ fn apply_validate_results(
                     observations.push(Observation {
                         detcore_tree: detcore_tree.to_string(),
                         provenance: ObservationProvenance::Validate,
+                        depth: depth.clone(),
                         hermit_shas: BTreeSet::new(),
                         results: BTreeSet::new(),
                         invocations: BTreeSet::new(),
@@ -1451,6 +1739,21 @@ fn apply_validate_results(
             };
             observation.hermit_shas.insert(hermit_sha.to_string());
             observation.results.insert(result);
+            // Record the invocation, exactly as the pressure path does. Without
+            // it a validate-sourced bound would have strictly WORSE provenance
+            // than a pressure-sourced one: no per-run record, no run_id, and no
+            // pasteable command to reproduce the divergence it reports.
+            observation.invocations.insert(ObservedInvocation {
+                hermit_sha: row.hermit_sha.clone(),
+                run_id: row.run_id.clone(),
+                result,
+                argv: row.argv.clone(),
+                guest_argv: row.guest_argv.clone(),
+                env: row.env.clone(),
+                cwd: row.cwd.clone(),
+                shell_command: row.shell_command.clone(),
+                attempts: attempt_invocations,
+            });
             merge_range(
                 &mut observation.first_divergent_scheduler_turn,
                 row.first_divergent_scheduler_turn,
@@ -1490,8 +1793,15 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let head = git_head(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let rows = read_result_candidates(results, &head)?;
+    let depth = source_depths(root)?;
+    if !depth.contains_key("reverie") {
+        println!(
+            "  note: no reverie checkout reachable, so reverie depth is OMITTED \
+             rather than guessed. Hermit depth is recorded."
+        );
+    }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
-    let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree)?;
+    let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
@@ -1525,8 +1835,15 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
     let summary: PressureSummary = read_json(summary_path)?;
     let head = git_head(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
+    let depth = source_depths(root)?;
+    if !depth.contains_key("reverie") {
+        println!(
+            "  note: no reverie checkout reachable, so reverie depth is OMITTED \
+             rather than guessed. Hermit depth is recorded."
+        );
+    }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
-    let updated = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree)?;
+    let updated = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
@@ -2094,6 +2411,7 @@ fn self_test() -> Result<(), String> {
             enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
+            last_tested: None,
             observations: Vec::new(),
         }],
     };
@@ -2114,6 +2432,7 @@ fn self_test() -> Result<(), String> {
             enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
+            last_tested: None,
             observations: Vec::new(),
         }],
     };
@@ -2127,11 +2446,13 @@ fn self_test() -> Result<(), String> {
             enabled: false,
             status: CellStatus::Red,
             ci_disabled_reason: None,
+            last_tested: None,
             observations: Vec::new(),
         }],
     };
     let pressure_row = |result: &str, turn, virtual_nanoseconds| PressureSummaryRow {
         cell: id.clone(),
+        repetition: None,
         result: result.into(),
         verification: Some(PressureVerification {
             first_divergent_scheduler_turn: turn,
@@ -2160,6 +2481,25 @@ fn self_test() -> Result<(), String> {
             }],
         }),
     };
+    // A fixture depth, so the brackets exercise the recorded-depth path rather
+    // than skipping it. Two repos with deliberately different magnitudes,
+    // because they are different keyspaces and must never be compared.
+    let depth_fixture: BTreeMap<String, SourceDepth> = BTreeMap::from([
+        (
+            "hermit".to_string(),
+            SourceDepth {
+                commits: 1927,
+                first_parent: 1852,
+            },
+        ),
+        (
+            "reverie".to_string(),
+            SourceDepth {
+                commits: 931,
+                first_parent: 916,
+            },
+        ),
+    ]);
     let pressure_summary = |sha: &str, tree: &str, rows| PressureSummary {
         schema: PRESSURE_SUMMARY_SCHEMA,
         hermit_sha: sha.into(),
@@ -2167,44 +2507,53 @@ fn self_test() -> Result<(), String> {
         source_tree_dirty: false,
         rows,
     };
+    // ONE CAMPAIGN, MANY ROWS. This is the shape a real pressure run produces:
+    // `summarize --results DIR` writes a single summary covering every repeat,
+    // so within-campaign rows are what a distribution is built from and they
+    // MERGE. The separate `first` summary below then proves the other half of
+    // the rule -- a LATER campaign at the same tree RESETS rather than widening.
+    // Each repeat is its OWN run with its own run_id, which is what a real
+    // campaign produces and what makes the invocations distinguishable.
+    let pressure_repeat = |repetition: u64, result: &str, turn, virtual_nanoseconds| {
+        let mut row = pressure_row(result, turn, virtual_nanoseconds);
+        row.repetition = Some(repetition);
+        if let Some(invocation) = row.invocation.as_mut() {
+            invocation.run_id = format!("fixture-{result}-rep{repetition}");
+        }
+        row
+    };
+    // Kept as a single-row summary for the refusal brackets below, which need a
+    // valid summary to corrupt.
     let first = pressure_summary(
         "sha-1",
         "tree-1",
         vec![pressure_row("determinism-failure", Some(20), Some(500))],
     );
-    apply_pressure_summary(&mut observed, &first, "sha-1", "tree-1")
-        .map_err(|e| format!("positive pressure-observation bracket failed: {e}"))?;
-    let later = pressure_summary(
+    let campaign = pressure_summary(
         "sha-1",
         "tree-1",
-        vec![pressure_row("determinism-failure", Some(10), Some(900))],
+        vec![
+            pressure_repeat(1, "determinism-failure", Some(20), Some(500)),
+            pressure_repeat(2, "determinism-failure", Some(10), Some(900)),
+            pressure_repeat(3, "timeout", None, None),
+            pressure_repeat(4, "replay-failure", Some(30), Some(1000)),
+        ],
     );
-    apply_pressure_summary(&mut observed, &later, "sha-1", "tree-1")
-        .map_err(|e| format!("pressure-observation range bracket failed: {e}"))?;
-    let timeout = pressure_summary("sha-1", "tree-1", vec![pressure_row("timeout", None, None)]);
-    apply_pressure_summary(&mut observed, &timeout, "sha-1", "tree-1")
-        .map_err(|e| format!("pressure-observation result-set bracket failed: {e}"))?;
+    apply_pressure_summary(&mut observed, &campaign, "sha-1", "tree-1", &depth_fixture)
+        .map_err(|e| format!("pressure-observation campaign bracket failed: {e}"))?;
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
-    apply_pressure_summary(&mut observed, &same_engine, "sha-doc", "tree-1")
+    apply_pressure_summary(&mut observed, &same_engine, "sha-doc", "tree-1", &depth_fixture)
         .map_err(|e| format!("same-Detcore-tree pressure-observation bracket failed: {e}"))?;
-    let replay = pressure_summary(
-        "sha-1",
-        "tree-1",
-        vec![pressure_row("replay-failure", Some(30), Some(1000))],
-    );
-    apply_pressure_summary(&mut observed, &replay, "sha-1", "tree-1")
-        .map_err(|e| format!("replay divergence-position bracket failed: {e}"))?;
     let observation = &observed.cells[0].observations[0];
-    // THREE NUMBERS THAT ARE ALL DIFFERENT, which is exactly why `samples` has
-    // to be stored rather than derived. This bracket folds FIVE rows; they
-    // collapse to FOUR distinct invocations (`invocations.len()` below, a
-    // BTreeSet); and only THREE of them LOCATED a divergence position -- the
-    // two determinism failures and the replay failure. The pass and the timeout
-    // contributed nothing to these bounds.
+    // SAMPLES IS NOT THE RUN COUNT, which is exactly why it has to be stored
+    // rather than derived. This bracket folds FIVE runs -- a four-repetition
+    // campaign plus one run at a second hermit sha on the same detcore tree --
+    // giving FIVE distinct invocations. Only THREE of them LOCATED a divergence
+    // position: the two determinism failures and the replay failure. The pass
+    // and the timeout contributed nothing to these bounds.
     //
-    // So neither the fold count nor the invocation count is the sample size
-    // behind a range. Reporting "earliest 10, latest 30" against an implied
-    // four or five runs would overstate the evidence.
+    // Reporting "earliest 10, latest 30" against an implied five runs would
+    // overstate the evidence by two thirds.
     if observation.first_divergent_scheduler_turn
         != Some(ObservedRange {
             earliest: 10,
@@ -2226,7 +2575,7 @@ fn self_test() -> Result<(), String> {
                 ObservedResult::Timeout,
             ])
         || observation.hermit_shas != BTreeSet::from(["sha-1".into(), "sha-doc".into()])
-        || observation.invocations.len() != 4
+        || observation.invocations.len() != 5
         || !observation.invocations.iter().any(|invocation| {
             invocation.hermit_sha == "sha-doc"
                 && invocation.result == ObservedResult::Pass
@@ -2278,7 +2627,18 @@ fn self_test() -> Result<(), String> {
         first_divergent_scheduler_turn: Some(7),
         first_divergent_virtual_nanoseconds: Some(70),
         first_divergent_record: Some(12),
-        attempts: Vec::new(),
+        attempts: vec![serde_json::json!({
+            "index": "1",
+            "outcome": "FAIL",
+            "status": 1,
+            "signal": null,
+            "timed_out": false,
+            "argv": ["hermit", "run"],
+            "guest_argv": ["fixture"],
+            "env": {"LC_ALL": "C"},
+            "cwd": "/repo",
+            "shell_command": "cd /repo && env LC_ALL=C hermit run",
+        })],
     };
     let rows = BTreeMap::from([(
         validate_id.clone(),
@@ -2288,7 +2648,7 @@ fn self_test() -> Result<(), String> {
             row: validate_row,
         }],
     )]);
-    apply_validate_results(&mut observed, &rows, "sha-1", "tree-1")
+    apply_validate_results(&mut observed, &rows, "sha-1", "tree-1", &depth_fixture)
         .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
     let pressure = observed.cells[0]
         .observations
@@ -2345,7 +2705,7 @@ fn self_test() -> Result<(), String> {
         "tree-2",
         vec![pressure_row("crash-error", None, None)],
     );
-    apply_pressure_summary(&mut observed, &next_source, "sha-2", "tree-2")
+    apply_pressure_summary(&mut observed, &next_source, "sha-2", "tree-2", &depth_fixture)
         .map_err(|e| format!("new-source pressure-observation bracket failed: {e}"))?;
     // Assert the exact KEY SET rather than a count. Observations are keyed by
     // (detcore_tree, provenance), so three distinct keys are expected here: the
@@ -2376,11 +2736,11 @@ fn self_test() -> Result<(), String> {
     let mut dirty = first.clone();
     dirty.source_tree_dirty = true;
     let mut refusal_target = observed.clone();
-    if apply_pressure_summary(&mut refusal_target, &dirty, "sha-1", "tree-1").is_ok() {
+    if apply_pressure_summary(&mut refusal_target, &dirty, "sha-1", "tree-1", &depth_fixture).is_ok() {
         return Err("dirty pressure observations were accepted".into());
     }
-    if apply_pressure_summary(&mut refusal_target, &first, "wrong-sha", "tree-1").is_ok()
-        || apply_pressure_summary(&mut refusal_target, &first, "sha-1", "wrong-tree").is_ok()
+    if apply_pressure_summary(&mut refusal_target, &first, "wrong-sha", "tree-1", &depth_fixture).is_ok()
+        || apply_pressure_summary(&mut refusal_target, &first, "sha-1", "wrong-tree", &depth_fixture).is_ok()
     {
         return Err("pressure observations with wrong source identity were accepted".into());
     }
@@ -2391,6 +2751,7 @@ fn self_test() -> Result<(), String> {
         &missing_invocation,
         "sha-1",
         "tree-1",
+        &depth_fixture,
     )
     .is_ok()
     {
@@ -2401,18 +2762,19 @@ fn self_test() -> Result<(), String> {
         "tree-1",
         vec![PressureSummaryRow {
             cell: id.clone(),
+            repetition: None,
             result: "infrastructure-error".into(),
             verification: None,
             evidence_errors: vec!["fixture missing".into()],
             invocation: None,
         }],
     );
-    if apply_pressure_summary(&mut refusal_target, &infrastructure, "sha-1", "tree-1").is_ok() {
+    if apply_pressure_summary(&mut refusal_target, &infrastructure, "sha-1", "tree-1", &depth_fixture).is_ok() {
         return Err("infrastructure failure was stored as product behavior".into());
     }
     let mut green_target = observed.clone();
     green_target.cells[0].status = CellStatus::Green;
-    if apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1").is_ok() {
+    if apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture).is_ok() {
         return Err("periodic pressure evidence was allowed to rewrite a green cell".into());
     }
 
