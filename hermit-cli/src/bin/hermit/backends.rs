@@ -68,6 +68,8 @@ use super::verify::ComparisonOptions;
 #[cfg(feature = "dbt")]
 use super::verify::LogCompareStrictness;
 #[cfg(feature = "dbt")]
+use super::verify::announce_verification_outcome;
+#[cfg(feature = "dbt")]
 use super::verify::compare_two_runs;
 #[cfg(feature = "dbt")]
 use super::verify::retain_verification_logs;
@@ -92,7 +94,6 @@ struct DbtSummary {
 
 #[cfg(feature = "dbt")]
 impl DbtSummary {
-    #[cfg(test)]
     fn same_observable_behavior(&self, other: &Self) -> bool {
         self.syscalls == other.syscalls
             && self.rewritten == other.rewritten
@@ -467,12 +468,121 @@ fn dbt_verification_output(output: Output) -> reverie::process::Output {
     }
 }
 
+// Preserve the established human-facing DBT verification contract when no
+// durable report was requested. Machine-readable verification below uses the
+// canonical INFO comparator because its result is consumed as evidence; this
+// path retains the existing stdout, exit-status, and native-summary checks.
+#[cfg(feature = "dbt")]
+fn run_dbt_legacy_verify(
+    runner: &DbtRunner,
+    guest: &StdCommand,
+    drrun: &Path,
+    verify_allow: VerifyAllow,
+    summary: bool,
+    stdin_is_terminal: bool,
+    verification_stdin: Option<std::fs::File>,
+) -> Result<ExitStatus, Error> {
+    let mut replay = if stdin_is_terminal && verification_stdin.is_none() {
+        None
+    } else {
+        Some(tempfile::tempfile()?)
+    };
+
+    eprintln!(":: DBT Run1...");
+    let first = match (replay.as_mut(), verification_stdin) {
+        (Some(replay), Some(input)) => run_once(
+            runner,
+            guest,
+            drrun,
+            TeeReader {
+                input,
+                replay: replay.try_clone()?,
+            },
+        )?,
+        (Some(replay), None) => run_once(
+            runner,
+            guest,
+            drrun,
+            TeeReader {
+                input: std::io::stdin(),
+                replay: replay.try_clone()?,
+            },
+        )?,
+        (None, _) => run_once_with_terminal_input(runner, guest, drrun)?,
+    };
+    if !verify_allow.satisfies(process_status(first.status)) {
+        write_output(&first)?;
+        return Ok(output_status(&first));
+    }
+    let first_summary = detcore_summary(&first)?;
+    if stdin_is_terminal && first_summary.stdin_reads != 0 {
+        write_output(&first)?;
+        return Err(Error::msg(format!(
+            "DBT verification cannot replay terminal stdin: guest attempted {} fd-0 read syscall(s)",
+            first_summary.stdin_reads
+        )));
+    }
+
+    eprintln!(":: DBT Run2...");
+    let second = match replay.as_mut() {
+        Some(replay) => {
+            replay.seek(SeekFrom::Start(0))?;
+            run_once(runner, guest, drrun, replay.try_clone()?)?
+        }
+        None => run_once_with_terminal_input(runner, guest, drrun)?,
+    };
+    if !verify_allow.satisfies(process_status(second.status)) {
+        write_output(&second)?;
+        return Ok(output_status(&second));
+    }
+    let second_summary = detcore_summary(&second)?;
+
+    if first.status != second.status {
+        write_output(&first)?;
+        return Err(Error::msg(format!(
+            "DBT verification failed: guest exit status differed between runs ({:?} != {:?})",
+            first.status, second.status
+        )));
+    }
+    if first.stdout != second.stdout {
+        return Err(Error::msg(dbt_stdout_mismatch(
+            &first.stdout,
+            &second.stdout,
+        )));
+    }
+    if !first_summary.same_observable_behavior(&second_summary) {
+        return Err(Error::msg(format!(
+            "DBT verification failed: native Detcore summaries differed ({first_summary:?} != {second_summary:?})"
+        )));
+    }
+    if first_summary.branches != second_summary.branches {
+        eprintln!(
+            ":: DBT diagnostic branch counts differed at the last syscall: {} | {}",
+            first_summary.branches, second_summary.branches
+        );
+    }
+
+    write_output(&first)?;
+    eprintln!(
+        ":: Comparing DBT observed guest-memory hashes... {} | {}",
+        first_summary.memory_hash, second_summary.memory_hash
+    );
+    eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
+    eprintln!(":: Success: deterministic. Determinism verified.");
+    if summary {
+        eprint!("{}", format_dbt_stats(&first_summary));
+    }
+    Ok(output_status(&first))
+}
+
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
 ///
-/// Verification obtains structured tracing records through Reverie's
-/// authenticated per-run evidence channel, decodes the finalized framed
-/// artifact after the complete process tree is reaped, and hands the resulting
-/// log plus exact stdout/stderr/status to Hermit's ordinary typed comparator.
+/// When `--verify-json` requests a durable report, verification obtains
+/// structured tracing records through Reverie's authenticated per-run evidence
+/// channel, decodes the finalized framed artifact after the complete process
+/// tree is reaped, and hands the resulting log plus exact stdout/stderr/status
+/// to Hermit's ordinary typed comparator. Without a report path, the existing
+/// human-facing DBT verification contract remains unchanged.
 // This mirrors the option surface of `hermit run`, so its parameters track the
 // CLI run flags rather than a cohesive value object; bundling them would not
 // clarify the dispatch shim.
@@ -555,7 +665,9 @@ pub(super) fn run_dbt(
         environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
     );
     let mut guest = StdCommand::new(&prepared.program);
-    if !verify && let Some(level) = log {
+    if (!verify || verify_json.is_none())
+        && let Some(level) = log
+    {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
     }
     environment.remove(OsStr::new("HERMIT_LOG_FILE"));
@@ -585,6 +697,18 @@ pub(super) fn run_dbt(
             }
         }
         return Ok(output_status(&output));
+    }
+
+    if verify_json.is_none() {
+        return run_dbt_legacy_verify(
+            &runner.clone().summary(true),
+            &guest,
+            &drrun,
+            verify_allow,
+            summary,
+            stdin_is_terminal,
+            verification_stdin,
+        );
     }
 
     let (log1, log2) = temp_log_files_in("dbt-run1", "dbt-run2", verify_log_dir)
@@ -720,6 +844,15 @@ pub(super) fn run_dbt(
     if let Some(path) = verify_json {
         write_verification_json(path, &outcome)?;
     }
+    let success_message = if config.detlog_io_buffers {
+        "Success: deterministic. Determinism verified."
+    } else {
+        "Success: deterministic. Determinism verified. NOTE: syscall \
+         output-buffer CONTENT was not compared, so a divergence confined to \
+         a buffer whose length is stable would not have been seen; add \
+         --detlog-io-buffers to include it."
+    };
+    announce_verification_outcome(&outcome, success_message, "Failure: nondeterministic.");
     if !outcome.verified() {
         return outcome.into_exit_status();
     }
@@ -752,7 +885,6 @@ pub(super) fn run_dbt(
 }
 
 #[cfg(feature = "dbt")]
-#[cfg(test)]
 fn dbt_stdout_mismatch(first: &[u8], second: &[u8]) -> String {
     const CONTEXT_BEFORE: usize = 40;
     const CONTEXT_AFTER: usize = 120;
@@ -792,6 +924,17 @@ fn run_once<R: Read + Send + 'static>(
 ) -> Result<Output, Error> {
     runner
         .output_with_detached_reader(guest, input)
+        .map_err(|error| launch_error(drrun, error))
+}
+
+#[cfg(feature = "dbt")]
+fn run_once_with_terminal_input(
+    runner: &DbtRunner,
+    guest: &StdCommand,
+    drrun: &Path,
+) -> Result<Output, Error> {
+    runner
+        .output_with_inherited_stdin(guest)
         .map_err(|error| launch_error(drrun, error))
 }
 
