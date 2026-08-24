@@ -45,7 +45,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! safe-ci-dag-runner = { path = "../agent-utils/rs/safe-ci-dag-runner" }
+//! safe-ci-dag-runner = { path = "../agent-utils/rs/dagrun", package = "dagrun" }
 //! serde_json = "1"
 //! libc = "0.2"
 //! ```

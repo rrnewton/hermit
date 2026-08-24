@@ -4,7 +4,7 @@
 //! ```cargo
 //! [dependencies]
 //! csv = "1"
-//! safe-ci-dag-runner = { path = "../../agent-utils/rs/safe-ci-dag-runner" }
+//! safe-ci-dag-runner = { path = "../../agent-utils/rs/dagrun", package = "dagrun" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! ```
