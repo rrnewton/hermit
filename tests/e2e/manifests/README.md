@@ -91,6 +91,15 @@ The mode contracts are:
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
 
+`verify`, `chaos`, and `custom` may set an absolute `workdir` path. The harness
+passes it to `hermit run` before the guest-command separator, so it is resolved
+inside the guest after mounts are applied. Use this when a guest's interpreter
+or toolchain inspects its inherited working directory before the program can
+change directories itself. `naked` and `replay` do not accept this field.
+The checked-in use is currently ptrace-only. A mode that enables DBT is
+rejected because the DBT launcher does not yet preserve the requested guest
+working directory; qualify that backend behavior before using `workdir` there.
+
 An enabled `verify` cell is green only when its typed report records canonical
 strictness, log comparison, positive INFO counts on both runs, bitwise parity,
 and a matched verdict. Output-only, stripped, empty-log, malformed, or

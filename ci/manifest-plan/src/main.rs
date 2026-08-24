@@ -22,6 +22,7 @@ use hermit_manifest_plan::ci_selection::CiDisabledReasonData;
 use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+use hermit_manifest_plan::runner::validate_mode_workdir;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -793,6 +794,7 @@ fn validate_mode(
         "backends_enabled",
         "backends_disabled",
         "guest_args",
+        "workdir",
     ];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
@@ -808,6 +810,11 @@ fn validate_mode(
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
+    let workdir = spec.get("workdir").map(|workdir| {
+        workdir
+            .as_str()
+            .unwrap_or_else(|| die(format!("{id}: modes.{mode}.workdir must be a string")))
+    });
     if mode == "verify" {
         if let Some(assert) = spec.get("assert") {
             ensure_keys(
@@ -836,6 +843,7 @@ fn validate_mode(
         spec.get("backends_enabled"),
         &format!("{id}.modes.{mode}.backends_enabled"),
     );
+    validate_mode_workdir(id, mode, workdir, &enabled).unwrap_or_else(|error| die(error));
     let disabled = spec
         .get("backends_disabled")
         .and_then(Value::as_table)
@@ -1258,6 +1266,7 @@ min_distinct = 2
 ci = true
 backends_enabled = ["ptrace"]
 guest_args = { ptrace = ["multi"] }
+workdir = "/tmp"
 
 [backends_disabled]
 dbt = "unsupported"
@@ -1288,6 +1297,59 @@ liteinst = "unsupported"
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
         assert_eq!(rows.iter().filter(|row| !row.enabled).count(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "workdir must be an absolute path")]
+    fn rejects_relative_run_workdir() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace"]
+workdir = "tmp"
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "workdir is unsupported when DBT is enabled")]
+    fn rejects_workdir_with_mixed_ptrace_and_dbt_backends() {
+        let spec = parse_mode(
+            r#"
+ci = true
+backends_enabled = ["ptrace", "dbt"]
+workdir = "/tmp"
+
+[backends_disabled]
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
     }
 
     #[test]
