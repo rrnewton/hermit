@@ -1213,6 +1213,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "chaos-c",
+      "lane": "portable",
+      "mode": "chaos",
+      "test": "chaos-c/lock-granularity"
+    },
+    {
+      "backend": "ptrace",
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
