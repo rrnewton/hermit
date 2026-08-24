@@ -16,9 +16,9 @@
  * "ino ok=4" summed four steps into one scalar, which is especially lossy for a
  * documented-gap row: a backend missing inotify entirely and a backend that
  * merely failed to remove the watch produced different totals, but any two
- * backends losing the SAME COUNT of different steps compared EQUAL, and
- * main() returned 0 unconditionally so exit status distinguished nothing. Naming
- * the steps makes a partial implementation legible as a partial implementation.
+ * backends losing the SAME COUNT of different steps compared EQUAL. The
+ * existing exit-status guard catches the lower total; naming the steps makes a
+ * partial implementation legible as a partial implementation.
  *
  * The watch descriptor number is not printed: it is kernel-allocated state the
  * guest inherits rather than a value it chooses, so it is withheld under the

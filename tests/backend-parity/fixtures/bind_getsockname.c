@@ -15,8 +15,8 @@
 // THE ADDRESS LENGTH THE GUEST BOUND AND THE ONE GETSOCKNAME ECHOED ARE BOTH
 // PRINTED. "bind_name ok=6" collapsed six checks into one scalar, so a backend
 // that echoed a truncated address length and a backend that corrupted the
-// abstract path both printed "bind_name ok=5" and compared EQUAL, and main()
-// returned 0 unconditionally so exit status said nothing either. Emitting both
+// abstract path both printed "bind_name ok=5" and compared EQUAL. The existing
+// exit-status guard catches the lower total, while emitting both
 // lengths makes a truncation self-describing instead of merely absent.
 //
 // Both lengths are guest-determined: the name is a fixed literal this fixture

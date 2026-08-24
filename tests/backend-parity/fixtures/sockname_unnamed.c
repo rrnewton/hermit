@@ -15,8 +15,9 @@
 // THE ADDRESS FAMILY AND LENGTH ARE PRINTED, not just a check count. "sockname
 // ok=6" collapsed six independent observations into one scalar, so a backend
 // reporting the wrong family and a backend reporting the wrong address length
-// both printed "sockname ok=5" and compared EQUAL; main() also returned 0
-// unconditionally, so a partial failure was invisible to exit status too.
+// both printed "sockname ok=5" and compared EQUAL. The existing exit-status
+// guard catches the lower total, but does not identify which observation was
+// wrong.
 // Both emitted numbers are ABI constants rather than host state -- AF_UNIX and
 // sizeof(sa_family_t) are fixed by the Linux ABI, and the unnamed length is a
 // property of the pair the guest itself created -- so printing them keeps the
