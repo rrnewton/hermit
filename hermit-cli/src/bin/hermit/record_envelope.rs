@@ -21,9 +21,12 @@ use serde::Serialize;
 pub(crate) enum RecordEnvelopePolicy {
     /// Preserve every parsed log record.
     AllRecordsV1,
-    /// Exclude only records emitted by the DBT evidence transport about itself.
-    /// This is an offline `hermit log-diff` policy; live DBT run verification
-    /// does not reach the generic log comparator.
+    /// Exclude only records emitted by the DBT evidence transport about
+    /// itself. Those records are real and present in a live evidence stream
+    /// (`evidence_emit_image_initialization`, reverie-dbt
+    /// native/client.c:863), but live DBT run verification compares them:
+    /// its adapter selects [`Self::AllRecordsV1`]. This policy is offered for
+    /// offline `hermit log-diff` inspection of an archived evidence log.
     DbtEvidenceTransportV1,
     /// A predicate whose semantics are not one of the named canonical policies.
     CallerDefined,

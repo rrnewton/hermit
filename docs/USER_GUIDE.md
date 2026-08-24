@@ -308,9 +308,11 @@ The default `--record-envelope=all-records-v1` preserves every parsed record.
 For a DBT evidence log, select
 `--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
 transport's self-description records. This is an offline inspection option;
-live `--backend=dbt run --verify` uses its dedicated DBT adapter and does not
-reach the generic comparator, so a record envelope does not apply to it. That
-adapter publishes its own verdict when `--verify-json` is requested.
+live `--backend=dbt run --verify` goes through its dedicated DBT adapter,
+which compares its two runs with `all-records-v1` and publishes its own verdict
+when `--verify-json` is requested. Selecting this envelope there would exclude
+records that adapter compares today, so it is offered here for offline
+inspection rather than applied to a live run.
 `hermit log-diff LEFT RIGHT --json REPORT.json` compares
 the same canonical INFO stream and atomically records a one-line result. Its
 `comparison.record_envelope` field names that versioned policy, alongside the

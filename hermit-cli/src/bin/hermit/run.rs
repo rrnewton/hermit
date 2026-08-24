@@ -3221,11 +3221,10 @@ impl RunOpts {
                 diagnostic_full_trace: self.verify_verbose,
                 compare_io_buffers: self.det_opts.det_config.detlog_io_buffers,
                 keep_logs: self.keep_logs,
-                // Every backend that reaches this generic comparator preserves
-                // every parsed record. DBT returns through `run_dbt` above and
-                // has no log-comparator or verification-receipt integration;
-                // its transport-only envelope is an explicit standalone
-                // `hermit log-diff` option, not live run wiring.
+                // Every backend that reaches this generic comparator
+                // preserves every parsed record. DBT returns through `run_dbt`
+                // above and reaches the comparator by its own route, where it
+                // names the same `all_records_v1` envelope.
                 record_envelope: RecordEnvelope::all_records_v1(),
             },
         )?;
