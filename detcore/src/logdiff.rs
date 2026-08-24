@@ -402,16 +402,16 @@ fn messages_for_comparison(messages: &[(usize, &str)], policy: LogComparisonPoli
 }
 
 #[cfg(test)]
-fn canonical_info_from_str(contents: &str) -> Vec<String> {
+fn canonical_info_from_str(contents: &str) -> std::io::Result<Vec<String>> {
     canonical_info_from_str_with_filter(contents, |_| true)
 }
 
 fn canonical_info_from_str_with_filter(
     contents: &str,
     keep_record: impl Fn(&str) -> bool,
-) -> Vec<String> {
+) -> std::io::Result<Vec<String>> {
     let info = filter_infos(
-        &extract_log_messages(contents)
+        &extract_log_messages(contents)?
             .into_iter()
             .filter(|(_, record)| keep_record(record))
             .collect::<Vec<_>>(),
@@ -421,7 +421,10 @@ fn canonical_info_from_str_with_filter(
         comparison: LogComparisonMode::Info,
         ..Default::default()
     };
-    messages_for_comparison(&info, LogComparisonPolicy::from_options(&opts))
+    Ok(messages_for_comparison(
+        &info,
+        LogComparisonPolicy::from_options(&opts),
+    ))
 }
 
 /// Print the canonical INFO messages that strict verification would compare for
@@ -449,7 +452,7 @@ pub fn write_canonical_info_with_filter(
 ) -> std::io::Result<usize> {
     let bytes = std::fs::read(file)?;
     let contents = String::from_utf8_lossy(&bytes);
-    let messages = canonical_info_from_str_with_filter(&contents, keep_record);
+    let messages = canonical_info_from_str_with_filter(&contents, keep_record)?;
     for message in &messages {
         writeln!(writer, "{message}")?;
     }
@@ -500,23 +503,48 @@ pub fn take_complete_records(contents: &str, n: usize) -> Option<&str> {
     starts.get(n).map(|end| &contents[..*end])
 }
 
-fn extract_log_messages(contents: &str) -> Vec<(usize, &str)> {
+/// Split a log into tagged records, REFUSING rather than panicking on a line
+/// that carries no level tag.
+///
+/// This used to `panic!`, and a panic is the wrong failure mode for a
+/// diagnostic tool -- people reach for `log-diff` when something is ALREADY
+/// broken, and unwinding at them is the least helpful thing it can do. Worse,
+/// the `--json` consumer could not tell a crash from a real verdict: the report
+/// came back `verdict: no_result` with null counts, which reads as "no
+/// comparison was reached" rather than "the tool died".
+///
+/// This is still FAIL-CLOSED -- an unrecognised line refuses the whole
+/// comparison rather than being skipped. Skipping would silently change the
+/// compared surface, which is exactly what `RecordEnvelopePolicy` exists to
+/// make explicit and versioned. Choosing what to exclude is a disclosed policy
+/// decision, not something a parser should do on its own initiative.
+///
+/// The refusal names the offending line, because in practice the cause is a
+/// backend emitting its own untagged diagnostics into the same stream --
+/// measured: DBT writes fourteen `detcore-dbt: ...` startup lines, which is
+/// what makes a ptrace-vs-DBT comparison impossible today.
+fn extract_log_messages(contents: &str) -> std::io::Result<Vec<(usize, &str)>> {
     let ts = &*RECORD_START;
     let tag = Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE) ").unwrap();
-    let iter = ts
-        .split(contents) // Not aware of a streaming version of this RE split operation.
+    ts.split(contents) // Not aware of a streaming version of this RE split operation.
         .enumerate()
         .map(|(i, s)| (i, s.trim()))
         .filter(|(_, s)| !s.is_empty())
         .map(|(i, s)| {
             // Only let through lines that start with one of the expected tags:
-            if !tag.is_match(s) {
-                panic!("Log line without expected tag: {}", s);
+            if tag.is_match(s) {
+                Ok((i, s))
             } else {
-                (i, s)
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "log line {i} has no ERROR/WARN/INFO/DEBUG/TRACE tag, so it cannot be \
+                         placed in the compared record stream: {s}"
+                    ),
+                ))
             }
-        });
-    iter.collect()
+        })
+        .collect()
 }
 
 fn is_info(line: &str) -> bool {
@@ -1319,14 +1347,14 @@ pub fn log_diff_summary_from_strs_with_filter(
     keep_record: impl Fn(&str) -> bool,
 ) -> std::io::Result<LogDiffSummary> {
     let all_a = filter_ignored(
-        extract_log_messages(file_a_str.as_ref())
+        extract_log_messages(file_a_str.as_ref())?
             .into_iter()
             .filter(|(_, record)| keep_record(record))
             .collect(),
         &opts.ignore_lines,
     );
     let all_b = filter_ignored(
-        extract_log_messages(file_b_str.as_ref())
+        extract_log_messages(file_b_str.as_ref())?
             .into_iter()
             .filter(|(_, record)| keep_record(record))
             .collect(),
@@ -1701,6 +1729,48 @@ mod test {
         assert_eq!(compare(&same, &same).summary.first_divergent_record, None);
         // And an empty comparison reports no location rather than record zero.
         assert_eq!(compare("", "").summary.first_divergent_record, None);
+    }
+
+    /// An untagged line REFUSES the comparison instead of panicking, and the
+    /// refusal names the line. A panic is the wrong failure mode for a tool
+    /// people reach for when something is already broken, and the `--json`
+    /// consumer could not distinguish a crash from a real `no_result` verdict.
+    ///
+    /// It still refuses rather than SKIPPING: dropping the line would silently
+    /// change the compared surface, which is a disclosed, versioned decision
+    /// belonging to the record envelope, not to the parser.
+    #[test]
+    fn an_untagged_line_is_refused_by_name_rather_than_panicking() {
+        // THE REAL SHAPE, and the reason it bites: records are delimited by the
+        // wall-clock PREFIX, not by newlines. DBT emits no timestamp prefix at
+        // all and writes its own untagged startup lines first, so the whole
+        // thing forms one segment beginning with untagged text. A line placed
+        // AFTER a timestamped record would simply be absorbed into that
+        // record's body and never seen as its own -- which is why this fixture
+        // has no timestamp.
+        let log = "detcore-dbt: background client thread entered\n";
+        let error = super::extract_log_messages(log)
+            .expect_err("an untagged line must refuse, not be admitted");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains("detcore-dbt: background client thread entered"),
+            "the refusal must name the offending line, got: {message}"
+        );
+        assert!(
+            message.contains("no ERROR/WARN/INFO/DEBUG/TRACE tag"),
+            "the refusal must say why, got: {message}"
+        );
+    }
+
+    /// A fully tagged log is unaffected -- the refusal must not become a
+    /// tripwire on ordinary input.
+    #[test]
+    fn a_fully_tagged_log_still_parses() {
+        let log = "2026-08-24T20:16:17.897469Z  INFO detcore: DETLOG a\n\
+                   2026-08-24T20:16:17.897470Z  WARN detcore: b\n";
+        let records = super::extract_log_messages(log).expect("tagged log parses");
+        assert_eq!(records.len(), 2);
     }
 
     /// The syscall counter is READ from detcore's own `finish syscall #N`
@@ -2573,7 +2643,7 @@ Jun 09 06:49:17.742  INFO detcore: [t] use 0x1111";
 2026-08-13T01:02:03.000002Z INFO detcore: DETLOG count=42 bare=0x6 marked=<hostaddr 0xaaaa> other=<hostaddr 0xbbbb>";
 
         assert_eq!(
-            super::canonical_info_from_str(log),
+            super::canonical_info_from_str(log).expect("fixture log is fully tagged"),
             vec![
                 "INFO detcore: COMMIT turn 17 at time 123456 bare=0x2 marked=<addr1>",
                 "INFO detcore: DETLOG count=42 bare=0x6 marked=<addr1> other=<addr2>",
@@ -2710,7 +2780,7 @@ Jan 09 06:49:03.100  INFO detcore: registers [dtid 3]. user_regs_struct { r15: 1
 Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar Go>); clear ivars for the next turn on dettid 2
 ";
 
-        let v = super::extract_log_messages(s);
+        let v = super::extract_log_messages(s).expect("fixture log is fully tagged");
         eprintln!("Split into {} log messages", v.len());
         for x in &v {
             eprintln!("{:?}", x);
