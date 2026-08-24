@@ -530,7 +530,23 @@ pub struct Config {
     /// against the 10.9 TB `--detlog-heap` hashes over the same run.
     ///
     /// NAME IS PROVISIONAL: `io-buffers` is the owner's candidate and is not settled.
-    #[clap(long)]
+    ///
+    /// ON BY DEFAULT. It was opt-in until 2026-08-24, and opt-in made the
+    /// determinism gate weaker than its name: with the hash absent, the netlink
+    /// `recvmsg` above compares equal and `--verify` reports success. A check
+    /// that must be requested is not a standard. The opt-out exists for the
+    /// deliberate case (bulk I/O where the cost matters and content parity is
+    /// not the question), not as the ordinary setting.
+    ///
+    /// COST OF THE DEFAULT, measured 2026-08-24 on a 316-core x86_64 Linux
+    /// build host: a typical small test guest pays about ONE MILLISECOND
+    /// (`/bin/true` 0.029s -> 0.030s, `/bin/ls` 0.041s -> 0.041s, 8 runs each).
+    /// 64 MiB through `cat` costs +0.07-0.10s in a RELEASE build, which is the
+    /// ~1.1-1.6 s/GB matching the figure quoted above. The same workload in a
+    /// DEBUG build costs +3.4s, roughly 50x more, because the hash loop is
+    /// unoptimized -- so a debug-built node moving tens of megabytes is the one
+    /// place the default is felt.
+    #[clap(long = "no-detlog-io-buffers", action = clap::ArgAction::SetFalse)]
     pub detlog_io_buffers: bool,
 
     /// Sampling cadence for `--detlog-regs`: hash every Nth guest-logical-control point.
@@ -922,8 +938,8 @@ impl fmt::Display for Config {
         if self.detlog_regs_cadence != /* default */ 1 {
             write!(f, " --detlog-regs-cadence={}", self.detlog_regs_cadence)?;
         }
-        if self.detlog_io_buffers {
-            write!(f, " --detlog-io-buffers")?;
+        if !self.detlog_io_buffers {
+            write!(f, " --no-detlog-io-buffers")?;
         }
         if self.sysinfo_uptime_offset != /* default */ 120 {
             write!(f, " --sysinfo-uptime-offset={}", self.sysinfo_uptime_offset)?;
