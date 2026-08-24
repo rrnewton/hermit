@@ -55,7 +55,12 @@ impl RecordVersion {
 // recorder, even though flock was already classified Determinized -- so
 // replaying one under this build would read the next thread event for every
 // flock and desynchronize the stream. The version gate must refuse it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10c);
+//
+// 0x10c -> 0x10d: raw pidfd_getfd now records one `Return` event and replay
+// re-executes the syscall to materialize and validate its OFD alias. A 0x10c
+// stream has no such event, so accepting it would consume the next event and
+// desynchronize every later syscall in that thread.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x10d);
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,6 +353,11 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_flock_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10b)));
+    }
+
+    #[test]
+    fn record_version_rejects_pre_pidfd_getfd_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10c)));
     }
 
     #[test]

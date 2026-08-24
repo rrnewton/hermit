@@ -87,6 +87,13 @@ struct OpenFileDescription {
     id: OpenFileId,
     /// fd type
     ty: FdType,
+    /// Process named by a pidfd created through `pidfd_open`.
+    ///
+    /// This is shared by descriptor aliases just like the kernel pidfd object.
+    /// `None` means either that this is not a pidfd or that Detcore did not
+    /// observe enough provenance to identify its target.
+    #[serde(default)]
+    pidfd_target: Option<DetPid>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -142,16 +149,21 @@ struct OpenFileDescription {
     /// this struct models: `dup`/`fork` aliases share one lock, two separate
     /// `open`s of the same file contend with each other.
     ///
-    /// Detcore tracks this only so `handle_flock` can tell a first acquisition
-    /// (where a failed `LOCK_NB` probe changes nothing) from a *conversion* of
-    /// an already-held lock (where Linux drops the old lock before it can fail).
-    /// It is a cache of what Detcore itself granted, never an authority: it is
-    /// written only after the kernel reports success.
+    /// Detcore tracks this so `handle_flock` can tell a known first acquisition
+    /// (where a failed `LOCK_NB` probe changes nothing) from a known
+    /// *conversion* of an already-held lock (where Linux drops the old lock
+    /// before it can fail). Unknown state permits neither conclusion: a
+    /// blocking acquisition or conversion must be refused before probing because
+    /// an unobserved lock may already exist. This is a cache of what Detcore
+    /// itself granted, never an authority, and is updated only while that
+    /// authority remains intact.
     #[serde(default)]
     flock_mode: Option<i32>,
     /// Whether `flock_mode` describes the kernel state. Descriptors created by
-    /// an intercepted syscall start known-unlocked; descriptors discovered
-    /// after entering the guest can already carry a lock.
+    /// an intercepted syscall start known-unlocked. Startup stdio, descriptors
+    /// discovered after entering the guest, received or potentially transferred
+    /// descriptions, and descriptions shared with a successfully cloned process
+    /// can already carry or later acquire a lock outside this cache.
     #[serde(default)]
     flock_mode_known: bool,
 }
@@ -187,6 +199,7 @@ impl DetFd {
             open_file: Arc::new(Mutex::new(OpenFileDescription {
                 id,
                 ty,
+                pidfd_target: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
                 inode: None,
@@ -312,6 +325,18 @@ impl DetFd {
     /// File type attached to the open file description.
     pub fn ty(&self) -> FdType {
         self.description().ty
+    }
+
+    /// Record the process identity carried by a newly created pidfd.
+    pub(crate) fn set_pidfd_target(&self, target: DetPid) {
+        let mut description = self.description();
+        debug_assert_eq!(description.ty, FdType::Pidfd);
+        description.pidfd_target = Some(target);
+    }
+
+    /// Return the process identity carried by this pidfd, when known.
+    pub(crate) fn pidfd_target(&self) -> Option<DetPid> {
+        self.description().pidfd_target
     }
 
     /// Resource attached to the open file description.
@@ -483,9 +508,10 @@ impl DetFd {
     // TODO-HUMAN-REVIEW(#2373)
     /// Return the known `flock(2)` state for this open file description.
     ///
-    /// The outer `None` means Detcore did not observe the descriptor's history.
+    /// The outer `None` means Detcore cannot prove the current kernel state.
     /// `Some(None)` means known-unlocked; `Some(Some(mode))` means the kernel
-    /// granted `LOCK_SH` or `LOCK_EX` through this handler.
+    /// granted `LOCK_SH` or `LOCK_EX` through this handler while the cache was
+    /// still authoritative.
     pub(crate) fn known_flock_mode(&self) -> Option<Option<i32>> {
         let description = self.description();
         description
@@ -506,8 +532,9 @@ impl DetFd {
     }
 
     /// Mark the kernel lock state unknown without changing the kernel lock.
-    /// This is required for live-discovered and externally received file
-    /// descriptions, whose history Detcore did not observe.
+    /// This is required whenever another process or an unobserved preexisting
+    /// descriptor can acquire, convert, or release the shared OFD lock without
+    /// updating this cache.
     pub(crate) fn forget_flock_mode(&self) {
         let mut description = self.description();
         description.flock_mode = None;
@@ -634,6 +661,23 @@ mod tests {
             None,
             "a later call cannot make externally mutable lock state reliable again"
         );
+    }
+
+    #[test]
+    fn pidfd_target_is_shared_by_descriptor_aliases() {
+        let target = DetPid::from_raw(41);
+        let original = DetFd::new(
+            3,
+            OFlag::O_CLOEXEC,
+            FdType::Pidfd,
+            OpenFileId::new(DetTid::from_raw(7), 0),
+        );
+        let duplicate = original.clone().with_fd(4);
+
+        assert_eq!(original.pidfd_target(), None);
+        original.set_pidfd_target(target);
+        assert_eq!(original.pidfd_target(), Some(target));
+        assert_eq!(duplicate.pidfd_target(), Some(target));
     }
 
     #[test]

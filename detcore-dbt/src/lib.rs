@@ -1221,6 +1221,93 @@ fn successful_process_clone_result(sysnum: i64, result: i64) -> bool {
         )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProcessCloneProperties {
+    blocks_parent: bool,
+    shares_files_without_thread: bool,
+}
+
+/// Decode the process-lifecycle properties that must be decided before copy.
+///
+/// This runs in `reverie_dbt_runtime_pre_syscall`, which the pinned Reverie
+/// client's `pre_syscall` callback invokes before
+/// `prepare_original_identity_syscall` and before DynamoRIO lets the kernel
+/// execute the clone. `clone3` keeps its flags in guest memory, so use the
+/// callback's fault-safe reader rather than dereferencing the guest pointer.
+/// Malformed or unreadable `clone3` arguments have no pre-copy properties: the
+/// kernel will reject those calls without creating a child.
+fn process_clone_properties(
+    sysnum: i64,
+    args: &[u64],
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> ProcessCloneProperties {
+    // Linux's original clone_args layout runs through `tls` and is 64 bytes;
+    // `cgroup` arrived in a later version. Smaller sizes are rejected with
+    // EINVAL and cannot create a child.
+    const CLONE_ARGS_SIZE_VER0: u64 = 64;
+    let flags = match sysnum {
+        libc::SYS_fork => Some(0),
+        libc::SYS_vfork => Some(libc::CLONE_VFORK as u64),
+        libc::SYS_clone => args.first().copied(),
+        libc::SYS_clone3 => {
+            let Some((&address, &size)) = args.first().zip(args.get(1)) else {
+                return ProcessCloneProperties::default();
+            };
+            if address == 0 || size < CLONE_ARGS_SIZE_VER0 {
+                return ProcessCloneProperties::default();
+            }
+            let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+            if !read(address as usize, &mut bytes) {
+                return ProcessCloneProperties::default();
+            }
+            Some(u64::from_ne_bytes(bytes))
+        }
+        _ => None,
+    };
+    let Some(flags) = flags else {
+        return ProcessCloneProperties::default();
+    };
+    ProcessCloneProperties {
+        blocks_parent: flags & libc::CLONE_VFORK as u64 != 0,
+        shares_files_without_thread: flags & libc::CLONE_FILES as u64 != 0
+            && flags & libc::CLONE_THREAD as u64 == 0,
+    }
+}
+
+/// Suppress a root pre-copy lifecycle syscall with one guest-visible errno.
+///
+/// # Safety
+///
+/// `result` must be valid for one aligned `i64` write.
+unsafe fn suppress_pre_copy_lifecycle(result: *mut i64, error: Errno) -> i32 {
+    unsafe { result.write(-(error.into_raw() as i64)) };
+    TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+    1
+}
+
+fn vfork_flock_state_is_unsafe(scratch: &NativeThreadScratch) -> bool {
+    if scratch.runtime_state.is_null() {
+        // The first trapped syscall can itself be vfork/CLONE_VFORK. Until the
+        // Detcore thread state exists, startup descriptors have not been
+        // discovered and therefore cannot be proven free of flock state.
+        return true;
+    }
+    // SAFETY: A non-null runtime_state is installed from Box::into_raw and is
+    // owned by this thread until thread_exit clears it.
+    unsafe { &*scratch.runtime_state }
+        .state
+        .has_unsafe_vfork_flock_state()
+}
+
+#[cfg(test)]
+fn process_clone_blocks_parent(
+    sysnum: i64,
+    args: &[u64],
+    read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
+    process_clone_properties(sysnum, args, read).blocks_parent
+}
+
 /// Applies the result of a native process-clone syscall after the kernel returns.
 ///
 /// Successful process clones share inherited open file descriptions, while the
@@ -1518,17 +1605,47 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
         return 1;
     }
-    if sysnum == libc::SYS_vfork
-        && !scratch.runtime_state.is_null()
-        && unsafe { &*scratch.runtime_state }
-            .state
-            .has_unsafe_vfork_flock_state()
-    {
+    let clone_properties = process_clone_properties(sysnum, raw_args, |address, bytes| unsafe {
+        read_memory(address, bytes.as_mut_ptr(), bytes.len()) != 0
+    });
+    // The pinned native client handles action 1 by clearing any pending thread-
+    // clone metadata, installing `result` as the guest syscall return, and
+    // skipping kernel execution. Process-clone identity preparation happens
+    // only after this callback returns action 0, so these refusals create no
+    // pending child identity either.
+    // A process clone may legally request CLONE_FILES without CLONE_THREAD.
+    // Linux then gives the copied process the parent's live files_struct, but
+    // DynamoRIO gives that process a private copy of the Rust Tool state. Its
+    // copied-child syscalls cannot update the parent's FileMetadata. Refuse
+    // before the kernel creates that uncoordinated shared table. Ordinary
+    // CLONE_THREAD|CLONE_FILES stays available: thread initialization shares
+    // the real FileMetadata Arc and the normal serialized Tool turn. Linux may
+    // allow this process clone, but DBT reports guest-visible EOPNOTSUPP because
+    // it cannot preserve the shared-table semantics without a shared Tool state.
+    if clone_properties.shares_files_without_thread {
         emit_lifecycle_marker(
             emit,
-            b"detcore-dbt: refusing vfork while an open file description may hold a flock\n",
+            b"detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD; copied child cannot share descriptor-table provenance\n",
         );
-        return -1;
+        return unsafe { suppress_pre_copy_lifecycle(result, Errno::EOPNOTSUPP) };
+    }
+    // Root-process clone-family syscalls reach this callback before the native
+    // client copies the process. A CLONE_VFORK child cannot enter the external
+    // Detcore runtime before exec/exit, and its parent is kernel-suspended, so
+    // an inherited blocking flock can deadlock the whole runtime tree. A null
+    // runtime_state is not evidence that the table is empty: on a freestanding
+    // guest the first trapped syscall can itself be vfork, before startup
+    // descriptors have been discovered. Treat that state as unknown/unsafe.
+    // Keep this refusal separate from the CLONE_FILES provenance boundary above.
+    // Suppress the syscall with guest-visible EOPNOTSUPP instead of aborting the
+    // runtime tree, so the caller observes an unsupported operation and can
+    // continue without any child having been copied.
+    if clone_properties.blocks_parent && vfork_flock_state_is_unsafe(scratch) {
+        emit_lifecycle_marker(
+            emit,
+            b"detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock\n",
+        );
+        return unsafe { suppress_pre_copy_lifecycle(result, Errno::EOPNOTSUPP) };
     }
 
     // clone(2) and clone3(2) return in both the parent and child. Injecting
@@ -1850,6 +1967,211 @@ mod tests {
                 -libc::EINVAL as i64
             ));
         }
+    }
+
+    #[test]
+    fn pre_copy_lifecycle_refusal_is_guest_visible_and_nonfatal() {
+        let rewritten_before = TOTAL_REWRITTEN.load(Ordering::Relaxed);
+        let mut result = 0;
+        let action =
+            unsafe { suppress_pre_copy_lifecycle(&mut result as *mut i64, Errno::EOPNOTSUPP) };
+
+        assert_eq!(action, 1, "action 1 suppresses the kernel syscall");
+        assert_eq!(
+            result,
+            -(libc::EOPNOTSUPP as i64),
+            "the native client must install exact guest-visible EOPNOTSUPP"
+        );
+        assert_eq!(
+            TOTAL_REWRITTEN.load(Ordering::Relaxed),
+            rewritten_before + 1,
+            "one suppressed lifecycle syscall must contribute exactly one rewrite"
+        );
+    }
+
+    #[test]
+    fn missing_first_syscall_runtime_state_is_unsafe_for_vfork() {
+        // SAFETY: Every field in NativeThreadScratch is an integer or pointer;
+        // the all-zero representation is valid and models deferred initialization.
+        let scratch = unsafe { std::mem::zeroed::<NativeThreadScratch>() };
+        assert!(scratch.runtime_state.is_null());
+        assert!(vfork_flock_state_is_unsafe(&scratch));
+    }
+
+    #[test]
+    fn vfork_guard_decodes_every_native_clone_spelling() {
+        let empty = [0; 6];
+        assert!(process_clone_blocks_parent(
+            libc::SYS_vfork,
+            &empty,
+            |_, _| false,
+        ));
+
+        let mut clone = [0; 6];
+        clone[0] = libc::CLONE_VFORK as u64;
+        assert!(process_clone_blocks_parent(
+            libc::SYS_clone,
+            &clone,
+            |_, _| false,
+        ));
+        clone[0] = libc::CLONE_VM as u64;
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_clone,
+            &clone,
+            |_, _| false,
+        ));
+
+        let address = 0x1234;
+        let mut clone3 = [0; 6];
+        clone3[0] = address;
+        clone3[1] = 64;
+        assert!(process_clone_blocks_parent(
+            libc::SYS_clone3,
+            &clone3,
+            |observed, bytes| {
+                assert_eq!(observed, address as usize);
+                assert_eq!(bytes.len(), std::mem::size_of::<u64>());
+                bytes.copy_from_slice(&(libc::CLONE_VFORK as u64).to_ne_bytes());
+                true
+            },
+        ));
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_clone3,
+            &clone3,
+            |_, bytes| {
+                bytes.copy_from_slice(&(libc::CLONE_VM as u64).to_ne_bytes());
+                true
+            },
+        ));
+
+        clone3[1] = 63;
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_clone3,
+            &clone3,
+            |_, _| panic!("short clone3 input must not be read"),
+        ));
+        clone3[1] = 64;
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_clone3,
+            &clone3,
+            |_, _| false,
+        ));
+        clone3[0] = 0;
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_clone3,
+            &clone3,
+            |_, _| panic!("null clone3 input must not be read"),
+        ));
+        assert!(!process_clone_blocks_parent(
+            libc::SYS_getpid,
+            &empty,
+            |_, _| panic!("non-clone syscalls must not be read"),
+        ));
+    }
+
+    #[test]
+    fn shared_files_process_clone_guard_is_narrow_and_fault_safe() {
+        let empty = [0; 6];
+        assert_eq!(
+            process_clone_properties(libc::SYS_fork, &empty, |_, _| {
+                panic!("fork has no clone flags in guest memory")
+            }),
+            ProcessCloneProperties::default()
+        );
+        assert_eq!(
+            process_clone_properties(libc::SYS_vfork, &empty, |_, _| {
+                panic!("vfork has no clone flags in guest memory")
+            }),
+            ProcessCloneProperties {
+                blocks_parent: true,
+                shares_files_without_thread: false,
+            }
+        );
+
+        let mut clone = [0; 6];
+        clone[0] = libc::CLONE_FILES as u64;
+        assert!(
+            process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_files_without_thread
+        );
+        clone[0] = (libc::CLONE_FILES | libc::CLONE_VM) as u64;
+        assert!(
+            process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_files_without_thread,
+            "CLONE_VM does not make a shared-files process into a thread"
+        );
+        clone[0] = (libc::CLONE_FILES | libc::CLONE_THREAD) as u64;
+        assert!(
+            !process_clone_properties(libc::SYS_clone, &clone, |_, _| false)
+                .shares_files_without_thread,
+            "ordinary CLONE_THREAD|CLONE_FILES must stay on the supported thread path"
+        );
+        clone[0] = libc::CLONE_VFORK as u64;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone, &clone, |_, _| false),
+            ProcessCloneProperties {
+                blocks_parent: true,
+                shares_files_without_thread: false,
+            },
+            "the vfork hazard is independent of CLONE_FILES"
+        );
+
+        let address = 0x2345;
+        let mut clone3 = [0; 6];
+        clone3[0] = address;
+        clone3[1] = 64;
+        assert!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |observed, bytes| {
+                assert_eq!(observed, address as usize);
+                bytes.copy_from_slice(&(libc::CLONE_FILES as u64).to_ne_bytes());
+                true
+            })
+            .shares_files_without_thread
+        );
+        assert!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, bytes| {
+                bytes.copy_from_slice(&((libc::CLONE_FILES | libc::CLONE_VM) as u64).to_ne_bytes());
+                true
+            })
+            .shares_files_without_thread,
+            "clone3 CLONE_VM does not make a shared-files process into a thread"
+        );
+        assert!(
+            !process_clone_properties(libc::SYS_clone3, &clone3, |_, bytes| {
+                bytes.copy_from_slice(
+                    &((libc::CLONE_FILES | libc::CLONE_THREAD) as u64).to_ne_bytes(),
+                );
+                true
+            })
+            .shares_files_without_thread
+        );
+
+        clone3[1] = 63;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, _| {
+                panic!("short clone3 input must not be read")
+            }),
+            ProcessCloneProperties::default()
+        );
+        clone3[1] = 64;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, _| false),
+            ProcessCloneProperties::default(),
+            "an unreadable clone3 argument must be left for the kernel to reject"
+        );
+        clone3[0] = 0;
+        assert_eq!(
+            process_clone_properties(libc::SYS_clone3, &clone3, |_, _| {
+                panic!("null clone3 input must not be read")
+            }),
+            ProcessCloneProperties::default()
+        );
+        assert_eq!(
+            process_clone_properties(libc::SYS_getpid, &empty, |_, _| {
+                panic!("non-clone syscalls must not be read")
+            }),
+            ProcessCloneProperties::default()
+        );
     }
 
     #[test]

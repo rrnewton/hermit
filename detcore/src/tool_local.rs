@@ -88,6 +88,65 @@ pub struct FileMetadata {
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
 }
 
+/// A descriptor identity held across an awaited syscall.
+///
+/// The clone retains the source open-file description until the operation
+/// finishes. `files_id` binds it to the table in which the syscall began.
+#[derive(Debug)]
+pub(crate) struct CapturedDetFd {
+    files_id: FilesId,
+    detfd: DetFd,
+}
+
+/// A captured descriptor could not be installed into the current descriptor
+/// table.  The capture is returned so the caller can release any resource held
+/// alive solely by the in-flight operation.
+#[derive(Debug)]
+pub(crate) struct CapturedDetFdInstallError {
+    pub(crate) expected_files_id: FilesId,
+    pub(crate) actual_files_id: FilesId,
+    returned_fd: RawFd,
+    pub(crate) captured: CapturedDetFd,
+}
+
+/// Cleanup required after the kernel created a descriptor but Detcore could not
+/// install its captured open-file-description identity in the current table.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CapturedDetFdInstallCleanup {
+    /// The exact kernel-returned descriptor that must be closed.
+    pub(crate) close_fd: RawFd,
+    /// A scheduler resource whose final modeled OFD reference was the capture.
+    pub(crate) release_open_file: Option<OpenFileId>,
+}
+
+impl CapturedDetFdInstallError {
+    /// Abandon the failed capture and preserve both cleanup obligations.
+    pub(crate) fn into_cleanup(self) -> CapturedDetFdInstallCleanup {
+        let release_open_file = (self.captured.detfd.open_file_alias_count() == 1)
+            .then(|| self.captured.detfd.open_file_id());
+        drop(self.captured);
+        CapturedDetFdInstallCleanup {
+            close_fd: self.returned_fd,
+            release_open_file,
+        }
+    }
+}
+
+/// Whether a pidfd target is proven to use the caller's exact descriptor table.
+///
+/// Linux pidfds name a specific task, and `pidfd_open(2)` accepts a thread-group
+/// leader. Equal TGIDs alone are not enough: a `CLONE_THREAD` child may omit
+/// `CLONE_FILES` and therefore have a different `files_struct`. Restrict the
+/// modeled path to the leader itself, where `target == getpid() == gettid()`
+/// proves that the task named by the pidfd and the caller are identical.
+pub(crate) fn pidfd_getfd_targets_calling_task(
+    target: Option<DetPid>,
+    current_tgid: DetPid,
+    current_tid: DetTid,
+) -> bool {
+    target == Some(current_tgid) && current_tid == current_tgid
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1154): Review SaBRe exec descriptor-status handoff state.
 /// Descriptor numbers that Detcore keeps physically nonblocking while presenting them as
@@ -437,6 +496,18 @@ impl FileMetadata {
     }
 
     fn has_unsafe_vfork_flock_state(&self) -> bool {
+        // Do not infer safety from `FdType`. A bounded native probe on
+        // 2026-08-23 (host-local x86_64 Linux
+        // 6.19.2-0_fbk0_hardened_rc25_0_g1d99d2f6053c, btrfs /tmp) called
+        // LOCK_SH|LOCK_NB on one OFD and LOCK_EX|LOCK_NB on an independent OFD.
+        // The first call returned 0 and the second returned -1/EWOULDBLOCK for
+        // each of: a regular file (mkstemp + open), the two ends of pipe2, two
+        // opens of one PTY slave, two opens of /dev/null, a memfd reopened via
+        // /proc/self/fd, and two opens of /dev/urandom. Consequently inherited
+        // stdio, pipes, TTYs, and other live-discovered descriptors with unknown
+        // history can hold a lock that makes a CLONE_VFORK child block.
+        // Structurally non-contendable descriptor exemptions need their own
+        // proven model; until then every unknown OFD remains fail-closed.
         self.file_handles
             .values()
             .any(|detfd| detfd.known_flock_mode() != Some(None))
@@ -568,7 +639,9 @@ impl FileMetadata {
         .with_resource(ResourceID::Device(Device::ContainerStderr));
 
         // These descriptors existed before Detcore began observing the guest,
-        // so they may already carry flock state that we cannot query.
+        // so they may already carry flock state that we cannot query. This is
+        // true even for pipe or TTY stdio on Linux; see the native evidence at
+        // `has_unsafe_vfork_flock_state`.
         stdin.forget_flock_mode();
         stdout.forget_flock_mode();
         stderr.forget_flock_mode();
@@ -690,6 +763,55 @@ impl FileMetadata {
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+    }
+
+    /// Capture the exact open-file description currently named by `fd`.
+    fn capture_fd(&mut self, fd: RawFd) -> Result<CapturedDetFd, Errno> {
+        let detfd = self.with_detfd(fd, |detfd| detfd.clone())?;
+        Ok(CapturedDetFd {
+            files_id: self.files_id,
+            detfd,
+        })
+    }
+
+    /// Install a previously captured open-file description as `newfd`.
+    ///
+    /// Unlike [`Self::dup_fd`], this never resolves the source fd number again.
+    /// It succeeds only if the destination still belongs to the descriptor
+    /// table in which the source was captured.
+    fn install_captured_fd(
+        &mut self,
+        captured: CapturedDetFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, CapturedDetFdInstallError> {
+        if captured.files_id != self.files_id {
+            return Err(CapturedDetFdInstallError {
+                expected_files_id: captured.files_id,
+                actual_files_id: self.files_id,
+                returned_fd: newfd,
+                captured,
+            });
+        }
+
+        let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
+        let replaced = self.file_handles.insert(newfd, detfd);
+        Ok(replaced
+            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+    }
+
+    /// Drop a capture that was not installed and report whether it retained the
+    /// final reference to the open-file description.
+    ///
+    /// A capture is a pending alias while the kernel syscall is in flight. If
+    /// the syscall fails (or its result cannot be installed after a descriptor-
+    /// table identity change), the caller uses this return value to perform any
+    /// final modeled open-file-description release.
+    fn abandon_captured_fd(&mut self, captured: CapturedDetFd) -> Option<OpenFileId> {
+        let release =
+            (captured.detfd.open_file_alias_count() == 1).then(|| captured.detfd.open_file_id());
+        drop(captured);
+        release
     }
 }
 
@@ -898,6 +1020,47 @@ mod file_metadata_tests {
                 .expect("child descriptor should be inherited"),
             None,
             "child starts with the same deliberately unknown shared state"
+        );
+    }
+
+    #[test]
+    fn vfork_guard_distinguishes_proven_unlocked_from_held_or_unknown_state() {
+        let owner = DetTid::from_raw(11);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("register regular descriptor");
+        metadata
+            .add_fd(owner, 4, OFlag::empty(), FdType::Pipe, None)
+            .expect("register pipe descriptor");
+
+        assert!(
+            !metadata.has_unsafe_vfork_flock_state(),
+            "newly created descriptors start proven unlocked"
+        );
+        metadata
+            .with_detfd(3, |fd| fd.set_flock_mode(Some(libc::LOCK_SH)))
+            .expect("regular descriptor should remain tracked");
+        assert!(
+            metadata.has_unsafe_vfork_flock_state(),
+            "a known held lock must stop an unobservable vfork child"
+        );
+        metadata
+            .with_detfd(3, |fd| fd.set_flock_mode(None))
+            .expect("regular descriptor should remain tracked");
+        assert!(!metadata.has_unsafe_vfork_flock_state());
+
+        metadata
+            .with_detfd(4, |fd| fd.forget_flock_mode())
+            .expect("pipe descriptor should remain tracked");
+        assert!(
+            metadata.has_unsafe_vfork_flock_state(),
+            "Linux flock locks can contend across the two independently owned ends of a pipe"
+        );
+        assert!(metadata.remove_fd(4).is_some());
+        assert!(
+            !metadata.has_unsafe_vfork_flock_state(),
+            "closing the last unknown descriptor makes vfork safe again"
         );
     }
 
@@ -1147,8 +1310,86 @@ mod file_metadata_tests {
     }
 
     #[test]
+    fn captured_fd_installs_when_the_descriptor_table_is_unchanged() {
+        let owner = DetTid::from_raw(32);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .expect("source should be inserted");
+        let source_id = metadata
+            .with_detfd(3, |fd| fd.open_file_id())
+            .expect("source should exist");
+        let captured = metadata.capture_fd(3).expect("source should be captured");
+
+        assert_eq!(
+            metadata
+                .install_captured_fd(captured, 4, OFlag::O_CLOEXEC)
+                .expect("an unchanged table should accept the captured alias"),
+            None
+        );
+        assert_eq!(
+            metadata
+                .with_detfd(4, |fd| (fd.open_file_id(), fd.is_cloexec()))
+                .expect("captured alias should be installed"),
+            (source_id, true)
+        );
+    }
+
+    #[test]
+    fn failed_captured_fd_install_closes_exact_result_and_releases_capture() {
+        let owner = DetTid::from_raw(36);
+        let mut original = FileMetadata::new(owner);
+        original
+            .add_fd(owner, 3, OFlag::empty(), FdType::Socket, None)
+            .expect("source should be inserted");
+        let source_id = original
+            .with_detfd(3, |fd| fd.open_file_id())
+            .expect("source should exist");
+        let captured = original.capture_fd(3).expect("source should be captured");
+
+        assert_eq!(
+            original.remove_fd(3),
+            None,
+            "the capture defers final-OFD cleanup while the syscall is in flight"
+        );
+        let mut replacement_table = FileMetadata::new(DetTid::from_raw(37));
+        let failure = replacement_table
+            .install_captured_fd(captured, 41, OFlag::O_CLOEXEC)
+            .expect_err("a capture must not cross descriptor-table identity");
+        assert_ne!(failure.expected_files_id, failure.actual_files_id);
+        let cleanup = failure.into_cleanup();
+        assert_eq!(
+            cleanup.close_fd, 41,
+            "cleanup must close the descriptor returned by the successful kernel syscall"
+        );
+        assert_eq!(
+            cleanup.release_open_file,
+            Some(source_id),
+            "abandoning the capture must release the final modeled OFD resource"
+        );
+
+        let mut retained = FileMetadata::new(owner);
+        retained
+            .add_fd(owner, 5, OFlag::empty(), FdType::Socket, None)
+            .expect("retained source should be inserted");
+        let captured = retained
+            .capture_fd(5)
+            .expect("retained source should be captured");
+        let failure = replacement_table
+            .install_captured_fd(captured, 42, OFlag::O_CLOEXEC)
+            .expect_err("a capture must not cross descriptor-table identity");
+        let cleanup = failure.into_cleanup();
+        assert_eq!(cleanup.close_fd, 42);
+        assert_eq!(
+            cleanup.release_open_file, None,
+            "abandoning a capture must not release an OFD that still has a modeled slot"
+        );
+        assert!(retained.with_detfd(5, |_| ()).is_ok());
+    }
+
+    #[test]
     fn close_range_removes_selected_slots_and_releases_final_aliases() {
-        let owner = DetTid::from_raw(35);
+        let owner = DetTid::from_raw(38);
         let mut metadata = FileMetadata::new(owner);
         metadata
             .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
@@ -1962,7 +2203,11 @@ impl<T> ThreadState<T> {
         self.metadata().has_loopback_peer()
     }
 
-    /// Whether any open file description is held or not proven unlocked.
+    /// Whether any open file description holds a lock or is not proven unlocked.
+    ///
+    /// Unknown includes startup stdio, descriptors discovered after execution
+    /// begins, externally received descriptions, and every inherited
+    /// description after a successful process clone or descriptor transfer.
     pub fn has_unsafe_vfork_flock_state(&self) -> bool {
         self.metadata().has_unsafe_vfork_flock_state()
     }
@@ -1996,6 +2241,54 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, oldfd)?;
         }
         metadata.dup_fd(oldfd, newfd, flags)
+    }
+
+    /// Atomically validate a pidfd target and capture its source descriptor.
+    ///
+    /// Both lookups occur under the one descriptor-table mutex. The caller must
+    /// hold the normal serialized Tool turn until the nonblocking kernel call
+    /// returns and the captured alias is installed.
+    pub(crate) fn capture_pidfd_getfd_source(
+        &self,
+        pidfd: RawFd,
+        targetfd: RawFd,
+        current_tgid: DetPid,
+        current_tid: DetTid,
+    ) -> Result<CapturedDetFd, Errno> {
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            metadata.discover_fd_from_current_process(self.dettid, pidfd)?;
+        }
+        let (is_pidfd, target) = metadata.with_detfd(pidfd, |detfd| {
+            (matches!(detfd.ty(), FdType::Pidfd), detfd.pidfd_target())
+        })?;
+        if !is_pidfd {
+            return Err(Errno::EBADF);
+        }
+        if !pidfd_getfd_targets_calling_task(target, current_tgid, current_tid) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if self.discover_live_file_metadata {
+            metadata.discover_fd_from_current_process(self.dettid, targetfd)?;
+        }
+        let captured = metadata.capture_fd(targetfd)?;
+        Ok(captured)
+    }
+
+    /// Install an alias from a pre-syscall capture without resolving the source
+    /// fd slot a second time.
+    pub(crate) fn install_captured_fd(
+        &mut self,
+        captured: CapturedDetFd,
+        newfd: RawFd,
+        flags: OFlag,
+    ) -> Result<Option<OpenFileId>, CapturedDetFdInstallError> {
+        self.metadata().install_captured_fd(captured, newfd, flags)
+    }
+
+    /// Abandon an uninstalled capture and identify a deferred final-OFD release.
+    pub(crate) fn abandon_captured_fd(&self, captured: CapturedDetFd) -> Option<OpenFileId> {
+        self.metadata().abandon_captured_fd(captured)
     }
 
     /// get thread prng, note this rng is deterministic and should not be used

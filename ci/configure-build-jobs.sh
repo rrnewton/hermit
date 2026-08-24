@@ -70,8 +70,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b664c80bb8588f3fe4f4f0cc6b1cbe9b967ba4c0 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie b664c80bb8588f3fe4f4f0cc6b1cbe9b967ba4c0" >&2
     return 2
 fi
 
@@ -513,10 +513,12 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # max-elapsed) carry unchanged. The >=5-clean-Hermit-lane-samples replacement bar
 # is still unmet, so nothing is recalibrated here.
 #
-# CARRY TO bfbe3b14 (2026-08-23), ACROSS EIGHT PIN ADVANCES. The
+# CARRY TO b664c80b (2026-08-23). The
 # calibration carries unchanged and the RECIPE IDENTITY DOES NOT MOVE: this is
 # the 0384d673 case, not the c261050 case, because neither source_recipe_key()
-# file input differs at any pin between c261050 and bfbe3b14.
+# file input differs at any reviewed pin below. bfbe3b14 and b664c80b are
+# alternate candidate heads descended from f2e9839e, not a claimed linear
+# ancestry or landing sequence; both preserve the calibrated recipe inputs.
 #
 #   pin        reverie-dbt/vendor/dynamorio                  reverie-dbt/build.rs
 #   c261050c   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
@@ -528,6 +530,7 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 #   af82f1b9   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #   f2e9839e   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #   bfbe3b14   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
+#   b664c80b   de352475846e385002c1e4e54604fa0a7647b2de      0ff8ae24b9746404...
 #
 # So the identity stays sha256:132d77130980c546c8867fc196d97e664bc4816b1dfa9ea9c18de4a94d109c4d
 # and no derivation is needed; the entry above already validated that value.
@@ -548,8 +551,10 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # f2e9839e changes only .github/workflows/ci.yml and
 # .github/workflows/merge-gate.yml. bfbe3b14 adds the external-scheduler
 # protected-evidence FINAL in native/client.c plus its source audit in
-# src/evidence.rs. Neither revision changes a recipe input; bfbe3b14 is
-# build-relevant, so the real Hermit validation still runs below.
+# src/evidence.rs. The b664c80b candidate instead changes native/client.c,
+# src/{evidence,lib,tools}.rs, and four process-clone fixtures/tests relative to
+# f2e9839e. None changes a recipe input; b664c80b is build-relevant, so the real
+# Hermit validation must still run at the final exact head.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS

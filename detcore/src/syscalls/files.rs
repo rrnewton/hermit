@@ -51,6 +51,7 @@ use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
+use crate::tool_local::CapturedDetFdInstallError;
 use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
@@ -417,16 +418,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// exactly what Linux does, and re-acquiring would be a divergence in the
     /// other direction. `DetFd::flock_mode` is what makes the two cases
     /// distinguishable -- it records the mode Detcore last saw the kernel grant
-    /// for this open file description, so a first acquisition (nothing to lose)
-    /// is not confused with a conversion (something to lose).
+    /// for this open file description, so a known first acquisition (nothing to
+    /// lose) is not confused with a known conversion (something to lose).
     ///
     /// That cache covers locks Detcore granted while it had sole knowledge of
     /// the open file description. State becomes permanently unknown when the
-    /// descriptor is inherited across a process fork, discovered after tracing
-    /// begins, or received through `SCM_RIGHTS`, because another process can
-    /// change that shared kernel lock without updating this cache. A blocking
-    /// conversion in unknown state is refused before the nonblocking probe, so
-    /// the refusal cannot destroy a lock Detcore cannot restore.
+    /// descriptor is inherited across a successful process clone, discovered
+    /// after tracing begins (including startup stdio), received through
+    /// `SCM_RIGHTS`, or potentially transferred by a successful send operation,
+    /// because another process can change that shared kernel lock without
+    /// updating this cache. A blocking acquisition *or* conversion in unknown
+    /// state is refused before the nonblocking probe: unknown may mean unlocked,
+    /// shared-locked, or exclusive-locked, and a probe must not destroy a lock
+    /// Detcore cannot restore. Failed clone, transfer, and duplication calls do
+    /// not widen the unknown set.
     pub async fn handle_flock<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2731,6 +2736,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);
         self.add_fd(guest, fd, flags, FdType::Pidfd).await?;
+        let target = DetPid::from_raw(call.pid() as i32);
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_pidfd_target(target))?;
         Ok(fd as i64)
     }
 
@@ -2784,37 +2793,117 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// caller that aliases `targetfd` in the target process. The source pidfd
     /// names one specific process fixed at `pidfd_open` time, the returned
     /// descriptor number is chosen through record/replay (so it is stable across
-    /// runs), and the operation executes inside this thread's serialized turn, so
-    /// the result is deterministic. Detcore fails closed with `EBADF` unless it
-    /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
-    /// to be zero (`EINVAL` otherwise). The duplicated descriptor is registered so
-    /// later `close`/`fcntl`/`dup` see it; Detcore cannot cheaply learn the source
-    /// descriptor's kind, so it is modeled as a regular, close-on-exec fd. This is
-    /// sufficient for descriptor lifecycle tracking; see the review tag above for
-    /// the type-inference limitation.
+    /// runs), and a successful modeled operation executes inside this thread's
+    /// serialized turn, so the result is deterministic. For zero flags, Detcore
+    /// fails closed with `EBADF` unless it models the descriptor as a pidfd.
+    /// Linux checks the kernel-reserved `flags` first, however, so a nonzero
+    /// value takes the raw record/replay path and preserves the kernel's exact
+    /// `EINVAL` across the complete valid/invalid pidfd and targetfd
+    /// cross-product. That error path creates no fd and is safe without thread
+    /// sequentialization.
+    ///
+    /// The modeled path is narrower than "same process": the caller must be the
+    /// thread-group leader named by the pidfd. `CLONE_THREAD` does not imply
+    /// `CLONE_FILES`, so a nonleader can share the target's TGID while using a
+    /// different descriptor table. Requiring `target == getpid() == gettid()`
+    /// proves that `targetfd` is resolved in the caller's exact table. The
+    /// returned descriptor is then modeled as a real alias of the source open
+    /// file description. That is required for `flock`: either alias may change
+    /// the one kernel lock, and both must observe the same cached authority.
+    /// Every other target is refused with `EOPNOTSUPP`. This is a narrow,
+    /// intentional capability boundary rather than a claim that Linux lacks the
+    /// operation: broader support requires atomically locating the target task's
+    /// descriptor table, capturing that exact source OFD across the awaited
+    /// syscall, installing the same modeled alias in the caller, and propagating
+    /// later flock mutations to every task that shares it. Detcore has no such
+    /// cross-task OFD channel today. Keep this refusal until that complete model
+    /// exists; merely forwarding the kernel call would make the source task's
+    /// flock cache stale. Failed calls leave all descriptor state unchanged.
     pub async fn handle_pidfd_getfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         pidfd: RawFd,
+        targetfd: RawFd,
         flags: u32,
     ) -> Result<i64, Error> {
+        // Linux rejects reserved flags before looking up either descriptor. Keep
+        // that precedence, including under --no-sequentialize-threads, and route
+        // the raw failure through record/replay so its exact errno is an event.
+        // A nonzero-flags call cannot install a descriptor, so it needs none of
+        // the source-capture or serialized-table machinery below.
         if flags != 0 {
-            return Err(Errno::EINVAL.into());
+            return Ok(self.record_or_replay(guest, call).await?);
         }
-        let is_pidfd = guest
-            .thread_state()
-            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
-        if !is_pidfd {
-            return Err(Errno::EBADF.into());
+
+        // The capture and install below are safe only while the normal Tool
+        // turn serializes every guest thread. Refuse before any injected
+        // syscall when the caller explicitly disables that guarantee.
+        if !guest.config().sequentialize_threads {
+            return Err(Errno::EOPNOTSUPP.into());
         }
-        let fd = self.record_or_replay(guest, call).await? as RawFd;
+
+        // `guest.pid()` is the backend's physical process identity for DBT,
+        // while pidfd_open receives Hermit's guest-visible PID. Ask the backend
+        // for the guest-visible TGID and TID before proving that the pidfd names
+        // the calling task itself.
+        let current_tgid = DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32);
+        let current_tid = DetTid::from_raw(guest.inject(syscalls::Gettid::new()).await? as i32);
+
+        // Validate the pidfd and capture the exact source model before the
+        // kernel call. From this capture through record_or_replay injection and
+        // model installation, this handler makes no scheduler resource request,
+        // blocking-I/O transition, or other deschedule. pidfd_getfd itself is
+        // nonblocking, so the normal serialized Tool turn keeps every
+        // CLONE_FILES sibling out of the shared table for this whole interval.
+        let source = guest.thread_state().capture_pidfd_getfd_source(
+            pidfd,
+            targetfd,
+            current_tgid,
+            current_tid,
+        )?;
+        let fd = match self.record_or_replay(guest, call).await {
+            Ok(fd) => fd as RawFd,
+            Err(error) => {
+                if let Some(open_file_id) = guest.thread_state().abandon_captured_fd(source) {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+                return Err(error.into());
+            }
+        };
         // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
-        self.add_fd(guest, fd, OFlag::O_CLOEXEC, FdType::Regular)
-            .await?;
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.forget_flock_mode())?;
+        let replaced = match guest.thread_state_mut().install_captured_fd(
+            source,
+            fd,
+            OFlag::O_CLOEXEC,
+        ) {
+            Ok(replaced) => replaced,
+            Err(error @ CapturedDetFdInstallError { .. }) => {
+                // The kernel has already installed `fd`. Never turn an internal
+                // modeling failure into a leaked, guest-visible descriptor.
+                let expected_files_id = error.expected_files_id;
+                let actual_files_id = error.actual_files_id;
+                let cleanup = error.into_cleanup();
+                let close_result = guest
+                    .inject(syscalls::Close::new().with_fd(cleanup.close_fd))
+                    .await;
+                if let Some(open_file_id) = cleanup.release_open_file {
+                    self.release_port_for_open_file(guest, open_file_id).await;
+                }
+                if let Err(close_error) = close_result {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "pidfd_getfd returned fd {fd}, but its captured source table changed from {expected_files_id:?} to {actual_files_id:?}; cleanup close failed with {close_error}"
+                    )));
+                }
+                warn!(
+                    "pidfd_getfd returned fd {fd}, but its captured source table changed from {expected_files_id:?} to {actual_files_id:?}; closed the result and refusing with EOPNOTSUPP"
+                );
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+        };
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(fd as i64)
     }
 
@@ -2956,14 +3045,287 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod test {
-    use nix::fcntl::OFlag;
+    use std::sync::Mutex;
 
+    use async_trait::async_trait;
+    use nix::fcntl::OFlag;
+    use reverie::Error;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Guest;
+    use reverie::Pid;
+    use reverie::Stack;
+    use reverie::TimerSchedule;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallArgs;
+    use reverie::syscalls::SyscallInfo;
+    use reverie::syscalls::Sysno;
+
+    use super::Detcore;
     use super::UNIX_AUTOBIND_NAME_LEN;
     use super::canonicalize_tcp_info;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
+    use crate::Config;
     use crate::fd::FdType;
+    use crate::record_or_replay::NoopTool;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::GlobalState;
+    use crate::tool_local::ThreadState;
+    use crate::tool_local::pidfd_getfd_targets_calling_task;
+    use crate::types::DetPid;
+    use crate::types::DetTid;
+    use crate::types::FilesId;
+    use crate::types::OpenFileId;
+    use crate::types::RawFd;
+
+    const PIDFD: RawFd = 8;
+    const TARGET_FD: RawFd = 7;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InjectedTableReplacement {
+        ReplaceTableAfterRemovingTarget,
+        ReplaceTableRetainingTarget,
+    }
+
+    struct PidfdGetfdTestGuest {
+        config: Config,
+        state: ThreadState<()>,
+        virtual_tgid: i32,
+        virtual_tid: i32,
+        returned_fd: RawFd,
+        pidfd_getfd_error: Option<Errno>,
+        replacement: Option<InjectedTableReplacement>,
+        injected_syscalls: Vec<Sysno>,
+        closed_fds: Vec<RawFd>,
+        released_open_files: Mutex<Vec<OpenFileId>>,
+    }
+
+    impl PidfdGetfdTestGuest {
+        fn new(
+            virtual_tgid: i32,
+            virtual_tid: i32,
+            returned_fd: RawFd,
+            replacement: Option<InjectedTableReplacement>,
+        ) -> (Detcore<NoopTool>, Self, OpenFileId) {
+            let mut config = Config::default();
+            config.sequentialize_threads = true;
+            let owner = DetTid::from_raw(virtual_tid);
+            let mut state = ThreadState::new(owner, &config, ());
+            state.detpid = Some(DetPid::from_raw(virtual_tgid));
+            state
+                .add_fd(TARGET_FD, OFlag::empty(), FdType::Socket, None)
+                .expect("pidfd_getfd source should be registered");
+            let source = state
+                .with_detfd(TARGET_FD, |detfd| detfd.open_file_id())
+                .expect("pidfd_getfd source should remain registered");
+            state
+                .add_fd(PIDFD, OFlag::O_CLOEXEC, FdType::Pidfd, None)
+                .expect("pidfd should be registered");
+            state
+                .with_detfd(PIDFD, |detfd| {
+                    detfd.set_pidfd_target(DetPid::from_raw(virtual_tgid))
+                })
+                .expect("pidfd target should be recorded");
+
+            let tool = Detcore {
+                detpid: DetPid::from_raw(virtual_tgid),
+                cfg: config.clone(),
+                record_or_replay: NoopTool,
+            };
+            let guest = Self {
+                config,
+                state,
+                virtual_tgid,
+                virtual_tid,
+                returned_fd,
+                pidfd_getfd_error: None,
+                replacement,
+                injected_syscalls: Vec::new(),
+                closed_fds: Vec::new(),
+                released_open_files: Mutex::new(Vec::new()),
+            };
+            (tool, guest, source)
+        }
+
+        fn call() -> Syscall {
+            Self::call_with(PIDFD, TARGET_FD, 0)
+        }
+
+        fn call_with(pidfd: RawFd, targetfd: RawFd, flags: u32) -> Syscall {
+            Syscall::Other(
+                Sysno::pidfd_getfd,
+                SyscallArgs {
+                    arg0: pidfd as usize,
+                    arg1: targetfd as usize,
+                    arg2: flags as usize,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: 0,
+                },
+            )
+        }
+
+        fn replace_files_table_identity(&self) {
+            self.state
+                .file_metadata
+                .lock()
+                .expect("pidfd_getfd test metadata mutex poisoned")
+                .files_id = FilesId::forked(DetTid::from_raw(self.virtual_tid + 1));
+        }
+    }
+
+    struct UnusedStack;
+
+    struct UnusedStackGuard;
+
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl Stack for UnusedStack {
+        type StackGuard = UnusedStackGuard;
+
+        fn size(&self) -> usize {
+            0
+        }
+
+        fn capacity(&self) -> usize {
+            0
+        }
+
+        fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
+            panic!("pidfd_getfd handler test unexpectedly used the guest stack")
+        }
+
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("pidfd_getfd handler test unexpectedly used the guest stack")
+        }
+
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            Ok(UnusedStackGuard)
+        }
+    }
+
+    #[async_trait]
+    impl GlobalRPC<GlobalState> for PidfdGetfdTestGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            match message.2 {
+                GlobalRequest::ReleasePort(open_file_id) => {
+                    self.released_open_files
+                        .lock()
+                        .expect("release observation mutex poisoned")
+                        .push(open_file_id);
+                    (None, GlobalResponse::ReleasePort(None))
+                }
+                request => panic!("unexpected pidfd_getfd test RPC: {request:?}"),
+            }
+        }
+
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[async_trait]
+    impl Guest<Detcore<NoopTool>> for PidfdGetfdTestGuest {
+        type Memory = LocalMemory;
+        type Stack = UnusedStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(self.virtual_tid)
+        }
+
+        fn pid(&self) -> Pid {
+            Pid::from_raw(self.virtual_tgid)
+        }
+
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.state
+        }
+
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.state
+        }
+
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            // None of these focused handler tests inspect registers.
+            unsafe { std::mem::zeroed() }
+        }
+
+        async fn stack(&mut self) -> Self::Stack {
+            UnusedStack
+        }
+
+        async fn daemonize(&mut self) {}
+
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            self.injected_syscalls.push(number);
+            match number {
+                Sysno::getpid => Ok(self.virtual_tgid as i64),
+                Sysno::gettid => Ok(self.virtual_tid as i64),
+                Sysno::pidfd_getfd => {
+                    if let Some(error) = self.pidfd_getfd_error {
+                        return Err(error);
+                    }
+                    match self.replacement.take() {
+                        Some(InjectedTableReplacement::ReplaceTableAfterRemovingTarget) => {
+                            assert_eq!(
+                                self.state.remove_fd(TARGET_FD),
+                                None,
+                                "the in-flight capture must defer final-OFD release"
+                            );
+                            self.replace_files_table_identity();
+                        }
+                        Some(InjectedTableReplacement::ReplaceTableRetainingTarget) => {
+                            self.replace_files_table_identity();
+                        }
+                        None => {}
+                    }
+                    Ok(self.returned_fd as i64)
+                }
+                Sysno::close => {
+                    self.closed_fds.push(args.arg0 as RawFd);
+                    Ok(0)
+                }
+                syscall => panic!("unexpected injected syscall in pidfd_getfd test: {syscall}"),
+            }
+        }
+
+        async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> reverie::Never {
+            panic!("pidfd_getfd handler test unexpectedly tail-injected a syscall")
+        }
+
+        fn set_timer(&mut self, _schedule: TimerSchedule) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn set_timer_precise(&mut self, _schedule: TimerSchedule) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            Ok(0)
+        }
+    }
 
     /// This is an assumption we're making about flags.  Probably these flags can never be
     /// changed, but let's check just in case.
@@ -3040,5 +3402,225 @@ mod test {
         for len in 0..8 {
             canonicalize_tcp_info(&mut [0xff; 8][..len]);
         }
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_refuses_same_tgid_with_a_distinct_files_table() {
+        let tgid = 400;
+        let tid = 401;
+        let (tool, mut guest, _) = PidfdGetfdTestGuest::new(tgid, tid, 41, None);
+        let caller_files_id = guest
+            .state
+            .file_metadata
+            .lock()
+            .expect("caller file metadata mutex poisoned")
+            .files_id;
+        assert_ne!(
+            caller_files_id,
+            FilesId::initial(DetTid::from_raw(tgid)),
+            "the nonleader models CLONE_THREAD without CLONE_FILES"
+        );
+        assert!(!pidfd_getfd_targets_calling_task(
+            Some(DetPid::from_raw(tgid)),
+            DetPid::from_raw(tgid),
+            DetTid::from_raw(tid),
+        ));
+
+        let error = tool
+            .handle_pidfd_getfd(&mut guest, PidfdGetfdTestGuest::call(), PIDFD, TARGET_FD, 0)
+            .await
+            .expect_err("same TGID without exact task identity must fail closed");
+        assert_eq!(
+            error
+                .into_errno()
+                .expect("the refusal must remain guest-visible"),
+            Errno::EOPNOTSUPP
+        );
+        assert!(
+            !guest.injected_syscalls.contains(&Sysno::pidfd_getfd),
+            "the target-table proof must fail before the kernel operation"
+        );
+        assert!(guest.closed_fds.is_empty());
+        assert_eq!(
+            guest.injected_syscalls,
+            [Sysno::getpid, Sysno::gettid],
+            "the target-table proof must stop before pidfd_getfd injection"
+        );
+        assert!(
+            guest
+                .released_open_files
+                .lock()
+                .expect("release observation mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_refuses_without_thread_sequentialization_before_injection() {
+        let (tool, mut guest, _) = PidfdGetfdTestGuest::new(402, 402, 40, None);
+        guest.config.sequentialize_threads = false;
+
+        let error = tool
+            .handle_pidfd_getfd(&mut guest, PidfdGetfdTestGuest::call(), PIDFD, TARGET_FD, 0)
+            .await
+            .expect_err("pidfd_getfd requires the normal serialized Tool turn");
+        assert_eq!(
+            error
+                .into_errno()
+                .expect("the relaxed-mode refusal must remain guest-visible"),
+            Errno::EOPNOTSUPP
+        );
+        assert!(
+            guest.injected_syscalls.is_empty(),
+            "the relaxed-mode gate must run before getpid, gettid, or pidfd_getfd injection"
+        );
+        assert!(guest.closed_fds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_nonzero_flags_preserve_kernel_precedence_and_rr_in_relaxed_mode() {
+        let (tool, mut guest, _) = PidfdGetfdTestGuest::new(403, 403, 40, None);
+        guest.config.sequentialize_threads = false;
+        guest.pidfd_getfd_error = Some(Errno::EINVAL);
+        let call = PidfdGetfdTestGuest::call_with(-1, -1, 1);
+
+        let error = tool
+            .handle_pidfd_getfd(&mut guest, call, -1, -1, 1)
+            .await
+            .expect_err("reserved flags must take the raw record/replay path");
+        assert_eq!(
+            error
+                .into_errno()
+                .expect("the kernel flags error must remain guest-visible"),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            guest.injected_syscalls,
+            [Sysno::pidfd_getfd],
+            "nonzero flags must be recorded/injected before relaxed-mode, identity, pidfd, or source validation"
+        );
+        assert!(guest.closed_fds.is_empty());
+        assert!(
+            guest
+                .released_open_files
+                .lock()
+                .expect("release observation mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_handler_installs_an_unchanged_leader_table_alias() {
+        let returned_fd = 40;
+        let (tool, mut guest, source_open_file) =
+            PidfdGetfdTestGuest::new(405, 405, returned_fd, None);
+
+        assert_eq!(
+            tool.handle_pidfd_getfd(&mut guest, PidfdGetfdTestGuest::call(), PIDFD, TARGET_FD, 0,)
+                .await
+                .expect("an unchanged leader table should be supported"),
+            returned_fd as i64
+        );
+        assert!(guest.closed_fds.is_empty());
+        assert_eq!(
+            guest.injected_syscalls,
+            [Sysno::getpid, Sysno::gettid, Sysno::pidfd_getfd],
+            "capture through pidfd_getfd injection and install must not enter a blocking or scheduler-aware helper"
+        );
+        assert!(
+            guest
+                .released_open_files
+                .lock()
+                .expect("release observation mutex poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            guest
+                .state
+                .with_detfd(returned_fd, |detfd| {
+                    (detfd.open_file_id(), detfd.is_cloexec())
+                })
+                .expect("returned alias should be installed"),
+            (source_open_file, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_handler_closes_result_and_releases_invalidated_final_alias() {
+        let returned_fd = 41;
+        let (tool, mut guest, source_open_file) = PidfdGetfdTestGuest::new(
+            410,
+            410,
+            returned_fd,
+            Some(InjectedTableReplacement::ReplaceTableAfterRemovingTarget),
+        );
+
+        let error = tool
+            .handle_pidfd_getfd(&mut guest, PidfdGetfdTestGuest::call(), PIDFD, TARGET_FD, 0)
+            .await
+            .expect_err("a descriptor-table replacement must invalidate the result");
+        assert_eq!(
+            error
+                .into_errno()
+                .expect("the invalidated result must be a deterministic refusal"),
+            Errno::EOPNOTSUPP
+        );
+        assert!(guest.injected_syscalls.contains(&Sysno::pidfd_getfd));
+        assert_eq!(
+            guest.closed_fds,
+            [returned_fd],
+            "the handler must close the exact fd returned by the successful kernel call"
+        );
+        assert_eq!(
+            *guest
+                .released_open_files
+                .lock()
+                .expect("release observation mutex poisoned"),
+            [source_open_file],
+            "dropping the final captured alias must release its global resource"
+        );
+        assert_eq!(
+            guest.state.with_detfd(returned_fd, |_| ()),
+            Err(Errno::EBADF),
+            "the refused kernel result must not enter Detcore's descriptor table"
+        );
+    }
+
+    #[tokio::test]
+    async fn pidfd_getfd_handler_closes_result_without_releasing_a_retained_alias() {
+        let returned_fd = 42;
+        let (tool, mut guest, source_open_file) = PidfdGetfdTestGuest::new(
+            420,
+            420,
+            returned_fd,
+            Some(InjectedTableReplacement::ReplaceTableRetainingTarget),
+        );
+
+        let error = tool
+            .handle_pidfd_getfd(&mut guest, PidfdGetfdTestGuest::call(), PIDFD, TARGET_FD, 0)
+            .await
+            .expect_err("a descriptor-table replacement must invalidate the result");
+        assert_eq!(
+            error
+                .into_errno()
+                .expect("the invalidated result must be a deterministic refusal"),
+            Errno::EOPNOTSUPP
+        );
+        assert_eq!(guest.closed_fds, [returned_fd]);
+        assert!(
+            guest
+                .released_open_files
+                .lock()
+                .expect("release observation mutex poisoned")
+                .is_empty(),
+            "the source slot still retains the open file description"
+        );
+        assert_eq!(
+            guest
+                .state
+                .with_detfd(TARGET_FD, |detfd| detfd.open_file_id())
+                .expect("the source alias should remain registered"),
+            source_open_file
+        );
     }
 }

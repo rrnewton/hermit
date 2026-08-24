@@ -1687,7 +1687,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let res = match classify_syscall(call.number()) {
+        let mut dispatch = async || match classify_syscall(call.number()) {
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {
@@ -1730,8 +1730,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_getfd(guest, call, args.arg0 as RawFd, args.arg2 as u32)
-                            .await
+                        self.handle_pidfd_getfd(
+                            guest,
+                            call,
+                            args.arg0 as RawFd,
+                            args.arg1 as RawFd,
+                            args.arg2 as u32,
+                        )
+                        .await
                     }
                     _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
                 }
@@ -2457,6 +2463,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        let res = dispatch().await;
 
         detlog!(
             "[syscall][detcore, dtid {}] finish syscall #{}: {} = {:?}",

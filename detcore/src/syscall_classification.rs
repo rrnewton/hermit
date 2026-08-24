@@ -568,11 +568,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1175): pidfd_send_signal/pidfd_getfd operate on
         // a pidfd that names one specific process fixed at pidfd_open time, so
-        // there is no numeric-PID ambiguity to resolve. Delivery/duplication runs
-        // inside the serialized scheduler turn (like tgkill), and the handlers add
-        // deterministic argument validation (EBADF for a non-pidfd descriptor,
-        // EINVAL for the kernel-reserved nonzero flags) before forwarding. Untyped
-        // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno.
+        // there is no numeric-PID ambiguity to resolve. Signal delivery and a
+        // successful getfd duplication run inside the serialized scheduler turn
+        // (like tgkill). The zero-flags getfd path validates its modeled pidfd and
+        // source before forwarding; reserved nonzero flags instead take raw
+        // record/replay first, preserving Linux's EINVAL-before-fd-lookup order.
+        // pidfd_getfd models exact OFD aliasing for self targets and returns
+        // EOPNOTSUPP for other targets. That narrow capability boundary remains
+        // until Detcore can atomically capture an OFD from another task's FilesId
+        // and propagate later flock mutations across both process-local models;
+        // merely forwarding would leave the source task's cache stale.
+        // Untyped (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno.
         | Sysno::pidfd_send_signal
         | Sysno::pidfd_getfd
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2136,7 +2142,9 @@ mod tests {
     fn pidfd_family_is_determinized() {
         // pidfd_send_signal and pidfd_getfd are now determinized alongside
         // pidfd_open: the pidfd names a fixed process (no numeric-PID ambiguity),
-        // so the signal/getfd forward through the serialized turn deterministically.
+        // signal delivery forwards through the serialized turn, and zero-flags
+        // getfd either models a self-target OFD alias or refuses an unmodelable
+        // foreign source. Reserved flags take the raw record/replay error path.
         for sysno in [
             Sysno::pidfd_open,
             Sysno::pidfd_getfd,

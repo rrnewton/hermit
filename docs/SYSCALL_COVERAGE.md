@@ -44,6 +44,60 @@ KVM accepts pure access-pattern/prefetch hints as deterministic no-ops. Advice
 whose memory, fork, dump, backing-store, or guard semantics the pinned KVM
 executor cannot reproduce returns deterministic `ENOSYS`.
 
+### Post-Snapshot `pidfd_getfd` Policy
+
+Current Detcore handles `pidfd_getfd(2)` only when the pidfd names the calling
+thread-group leader and that leader is the caller. Equal TGIDs are insufficient:
+Linux permits a `CLONE_THREAD` task without `CLONE_FILES`, giving it a distinct
+descriptor table. For the proven same-task case, Detcore captures the exact
+modeled source open file description before the kernel call and installs the
+returned descriptor as an alias in the same `FilesId`. This path requires the
+default serialized-thread mode. From capture through the nonblocking
+record/replay kernel call and model install, the handler makes no scheduler or
+blocking-I/O request, so the normal Tool turn prevents a `CLONE_FILES` sibling
+from changing the table. With `--no-sequentialize-threads`, a zero-flags call
+returns deterministic `EOPNOTSUPP` before injected identity queries or
+`pidfd_getfd`. Reserved nonzero flags are different: Linux checks them before
+looking up either descriptor, so Detcore sends that side-effect-free call
+through raw record/replay first and preserves the kernel's exact `EINVAL`, even
+in relaxed mode and across the complete valid/invalid pidfd and targetfd
+cross-product. Ordinary descriptor operations such as `accept`, `open`,
+`socket`, `dup`, and `recvmsg` do not take a cross-syscall table token and
+remain able to run while a sibling is parked in blocking external I/O.
+
+Record/replay records the exact `pidfd_getfd` descriptor or errno. Replay
+re-executes every call that reached the kernel, including successful aliases,
+post-validation kernel errors, and all four flags-first `EINVAL` descriptor
+validity combinations, requires the result to match exactly, and keeps each
+real kernel alias for later descriptor and `flock` operations. Model-level
+zero-flags refusals happen before injection and therefore create no record
+event.
+
+A pidfd naming another task, including a same-TGID nonleader, returns
+deterministic `EOPNOTSUPP`. Linux may permit that operation, but Hermit does not
+yet have the cross-task channel needed to atomically capture the target task's
+descriptor identity and propagate later open-file-description mutations to
+every process-local cache. Forwarding without that model would make `flock`
+state stale. This is an intentional narrow capability boundary, not evidence
+that the host kernel lacks `pidfd_getfd`. The DBT backend also refuses a
+fork-like `clone`/`clone3` with `CLONE_FILES` but without `CLONE_THREAD` before
+copy: such a process would share the parent's kernel descriptor table while its
+copied pre-exec runtime has no shared Detcore `FileMetadata`. Ordinary
+`CLONE_THREAD|CLONE_FILES` remains on the shared Tool-state path. DBT suppresses
+the unsupported process clone and returns guest-visible `EOPNOTSUPP`; it does
+not terminate the runtime tree, and no child reaches the kernel copy path.
+
+DBT applies the same guest-visible pre-copy refusal to `vfork` and
+`CLONE_VFORK` when an inherited open file description may hold a flock. A null
+per-thread runtime on the first trapped syscall is unknown rather than known
+empty, because startup descriptors have not yet been discovered, so it is
+refused too. Once state is initialized and every descriptor is closed, the
+existing safe vfork path remains available. Linux normally permits these calls,
+but the DBT child cannot enter the external Tool before exec or exit while its
+parent is suspended, so allowing a blocking flock could deadlock the whole
+tree. Returning `EOPNOTSUPP` preserves process continuation while making that
+unsupported semantic boundary explicit.
+
 ## Terminology And Scope
 
 - **Emulated** means Detcore returns a result without executing the guest's
@@ -194,7 +248,7 @@ restart_syscall rt_sigreturn
 | Priority | Gap | Consequence | Suggested first boundary |
 | --- | --- | --- | --- |
 | P0 | Optimized subscriptions do not cover handled `recvmsg`/send-family calls. | Socket calls can block or complete according to host timing without a scheduler event; debug tests exercise different behavior. | Subscribe the implemented calls and add an optimized-build subscription test. Implement `recvmmsg` timeout semantics. |
-| P0 | Modern FD creators/mutators are untracked: `openat2`, `close_range`, `pidfd_open`, `pidfd_getfd`, `memfd_secret`, `fanotify_init`, `io_uring_setup`, and mount-FD APIs. | Detcore's FD type/flags/resource map diverges; later trapped `read`, `write`, `close`, `fcntl`, or polling may fail or use the wrong model. | Trap and update FD bookkeeping, or return a documented deterministic error until modeled. |
+| P0 | Modern FD creators/mutators still needing coverage include `openat2`, nonzero-flag `close_range`, `memfd_secret`, `fanotify_init`, `io_uring_setup`, and mount-FD APIs. `pidfd_open` is tracked; `pidfd_getfd` is modeled only for the exact same-task case under default thread sequentialization, while relaxed mode, cross-task targets, and DBT copied-process `CLONE_FILES` sharing fail closed. | An unmodeled successful creator or mutation can make Detcore's FD type/flags/resource map diverge; later trapped `read`, `write`, `close`, `fcntl`, or polling may fail or use the wrong model. | Trap and update FD bookkeeping, or return a documented deterministic error until modeled. |
 | P0 | `select`, `pselect6`, `ppoll`, `epoll_pwait2`, new futex calls, and `waitid` bypass blocking control. | A guest thread can block in Linux outside Detcore's timed-wait/run-queue model, causing hangs and timing-dependent wake order. | Add nonblocking retry/scheduler adapters matching `poll`, `epoll_wait`, futex, and `wait4`. |
 | P1 | Positioned/vectored and zero-copy I/O bypass deterministic I/O and resource ordering. | Common runtimes, databases, and file servers expose short-I/O, file-offset, pipe, and socket timing differences. | Cover `pread*`, `pwrite*`, `readv`, `sendfile`, `copy_file_range`, `splice`, `tee`, and `vmsplice`, classifying the FD type. |
 | P1 | POSIX/interval timers and accounting clocks use host time. | `getitimer`, `setitimer`, POSIX timers, `times`, and `getrusage` reveal wall/CPU timing and signal races. | Back timers with logical time and scheduler events; normalize CPU accounting or reject it. |

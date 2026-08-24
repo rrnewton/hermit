@@ -898,7 +898,7 @@
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/flock_exclusion.c",
       "runner": "cargo test -p hermit --test flock_exclusion",
-      "why": "tests/c/flock_exclusion.c is compiled and exercised by hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking upgrades of known and SCM_RIGHTS-received lock state, safe cross-process inherited-lock state, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files"
+      "why": "tests/c/flock_exclusion.c is compiled and exercised by the CI-registered hermit-cli/tests/flock_exclusion.rs: it proves flock exclusion between distinct open file descriptions in one process and across processes, release and reacquire, safe refusal for blocking acquisitions or upgrades of known and unknown lock state, the complete pidfd_getfd nonzero-flags EINVAL precedence cross-product and relaxed-mode refusal, shared-table accept/recvmsg liveness, root DBT pre-copy refusal for vfork/clone(CLONE_VFORK)/clone3(CLONE_VFORK), prompt refusal with inherited pipe stdio bracketed by all-descriptors-closed success, freestanding first-syscall refusal while DBT runtime state is absent, replayed lock side effects for materialized files, and fail-closed replay for non-materialized files"
     },
     {
       "disposition": "manifest-test",

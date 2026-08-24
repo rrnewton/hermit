@@ -23,9 +23,19 @@
 //! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations |
 //! | [`dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy`] | a copied fork child's vfork path was assumed to bypass the copied-syscall flock guard |
 //! | [`failed_process_clone_preserves_known_flock_state`] | a failed clone made an unlocked descriptor permanently unknown |
+//! | [`pidfd_getfd_alias_mutation_invalidates_source_flock_authority`] | a pidfd_getfd duplicate unlocked its source OFD while the source cache stayed stale and restored the released lock |
+//! | [`pidfd_getfd_relaxed_mode_refuses_before_any_kernel_injection`] | the direct handler test passed while the raw dispatcher reordered the relaxed-mode guard |
+//! | [`blocking_accept_allows_sibling_descriptor_mutations_to_unblock_it`] | a generic descriptor-table token made a parked accept reject the sibling open/dup/dup2/close sequence needed before connect |
+//! | [`blocking_recvmsg_allows_sibling_descriptor_mutations_to_unblock_it`] | a generic descriptor-table token made parked recvmsg hold the table needed by its sending sibling |
 //! | [`transferred_lock_state_is_unknown_to_the_sender`] | the sender restored stale state after the receiver unlocked the OFD |
-//! | [`dbt_vfork_child_flock_fails_closed_without_deadlock`] | a copied vfork child blocked in the kernel while its parent was suspended |
+//! | [`dbt_vfork_child_flock_fails_closed_without_deadlock`] | a root DBT vfork copied a child that blocked in the kernel while its parent was suspended |
+//! | [`dbt_clone_vfork_forms_fail_closed_before_copy`] | clone/clone3 `CLONE_VFORK` spellings bypassed the root vfork guard |
+//! | [`dbt_first_syscall_vfork_forms_fail_closed_before_runtime_initialization`] | a vfork-family first syscall bypassed the guard while runtime state was still null |
+//! | [`dbt_process_clone_files_is_refused_before_copied_child_mutation`] | a copied DBT process shared the kernel descriptor table while mutating only a private model copy |
+//! | [`dbt_vfork_with_inherited_stdio_fails_closed_promptly`] | ordinary DBT vfork was tested only after closing the unknown startup descriptors |
+//! | [`dbt_vfork_without_flock_state_still_runs`] | the conservative guard accidentally disabled every root-process vfork |
 //! | [`replay_reissues_every_flock_for_a_materialized_file`] | replay consumed the recorded return and took no lock |
+//! | [`replay_reissues_pidfd_getfd_success_and_failure`] | raw pidfd_getfd results were not recorded, the flags-first EINVAL matrix was incomplete, and replay injected live without validating the OFD alias or errno |
 //! | [`replay_refuses_flock_for_a_non_materialized_file`] | replay reported success while locking only a placeholder |
 //! | [`pre_flock_recordings_are_refused_by_the_version_gate`] | a 0x10b recording has no flock event and desynchronized |
 
@@ -41,6 +51,12 @@ use std::sync::OnceLock;
 /// `hermit record` writes to shared per-run state; serialize the record/replay
 /// cases the same way `record_replay.rs` does.
 static RECORD_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(feature = "dbt")]
+const DBT_VFORK_FLOCK_REFUSAL: &str =
+    "detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock";
+#[cfg(feature = "dbt")]
+const DBT_PROCESS_CLONE_FILES_REFUSAL: &str =
+    "detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD";
 
 fn record_lock() -> MutexGuard<'static, ()> {
     RECORD_LOCK
@@ -63,7 +79,7 @@ fn guest() -> &'static Path {
         let binary = build_root.join("flock_exclusion");
         let source = repository().join("tests/c/flock_exclusion.c");
         let compile = Command::new("cc")
-            .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+            .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(&source)
             .arg("-o")
             .arg(&binary)
@@ -76,6 +92,58 @@ fn guest() -> &'static Path {
             String::from_utf8_lossy(&compile.stderr)
         );
         binary
+    })
+}
+
+#[cfg(feature = "dbt")]
+fn compile_first_syscall_vfork_guest(name: &str, form: u8) -> PathBuf {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("flock-first-syscall-vfork");
+    fs::create_dir_all(&build_root)
+        .expect("failed to create the first-syscall vfork guest build directory");
+    let binary = build_root.join(name);
+    let source = repository().join("tests/c/flock_exclusion.c");
+    let compile = Command::new("cc")
+        .args([
+            "-O2",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-fno-stack-protector",
+            "-Wl,-e,_start",
+        ])
+        .arg(format!("-DHERMIT_DBT_FIRST_VFORK_FORM={form}"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to start cc for first-syscall fixture {}: {error}",
+                source.display()
+            )
+        });
+    assert!(
+        compile.status.success(),
+        "failed to compile first-syscall fixture {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    binary
+}
+
+#[cfg(feature = "dbt")]
+fn first_syscall_vfork_guests() -> &'static [PathBuf; 3] {
+    static GUESTS: OnceLock<[PathBuf; 3]> = OnceLock::new();
+    GUESTS.get_or_init(|| {
+        [
+            compile_first_syscall_vfork_guest("first-vfork", 1),
+            compile_first_syscall_vfork_guest("first-clone-vfork", 2),
+            compile_first_syscall_vfork_guest("first-clone3-vfork", 3),
+        ]
     })
 }
 
@@ -118,6 +186,17 @@ fn hermit_run_backend_timeout(
     scenario: &str,
     timeout: &str,
 ) -> Run {
+    hermit_run_program_backend_timeout(backend, log, extra, guest(), &[scenario], timeout)
+}
+
+fn hermit_run_program_backend_timeout(
+    backend: &str,
+    log: &str,
+    extra: &[&str],
+    program: &Path,
+    args: &[&str],
+    timeout: &str,
+) -> Run {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", timeout])
@@ -126,13 +205,37 @@ fn hermit_run_backend_timeout(
         .args(["run", &format!("--backend={backend}"), "--base-env=minimal"])
         .args(extra)
         .arg("--")
-        .arg(guest())
-        .arg(scenario);
-    finish(
-        command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start hermit for {scenario}: {error}")),
-    )
+        .arg(program)
+        .args(args);
+    finish(command.output().unwrap_or_else(|error| {
+        panic!("failed to start hermit for {}: {error}", program.display())
+    }))
+}
+
+fn injected_syscall_offset(stderr: &str, syscall: &str) -> Option<usize> {
+    stderr.find(&format!("beginning inject of syscall: {syscall},"))
+}
+
+fn injected_syscall_offset_after(stderr: &str, syscall: &str, after: usize) -> Option<usize> {
+    stderr[after..]
+        .find(&format!("beginning inject of syscall: {syscall},"))
+        .map(|offset| after + offset)
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_summary_counter(run: &Run, field: &str) -> u64 {
+    let summary = run
+        .stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+        .unwrap_or_else(|| panic!("DBT summary missing\n{}", run.combined()));
+    summary
+        .split_ascii_whitespace()
+        .find_map(|value| value.strip_prefix(field))
+        .unwrap_or_else(|| panic!("DBT summary omitted {field}\n{}", run.combined()))
+        .parse()
+        .unwrap_or_else(|error| panic!("invalid DBT {field} counter: {error}\n{}", run.combined()))
 }
 
 /// Mutual exclusion, the property the pre-#2373 no-op removed outright: under
@@ -401,9 +504,7 @@ fn dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy() {
         run.combined()
     );
     assert!(
-        !run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
+        !run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
         "the root-process vfork guard fired instead of the copied-child flock policy\n{}",
         run.combined()
     );
@@ -455,6 +556,139 @@ fn failed_process_clone_preserves_known_flock_state() {
 #[test]
 fn dbt_failed_process_clone_preserves_known_flock_state() {
     assert_failed_clone_preserves_known_flock_state("dbt");
+}
+
+fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend: &str) {
+    let run = hermit_run_backend(backend, "error", &[], "pidfd-getfd");
+    assert!(
+        run.status.success(),
+        "{backend} pidfd_getfd flock-alias run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-pidfd-duplicate-unlocked",
+        "flock-pidfd-source-upgrade-refused errno=37",
+        "flock-pidfd-stale-restore-absent",
+        "flock-pidfd-failed-getfd-preserved errno=9",
+        "flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-recorded-failure-preserved errno=22",
+        "flock-pidfd-unrelated-authority-preserved",
+        "flock-pidfd-foreign-source-refused errno=95",
+        "flock-pidfd-getfd-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "{backend} missed {marker}\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// A self `pidfd_getfd` result aliases the source open file description. After
+/// the duplicate releases its lock, Detcore must not let the source's stale
+/// cache restore that lock during a refused blocking conversion. Failed calls
+/// preserve source authority, and duplicating an unrelated descriptor does not
+/// poison an independently held lock.
+#[test]
+fn pidfd_getfd_alias_mutation_invalidates_source_flock_authority() {
+    assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority("ptrace");
+}
+
+/// The raw dispatcher, not only the handler unit, must apply the zero-flags
+/// relaxed-mode boundary before any identity or pidfd syscall injection. The
+/// invalid descriptors distinguish Detcore's EOPNOTSUPP from Linux EBADF.
+#[test]
+fn pidfd_getfd_relaxed_mode_refuses_before_any_kernel_injection() {
+    let run = hermit_run(
+        "debug",
+        &["--no-sequentialize-threads"],
+        "pidfd-getfd-relaxed-refusal",
+    );
+    assert!(
+        run.status.success() && run.stdout.contains("flock-pidfd-relaxed-refused errno=95"),
+        "raw relaxed-mode pidfd_getfd did not return EOPNOTSUPP and continue\n{}",
+        run.combined()
+    );
+    for syscall in ["getpid", "gettid", "pidfd_getfd"] {
+        assert!(
+            injected_syscall_offset(&run.stderr, syscall).is_none(),
+            "relaxed-mode pidfd_getfd reached an injected {syscall} syscall\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// `accept` may park its thread while a sibling sharing the same Linux files
+/// table performs the descriptor operations needed to create the eventual
+/// connection. Those ordinary operations must retain Linux semantics; a
+/// handler-spanning table token either rejects them or deadlocks the wakeup.
+#[test]
+fn blocking_accept_allows_sibling_descriptor_mutations_to_unblock_it() {
+    let run = hermit_run_backend_timeout("ptrace", "debug", &[], "shared-table-fd-liveness", "10s");
+    assert!(
+        run.status.success(),
+        "shared-table descriptor liveness run failed\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-shared-table-fd-liveness-ok"),
+        "shared-table descriptor liveness marker missing\n{}",
+        run.combined()
+    );
+    let accept = ["accept", "accept4"]
+        .into_iter()
+        .filter_map(|syscall| injected_syscall_offset(&run.stderr, syscall))
+        .min()
+        .unwrap_or_else(|| panic!("accept injection missing\n{}", run.combined()));
+    let mutation = injected_syscall_offset_after(&run.stderr, "dup2", accept)
+        .unwrap_or_else(|| panic!("sibling dup2 injection missing\n{}", run.combined()));
+    let client = run
+        .stderr
+        .rfind("beginning inject of syscall: socket,")
+        .unwrap_or_else(|| panic!("client socket injection missing\n{}", run.combined()));
+    assert!(
+        accept < mutation && mutation < client,
+        "accept must be injected and parked before sibling mutation and later client creation\n{}",
+        run.combined()
+    );
+}
+
+/// `recvmsg` uses the same scheduler-aware nonblocking path as `accept`. A
+/// sibling must be able to change shared descriptor slots and then send the
+/// message that makes the parked receive runnable. The injection order proves
+/// the structural mutation and send happened after recvmsg first reached the
+/// kernel, rather than relying only on a settling delay.
+#[test]
+fn blocking_recvmsg_allows_sibling_descriptor_mutations_to_unblock_it() {
+    let run = hermit_run_backend_timeout(
+        "ptrace",
+        "debug",
+        &[],
+        "shared-table-recvmsg-liveness",
+        "10s",
+    );
+    assert!(
+        run.status.success()
+            && run
+                .stdout
+                .contains("flock-shared-table-recvmsg-liveness-ok"),
+        "shared-table recvmsg liveness run failed\n{}",
+        run.combined()
+    );
+    let recvmsg = injected_syscall_offset(&run.stderr, "recvmsg")
+        .unwrap_or_else(|| panic!("recvmsg injection missing\n{}", run.combined()));
+    let mutation = injected_syscall_offset_after(&run.stderr, "dup2", recvmsg)
+        .unwrap_or_else(|| panic!("sibling dup2 injection missing\n{}", run.combined()));
+    let sendmsg = injected_syscall_offset_after(&run.stderr, "sendmsg", mutation)
+        .unwrap_or_else(|| panic!("sendmsg injection missing\n{}", run.combined()));
+    assert!(
+        recvmsg < mutation && mutation < sendmsg,
+        "recvmsg must be injected and parked before sibling mutation and the unblocking sendmsg\n{}",
+        run.combined()
+    );
 }
 
 fn assert_transferred_lock_state_is_unknown_to_the_sender(backend: &str) {
@@ -537,52 +771,248 @@ fn partial_sendmmsg_invalidates_all_flock_state() {
 /// A DBT vfork child is not observable by the external runtime before it execs
 /// or exits. If an inherited open file description already holds a flock, a
 /// blocking conversion in that child can deadlock the complete process tree.
-/// Refuse that unsafe vfork before copying, while still allowing vfork when no
-/// known flock is held. The exact exit and diagnostic distinguish refusal from
-/// a timeout.
+/// Refuse that unsafe root-process vfork before copying. The guest closes stdio
+/// immediately before the call, so the regular-file lock is the only unsafe
+/// modeled state. Guest-visible EOPNOTSUPP lets the caller continue and exit 0;
+/// that exit plus the out-of-band diagnostic distinguishes pre-copy refusal
+/// from a timeout, runtime-tree abort, or copied-child policy.
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
     let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-upgrade", "5s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "copied DBT vfork flock must fail closed with exit 101, not time out or return\n{}",
+    assert!(
+        run.status.success(),
+        "root DBT vfork flock must return guest-visible EOPNOTSUPP and continue\n{}",
         run.combined()
     );
     assert!(
-        run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
-        "copied DBT vfork did not report the flock refusal\n{}",
+        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+        "root DBT vfork did not report the pre-copy flock refusal\n{}",
         run.combined()
     );
 }
 
 /// A successful process fork makes inherited flock state unknown. Unknown can
 /// still mean held, so the same vfork guard must refuse rather than let the
-/// unobservable child block in the kernel.
+/// unobservable child block in the kernel. The guest closes stdio before vfork,
+/// so the post-fork regular-file state is the causal unknown descriptor.
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
     let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-unknown-upgrade", "5s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "DBT vfork with unknown flock state must fail closed, not time out\n{}",
+    assert!(
+        run.status.success(),
+        "DBT vfork with unknown flock state must return EOPNOTSUPP and continue\n{}",
         run.combined()
     );
     assert!(
-        run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
+        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
         "DBT vfork with unknown flock state missed its refusal diagnostic\n{}",
         run.combined()
     );
 }
 
+/// `clone(CLONE_VFORK)` and `clone3(CLONE_VFORK)` have the same parent-suspension
+/// hazard as `vfork(2)`. The native controls reach the blocking child flock and
+/// time out. The guest closes stdio before each call, making the known-held
+/// regular-file locks causal. DBT must instead reject each call in the root
+/// pre-syscall callback, before the kernel copies a child. The clone3 case also
+/// proves the guard reads flags from the guest `struct clone_args`, rather than
+/// looking only at raw arg0.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_clone_vfork_forms_fail_closed_before_copy() {
+    for scenario in ["clone-vfork-upgrade", "clone3-vfork-upgrade"] {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "1s", "2s"])
+            .arg(guest())
+            .arg(scenario);
+        let native = finish(
+            native
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start native {scenario}: {error}")),
+        );
+        assert_eq!(
+            native.status.code(),
+            Some(124),
+            "native {scenario} must block or the DBT refusal is not causal\n{}",
+            native.combined()
+        );
+        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
+        assert!(
+            run.status.success(),
+            "DBT {scenario} must return EOPNOTSUPP before copying and continue\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+            "DBT {scenario} missed the pre-copy flock diagnostic\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// A freestanding static guest has no loader or libc startup syscalls: each
+/// binary's first trapped syscall is exactly vfork, clone(CLONE_VFORK), or
+/// clone3(CLONE_VFORK). Null runtime state therefore means unknown descriptor
+/// provenance, not an empty table. DBT must use action 1 to return exact
+/// EOPNOTSUPP, emit the refusal diagnostic, avoid all child output, and let the
+/// caller write its success marker. The only suppressed syscalls are the
+/// lifecycle refusal and that reporting write; exit remains a deferred native
+/// lifecycle operation, so `rewritten=2` is an exact callback contract.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_first_syscall_vfork_forms_fail_closed_before_runtime_initialization() {
+    let definitions = [
+        ("vfork", "flock-first-vfork-refused errno=95 continued"),
+        (
+            "clone(CLONE_VFORK)",
+            "flock-first-clone-vfork-refused errno=95 continued",
+        ),
+        (
+            "clone3(CLONE_VFORK)",
+            "flock-first-clone3-vfork-refused errno=95 continued",
+        ),
+    ];
+    for ((name, marker), program) in definitions.into_iter().zip(first_syscall_vfork_guests()) {
+        let run = hermit_run_program_backend_timeout("dbt", "info", &[], program, &[], "5s");
+        assert!(
+            run.status.success() && run.stdout.contains(marker),
+            "DBT first-syscall {name} did not return EOPNOTSUPP and continue\n{}",
+            run.combined()
+        );
+        assert!(
+            !run.stdout
+                .contains("flock-first-vfork-child-reached-kernel"),
+            "DBT first-syscall {name} executed a child mutation\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+            "DBT first-syscall {name} missed the pre-copy diagnostic\n{}",
+            run.combined()
+        );
+        assert!(
+            !run.stderr
+                .contains("detcore-dbt: initializing Detcore thread state"),
+            "DBT first-syscall {name} initialized state before applying the null-state guard\n{}",
+            run.combined()
+        );
+        assert_eq!(
+            dbt_summary_counter(&run, "rewritten="),
+            2,
+            "DBT first-syscall {name} must rewrite exactly the refused lifecycle call and the reporting write\n{}",
+            run.combined()
+        );
+        assert_eq!(
+            dbt_summary_counter(&run, "syscalls="),
+            3,
+            "DBT first-syscall {name} must observe only lifecycle refusal, reporting write, and exit\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// Linux permits a fork-like clone to share its parent's descriptor table
+/// without joining the parent's thread group. A native child that closes and
+/// reuses a slot therefore changes the parent's slot too. DynamoRIO copies the
+/// Rust Tool state into that child instead of sharing the parent's
+/// `FileMetadata`, so DBT must refuse before copy rather than let the two models
+/// diverge. The native controls prove each fixture actually mutates the shared
+/// table; the DBT half requires guest-visible EOPNOTSUPP, continued execution,
+/// and the dedicated pre-copy diagnostic.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_process_clone_files_is_refused_before_copied_child_mutation() {
+    for scenario in ["clone-files-process", "clone3-files-process"] {
+        let native = finish(
+            Command::new(guest())
+                .arg(scenario)
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start native {scenario}: {error}")),
+        );
+        assert!(
+            native.status.success()
+                && native
+                    .stdout
+                    .contains(&format!("flock-{scenario}-shared-mutation-observed")),
+            "native {scenario} did not prove CLONE_FILES table sharing\n{}",
+            native.combined()
+        );
+
+        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
+        assert!(
+            run.status.success(),
+            "DBT {scenario} must return EOPNOTSUPP before copying and continue\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stderr.contains(DBT_PROCESS_CLONE_FILES_REFUSAL),
+            "DBT {scenario} missed the shared-files pre-copy diagnostic\n{}",
+            run.combined()
+        );
+        assert!(
+            !run.stdout
+                .contains(&format!("flock-{scenario}-shared-mutation-observed")),
+            "DBT {scenario} executed the copied child's descriptor mutation\n{}",
+            run.combined()
+        );
+        assert!(
+            run.stdout
+                .contains(&format!("flock-{scenario}-refused errno=95")),
+            "DBT {scenario} did not observe guest-visible EOPNOTSUPP\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// Startup stdio is inherited before Detcore can observe its lock history. It
+/// cannot be presumed harmless by kind: native Linux accepts a flock on an
+/// anonymous pipe end and a distinct end contends, and two opens of one PTY
+/// slave contend likewise. `Command::output` supplies pipe stdout/stderr here,
+/// so ordinary DBT vfork must refuse promptly rather than silently treating
+/// those unknown OFDs as unlocked. The next test is the success bracket after
+/// every unknown descriptor is closed.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_vfork_with_inherited_stdio_fails_closed_promptly() {
+    let native = finish(
+        Command::new(guest())
+            .arg("vfork-stdio-open")
+            .output()
+            .expect("failed to start native stdio-open vfork control"),
+    );
+    assert!(
+        native.status.success() && native.stdout.contains("flock-vfork-stdio-open-ok"),
+        "native stdio-open vfork control failed\n{}",
+        native.combined()
+    );
+
+    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-stdio-open", "5s");
+    assert!(
+        run.status.success(),
+        "DBT vfork with inherited pipe stdio must return EOPNOTSUPP and continue\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-vfork-stdio-open-entered"),
+        "the stdio-open guest did not reach vfork\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout
+            .contains("flock-vfork-stdio-open-refused errno=95")
+            && !run.stdout.contains("flock-vfork-stdio-open-ok")
+            && run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
+        "the stdio-open run did not take the root pre-copy refusal path\n{}",
+        run.combined()
+    );
+}
+
 /// When no descriptor can possibly carry flock state, ordinary DBT vfork remains
-/// available. This brackets the conservative pre-copy refusal above.
+/// available. This brackets both known/unknown refusal paths above and prevents
+/// the conservative guard from becoming an unconditional vfork ban.
 #[cfg(feature = "dbt")]
 #[test]
 fn dbt_vfork_without_flock_state_still_runs() {
@@ -683,6 +1113,82 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     }
 }
 
+/// `pidfd_getfd` creates a real descriptor alias, so replay must both consume an
+/// exact recorded result and execute the syscall again. The guest brackets two
+/// successful self-target aliases with all four valid/invalid pidfd and
+/// targetfd nonzero-flags combinations, each requiring exact `EINVAL`, and then
+/// uses flock state through the aliases; matching stdout alone cannot prove
+/// those kernel effects occurred. Count replay injections and require all
+/// scenario markers so successful side effects, exact errno replay, and
+/// failed-call model preservation remain causal. The separate zero-flags
+/// `EBADF` source remains a pre-kernel validation bracket.
+#[test]
+fn replay_reissues_pidfd_getfd_success_and_failure() {
+    let _guard = record_lock();
+    let data_dir =
+        tempfile::tempdir().expect("failed to create the pidfd_getfd recording directory");
+
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=120"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--"])
+        .arg(guest())
+        .arg("pidfd-getfd");
+    let recorded = finish(
+        record
+            .output()
+            .expect("failed to start pidfd_getfd recording"),
+    );
+    assert!(
+        recorded.status.success(),
+        "recording pidfd_getfd failed\n{}",
+        recorded.combined()
+    );
+    assert!(recorded.stdout.contains("flock-pidfd-getfd-ok"));
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=debug", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(replay.output().expect("failed to start pidfd_getfd replay"));
+    assert!(
+        replayed.status.success(),
+        "replaying pidfd_getfd failed\n{}",
+        replayed.combined()
+    );
+    for marker in [
+        "flock-pidfd-duplicate-unlocked",
+        "flock-pidfd-failed-getfd-preserved errno=9",
+        "flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-valid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-valid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-invalid-pidfd-invalid-targetfd-flags-precedence errno=22",
+        "flock-pidfd-recorded-failure-preserved errno=22",
+        "flock-pidfd-unrelated-authority-preserved",
+        "flock-pidfd-getfd-ok",
+    ] {
+        assert!(
+            replayed.stdout.contains(marker),
+            "replayed pidfd_getfd scenario missed {marker}\n{}",
+            replayed.combined()
+        );
+    }
+    assert_eq!(
+        replayed
+            .stderr
+            .matches("beginning inject of syscall: pidfd_getfd")
+            .count(),
+        6,
+        "replay must re-execute both successful self-target pidfd_getfd calls and all four flags-first EINVAL calls; the zero-flags invalid source is refused before kernel injection\n{}",
+        replayed.combined()
+    );
+}
+
 /// Replay cannot reproduce the lock side effect for an external file that was
 /// not materialized in the replay root. It must fail closed rather than replay
 /// the recorded success while holding no lock.
@@ -703,7 +1209,7 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     let recorded = finish(record.output().expect("failed to start hermit record"));
     assert!(
         recorded.status.success(),
-        "recording flock on the external file failed\\n{}",
+        "recording flock on the external file failed\n{}",
         recorded.combined()
     );
     assert!(recorded.stdout.contains("flock-holder-ok"));
@@ -718,18 +1224,18 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     assert_ne!(
         replayed.status.code(),
         Some(124),
-        "external-file replay timed out instead of failing closed\\n{}",
+        "external-file replay timed out instead of failing closed\n{}",
         replayed.combined()
     );
     assert!(
         !replayed.status.success(),
-        "external-file replay reported success without reproducing the flock side effect\\n{}",
+        "external-file replay reported success without reproducing the flock side effect\n{}",
         replayed.combined()
     );
     assert!(
         replayed.stderr.contains("cannot replay flock side effects")
             && replayed.stderr.contains("outside the replay root"),
-        "external-file replay did not report the unsupported flock side effect\\n{}",
+        "external-file replay did not report the unsupported flock side effect\n{}",
         replayed.combined()
     );
 }
@@ -822,7 +1328,7 @@ fn replay_preserves_contended_blocking_upgrade_event_shape_and_errno() {
 /// `record_or_replay`, so a 0x10b recording contains no flock event. This
 /// replayer expects one per call, so replaying such a stream would consume the
 /// *next* event for every flock and desynchronize the run. `RECORD_VERSION` was
-/// bumped to 0x10c precisely so the gate in `hermit-cli/src/replay.rs` refuses
+/// bumped after 0x10b precisely so the gate in `hermit-cli/src/replay.rs` refuses
 /// it up front.
 ///
 /// The fixture is a real current recording with only its metadata version
@@ -877,7 +1383,7 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .as_u64()
         .expect("recording metadata has no numeric version");
     assert_eq!(
-        current, 0x10c,
+        current, 0x10d,
         "RECORD_VERSION moved; point this test at the new pre-flock predecessor"
     );
     metadata["version"] = serde_json::json!(0x10b);
