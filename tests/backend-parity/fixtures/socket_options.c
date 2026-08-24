@@ -21,9 +21,8 @@
 // checks collapsed into one scalar, so a backend that dropped SO_KEEPALIVE and a
 // backend that dropped SO_BROADCAST both printed "sockopt ok=5" and compared
 // EQUAL to each other. The failing option was unrecoverable from the byte
-// stream. Worse, main() returned 0 unconditionally, so exit status carried no
-// signal either and a partial failure looked like a pass to any status-only
-// observer.
+// stream; the existing exit-status guard catches the lower total, but does not
+// identify that option.
 //
 // There is no host-independent VALUE to print here -- the observable genuinely
 // is a boolean, and the kernel canonicalises the readback -- so this fixture is

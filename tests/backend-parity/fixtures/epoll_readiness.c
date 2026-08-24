@@ -11,7 +11,8 @@
  * THE READY COUNTS ARE PRINTED. "epoll ok=6" collapsed six checks into one
  * scalar, so a backend that reported the wrong number of ready descriptors and
  * a backend that failed to deregister both printed "epoll ok=5" and compared
- * EQUAL, while main() returned 0 unconditionally so exit status was silent too.
+ * EQUAL. The existing exit-status guard catches the lower total, but does not
+ * identify which observation was wrong.
  * The two readiness counts are the substance of this contract -- armed set
  * reports exactly 1, empty set reports exactly 0 -- and both are determined by
  * the guest's own actions on descriptors it just created, so emitting them adds

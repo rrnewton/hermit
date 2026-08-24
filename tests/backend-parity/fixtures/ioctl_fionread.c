@@ -15,8 +15,9 @@
 // THE READABLE-BYTE COUNT IS PRINTED, and each flag check is named separately.
 // "fionread ok=6" was blind twice over: six checks collapsed into one scalar, so
 // a backend that misreported the byte count and a backend that dropped the
-// FIONBIO toggle both printed "fionread ok=5" and compared EQUAL; and because
-// main() returned 0 unconditionally, exit status carried no signal either.
+// FIONBIO toggle both printed "fionread ok=5" and compared EQUAL. The existing
+// exit-status guard catches the lower total, but does not identify which
+// observation was wrong.
 // navail is the strongest observable here and it is fully guest-determined --
 // the guest wrote exactly those six bytes -- so it is printed and compared
 // exactly. Only the O_NONBLOCK BIT of the status word is emitted, not the raw

@@ -17,8 +17,8 @@
  * EACH STEP IS REPORTED SEPARATELY and the fixture fails closed. "sfd ok=6"
  * summed six independent contracts, so a backend that failed to block the second
  * signal and a backend that handed back a duplicate descriptor both printed
- * "sfd ok=5" and compared EQUAL, and main() returned 0 unconditionally so a
- * partial failure was invisible to exit status as well.
+ * "sfd ok=5" and compared EQUAL. The existing exit-status guard catches the
+ * lower total, but does not identify which step failed.
  *
  * The raw descriptor NUMBERS are deliberately not printed. A file descriptor is
  * allocation state the guest inherits rather than a value it chooses, so

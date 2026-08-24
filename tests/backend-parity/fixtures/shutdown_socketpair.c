@@ -14,8 +14,8 @@
 // EACH SHUTDOWN IS REPORTED SEPARATELY, and the fixture fails closed. "shutdown
 // ok=5" collapsed five independent return-value contracts into one scalar, so a
 // backend that broke SHUT_RD and a backend that broke the EBADF refusal both
-// printed "shutdown ok=4" and compared EQUAL; main() also returned 0
-// unconditionally, so exit status carried no signal.
+// printed "shutdown ok=4" and compared EQUAL. The existing exit-status guard
+// catches the lower total, but does not identify which outcome was wrong.
 //
 // The datagram check had a third, invisible state: it was nested inside the
 // dgram socketpair() succeeding, so a FAILURE TO CREATE THE PAIR and a FAILURE
