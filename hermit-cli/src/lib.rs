@@ -25,6 +25,20 @@ mod id;
 pub mod instruction_map;
 mod interp;
 mod metadata;
+
+/// Whether record/replay verification hashes syscall output buffers, and
+/// therefore whether its log comparison can see buffer CONTENT at all.
+///
+/// ONE CONSTANT BECAUSE TWO INDEPENDENT SWITCHES HAD TO AGREE AND SILENTLY DID
+/// NOT MATTER. Record/replay carried this decision twice: `metadata.rs`'s
+/// `record_or_replay_config` decided whether the recorder EMITS the hash, and
+/// `record_start.rs`'s `ComparisonOptions` decided whether the comparator READS
+/// it. Both were hard-coded `false`, neither was reachable from the command
+/// line, and nothing related them. Setting either alone achieves nothing: hash
+/// without compare is dead weight, compare without hash finds nothing. Naming
+/// the decision once makes the pair impossible to desynchronize, and makes
+/// changing it a one-line edit in a place a reader can find.
+pub const RECORD_REPLAY_HASHES_IO_BUFFERS: bool = true;
 mod record;
 mod recorder;
 mod replay;
