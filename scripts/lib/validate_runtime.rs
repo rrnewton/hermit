@@ -64,6 +64,115 @@ pub fn env_block_max_retries() -> usize {
     }
 }
 
+// ------------------------------------------------------------------ measured-unstable nodes
+
+/// Path of the registry naming nodes with MEASURED instability, if one is reachable.
+///
+/// `VALIDATE_FLAKY_CELL_REGISTRY` names it outright; otherwise the parent
+/// workspace's `ci-hub/validate/flaky-cells.json` is used. That file already
+/// exists, already carries the project's rule for membership — "Add a cell ONLY
+/// with a measured pass/fail sample and its provenance; do not list a cell on
+/// suspicion" — and is already consumed by `ci-hub/validate/flake_class.py` to
+/// reclassify a recorded red. Reading the SAME file here is what stops the
+/// read-side taxonomy and the write-side retry policy from drifting apart.
+fn flaky_cell_registry_path(parent: Option<&Path>) -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("VALIDATE_FLAKY_CELL_REGISTRY") {
+        if !explicit.is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+    let candidate = parent?.join("ci-hub/validate/flaky-cells.json");
+    candidate.is_file().then_some(candidate)
+}
+
+/// Node tags whose failure is retry-eligible because instability was MEASURED.
+///
+/// Returns an EMPTY set when no registry is reachable — a standalone hermit
+/// checkout with no parent widens nothing, and only the environmental classes
+/// below remain eligible. That is the safe direction: an unreachable registry
+/// must not silently grant a blanket retry policy.
+///
+/// A ONE-SIDED SAMPLE IS REFUSED, and that refusal is the load-bearing part.
+/// The flakiness investigation measured identities that fail EVERY time for a
+/// structural reason: at SHA 0f1f6cd0, eight DBT identities reported `no_result`
+/// 5 runs out of 5 because DBT never publishes a terminal verify report, and
+/// `dbt-unsupported-syscall/ptrace` was pre-comparison `no_result` 5/5. Those
+/// are 100% reproducible, so retrying them costs three runs and returns the
+/// same answer. An entry recording `observed_pass: 0` describes exactly that
+/// shape, so it is rejected here with its numbers named rather than silently
+/// granted a retry budget.
+///
+/// The registry's entries are cell names (`command_strict_verify`). A DAG node's
+/// tag is `group.job` (`test.command_strict_verify`), so both spellings are
+/// accepted: an entry matches a tag outright, or matches its `job` half.
+pub fn measured_unstable_nodes(parent: Option<&Path>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(path) = flaky_cell_registry_path(parent) else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        eprintln!(
+            "validate: WARNING: {} is not readable JSON; no node is retry-eligible on measured \
+             instability. Environmental classification is unaffected.",
+            path.display()
+        );
+        return out;
+    };
+    let Some(cells) = value.get("cells").and_then(|c| c.as_array()) else {
+        return out;
+    };
+    for cell in cells {
+        let Some(name) = cell.get("cell").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        // An entry without a measured sample is not evidence, and the registry's
+        // own rule already forbids it. Refuse it here too rather than trusting
+        // that every future editor read the comment.
+        let passes = cell.get("observed_pass").and_then(serde_json::Value::as_u64);
+        let fails = cell.get("observed_fail").and_then(serde_json::Value::as_u64);
+        let (Some(passes), Some(fails)) = (passes, fails) else {
+            eprintln!(
+                "validate: WARNING: flaky-cell registry entry {name:?} has no observed_pass/\
+                 observed_fail sample; NOT treating it as retry-eligible."
+            );
+            continue;
+        };
+        if passes == 0 || fails == 0 {
+            eprintln!(
+                "validate: WARNING: flaky-cell registry entry {name:?} is {passes} pass / {fails} \
+                 fail, which is a one-sided sample rather than measured instability; NOT treating \
+                 it as retry-eligible."
+            );
+            continue;
+        }
+        let measured_at = cell
+            .get("measured_at")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown date");
+        out.insert(
+            name.to_string(),
+            format!("measured-unstable {passes} pass / {fails} fail, measured {measured_at}"),
+        );
+    }
+    out
+}
+
+/// The registry's reason for retrying `tag`, or `None` when it names no such node.
+pub fn measured_unstable_class(
+    registry: &BTreeMap<String, String>,
+    tag: &str,
+) -> Option<String> {
+    if let Some(reason) = registry.get(tag) {
+        return Some(reason.clone());
+    }
+    // `group.job` -> `job`, so a registry written in cell names still matches.
+    let job = tag.split_once('.').map(|(_, job)| job)?;
+    registry.get(job).cloned()
+}
+
 /// Phrases that mean "the kernel/sandbox said no", in lowercase.
 const DENIALS: &[&str] = &["operation not permitted", "permission denied", "(os error 1)"];
 
