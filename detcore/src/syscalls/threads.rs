@@ -48,9 +48,8 @@ use crate::tool_global::cancel_exec;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
 use crate::tool_global::prepare_exec;
-use crate::tool_global::resolve_kill_targets;
-use crate::tool_global::thread_is_live;
 use crate::tool_global::resource_request;
+use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
@@ -158,10 +157,10 @@ fn scan_tail_is_zeroed<M: MemoryAccess>(
         else {
             return TailVerdict::Faulted;
         };
-        let got = match memory.read(addr, &mut buf[..read_len]) {
-            Ok(got) => got,
-            Err(_) => 0,
-        };
+        // A failed read means zero NEW bytes were obtained; the `got < read_len`
+        // check below is what turns that into `Faulted`. Written `unwrap_or(0)`
+        // rather than `unwrap_or_default()` so the 0 stays visible.
+        let got = memory.read(addr, &mut buf[..read_len]).unwrap_or(0);
         // Judge only the bytes that are genuinely new AND genuinely read.
         let new_from = back.min(got);
         if buf[new_from..got].iter().any(|byte| *byte != 0) {
@@ -1457,9 +1456,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Every check is a pure function of the guest's own arguments. The one
     /// piece of state consulted is the pid lookup, which asks the scheduler's
-    /// own task table via [`resolve_kill_targets`] -- Detcore state, replayed
+    /// own task table via [`thread_is_live`] -- Detcore state, replayed
     /// identically -- rather than the host's process table, which would leak
     /// unrelated host processes into a guest-visible answer.
+    ///
+    /// Specifically NOT [`crate::tool_global::resolve_kill_targets`], which
+    /// models `kill(2)` and so recognises only thread-group leaders; asking it
+    /// this question reports ESRCH for a live non-leader thread.
     ///
     /// # Deliberately not emulated
     ///

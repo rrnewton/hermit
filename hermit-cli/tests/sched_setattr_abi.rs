@@ -144,7 +144,6 @@ fn run_under_hermit_sabre(guest: &Path, loader: &Path, plugin: &Path) -> String 
 }
 
 fn compare(native: &str, sandboxed: &str, backend: &str) {
-
     assert!(
         !native.trim().is_empty(),
         "the probe printed nothing natively, so the comparison would be vacuous"

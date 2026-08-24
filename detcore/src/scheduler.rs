@@ -4376,10 +4376,7 @@ mod test {
         register_known_thread(&mut sched, leader);
         register_known_thread(&mut sched, member);
 
-        assert!(
-            sched.thread_is_live(leader),
-            "the leader is obviously live"
-        );
+        assert!(sched.thread_is_live(leader), "the leader is obviously live");
         assert!(
             sched.thread_is_live(member),
             "a non-leader thread of a live group is live; sched_setattr must reach it"
