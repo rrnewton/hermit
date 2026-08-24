@@ -2689,7 +2689,7 @@ mod subscription_tests {
         );
     }
 
-    /// `--detlog-io-buffers` can only hash a syscall Detcore is subscribed to.
+    /// Io-buffer hashing can only hash a syscall Detcore is subscribed to.
     /// Under `--passthru-opt` the subscription narrows, so the check's coverage
     /// narrows with it -- silently, because a syscall that never reaches
     /// Detcore produces no record and no record is indistinguishable from a
@@ -2736,7 +2736,7 @@ mod subscription_tests {
         assert_eq!(
             unreachable,
             vec![Sysno::getcwd],
-            "--passthru-opt changes which syscalls `--detlog-io-buffers` can hash, and the set \
+            "--passthru-opt changes which syscalls io-buffer hashing can reach, and the set \
              moved. {} of {} reachable. If a syscall was RECLASSIFIED out of Determinized, that \
              silently shrank an enabled determinism check -- re-derive rather than editing this \
              expectation to match.",
