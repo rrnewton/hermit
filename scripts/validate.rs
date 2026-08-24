@@ -1148,6 +1148,7 @@ fn self_test() -> Result<(), String> {
     typed_libtest_count_bracket()?;
     selective_subset_bracket(&root)?;
     self_output_bracket()?;
+    git_anchor_bracket()?;
     // ---- DAG-config carry + ungrantable-resource brackets -------------------
     // BOTH directions. A check that refuses everything would pass the negative
     // case alone, so the positive case (a real lane admits) is load-bearing.
@@ -1728,27 +1729,131 @@ fn self_output_bracket() -> Result<(), String> {
     // checkout's real state is, no surviving entry may be validate's own output.
     // This is what actually catches a reintroduced trim, because it exercises
     // the real `git` invocation rather than a hand-written line.
+    let root = repo_root();
     let mut live = 0usize;
-    for args in [
-        vec!["status", "--porcelain"],
-        vec!["diff", "--name-only"],
-        vec!["ls-files", "--others", "--exclude-standard"],
-    ] {
-        for line in foreign_porcelain(&args) {
-            live += 1;
-            if path_readings(&line).iter().any(|p| is_self_output(p)) {
-                return Err(format!(
-                    "self-output: `git {}` leaked validate's own output into the dirty set: {line:?}",
-                    args.join(" ")
-                ));
-            }
+    for line in foreign_porcelain(&root, SOURCE_STATUS_ARGS)? {
+        live += 1;
+        if path_readings(&line).iter().any(|p| is_self_output(p)) {
+            return Err(format!(
+                "self-output: `git {}` leaked validate's own output into the dirty set: {line:?}",
+                SOURCE_STATUS_ARGS.join(" ")
+            ));
         }
+    }
+    for (line, expected) in [
+        ("M  staged.rs", false),
+        ("R  old.rs -> staged.rs", false),
+        (" M unstaged.rs", true),
+        ("MM both.rs", true),
+        ("?? untracked.rs", true),
+        ("UU conflicted.rs", true),
+        ("malformed", true),
+    ] {
+        if line_has_worktree_change(line) != expected {
+            return Err(format!(
+                "self-output: worktree classification for {line:?} must be {expected}"
+            ));
+        }
+    }
+    if foreign_porcelain(&root, &["definitely-not-a-git-subcommand"]).is_ok() {
+        return Err(
+            "self-output: a failed Git dirtiness probe was mistaken for an empty clean result"
+                .into(),
+        );
     }
     println!(
         "  self-output: {} own-output shape(s) excused, {} foreign change(s) still dirty, \
-         {live} live entr(y/ies) from the real checkout all correctly classified",
+         {live} live entr(y/ies) classified from one status snapshot; failed Git probes refused",
         excused.len(),
         foreign.len()
+    );
+    Ok(())
+}
+
+/// Brackets for the source-identity proof carried into the ledger row.
+///
+/// A checkout can be clean at both ends while naming a different commit after
+/// the run. Dirtiness alone therefore cannot establish `commit_anchored`; the
+/// exact commit and its tree must also match the captured start snapshot. Git
+/// probe failures are modelled explicitly so an error cannot collapse into a
+/// false "clean" result. A disposable repository additionally exercises real
+/// replacement refs and poisoned repository-selection variables.
+fn git_anchor_bracket() -> Result<(), String> {
+    let oid = |digit: char| digit.to_string().repeat(40);
+    let start = GitSnapshot {
+        commit: oid('1'),
+        tree: oid('2'),
+        dirty: false,
+        worktree_dirty: false,
+    };
+
+    let clean = assess_final_anchor(&start, Ok(start.clone()));
+    if clean
+        != (AnchorAssessment {
+            commit_anchored: true,
+            tree_dirty: false,
+            integrity_error: None,
+        })
+    {
+        return Err("git anchor: identical clean start/end snapshots must anchor".into());
+    }
+
+    let changed_head = assess_final_anchor(
+        &start,
+        Ok(GitSnapshot { commit: oid('3'), ..start.clone() }),
+    );
+    if changed_head.commit_anchored
+        || changed_head.integrity_error.as_deref().is_none_or(|e| !e.contains("HEAD changed"))
+    {
+        return Err("git anchor: a clean mid-run HEAD change was not refused".into());
+    }
+
+    let changed_tree = assess_final_anchor(
+        &start,
+        Ok(GitSnapshot { tree: oid('4'), ..start.clone() }),
+    );
+    if changed_tree.commit_anchored
+        || changed_tree.integrity_error.as_deref().is_none_or(|e| !e.contains("HEAD tree changed"))
+    {
+        return Err("git anchor: a clean mid-run tree change was not refused".into());
+    }
+
+    let became_dirty = assess_final_anchor(
+        &start,
+        Ok(GitSnapshot { dirty: true, worktree_dirty: true, ..start.clone() }),
+    );
+    if became_dirty.commit_anchored || !became_dirty.tree_dirty || became_dirty.integrity_error.is_none() {
+        return Err("git anchor: a tree dirtied during validation was not refused".into());
+    }
+
+    let probe_failed = assess_final_anchor(&start, Err("git status failed".into()));
+    if probe_failed.commit_anchored
+        || !probe_failed.tree_dirty
+        || probe_failed.integrity_error.as_deref().is_none_or(|e| !e.contains("probe failed"))
+    {
+        return Err("git anchor: a failed final Git probe did not fail closed".into());
+    }
+    let later_clean = assess_final_anchor(&start, Ok(start.clone()));
+    let preserved_failure = combine_anchor_assessments(probe_failed, later_clean);
+    if preserved_failure.commit_anchored || preserved_failure.integrity_error.is_none() {
+        return Err("git anchor: a later clean probe laundered an earlier probe failure".into());
+    }
+
+    let dirty_start = GitSnapshot { dirty: true, worktree_dirty: true, ..start.clone() };
+    let cleaned_later = assess_final_anchor(
+        &dirty_start,
+        Ok(GitSnapshot { dirty: false, worktree_dirty: false, ..start }),
+    );
+    if cleaned_later.commit_anchored || !cleaned_later.tree_dirty {
+        return Err("git anchor: a dirty start was laundered by a clean final snapshot".into());
+    }
+
+    live_git_identity_bracket()?;
+    live_submodule_identity_bracket()?;
+
+    println!(
+        "  git anchor: clean identity accepted; HEAD/tree drift, dirtiness, replacement refs, \
+         poisoned Git repository env, submodule drift, and probe failure refused"
     );
     Ok(())
 }
@@ -2424,22 +2529,151 @@ fn sh(cmd: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+const GIT_REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
+const SOURCE_STATUS_ARGS: &[&str] = &[
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+];
+const GIT_IDENTITY_CONFIG: &[&str] = &[
+    "core.fileMode=true",
+    "core.symlinks=true",
+    "core.trustctime=true",
+    "core.ignoreCase=false",
+    "core.ignoreStat=false",
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    "core.checkStat=default",
+];
+
+/// A Git process bound to `root`, isolated from caller-selected repository and
+/// object-storage state. Configuration transport (including proxy/auth config)
+/// remains intact; only variables able to redirect what repository or objects
+/// an identity probe sees are removed.
+fn isolated_git(root: &Path, no_replace_objects: bool) -> Command {
+    let mut command = Command::new("git");
+    for key in GIT_REPOSITORY_ENV {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| {
+            key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(key);
+        }
+    }
+    if no_replace_objects {
+        command.arg("--no-replace-objects");
+    }
+    for setting in GIT_IDENTITY_CONFIG {
+        command.arg("-c").arg(setting);
+    }
+    command.arg("-C").arg(root);
+    command
+}
+
+fn git_output_at_mode(
+    root: &Path,
+    args: &[&str],
+    no_replace_objects: bool,
+) -> Result<String, String> {
+    let out = isolated_git(root, no_replace_objects)
+        .args(args)
+        .output()
+        .map_err(|e| format!("cannot run `git -C {} {}`: {e}", root.display(), args.join(" ")))?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "`git -C {} {}` exited {}{}",
+            root.display(),
+            args.join(" "),
+            out.status,
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
+    }
+    String::from_utf8(out.stdout)
+        .map(|value| value.trim().to_string())
+        .map_err(|e| {
+            format!(
+                "`git -C {} {}` emitted non-UTF-8 output: {e}",
+                root.display(),
+                args.join(" ")
+            )
+        })
+}
+
+fn git_output_at(root: &Path, args: &[&str]) -> Result<String, String> {
+    git_output_at_mode(root, args, true)
+}
+
+fn git_oid(root: &Path, args: &[&str], description: &str) -> Result<String, String> {
+    let value = git_output_at(root, args)?;
+    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{description} is not an exact 40-hex object id: {value:?}"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn git_sha_checked(root: &Path) -> Result<String, String> {
+    git_oid(root, &["rev-parse", "HEAD^{commit}"], "HEAD commit")
+}
+
 fn git_sha() -> String {
-    sh("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+    let root = repo_root();
+    git_sha_checked(&root).unwrap_or_else(|_| "unknown".into())
 }
 
 /// Content-addressed identity of exactly what validate builds and tests: the root
 /// tree object. It hashes tracked file content AND submodule gitlink SHAs, but not
 /// commit metadata — so a rebase or amend that leaves content byte-identical
 /// yields the SAME tree. This, not the commit SHA, is the result-cache key.
+fn git_tree_at(root: &Path, commit: &str) -> Result<String, String> {
+    git_oid(root, &["rev-parse", &format!("{commit}^{{tree}}")], "commit tree")
+}
+
 fn git_tree() -> String {
-    sh("git", &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|| "unknown".into())
+    let root = repo_root();
+    git_sha_checked(&root)
+        .and_then(|commit| git_tree_at(&root, &commit))
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitSnapshot {
+    commit: String,
+    tree: String,
+    dirty: bool,
+    worktree_dirty: bool,
 }
 
 fn repo_root() -> PathBuf {
-    sh("git", &["rev-parse", "--show-toplevel"])
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    git_output_at(&cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or(cwd)
 }
 
 /// Paths excluded from every dirtiness and anchoring judgement.
@@ -2539,30 +2773,819 @@ fn line_is_self_output(line: &str) -> bool {
 /// Reads git's stdout UNTRIMMED, because `git status --porcelain`'s leading
 /// status column is significant and a global trim silently shifts the first
 /// line's columns (see [`path_readings`]).
-fn foreign_porcelain(args: &[&str]) -> Vec<String> {
-    let Ok(out) = Command::new("git").args(args).output() else { return Vec::new() };
+fn porcelain_entries(
+    root: &Path,
+    args: &[&str],
+    exclude_self_output: bool,
+) -> Result<Vec<String>, String> {
+    let out = isolated_git(root, true)
+        .args(args)
+        .output()
+        .map_err(|e| format!("cannot run `git -C {} {}`: {e}", root.display(), args.join(" ")))?;
     if !out.status.success() {
-        return Vec::new();
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "`git -C {} {}` exited {}{}",
+            root.display(),
+            args.join(" "),
+            out.status,
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ));
     }
-    String::from_utf8_lossy(&out.stdout)
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| {
+            format!(
+                "`git -C {} {}` emitted non-UTF-8 output: {e}",
+                root.display(),
+                args.join(" ")
+            )
+        })?;
+    Ok(stdout
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter(|l| !line_is_self_output(l))
+        .filter(|l| !exclude_self_output || !line_is_self_output(l))
         .map(|l| l.trim_end().to_string())
-        .collect()
+        .collect())
+}
+
+fn foreign_porcelain(root: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    porcelain_entries(root, args, true)
 }
 
 /// True when the tree differs from HEAD in any way validate did not itself cause.
-fn tree_dirty() -> bool {
-    !foreign_porcelain(&["status", "--porcelain"]).is_empty()
+fn tree_dirty_checked(root: &Path) -> Result<bool, String> {
+    foreign_porcelain(root, SOURCE_STATUS_ARGS).map(|entries| !entries.is_empty())
 }
 
-/// True when the WORKING TREE proper carries changes `git add` would capture.
-/// This drives the hard gate, because staging or committing is the caller's
-/// escape from it.
-fn worktree_dirty() -> bool {
-    let unstaged = !foreign_porcelain(&["diff", "--name-only"]).is_empty();
-    unstaged || !foreign_porcelain(&["ls-files", "--others", "--exclude-standard"]).is_empty()
+/// Conservative convenience for intrinsically non-qualifying diagnostic seams.
+/// Production qualification paths use [`tree_dirty_checked`] and retain its error.
+fn tree_dirty() -> bool {
+    let root = repo_root();
+    tree_dirty_checked(&root).unwrap_or(true)
+}
+
+/// Whether one porcelain-v1 entry describes a change outside the index.
+/// Staged-only `X ` changes are allowed past the initial hard gate (but the full
+/// dirty bit still prevents anchoring); unstaged, untracked, conflicted, and
+/// malformed entries fail closed.
+fn line_has_worktree_change(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.starts_with(b"?? ") {
+        return true;
+    }
+    if bytes.len() < 3 || bytes[2] != b' ' {
+        return true;
+    }
+    bytes[1] != b' '
+}
+
+fn hidden_index_entries(root: &Path) -> Result<Vec<String>, String> {
+    let output = git_output_at(root, &["ls-files", "-v", "-z"])?;
+    let mut hidden = Vec::new();
+    for entry in output.split('\0').filter(|entry| !entry.is_empty()) {
+        let bytes = entry.as_bytes();
+        if bytes.len() < 3 || bytes[1] != b' ' {
+            return Err(format!("unexpected `git ls-files -v -z` entry: {entry:?}"));
+        }
+        let tag = bytes[0];
+        if tag == b'S' || tag.is_ascii_lowercase() {
+            let kind = match tag {
+                b'S' => "skip-worktree",
+                b's' => "assume-unchanged+skip-worktree",
+                _ => "assume-unchanged",
+            };
+            hidden.push(format!("{kind}: {}", &entry[2..]));
+        }
+    }
+    Ok(hidden)
+}
+
+fn tracked_gitlinks(root: &Path, commit: &str) -> Result<Vec<(PathBuf, String)>, String> {
+    let output = git_output_at(root, &["ls-tree", "-r", "-z", "--full-tree", commit])?;
+    let mut gitlinks = Vec::new();
+    for entry in output.split('\0').filter(|entry| !entry.is_empty()) {
+        let (metadata, path) = entry
+            .split_once('\t')
+            .ok_or_else(|| format!("unexpected `git ls-tree -r -z` entry: {entry:?}"))?;
+        let mut fields = metadata.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let oid = fields.next().unwrap_or_default();
+        if mode != "160000" {
+            continue;
+        }
+        if kind != "commit"
+            || oid.len() != 40
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || fields.next().is_some()
+        {
+            return Err(format!("invalid gitlink entry in {commit}: {entry:?}"));
+        }
+        let path = PathBuf::from(path);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!("unsafe gitlink path in {commit}: {}", path.display()));
+        }
+        gitlinks.push((path, oid.to_ascii_lowercase()));
+    }
+    Ok(gitlinks)
+}
+
+fn initialized_submodule_dirtiness(
+    root: &Path,
+    commit: &str,
+    require_initialized: bool,
+    display_prefix: &Path,
+) -> Result<(bool, bool), String> {
+    let mut any_dirty = false;
+    let mut any_worktree_dirty = false;
+    for (relative, expected) in tracked_gitlinks(root, commit)? {
+        let checkout = root.join(&relative);
+        let display_path = display_prefix.join(&relative);
+        let marker = checkout.join(".git");
+        match std::fs::symlink_metadata(&marker) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if require_initialized {
+                    return Err(format!(
+                        "submodule {} is not initialized at required gitlink {expected}",
+                        display_path.display()
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect submodule marker {}: {error}",
+                    marker.display()
+                ));
+            }
+        }
+
+        let observed = git_sha_checked(&checkout).map_err(|error| {
+            format!(
+                "cannot resolve initialized submodule {}: {error}",
+                display_path.display()
+            )
+        })?;
+        if observed != expected {
+            return Err(format!(
+                "submodule {} HEAD {observed} does not match gitlink {expected}",
+                display_path.display()
+            ));
+        }
+        let hidden = hidden_index_entries(&checkout).map_err(|error| {
+            format!("cannot inspect submodule {} index: {error}", display_path.display())
+        })?;
+        if !hidden.is_empty() {
+            return Err(format!(
+                "submodule {} has tracked paths carrying index flags that can hide source changes: {}",
+                display_path.display(),
+                hidden.join(", ")
+            ));
+        }
+        let entries = porcelain_entries(&checkout, SOURCE_STATUS_ARGS, false).map_err(|error| {
+            format!("cannot inspect submodule {} status: {error}", display_path.display())
+        })?;
+        any_dirty |= !entries.is_empty();
+        any_worktree_dirty |= entries.iter().any(|line| line_has_worktree_change(line));
+        let nested = initialized_submodule_dirtiness(
+            &checkout,
+            &observed,
+            require_initialized,
+            &display_path,
+        )?;
+        any_dirty |= nested.0;
+        any_worktree_dirty |= nested.1;
+        let observed_after = git_sha_checked(&checkout)?;
+        if observed_after != observed {
+            return Err(format!(
+                "submodule {} HEAD changed while source identity was being captured: {observed} -> {observed_after}",
+                display_path.display()
+            ));
+        }
+    }
+    Ok((any_dirty, any_worktree_dirty))
+}
+
+fn git_snapshot(root: &Path, require_initialized_submodules: bool) -> Result<GitSnapshot, String> {
+    let commit = git_sha_checked(root)?;
+    let tree = git_tree_at(root, &commit)?;
+    let hidden = hidden_index_entries(root)?;
+    if !hidden.is_empty() {
+        return Err(format!(
+            "tracked paths carry index flags that can hide source changes: {}",
+            hidden.join(", ")
+        ));
+    }
+    let entries = foreign_porcelain(root, SOURCE_STATUS_ARGS)?;
+    let mut dirty = !entries.is_empty();
+    let mut worktree_dirty = entries.iter().any(|line| line_has_worktree_change(line));
+    let submodules = initialized_submodule_dirtiness(
+        root,
+        &commit,
+        require_initialized_submodules,
+        Path::new("."),
+    )?;
+    dirty |= submodules.0;
+    worktree_dirty |= submodules.1;
+    let observed_after_status = git_sha_checked(root)?;
+    if observed_after_status != commit {
+        return Err(format!(
+            "HEAD changed while source identity was being captured: {commit} -> {observed_after_status}"
+        ));
+    }
+    let observed_tree = git_tree_at(root, &observed_after_status)?;
+    if observed_tree != tree {
+        return Err(format!(
+            "HEAD tree changed while source identity was being captured: {tree} -> {observed_tree}"
+        ));
+    }
+    Ok(GitSnapshot { commit, tree, dirty, worktree_dirty })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AnchorAssessment {
+    commit_anchored: bool,
+    tree_dirty: bool,
+    integrity_error: Option<String>,
+}
+
+fn assess_final_anchor(
+    start: &GitSnapshot,
+    final_snapshot: Result<GitSnapshot, String>,
+) -> AnchorAssessment {
+    let end = match final_snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return AnchorAssessment {
+                commit_anchored: false,
+                tree_dirty: true,
+                integrity_error: Some(format!("final Git source probe failed: {error}")),
+            };
+        }
+    };
+    let mut drift = Vec::new();
+    if end.commit != start.commit {
+        drift.push(format!("HEAD changed from {} to {}", start.commit, end.commit));
+    }
+    if end.tree != start.tree {
+        drift.push(format!("HEAD tree changed from {} to {}", start.tree, end.tree));
+    }
+    if !start.dirty && end.dirty {
+        drift.push("the source tree became dirty during validation".into());
+    }
+    AnchorAssessment {
+        commit_anchored: !start.dirty && !end.dirty && drift.is_empty(),
+        tree_dirty: start.dirty || end.dirty,
+        integrity_error: (!drift.is_empty()).then(|| drift.join("; ")),
+    }
+}
+
+fn combine_anchor_assessments(
+    earlier: AnchorAssessment,
+    evidence_commit: AnchorAssessment,
+) -> AnchorAssessment {
+    let integrity_error = match (earlier.integrity_error, evidence_commit.integrity_error) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    };
+    AnchorAssessment {
+        commit_anchored: earlier.commit_anchored && evidence_commit.commit_anchored,
+        tree_dirty: earlier.tree_dirty || evidence_commit.tree_dirty,
+        integrity_error,
+    }
+}
+
+fn init_git_test_repo(path: &Path) -> Result<(), String> {
+    std::fs::create_dir(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    git_output_at(path, &["init", "--quiet"])?;
+    git_output_at(path, &["config", "user.name", "Validate Self-Test"])?;
+    git_output_at(path, &["config", "user.email", "validate-self-test@example.invalid"])?;
+    git_output_at(path, &["config", "commit.gpgsign", "false"])?;
+    Ok(())
+}
+
+fn git_status_with_injected_config(
+    root: &Path,
+    settings: &[(&str, &str)],
+    path: &str,
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    for variable in GIT_REPOSITORY_ENV {
+        command.env_remove(variable);
+    }
+    for (variable, _) in std::env::vars_os() {
+        if variable.to_str().is_some_and(|variable| {
+            variable.starts_with("GIT_CONFIG_KEY_")
+                || variable.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(variable);
+        }
+    }
+    command.env("GIT_CONFIG_COUNT", settings.len().to_string());
+    for (index, (key, value)) in settings.iter().enumerate() {
+        command
+            .env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+    }
+    command
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--", path]);
+    let output = command
+        .output()
+        .map_err(|e| format!("git anchor live bracket: config control failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git anchor live bracket: config control exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|output| output.trim().to_string())
+        .map_err(|e| format!("git anchor live bracket: config control was not UTF-8: {e}"))
+}
+
+fn hidden_index_bracket(
+    root: &Path,
+    flag: &str,
+    clear_flag: &str,
+    expected: &str,
+) -> Result<(), String> {
+    git_output_at(root, &["update-index", flag, "source.txt"])?;
+    std::fs::write(root.join("source.txt"), format!("hidden-{expected}\n"))
+        .map_err(|e| format!("git anchor live bracket: cannot write {expected} fixture: {e}"))?;
+    if !git_output_at(root, SOURCE_STATUS_ARGS)?.is_empty() {
+        return Err(format!(
+            "git anchor live bracket: {expected} did not hide the edit; positive control is vacuous"
+        ));
+    }
+    if git_snapshot(root, false)
+        .as_ref()
+        .err()
+        .is_none_or(|error| !error.contains(expected))
+    {
+        return Err(format!("git anchor live bracket: {expected} path was not refused"));
+    }
+    git_output_at(root, &["update-index", clear_flag, "source.txt"])?;
+    git_output_at(root, &["checkout", "--", "source.txt"])?;
+    Ok(())
+}
+
+/// Exercise the real Git plumbing against the two ambient inputs most able to
+/// forge source identity: replacement refs and repository-selection variables.
+fn live_git_identity_bracket() -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-git-identity-selftest-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&tmp)
+        .map_err(|e| format!("git anchor live bracket: cannot create {}: {e}", tmp.display()))?;
+
+    let result = (|| -> Result<(), String> {
+        let repo = tmp.join("repo");
+        let worktree = tmp.join("worktree-a");
+        init_git_test_repo(&repo)?;
+
+        let source = repo.join("source.txt");
+        let link = repo.join("link.txt");
+        std::fs::write(&source, b"tree-a\n").map_err(|e| {
+            format!("git anchor live bracket: cannot write {}: {e}", source.display())
+        })?;
+        std::os::unix::fs::symlink("source.txt", &link).map_err(|e| {
+            format!("git anchor live bracket: cannot create {}: {e}", link.display())
+        })?;
+        git_output_at(&repo, &["add", "source.txt", "link.txt"])?;
+        git_output_at(&repo, &["commit", "--quiet", "-m", "tree a"])?;
+        let commit_a = git_sha_checked(&repo)?;
+        let tree_a = git_tree_at(&repo, &commit_a)?;
+
+        std::fs::write(&source, b"tree-b\n").map_err(|e| {
+            format!("git anchor live bracket: cannot rewrite {}: {e}", source.display())
+        })?;
+        git_output_at(&repo, &["add", "source.txt"])?;
+        git_output_at(&repo, &["commit", "--quiet", "-m", "tree b"])?;
+        let commit_b = git_sha_checked(&repo)?;
+        let tree_b = git_tree_at(&repo, &commit_b)?;
+        if tree_a == tree_b {
+            return Err("git anchor live bracket: distinct fixtures have the same tree".into());
+        }
+
+        git_output_at(&repo, &["replace", &commit_a, &commit_b])?;
+        let worktree_s = worktree
+            .to_str()
+            .ok_or_else(|| "git anchor live bracket: worktree path is not UTF-8".to_string())?;
+        git_output_at(
+            &repo,
+            &["worktree", "add", "--quiet", "--detach", worktree_s, &commit_a],
+        )?;
+
+        // Positive control: without the production `--no-replace-objects`, Git
+        // resolves A's commit body through B and reports B's tree. The test would
+        // be vacuous if the replacement were not demonstrably active.
+        let replaced_tree = git_output_at_mode(
+            &worktree,
+            &["rev-parse", "HEAD^{tree}"],
+            false,
+        )?;
+        if replaced_tree != tree_b {
+            return Err(format!(
+                "git anchor live bracket: replacement ref was not active ({replaced_tree} != {tree_b})"
+            ));
+        }
+        let snapshot = git_snapshot(&worktree, false)?;
+        if snapshot.commit != commit_a || snapshot.tree != tree_a || snapshot.dirty {
+            return Err(format!(
+                "git anchor live bracket: replacement-safe snapshot did not bind A: {snapshot:?}"
+            ));
+        }
+
+        // Point every common repository-selection/storage override at B's main
+        // checkout. The production probe must still use the explicit worktree A.
+        let poisoned = [
+            ("GIT_DIR", repo.join(".git")),
+            ("GIT_WORK_TREE", repo.clone()),
+            ("GIT_COMMON_DIR", repo.join(".git")),
+            ("GIT_INDEX_FILE", repo.join(".git/index")),
+            ("GIT_OBJECT_DIRECTORY", repo.join(".git/objects")),
+        ];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = poisoned
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        let original_cwd = std::env::current_dir()
+            .map_err(|e| format!("git anchor live bracket: cannot read current directory: {e}"))?;
+        std::env::set_current_dir(&worktree).map_err(|e| {
+            format!(
+                "git anchor live bracket: cannot enter {}: {e}",
+                worktree.display()
+            )
+        })?;
+        for (key, value) in &poisoned {
+            std::env::set_var(key, value);
+        }
+        let discovered = repo_root();
+        let isolated = git_snapshot(&worktree, false);
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        std::env::set_current_dir(&original_cwd).map_err(|e| {
+            format!(
+                "git anchor live bracket: cannot restore {}: {e}",
+                original_cwd.display()
+            )
+        })?;
+        if discovered != worktree {
+            return Err(format!(
+                "git anchor live bracket: poisoned GIT_DIR redirected repo discovery to {}",
+                discovered.display()
+            ));
+        }
+        let isolated = isolated?;
+        if isolated.commit != commit_a || isolated.tree != tree_a || isolated.dirty {
+            return Err(format!(
+                "git anchor live bracket: poisoned repository env escaped isolation: {isolated:?}"
+            ));
+        }
+
+        git_output_at(&repo, &["replace", "-d", &commit_a])?;
+        let worktree_source = worktree.join("source.txt");
+
+        // A command-scoped core.fileMode=false can hide an executable-bit
+        // change from ordinary status. The identity helper clears injected
+        // config and forces the repository's real mode semantics.
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&worktree_source)
+            .map_err(|e| {
+                format!(
+                    "git anchor live bracket: cannot stat {}: {e}",
+                    worktree_source.display()
+                )
+            })?
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&worktree_source, permissions).map_err(|e| {
+            format!(
+                "git anchor live bracket: cannot chmod {}: {e}",
+                worktree_source.display()
+            )
+        })?;
+
+        // With ctime checks disabled, equal-size content plus a restored mtime
+        // can look unchanged in the index stat cache. The hardened probe forces
+        // ctime trust back on.
+        let set_old_mtime = || -> Result<(), String> {
+            let status = Command::new("touch")
+                .args(["-t", "200101010101.01"])
+                .arg(&worktree_source)
+                .status()
+                .map_err(|e| format!("git anchor live bracket: cannot set fixture mtime: {e}"))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("git anchor live bracket: touch exited {status}"))
+            }
+        };
+        set_old_mtime()?;
+        git_output_at(&worktree, &["update-index", "--refresh"])?;
+        std::fs::write(&worktree_source, b"tree-z\n")
+            .map_err(|e| format!("git anchor live bracket: cannot rewrite ctime fixture: {e}"))?;
+        set_old_mtime()?;
+        let ambient_ctime = git_status_with_injected_config(
+            &worktree,
+            &[("core.trustctime", "false")],
+            "source.txt",
+        )?;
+        if !ambient_ctime.is_empty() {
+            return Err(
+                "git anchor live bracket: core.trustctime=false did not hide the content change; \
+                 positive control is vacuous"
+                    .into(),
+            );
+        }
+        if !git_snapshot(&worktree, false)?.dirty {
+            return Err(
+                "git anchor live bracket: injected core.trustctime=false hid a content change"
+                    .into(),
+            );
+        }
+        git_output_at(&worktree, &["checkout", "--", "source.txt"])?;
+        let ambient_mode_status =
+            git_status_with_injected_config(&worktree, &[("core.fileMode", "false")], "source.txt")?;
+        let isolated_mode = git_snapshot(&worktree, false);
+        if !ambient_mode_status.is_empty() {
+            return Err(
+                "git anchor live bracket: core.fileMode=false did not hide the mode change; \
+                 positive control is vacuous"
+                    .into(),
+            );
+        }
+        let isolated_mode = isolated_mode?;
+        if !isolated_mode.dirty || !isolated_mode.worktree_dirty {
+            return Err(
+                "git anchor live bracket: injected core.fileMode=false hid a mode change".into(),
+            );
+        }
+        let mut permissions = std::fs::metadata(&worktree_source)
+            .map_err(|e| {
+                format!(
+                    "git anchor live bracket: cannot restat {}: {e}",
+                    worktree_source.display()
+                )
+            })?
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&worktree_source, permissions).map_err(|e| {
+            format!(
+                "git anchor live bracket: cannot restore mode on {}: {e}",
+                worktree_source.display()
+            )
+        })?;
+
+        // core.symlinks=false makes Git accept a regular file containing a
+        // symlink target as if it were the committed symlink. Validation runs
+        // on Linux and must compare the real file type, not that compatibility
+        // representation.
+        let worktree_link = worktree.join("link.txt");
+        std::fs::remove_file(&worktree_link).map_err(|e| {
+            format!("git anchor live bracket: cannot remove {}: {e}", worktree_link.display())
+        })?;
+        std::fs::write(&worktree_link, b"source.txt").map_err(|e| {
+            format!("git anchor live bracket: cannot replace {}: {e}", worktree_link.display())
+        })?;
+        let ambient_symlink_status =
+            git_status_with_injected_config(&worktree, &[("core.symlinks", "false")], "link.txt")?;
+        let isolated_symlink = git_snapshot(&worktree, false);
+        if !ambient_symlink_status.is_empty() {
+            return Err(
+                "git anchor live bracket: core.symlinks=false did not hide the file-type change; \
+                 positive control is vacuous"
+                    .into(),
+            );
+        }
+        let isolated_symlink = isolated_symlink?;
+        if !isolated_symlink.dirty || !isolated_symlink.worktree_dirty {
+            return Err(
+                "git anchor live bracket: injected core.symlinks=false hid a symlink replacement"
+                    .into(),
+            );
+        }
+        std::fs::remove_file(&worktree_link).map_err(|e| {
+            format!("git anchor live bracket: cannot remove {}: {e}", worktree_link.display())
+        })?;
+        std::os::unix::fs::symlink("source.txt", &worktree_link).map_err(|e| {
+            format!("git anchor live bracket: cannot restore {}: {e}", worktree_link.display())
+        })?;
+
+        // On a case-sensitive validation host, core.ignoreCase=true can hide a
+        // second untracked path that differs only by case.
+        let case_variant = worktree.join("SOURCE.txt");
+        std::fs::write(&case_variant, b"case collision\n")
+            .map_err(|e| format!("git anchor live bracket: cannot write case fixture: {e}"))?;
+        let ambient_case = git_status_with_injected_config(
+            &worktree,
+            &[("core.ignoreCase", "true")],
+            "SOURCE.txt",
+        )?;
+        if !ambient_case.is_empty() {
+            return Err(
+                "git anchor live bracket: core.ignoreCase=true did not hide the case collision; \
+                 positive control is vacuous"
+                    .into(),
+            );
+        }
+        if !git_snapshot(&worktree, false)?.dirty {
+            return Err(
+                "git anchor live bracket: injected core.ignoreCase=true hid an untracked path"
+                    .into(),
+            );
+        }
+        std::fs::remove_file(&case_variant)
+            .map_err(|e| format!("git anchor live bracket: cannot remove case fixture: {e}"))?;
+
+        // Both index hints can make ordinary status claim clean while bytes on
+        // disk differ. Their mere presence is therefore a refusal.
+        hidden_index_bracket(
+            &worktree,
+            "--assume-unchanged",
+            "--no-assume-unchanged",
+            "assume-unchanged",
+        )?;
+        hidden_index_bracket(
+            &worktree,
+            "--skip-worktree",
+            "--no-skip-worktree",
+            "skip-worktree",
+        )?;
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp).map_err(|e| {
+        format!("git anchor live bracket: cannot remove {}: {e}", tmp.display())
+    });
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Prove that a submodule cannot hide changed source behind index flags even
+/// when the superproject's ordinary status appears clean.
+fn live_submodule_identity_bracket() -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-submodule-identity-selftest-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&tmp).map_err(|e| {
+        format!(
+            "git anchor submodule bracket: cannot create {}: {e}",
+            tmp.display()
+        )
+    })?;
+
+    let result = (|| -> Result<(), String> {
+        let child = tmp.join("child");
+        let superproject = tmp.join("super");
+        for repo in [&child, &superproject] {
+            std::fs::create_dir(repo).map_err(|e| {
+                format!(
+                    "git anchor submodule bracket: cannot create {}: {e}",
+                    repo.display()
+                )
+            })?;
+            git_output_at(repo, &["init", "--quiet"])?;
+            git_output_at(repo, &["config", "user.name", "Validate Self-Test"])?;
+            git_output_at(
+                repo,
+                &["config", "user.email", "validate-self-test@example.invalid"],
+            )?;
+            git_output_at(repo, &["config", "commit.gpgsign", "false"])?;
+        }
+
+        std::fs::write(child.join("payload.txt"), b"committed\n")
+            .map_err(|e| format!("git anchor submodule bracket: cannot write child: {e}"))?;
+        git_output_at(&child, &["add", "payload.txt"])?;
+        git_output_at(&child, &["commit", "--quiet", "-m", "child"])?;
+
+        let child_s = child
+            .to_str()
+            .ok_or_else(|| "git anchor submodule bracket: child path is not UTF-8".to_string())?;
+        git_output_at(
+            &superproject,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                child_s,
+                "module",
+            ],
+        )?;
+        git_output_at(&superproject, &["commit", "--quiet", "-am", "super"])?;
+
+        // A fresh checkout may legitimately reach the initial admission probe
+        // before pre.submodules materializes the gitlink. The final proof is
+        // stricter because that DAG node must have initialized every module.
+        git_output_at(&superproject, &["submodule", "deinit", "--force", "--quiet", "module"])?;
+        let uninitialized_start = git_snapshot(&superproject, false)?;
+        if uninitialized_start.dirty {
+            return Err(
+                "git anchor submodule bracket: an uninitialized fresh checkout reported dirty"
+                    .into(),
+            );
+        }
+        if git_snapshot(&superproject, true)
+            .as_ref()
+            .err()
+            .is_none_or(|error| !error.contains("not initialized"))
+        {
+            return Err(
+                "git anchor submodule bracket: final proof accepted an uninitialized submodule"
+                    .into(),
+            );
+        }
+        git_output_at(
+            &superproject,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--quiet",
+                "module",
+            ],
+        )?;
+        let clean = git_snapshot(&superproject, true)?;
+        if clean.dirty {
+            return Err("git anchor submodule bracket: clean fixture reported dirty".into());
+        }
+
+        let module = superproject.join("module");
+        std::fs::write(module.join("payload.txt"), b"visible change\n").map_err(|e| {
+            format!("git anchor submodule bracket: cannot write visible child change: {e}")
+        })?;
+        let visible = git_snapshot(&superproject, true)?;
+        if !visible.dirty || !visible.worktree_dirty {
+            return Err(
+                "git anchor submodule bracket: visible submodule dirtiness was not represented"
+                    .into(),
+            );
+        }
+        git_output_at(&module, &["checkout", "--", "payload.txt"])?;
+
+        git_output_at(&module, &["update-index", "--assume-unchanged", "payload.txt"])?;
+        std::fs::write(module.join("payload.txt"), b"hidden change\n").map_err(|e| {
+            format!("git anchor submodule bracket: cannot write hidden child change: {e}")
+        })?;
+        let ordinary = git_output_at(&superproject, SOURCE_STATUS_ARGS)?;
+        if !ordinary.is_empty() {
+            return Err(
+                "git anchor submodule bracket: assume-unchanged did not hide the child edit; \
+                 positive control is vacuous"
+                    .into(),
+            );
+        }
+        let hardened = git_snapshot(&superproject, true);
+        if hardened.as_ref().err().is_none_or(|error| {
+            !error.contains("module") || !error.contains("assume-unchanged")
+        }) {
+            return Err(
+                "git anchor submodule bracket: hidden submodule source change was not refused"
+                    .into(),
+            );
+        }
+        Ok(())
+    })();
+
+    let cleanup = std::fs::remove_dir_all(&tmp).map_err(|e| {
+        format!(
+            "git anchor submodule bracket: cannot remove {}: {e}",
+            tmp.display()
+        )
+    });
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn utc_now() -> String {
@@ -2587,11 +3610,9 @@ fn find_parent(root: &Path) -> Option<PathBuf> {
     let mut cur = root.to_path_buf();
     loop {
         if cur.join(".gitmodules").is_file() {
-            if let Some(p) = sh(
-                "git",
+            if let Ok(p) = git_output_at(
+                &cur,
                 &[
-                    "-C",
-                    cur.to_str()?,
                     "config",
                     "-f",
                     ".gitmodules",
@@ -2652,12 +3673,20 @@ fn cache_state(root: &Path) -> &'static str {
 /// head lacks. It does NOT fetch (that would make an offline run fail for a
 /// network reason) and it does not fire when the ref is absent — an unknown base
 /// is reported as unknown, never silently treated as fresh.
-fn rebase_freshness(force: bool) -> Result<String, String> {
-    if sh("git", &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]).is_none() {
+fn rebase_freshness(root: &Path, commit: &str, force: bool) -> Result<String, String> {
+    if git_output_at(
+        root,
+        &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"],
+    )
+    .is_err()
+    {
         return Ok("base: origin/main not present locally; freshness UNKNOWN (not asserted)".into());
     }
-    let counts = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0\t0".into());
+    let counts = git_output_at(
+        root,
+        &["rev-list", "--left-right", "--count", &format!("origin/main...{commit}")],
+    )
+    .unwrap_or_else(|_| "0\t0".into());
     let mut it = counts.split_whitespace();
     let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -3457,17 +4486,13 @@ fn selective_plan(
     gate: &str,
     shallow: bool,
 ) -> Result<Plan, String> {
-    let commit_exists =
-        |sha: &str| sh("git", &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
-            || Command::new("git")
-                .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+    let commit_exists = |sha: &str| {
+        git_output_at(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok()
+    };
     let baseline: Option<String> = if shallow {
         // --shallow-select pins the baseline to HEAD~1. A root commit has no
         // parent, so selection fails safe to the full lane (validate.sh:4369).
-        sh("git", &["rev-parse", "--verify", "HEAD~1"])
+        git_output_at(root, &["rev-parse", "--verify", "HEAD~1"]).ok()
     } else {
         let ledger = ledger_path(root);
         let rows = validate_history::read_rows(&ledger);
@@ -4191,13 +5216,8 @@ fn forward_step_profiles(result: &RunResult, jobs: i64) {
     if dir.is_empty() || result.step_profile_rows.is_empty() {
         return;
     }
-    let git_sha = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let root = repo_root();
+    let git_sha = git_sha_checked(&root).unwrap_or_default();
     match append_step_profiles(
         Path::new(&dir),
         &result.step_profile_rows,
@@ -6150,6 +7170,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         return stop_test_seam(&root, &profile_name, parent.as_deref());
     }
 
+    // Capture one exact source identity for the logical run. Every later cache,
+    // ledger, receipt, and lock decision is tied to these values; re-reading
+    // HEAD independently at each call site could splice two clean checkouts into
+    // one apparently anchored row. A failed Git probe is not evidence of a
+    // clean tree, so it refuses before any validation state is created.
+    let source_start = match git_snapshot(&root, false) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("validate: REFUSED — cannot capture source identity: {error}");
+            return RunSummary::refused(
+                2,
+                &profile_name,
+                "the initial Git source-identity probe",
+                vec![
+                    error,
+                    "commit anchoring requires an exact HEAD commit, its tree, and a successful \
+                     porcelain status query"
+                        .into(),
+                ],
+            );
+        }
+    };
+
     // Anchor the logical run before locks, freshness checks, plan construction, cgroup re-exec,
     // durable-log setup, and registration.  A nested focused payload inherits the enclosing
     // safe-ci step's scheduler-owned epoch; a top-level run owns its epoch here.
@@ -6184,7 +7227,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // does not contend.
     let _invocation_lock;
     if !nesting.nested && !args.show_plan {
-        match validate_runtime::acquire_invocation_lock(&root, &profile_name, &git_sha()) {
+        match validate_runtime::acquire_invocation_lock(
+            &root,
+            &profile_name,
+            &source_start.commit,
+        ) {
             validate_runtime::LockOutcome::Acquired(l) => _invocation_lock = Some(l),
             validate_runtime::LockOutcome::Busy(why) => {
                 eprintln!("validate: REFUSED — {}", why[0]);
@@ -6211,14 +7258,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // that exists nowhere in history and cannot be reproduced or compared.
     // Skipped for a nested payload: the outer run already made this judgement
     // about the same checkout, and a second answer could only disagree.
-    let wt_dirty = worktree_dirty();
+    let wt_dirty = source_start.worktree_dirty;
     if !nesting.nested && wt_dirty && !args.run_on_dirty_tree {
         eprintln!("validate: refusing to run on a dirty working tree.");
-        eprintln!("  HEAD {} has uncommitted working-tree changes, so a record anchored to it", git_sha());
+        eprintln!(
+            "  HEAD {} has uncommitted working-tree changes, so a record anchored to it",
+            source_start.commit
+        );
         eprintln!("  would describe a tree that exists nowhere in history. Commit (preferred), or");
         eprintln!("  stage the WIP with 'git add', then re-run. To force an explicitly unanchored");
         eprintln!("  run pass --run-on-dirty-tree (agents must not).");
-        let _ = Command::new("git").args(["status", "--short"]).status();
+        let _ = isolated_git(&root, true).args(["status", "--short"]).status();
         return RunSummary::refused(
             2,
             &level_name,
@@ -6237,7 +7287,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
     // payload inherits the outer run's verdict on the very same checkout; it also
     // must not spend a network round trip inside a budgeted DAG node.
-    match rebase_freshness(args.run_on_dirty_tree || nesting.nested) {
+    match rebase_freshness(
+        &root,
+        &source_start.commit,
+        args.run_on_dirty_tree || nesting.nested,
+    ) {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
@@ -6432,7 +7486,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // part of the key.
     let ledger = ledger_path(&root);
     let ledger_rows = validate_history::read_rows(&ledger);
-    let tree = git_tree();
+    let tree = source_start.tree.clone();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
     let cache = cache_state(&root);
@@ -6448,13 +7502,27 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         && !args.ignore_cache
         && plan.cacheable
         && !wt_dirty
-        && !tree_dirty()
+        && !source_start.dirty
         && plan.selection_mode == "full"
     {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
+            let cache_anchor = assess_final_anchor(&source_start, git_snapshot(&root, false));
+            if !cache_anchor.commit_anchored {
+                let why = cache_anchor.integrity_error.unwrap_or_else(|| {
+                    "the checkout was not clean and commit-anchored at cache return".into()
+                });
+                eprintln!("validate: REFUSED — cache source identity changed: {why}");
+                let _ = std::fs::remove_dir_all(&tmp);
+                return RunSummary::refused(
+                    2,
+                    &plan.profile,
+                    "the cache-hit source-identity proof",
+                    vec![why],
+                );
+            }
             println!("# ============================================================");
             println!("# validate CACHE HIT for tree {tree}");
-            println!("#   (commit {})", git_sha());
+            println!("#   (commit {})", source_start.commit);
             println!(
                 "#   passed {} (wall {}, CPU {}, {} {} executed)",
                 hit.finished_at,
@@ -6489,6 +7557,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                     ),
                 ],
             );
+            s.commit = source_start.commit.clone();
             s.ledger = Some(ledger.clone());
             return s;
         }
@@ -6542,7 +7611,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             }
         };
 
-    let commit = git_sha();
+    let commit = source_start.commit.clone();
     match setup_durable_log(&root, &plan.profile, &commit) {
         Ok(d) => *durable_slot = Some(d),
         Err(code) => {
@@ -6625,7 +7694,14 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let node_count = plan.cfg.steps.len() + plan.second.as_ref().map(|c| c.steps.len()).unwrap_or(0);
 
     println!("Validation profile: {} (selection: {})", plan.profile, plan.selection_mode);
-    println!("Commit: {commit} ({})", if tree_dirty() { "⚠️  NOT commit-anchored: dirty tree" } else { "clean tree, commit-anchored" });
+    println!(
+        "Commit: {commit} ({})",
+        if source_start.dirty {
+            "⚠️  NOT commit-anchored: dirty tree at start"
+        } else {
+            "clean tree at start; final anchor check pending"
+        }
+    );
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
     println!("Plan: {node_count} boxed DAG node(s){}", if plan.second.is_some() { " across 2 sequential lanes" } else { "" });
     // A measured estimate from THIS machine's own history, or an honest "not
@@ -6753,17 +7829,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         &outcomes,
     );
 
-    let behind_ahead = sh("git", &["rev-list", "--left-right", "--count", "origin/main...HEAD"])
-        .unwrap_or_else(|| "0 0".into());
+    let behind_ahead = git_output_at(
+        &root,
+        &["rev-list", "--left-right", "--count", &format!("origin/main...{commit}")],
+    )
+    .unwrap_or_else(|_| "0 0".into());
     let mut ba = behind_ahead.split_whitespace();
     let git_behind: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let git_ahead: i64 = ba.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let dirty_now = tree_dirty();
-    let commit_anchored = commit != "unknown" && !dirty_now;
+    // First end checkpoint: this is the evidence used if an operator interrupt
+    // returns immediately below. Ordinary completion takes one more snapshot at
+    // the ledger commit point after all result processing.
+    let mut anchor = assess_final_anchor(&source_start, git_snapshot(&root, true));
     // Observed, not inferred: did the pin gate actually run and pass in THIS run?
     let pin_gate_passed = outcomes.iter().any(|o| o.tag == PIN_GATE_TAG && o.ok);
     let lock_admitted = canonical_validate_lock_admission(parent.as_deref(), &commit, &host);
-    let ctx = LedgerCtx {
+    let mut ctx = LedgerCtx {
         started_at,
         host: host.clone(),
         toolchain: toolchain.clone(),
@@ -6773,11 +7854,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         selection_mode: plan.selection_mode.into(),
         cache_state: cache.into(),
         commit: commit.clone(),
-        tree: git_tree(),
+        tree: source_start.tree.clone(),
         git_ahead,
         git_behind,
-        commit_anchored,
-        tree_dirty: dirty_now,
+        commit_anchored: anchor.commit_anchored,
+        tree_dirty: anchor.tree_dirty,
         dag_jobs: jobs,
         admission: lock_admitted.then_some("ci-hub-validate-lock"),
         base_sha: receipt.base_sha,
@@ -6814,6 +7895,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     // no_result verdict. A TIMEOUT, by contrast, is a completed run and falls
     // through to the normal verdict below.
     if let Some(sig) = &interruption {
+        if let Some(error) = &anchor.integrity_error {
+            eprintln!(
+                "validate: ERROR: source identity did not remain stable through interruption cleanup: {error}"
+            );
+        }
         if !nesting.nested {
             write_ledger(
                 &ledger,
@@ -6829,20 +7915,22 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
-        let mut s = RunSummary::new(
-            Verdict::Interrupted,
-            130,
-            &plan.profile,
-            vec![
+        let mut detail = vec![
                 format!("stopped by SIG{sig}; recorded as a NO-RESULT, not a failure"),
                 "an interrupt learned nothing about the tree, so it does not establish a product \
                  verdict — a TIMEOUT, by contrast, does"
                     .into(),
-            ],
-        );
+            ];
+        if let Some(error) = &anchor.integrity_error {
+            detail.push(format!(
+                "SOURCE IDENTITY REFUSED: {error}; commit_anchored=false"
+            ));
+        }
+        let mut s = RunSummary::new(Verdict::Interrupted, 130, &plan.profile, detail);
         s.nodes_executed = outcomes.len();
         s.nodes_failed = outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
         s.nodes_skipped = skipped.len();
+        s.commit = commit.clone();
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
         s.log = Some(log_path);
@@ -6893,7 +7981,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let mut envelope_regressed = false;
     let mut envelope_error: Option<(u8, String)> = None;
     if let Some(env) = &plan.envelope {
-        let short = sh("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+        let short: String = commit.chars().take(12).collect();
         let vector = validate_envelope::score(&outcomes, env.reps, &short);
         let json_file = validate_envelope::json_path(&root);
         let text = validate_envelope::to_ordered_json(&vector);
@@ -7003,6 +8091,29 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         pin_gate_bypassed = true;
     }
 
+    // Evidence-commit checkpoint: sample again only after every result and
+    // artifact has been derived, immediately before the ledger append that can
+    // make this run authoritative. Preserve any failure seen at the earlier
+    // post-DAG checkpoint instead of allowing a later clean read to launder it.
+    anchor = combine_anchor_assessments(
+        anchor,
+        assess_final_anchor(&source_start, git_snapshot(&root, true)),
+    );
+    ctx.commit_anchored = anchor.commit_anchored;
+    ctx.tree_dirty = anchor.tree_dirty;
+    if let Some(error) = &anchor.integrity_error {
+        eprintln!(
+            "validate: ERROR: source identity did not remain stable through validation: {error}"
+        );
+        // A green DAG over an identity that cannot be tied to the captured
+        // source is not a successful validation. The ledger retains the gate
+        // outcomes for diagnosis, but the process and receipt both fail closed.
+        exit_code = 2;
+    }
+    let commit_anchored = anchor.commit_anchored;
+    let dirty_now = anchor.tree_dirty;
+    let anchor_integrity_error = anchor.integrity_error.clone();
+
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
@@ -7082,6 +8193,11 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Some((_, msg)) = &envelope_error {
         detail.push(format!("envelope comparison could not run: {msg}"));
     }
+    if let Some(error) = &anchor_integrity_error {
+        detail.push(format!(
+            "SOURCE IDENTITY REFUSED: {error}; commit_anchored=false and no qualifying receipt was produced"
+        ));
+    }
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(
             "{} node(s) hit a wall or CPU budget; a timeout IS a recorded result: {}",
@@ -7135,6 +8251,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     s.nodes_executed = outcomes.len();
     s.nodes_failed = failures;
     s.nodes_skipped = skipped.len();
+    s.commit = commit;
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
     s.log = Some(log_path);
