@@ -447,6 +447,18 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// The divergence position, LIFTED OUT of `verification_report` so it is a
+    /// field rather than a substring.
+    ///
+    /// `verification_report` already contained these numbers, but as a
+    /// JSON-ENCODED STRING, so every consumer had to parse the row and then
+    /// parse a string inside it. That is why no cell has ever reported where
+    /// its divergence began: the value was present and unreachable. One
+    /// attempt is one observation, so this is the level the position belongs
+    /// at -- a cell with three attempts has three of them.
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// Companion to the field above, in virtual-nanosecond units.
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
     pub sabre_path_evidence: Option<String>,
     pub sabre_path_evidence_sha256: Option<String>,
     pub reason: Option<String>,
@@ -489,6 +501,21 @@ pub struct CellResult {
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
     pub attempts: Vec<AttemptResult>,
+    /// Cell-level divergence position: the FIRST attempt that located one.
+    ///
+    /// This mirrors `reason` exactly, which is also
+    /// `attempts.iter().find_map(...)`. Two other rules were available and both
+    /// are worse here: the LAST attempt would let a passing retry erase the
+    /// position a failing attempt found, and a min across attempts would be a
+    /// one-run aggregate that reads like the cross-run `ObservedRange`
+    /// earliest/latest without having a sample behind it. The per-attempt
+    /// fields are still present, so a consumer that wants a different rule can
+    /// apply it rather than being stuck with this one.
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// Companion to the field above, selected by the same first-attempt rule.
+    /// Selected INDEPENDENTLY, so a report carrying only one of the two
+    /// coordinates still contributes the one it has.
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
     pub reason: Option<String>,
 }
 
@@ -917,6 +944,8 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     }
     let mut report_json = None;
     let mut report_sha = None;
+    let mut first_divergent_scheduler_turn = None;
+    let mut first_divergent_virtual_nanoseconds = None;
     let (sabre_path_evidence, sabre_path_evidence_sha256) = spec
         .sabre_path_evidence
         .as_ref()
@@ -935,6 +964,21 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
                 match VerificationReport::from_json_slice(&bytes) {
                     Ok(report) => {
+                        // Recorded BEFORE the classification chain below,
+                        // because where the divergence began is a fact about
+                        // the report rather than a consequence of how the
+                        // attempt is classified -- a FAIL and an ERROR can both
+                        // carry a located divergence.
+                        //
+                        // Guarded on `launch_refusal` for the same reason the
+                        // arm below refuses to reclassify: no guest was ever
+                        // created, so any report present is stale or unrelated
+                        // and its position describes a different execution.
+                        if !launch_refusal {
+                            first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+                            first_divergent_virtual_nanoseconds =
+                                report.first_divergent_virtual_nanoseconds;
+                        }
                         if launch_refusal {
                             // The process never created a guest.  A report at
                             // this point is stale or otherwise unrelated and
@@ -1011,6 +1055,8 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds,
         sabre_path_evidence,
         sabre_path_evidence_sha256,
         reason,
@@ -1224,6 +1270,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     }
     .to_string();
     let mut reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
+    let (first_divergent_scheduler_turn, first_divergent_virtual_nanoseconds) =
+        cell_divergence_position(&attempts);
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
@@ -1362,6 +1410,8 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
             )
         }),
         attempts,
+        first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds,
         reason,
     })
 }
@@ -1417,8 +1467,39 @@ pub fn infrastructure_error_result(
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
+        // No attempt ran, so there is no divergence position to report. `None`
+        // here means "never measured", which is the same value a clean run
+        // produces -- see the note in the observation fold about those two
+        // being indistinguishable in this field alone. The surrounding row is
+        // what distinguishes them: this one carries an infrastructure error
+        // kind and an empty `attempts`.
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
         reason: Some(reason),
     }
+}
+
+/// Reduce per-attempt divergence positions to the cell-level pair.
+///
+/// Same first-attempt rule as `reason`, and resolved PER COORDINATE rather than
+/// per attempt: a report that located a turn but no virtual nanosecond still
+/// contributes the turn. Picking one attempt and taking both of its values
+/// would silently drop the other coordinate.
+///
+/// Deliberately NOT a min across attempts. A min over the attempts of one run
+/// is a one-run aggregate that would read like the cross-run `ObservedRange`
+/// earliest/latest in ci/compat-envelope/scorecard.rs without having a sample
+/// behind it, and this project has repeatedly been bitten by numbers that look
+/// like a measurement and are not.
+fn cell_divergence_position(attempts: &[AttemptResult]) -> (Option<u64>, Option<u64>) {
+    (
+        attempts
+            .iter()
+            .find_map(|attempt| attempt.first_divergent_scheduler_turn),
+        attempts
+            .iter()
+            .find_map(|attempt| attempt.first_divergent_virtual_nanoseconds),
+    )
 }
 
 fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<JsonValue>, String> {
@@ -2190,8 +2271,56 @@ backends_disabled:
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn attempt_with_divergence(turn: Option<u64>, nanos: Option<u64>) -> AttemptResult {
+        let mut attempt = attempt_with_sabre_evidence("");
+        attempt.first_divergent_scheduler_turn = turn;
+        attempt.first_divergent_virtual_nanoseconds = nanos;
+        attempt
+    }
+
+    /// The cell-level position is the FIRST attempt that located one, matching
+    /// how `reason` is chosen, and NOT the last -- otherwise a passing retry
+    /// would erase the position the failing attempt found.
+    #[test]
+    fn cell_divergence_takes_the_first_attempt_that_located_one() {
+        let attempts = vec![
+            attempt_with_divergence(None, None),
+            attempt_with_divergence(Some(4), Some(400)),
+            attempt_with_divergence(Some(1), Some(100)),
+        ];
+        assert_eq!(
+            cell_divergence_position(&attempts),
+            (Some(4), Some(400)),
+            "the first located position wins; a later, earlier-diverging attempt \
+             must not silently replace it, and this is NOT a min across attempts"
+        );
+    }
+
+    /// Resolved per coordinate, so a report that located only one of the two
+    /// still contributes the one it has.
+    #[test]
+    fn cell_divergence_resolves_each_coordinate_independently() {
+        let attempts = vec![
+            attempt_with_divergence(None, Some(900)),
+            attempt_with_divergence(Some(7), None),
+        ];
+        assert_eq!(cell_divergence_position(&attempts), (Some(7), Some(900)));
+    }
+
+    /// A clean cell reports no position. `None` here means "no divergence
+    /// located", which is the same value an unmeasured cell carries -- the
+    /// surrounding row is what distinguishes them, not this field.
+    #[test]
+    fn cell_divergence_is_absent_when_no_attempt_located_one() {
+        let attempts = vec![attempt_with_divergence(None, None)];
+        assert_eq!(cell_divergence_position(&attempts), (None, None));
+        assert_eq!(cell_divergence_position(&[]), (None, None));
+    }
+
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
         AttemptResult {
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
             index: "1".into(),
             outcome: "PASS".into(),
             error_kind: None,
@@ -2277,6 +2406,8 @@ backends_disabled:
                 compare_logs: true,
                 record_envelope: crate::canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
             }),
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
@@ -2342,6 +2473,8 @@ backends_disabled:
             verdict: "no_result".into(),
             comparison: None,
             compared_log_messages: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
         })
         .unwrap();
         let spec = CellRunSpec {
