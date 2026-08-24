@@ -465,6 +465,19 @@ pub struct VerificationOutcome {
     /// unit with `compared_log_messages`, so `record / compared` is the fraction
     /// of the log that was deterministic.
     pub first_divergent_record: Option<usize>,
+    /// How many syscalls the guest had COMPLETED when the divergence appeared,
+    /// read from detcore's own `finish syscall #N` counter.
+    ///
+    /// The fourth unit, and the one closest to what a person debugging actually
+    /// pictures: "the guest got 37 syscalls in" is more legible than a record
+    /// index. It is NOT interchangeable with `first_divergent_record` -- one
+    /// counts guest work, the other counts compared log records, and the two
+    /// move at completely different rates.
+    ///
+    /// `null` when the logs matched, when no comparison ran, or when no syscall
+    /// had completed before the divergence -- which is a real state, not a
+    /// missing value: a run can diverge during startup.
+    pub first_divergent_syscall: Option<u64>,
 }
 
 impl VerificationOutcome {
@@ -540,6 +553,10 @@ pub struct VerificationReport {
     /// null is "no divergence located", while a hypothetical 0 would mean the
     /// very first record differed. Nothing writes 0 -- the index is 1-based.
     pub first_divergent_record: Option<usize>,
+    /// How many syscalls the guest had COMPLETED when the divergence appeared,
+    /// from detcore's own `finish syscall #N` counter. See the identically
+    /// named field on [`VerificationOutcome`].
+    pub first_divergent_syscall: Option<u64>,
 }
 
 impl VerificationReport {
@@ -557,6 +574,7 @@ impl VerificationReport {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         }
     }
 }
@@ -588,6 +606,7 @@ impl From<&VerificationOutcome> for VerificationReport {
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
             first_divergent_record: outcome.first_divergent_record,
+            first_divergent_syscall: outcome.first_divergent_syscall,
         }
     }
 }
@@ -805,6 +824,7 @@ fn compare_two_runs_with_unsupported_scan(
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
+    let mut first_divergent_syscall = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -907,6 +927,7 @@ fn compare_two_runs_with_unsupported_scan(
                 // invariant if the comparator ever starts reporting a position
                 // on a match.
                 first_divergent_record = summary.first_divergent_record;
+                first_divergent_syscall = summary.first_divergent_syscall;
                 eprintln!(":: {}", "Log differences found between runs.".red().bold());
             }
         } else {
@@ -960,6 +981,7 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
+            first_divergent_syscall,
         })
     } else {
         Ok(VerificationOutcome {
@@ -970,6 +992,7 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
+            first_divergent_syscall,
         })
     }
 }
@@ -2067,6 +2090,7 @@ mod tests {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }

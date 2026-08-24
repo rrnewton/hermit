@@ -213,6 +213,11 @@ struct Observation {
     /// index. Shares a unit with the report's compared counts, unlike the two
     /// above, which are positions in scheduler and virtual time.
     first_divergent_record: Option<ObservedRange>,
+    /// Syscalls the guest completed before diverging. A DIFFERENT KEYSPACE from
+    /// the three above -- one real divergence was record 98, syscall 37,
+    /// scheduler turn 4 -- so these bounds must never be read against another
+    /// coordinate's axis.
+    first_divergent_syscall: Option<ObservedRange>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -422,6 +427,8 @@ struct PressureVerification {
     /// before this field existed still parses and simply reports None.
     #[serde(default)]
     first_divergent_record: Option<u64>,
+    #[serde(default)]
+    first_divergent_syscall: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -466,6 +473,8 @@ struct ResultRow {
     /// the differing record itself.
     #[serde(default)]
     first_divergent_record: Option<u64>,
+    #[serde(default)]
+    first_divergent_syscall: Option<u64>,
 }
 
 impl ResultRow {
@@ -1563,6 +1572,10 @@ fn apply_pressure_summary(
             .verification
             .as_ref()
             .and_then(|report| report.first_divergent_record);
+        let divergent_syscall = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_syscall);
         if !result.carries_divergence_position()
             && (turn.is_some() || virtual_nanoseconds.is_some())
         {
@@ -1577,11 +1590,14 @@ fn apply_pressure_summary(
             turn,
             virtual_nanoseconds,
             divergent_record,
+            divergent_syscall,
             invocation,
         ));
     }
 
-    for (index, result, turn, virtual_nanoseconds, divergent_record, invocation) in prepared {
+    for (index, result, turn, virtual_nanoseconds, divergent_record, divergent_syscall, invocation) in
+        prepared
+    {
         // Every row here is a cell the pressure test actually exercised,
         // whatever its result, so it gets the same stamp the validate fold
         // applies. This is the ONLY writer that reaches red cells.
@@ -1610,6 +1626,7 @@ fn apply_pressure_summary(
                     first_divergent_scheduler_turn: None,
                     first_divergent_virtual_nanoseconds: None,
                     first_divergent_record: None,
+                    first_divergent_syscall: None,
                 });
                 observations.last_mut().expect("observation was appended")
             }
@@ -1633,6 +1650,7 @@ fn apply_pressure_summary(
             virtual_nanoseconds,
         );
         merge_range(&mut observation.first_divergent_record, divergent_record);
+        merge_range(&mut observation.first_divergent_syscall, divergent_syscall);
         // Sort by the full key, so a tree carrying both a pressure-test and a
         // validate observation still has a stable tracked-file order.
         observations.sort_by(|left, right| {
@@ -1724,6 +1742,7 @@ fn apply_validate_results(
             if row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
                 && row.first_divergent_record.is_none()
+                && row.first_divergent_syscall.is_none()
             {
                 continue;
             }
@@ -1781,6 +1800,7 @@ fn apply_validate_results(
                         first_divergent_scheduler_turn: None,
                         first_divergent_virtual_nanoseconds: None,
                         first_divergent_record: None,
+                        first_divergent_syscall: None,
                     });
                     observations.last_mut().expect("observation was appended")
                 }
@@ -1813,6 +1833,10 @@ fn apply_validate_results(
             merge_range(
                 &mut observation.first_divergent_record,
                 row.first_divergent_record,
+            );
+            merge_range(
+                &mut observation.first_divergent_syscall,
+                row.first_divergent_syscall,
             );
             observations.sort_by(|left, right| {
                 left.detcore_tree
@@ -2272,6 +2296,7 @@ fn self_test() -> Result<(), String> {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
@@ -2293,6 +2318,7 @@ fn self_test() -> Result<(), String> {
                     first_divergent_scheduler_turn: None,
                     first_divergent_virtual_nanoseconds: None,
                     first_divergent_record: None,
+                    first_divergent_syscall: None,
                 }).unwrap();
                 serde_json::json!({
                 "argv":["hermit","run"],
@@ -2506,6 +2532,7 @@ fn self_test() -> Result<(), String> {
             first_divergent_scheduler_turn: turn,
             first_divergent_virtual_nanoseconds: virtual_nanoseconds,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         }),
         evidence_errors: Vec::new(),
         invocation: Some(PressureInvocation {
@@ -2675,6 +2702,7 @@ fn self_test() -> Result<(), String> {
         first_divergent_scheduler_turn: Some(7),
         first_divergent_virtual_nanoseconds: Some(70),
         first_divergent_record: Some(12),
+        first_divergent_syscall: Some(9),
         attempts: vec![serde_json::json!({
             "index": "1",
             "outcome": "FAIL",
@@ -2741,6 +2769,14 @@ fn self_test() -> Result<(), String> {
             != Some(ObservedRange {
                 earliest: 12,
                 latest: 12,
+                samples: 1,
+            })
+        // The fourth unit, a different keyspace again: 12 records in but only
+        // 9 syscalls completed.
+        || from_validate.first_divergent_syscall
+            != Some(ObservedRange {
+                earliest: 9,
+                latest: 9,
                 samples: 1,
             })
         || from_validate.results != BTreeSet::from([ObservedResult::DeterminismFailure])
@@ -2851,6 +2887,7 @@ fn self_test() -> Result<(), String> {
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
+        first_divergent_syscall: None,
         attempts: vec![serde_json::json!({
             "argv":["fixture"],
             "guest_argv":["fixture"],

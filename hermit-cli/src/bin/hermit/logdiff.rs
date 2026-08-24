@@ -523,6 +523,8 @@ struct JsonReport<'a> {
     /// than merely bounded by `records.compared`.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_divergent_record: Option<usize>,
+    /// How many syscalls the guest had completed when the divergence appeared.
+    first_divergent_syscall: Option<u64>,
     first_divergent_scheduler_turn: Option<u64>,
     first_divergent_virtual_nanoseconds: Option<u64>,
 }
@@ -563,6 +565,7 @@ fn json_report<'a>(
         records,
         follow_stopped_because: None,
         first_divergent_record: summary.first_divergent_record,
+        first_divergent_syscall: summary.first_divergent_syscall,
         comparison: JsonComparison {
             stream,
             record_envelope,
@@ -590,6 +593,7 @@ fn pending_json_report(
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
+        first_divergent_syscall: None,
     };
     let mut report = json_report(&summary, options, no_records(), record_envelope);
     report.verdict = JsonVerdict::NoResult;
@@ -912,6 +916,7 @@ mod tests {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         };
         let records = JsonRecords {
             compared: 40,
@@ -978,6 +983,9 @@ mod tests {
             first_divergent_scheduler_turn: Some(17),
             first_divergent_virtual_nanoseconds: Some(123),
             first_divergent_record: Some(9),
+            // A different keyspace from the record index above, deliberately:
+            // nine compared records in, only three syscalls completed.
+            first_divergent_syscall: Some(3),
         };
         let value = serde_json::to_value(json_report(
             &summary,
@@ -1071,6 +1079,7 @@ mod tests {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         };
         write_json(
             &path,

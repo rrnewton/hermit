@@ -772,6 +772,40 @@ fn commit_position_at_or_before(
         .find_map(|(_, message)| commit_position(message))
 }
 
+/// detcore's OWN syscall counter, read verbatim from a `finish syscall #N`
+/// record rather than derived by counting.
+///
+/// Counting compared records would invent a SECOND numbering that could
+/// silently disagree with the one printed in the log, and this project has
+/// already had a bare ordinal misread against the wrong axis. Parsing the
+/// number detcore itself emitted means the value can be grepped straight out of
+/// the log it came from.
+fn finished_syscall_number(line: &str) -> Option<u64> {
+    let rest = line.split("finish syscall #").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// How many syscalls the guest had COMPLETED when the divergence appeared.
+///
+/// `inbound syscall` records carry no number, so this deliberately reads only
+/// `finish syscall #N`: the answer is "the guest got this far", and a syscall
+/// that was entered but never returned has not got anywhere yet.
+///
+/// ⚠️ THIS UNIT IS COMPARABLE ACROSS BACKENDS, AND A DIFFERENCE IS A FINDING
+/// RATHER THAN AN ARTEFACT. The same `getpgrp` sitting at DETLOG event 40 under
+/// ptrace and 39 under DBT is not a limitation of the measurement -- the guest
+/// is not supposed to be able to tell which backend it is running on, so a
+/// syscall-stream difference between two backends IS the parity divergence.
+/// Do not restrict this to within-backend use or label it incomparable; that
+/// would hide exactly what parity cells exist to detect.
+fn finished_syscall_at_or_before(v: &[(usize, &str)], message_index: usize) -> Option<u64> {
+    v.iter()
+        .rev()
+        .filter(|(index, _)| *index <= message_index)
+        .find_map(|(_, message)| finished_syscall_number(message))
+}
+
 fn syscall_at_or_before<'a>(
     syscalls: &[(usize, &'a str)],
     index: usize,
@@ -1063,6 +1097,11 @@ pub struct LogDiffSummary {
     /// the first N records" is a bound, not a location, and on a long run the
     /// two are far apart; this is the location.
     pub first_divergent_record: Option<usize>,
+    /// How many syscalls the guest had COMPLETED when the divergence appeared,
+    /// as detcore's own `finish syscall #N` counter. The fourth unit: a
+    /// divergence located at record 108 is easier to act on when you also know
+    /// the guest was 37 syscalls in.
+    pub first_divergent_syscall: Option<u64>,
 }
 
 impl LogDiffSummary {
@@ -1367,6 +1406,11 @@ pub fn log_diff_summary_from_strs_with_filter(
             .or_else(|| right_index.and_then(|index| commit_position_at_or_before(&all_b, index)))
     });
 
+    let first_divergent_syscall_candidate = first_different.and_then(|(left, right)| {
+        left.and_then(|index| finished_syscall_at_or_before(&all_a, index))
+            .or_else(|| right.and_then(|index| finished_syscall_at_or_before(&all_b, index)))
+    });
+
     let diff_found = if opts.git_diff {
         git_diff(
             which,
@@ -1405,6 +1449,9 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_different)
             .flatten()
             .and_then(|(left_index, right_index)| left_index.or(right_index)),
+        first_divergent_syscall: diff_found
+            .then_some(first_divergent_syscall_candidate)
+            .flatten(),
     };
 
     if diff_found {
@@ -1485,6 +1532,8 @@ mod test {
     use clap::Parser;
     use pretty_assertions::assert_eq;
 
+    use super::finished_syscall_at_or_before;
+    use super::finished_syscall_number;
     use crate::logdiff::DetLogFilter;
 
     /// One well-formed log record. Records are delimited by their leading
@@ -1652,6 +1701,50 @@ mod test {
         assert_eq!(compare(&same, &same).summary.first_divergent_record, None);
         // And an empty comparison reports no location rather than record zero.
         assert_eq!(compare("", "").summary.first_divergent_record, None);
+    }
+
+    /// The syscall counter is READ from detcore's own `finish syscall #N`
+    /// text, not re-derived by counting records. Counting would invent a second
+    /// numbering that could disagree with the log it came from.
+    #[test]
+    fn the_syscall_number_is_parsed_from_the_record_detcore_wrote() {
+        assert_eq!(
+            finished_syscall_number(
+                "DETLOG [syscall][detcore, dtid 3] finish syscall #37: write(1, 0x5, 6) = Ok(6)"
+            ),
+            Some(37)
+        );
+        // `inbound` records carry no number: the guest has not got anywhere yet.
+        assert_eq!(
+            finished_syscall_number(
+                "DETLOG [syscall][detcore, dtid 3] inbound syscall: brk(NULL) = ?"
+            ),
+            None
+        );
+        assert_eq!(finished_syscall_number("no syscall here"), None);
+    }
+
+    /// Reports the LAST syscall completed at or before the divergence, and
+    /// reports NONE when none had completed. The second half is a real state
+    /// rather than a gap: a run can diverge during startup, before the guest
+    /// has finished a single syscall. Measured on a real 131-line log --
+    /// diverging at record 12 reported no syscall, while diverging at record 98
+    /// reported syscall 37.
+    #[test]
+    fn the_syscall_count_is_the_last_one_completed_before_the_divergence() {
+        let finished = |n: u64| format!("finish syscall #{n}: write(1, 0x5, 6) = Ok(6)");
+        let a = finished(2);
+        let b = finished(37);
+        let syscalls = vec![(10usize, a.as_str()), (90usize, b.as_str())];
+        assert_eq!(finished_syscall_at_or_before(&syscalls, 98), Some(37));
+        assert_eq!(finished_syscall_at_or_before(&syscalls, 90), Some(37));
+        assert_eq!(finished_syscall_at_or_before(&syscalls, 50), Some(2));
+        assert_eq!(
+            finished_syscall_at_or_before(&syscalls, 9),
+            None,
+            "a divergence before any syscall completed has no syscall count, \
+             and that is a state rather than a missing value"
+        );
     }
 
     #[test]

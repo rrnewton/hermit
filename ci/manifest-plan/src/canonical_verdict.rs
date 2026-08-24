@@ -49,6 +49,16 @@ pub struct VerificationReport {
     /// the index is 1-based. Same tolerant-default rationale as its siblings.
     #[serde(default)]
     pub first_divergent_record: Option<u64>,
+    /// How many syscalls the guest had COMPLETED when the divergence appeared,
+    /// from detcore's own `finish syscall #N` counter.
+    ///
+    /// NOT interchangeable with `first_divergent_record`: one counts guest work
+    /// and the other counts compared log records, and they move at completely
+    /// different rates. Measured on one real divergence: record 98, syscall 37.
+    /// `null` also covers a genuine state -- a run that diverged before any
+    /// syscall completed.
+    #[serde(default)]
+    pub first_divergent_syscall: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -306,6 +316,7 @@ mod tests {
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         }
     }
 
