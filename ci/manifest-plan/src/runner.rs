@@ -1806,7 +1806,14 @@ mod tests {
         let mode = ModeRecipe {
             ci: CiSelectionSpec::Uniform(ci),
             ci_disabled_reason: (!ci)
-                .then(|| CiDisabledReasonSpec::Uniform("not selected yet".into())),
+                // A real sentence, because the shared-string form now carries the
+                // same substance rule as a per-backend entry. "not selected yet"
+                // is one of the placeholder phrases that rule bans outright.
+                .then(|| {
+                    CiDisabledReasonSpec::Uniform(
+                        "fixture cell: ptrace only, other backends unmeasured here".into(),
+                    )
+                }),
             backends_enabled: vec!["ptrace".into()],
             backends_disabled: disabled,
             ..ModeRecipe::default()

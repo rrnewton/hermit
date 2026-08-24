@@ -225,19 +225,25 @@ impl CiSelection {
     }
 }
 
-fn nonempty_legacy_reason(reason: &str) -> Result<String, String> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err("ci_disabled_reason must be a non-empty string".into());
-    }
-    Ok(reason.to_string())
-}
-
-fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> Result<(), String> {
-    let detail = reason.reason.trim();
+/// The substance a stated reason must carry, independent of how it is spelled.
+///
+/// `subject` is an already-spaced qualifier appended to the message: `" for
+/// dbt"` for a per-backend entry, or `""` for the shared string form, which
+/// names no backend because it applies to all of them at once.
+///
+/// WHY THIS IS SHARED. These two checks used to live only in
+/// [`validate_backend_reason`], so which rule a cell was held to depended on
+/// which spelling its manifest happened to use. Measured before this change:
+/// the single character `x` was accepted as a shared string and refused by name
+/// as a per-backend entry, and `temporarily disabled for now` -- a phrase the
+/// list below bans outright -- passed as a shared string. Counting one stated
+/// reason as one unit, 535 of the 568 in the manifests were on the weaker path
+/// (535 shared strings against 33 per-backend entries, which occupy 32 cells).
+fn validate_reason_substance(subject: &str, detail: &str) -> Result<(), String> {
+    let detail = detail.trim();
     if detail.len() < 16 || detail.split_whitespace().count() < 3 {
         return Err(format!(
-            "ci_disabled_reason for {backend} must explain the result in at least three words"
+            "ci_disabled_reason{subject} must explain the result in at least three words"
         ));
     }
     let normalized = detail.to_ascii_lowercase();
@@ -251,9 +257,30 @@ fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> R
     .any(|placeholder| normalized.contains(placeholder))
     {
         return Err(format!(
-            "ci_disabled_reason for {backend} must state the measured result, not placeholder text"
+            "ci_disabled_reason{subject} must state the measured result, not placeholder text"
         ));
     }
+    Ok(())
+}
+
+/// The shared-string form of `ci_disabled_reason`.
+///
+/// It carries the same substance requirement as a per-backend entry. It does
+/// NOT carry the evidence requirement, and cannot: evidence is a field of the
+/// per-backend shape and this form has nowhere to put one. Closing that half
+/// means changing what a manifest may say, across every cell using this form,
+/// which is a migration rather than a validator change.
+fn nonempty_legacy_reason(reason: &str) -> Result<String, String> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err("ci_disabled_reason must be a non-empty string".into());
+    }
+    validate_reason_substance("", reason)?;
+    Ok(reason.to_string())
+}
+
+fn validate_backend_reason(backend: &str, reason: &BackendCiDisabledReason) -> Result<(), String> {
+    validate_reason_substance(&format!(" for {backend}"), &reason.reason)?;
     let evidence = reason.evidence.trim();
     let evidence_is_locator = evidence.len() >= 8
         && (evidence.contains('/')

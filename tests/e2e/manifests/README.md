@@ -208,10 +208,12 @@ updated in the same review.
 A `ci = false` cell is never executed **and never compiled** by ordinary
 validation, so its guest can
 rot without any node noticing. Two mechanisms bound that. `manifest-plan`
-rejects every enabled mode with boolean `ci = false` unless it has a non-empty
-shared `ci_disabled_reason`. For a per-backend mapping it instead requires the
-structured checks above. It rejects a stale reason left behind on a selected
-backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
+rejects every enabled mode with boolean `ci = false` unless it has a shared
+`ci_disabled_reason` carrying explanatory text: at least sixteen characters and
+at least three words, and not placeholder text. A per-backend mapping is held to
+that same requirement, and additionally requires the retained evidence described
+above, which the shared string has no field for. It rejects a stale reason left
+behind on a selected backend. Separately, `target/debug/test-harness audit-compile --category <bucket>` compiles every C guest
 the bucket declares regardless of its `ci` flag; it is wired into the portable
 DAG for `backend-parity-c` and fails closed on zero compiled.
 
