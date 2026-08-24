@@ -22,10 +22,30 @@
   #     build dependencies -- they are the program under test. A different
   #     `openssl` or `sqlite3` is a different guest.
 
+  # PIN POLICY: current when set, refreshed deliberately, never left to rot.
+  # A pin by revision + narHash is what gives the rebuild-from-source property;
+  # being CURRENT is a separate property, and the two are not in conflict. The
+  # first version of this file pinned nixpkgs at 2024-12-30 while rust-overlay
+  # was current, and nobody noticed for the whole life of the change, because
+  # the Rust toolchain comes from the overlay so the stale half was invisible.
+  # At that revision `pkgs.rustc` was 1.77.2, which cannot build this repo at
+  # all -- 30 of its crates are edition 2024, which needs 1.85 or newer. That
+  # made "could we drop rust-overlay and use nixpkgs' own Rust?" look answered
+  # in the negative when it was not.
+  #
+  # Do NOT replace these with a branch name to keep them fresh. A branch is not
+  # reproducible. Re-pin to a new revision as a reviewed change instead.
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/b134951a4c9f3c995fd7be05f3243f8ecd65d798";
+    # nixos-unstable @ 2026-08-23. `pkgs.rustc` here is 1.95.0 on the 26.05
+    # release branch and 1.97.1 on unstable; unstable is taken because 1.97.1 is
+    # the exact stable version the whole workspace has been shown to
+    # `cargo check` clean against, so the drop-rust-overlay question can be
+    # tested against this image rather than argued about.
+    nixpkgs.url = "github:NixOS/nixpkgs/56c02bc00adcf003215cc4bd996d6efaf4cff188";
+    # oxalica/rust-overlay @ 2026-08-24, which was already the tip when this
+    # bump was made -- this input had not gone stale, only nixpkgs had.
     rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+      url = "github:oxalica/rust-overlay/ab450d47a3f906d19de1b332915bfc6e5b29c853";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
