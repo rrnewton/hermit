@@ -5,4 +5,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
-reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7", default-features = false, features = ["preload-constructor"] }
+reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "3798935e38ee0d85a2f2e3b91572280cb337af07", default-features = false, features = ["preload-constructor"] }
