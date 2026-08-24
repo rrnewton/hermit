@@ -98,6 +98,7 @@ pub struct ModeRecipe {
     pub backends_disabled: BTreeMap<String, String>,
     #[serde(default)]
     pub guest_args: BTreeMap<String, Vec<String>>,
+    pub workdir: Option<String>,
     pub runs: Option<u64>,
     pub seeds: Option<Vec<i64>>,
     pub assert: Option<Assertions>,
@@ -353,6 +354,12 @@ fn validate_document(document: &ManifestDocument, stem: &str, root: &Path) -> Re
 }
 
 fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
+    validate_mode_workdir(
+        id,
+        mode,
+        recipe.workdir.as_deref(),
+        &recipe.backends_enabled,
+    )?;
     let expected: BTreeSet<&str> = if mode == "naked" {
         ["native"].into_iter().collect()
     } else {
@@ -401,6 +408,33 @@ fn validate_mode(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String
                 "{id}: {mode} guest_args names disabled backend {backend}"
             ));
         }
+    }
+    Ok(())
+}
+
+pub fn validate_mode_workdir(
+    id: &str,
+    mode: &str,
+    workdir: Option<&str>,
+    backends_enabled: &[String],
+) -> Result<(), String> {
+    let Some(workdir) = workdir else {
+        return Ok(());
+    };
+    if !matches!(mode, "verify" | "chaos" | "custom") {
+        return Err(format!(
+            "{id}: {mode} workdir is supported only by Hermit run modes"
+        ));
+    }
+    if !Path::new(workdir).is_absolute() {
+        return Err(format!("{id}: {mode} workdir must be an absolute path"));
+    }
+    // The DBT dispatcher currently rebuilds the guest launch from program,
+    // arguments, and environment only; it does not preserve Command::current_dir.
+    if backends_enabled.iter().any(|backend| backend == "dbt") {
+        return Err(format!(
+            "{id}: {mode} workdir is unsupported when DBT is enabled"
+        ));
     }
     Ok(())
 }
@@ -778,6 +812,7 @@ pub fn build_spec(
     seed: Option<i64>,
 ) -> Result<CellRunSpec, String> {
     let backend = cell.id.backend.as_deref().unwrap_or("native");
+    let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
     let sabre_path_evidence = (backend == "sabre").then(|| {
         dir.join("captures")
@@ -825,6 +860,7 @@ pub fn build_spec(
                 ]);
                 verification_log_dir = Some(logs);
             }
+            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
             append_guest_env_args(&mut argv, &env);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -882,6 +918,7 @@ pub fn build_spec(
                 "--sched-heuristic=random".into(),
                 format!("--seed={seed}"),
             ]);
+            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
             append_guest_env_args(&mut argv, &env);
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -898,6 +935,7 @@ pub fn build_spec(
             ];
             argv.extend(cell.test.modes["custom"].args.clone());
             append_scheduled_jobs_env_arg(&mut argv, &env);
+            append_workdir_arg(&mut argv, mode_recipe.workdir.as_deref());
             argv.push("--".into());
             argv.extend(guest_argv.clone());
             (argv, None)
@@ -1903,6 +1941,15 @@ fn append_scheduled_jobs_env_arg(argv: &mut Vec<String>, env: &BTreeMap<String, 
     argv.push(format!("{SCHEDULED_JOBS_ENV}={value}"));
 }
 
+/// Hermit resolves `--workdir` AFTER installing guest mounts, so an absolute
+/// path here starts the guest in the fresh private mount rather than whatever
+/// host directory the validation checkout occupied.
+fn append_workdir_arg(argv: &mut Vec<String>, workdir: Option<&str>) {
+    if let Some(workdir) = workdir {
+        argv.extend(["--workdir".into(), workdir.into()]);
+    }
+}
+
 fn observation_hash(observation: &Observation, attempt: &AttemptResult, dir: &Path) -> String {
     let mut digest = Sha256::new();
     if observation.status {
@@ -2188,6 +2235,7 @@ mod tests {
 ci:
   ptrace: true
   liteinst: false
+workdir: /tmp
 ci_disabled_reason:
   liteinst:
     result: determinism-failure
@@ -2202,6 +2250,7 @@ backends_disabled:
         )
         .unwrap();
         validate_mode("fixture/test", "verify", &mode).unwrap();
+        assert_eq!(mode.workdir.as_deref(), Some("/tmp"));
         let policy = ci_selection(&mode).unwrap();
         assert!(policy.selected("ptrace"));
         assert!(!policy.selected("liteinst"));
@@ -2209,6 +2258,90 @@ backends_disabled:
             policy.reason("liteinst").unwrap().result,
             Some(CiDisabledResult::DeterminismFailure)
         );
+    }
+
+    #[test]
+    fn rejects_relative_run_workdir() {
+        let mut mode = recipe(true).modes.remove("verify").unwrap();
+        mode.workdir = Some("tmp".into());
+        assert_eq!(
+            validate_mode("fixture/test", "verify", &mode).unwrap_err(),
+            "fixture/test: verify workdir must be an absolute path"
+        );
+    }
+
+    #[test]
+    fn rejects_workdir_for_non_run_modes() {
+        for mode in ["replay", "naked"] {
+            assert_eq!(
+                validate_mode_workdir("fixture/test", mode, Some("/tmp"), &[]).unwrap_err(),
+                format!("fixture/test: {mode} workdir is supported only by Hermit run modes")
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_accepts_ptrace_and_rejects_dbt_or_mixed_modes() {
+        let ptrace = vec!["ptrace".into()];
+        assert_eq!(
+            validate_mode_workdir("fixture/test", "verify", Some("/tmp"), &ptrace),
+            Ok(())
+        );
+
+        for mode in ["verify", "chaos", "custom"] {
+            for backends in [vec!["dbt".into()], vec!["ptrace".into(), "dbt".into()]] {
+                assert_eq!(
+                    validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends)
+                        .unwrap_err(),
+                    format!("fixture/test: {mode} workdir is unsupported when DBT is enabled")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_workdir_precedes_the_guest_separator() {
+        let mut test = recipe(true);
+        test.modes.get_mut("verify").unwrap().workdir = Some("/tmp".into());
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: PathBuf::from("/repo"),
+            hermit_bin: PathBuf::from("/repo/hermit"),
+            result_root: PathBuf::from("/repo/results"),
+            build_root: PathBuf::from("/repo/build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: true,
+            record_verify_strict: true,
+        };
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+        let workdir = spec
+            .argv
+            .windows(2)
+            .position(|args| args == ["--workdir", "/tmp"])
+            .unwrap();
+        assert!(workdir < separator);
     }
 
     #[test]
