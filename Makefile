@@ -133,12 +133,43 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 #
 # It stays runnable and it stays a real contract for the stop path; it is only
 # out of the pre-flight. A target that is red by construction teaches people to
-# ignore it within a day, which costs more than the coverage it was providing --
-# and it was providing none, since it never passed.
+# ignore it within a day.
+#
+# ⚠️ WHAT IS GOING UNENFORCED, BECAUSE "IT NEVER PASSED" IS NOT THE SAME AS
+# "IT COVERED NOTHING", AND THE DIFFERENCE DECIDES WHETHER ANYONE REPAIRS IT.
+# main() runs EIGHT contract groups BEFORE the rotted assertion, and Python
+# raises at the first failure, so reaching line 308 proves all eight PASSED on
+# every run:
+#     run_signal(SIGTERM / SIGINT / SIGHUP, expect_record=True)    3
+#     run_signal(SIGKILL,  expect_record=False)                    1
+#     run_signal(SIGTERM,  prior_failure=True)                     1
+#     run_signal(SIGTERM,  lock_proven=True)                       1
+#     run_signal(SIGTERM,  forged_owner=True)                      1
+#     run_incomplete_exit()                                        1
+# Those pin the stop-path signal semantics AND the schema-5 receipt provenance:
+# admission == "ci-hub-validate-lock", concurrent_validates == 0,
+# concurrency_proof == "validate_lock_owner_ancestry", git_depth > 0, and --
+# via forged_owner -- that a CALLER-SELECTED owner value can never establish
+# admission. Those are landing-authority fields. That is what is lost here, not
+# nothing.
+#
+# ONE MOVED SHARD LOCATION RESTORES ALL EIGHT. The only rotted assertion is
+# `assert len(shards) == 1` looking for a local shard the run no longer writes;
+# it now publishes to ledger/hermit/<host>/<month>.jsonl through the parent
+# adapter, which the failure output states outright. Tracked as its own task,
+# `tg restore_stop_path_test`, so this comment is not the only
+# record of a repair nobody owns.
 #
 # I did NOT "fix" (2) by editing the assertion to match what the code now does.
 # That is the shape this project refuses elsewhere, and the right repair needs
 # whoever owns the stop path to say which location is correct.
+#
+# TO RUN IT: from a checkout NESTED UNDER the dev-hermit parent, with the
+# agent-utils submodule initialised. The test walks ROOT.parents for a directory
+# containing ci-hub/ledger/validate_rows.py, so an un-nested checkout dies with
+# StopIteration at line 213, and a missing submodule makes validate.rs exit 1
+# before READY now that it needs agent-utils/rs/dagrun. Both look like the test
+# failing and are neither -- that mislocation cost two separate verifications.
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
