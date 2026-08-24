@@ -2699,32 +2699,44 @@ impl Scheduler {
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && blockers_empty {
-                // `trace!`, not `info!`, and that level is load-bearing.
+                // `info!`, and that level is load-bearing. Restored from `trace!`
+                // by owner ruling after 08ff51a33e demoted it.
                 //
-                // How many times this branch is reached is a function of HOST
-                // scheduling, not of the guest. The branch above spins on
-                // `yield_now()` until the host kernel delivers the child's final
-                // wait status, so whether the scheduler arrives here once or not
-                // at all before the run queue drains depends on when that
-                // external, real-time event lands. Under concurrent
-                // verification it lands later, and this line then appears in one
-                // run of a `--verify` pair and not the other.
+                // THE DEMOTION'S ARGUMENT AND WHY IT WAS REJECTED. It ran: how
+                // many times this branch is reached depends on when the host
+                // delivers a child's final wait status, that is an external
+                // real-time event, an INFO line driven by one is a determinism
+                // hazard by construction, so keep the loop sub-INFO. The
+                // measurement offered with it was real -- over 312 concurrent
+                // SaBRe cell-runs, 4 diverged, and in each the whole difference
+                // was this line plus one unrelated WARN.
                 //
-                // Measured: over 312 concurrent SaBRe cell-runs, 4 diverged, and
-                // in every one of the four the ENTIRE difference between the two
-                // runs was this line plus the position of one unrelated WARN.
-                // Zero guest events, syscalls, virtual-time values or COMMITs
-                // differed; guest exit status and stdout were identical. The
-                // canonical `BitwiseInfoV1` comparator reads the full INFO
-                // remainder, so an INFO line emitted from a host-timing-dependent
-                // poll is a determinism hazard by construction.
+                // The owner's ruling: this fizzle is part of the deterministic
+                // scheduling model, not record/replay external-IO terrain, so it
+                // SHOULD be a deterministic function of detcore scheduling. If it
+                // is not, that is a hermit DEFECT, and demoting the line hid the
+                // defect instead of fixing it. The previous note ended "do not
+                // promote this back without making the host's wait-status
+                // delivery deterministic, which is not possible" -- but making it
+                // deterministic is exactly the work owed, not a reason to stop
+                // reporting it.
                 //
-                // The sibling branch immediately above already logs at `trace!`
-                // for the same reason; this branch was the inconsistent one.
-                // Keep the whole loop sub-INFO. Do not promote this back without
-                // making the host's wait-status delivery deterministic, which is
-                // not possible -- it is an external event.
-                trace!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
+                // AND THE DEFECT IS REAL AND LARGER THAN THIS LINE. Measured
+                // 2026-08-24 on the CI-staged SaBRe artifact: a guest that forks
+                // and reaps its child with `wait4(WNOHANG)` diverges 36 of 50
+                // under `--verify-strict`, while ptrace is 0 of 50 on the same
+                // guest. The divergence is not confined to logging -- the guest
+                // ITSELF executes different work, 355 syscalls with 4 `wait4`
+                // calls in one run against 354 with 3 in the other. The
+                // scheduler's committed non-poll decisions are byte-identical
+                // (68 in both), so what varies is how many times the parent is
+                // told "not yet". Silencing this line would have left that
+                // unreported.
+                //
+                // If this line is noisy again, the fix is to make a child's exit
+                // become observable to its parent at a deterministic point, not
+                // to lower the level.
+                info!("scheduler (step2_process_blocked): zero threads left anywhere, fizzling.");
                 return Err(SkipTurn);
             } else if !futex_empty && timed_empty && blockers_empty {
                 return Err(self.report_terminal_deadlock());
