@@ -236,8 +236,9 @@ impl CiSelection {
 /// which spelling its manifest happened to use. Measured before this change:
 /// the single character `x` was accepted as a shared string and refused by name
 /// as a per-backend entry, and `temporarily disabled for now` -- a phrase the
-/// list below bans outright -- passed as a shared string. 535 of the 567 stated
-/// reasons were on the weaker path.
+/// list below bans outright -- passed as a shared string. Counting one stated
+/// reason as one unit, 535 of the 568 in the manifests were on the weaker path
+/// (535 shared strings against 33 per-backend entries, which occupy 32 cells).
 fn validate_reason_substance(subject: &str, detail: &str) -> Result<(), String> {
     let detail = detail.trim();
     if detail.len() < 16 || detail.split_whitespace().count() < 3 {
