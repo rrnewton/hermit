@@ -454,6 +454,15 @@ pub struct VerificationOutcome {
     pub first_divergent_scheduler_turn: Option<u64>,
     /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// 1-based index of the first differing compared record.
+    ///
+    /// The two fields above are the position of the preceding scheduler COMMIT,
+    /// so when no COMMIT precedes the differing record they both collapse to the
+    /// origin and say nothing about how far the run got. This one is the
+    /// LOCATION of the divergence rather than a bound on it, and it shares a
+    /// unit with `compared_log_messages`, so `record / compared` is the fraction
+    /// of the log that was deterministic.
+    pub first_divergent_record: Option<usize>,
 }
 
 impl VerificationOutcome {
@@ -524,6 +533,11 @@ pub struct VerificationReport {
     pub first_divergent_scheduler_turn: Option<u64>,
     /// Virtual nanoseconds at that same point, with the same nullability rules.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// 1-based index of the first differing compared record, or `null` when the
+    /// logs matched or no comparison ran. `null` and `0` are NOT the same claim:
+    /// null is "no divergence located", while a hypothetical 0 would mean the
+    /// very first record differed. Nothing writes 0 -- the index is 1-based.
+    pub first_divergent_record: Option<usize>,
 }
 
 impl VerificationReport {
@@ -540,6 +554,7 @@ impl VerificationReport {
             guest_signal: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
         }
     }
 }
@@ -570,6 +585,7 @@ impl From<&VerificationOutcome> for VerificationReport {
             guest_signal: outcome.guest_status.signal(),
             first_divergent_scheduler_turn: outcome.first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds: outcome.first_divergent_virtual_nanoseconds,
+            first_divergent_record: outcome.first_divergent_record,
         }
     }
 }
@@ -786,6 +802,7 @@ fn compare_two_runs_with_unsupported_scan(
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
+    let mut first_divergent_record = None;
 
     // Resolve the strictness label to concrete diff flags once, and carry the
     // resulting spec through to the verdict so the returned outcome records
@@ -871,6 +888,9 @@ fn compare_two_runs_with_unsupported_scan(
                 failed = true;
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
+                // Set ONLY inside this `diff_found` arm, so a matching pair
+                // leaves it None rather than 0.
+                first_divergent_record = summary.first_divergent_record;
                 eprintln!(":: {}", "Log differences found between runs.".red().bold());
             }
         } else {
@@ -923,6 +943,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            first_divergent_record,
         })
     } else {
         Ok(VerificationOutcome {
@@ -932,6 +953,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_log_messages,
             first_divergent_scheduler_turn,
             first_divergent_virtual_nanoseconds,
+            first_divergent_record,
         })
     }
 }
@@ -2028,6 +2050,7 @@ mod tests {
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
         };
         assert!(!VerificationReport::from(&diverged).bitwise_parity);
     }

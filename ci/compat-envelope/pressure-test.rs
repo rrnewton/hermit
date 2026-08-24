@@ -817,6 +817,14 @@ struct VerificationEvidence {
     compared_log_messages: JsonValue,
     first_divergent_scheduler_turn: RequiredNullableU64,
     first_divergent_virtual_nanoseconds: RequiredNullableU64,
+    /// REQUIRED-nullable, unlike the scorecard's tolerant `#[serde(default)]`
+    /// copy, and the asymmetry is deliberate. This test sets `E2E_RESULT_ROOT`
+    /// itself, so it only ever reads reports it just produced: requiring the key
+    /// catches a producer that silently stops emitting it. The scorecard
+    /// aggregates RETAINED reports, including ones written before this field
+    /// existed, so there absence has to mean "older report" rather than "broken
+    /// producer".
+    first_divergent_record: RequiredNullableU64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

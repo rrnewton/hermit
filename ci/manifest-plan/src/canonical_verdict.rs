@@ -240,7 +240,7 @@ mod tests {
         r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","#,
         r#""comparison":null,"compared_log_messages":null,"guest_exit_code":null,"#,
         r#""guest_signal":null,"first_divergent_scheduler_turn":null,"#,
-        r#""first_divergent_virtual_nanoseconds":null}"#,
+        r#""first_divergent_virtual_nanoseconds":null,"first_divergent_record":null}"#,
     );
 
     #[test]

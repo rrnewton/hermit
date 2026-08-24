@@ -137,6 +137,10 @@ struct Observation {
     invocations: BTreeSet<ObservedInvocation>,
     first_divergent_scheduler_turn: Option<ObservedRange>,
     first_divergent_virtual_nanoseconds: Option<ObservedRange>,
+    /// The prefix of the log that was deterministic, as a compared-record
+    /// index. Shares a unit with the report's compared counts, unlike the two
+    /// above, which are positions in scheduler and virtual time.
+    first_divergent_record: Option<ObservedRange>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -257,6 +261,10 @@ struct PressureVerification {
     first_divergent_scheduler_turn: Option<u64>,
     #[serde(default)]
     first_divergent_virtual_nanoseconds: Option<u64>,
+    /// `#[serde(default)]` like its siblings, so every verify report written
+    /// before this field existed still parses and simply reports None.
+    #[serde(default)]
+    first_divergent_record: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1158,6 +1166,10 @@ fn apply_pressure_summary(
             .verification
             .as_ref()
             .and_then(|report| report.first_divergent_virtual_nanoseconds);
+        let divergent_record = row
+            .verification
+            .as_ref()
+            .and_then(|report| report.first_divergent_record);
         if !result.carries_divergence_position()
             && (turn.is_some() || virtual_nanoseconds.is_some())
         {
@@ -1166,10 +1178,17 @@ fn apply_pressure_summary(
                 display_id(&row.cell)
             ));
         }
-        prepared.push((index, result, turn, virtual_nanoseconds, invocation));
+        prepared.push((
+            index,
+            result,
+            turn,
+            virtual_nanoseconds,
+            divergent_record,
+            invocation,
+        ));
     }
 
-    for (index, result, turn, virtual_nanoseconds, invocation) in prepared {
+    for (index, result, turn, virtual_nanoseconds, divergent_record, invocation) in prepared {
         let observations = &mut tracked.cells[index].observations;
         let position = observations
             .iter()
@@ -1184,6 +1203,7 @@ fn apply_pressure_summary(
                     invocations: BTreeSet::new(),
                     first_divergent_scheduler_turn: None,
                     first_divergent_virtual_nanoseconds: None,
+                    first_divergent_record: None,
                 });
                 observations.last_mut().expect("observation was appended")
             }
@@ -1206,6 +1226,7 @@ fn apply_pressure_summary(
             &mut observation.first_divergent_virtual_nanoseconds,
             virtual_nanoseconds,
         );
+        merge_range(&mut observation.first_divergent_record, divergent_record);
         observations.sort_by(|left, right| left.detcore_tree.cmp(&right.detcore_tree));
     }
     Ok(seen.len())
@@ -1830,6 +1851,7 @@ fn self_test() -> Result<(), String> {
         verification: Some(PressureVerification {
             first_divergent_scheduler_turn: turn,
             first_divergent_virtual_nanoseconds: virtual_nanoseconds,
+            first_divergent_record: None,
         }),
         evidence_errors: Vec::new(),
         invocation: Some(PressureInvocation {
