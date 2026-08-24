@@ -673,7 +673,6 @@
     "c-programs/writev-determinism::custom",
     "c-programs/writev-determinism::naked",
     "c-programs/writev-determinism::replay",
-    "chaos-c/lock-granularity::chaos",
     "chaos-c/lock-granularity::custom",
     "chaos-c/lock-granularity::naked",
     "chaos-c/lock-granularity::replay",
