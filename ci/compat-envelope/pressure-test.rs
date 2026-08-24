@@ -52,7 +52,13 @@ use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
-const TRACKED_CELLS_SCHEMA: u64 = 5;
+/// ⚠️ COUPLED TO `SCHEMA` IN ci/compat-envelope/scorecard.rs. Both tools read
+/// cells.json and both pin its version, so a bump in one WITHOUT the other
+/// leaves this tool refusing every tracked file with "unsupported tracked cell
+/// schema N". That is a fail-closed refusal rather than silent misreading, but
+/// it takes the pressure test offline entirely, and nothing in either file
+/// points at the other -- which is how it was missed when 5 became 6.
+const TRACKED_CELLS_SCHEMA: u64 = 6;
 const RUN_SCHEMA: u64 = 3;
 const CELL_RESULT_SCHEMA: u64 = 4;
 const SUMMARY_SCHEMA: u64 = 4;
