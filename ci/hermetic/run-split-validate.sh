@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Run local validate as TWO PHASES separated by a network boundary:
+#
+#   FETCH phase   -- on the host, WITH network, and it does nothing but
+#                    download. `cargo fetch --locked` populates a CARGO_HOME and
+#                    produces no build output at all.
+#
+#   OFFLINE phase -- inside the nix-pinned root, with NO network. BUILD AND TEST
+#                    BOTH RUN HERE, against the fetched cache and the pinned
+#                    toolchain.
+#
+# WHY THIS SHAPE. The earlier version of this script put the boundary between
+# build and test, which left the build with network. Shrinking the network
+# window to a pure download is strictly better, and the reason is worth stating
+# precisely: `cargo fetch --locked` cannot introduce variance, because every
+# byte it writes is checked against Cargo.lock -- exact versions AND content
+# checksums for registry crates, exact revisions for git dependencies. A phase
+# whose ENTIRE OUTPUT IS CHECKSUM-VERIFIED is a far smaller trust surface than a
+# build phase that merely happens to have network available. Nothing can enter
+# the build from the network except bytes that already matched a hash.
+#
+# So the honest claim is now stronger than it was:
+#   * the COMPILER is pinned      -- the offline phase runs in the nix root
+#   * the CRATES are pinned       -- Cargo.lock versions + checksums
+#   * the BUILD cannot reach out  -- --network=none, asserted from inside
+#   * the TESTS cannot reach out  -- same phase, same assertion
+# What is NOT claimed: that the fetch phase needs no upstreams. It does. It just
+# cannot lie to us about what it got.
+#
+# OPT-IN: nothing calls this by default and the ordinary validate path is
+# unchanged.
+#
+# ---------------------------------------------------------------------------
+# WHERE THE NODE SETS COME FROM -- and why they are not invented here.
+#
+# The build/test partition already exists in ci/portable-shards.json, and GitHub
+# CI already runs it as separate jobs: `build-debug` and `build-release` execute
+# the build-side node sets and publish a prebuilt tree, then the shard jobs
+# execute their own node sets against it. This script reads THE SAME KEYS with
+# THE SAME jq expressions as .github/workflows/ci-portable.yml, so the local
+# ordering cannot drift from the GitHub one. ci/check-shard-coverage.sh already
+# fails closed if that map drifts from ci/dag/portable.json, so the partition
+# stays total by construction.
+#
+# THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
+# gets this wrong in both directions:
+#   * build.e2e_artifact has group "build" but lives in the `integration` SHARD,
+#     so it is TEST-side.
+#   * setup.manifest_plan, setup.nextest, e2e.metadata and
+#     e2e.audit_compile_backend_parity_c are NOT group "build", but they are in
+#     build_debug_nodes, so they are BUILD-side.
+# Partitioning on `group` would misplace five nodes. Read the map.
+#
+# HOW THIS DIFFERS FROM GITHUB, STATED PLAINLY. GitHub's split is for WALL CLOCK
+# -- build once, fan out -- not for network. Its shard jobs have full network
+# and restore a cargo cache with `Swatinem/rust-cache`; the prebuilt tarball
+# carries only binaries, not target/debug/deps, so the shards genuinely do
+# compile. GitHub enforces no network boundary anywhere. This script mirrors
+# GitHub's node sets and their order, then adds a boundary GitHub does not have.
+# Nothing here changes or weakens the GitHub lane.
+#
+# WHAT CROSSES THE BOUNDARY: two directories under <out>.
+#   <out>/cargo    the fetched CARGO_HOME  (the fetch phase's only output)
+#   <out>/target   build outputs           (CARGO_TARGET_DIR, written offline)
+#
+# THE FAILURE MODE THIS BUYS, which is the useful part: if the fetch phase did
+# not populate correctly, the offline phase fails immediately and loudly at
+# `cargo metadata` (exit 101 on the pinned reverie git dependency) instead of
+# silently reaching out to the network. Loud and early beats quiet and wrong.
+#
+#   usage: run-split-validate.sh [options]
+#     --lane LANE        portable (default) | privileged
+#     --out DIR          phase-boundary directory (default ignored/hermetic/split)
+#     --shards a,b,c     run only these test shard slugs (default: all)
+#     --fetch-only       run the fetch phase and stop
+#     --offline-only     run the offline phase only (fetch must have run before)
+#     --seed-cargo DIR   warm-start the CARGO_HOME by reflink from DIR (usually
+#                        ~/.cargo) before fetching. An OPTIMISATION only: the
+#                        fetch phase still runs and still reconciles against
+#                        Cargo.lock, this just avoids redownloading what the host
+#                        already has. ci-hub's validate does the same thing
+#                        (ci-hub/validate/start_unit.py), so it is a pattern to
+#                        copy rather than invent.
+#     --dry-run          print the phases and node sets, run nothing
+
+set -euo pipefail
+
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(cd -- "$HERE/../.." && pwd)
+
+lane=portable
+out="$ROOT/ignored/hermetic/split"
+shards=""
+do_fetch=1; do_offline=1; dry=0; seed=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --lane) lane=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        --shards) shards=$2; shift 2 ;;
+        --fetch-only) do_offline=0; shift ;;
+        --offline-only) do_fetch=0; shift ;;
+        --seed-cargo) seed=$2; shift 2 ;;
+        --dry-run) dry=1; shift ;;
+        *) echo "run-split-validate: unexpected argument '$1'" >&2; exit 2 ;;
+    esac
+done
+
+[[ "$lane" == portable ]] || {
+    echo "run-split-validate: only the portable lane has a shard map today (got '$lane')." >&2
+    echo "  ci/portable-shards.json is what defines the node sets; there is no" >&2
+    echo "  privileged-shards.json, so a privileged split would have to invent one." >&2
+    exit 2
+}
+
+MAP="$ROOT/ci/portable-shards.json"
+[[ -f "$MAP" ]] || { echo "run-split-validate: missing $MAP" >&2; exit 2; }
+
+# The SAME jq expressions ci-portable.yml uses, so the two cannot disagree.
+build_nodes=$(jq -r '(.preflight_nodes + .build_debug_nodes + .build_dbt_nodes + .build_aux_nodes)|join(",")' "$MAP")
+
+if [[ -n "$shards" ]]; then
+    test_nodes=$(jq -r --arg sel "$shards" \
+        '($sel|split(",")) as $s
+         | [ (.debug_shards[], .release_shards[]) | select(.slug as $x | $s | index($x)) | .nodes[] ]
+         | join(",")' "$MAP")
+    [[ -n "$test_nodes" ]] || {
+        echo "run-split-validate: no shard matched '$shards'. Known slugs:" >&2
+        jq -r '(.debug_shards[], .release_shards[]).slug | "  " + .' "$MAP" >&2
+        exit 2
+    }
+else
+    test_nodes=$(jq -r '[ (.debug_shards[], .release_shards[]).nodes[] ]|join(",")' "$MAP")
+fi
+
+cargo_home="$out/cargo"
+target_dir="$out/target"
+
+echo "== phase boundary: $out"
+echo "== FETCH phase   (host, WITH network): cargo fetch --locked, no build output"
+echo "== OFFLINE phase (pinned root, NO network): build then test, in one place"
+echo "     build-side: $(tr ',' '\n' <<<"$build_nodes" | wc -l) node(s)"
+echo "     test-side:  $(tr ',' '\n' <<<"$test_nodes" | wc -l) node(s)"
+
+if [[ $dry -eq 1 ]]; then
+    echo
+    echo "-- fetch phase would run, on the host:"
+    echo "   CARGO_HOME=$cargo_home cargo fetch --locked"
+    echo "-- offline phase would run, inside the pinned root, --network=none:"
+    echo "   ci/hermetic/assert-no-network.sh"
+    echo "   ci/run-node.sh $lane $build_nodes"
+    echo "   ci/run-node.sh $lane $test_nodes"
+    exit 0
+fi
+
+mkdir -p "$cargo_home" "$target_dir"
+
+if [[ $do_fetch -eq 1 ]]; then
+    echo
+    echo ":::: FETCH PHASE -- host, network ALLOWED, download only"
+    # Asserted, not assumed. Without network the fetch silently produces an
+    # incomplete cache and the offline phase fails later for a confusing reason.
+    if ! "$HERE/assert-no-network.sh" --expect-network; then
+        echo "run-split-validate: the fetch phase needs network -- github.com for the" >&2
+        echo "  pinned reverie git dependency and crates.io for the registry -- and" >&2
+        echo "  this host has none. Refusing to start a fetch that cannot complete." >&2
+        exit 1
+    fi
+
+    # Warm-start is optional and never fatal. --reflink=auto, not =always: a
+    # non-CoW filesystem must still work, just slower. Failing here would trade
+    # a slow fetch for an outage, and the fetch phase has network anyway.
+    if [[ -n "$seed" ]]; then
+        for sub in registry git/db; do
+            if [[ -d "$seed/$sub" && ! -e "$cargo_home/$sub" ]]; then
+                mkdir -p "$(dirname "$cargo_home/$sub")"
+                if cp -a --reflink=auto "$seed/$sub" "$cargo_home/$sub"; then
+                    echo ":: warm-started CARGO_HOME/$sub from $seed"
+                else
+                    echo ":: could not warm-start $sub from $seed; fetching it instead" >&2
+                fi
+            fi
+        done
+    fi
+
+    # --locked is the point of the phase: resolve to EXACTLY Cargo.lock or fail.
+    # A fetch that is allowed to update the lock is a fetch that can introduce a
+    # version the reviewed lock never named.
+    ( cd "$ROOT" && CARGO_HOME="$cargo_home" cargo fetch --locked )
+    echo ":::: FETCH PHASE complete -- every byte checked against Cargo.lock"
+fi
+
+if [[ $do_offline -eq 1 ]]; then
+    echo
+    echo ":::: OFFLINE PHASE -- pinned root, network REFUSED, build AND test"
+    [[ -d "$cargo_home/registry" ]] || {
+        echo "run-split-validate: $cargo_home has no registry; the fetch phase has not run." >&2
+        echo "  The offline phase has no network and cannot populate it itself." >&2
+        exit 2
+    }
+    # The assertion runs INSIDE the container as its first act, and a reachable
+    # network aborts the phase before anything is built or tested. Checking from
+    # out here would prove nothing about in there.
+    exec "$HERE/run-in-pinned-root.sh" \
+        --src "$ROOT" --out "$out" --src-rw --cargo-home "$cargo_home" \
+        -- bash -c '
+            set -euo pipefail
+            /src/ci/hermetic/assert-no-network.sh
+            echo ":: build-side nodes"
+            /src/ci/run-node.sh '"$lane"' '"$build_nodes"'
+            echo ":: test-side nodes"
+            exec /src/ci/run-node.sh '"$lane"' '"$test_nodes"'
+        '
+fi
