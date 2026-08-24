@@ -35,6 +35,19 @@ default-members = [
 ]
 resolver = "2"
 
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie" }
+reverie-dbt = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-dbt" }
+reverie-kvm = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-kvm" }
+reverie-liteinst = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-liteinst" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-memory" }
+reverie-process = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-process" }
+reverie-ptrace = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-ptrace" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-rpc-transport" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-syscalls" }
+reverie-util = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/reverie-util" }
+safeptrace = { path = "/home/newton/work/dev-hermit/worktrees/m2audit/reverie-owner-evidence-copy/safeptrace" }
+
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
