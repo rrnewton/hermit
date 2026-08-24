@@ -50,6 +50,28 @@ if [[ $build_job_context == launcher ]]; then
     # the nested native-build knob identical so the Rust validator cannot widen it.
     export CARGO_BUILD_JOBS=$CI_DAG_BUILD_JOBS
     export THIRD_PARTY_BUILD_JOBS=$CI_DAG_BUILD_JOBS
+
+    # AND LET A NODE'S OWN DECLARED WIDTH REACH CARGO, which until now it could not.
+    #
+    # The K=8 above is the FLOOR for a step that declares nothing. The comment at the
+    # top of this file already says the collapsed fat-build nodes "declare their
+    # independently measured higher width in the DAG manifest" -- build.workspace and
+    # build.runtime_release both declare preferred_inner_jobs=32. That declaration has
+    # never reached Cargo: every jobs_flag in ci/dag/portable.json is the empty string,
+    # so the runner had no way to hand a step its width, and this line's ambient 8 was
+    # the only value Cargo ever saw. Measured on the 2026-08-24 clean full run.
+    #
+    # $SAFE_CI_DAG_RUNNER_JOBS_ENV names the environment variable through which the
+    # runner delivers a step's width (agent-utils 612adb1). The runner applies it as a
+    # per-step overlay ON TOP of this ambient value, so a step that declares a width
+    # gets it and a step that declares none still gets 8.
+    #
+    # DELIBERATELY NOT A NEW CONSTANT. 8 is not raised here and no width is invented:
+    # the widths that now take effect are the ones already measured and recorded per
+    # node in the DAG. Picking a fresh global number was rejected -- the historical 284
+    # inference "raced the native linker" (see the header), and a sweep on a loaded box
+    # is not evidence for a production default.
+    export SAFE_CI_DAG_RUNNER_JOBS_ENV=CARGO_BUILD_JOBS
     return 0
 fi
 
