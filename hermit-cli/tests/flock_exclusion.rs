@@ -23,6 +23,7 @@
 //! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations |
 //! | [`dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy`] | a copied fork child's vfork path was assumed to bypass the copied-syscall flock guard |
 //! | [`failed_process_clone_preserves_known_flock_state`] | a failed clone made an unlocked descriptor permanently unknown |
+//! | [`pidfd_getfd_alias_mutation_invalidates_source_flock_authority`] | a pidfd_getfd duplicate unlocked its source OFD while the source cache stayed stale and restored the released lock |
 //! | [`transferred_lock_state_is_unknown_to_the_sender`] | the sender restored stale state after the receiver unlocked the OFD |
 //! | [`dbt_vfork_child_flock_fails_closed_without_deadlock`] | a copied vfork child blocked in the kernel while its parent was suspended |
 //! | [`replay_reissues_every_flock_for_a_materialized_file`] | replay consumed the recorded return and took no lock |
@@ -455,6 +456,40 @@ fn failed_process_clone_preserves_known_flock_state() {
 #[test]
 fn dbt_failed_process_clone_preserves_known_flock_state() {
     assert_failed_clone_preserves_known_flock_state("dbt");
+}
+
+fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend: &str) {
+    let run = hermit_run_backend(backend, "error", &[], "pidfd-getfd");
+    assert!(
+        run.status.success(),
+        "{backend} pidfd_getfd flock-alias run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-pidfd-duplicate-unlocked",
+        "flock-pidfd-source-upgrade-refused errno=37",
+        "flock-pidfd-stale-restore-absent",
+        "flock-pidfd-failed-getfd-preserved errno=9",
+        "flock-pidfd-unrelated-authority-preserved",
+        "flock-pidfd-foreign-source-refused errno=95",
+        "flock-pidfd-getfd-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "{backend} missed {marker}\n{}",
+            run.combined()
+        );
+    }
+}
+
+/// A self `pidfd_getfd` result aliases the source open file description. After
+/// the duplicate releases its lock, Detcore must not let the source's stale
+/// cache restore that lock during a refused blocking conversion. Failed calls
+/// preserve source authority, and duplicating an unrelated descriptor does not
+/// poison an independently held lock.
+#[test]
+fn pidfd_getfd_alias_mutation_invalidates_source_flock_authority() {
+    assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority("ptrace");
 }
 
 fn assert_transferred_lock_state_is_unknown_to_the_sender(backend: &str) {
