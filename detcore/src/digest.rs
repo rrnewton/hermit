@@ -194,4 +194,36 @@ mod test {
         let s = "b1fbeefc23e6a149a6f7d0c2fb635bfc78f7ddc2da963ea9c6a63eb324260e6d";
         assert_eq!(Digest::from_str(s).unwrap().to_string(), s);
     }
+
+    /// Known-answer test pinning what `Digest::new` actually computes.
+    ///
+    /// The root `Cargo.toml` builds `sha2` at `opt-level = 3` even in a debug
+    /// build, because an unoptimised SHA-256 is 34.6x slower and dominates
+    /// `--detlog-io-buffers`. That is a build-configuration change, and the
+    /// hazard with build-configuration changes is that they are assumed not to
+    /// affect behaviour rather than shown not to. This pins the output against
+    /// the published SHA-256 vectors, so it fails if the digest of a fixed
+    /// input ever moves -- whatever the reason, optimisation or otherwise.
+    ///
+    /// Values are the standard NIST/FIPS-180 vectors for "" and "abc", not
+    /// numbers copied back out of a previous run of this code.
+    #[test]
+    fn digest_is_independent_of_optimisation_level() {
+        assert_eq!(
+            Digest::new(b"").to_string(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            Digest::new(b"abc").to_string(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // A multi-block input, so the compress loop runs more than once: the
+        // optimised and unoptimised builds take different code paths through
+        // it, and a single-block vector would not exercise that.
+        let long = vec![0x61u8; 1_000_000];
+        assert_eq!(
+            Digest::new(&long).to_string(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
 }
