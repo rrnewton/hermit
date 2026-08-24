@@ -461,6 +461,9 @@ pub struct AttemptResult {
     pub first_divergent_virtual_nanoseconds: Option<u64>,
     /// The coordinate that LOCATES the divergence rather than bounding it.
     pub first_divergent_record: Option<u64>,
+    /// Syscalls the guest completed before diverging. A different keyspace from
+    /// every other coordinate here; see the note in canonical_verdict.
+    pub first_divergent_syscall: Option<u64>,
     pub sabre_path_evidence: Option<String>,
     pub sabre_path_evidence_sha256: Option<String>,
     pub reason: Option<String>,
@@ -520,6 +523,8 @@ pub struct CellResult {
     pub first_divergent_virtual_nanoseconds: Option<u64>,
     /// The coordinate that LOCATES the divergence. Same first-attempt rule.
     pub first_divergent_record: Option<u64>,
+    /// Syscalls completed before diverging. Same first-attempt rule.
+    pub first_divergent_syscall: Option<u64>,
     pub reason: Option<String>,
 }
 
@@ -951,6 +956,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
     let mut first_divergent_scheduler_turn = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
+    let mut first_divergent_syscall = None;
     let (sabre_path_evidence, sabre_path_evidence_sha256) = spec
         .sabre_path_evidence
         .as_ref()
@@ -984,6 +990,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                             first_divergent_virtual_nanoseconds =
                                 report.first_divergent_virtual_nanoseconds;
                             first_divergent_record = report.first_divergent_record;
+                            first_divergent_syscall = report.first_divergent_syscall;
                         }
                         if launch_refusal {
                             // The process never created a guest.  A report at
@@ -1064,6 +1071,7 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
+        first_divergent_syscall,
         sabre_path_evidence,
         sabre_path_evidence_sha256,
         reason,
@@ -1277,11 +1285,11 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
     }
     .to_string();
     let mut reason = attempts.iter().find_map(|attempt| attempt.reason.clone());
-    let (
-        first_divergent_scheduler_turn,
-        first_divergent_virtual_nanoseconds,
-        first_divergent_record,
-    ) = cell_divergence_position(&attempts);
+    let position = cell_divergence_position(&attempts);
+    let first_divergent_scheduler_turn = position.scheduler_turn;
+    let first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
+    let first_divergent_record = position.record;
+    let first_divergent_syscall = position.syscall;
     let mut error_kind = attempts
         .iter()
         .find_map(|attempt| attempt.error_kind.clone());
@@ -1423,6 +1431,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
+        first_divergent_syscall,
         reason,
     })
 }
@@ -1487,6 +1496,7 @@ pub fn infrastructure_error_result(
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
+        first_divergent_syscall: None,
         reason: Some(reason),
     }
 }
@@ -1503,18 +1513,36 @@ pub fn infrastructure_error_result(
 /// earliest/latest in ci/compat-envelope/scorecard.rs without having a sample
 /// behind it, and this project has repeatedly been bitten by numbers that look
 /// like a measurement and are not.
-fn cell_divergence_position(attempts: &[AttemptResult]) -> (Option<u64>, Option<u64>, Option<u64>) {
-    (
-        attempts
+/// The four divergence coordinates of one cell.
+///
+/// A NAMED STRUCT rather than a tuple, deliberately: four `Option<u64>` in
+/// positional order is four indistinguishable integers, and this project has
+/// already had a bare ordinal read against the wrong axis. Each field is a
+/// DIFFERENT KEYSPACE -- measured on one real divergence, the same event was
+/// record 98, syscall 37 and scheduler turn 4.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DivergencePosition {
+    pub scheduler_turn: Option<u64>,
+    pub virtual_nanoseconds: Option<u64>,
+    pub record: Option<u64>,
+    pub syscall: Option<u64>,
+}
+
+fn cell_divergence_position(attempts: &[AttemptResult]) -> DivergencePosition {
+    DivergencePosition {
+        scheduler_turn: attempts
             .iter()
             .find_map(|attempt| attempt.first_divergent_scheduler_turn),
-        attempts
+        virtual_nanoseconds: attempts
             .iter()
             .find_map(|attempt| attempt.first_divergent_virtual_nanoseconds),
-        attempts
+        record: attempts
             .iter()
             .find_map(|attempt| attempt.first_divergent_record),
-    )
+        syscall: attempts
+            .iter()
+            .find_map(|attempt| attempt.first_divergent_syscall),
+    }
 }
 
 fn summarize_sabre_path_evidence(attempts: &[AttemptResult]) -> Result<Option<JsonValue>, String> {
@@ -2290,11 +2318,13 @@ backends_disabled:
         turn: Option<u64>,
         nanos: Option<u64>,
         record: Option<u64>,
+        syscall: Option<u64>,
     ) -> AttemptResult {
         let mut attempt = attempt_with_sabre_evidence("");
         attempt.first_divergent_scheduler_turn = turn;
         attempt.first_divergent_virtual_nanoseconds = nanos;
         attempt.first_divergent_record = record;
+        attempt.first_divergent_syscall = syscall;
         attempt
     }
 
@@ -2304,42 +2334,66 @@ backends_disabled:
     #[test]
     fn cell_divergence_takes_the_first_attempt_that_located_one() {
         let attempts = vec![
-            attempt_with_divergence(None, None, None),
-            attempt_with_divergence(Some(4), Some(400), Some(40)),
-            attempt_with_divergence(Some(1), Some(100), Some(10)),
+            attempt_with_divergence(None, None, None, None),
+            attempt_with_divergence(Some(4), Some(400), Some(40), Some(14)),
+            attempt_with_divergence(Some(1), Some(100), Some(10), Some(2)),
         ];
         assert_eq!(
             cell_divergence_position(&attempts),
-            (Some(4), Some(400), Some(40)),
+            DivergencePosition {
+                scheduler_turn: Some(4),
+                virtual_nanoseconds: Some(400),
+                record: Some(40),
+                syscall: Some(14),
+            },
             "the first located position wins; a later, earlier-diverging attempt \
              must not silently replace it, and this is NOT a min across attempts"
         );
     }
 
-    /// Resolved per coordinate, so a report that located only some of the three
+    /// Resolved per coordinate, so a report that located only some of the four
     /// still contributes the ones it has. Each coordinate here comes from a
     /// DIFFERENT attempt, which a per-attempt rule could not produce.
     #[test]
     fn cell_divergence_resolves_each_coordinate_independently() {
         let attempts = vec![
-            attempt_with_divergence(None, Some(900), None),
-            attempt_with_divergence(Some(7), None, None),
-            attempt_with_divergence(None, None, Some(3)),
+            attempt_with_divergence(None, Some(900), None, None),
+            attempt_with_divergence(Some(7), None, None, None),
+            attempt_with_divergence(None, None, Some(3), None),
+            attempt_with_divergence(None, None, None, Some(5)),
         ];
         assert_eq!(
             cell_divergence_position(&attempts),
-            (Some(7), Some(900), Some(3))
+            DivergencePosition {
+                scheduler_turn: Some(7),
+                virtual_nanoseconds: Some(900),
+                record: Some(3),
+                syscall: Some(5),
+            }
         );
     }
 
-    /// A clean cell reports no position. `None` here means "no divergence
-    /// located", which is the same value an unmeasured cell carries -- the
-    /// surrounding row is what distinguishes them, not this field.
+    /// A located record with NO syscall is a real state, not a gap: a run can
+    /// diverge before any syscall has completed. Measured on a real log --
+    /// diverging at record 12 reported syscall `None`, because no
+    /// `finish syscall #N` had been written yet.
+    #[test]
+    fn a_divergence_before_any_syscall_completes_reports_no_syscall() {
+        let attempts = vec![attempt_with_divergence(Some(1), None, Some(12), None)];
+        let position = cell_divergence_position(&attempts);
+        assert_eq!(position.record, Some(12));
+        assert_eq!(position.syscall, None);
+    }
+
+    /// A clean cell reports no position at all.
     #[test]
     fn cell_divergence_is_absent_when_no_attempt_located_one() {
-        let attempts = vec![attempt_with_divergence(None, None, None)];
-        assert_eq!(cell_divergence_position(&attempts), (None, None, None));
-        assert_eq!(cell_divergence_position(&[]), (None, None, None));
+        let attempts = vec![attempt_with_divergence(None, None, None, None)];
+        assert_eq!(
+            cell_divergence_position(&attempts),
+            DivergencePosition::default()
+        );
+        assert_eq!(cell_divergence_position(&[]), DivergencePosition::default());
     }
 
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
@@ -2347,6 +2401,7 @@ backends_disabled:
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
             index: "1".into(),
             outcome: "PASS".into(),
             error_kind: None,
@@ -2435,6 +2490,7 @@ backends_disabled:
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
             compared_log_messages: Some(crate::canonical_verdict::ComparedLogMessages {
                 left: 1,
                 right: 1,
@@ -2503,6 +2559,7 @@ backends_disabled:
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_syscall: None,
         })
         .unwrap();
         let spec = CellRunSpec {
