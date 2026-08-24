@@ -40,6 +40,6 @@ if grep -s DESYNC "$log2".log; then
     exit 1
 fi
 
-"$hermit" log-diff --record-envelope=all-records-v1 "$log1".log "$log2".log
+"$hermit" log-diff "$log1".log "$log2".log
 
 echo "Test passed."

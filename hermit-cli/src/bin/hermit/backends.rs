@@ -446,6 +446,26 @@ fn materialize_dbt_comparison_log(
     }
     log.flush()?;
 
+    // The verdict this comparison publishes names `all_records_v1`, so every
+    // decoded record must reach the log. Filtering here instead of at the
+    // envelope would report a policy that was not applied, which is the exact
+    // failure the envelope exists to prevent -- and it would be invisible,
+    // because the envelope name lives in a different file. Each record was
+    // checked above to hold no embedded line boundary, so one record is one
+    // line and this count is exact.
+    let materialized = std::fs::read(path)
+        .map_err(|error| Error::msg(format!("DBT canonical evidence log unreadable: {error}")))?
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    if materialized != records.len() {
+        return Err(Error::msg(format!(
+            "DBT canonical evidence log holds {materialized} records but {} were decoded; the \
+             comparison publishes the all_records_v1 envelope and must not drop any",
+            records.len()
+        )));
+    }
+
     let compared =
         detcore::logdiff::write_canonical_info(path, &mut std::io::sink()).map_err(|error| {
             Error::msg(format!(
@@ -847,12 +867,14 @@ pub(super) fn run_dbt(
             //
             // The transport does put records about itself in this stream:
             // `evidence_emit_image_initialization` (reverie-dbt
-            // native/client.c:863) emits one
+            // native/client.c:863) emits
             // `INFO reverie_dbt::evidence: protected evidence initialized`
-            // per admitted image, and its `evidence_log_level < 3` guard is
-            // open at the verification default of INFO. They are a compile-time
-            // constant string sent once per sender, so they compare equal
-            // between two runs of a single-process guest. Excluding them is
+            // once per sender -- the sender is keyed on (pid, start_time) and
+            // latched by `initialization_record_sent`, so it is once per
+            // process, not per image -- and its `evidence_log_level < 3` guard
+            // is open at the verification default of INFO. The record is a
+            // compile-time constant string, so two runs of a single-process
+            // guest compare equal. Excluding them is
             // therefore a separable change, not a prerequisite: it would alter
             // which records this adapter compares, and it needs its own
             // evidence about multi-process arrival order, which is host order.
@@ -1149,6 +1171,39 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt")]
+    /// A behavioural pin, not a text match: drive the real materialization with
+    /// a transport self-record present and require every decoded record to
+    /// reach the log. Filtering anywhere in this function -- at the write loop,
+    /// at the decoder, or through a filtered canonical writer -- makes the
+    /// materialized count disagree with the decoded count and fails here, while
+    /// the verdict still names `all_records_v1`.
+    #[test]
+    fn materialization_keeps_every_decoded_record_including_transport_self_records() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("evidence.log");
+        let file = std::fs::File::create(&path).expect("create log");
+        let records: Vec<Vec<u8>> = vec![
+            b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n".to_vec(),
+            b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG first\n".to_vec(),
+            b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG second\n".to_vec(),
+        ];
+
+        super::materialize_dbt_comparison_log(&records, file, &path)
+            .expect("materialization must accept a stream containing transport self-records");
+
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(
+            written.lines().count(),
+            records.len(),
+            "every decoded record must reach the compared log"
+        );
+        assert!(
+            written.contains("reverie_dbt::evidence: protected evidence initialized"),
+            "the transport self-record is part of what all_records_v1 compares; dropping it \
+             here would publish an envelope that was not applied:\n{written}"
+        );
+    }
     use super::*;
 
     #[cfg(feature = "dbt")]
