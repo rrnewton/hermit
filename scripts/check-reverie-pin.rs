@@ -391,7 +391,7 @@ fn read_pins(root: &Path) -> Result<PinScan, String> {
 
     let mut pins = Vec::new();
     for path in &tracked_files {
-        let contents = fs::read_to_string(&path)
+        let contents = fs::read_to_string(path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let file_name = path.file_name().and_then(|name| name.to_str());
         for (line_index, line) in contents.lines().enumerate() {
