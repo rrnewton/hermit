@@ -57,7 +57,12 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         (
             "passthru-opt madvise verification",
             false,
-            Some("--passthru-opt"),
+            // --passthru-opt cannot coexist with fail-closed unsupported-syscall
+            // handling, and refusing is now the DEFAULT rather than a strict-mode
+            // extra, so this arm must ask for forwarding explicitly. Without it the
+            // run bails before the guest starts and this test never reaches the
+            // determinism check it exists for.
+            Some(&["--passthru-opt", "--allow-unsupported-syscalls"][..]),
         ),
     ] {
         let mut verify = Command::new("timeout");
@@ -74,8 +79,8 @@ fn madvise_policy_verifies_in_run_record_and_kvm_modes() {
         if strict {
             verify.arg("--strict");
         }
-        if let Some(arg) = extra_arg {
-            verify.arg(arg);
+        if let Some(args) = extra_arg {
+            verify.args(args);
         }
         verify.arg("--").arg(&guest);
         let output = command_output(verify, label);

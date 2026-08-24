@@ -57,7 +57,12 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         (
             "passthru-opt arch_prctl verification",
             false,
-            Some("--passthru-opt"),
+            // --passthru-opt cannot coexist with fail-closed unsupported-syscall
+            // handling, and refusing is now the DEFAULT rather than a strict-mode
+            // extra, so this arm must ask for forwarding explicitly. Without it the
+            // run bails before the guest starts and this test never reaches the
+            // determinism check it exists for.
+            Some(&["--passthru-opt", "--allow-unsupported-syscalls"][..]),
         ),
     ] {
         let mut verify = Command::new("timeout");
@@ -74,8 +79,8 @@ fn arch_prctl_controls_verify_in_run_and_record_modes() {
         if strict {
             verify.arg("--strict");
         }
-        if let Some(arg) = extra_args {
-            verify.arg(arg);
+        if let Some(args) = extra_args {
+            verify.args(args);
         }
         verify.arg("--").arg(&guest);
         let output = command_output(verify, label);
