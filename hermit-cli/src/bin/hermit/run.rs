@@ -3170,14 +3170,17 @@ impl RunOpts {
         }
 
         let kvm_output_only = self.selected_backend() == Backend::Kvm;
-        // Say what was actually established. Without `--detlog-io-buffers` the
+        // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
+        // this qualification is now reachable only when the caller has asked for
+        // the weaker comparison with `--no-detlog-io-buffers`. With it, the
         // compared records carry no syscall output-buffer CONTENT -- Reverie
         // types many output buffers as bare pointers, so the record shows the
         // address and not the bytes -- and two runs whose buffers differ while
         // their return values agree compare equal. Measured on a netlink
         // `recvmsg` that returns a stable `Ok(1468)` while four payload bytes
-        // vary: this path reported "Determinism verified" on a run that the same
-        // command with `--detlog-io-buffers` reports as diverged. Claiming
+        // vary, back when hashing was opt-in: this path reported "Determinism
+        // verified" on a run that the same command with hashing enabled
+        // reports as diverged. Claiming
         // determinism there was the defect, so the sentence now names its limit.
         let success_message = if kvm_output_only {
             "Success: KVM guest output and exit status matched."
@@ -3191,9 +3194,10 @@ impl RunOpts {
             // keeps every consumer working while the reader still learns the
             // limit.
             "Success: deterministic. Determinism verified. NOTE: syscall \
-             output-buffer CONTENT was not compared, so a divergence confined to \
-             a buffer whose length is stable would not have been seen; add \
-             --detlog-io-buffers to include it."
+             output-buffer CONTENT was not compared because \
+             --no-detlog-io-buffers was given, so a divergence confined to a \
+             buffer whose length is stable would not have been seen; drop that \
+             flag to include it."
         } else {
             "Success: deterministic. Determinism verified."
         };
