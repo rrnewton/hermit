@@ -480,7 +480,12 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
+      "ci_disabled_reason": {
+        "result": "infrastructure-error",
+        "evidence": "task git-repository-workflow-verify-ptrace-is-a-ratchet-violation-not-a-flake",
+        "reason": "The harness starts this shell guest with PWD under a mutable checkout path and lazily creates sibling cell directories between the verify pair; Bash canonicalizes PWD by statting each ancestor, so directory st_size changes produce unequal strict ptrace logs."
+      },
       "observations": []
     },
     {
