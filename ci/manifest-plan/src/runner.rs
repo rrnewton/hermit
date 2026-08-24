@@ -104,6 +104,8 @@ pub struct ModeRecipe {
     pub outcome_classes: Option<u64>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -741,6 +743,7 @@ pub fn build_spec(
                 backend.into(),
                 "--strict".into(),
             ];
+            append_workdir(&mut argv, cell.test.modes["verify"].workdir.as_deref());
             if context.run_verify_strict {
                 argv.push("--verify-strict".into());
             }
@@ -804,6 +807,7 @@ pub fn build_spec(
                 backend.into(),
                 "--strict".into(),
             ];
+            append_workdir(&mut argv, cell.test.modes["chaos"].workdir.as_deref());
             if context.run_verify_strict {
                 argv.push("--verify-strict".into());
             }
@@ -830,6 +834,7 @@ pub fn build_spec(
                 "--backend".into(),
                 backend.into(),
             ];
+            append_workdir(&mut argv, cell.test.modes["custom"].workdir.as_deref());
             argv.extend(cell.test.modes["custom"].args.clone());
             argv.push("--".into());
             argv.extend(guest_argv.clone());
@@ -851,6 +856,13 @@ pub fn build_spec(
         sabre_path_evidence,
         cell_dir: dir,
     })
+}
+
+fn append_workdir(argv: &mut Vec<String>, workdir: Option<&str>) {
+    if let Some(workdir) = workdir {
+        argv.push("--workdir".into());
+        argv.push(workdir.into());
+    }
 }
 
 pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, String> {
@@ -2034,7 +2046,8 @@ backends_disabled:
 
     #[test]
     fn run_spec_records_correct_policy_without_hidden_portable_flags() {
-        let test = recipe(true);
+        let mut test = recipe(true);
+        test.modes.get_mut("verify").unwrap().workdir = Some("/tmp".into());
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -2069,7 +2082,39 @@ backends_disabled:
         .unwrap();
         assert!(spec.argv.iter().any(|arg| arg == "--verify-strict"));
         assert!(spec.argv.iter().any(|arg| arg == "--base-env=minimal"));
+        assert!(
+            spec.argv
+                .windows(2)
+                .any(|window| window[0] == "--workdir" && window[1] == "/tmp")
+        );
         assert!(!spec.argv.iter().any(|arg| arg == "--no-virtualize-cpuid"));
+
+        let without_workdir = recipe(true);
+        let without_workdir_cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: without_workdir.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test: without_workdir,
+            enabled: true,
+        };
+        let without_workdir_spec = build_spec(
+            &context,
+            &without_workdir_cell,
+            PathBuf::from("/repo/results/no-workdir-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            !without_workdir_spec
+                .argv
+                .iter()
+                .any(|arg| arg == "--workdir")
+        );
         assert!(
             !spec
                 .argv

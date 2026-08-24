@@ -747,6 +747,26 @@ fn validate_and_expand(
     }
 }
 
+fn validate_workdir(workdir: Option<&Value>, id: &str) {
+    let Some(workdir) = workdir else {
+        return;
+    };
+    let workdir = workdir
+        .as_str()
+        .unwrap_or_else(|| die(format!("{id}: workdir must be a string")));
+    let path = Path::new(workdir);
+    if workdir.is_empty()
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        die(format!(
+            "{id}: workdir must be an absolute normalized guest path: {workdir}"
+        ));
+    }
+}
+
 fn validate_observation(test: &Value, id: &str) {
     let observation_value = test
         .get("observation")
@@ -796,18 +816,19 @@ fn validate_mode(
     ];
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
-        "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
-        "custom" => allowed.extend(["args", "assert"]),
+        "chaos" => allowed.extend(["seeds", "assert", "outcome_classes", "workdir"]),
+        "custom" => allowed.extend(["args", "assert", "workdir"]),
         // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
         // cell from the lossy default comparator to the L2 parity comparator and
         // requires the run's own verdict JSON to report parity. Without it a
         // `verify` cell runs `--strict --verify` only, which per
         // AGENTS.md "cannot establish L2" -- so a cell justified by a
         // hand-measured `bitwise_parity: true` does not actually ratchet it.
-        "verify" => allowed.push("assert"),
+        "verify" => allowed.extend(["assert", "workdir"]),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
+    validate_workdir(spec.get("workdir"), &format!("{id}.modes.{mode}"));
     if mode == "verify" {
         if let Some(assert) = spec.get("assert") {
             ensure_keys(
@@ -1190,6 +1211,26 @@ mod tests {
     fn accepts_structured_direct_argv() {
         let value = parse_mode("direct = [\"./example\", \"argument with spaces\"]\n");
         validate_direct(value.get("direct").unwrap(), "bucket/test");
+    }
+
+    #[test]
+    fn accepts_absolute_normalized_workdir() {
+        let value = parse_mode("workdir = \"/tmp\"\n");
+        validate_workdir(value.get("workdir"), "bucket/test");
+    }
+
+    #[test]
+    #[should_panic(expected = "workdir must be an absolute normalized guest path")]
+    fn rejects_relative_workdir() {
+        let value = parse_mode("workdir = \"tmp\"\n");
+        validate_workdir(value.get("workdir"), "bucket/test");
+    }
+
+    #[test]
+    #[should_panic(expected = "workdir must be an absolute normalized guest path")]
+    fn rejects_parent_components_in_workdir() {
+        let value = parse_mode("workdir = \"/tmp/../checkout\"\n");
+        validate_workdir(value.get("workdir"), "bucket/test");
     }
 
     #[test]

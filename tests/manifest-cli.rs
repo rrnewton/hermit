@@ -250,6 +250,7 @@ fn hermit_command(
     timeout: i64,
     seed: Option<i64>,
     mode_args: &[String],
+    workdir: Option<&str>,
     verify_bitwise_parity: bool,
     log: &str,
     extra: &[String],
@@ -258,6 +259,9 @@ fn hermit_command(
     let _lane = lane;
     let profile: Vec<String> = Vec::new();
     let be = shell_quote(backend);
+    let workdir = workdir
+        .map(|path| format!(" --workdir {}", shell_quote(path)))
+        .unwrap_or_default();
     let run_extra_joined = {
         let mut all: Vec<String> = profile;
         all.extend(extra.iter().map(|x| shell_quote(x)));
@@ -284,7 +288,7 @@ fn hermit_command(
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict{workdir} $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{run_extra_joined} -- {guest}"
             )
         }
         "replay" => format!(
@@ -295,7 +299,7 @@ fn hermit_command(
                 fail("internal error: chaos command construction requires a declared seed")
             });
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --base-env=minimal --backend {be} --strict{workdir} $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{seed}.json\" --chaos --sched-heuristic=random --seed={seed}{run_extra_joined} -- {guest}"
             )
         }
         "custom" => {
@@ -308,7 +312,7 @@ fn hermit_command(
                 .join(" ");
             let sep = if margs.is_empty() { "" } else { " " };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{sep}{margs} -- {guest}"
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log={log} run --backend {be}{workdir}{sep}{margs} -- {guest}"
             )
         }
         other => fail(format!("unsupported mode `{other}`")),
@@ -649,8 +653,10 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
     } else {
         Vec::new()
     };
+    let modes = modes_table(test, id);
+    let workdir = modes[&mode].get("workdir").and_then(Value::as_str);
     let verify_bitwise_parity = if mode == "verify" {
-        modes_table(test, id)[&mode]
+        modes[&mode]
             .get("assert")
             .and_then(Value::as_table)
             .and_then(|assert| assert.get("bitwise_parity"))
@@ -660,7 +666,6 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
         false
     };
     let seed = if mode == "chaos" {
-        let modes = modes_table(test, id);
         Some(first_chaos_seed(&modes[&mode], id).unwrap_or_else(|error| fail(error)))
     } else {
         None
@@ -675,6 +680,7 @@ fn build_full_command(test: &Value, id: &str, args: &Args) -> (String, String, S
             timeout,
             seed,
             &mode_args,
+            workdir,
             verify_bitwise_parity,
             &log,
             &args.passthrough,
@@ -693,6 +699,7 @@ fn self_test() -> ExitCode {
         60,
         None,
         &[],
+        None,
         false,
         "info",
         &[],
@@ -711,6 +718,7 @@ fn self_test() -> ExitCode {
         60,
         Some(7),
         &[],
+        None,
         false,
         "info",
         &[],
@@ -739,6 +747,7 @@ fn self_test() -> ExitCode {
         60,
         None,
         &["--base-env=minimal".to_owned()],
+        None,
         false,
         "info",
         &[],
@@ -755,14 +764,16 @@ fn self_test() -> ExitCode {
         60,
         None,
         &[],
+        Some("/tmp"),
         true,
         "info",
         &[],
         "guest",
     );
     assert!(verify.contains("run --base-env=minimal"));
+    assert!(verify.contains("--strict --workdir /tmp $run_verify_strict"));
     assert!(verify.contains(
-        "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+        "--strict --workdir /tmp $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
     ));
     assert!(!verify.contains("--no-virtualize-cpuid"));
     assert!(!verify.contains("--max-timeslice=disabled"));
@@ -773,6 +784,7 @@ fn self_test() -> ExitCode {
         60,
         None,
         &[],
+        None,
         false,
         "info",
         &[],

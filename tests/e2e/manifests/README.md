@@ -160,6 +160,23 @@ test:
 Every `guest_args` key must name an enabled backend. Omitted backends receive
 no guest arguments.
 
+A run-backed mode (`verify`, `chaos`, or `custom`) may declare an absolute
+guest `workdir`. Naked and replay execution retain their existing working-
+directory behavior. Use `/tmp` when a guest must not inherit the checkout path:
+
+```yaml
+test:
+  - id: example/private-working-directory
+    modes:
+      verify:
+        workdir: /tmp
+```
+
+Hermit resolves the directory after applying guest mounts, so `/tmp` names its
+fresh isolated temporary directory. This does not make a program stored under
+host `/tmp` visible inside the guest; such a program still requires an explicit
+bind or `--tmp=/tmp`.
+
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
 every disabled backend. Regular CI executes only cells with `ci = true`;

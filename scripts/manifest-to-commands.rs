@@ -253,16 +253,20 @@ fn hermit_command(
     timeout: i64,
     seed: Option<i64>,
     extra: &[String],
+    workdir: Option<&str>,
     verify_bitwise_parity: bool,
     guest: &str,
 ) -> String {
     let _lane = lane;
     let profile = "";
+    let workdir = workdir
+        .map(|path| format!(" --workdir {}", shell_quote(path)))
+        .unwrap_or_default();
     let command = match mode {
         "verify" => {
             let _verify_bitwise_parity = verify_bitwise_parity;
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict{workdir} $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\"{profile} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -271,7 +275,7 @@ fn hermit_command(
             shell_quote(backend)
         ),
         "chaos" => format!(
-            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
+            "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --base-env=minimal --backend {} --strict{workdir} $run_verify_strict --verify --verify-allow=both --verify-json \"$cell/captures/verify-seed-{}.json\" --chaos --sched-heuristic=random --seed={}{profile} -- {guest}",
             shell_quote(backend),
             seed.unwrap_or(0),
             seed.unwrap_or(0)
@@ -284,7 +288,7 @@ fn hermit_command(
                 .join(" ");
             let separator = if extra.is_empty() { "" } else { " " };
             format!(
-                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {}{separator}{extra} -- {guest}",
+                "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {}{workdir}{separator}{extra} -- {guest}",
                 shell_quote(backend)
             )
         }
@@ -350,6 +354,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
             continue;
         }
         let extra = string_array(spec.get("args"), &format!("{id}.modes.{mode}.args"));
+        let workdir = spec.get("workdir").and_then(Value::as_str);
         // `args` are Hermit's; `guest_args` are the guest's and are per-backend,
         // so they are resolved inside the backend loop below.
         let assert = spec.get("assert").and_then(Value::as_table);
@@ -381,6 +386,7 @@ fn commands_for_test(test: &Value, bucket: &str) -> Vec<String> {
                     timeout,
                     seed,
                     &extra,
+                    workdir,
                     verify_bitwise_parity,
                     &guest,
                 );
@@ -707,6 +713,7 @@ test:
             60,
             None,
             &[],
+            None,
             false,
             "guest",
         );
@@ -723,6 +730,7 @@ test:
             60,
             Some(7),
             &[],
+            None,
             false,
             "guest",
         );
@@ -741,6 +749,7 @@ test:
             60,
             None,
             &["--base-env=minimal".to_owned()],
+            None,
             false,
             "guest",
         );
@@ -748,10 +757,21 @@ test:
         assert!(!custom.contains("--strict"));
         assert!(!custom.contains("--no-virtualize-cpuid"));
 
-        let verify = hermit_command("verify", "ptrace", "portable", 60, None, &[], true, "guest");
+        let verify = hermit_command(
+            "verify",
+            "ptrace",
+            "portable",
+            60,
+            None,
+            &[],
+            Some("/tmp"),
+            true,
+            "guest",
+        );
         assert!(verify.contains("run --base-env=minimal"));
+        assert!(verify.contains("--strict --workdir /tmp $run_verify_strict"));
         assert!(verify.contains(
-            "--strict $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
+            "--strict --workdir /tmp $run_verify_strict --verify --verify-json \"$cell/captures/verify.json\""
         ));
     }
 

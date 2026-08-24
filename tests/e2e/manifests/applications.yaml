@@ -321,6 +321,7 @@ test:
         backends_disabled:
           native: Fixed content, identities, timestamps, and configuration make the repository transaction deterministic by construction
       verify:
+        workdir: /tmp
         ci: true
         backends_enabled:
           - ptrace
