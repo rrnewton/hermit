@@ -129,6 +129,34 @@ run_case "prose mention of a section keyword does not satisfy it" 1 \
     "$FULL_LABELS" \
     $'## Summary\nIn summary, this changes determinism and validation broadly.\n## Determinism\nd\n## Validation\nv\n## Human Review Required\nt'
 
+# --- UNSET vs EMPTY: the defect this gate had, in both directions -----------
+# run_case cannot express "unset", because it always assigns the variables.
+# These cases invoke the lint directly with the variable removed from the
+# environment, which is the whole point: the previous `${PR_LABELS-}` made the
+# unset case indistinguishable from an empty one and returned a PASS having
+# checked nothing.
+run_unset_case() { # NAME EXPECTED_EXIT UNSET_VAR [ENV...]
+    local name=$1 expected=$2 unset_var=$3; shift 3
+    local actual=0
+    env -u "$unset_var" PR_NUMBER=test "$@" bash "$LINT" >/dev/null 2>&1 || actual=$?
+    if [ "$actual" -eq "$expected" ]; then
+        echo "ok   - ${name} (exit ${actual})"; pass=$((pass + 1))
+    else
+        echo "FAIL - ${name}: expected exit ${expected}, got ${actual}"; fail=$((fail + 1))
+    fi
+}
+
+run_unset_case "PR_LABELS unset REFUSES (was a silent pass)" 2 PR_LABELS PR_BODY=""
+run_case "PR_LABELS empty is a PASS and is not the unset case" 0 "" ""
+run_unset_case "PR_BODY unset REFUSES when the protocol applies" 2 PR_BODY \
+    "PR_LABELS=$FULL_LABELS"
+run_unset_case "PR_BODY unset is IGNORED when the protocol does not apply" 0 PR_BODY \
+    "PR_LABELS=category:detcore"
+
+# The genuinely-empty label set must still take the not-applicable path, so the
+# refusal above cannot be mistaken for "any missing label now blocks".
+run_case "empty labels + empty body still passes (not applicable)" 0 "" ""
+
 echo
 echo "core-review-protocol-lint self-test: ${pass} passed, ${fail} failed."
 [ "$fail" -eq 0 ]
