@@ -31,11 +31,21 @@ case ${1:-} in
         printf 'AUXV-DUMP\n'
         cat "$E2E_TMPDIR/auxv.txt"
 
-        # Structural summary, so a truncated or empty dump is not silently
-        # mistaken for a stable one.
-        printf 'AUXV-KEYS %s\n' "$(grep -c '^AT_' "$E2E_TMPDIR/auxv.txt" | tr -d '[:space:]')"
+        # Structural checks make a truncated or empty dump fail, rather than
+        # merely producing the same incomplete output twice.
+        keys=$(grep -c '^AT_' "$E2E_TMPDIR/auxv.txt" || true)
+        printf 'AUXV-KEYS %s\n' "$keys"
+        if [ "$keys" -lt 5 ]; then
+            echo "auxv dump is incomplete: found $keys AT_ entries" >&2
+            exit 1
+        fi
         for key in AT_RANDOM AT_SYSINFO_EHDR AT_PAGESZ AT_SECURE AT_CLKTCK; do
-            printf 'HAS %s %s\n' "$key" "$(grep -c "^$key:" "$E2E_TMPDIR/auxv.txt" | tr -d '[:space:]')"
+            matches=$(grep -c "^$key:" "$E2E_TMPDIR/auxv.txt" || true)
+            printf 'HAS %s %s\n' "$key" "$matches"
+            if [ "$matches" -ne 1 ]; then
+                echo "auxv key $key occurred $matches times, want exactly once" >&2
+                exit 1
+            fi
         done
         ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
