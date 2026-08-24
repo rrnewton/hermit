@@ -1730,8 +1730,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized if call.number() == Sysno::pidfd_getfd => {
                 match call {
                     Syscall::Other(_, args) => {
-                        self.handle_pidfd_getfd(guest, call, args.arg0 as RawFd, args.arg2 as u32)
-                            .await
+                        self.handle_pidfd_getfd(
+                            guest,
+                            call,
+                            args.arg0 as RawFd,
+                            args.arg1 as RawFd,
+                            args.arg2 as u32,
+                        )
+                        .await
                     }
                     _ => unreachable!("pidfd_getfd unexpectedly gained a typed variant"),
                 }
