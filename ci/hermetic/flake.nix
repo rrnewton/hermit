@@ -133,7 +133,10 @@
           '';
           config = {
             Env = [
-              "PATH=/bin:/usr/bin"
+              # $CARGO_HOME/bin first: the fetch phase installs exactly-pinned
+              # developer tools there (cargo-nextest at the version the DAG
+              # names), and they must win over anything the image ships.
+              "PATH=/build/.cargo/bin:/bin:/usr/bin"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # The run is offline by construction; make a stray fetch fail loudly
               # rather than silently reach a network that a rebuild will not have.

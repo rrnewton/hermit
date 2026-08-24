@@ -108,6 +108,38 @@ if (( fetch )); then
         echo "  and that failure would be harder to read than this one." >&2
         exit 1
     fi
+    # PINNED DEVELOPER TOOLS BELONG IN THE FETCH PHASE TOO, for the same reason
+    # the crates do. `setup.nextest` wants EXACTLY 0.9.100 and installs it from
+    # the network when absent; offline it fails with "could not find
+    # `cargo-nextest` in registry `crates-io` with version `=0.9.100`". Shipping
+    # the version in the pinned nixpkgs instead -- 0.9.72 -- WOULD make the node
+    # pass, because it only probes `cargo nextest show-config version`, and that
+    # is precisely why it is the wrong fix: the node would go green while the
+    # tests ran under a version the project did not pin. Installing the exact
+    # version here keeps the pin honest and keeps the run offline.
+    nextest_version=$(sed -n 's/.*cargo install cargo-nextest --locked --version \([0-9.]*\).*/\1/p' \
+        "$src/ci/dag/portable.json" | head -n1)
+    if [[ -n "$nextest_version" ]]; then
+        # INSTALL TO A THROWAWAY --root, NEVER INTO THE SHARED CARGO_HOME/bin.
+        # A host-built binary CANNOT RUN in the nix root -- its ELF interpreter
+        # does not exist there -- and installing it into $CARGO_HOME/bin also
+        # records it in .crates.toml, which made `setup.nextest` exit 0 on
+        # "already installed" while every one of the 15 downstream test nodes
+        # died on "could not execute process .../cargo-nextest (never
+        # executed)". A gate reporting a tool present when it is unrunnable is
+        # worse than the missing tool. What this phase is FOR is the crate
+        # SOURCE in the shared registry cache; the in-image `cargo install` then
+        # builds a runnable binary offline from it.
+        if ! CARGO_HOME="$out/home/.cargo" CARGO_NET_OFFLINE=false \
+                "${proxy_wrapper[@]}" cargo install cargo-nextest --locked \
+                --version "$nextest_version" --root "$out/home/.nextest-fetch" \
+                >/dev/null 2>&1; then
+            echo "run-in-pinned-root: WARNING: could not install cargo-nextest $nextest_version;" >&2
+            echo "  setup.nextest will fail offline. Not fatal: nodes that do not use it still run." >&2
+        else
+            echo ":: fetch phase cached cargo-nextest $nextest_version source (built in-image)"
+        fi
+    fi
     echo ":: fetch phase complete; the run below has no network"
 fi
 
@@ -120,6 +152,16 @@ exec podman run --rm \
     --network=none \
     --mount "type=bind,source=$src,destination=/src,ro=true" \
     --mount "type=bind,source=$out/target,destination=/out/target" \
+    `# AND THE SAME VOLUME AT /src/target. CARGO_TARGET_DIR redirects CARGO,` \
+    `# but it does not redirect the project. Measured over all 53 portable DAG` \
+    `# nodes: 20 died on "mkdir: cannot create directory 'target': Read-only` \
+    `# file system" and 14 more downstream on a missing /src/target -- because` \
+    `# the node commands reference the literal path (target/debug/test-harness,` \
+    `# target/install_pkg/rsrcs/..., and plain mkdir target). /src stays` \
+    `# read-only; this makes exactly the one subpath that must be writable so,` \
+    `# and points it at the same volume cargo already writes to, so the two` \
+    `# views cannot diverge.` \
+    --mount "type=bind,source=$out/target,destination=/src/target" \
     --mount "type=bind,source=$out/home,destination=/build" \
     -e HOME=/build \
     -e CARGO_HOME=/build/.cargo \
