@@ -1975,6 +1975,7 @@ fn self_test() -> Result<(), String> {
                     // report carries.
                     first_divergent_scheduler_turn: None,
                     first_divergent_virtual_nanoseconds: None,
+                    first_divergent_record: None,
                 }).unwrap();
                 serde_json::json!({
                 "argv":["hermit","run"],
