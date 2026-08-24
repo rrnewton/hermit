@@ -888,8 +888,22 @@ fn compare_two_runs_with_unsupported_scan(
                 failed = true;
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
-                // Set ONLY inside this `diff_found` arm, so a matching pair
-                // leaves it None rather than 0.
+                // Set inside this `diff_found` arm, matching its two siblings
+                // above.
+                //
+                // The arm is DEFENCE, not the source of the guarantee, and the
+                // difference matters to whoever edits this next: a matching pair
+                // already yields `None` from the comparator, because
+                // `first_divergent_record` is computed from `first_different`,
+                // which is `None` when nothing differed. Deleting this arm would
+                // therefore NOT produce a `0` today, and no test would catch its
+                // removal -- verified by deleting the equivalent gate in
+                // `logdiff.rs` and watching
+                // `identical_logs_have_no_first_divergent_record` still pass.
+                //
+                // It is kept because it costs nothing and it is what holds the
+                // invariant if the comparator ever starts reporting a position
+                // on a match.
                 first_divergent_record = summary.first_divergent_record;
                 eprintln!(":: {}", "Log differences found between runs.".red().bold());
             }
