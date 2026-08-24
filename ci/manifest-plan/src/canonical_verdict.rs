@@ -34,11 +34,21 @@ pub struct VerificationReport {
     ///
     /// NOTE both of these are the position of the PRECEDING scheduler COMMIT,
     /// so when no COMMIT precedes the differing record they collapse to the
-    /// origin and bound the divergence rather than locating it. The record
-    /// index that locates it exactly is a separate field being added by
-    /// hermit#2386; this struct will gain it when that lands.
+    /// origin and BOUND the divergence rather than locating it. The field below
+    /// is the one that locates it.
     #[serde(default)]
     pub first_divergent_virtual_nanoseconds: Option<u64>,
+    /// 1-based index of the first differing compared record -- the LOCATION of
+    /// the divergence rather than a bound on it, and the only one of the three
+    /// that is a true log prefix. It shares a unit with
+    /// `compared_log_messages`, so `record / compared` is the fraction of the
+    /// log that was deterministic.
+    ///
+    /// `null` and `0` are not the same claim: null is "no divergence located",
+    /// while 0 would mean the very first record differed. Nothing writes 0 --
+    /// the index is 1-based. Same tolerant-default rationale as its siblings.
+    #[serde(default)]
+    pub first_divergent_record: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -213,13 +223,31 @@ mod tests {
         let json = br#"{"verified":false,"bitwise_parity":false,"verdict":"diverged",
             "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":180,"right":180},
             "first_divergent_scheduler_turn":4,
-            "first_divergent_virtual_nanoseconds":1767225600002825515}"#;
+            "first_divergent_virtual_nanoseconds":1767225600002825515,
+            "first_divergent_record":108}"#;
         let report = VerificationReport::from_json_slice(json).expect("diverged report parses");
         assert_eq!(report.first_divergent_scheduler_turn, Some(4));
         assert_eq!(
             report.first_divergent_virtual_nanoseconds,
             Some(1_767_225_600_002_825_515)
         );
+        assert_eq!(report.first_divergent_record, Some(108));
+    }
+
+    /// The record index is the only coordinate that LOCATES the divergence;
+    /// the other two are the preceding COMMIT and merely bound it. So a report
+    /// can carry a record with both bounds collapsed to the origin, and that
+    /// is a MORE informative report rather than a malformed one.
+    #[test]
+    fn a_located_record_does_not_require_its_bounding_siblings() {
+        let json = br#"{"verified":false,"bitwise_parity":false,"verdict":"diverged",
+            "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},
+            "compared_log_messages":{"left":180,"right":180},
+            "first_divergent_record":3}"#;
+        let report = VerificationReport::from_json_slice(json).expect("report parses");
+        assert_eq!(report.first_divergent_record, Some(3));
+        assert_eq!(report.first_divergent_scheduler_turn, None);
+        assert_eq!(report.first_divergent_virtual_nanoseconds, None);
     }
 
     /// An EARLIER divergence must report a SMALLER value in both units. This is
@@ -277,6 +305,7 @@ mod tests {
             compared_log_messages: Some(ComparedLogMessages { left, right }),
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
         }
     }
 
