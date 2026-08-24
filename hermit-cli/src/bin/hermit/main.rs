@@ -516,6 +516,55 @@ mod tests {
         }
     }
 
+    /// The DBT arm builds its own [`verify::ComparisonOptions`], so the record
+    /// envelope it names is not covered by the generic verifier's tests. Pin it
+    /// to a canonical policy: an opaque `caller_defined` predicate here would
+    /// silently disqualify every DBT verdict from bitwise parity, and a switch
+    /// to the transport envelope would start excluding records this adapter
+    /// compares today. Either is a deliberate change that must edit this test.
+    #[test]
+    fn dbt_verdict_names_a_canonical_record_envelope() {
+        let source = include_str!("backends.rs");
+        let start = source
+            .find("let outcome = compare_two_runs(")
+            .expect("DBT arm must compare two runs");
+        let options = source[start..]
+            .find("ComparisonOptions {")
+            .map(|offset| &source[start + offset..])
+            .expect("DBT comparison must build ComparisonOptions");
+        let block = &options[..options.find("\n        },").expect("options block end")];
+
+        let envelope = block
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("record_envelope:"))
+            .map(|value| value.trim().trim_end_matches(',').to_string())
+            .expect(
+                "the DBT comparison must state its record envelope; an unnamed selection is \
+                 exactly the undisclosed filtering the envelope exists to prevent",
+            );
+        assert_eq!(
+            envelope, "RecordEnvelope::all_records_v1()",
+            "the DBT adapter compares every decoded evidence record. Changing this envelope \
+             changes which records are compared, so update the adapter and its evidence \
+             together, not just this literal"
+        );
+        // Bind the literal above to the real policy, so renaming the
+        // constructor without preserving its meaning fails here too.
+        assert!(
+            crate::record_envelope::RecordEnvelope::all_records_v1()
+                .policy()
+                .is_canonical(),
+            "all_records_v1 must remain a canonical envelope or DBT verdicts silently lose \
+             bitwise-parity eligibility"
+        );
+        assert_eq!(
+            crate::record_envelope::RecordEnvelope::all_records_v1()
+                .policy()
+                .as_str(),
+            "all_records_v1"
+        );
+    }
+
     /// `--namespace-only` appears on the list of paths that bypass `verify()`,
     /// but it is NOT reachable with a verdict artifact: clap rejects
     /// `--verify` together with `--namespace-only`, and `--verify-json`
