@@ -7,7 +7,8 @@
  */
 
 /*
- * Regression guest for the determinized `chown` family (#1849).
+ * Regression guest for the determinized `chown` family: issue #1849,
+ * implemented by PR #1851 (https://github.com/rrnewton/hermit/pull/1851).
  *
  * Detcore fixes the guest identity at root, so an ownership change must report
  * the answer a real root gets -- success, for any uid -- instead of the errno
@@ -24,8 +25,12 @@
  *   - a plain pass-through satisfies the error half and reintroduces the
  *     host-dependent EPERM/EINVAL the determinization exists to remove.
  *
- * Only an implementation that emulates the identity half while validating the
- * argument half without entering setattr passes all of the checks below.
+ * Only an implementation that emulates the identity half, validates the
+ * argument half, and still applies the metadata consequence Linux attaches to
+ * a successful chown -- clearing set-id bits and moving ctime -- passes all of
+ * the checks below. Skipping that last part is its own defect: hermit clears
+ * the bits today under pass-through, so a determinization that stops doing it
+ * would be a privilege-containment regression.
  *
  * Success is printing "chown-virtual-root-identity-ok" and exiting 0. Every
  * failure prints the exact call, what was expected, and what was observed.
@@ -166,11 +171,17 @@ int main(void) {
   expect_errno("fchownat(bad flags)",
                (int)syscall(SYS_fchownat, AT_FDCWD, path, 0, 0, 0x4000), EINVAL);
 
-  /* ---- Host ownership must be untouched: this is a no-op, not a forwarded
-   * chown. Detcore does not model per-file ownership, so the read-back shows
-   * the unchanged owner even though the calls above reported success. That
-   * divergence is the documented boundary; assert it so a future change that
-   * starts really mutating ownership cannot pass silently. ---- */
+  /* ---- Read-back. Two different expectations, deliberately:
+   *
+   * OWNERSHIP is untouched, because the identity half is emulated rather than
+   * forwarded. Detcore does not model per-file ownership, so the read-back
+   * shows the unchanged owner even though the calls above reported success.
+   * That divergence is the documented boundary; assert it so a future change
+   * that starts really mutating ownership cannot pass silently.
+   *
+   * The METADATA CONSEQUENCE, by contrast, must match the kernel exactly: a
+   * successful chown clears set-id bits and moves ctime, so those are asserted
+   * to have HAPPENED, not to have been skipped. ---- */
   struct stat st;
   if (stat(path, &st) != 0) {
     perror("stat");
