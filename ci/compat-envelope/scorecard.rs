@@ -35,7 +35,7 @@ const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 4;
-const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
+const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
@@ -187,6 +187,10 @@ impl ObservedResult {
             "oom" => Ok(Self::Oom),
             "infrastructure-error" => Err(
                 "pressure summary contains an infrastructure error; refusing to store it as product behavior"
+                    .into(),
+            ),
+            "sandbox-denied" => Err(
+                "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
                     .into(),
             ),
             other => Err(format!("unknown pressure result `{other}`")),
@@ -1012,7 +1016,7 @@ fn apply_pressure_summary(
     head: &str,
     detcore_tree: &str,
 ) -> Result<usize, String> {
-    if summary.schema != PRESSURE_SUMMARY_SCHEMA {
+    if !matches!(summary.schema, 4 | PRESSURE_SUMMARY_SCHEMA) {
         return Err(format!(
             "unsupported pressure summary schema {}",
             summary.schema
@@ -1809,6 +1813,14 @@ fn self_test() -> Result<(), String> {
     let timeout = pressure_summary("sha-1", "tree-1", vec![pressure_row("timeout", None, None)]);
     apply_pressure_summary(&mut observed, &timeout, "sha-1", "tree-1")
         .map_err(|e| format!("pressure-observation result-set bracket failed: {e}"))?;
+    let sandbox_denied = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("sandbox-denied", None, None)],
+    );
+    if apply_pressure_summary(&mut observed, &sandbox_denied, "sha-1", "tree-1").is_ok() {
+        return Err("sandbox-denied pressure output was stored as product behavior".into());
+    }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(&mut observed, &same_engine, "sha-doc", "tree-1")
         .map_err(|e| format!("same-Detcore-tree pressure-observation bracket failed: {e}"))?;
