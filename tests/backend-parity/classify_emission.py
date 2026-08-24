@@ -40,6 +40,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parent.parent.parent
 FIXTURE_DIR = REPO / "tests" / "backend-parity" / "fixtures"
 
@@ -111,9 +113,8 @@ def main():
     ap.add_argument("--virtualize-cpuid", action="store_true",
                     help="drop --no-virtualize-cpuid (the portable lane sets it; cpuid_probe needs it off)")
     ap.add_argument("--population", choices=("dir", "bucket"), default="dir",
-                    help="'dir' = *.c under fixtures/ (82); 'bucket' = every program the "
-                         "backend-parity-c manifest registers (85, incl. 6 under tests/c/, "
-                         "excl. 3 unregistered orphans)")
+                    help="'dir' = every *.c under fixtures/; 'bucket' = every program "
+                         "the backend-parity-c manifest registers")
     args = ap.parse_args()
 
     global FIXTURE_DIR
@@ -130,15 +131,15 @@ def main():
     # fixture is wrong: numa_node_identity defines _GNU_SOURCE itself and is
     # declared with no cflags, so forcing the flag makes it fail -Werror on a
     # redefinition that the real harness never triggers.
-    manifest = (REPO / "tests/e2e/manifests/backend-parity-c.toml").read_text()
+    manifest = yaml.safe_load(
+        (REPO / "tests/e2e/manifests/backend-parity-c.yaml").read_text()
+    )
     cflags_by_program = {}
-    for block in manifest.split("\n[[test]]\n")[1:]:
-        pm = re.search(r'^program = "(.*?)"', block, re.M)
-        if not pm:
+    for test in manifest["test"]:
+        program = test.get("program")
+        if not program:
             continue
-        cm = re.search(r'^cflags = \[(.*?)\]', block, re.M)
-        cflags_by_program[pm.group(1)] = (
-            re.findall(r'"(.*?)"', cm.group(1)) if cm else [])
+        cflags_by_program[program] = test.get("build", {}).get("cflags", [])
 
     if args.population == "bucket":
         fixtures = [REPO / m for m in sorted(cflags_by_program)]

@@ -118,6 +118,18 @@ FIXTURES: dict[str, FixtureSpec] = {
         source="sched_getaffinity_identity.c",
         fields=("affinity_count",),
     ),
+    "ioctl_fionread": FixtureSpec(
+        source="ioctl_fionread.c",
+        fields=(
+            "navail",
+            "fionread_ok",
+            "fionbio_set",
+            "nonblock_after_set",
+            "fionbio_clear",
+            "clear_readback_ok",
+            "nonblock_after_clear",
+        ),
+    ),
 }
 
 
@@ -594,6 +606,30 @@ def run_native(report: Report, name: str, binary: Path, spec: FixtureSpec) -> No
         require_divergence(report, f"{name} [native] mutate({field})", clean, mutated)
 
 
+def check_ioctl_fionread_getfl_failure(
+    report: Report, spec: FixtureSpec, output: Path
+) -> None:
+    failed_readback = dataclasses.replace(
+        spec,
+        cflags=spec.cflags + ("-DHERMIT_TEST_FIONREAD_SECOND_GETFL_FAILURE",),
+    )
+    observation = observe_native(compile_fixture(failed_readback, output), mutate=None)
+    expected = b"clear_readback_ok=0 nonblock_after_clear=-1"
+    if (
+        observation is not None
+        and observation.exit_status != 0
+        and expected in observation.stdout
+    ):
+        report.ok(
+            "ioctl_fionread [native] failed second F_GETFL cannot satisfy the clear check"
+        )
+    else:
+        report.fail(
+            "ioctl_fionread [native] failed second F_GETFL was not preserved as a failed check "
+            f"({observation.summary() if observation else 'timeout'})"
+        )
+
+
 def run_hermit(
     report: Report,
     name: str,
@@ -909,6 +945,10 @@ def main(argv: list[str]) -> int:
             check_declared_fields(report, name, spec)
             binary = compile_fixture(spec, workdir / name)
             run_native(report, name, binary, spec)
+            if name == "ioctl_fionread":
+                check_ioctl_fionread_getfl_failure(
+                    report, spec, workdir / f"{name}-getfl-failure"
+                )
             if args.hermit and not args.native_only:
                 if not args.hermit.is_file():
                     report.fail(f"hermit binary not found: {args.hermit}")
