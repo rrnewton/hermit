@@ -61,7 +61,7 @@ test:
         # Fail, exit 1), or it computes after that store (prints Success,
         # exit 0).
         #
-        # Direct ptrace verification on devbig030 at e2f9a36b1ad8 used
+        # Direct ptrace verification at e2f9a36b1ad8 used
         # --log=info, --verify-strict, --detlog-stack and --detlog-heap. Seeds
         # 0..31 reproduced 32/32 with 28 successes and 4 failures; seeds 32..63
         # reproduced 32/32 with 20 successes and 12 failures. A retained-work
