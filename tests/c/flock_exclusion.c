@@ -51,6 +51,12 @@
  *   failed-clone  A rejected process-clone syscall must not discard known
  *              flock state; the next uncontended blocking lock succeeds.
  *
+ *   pidfd-getfd  A successful self pidfd_getfd creates another alias of the
+ *              source open file description. Unlocking through the returned
+ *              fd must invalidate the source alias's cached flock authority;
+ *              failed duplication and duplication of an unrelated fd must not
+ *              discard still-authoritative state.
+ *
  *   sent-after-fork  Transfer a lock acquired after fork, let the receiver
  *              unlock it, and prove the sender does not restore stale state.
  *
@@ -588,6 +594,179 @@ static int scenario_failed_clone(void) {
   return 0;
 }
 
+static int scenario_pidfd_getfd(void) {
+  const char *path = lock_path("pidfd-getfd");
+  int source = open_lock(path);
+  int contender = open_lock(path);
+  if (source < 0 || contender < 0 ||
+      flock(source, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: could not establish pidfd_getfd source lock (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+
+  int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+  if (pidfd < 0) {
+    printf("FAIL: pidfd_open self failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  int duplicate = (int)syscall(SYS_pidfd_getfd, pidfd, source, 0);
+  if (duplicate < 0) {
+    printf("FAIL: pidfd_getfd self failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (flock(duplicate, LOCK_UN) != 0) {
+    printf("FAIL: pidfd_getfd duplicate unlock failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  printf("flock-pidfd-duplicate-unlocked\n");
+
+  if (flock(contender, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: pidfd_getfd contender could not take LOCK_SH (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  errno = 0;
+  if (flock(source, LOCK_EX) != -1 || errno != ENOLCK) {
+    printf("FAIL: pidfd_getfd source blocking upgrade returned errno=%d\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-source-upgrade-refused errno=%d\n", errno);
+
+  if (flock(contender, LOCK_UN) != 0) {
+    printf("FAIL: pidfd_getfd contender unlock failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  int fresh = open_lock(path);
+  if (fresh < 0 || flock(fresh, LOCK_EX | LOCK_NB) != 0) {
+    printf("FAIL: pidfd_getfd stale source cache restored a released lock (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-stale-restore-absent\n");
+  flock(fresh, LOCK_UN);
+  close(fresh);
+  close(duplicate);
+  close(contender);
+  close(source);
+
+  const char *failed_path = lock_path("pidfd-getfd-failed");
+  int failed_source = open_lock(failed_path);
+  if (failed_source < 0 || flock(failed_source, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: could not establish failed-pidfd_getfd source lock (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, pidfd, -1, 0) != -1 || errno != EBADF) {
+    printf("FAIL: invalid pidfd_getfd did not return EBADF (errno=%d)\n", errno);
+    return 1;
+  }
+  if (flock(failed_source, LOCK_EX) != 0) {
+    printf("FAIL: failed pidfd_getfd discarded source authority (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-failed-getfd-preserved errno=%d\n", EBADF);
+  flock(failed_source, LOCK_UN);
+  close(failed_source);
+
+  const char *unrelated_path = lock_path("pidfd-getfd-unrelated");
+  char duplicated_path[512];
+  snprintf(duplicated_path, sizeof(duplicated_path), "%s-duplicate",
+           unrelated_path);
+  int authoritative = open_lock(unrelated_path);
+  int unrelated = open_lock(duplicated_path);
+  if (authoritative < 0 || unrelated < 0 ||
+      flock(authoritative, LOCK_SH | LOCK_NB) != 0) {
+    printf("FAIL: could not establish unrelated-authority bracket (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  int unrelated_duplicate =
+      (int)syscall(SYS_pidfd_getfd, pidfd, unrelated, 0);
+  if (unrelated_duplicate < 0) {
+    printf("FAIL: unrelated pidfd_getfd failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (flock(authoritative, LOCK_EX) != 0) {
+    printf("FAIL: unrelated pidfd_getfd discarded authoritative flock state (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-unrelated-authority-preserved\n");
+  flock(authoritative, LOCK_UN);
+  close(unrelated_duplicate);
+  close(unrelated);
+  close(authoritative);
+
+  int ready[2];
+  int release[2];
+  if (pipe(ready) != 0 || pipe(release) != 0) {
+    printf("FAIL: could not create foreign-pidfd synchronization pipes (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    printf("FAIL: foreign-pidfd fork failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  if (child == 0) {
+    close(ready[0]);
+    close(release[1]);
+    int foreign = open_lock(lock_path("pidfd-getfd-foreign"));
+    char token = 0;
+    if (foreign < 0 ||
+        write(ready[1], &foreign, sizeof(foreign)) != sizeof(foreign) ||
+        read(release[0], &token, sizeof(token)) != sizeof(token)) {
+      _exit(HARNESS_FAILURE);
+    }
+    close(foreign);
+    _exit(0);
+  }
+  close(ready[1]);
+  close(release[0]);
+  int foreign = -1;
+  if (read(ready[0], &foreign, sizeof(foreign)) != sizeof(foreign)) {
+    printf("FAIL: child did not publish its foreign descriptor (errno=%d)\n",
+           errno);
+    return HARNESS_FAILURE;
+  }
+  int child_pidfd = (int)syscall(SYS_pidfd_open, child, 0);
+  if (child_pidfd < 0) {
+    printf("FAIL: pidfd_open child failed (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  errno = 0;
+  if (syscall(SYS_pidfd_getfd, child_pidfd, foreign, 0) != -1 ||
+      errno != EOPNOTSUPP) {
+    printf("FAIL: foreign pidfd_getfd did not fail closed (errno=%d)\n",
+           errno);
+    return 1;
+  }
+  printf("flock-pidfd-foreign-source-refused errno=%d\n", errno);
+  char token = 'x';
+  if (write(release[1], &token, sizeof(token)) != sizeof(token)) {
+    printf("FAIL: could not release foreign-pidfd child (errno=%d)\n", errno);
+    return HARNESS_FAILURE;
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0) {
+    printf("FAIL: foreign-pidfd child failed (status=%d errno=%d)\n", status,
+           errno);
+    return HARNESS_FAILURE;
+  }
+  close(child_pidfd);
+  close(ready[0]);
+  close(release[1]);
+  close(pidfd);
+  printf("flock-pidfd-getfd-ok\n");
+  return 0;
+}
+
 static int scenario_sent_after_fork(const char *scenario, int batched) {
   const char *path = lock_path(scenario);
   int sockets[2];
@@ -886,6 +1065,9 @@ int main(int argc, char **argv) {
   }
   if (strcmp(scenario, "failed-clone") == 0) {
     return scenario_failed_clone();
+  }
+  if (strcmp(scenario, "pidfd-getfd") == 0) {
+    return scenario_pidfd_getfd();
   }
   if (strcmp(scenario, "sent-after-fork") == 0) {
     return scenario_sent_after_fork(scenario, 0);
