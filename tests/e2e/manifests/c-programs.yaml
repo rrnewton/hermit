@@ -83,9 +83,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -321,9 +321,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -1345,9 +1345,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -1524,9 +1524,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -2181,9 +2181,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -2451,9 +2451,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -2510,9 +2510,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -2628,9 +2628,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:

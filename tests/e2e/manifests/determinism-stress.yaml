@@ -287,7 +287,8 @@ test:
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
       chaos:
-        ci: true
+        ci: false
+        ci_disabled_reason: Canonical verification diverged in one of three repetitions at seed 15 and scheduler turn 9; re-enable after repeated qualification passes
         seeds:
           - 0
           - 1

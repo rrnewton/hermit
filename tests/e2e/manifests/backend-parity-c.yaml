@@ -5691,8 +5691,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
         backends_disabled:
+          dbt: Canonical DBT verification is unavailable with the pinned Reverie revision; re-enable after protected nonempty INFO evidence passes repeated qualification
           kvm: KVM times out before guest start on the validation host, so no host-identity verdict is available; re-enable when the startup livelock is fixed
           sabre: SaBRe loader is not staged in the default build, so the backend reports unavailable rather than a host-identity verdict
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately

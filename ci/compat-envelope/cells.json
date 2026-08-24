@@ -5717,16 +5717,6 @@
       "test": "backend-parity-c/host-identity",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "backend-parity-c",
-      "test": "backend-parity-c/host-identity",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -5736,6 +5726,16 @@
       "category": "backend-parity-c",
       "test": "backend-parity-c/host-identity",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "backend-parity-c",
+      "test": "backend-parity-c/host-identity",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -16277,16 +16277,6 @@
       "test": "c-programs/add-key-enosys",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/add-key-enosys",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -16296,6 +16286,16 @@
       "category": "c-programs",
       "test": "c-programs/add-key-enosys",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/add-key-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -16917,16 +16917,6 @@
       "test": "c-programs/cachestat-enosys",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/cachestat-enosys",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -16936,6 +16926,16 @@
       "category": "c-programs",
       "test": "c-programs/cachestat-enosys",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/cachestat-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -19477,16 +19477,6 @@
       "test": "c-programs/futex-waitv-enosys",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/futex-waitv-enosys",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -19496,6 +19486,16 @@
       "category": "c-programs",
       "test": "c-programs/futex-waitv-enosys",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/futex-waitv-enosys",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -19957,16 +19957,6 @@
       "test": "c-programs/get-robust-list-self",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/get-robust-list-self",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -19976,6 +19966,16 @@
       "category": "c-programs",
       "test": "c-programs/get-robust-list-self",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/get-robust-list-self",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -21557,16 +21557,6 @@
       "test": "c-programs/ioctl-fioclex",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
-      "observations": []
-    },
-    {
-      "lane": "portable",
-      "category": "c-programs",
-      "test": "c-programs/ioctl-fioclex",
-      "mode": "verify",
-      "backend": "kvm",
       "enabled": false,
       "status": "red",
       "observations": []
@@ -21576,6 +21566,16 @@
       "category": "c-programs",
       "test": "c-programs/ioctl-fioclex",
       "mode": "verify",
+      "backend": "kvm",
+      "enabled": false,
+      "status": "red",
+      "observations": []
+    },
+    {
+      "lane": "portable",
+      "category": "c-programs",
+      "test": "c-programs/ioctl-fioclex",
+      "mode": "verify",
       "backend": "liteinst",
       "enabled": false,
       "status": "red",
@@ -22197,8 +22197,8 @@
       "test": "c-programs/kcmp-eperm",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
+      "enabled": false,
+      "status": "red",
       "observations": []
     },
     {
@@ -22357,8 +22357,8 @@
       "test": "c-programs/keyctl-enosys",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
+      "enabled": false,
+      "status": "red",
       "observations": []
     },
     {
@@ -22677,8 +22677,8 @@
       "test": "c-programs/listmount-enosys",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
-      "status": "green",
+      "enabled": false,
+      "status": "red",
       "observations": []
     },
     {
@@ -42918,7 +42918,7 @@
       "mode": "chaos",
       "backend": "ptrace",
       "enabled": true,
-      "status": "green",
+      "status": "red",
       "observations": []
     },
     {
