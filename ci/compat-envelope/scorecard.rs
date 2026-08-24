@@ -34,7 +34,7 @@ use sha2::Sha256;
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
-const SCHEMA: u64 = 5;
+const SCHEMA: u64 = 6;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
@@ -51,6 +51,12 @@ Commands:
   update-observations --summary FILE
       Merge one completed clean pressure-test summary into the red cells'
       checked-in observations. This never changes which cells are green.
+  observe-results --results DIR
+      Merge the divergence positions from ONE validate result directory into
+      the cells' checked-in observations, under the `validate` provenance so
+      they never mix with pressure-test bounds. Explicit and opt-in: ordinary
+      validation does not run this and changes no tracked file. Never changes
+      which cells are green.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -108,8 +114,17 @@ struct TrackedCell {
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
-    /// Filled only by the periodic all-red pressure test. Ordinary validate
-    /// never changes this array.
+    /// Divergence evidence, keyed by `(detcore_tree, provenance)`.
+    ///
+    /// ORDINARY VALIDATE STILL NEVER CHANGES THIS ARRAY. Two commands write it,
+    /// both explicit and opt-in: `update-observations` from a pressure-test
+    /// summary, and `observe-results` from a validate result directory. Neither
+    /// runs as part of a normal validate, so the tracked file stays untouched
+    /// by routine runs.
+    ///
+    /// The two provenances answer different questions and are never merged --
+    /// pressure test repeats a cell at one tree and measures flakiness, while
+    /// validate runs it once per commit and supplies the regression signal.
     observations: Vec<Observation>,
 }
 
@@ -129,9 +144,48 @@ enum CellStatus {
     Red,
 }
 
+/// WHICH MECHANISM produced an observation. Two mechanisms answer two different
+/// questions and their bounds must never be merged into one range.
+///
+/// PRESSURE TEST repeats a cell at ONE fixed tree, so its bounds isolate
+/// run-to-run flakiness -- that is the distribution a yellow-cell floor should
+/// be derived from.
+///
+/// VALIDATE runs a cell ONCE per commit, so a single validate observation is a
+/// point, not a distribution. Its value is as the regression signal a floor is
+/// CHECKED against.
+///
+/// Merging them would produce one number moving for two unrelated causes -- "the
+/// code changed" and "this varies run to run" -- which is the measurement trap
+/// this project has repeatedly been bitten by. Observations are therefore keyed
+/// by `(detcore_tree, provenance)`, not by tree alone.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ObservationProvenance {
+    PressureTest,
+    Validate,
+}
+
+impl ObservationProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PressureTest => "pressure-test",
+            Self::Validate => "validate",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Observation {
     detcore_tree: String,
+    /// Defaulted to `pressure-test` so the pre-provenance corpus keeps its
+    /// meaning: before this field existed, the pressure test was the ONLY
+    /// writer of observations, so that is what any older entry must have been.
+    /// (In practice no such entry exists -- every cell's array was empty when
+    /// this landed -- but a default that quietly relabelled old data as
+    /// validate-sourced would be wrong even with nothing to relabel.)
+    #[serde(default = "default_provenance")]
+    provenance: ObservationProvenance,
     hermit_shas: BTreeSet<String>,
     results: BTreeSet<ObservedResult>,
     invocations: BTreeSet<ObservedInvocation>,
@@ -222,6 +276,22 @@ impl ObservedResult {
 struct ObservedRange {
     earliest: u64,
     latest: u64,
+    /// How many LOCATED positions produced these bounds.
+    ///
+    /// Without it the bounds invite exactly the over-reading this repository
+    /// keeps catching: "earliest 80, latest 500" is a different claim over two
+    /// runs than over fifty, and the pair alone cannot tell them apart.
+    ///
+    /// This is NOT the number of runs, and the difference matters. A run that
+    /// passed located nothing and contributes no sample, so `samples` counts
+    /// only the runs that actually diverged. It is also per COORDINATE rather
+    /// than per observation, because a report can locate a scheduler turn
+    /// without locating a virtual nanosecond, which would leave one coordinate
+    /// with fewer samples behind it than its sibling.
+    ///
+    /// `samples == 1` is the honest way to say "one observation, so these
+    /// bounds are a point, not a range".
+    samples: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -291,6 +361,24 @@ struct ResultRow {
     shell_command: String,
     relaxations: Vec<String>,
     attempts: Vec<JsonValue>,
+    /// WHERE the cell diverged, as emitted by the harness.
+    ///
+    /// `#[serde(default)]` for the same reason the sibling copy in
+    /// ci/manifest-plan/src/canonical_verdict.rs is tolerant: this reader
+    /// aggregates RETAINED result rows, including ones written before the field
+    /// existed, so absence has to mean "older row" rather than "broken
+    /// producer". The pressure test's copy is deliberately REQUIRED-nullable
+    /// instead, because it only ever reads rows it just produced.
+    #[serde(default)]
+    first_divergent_scheduler_turn: Option<u64>,
+    #[serde(default)]
+    first_divergent_virtual_nanoseconds: Option<u64>,
+    /// The third coordinate, added by hermit#2386. Unlike its two siblings this
+    /// one LOCATES the divergence rather than bounding it: they are the
+    /// position of the preceding scheduler COMMIT, while this is the index of
+    /// the differing record itself.
+    #[serde(default)]
+    first_divergent_record: Option<u64>,
 }
 
 impl ResultRow {
@@ -555,6 +643,21 @@ fn run() -> Result<(), String> {
             let result_root = result_root.ok_or("verify-results requires --results DIR")?;
             check_tracked(&root)?;
             verify_results(&root, &result_root, &lanes)?;
+        }
+        "observe-results" => {
+            let mut result_root = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--results" => {
+                        result_root = Some(PathBuf::from(
+                            args.next().ok_or("--results requires a directory")?,
+                        ));
+                    }
+                    _ => return Err(format!("unknown observe-results option `{arg}`\n\n{USAGE}")),
+                }
+            }
+            let result_root = result_root.ok_or("observe-results requires --results DIR")?;
+            observe_results(&root, &result_root)?;
         }
         "self-test" => {
             no_more(&mut args)?;
@@ -1034,19 +1137,28 @@ fn update_tracked(
     Ok(())
 }
 
+fn default_provenance() -> ObservationProvenance {
+    ObservationProvenance::PressureTest
+}
+
 fn merge_range(range: &mut Option<ObservedRange>, value: Option<u64>) {
     let Some(value) = value else {
+        // A run that located nothing is not a sample of WHERE the divergence
+        // was, so it must not increment `samples`. Counting it would inflate
+        // the denominator with runs that contributed no bound.
         return;
     };
     match range {
         Some(range) => {
             range.earliest = range.earliest.min(value);
             range.latest = range.latest.max(value);
+            range.samples += 1;
         }
         None => {
             *range = Some(ObservedRange {
                 earliest: value,
                 latest: value,
+                samples: 1,
             });
         }
     }
@@ -1190,14 +1302,18 @@ fn apply_pressure_summary(
 
     for (index, result, turn, virtual_nanoseconds, divergent_record, invocation) in prepared {
         let observations = &mut tracked.cells[index].observations;
-        let position = observations
-            .iter()
-            .position(|observation| observation.detcore_tree == summary.detcore_tree);
+        // Keyed by tree AND provenance. Keying by tree alone would let a
+        // validate point and a pressure-test distribution fall into one range.
+        let position = observations.iter().position(|observation| {
+            observation.detcore_tree == summary.detcore_tree
+                && observation.provenance == ObservationProvenance::PressureTest
+        });
         let observation = match position {
             Some(position) => &mut observations[position],
             None => {
                 observations.push(Observation {
                     detcore_tree: summary.detcore_tree.clone(),
+                    provenance: ObservationProvenance::PressureTest,
                     hermit_shas: BTreeSet::new(),
                     results: BTreeSet::new(),
                     invocations: BTreeSet::new(),
@@ -1227,9 +1343,169 @@ fn apply_pressure_summary(
             virtual_nanoseconds,
         );
         merge_range(&mut observation.first_divergent_record, divergent_record);
-        observations.sort_by(|left, right| left.detcore_tree.cmp(&right.detcore_tree));
+        // Sort by the full key, so a tree carrying both a pressure-test and a
+        // validate observation still has a stable tracked-file order.
+        observations.sort_by(|left, right| {
+            left.detcore_tree
+                .cmp(&right.detcore_tree)
+                .then(left.provenance.cmp(&right.provenance))
+        });
     }
     Ok(seen.len())
+}
+
+/// Classify one validate row into the observed-result taxonomy.
+///
+/// Validate rows carry PASS/FAIL/ERROR, which is a coarser vocabulary than the
+/// pressure summary's. The mapping is by MODE, because a divergence in `verify`
+/// and a divergence in `replay` are different findings and collapsing them
+/// would make the observed result set say less than the row already knew.
+///
+/// ERROR is refused rather than mapped. It is an infrastructure state, and the
+/// pressure path already refuses `infrastructure-error` with the same
+/// reasoning: storing it as product behaviour would record a fault against the
+/// cell.
+///
+/// There is deliberately no arm producing `ParityFailure`. No parity MODE
+/// exists in the cell grid today -- the modes are verify, replay, chaos and
+/// naked -- so validate cannot observe one, and inventing a mapping would
+/// manufacture a result the run never established.
+fn validate_row_result(row: &ResultRow) -> Result<ObservedResult, String> {
+    match (row.outcome.as_str(), row.mode.as_str()) {
+        ("PASS", _) => Ok(ObservedResult::Pass),
+        ("FAIL", "replay") => Ok(ObservedResult::ReplayFailure),
+        ("FAIL", _) => Ok(ObservedResult::DeterminismFailure),
+        ("ERROR", _) => Err(format!(
+            "{} is an infrastructure ERROR; refusing to store it as product behavior",
+            row.test
+        )),
+        (other, _) => Err(format!("unknown validate outcome `{other}` for {}", row.test)),
+    }
+}
+
+/// Fold VALIDATE rows into the tracked observations under the `validate`
+/// provenance.
+///
+/// This is a SEPARATE ENTRY POINT and not something ordinary validation does.
+/// `ci/compat-envelope/README.md` states that normal validation changes no
+/// tracked scorecard file, and that invariant is preserved: a run only reaches
+/// here when someone explicitly asks it to.
+///
+/// WHAT THESE BOUNDS MEAN, AND WHAT THEY DO NOT. Validate runs a cell once per
+/// commit, so a validate observation at one tree is a POINT, not a
+/// distribution. Its `samples` will read 1 until the same tree is validated
+/// again. Only the pressure test repeats a cell at a fixed tree, so only its
+/// bounds describe flakiness. They are stored under different provenance keys
+/// precisely so nobody reads one as the other.
+fn apply_validate_results(
+    tracked: &mut TrackedCells,
+    rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    hermit_sha: &str,
+    detcore_tree: &str,
+) -> Result<usize, String> {
+    let mut updated = 0usize;
+    for (id, candidates) in rows {
+        let Some(index) = tracked.cells.iter().position(|cell| &cell.id == id) else {
+            continue;
+        };
+        for candidate in candidates {
+            let row = &candidate.row;
+            // Nothing to record. Skipping rather than folding a no-op keeps a
+            // cell that has only ever passed free of an empty observation,
+            // which would otherwise be indistinguishable from one that was
+            // measured and located nothing.
+            if row.first_divergent_scheduler_turn.is_none()
+                && row.first_divergent_virtual_nanoseconds.is_none()
+                && row.first_divergent_record.is_none()
+            {
+                continue;
+            }
+            let result = validate_row_result(row)?;
+            if !result.carries_divergence_position() {
+                return Err(format!(
+                    "{} reports {} yet carries a divergence position",
+                    display_id(id),
+                    row.outcome
+                ));
+            }
+            let observations = &mut tracked.cells[index].observations;
+            let position = observations.iter().position(|observation| {
+                observation.detcore_tree == detcore_tree
+                    && observation.provenance == ObservationProvenance::Validate
+            });
+            let observation = match position {
+                Some(position) => &mut observations[position],
+                None => {
+                    observations.push(Observation {
+                        detcore_tree: detcore_tree.to_string(),
+                        provenance: ObservationProvenance::Validate,
+                        hermit_shas: BTreeSet::new(),
+                        results: BTreeSet::new(),
+                        invocations: BTreeSet::new(),
+                        first_divergent_scheduler_turn: None,
+                        first_divergent_virtual_nanoseconds: None,
+                        first_divergent_record: None,
+                    });
+                    observations.last_mut().expect("observation was appended")
+                }
+            };
+            observation.hermit_shas.insert(hermit_sha.to_string());
+            observation.results.insert(result);
+            merge_range(
+                &mut observation.first_divergent_scheduler_turn,
+                row.first_divergent_scheduler_turn,
+            );
+            merge_range(
+                &mut observation.first_divergent_virtual_nanoseconds,
+                row.first_divergent_virtual_nanoseconds,
+            );
+            merge_range(
+                &mut observation.first_divergent_record,
+                row.first_divergent_record,
+            );
+            observations.sort_by(|left, right| {
+                left.detcore_tree
+                    .cmp(&right.detcore_tree)
+                    .then(left.provenance.cmp(&right.provenance))
+            });
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
+fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
+    check_tracked(root)?;
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cannot inspect working tree: {e}"))?;
+    if !status.status.success() {
+        return Err("git status failed while checking the working tree".into());
+    }
+    if !status.stdout.is_empty() {
+        return Err("observe-results requires a clean tracked working tree".into());
+    }
+    let head = git_head(root)?;
+    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
+    let rows = read_result_candidates(results, &head)?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree)?;
+    fs::write(root.join(CELLS), encoded_cells(&tracked)?)
+        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    println!(
+        "compatibility scorecard: merged {} {} divergence position(s) at {head}",
+        updated,
+        ObservationProvenance::Validate.as_str()
+    );
+    if updated == 0 {
+        println!(
+            "  no row located a divergence. That is the expected result for an \
+             all-green run and is NOT evidence that the field is unpopulated."
+        );
+    }
+    Ok(())
 }
 
 fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
@@ -1628,6 +1904,9 @@ fn self_test() -> Result<(), String> {
             cwd: "/repo".into(),
             shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
             relaxations: Vec::new(),
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
                     verified: true,
@@ -1643,6 +1922,11 @@ fn self_test() -> Result<(), String> {
                             canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
                     }),
                     compared_log_messages: Some(canonical_verdict::ComparedLogMessages { left: 1, right: 1 }),
+                    // A matched verdict located no divergence, so both
+                    // positions are absent -- the same value a pre-field
+                    // report carries.
+                    first_divergent_scheduler_turn: None,
+                    first_divergent_virtual_nanoseconds: None,
                 }).unwrap();
                 serde_json::json!({
                 "argv":["hermit","run"],
@@ -1910,16 +2194,29 @@ fn self_test() -> Result<(), String> {
     apply_pressure_summary(&mut observed, &replay, "sha-1", "tree-1")
         .map_err(|e| format!("replay divergence-position bracket failed: {e}"))?;
     let observation = &observed.cells[0].observations[0];
+    // THREE NUMBERS THAT ARE ALL DIFFERENT, which is exactly why `samples` has
+    // to be stored rather than derived. This bracket folds FIVE rows; they
+    // collapse to FOUR distinct invocations (`invocations.len()` below, a
+    // BTreeSet); and only THREE of them LOCATED a divergence position -- the
+    // two determinism failures and the replay failure. The pass and the timeout
+    // contributed nothing to these bounds.
+    //
+    // So neither the fold count nor the invocation count is the sample size
+    // behind a range. Reporting "earliest 10, latest 30" against an implied
+    // four or five runs would overstate the evidence.
     if observation.first_divergent_scheduler_turn
         != Some(ObservedRange {
             earliest: 10,
             latest: 30,
+            samples: 3,
         })
         || observation.first_divergent_virtual_nanoseconds
             != Some(ObservedRange {
                 earliest: 500,
                 latest: 1000,
+                samples: 3,
             })
+        || observation.provenance != ObservationProvenance::PressureTest
         || observation.results
             != BTreeSet::from([
                 ObservedResult::Pass,
@@ -1949,6 +2246,99 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
+
+    // VALIDATE BRACKET. A validate fold at the SAME detcore tree must land in
+    // its OWN observation and must not touch the pressure-test bounds above.
+    // Merging them would produce one range moving for two unrelated causes --
+    // "the code changed" and "this varies run to run".
+    let validate_id = observed.cells[0].id.clone();
+    let validate_row = ResultRow {
+        schema: CELL_RESULT_SCHEMA,
+        run_id: "validate-bracket".into(),
+        hermit_sha: "sha-1".into(),
+        source_tree_dirty: false,
+        binary_sha256: Some("b".repeat(64)),
+        test_sha256: "c".repeat(64),
+        test: validate_id.test.clone(),
+        category: validate_id.category.clone(),
+        lane: validate_id.lane.clone(),
+        mode: validate_id.mode.clone(),
+        backend: Some(validate_id.backend.clone()),
+        classification: "required".into(),
+        outcome: "FAIL".into(),
+        log_level: Some("info".into()),
+        effective_args: vec!["run".into()],
+        argv: vec!["hermit".into(), "run".into()],
+        guest_argv: vec!["fixture".into()],
+        env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
+        cwd: "/repo".into(),
+        shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
+        relaxations: Vec::new(),
+        first_divergent_scheduler_turn: Some(7),
+        first_divergent_virtual_nanoseconds: Some(70),
+        first_divergent_record: Some(12),
+        attempts: Vec::new(),
+    };
+    let rows = BTreeMap::from([(
+        validate_id.clone(),
+        vec![ResultCandidate {
+            evidence_identity: "validate-bracket".into(),
+            path: PathBuf::from("fixture/results.jsonl"),
+            row: validate_row,
+        }],
+    )]);
+    apply_validate_results(&mut observed, &rows, "sha-1", "tree-1")
+        .map_err(|e| format!("validate-observation bracket failed: {e}"))?;
+    let pressure = observed.cells[0]
+        .observations
+        .iter()
+        .find(|o| o.provenance == ObservationProvenance::PressureTest)
+        .ok_or("validate fold destroyed the pressure-test observation")?;
+    if pressure.first_divergent_scheduler_turn
+        != Some(ObservedRange {
+            earliest: 10,
+            latest: 30,
+            samples: 3,
+        })
+    {
+        return Err(
+            "a validate fold at the same tree contaminated the pressure-test range".into(),
+        );
+    }
+    let from_validate = observed.cells[0]
+        .observations
+        .iter()
+        .find(|o| o.provenance == ObservationProvenance::Validate)
+        .ok_or("validate fold recorded no validate-provenance observation")?;
+    // `samples: 1` is the honest reading of a single validate run: a POINT, not
+    // a distribution. Validate runs a cell once per commit, so it cannot
+    // produce a range at one tree by itself.
+    if from_validate.first_divergent_scheduler_turn
+        != Some(ObservedRange {
+            earliest: 7,
+            latest: 7,
+            samples: 1,
+        })
+        || from_validate.first_divergent_virtual_nanoseconds
+            != Some(ObservedRange {
+                earliest: 70,
+                latest: 70,
+                samples: 1,
+            })
+        // The third coordinate, from hermit#2386. Unlike the two above it
+        // LOCATES the divergence rather than bounding it, so it is the one a
+        // reader should trust for "how far did the run get".
+        || from_validate.first_divergent_record
+            != Some(ObservedRange {
+                earliest: 12,
+                latest: 12,
+                samples: 1,
+            })
+        || from_validate.results != BTreeSet::from([ObservedResult::DeterminismFailure])
+    {
+        return Err("validate observation did not record its own bounds and result".into());
+    }
+
     let next_source = pressure_summary(
         "sha-2",
         "tree-2",
@@ -1956,8 +2346,26 @@ fn self_test() -> Result<(), String> {
     );
     apply_pressure_summary(&mut observed, &next_source, "sha-2", "tree-2")
         .map_err(|e| format!("new-source pressure-observation bracket failed: {e}"))?;
-    if observed.cells[0].observations.len() != 2 {
-        return Err("a new Detcore tree was blended into an old observation".into());
+    // Assert the exact KEY SET rather than a count. Observations are keyed by
+    // (detcore_tree, provenance), so three distinct keys are expected here: the
+    // tree-1 pressure bounds, the tree-1 VALIDATE bounds folded by the bracket
+    // above, and the new tree-2 pressure entry. A bare length check would pass
+    // for the wrong reason if two of these ever collapsed while a third split.
+    let keys: Vec<(String, ObservationProvenance)> = observed.cells[0]
+        .observations
+        .iter()
+        .map(|o| (o.detcore_tree.clone(), o.provenance))
+        .collect();
+    if keys
+        != vec![
+            ("tree-1".to_string(), ObservationProvenance::PressureTest),
+            ("tree-1".to_string(), ObservationProvenance::Validate),
+            ("tree-2".to_string(), ObservationProvenance::PressureTest),
+        ]
+    {
+        return Err(format!(
+            "observations are not keyed by (tree, provenance) in sorted order: {keys:?}"
+        ));
     }
     let preserved = tracked_from(&regressed, Some(observed.clone()), true, false)?;
     if preserved.cells[0].observations != observed.cells[0].observations {
@@ -2029,6 +2437,9 @@ fn self_test() -> Result<(), String> {
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C fixture".into(),
         relaxations: Vec::new(),
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
         attempts: vec![serde_json::json!({
             "argv":["fixture"],
             "guest_argv":["fixture"],
@@ -2046,7 +2457,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, validate-observation, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
