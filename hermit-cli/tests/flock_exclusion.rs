@@ -440,9 +440,46 @@ fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
         run.combined()
     );
     assert!(
-        run.stderr
-            .contains("detcore-dbt: refusing vfork while an open file description holds a flock"),
+        run.stderr.contains(
+            "detcore-dbt: refusing vfork while an open file description may hold a flock"
+        ),
         "copied DBT vfork did not report the flock refusal\n{}",
+        run.combined()
+    );
+}
+
+/// A successful process fork makes inherited flock state unknown. Unknown can
+/// still mean held, so the same vfork guard must refuse rather than let the
+/// unobservable child block in the kernel.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
+    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-unknown-upgrade", "5s");
+    assert_eq!(
+        run.status.code(),
+        Some(101),
+        "DBT vfork with unknown flock state must fail closed, not time out\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(
+            "detcore-dbt: refusing vfork while an open file description may hold a flock"
+        ),
+        "DBT vfork with unknown flock state missed its refusal diagnostic\n{}",
+        run.combined()
+    );
+}
+
+/// When no descriptor can possibly carry flock state, ordinary DBT vfork remains
+/// available. This brackets the conservative pre-copy refusal above.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_vfork_without_flock_state_still_runs() {
+    let run = hermit_run_backend_timeout("dbt", "error", &[], "vfork-no-flock-state", "5s");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "DBT vfork without possible flock state must remain available\n{}",
         run.combined()
     );
 }

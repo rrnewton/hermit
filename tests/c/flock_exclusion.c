@@ -656,7 +656,23 @@ static int scenario_partial_sendmmsg(void) {
   return 0;
 }
 
-static int scenario_vfork_upgrade(void) {
+static int scenario_vfork_no_flock_state(void) {
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
+  pid_t child = vfork();
+  if (child < 0)
+    return HARNESS_FAILURE;
+  if (child == 0)
+    _exit(0);
+  int status = 0;
+  return waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                 WEXITSTATUS(status) == 0
+             ? 0
+             : HARNESS_FAILURE;
+}
+
+static int scenario_vfork_upgrade(int make_unknown) {
   const char *path = lock_path("vfork-upgrade");
   int inherited = open_lock(path);
   int contender = open_lock(path);
@@ -665,6 +681,19 @@ static int scenario_vfork_upgrade(void) {
       flock(contender, LOCK_SH | LOCK_NB) != 0) {
     printf("FAIL: could not establish vfork upgrade contention (errno=%d)\n", errno);
     return HARNESS_FAILURE;
+  }
+
+  if (make_unknown) {
+    fflush(stdout);
+    pid_t fork_child = fork();
+    if (fork_child < 0)
+      return HARNESS_FAILURE;
+    if (fork_child == 0)
+      _exit(0);
+    int fork_status = 0;
+    if (waitpid(fork_child, &fork_status, 0) != fork_child ||
+        !WIFEXITED(fork_status) || WEXITSTATUS(fork_status) != 0)
+      return HARNESS_FAILURE;
   }
 
   fflush(stdout);
@@ -737,8 +766,14 @@ int main(int argc, char **argv) {
   if (strcmp(scenario, "partial-sendmmsg") == 0) {
     return scenario_partial_sendmmsg();
   }
+  if (strcmp(scenario, "vfork-no-flock-state") == 0) {
+    return scenario_vfork_no_flock_state();
+  }
   if (strcmp(scenario, "vfork-upgrade") == 0) {
-    return scenario_vfork_upgrade();
+    return scenario_vfork_upgrade(0);
+  }
+  if (strcmp(scenario, "vfork-unknown-upgrade") == 0) {
+    return scenario_vfork_upgrade(1);
   }
   if (strcmp(scenario, "holder") == 0) {
     return scenario_holder();
