@@ -1283,6 +1283,7 @@ fn self_test() -> Result<(), String> {
         safe_ci_scope::self_test()?,
         nested_scope_self_test()?,
         scheduler_accounting_bracket()?,
+        budget_reason_bracket()?,
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
@@ -5662,18 +5663,129 @@ fn print_retry_ledger(attempts: &[NodeAttempt]) {
     }
 }
 
-/// Was this node killed by its wall or CPU budget? The runner's own
-/// `step_failure_reason` produces these strings, so this reads its typed
-/// classification rather than re-deriving one.
+/// The exact renderings `step_failure_reason` produces for the two budget
+/// breaches, as prefixes. Everything after them is a number, so a prefix is an
+/// exact identification of the arm rather than a search for a word.
+const WALL_BUDGET_REASON_PREFIX: &str = "TIMEOUT >";
+const CPU_BUDGET_REASON_PREFIX: &str = "CPU-TIMEOUT >";
+
+/// Was this node killed by its wall or CPU budget?
 ///
-/// A bound-kill says nothing about the tree — it says the node did not get to
-/// finish. That is why it is both a `timed_out_nodes` entry in the ledger and a
-/// retry ground above; the two readings must stay the same predicate, or a node
-/// could be retried without being reported as timed out, or the reverse.
+/// WHY THIS IS NOT A SUBSTRING TEST, which is what it used to be. `reason` is a
+/// closed set produced by `safe_ci_dag_runner::model::step_failure_reason`, and
+/// one member of that set reads:
+///
+///   `received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded`
+///
+/// A `contains("timeout")` test matches that string — INSIDE THE CLAUSE SAYING
+/// THERE WAS NO TIMEOUT. Every signal-killed node therefore read as a budget
+/// breach, so a segfault, an abort and a SIGKILL were all retry-eligible and
+/// would each be re-run to `max` for the same deterministic answer. That is
+/// precisely the waste the eligibility rule exists to prevent.
+///
+/// A SUBSTRING TEST AGAINST A HUMAN-READABLE MESSAGE IS NOT A PREDICATE. The
+/// message is written for a reader and can carry the word in a negating
+/// context. The typed `timed_out`/`cpu_timed_out` inputs are the real facts, but
+/// `StepOutcome` does not carry them — `StepOutcome::failed` takes them and
+/// keeps only the rendered string. So this matches the two arms EXACTLY, and
+/// `budget_reason_bracket` below pins that match by calling the real producer
+/// with the typed inputs rather than by restating its wording here.
 fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
-    let reason = outcome.reason.to_ascii_lowercase();
-    reason.contains("timeout") || reason.contains("timed out")
+    reason_is_budget_breach(&outcome.reason)
 }
+
+/// The same rule over a bare reason string, so the bracket can exercise it
+/// against producer output without building a whole `StepOutcome`.
+fn reason_is_budget_breach(reason: &str) -> bool {
+    reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
+}
+
+/// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
+///
+/// Every case below is built by calling `step_failure_reason` itself with the
+/// typed inputs, then asserting the predicate agrees with `timed_out ||
+/// cpu_timed_out`. Nothing here hardcodes a message, so a reworded reason does
+/// not silently drift past the predicate — it fails here instead.
+fn budget_reason_bracket() -> Result<String, String> {
+    use safe_ci_dag_runner::model::step_failure_reason;
+    // (label, returncode, oomed, timed_out, pids_tripped, detail_failure, cpu_timed_out)
+    let cases: &[(&str, Option<i64>, bool, bool, bool, bool, bool)] = &[
+        ("wall budget", None, false, true, false, false, false),
+        ("cpu budget", None, false, false, false, false, true),
+        ("oom kill", Some(-9), true, false, false, false, false),
+        ("pids guard", None, false, false, true, false, false),
+        ("detail capture", None, false, false, false, true, false),
+        ("SIGSEGV", Some(-11), false, false, false, false, false),
+        ("SIGABRT", Some(-6), false, false, false, false, false),
+        ("SIGKILL", Some(-9), false, false, false, false, false),
+        ("ordinary exit", Some(1), false, false, false, false, false),
+        ("no exit collected", None, false, false, false, false, false),
+    ];
+    let mut eligible = Vec::new();
+    for (label, rc, oomed, timed_out, pids, detail, cpu_timed_out) in cases {
+        let detail_rows: Vec<String> = if *detail {
+            vec!["fixture detail write failed".to_string()]
+        } else {
+            Vec::new()
+        };
+        let reason = step_failure_reason(
+            *rc,
+            *oomed,
+            if *oomed { 1 } else { 0 },
+            *timed_out,
+            600,
+            *pids,
+            pids.then_some("fixture pids guard"),
+            &detail_rows,
+            *cpu_timed_out,
+            300,
+            300,
+            1.0,
+            "",
+        );
+        let want = *timed_out || *cpu_timed_out;
+        let got = reason_is_budget_breach(&reason);
+        if got != want {
+            return Err(format!(
+                "budget reason: {label} rendered {reason:?}; retry-eligible={got} but the typed                  inputs say timed_out={timed_out} cpu_timed_out={cpu_timed_out}. A reason that                  merely MENTIONS a timeout is not a timeout."
+            ));
+        }
+        if got {
+            eligible.push(*label);
+        }
+    }
+    // The negative direction, stated as its own assertion rather than left
+    // implicit in the loop: the signal arm is the one that used to misclassify,
+    // and it must stay ineligible even though its text contains "timeout".
+    let segv = step_failure_reason(
+        Some(-11),
+        false,
+        0,
+        false,
+        600,
+        false,
+        None,
+        &[],
+        false,
+        300,
+        300,
+        1.0,
+        "",
+    );
+    if !segv.contains("timeout") {
+        return Err(format!(
+            "budget reason: the signal arm no longer contains the word 'timeout' ({segv:?}); this              bracket exists because it DOES, so re-check the producer before relaxing it"
+        ));
+    }
+    if reason_is_budget_breach(&segv) {
+        return Err(format!("budget reason: signal-killed reason {segv:?} is retry-eligible"));
+    }
+    Ok(format!(
+        "budget reason: 10 producer-rendered reason(s) classified; retry-eligible = {eligible:?};          the SIGSEGV arm contains the word \"timeout\" and is correctly NOT eligible"
+    ))
+}
+
+/// Nodes the runner reported as killed by their wall or CPU budget.
 
 /// Nodes the runner reported as killed by their wall or CPU budget.
 fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
