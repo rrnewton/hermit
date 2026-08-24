@@ -1685,7 +1685,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reverie-core"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1761,7 +1760,6 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "syscalls",
 ]
@@ -1780,7 +1778,6 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "bincode 2.0.1",
  "bitflags 2.13.1",
@@ -1797,7 +1794,6 @@ dependencies = [
 [[package]]
 name = "reverie-ptrace"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1909,7 +1905,6 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -1973,7 +1968,6 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "safeptrace"
 version = "0.2.0"
-source = "git+https://github.com/rrnewton/reverie.git?rev=c261050cfd41bec67e31bfd0cf6f56be008d0ebb#c261050cfd41bec67e31bfd0cf6f56be008d0ebb"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
@@ -2965,3 +2959,7 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "reverie-util"
+version = "0.2.0"
