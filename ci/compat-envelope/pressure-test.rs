@@ -684,13 +684,26 @@ impl FreshCheckout {
                 ]),
                 "initialize pressure-test submodules",
             )?;
+            // Each entry is a set of acceptable spellings, and the checkout is
+            // usable when ANY member is present. The DAG-runner crate was
+            // renamed in agent-utils (rs/safe-ci-dag-runner -> rs/dagrun), and
+            // `sha` above is arbitrary, so a pressure test can legitimately
+            // target a commit on either side of that rename. Naming one exact
+            // path made every commit on the other side unpressure-testable.
             for required in [
-                "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+                &["ci/compat-envelope/pressure-test.rs"][..],
+                &[
+                    "agent-utils/rs/dagrun/Cargo.toml",
+                    "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+                ][..],
             ] {
-                if !checkout.path.join(required).is_file() {
+                if !required
+                    .iter()
+                    .any(|rel| checkout.path.join(rel).is_file())
+                {
                     return Err(format!(
-                        "fresh pressure-test checkout is missing required file {required}"
+                        "fresh pressure-test checkout is missing required file {}",
+                        required.join(" or ")
                     ));
                 }
             }
