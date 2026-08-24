@@ -571,8 +571,10 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         // there is no numeric-PID ambiguity to resolve. Delivery/duplication runs
         // inside the serialized scheduler turn (like tgkill), and the handlers add
         // deterministic argument validation (EBADF for a non-pidfd descriptor,
-        // EINVAL for the kernel-reserved nonzero flags) before forwarding. Untyped
-        // (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno.
+        // EINVAL for the kernel-reserved nonzero flags) before forwarding.
+        // pidfd_getfd models exact OFD aliasing for self targets and fails closed
+        // for other targets because their source cache cannot be invalidated.
+        // Untyped (Syscall::Other) in the pinned Reverie, so dispatch on the Sysno.
         | Sysno::pidfd_send_signal
         | Sysno::pidfd_getfd
         // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2180,7 +2182,8 @@ mod tests {
     fn pidfd_family_is_determinized() {
         // pidfd_send_signal and pidfd_getfd are now determinized alongside
         // pidfd_open: the pidfd names a fixed process (no numeric-PID ambiguity),
-        // so the signal/getfd forward through the serialized turn deterministically.
+        // signal delivery forwards through the serialized turn, and getfd either
+        // models a self-target OFD alias or refuses an unmodelable foreign source.
         for sysno in [
             Sysno::pidfd_open,
             Sysno::pidfd_getfd,

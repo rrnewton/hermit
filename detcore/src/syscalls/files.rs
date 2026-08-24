@@ -2933,6 +2933,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);
         self.add_fd(guest, fd, flags, FdType::Pidfd).await?;
+        let target = DetPid::from_raw(call.pid() as i32);
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_pidfd_target(target))?;
         Ok(fd as i64)
     }
 
@@ -2989,34 +2993,55 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// runs), and the operation executes inside this thread's serialized turn, so
     /// the result is deterministic. Detcore fails closed with `EBADF` unless it
     /// models the descriptor as a pidfd, and requires the kernel-reserved `flags`
-    /// to be zero (`EINVAL` otherwise). The duplicated descriptor is registered so
-    /// later `close`/`fcntl`/`dup` see it; Detcore cannot cheaply learn the source
-    /// descriptor's kind, so it is modeled as a regular, close-on-exec fd. This is
-    /// sufficient for descriptor lifecycle tracking; see the review tag above for
-    /// the type-inference limitation.
+    /// to be zero (`EINVAL` otherwise).
+    ///
+    /// For a pidfd that names this process, `targetfd` is in this descriptor table,
+    /// so the returned descriptor is modeled as a real alias of the source open
+    /// file description. That is required for `flock`: either alias may change the
+    /// one kernel lock, and both must observe the same cached authority. A pidfd
+    /// targeting another process is refused with `EOPNOTSUPP`; Detcore currently
+    /// has no cross-process channel that can invalidate the source task's cache if
+    /// the returned alias later mutates the shared open file description. Failed
+    /// calls leave all descriptor state unchanged.
     pub async fn handle_pidfd_getfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         pidfd: RawFd,
+        targetfd: RawFd,
         flags: u32,
     ) -> Result<i64, Error> {
         if flags != 0 {
             return Err(Errno::EINVAL.into());
         }
-        let is_pidfd = guest
-            .thread_state()
-            .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
+        let (is_pidfd, target) = guest.thread_state().with_detfd(pidfd, |detfd| {
+            (matches!(detfd.ty(), FdType::Pidfd), detfd.pidfd_target())
+        })?;
         if !is_pidfd {
             return Err(Errno::EBADF.into());
         }
+        // `guest.pid()` is the backend's physical process identity for DBT,
+        // while pidfd_open receives Hermit's guest-visible PID. Ask the backend
+        // for that same guest-visible identity before deciding this is a
+        // self-targeting pidfd.
+        let current = DetPid::from_raw(guest.inject(syscalls::Getpid::new()).await? as i32);
+        if target != Some(current) {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+
+        // Prove the source model before the kernel call. A successful self
+        // pidfd_getfd aliases this exact descriptor; if Detcore cannot identify
+        // it, permitting the call would create mutable OFD state with no sound
+        // cache relationship.
+        guest.thread_state().with_detfd(targetfd, |_| ())?;
         let fd = self.record_or_replay(guest, call).await? as RawFd;
         // pidfd_getfd always sets FD_CLOEXEC on the returned descriptor.
-        self.add_fd(guest, fd, OFlag::O_CLOEXEC, FdType::Regular)
-            .await?;
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.forget_flock_mode())?;
+        let replaced = guest
+            .thread_state_mut()
+            .dup_fd(targetfd, fd, OFlag::O_CLOEXEC)?;
+        if let Some(open_file_id) = replaced {
+            self.release_port_for_open_file(guest, open_file_id).await;
+        }
         Ok(fd as i64)
     }
 
