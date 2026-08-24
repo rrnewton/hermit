@@ -1041,6 +1041,31 @@ fn self_test() -> Result<(), String> {
     if depth == 0 {
         return Err("git-depth measurement accepted an impossible zero".into());
     }
+    // The COMMAND-FAILURE branch, which the parser brackets above cannot reach.
+    // `parse_git_depth` is only consulted when `git rev-list` exits zero, so a
+    // parser that refuses every malformed string still says nothing about what
+    // happens when the command itself fails -- and that is the case this field
+    // exists for. Measured: `git rev-list --count 000...0` exits 128 with
+    // "fatal: bad object", so this drives the `!output.status.success()` arm.
+    // Without that arm the empty stdout would fall through to the parser and be
+    // refused for the WRONG REASON, reporting a non-integer depth rather than a
+    // failed command, so the assertion is on the message and not merely on
+    // is_err().
+    let absent = "0000000000000000000000000000000000000000";
+    match measure_git_depth(absent) {
+        Ok(depth) => {
+            return Err(format!(
+                "git-depth measurement invented {depth} for a commit that does not exist"
+            ));
+        }
+        Err(error) => {
+            if !error.contains("git rev-list --count") || !error.contains("failed with") {
+                return Err(format!(
+                    "git-depth refusal must name the failed command, not blame the parser: {error}"
+                ));
+            }
+        }
+    }
     // All three legitimate deadline sources share one pure precedence rule. The standalone boxed
     // re-exec must preserve D1 exactly; a scheduler epoch applies even when validate is top-level;
     // missing, future, and contradictory sources are refused.
