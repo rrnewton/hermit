@@ -53192,9 +53192,6 @@
       "backend": "kvm",
       "enabled": true,
       "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
       "observations": []
     },
     {
@@ -53214,10 +53211,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": []
     },
     {
@@ -53228,9 +53222,6 @@
       "backend": "sabre",
       "enabled": true,
       "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
       "observations": []
     },
     {
