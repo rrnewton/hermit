@@ -309,8 +309,9 @@ For a DBT evidence log, select
 `--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
 transport's self-description records. This is an offline inspection option;
 live `--backend=dbt run --verify` uses its dedicated DBT adapter and does not
-reach the generic comparator. If `--verify-json` is requested there, the receipt
-remains `no_result`. `hermit log-diff LEFT RIGHT --json REPORT.json` compares
+reach the generic comparator, so a record envelope does not apply to it. That
+adapter publishes its own verdict when `--verify-json` is requested.
+`hermit log-diff LEFT RIGHT --json REPORT.json` compares
 the same canonical INFO stream and atomically records a one-line result. Its
 `comparison.record_envelope` field names that versioned policy, alongside the
 first divergent scheduler turn and virtual nanoseconds when the logs contain

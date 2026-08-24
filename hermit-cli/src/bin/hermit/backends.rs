@@ -60,6 +60,8 @@ use reverie_dbt::DbtEvidenceLogLevel;
 use reverie_dbt::DbtRunner;
 use tracing::metadata::LevelFilter;
 
+#[cfg(feature = "dbt")]
+use super::record_envelope::RecordEnvelope;
 use super::run::VerifyAllow;
 #[cfg(feature = "dbt")]
 use super::verify::ComparedRun;
@@ -77,7 +79,6 @@ use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 #[cfg(feature = "dbt")]
 use super::verify::verification_log_level;
-#[cfg(feature = "dbt")]
 use super::verify::write_pending_verification_json;
 #[cfg(feature = "dbt")]
 use super::verify::write_verification_json;
@@ -839,6 +840,13 @@ pub(super) fn run_dbt(
             diagnostic_full_trace: verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
             keep_logs,
+            // Every decoded evidence record is compared, which is what this
+            // adapter already did before the envelope was disclosed. Naming it
+            // changes no record selection; it states the selection in the
+            // verdict rather than leaving it implicit. Excluding the
+            // transport's own records here would be a filtering change and
+            // needs its own evidence, not a rename.
+            record_envelope: RecordEnvelope::all_records_v1(),
         },
     )?;
     if let Some(path) = verify_json {
