@@ -52271,11 +52271,8 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
+      "enabled": false,
       "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
       "observations": []
     },
     {
@@ -52443,11 +52440,8 @@
       "test": "system-utils/example-devrand",
       "mode": "verify",
       "backend": "dbt",
-      "enabled": true,
+      "enabled": false,
       "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
       "observations": []
     },
     {

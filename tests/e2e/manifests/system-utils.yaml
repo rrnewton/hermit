@@ -167,10 +167,10 @@ test:
         ci: false
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
           - sabre
         backends_disabled:
+          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec /usr/bin/date`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the date script's post-start exec
         ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       replay:
@@ -227,10 +227,10 @@ test:
         ci: false
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
           - sabre
         backends_disabled:
+          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the hexdump script's post-start exec
         ci_disabled_reason: This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend.
       replay:
