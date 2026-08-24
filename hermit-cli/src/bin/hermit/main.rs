@@ -484,9 +484,68 @@ mod tests {
         );
     }
 
+    // The series jumps 1 -> 3 on purpose. A DBT-flavoured case sat at 2 and was
+    // removed with #2359; it should NOT be recreated, because it could not fail
+    // on its own. `assert_top_level_exit_leaves_no_result` always appends a
+    // nonexistent guest, and `RunOpts::main` calls `validate_program()`
+    // (run.rs:2149) BEFORE the `match backend` that returns through the DBT
+    // adapter (run.rs:2166), so such a case exits at exactly the statement
+    // EXIT 3 already covers and never consults the backend at all. It was
+    // `run_preflight_exit_leaves_an_invocation_bound_no_result` with one flag
+    // changed. Executing is not the same as discriminating.
+    //
+    // What DID need restoring from that deletion is the ordering premise
+    // immediately below.
+
+    /// `RunOpts::main` returns through the dedicated DBT adapter BEFORE the
+    /// generic `verify()` dispatch. That ordering is the whole reason `run_dbt`
+    /// has to carry the verdict-artifact path itself: if the generic dispatch
+    /// ran first, it would not.
+    ///
+    /// The next test's doc comment has asserted this in prose since #2359 while
+    /// nothing checked it, which is the worse failure mode — a reader trusts a
+    /// documented guarantee. Restored rather than deleted because reading
+    /// `run.rs` confirms the property still holds. Only the OTHER half of the
+    /// original assertion, that a DBT run therefore keeps `no_result`, was made
+    /// false by `f0584c1aac` (which gave `run_dbt` a `verify_json` path, a
+    /// `ComparisonOptions`, and a real `compare_two_runs` outcome), and that
+    /// half is deliberately not restored.
+    ///
+    /// Both needles must appear EXACTLY once. A bare `find` is satisfied by a
+    /// comment quoting the string, and #2359's own round-2 review caught
+    /// precisely that: a text assertion a comment can satisfy is not a pin.
+    /// Requiring uniqueness turns such a quote into a loud failure.
+    #[test]
+    fn dbt_arm_returns_before_the_generic_verify_dispatch() {
+        let source = include_str!("run.rs");
+        let sole_offset = |needle: &str| -> usize {
+            let hits: Vec<usize> = source.match_indices(needle).map(|(i, _)| i).collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected exactly one occurrence of {needle:?} in run.rs, found {}. Zero means \
+                 the shape this check reads has moved or gone, so it can no longer see the \
+                 ordering; two or more (including one inside a comment) would make the check \
+                 meaningless rather than merely wrong",
+                hits.len()
+            );
+            hits[0]
+        };
+        let dbt_return = sole_offset("return super::backends::run_dbt(");
+        let generic_verify = sole_offset("self.verify(global)");
+        assert!(
+            dbt_return < generic_verify,
+            "RunOpts::main must return through the dedicated DBT adapter before the generic \
+             verify() dispatch; if that order ever reverses, run_dbt no longer needs to carry \
+             the verdict-artifact path and dbt_arm_has_a_channel_to_publish_a_verdict is \
+             asserting something that no longer follows"
+        );
+    }
+
     /// The DBT arm of `RunOpts::main` returns `run_dbt(..)` and never reaches
     /// the common `verify()` function, so both cfg arms of `run_dbt` must carry
-    /// the verdict-artifact path explicitly.
+    /// the verdict-artifact path explicitly. The ordering that makes that true
+    /// is pinned by `dbt_arm_returns_before_the_generic_verify_dispatch`.
     ///
     /// Asserted structurally rather than by executing the arm so this focused
     /// test cannot block on the harness stdin or require DynamoRIO.
