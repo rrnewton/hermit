@@ -466,7 +466,7 @@ pub fn calibrated_analyze_node(g: &SuperGate, deps: Vec<String>) -> Step {
     // Nextest owns process concurrency with `-j 1`, so do not forward an
     // emulation flag it deliberately does not support.
     let test_args = shell_join(
-        &g.argv
+        g.argv
             .iter()
             .filter(|arg| !arg.starts_with("--test-threads="))
             .cloned()

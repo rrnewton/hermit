@@ -682,8 +682,10 @@ fn run_one_nested_scope_probe_step(
     step: safe_ci_dag_runner::model::Step,
     run_timeout_s: i64,
 ) -> Result<(), String> {
-    let mut cfg = DagConfig::default();
-    cfg.description = "real nested safe-ci scope self-test".into();
+    let mut cfg = DagConfig {
+        description: "real nested safe-ci scope self-test".into(),
+        ..Default::default()
+    };
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
         &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
@@ -704,8 +706,10 @@ fn run_one_nested_scope_signal_step(
     step: safe_ci_dag_runner::model::Step,
     run_timeout_s: i64,
 ) -> Result<(), String> {
-    let mut cfg = DagConfig::default();
-    cfg.description = "real inherited-scope signal self-test".into();
+    let mut cfg = DagConfig {
+        description: "real inherited-scope signal self-test".into(),
+        ..Default::default()
+    };
     cfg.steps.push(step);
     let result = run_dag_boxed_deadline(
         &cfg, 1, true, 2, cgroups, None, Some(1), Some(run_timeout_s),
@@ -4067,7 +4071,7 @@ fn step_with_caps(
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
     println!("\n=== per-node cost (safe-ci-dag-runner) ===");
-    println!("{:<44} {:>9}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
+    println!("{:<44} {:>9}  {:<8} reason/returncode", "node", "seconds", "status");
     println!("{}", "-".repeat(84));
     let mut total = 0.0_f64;
     for o in outcomes {
@@ -6177,7 +6181,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
     let coverage = correct_test_node_coverage(
         parent_zero.clone(),
         &planned,
-        &[ran_failed.clone()],
+        std::slice::from_ref(&ran_failed),
     );
     if coverage
         != serde_json::json!({
@@ -6215,7 +6219,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         "zero_executed_nodes": [],
         "absent_nodes": ["test.ran_failed"],
     });
-    if correct_test_node_coverage(parent_absent.clone(), &planned, &[ran_failed.clone()])
+    if correct_test_node_coverage(parent_absent.clone(), &planned, std::slice::from_ref(&ran_failed))
         != parent_absent
     {
         return Err("test-node coverage: an absent classification must not be rewritten".into());
@@ -6226,7 +6230,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         "zero_executed_nodes": [],
         "absent_nodes": [],
     });
-    if correct_test_node_coverage(parent_executed.clone(), &planned, &[ran_failed.clone()])
+    if correct_test_node_coverage(parent_executed.clone(), &planned, std::slice::from_ref(&ran_failed))
         != parent_executed
     {
         return Err("test-node coverage: an already-executed classification must not change".into());
@@ -6241,7 +6245,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
             "absent_nodes": [],
         }),
     ] {
-        if correct_test_node_coverage(malformed.clone(), &planned, &[ran_failed.clone()])
+        if correct_test_node_coverage(malformed.clone(), &planned, std::slice::from_ref(&ran_failed))
             != malformed
         {
             return Err("test-node coverage: malformed evidence must remain unchanged".into());
@@ -6274,7 +6278,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         return Err("typed libtest counts: complete outcomes did not sum to 873/350".into());
     }
     let failed = outcome("test.failed", false, Some(23), Some(5));
-    if libtest_counts(&[failed.clone()]) != (Some(23), Some(5)) || failed.ok {
+    if libtest_counts(std::slice::from_ref(&failed)) != (Some(23), Some(5)) || failed.ok {
         return Err(
             "typed libtest counts: a 23-test failed outcome must contribute counts and remain failed"
                 .into(),
@@ -7284,7 +7288,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         println!("profile: {}  selection: {}", plan.profile, plan.selection_mode);
         for (i, cfg) in all.iter().enumerate() {
             println!("\n--- DAG {} of {} ({}) : {} node(s)", i + 1, all.len(), cfg.description, cfg.steps.len());
-            println!("{:<40} {:>7} {:>7} {:>8}  {}", "node", "wall_s", "cpu_s", "mem", "deps");
+            println!("{:<40} {:>7} {:>7} {:>8}  deps", "node", "wall_s", "cpu_s", "mem");
             for s in &cfg.steps {
                 let cpu = if s.cpu_timeout > 0 { s.cpu_timeout } else { cfg.default_step_cpu_timeout };
                 let mem = s.hint.hard_mem_max_bytes.or(s.hint.rss_baseline_bytes).unwrap_or(0);
