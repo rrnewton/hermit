@@ -605,7 +605,7 @@ fn changed_files_from_base(base: &str) -> Vec<String> {
 /// self-test can exercise the local-delta merge without touching git.
 fn merge_delta(committed: Vec<String>, dirty: Vec<String>) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    for f in committed.into_iter().chain(dirty.into_iter()) {
+    for f in committed.into_iter().chain(dirty) {
         let f = f.trim().to_string();
         if !f.is_empty() {
             set.insert(f);
@@ -998,19 +998,19 @@ fn self_test() {
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
 
-    let docs = select(&fp, &dag, &vec!["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
+    let docs = select(&fp, &dag, &["ai_docs/x.md".into(), "docs/y.md".into(), "README.md".into()]);
     check("docs-only ⇒ skip", docs.decision == Decision::Skip && docs.nodes.is_empty());
 
-    let lock = select(&fp, &dag, &vec!["Cargo.lock".into()]);
+    let lock = select(&fp, &dag, &["Cargo.lock".into()]);
     check("Cargo.lock ⇒ full", lock.decision == Decision::Full && lock.nodes.len() == dag.all_nodes.len());
 
-    let toolchain = select(&fp, &dag, &vec!["rust-toolchain.toml".into()]);
+    let toolchain = select(&fp, &dag, &["rust-toolchain.toml".into()]);
     check("toolchain ⇒ full", toolchain.decision == Decision::Full);
 
-    let ci = select(&fp, &dag, &vec!["ci/dag/portable.json".into()]);
+    let ci = select(&fp, &dag, &["ci/dag/portable.json".into()]);
     check("ci/** ⇒ full", ci.decision == Decision::Full);
 
-    let skill = select(&fp, &dag, &vec![".claude/skills/benchmark/SKILL.md".into()]);
+    let skill = select(&fp, &dag, &[".claude/skills/benchmark/SKILL.md".into()]);
     check("skill change ⇒ selective", skill.decision == Decision::Selective);
     check(
         "skill change runs discovery check",
@@ -1021,7 +1021,7 @@ fn self_test() {
         skill.nodes.contains("check.script_sigpipe"),
     );
 
-    let dbt = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into()]);
+    let dbt = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into()]);
     check("dbt-only ⇒ selective", dbt.decision == Decision::Selective);
     check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity"));
     check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
@@ -1031,21 +1031,21 @@ fn self_test() {
     check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
     check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
-    let core = select(&fp, &dag, &vec!["detcore/src/scheduler.rs".into()]);
+    let core = select(&fp, &dag, &["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
     check("detcore core runs strict_compat", core.nodes.contains("test.strict_compat"));
     check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit"));
 
-    let unknown = select(&fp, &dag, &vec!["some/brand/new/area/file.py".into()]);
+    let unknown = select(&fp, &dag, &["some/brand/new/area/file.py".into()]);
     check("unknown path ⇒ full", unknown.decision == Decision::Full);
 
-    let mixed = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into(), "README.md".into()]);
+    let mixed = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into(), "README.md".into()]);
     check("dbt + docs ⇒ selective (docs inert)", mixed.decision == Decision::Selective);
 
-    let mixed2 = select(&fp, &dag, &vec!["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()]);
+    let mixed2 = select(&fp, &dag, &["detcore-dbt/src/lib.rs".into(), "Cargo.lock".into()]);
     check("dbt + Cargo.lock ⇒ full (force wins)", mixed2.decision == Decision::Full);
 
-    let rs_lint = select(&fp, &dag, &vec!["hermit-verify/src/main.rs".into()]);
+    let rs_lint = select(&fp, &dag, &["hermit-verify/src/main.rs".into()]);
     check("rs change pulls clippy", rs_lint.nodes.contains("lint.clippy"));
 
     // --- shard + e2e cell derivation (footprint → shard-selection layer) ---
@@ -1073,14 +1073,14 @@ fn self_test() {
     check("dbt ⇒ cells are a strict subset", rp_dbt.cells.len() < total_cells);
 
     // SaBRe backend change: only sabre cells + sabre shard.
-    let sabre = select(&fp, &dag, &vec!["detcore-sabre/src/lib.rs".into()]);
+    let sabre = select(&fp, &dag, &["detcore-sabre/src/lib.rs".into()]);
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan);
     check("sabre ⇒ sabre shard", rp_sabre.shards.contains(&"sabre".to_string()));
     check("sabre ⇒ only sabre cells", !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"));
     check("sabre ⇒ build_dbt, not aux", rp_sabre.build_dbt && !rp_sabre.build_aux);
 
     // LiteInst runtime change: only liteinst cells + liteinst shard.
-    let liteinst = select(&fp, &dag, &vec!["scripts/stage-liteinst-runtime.sh".into()]);
+    let liteinst = select(&fp, &dag, &["scripts/stage-liteinst-runtime.sh".into()]);
     let rp_lite = derive_run_plan(&liteinst, &shards, &plan);
     check("liteinst ⇒ liteinst shard", rp_lite.shards.contains(&"liteinst".to_string()));
     check("liteinst ⇒ only liteinst cells", !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"));
@@ -1119,10 +1119,9 @@ fn self_test() {
 
     // A resolved baseline feeds the SAME select() path as a PR diff, so the
     // local delta of a docs-only change must still skip.
-    let local_docs = select(&fp, &dag, &vec!["docs/z.md".into()]);
+    let local_docs = select(&fp, &dag, &["docs/z.md".into()]);
     check("local docs-only ⇒ skip", local_docs.decision == Decision::Skip);
 
-    drop(check);
     println!("\n{total} check(s), {failures} failure(s)");
     if failures > 0 {
         std::process::exit(1);

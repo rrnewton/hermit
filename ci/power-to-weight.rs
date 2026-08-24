@@ -301,8 +301,8 @@ nightly', never 'safe to delete'.
                 sample_newest_short
             );
             println!(
-                "{:<38} {:>6} {:>14} {:>9} {:>7}  {}",
-                "node", "weight", "classification", "sel_rate", "p2w", "flag"
+                "{:<38} {:>6} {:>14} {:>9} {:>7}  flag",
+                "node", "weight", "classification", "sel_rate", "p2w"
             );
             for n in &ranked {
                 let rate = n.times_selected as f64 / total;

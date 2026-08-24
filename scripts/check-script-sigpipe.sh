@@ -136,6 +136,40 @@ echo "check-script-sigpipe.sh: OK — $consumers tracked rust-script entrypoint(
 # Compile every discovered entrypoint. Report ALL failures rather than stopping
 # at the first, so one run names everything a workspace type change broke
 # instead of forcing a fix-one-rerun loop.
+# CLIPPY, NOT JUST `cargo check`, AND WHY IT LIVES HERE.
+#
+# `cargo clippy --workspace` cannot see these files: rust-scripts are not
+# workspace members, so cargo never compiles them and every workspace lint gate
+# reports success while they rot. This loop already DISCOVERS them by shebang
+# and already builds each one, so linting them is a change of verb, not a new
+# gate and not a second list to maintain. A script added tomorrow is covered the
+# day it lands, with nothing to update.
+#
+# THE WAIVERS ARE LISTED ONCE, HERE, RATHER THAN AS `#![allow]` SCATTERED
+# THROUGH FIFTEEN FILES, so the whole exemption surface is one reviewable block.
+#
+#   The three doc lints govern how rustdoc RENDERS a list. Nothing renders the
+#   rustdoc of a standalone script, and these files use hand-aligned doc blocks
+#   whose continuation lines are indented to line up under the item text --
+#   which reads better in a terminal than what the lint wants and is the form
+#   the authors chose deliberately. Enforcing them would reflow prose for a
+#   rendering nobody performs.
+#
+#   `too_many_arguments` and `type_complexity` are structural. Both fire on
+#   tooling functions that genuinely take many parameters -- and silencing them
+#   by bundling arguments into a struct purely to satisfy a count would be
+#   change for the lint's benefit rather than the reader's.
+#
+# Everything else is DENIED. This list should shrink, never grow: a new entry
+# means a lint was switched off rather than answered.
+CLIPPY_WAIVERS=(
+    -A clippy::doc_overindented_list_items
+    -A clippy::doc_lazy_continuation
+    -A clippy::empty_line_after_doc_comments
+    -A clippy::too_many_arguments
+    -A clippy::type_complexity
+)
+
 broken=()
 for source in "${entrypoints[@]}"; do
     package="$(rust-script --package "$source" 2>"$tmp/pkg.err" | tail -n1)"
@@ -145,8 +179,9 @@ for source in "${entrypoints[@]}"; do
         broken+=("$source")
         continue
     fi
-    if ! cargo check --manifest-path "$package/Cargo.toml" >"$tmp/check.out" 2>&1; then
-        echo "check-script-sigpipe.sh: FAIL — $source does not compile" >&2
+    if ! cargo clippy --manifest-path "$package/Cargo.toml" \
+            -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$tmp/check.out" 2>&1; then
+        echo "check-script-sigpipe.sh: FAIL — $source does not compile cleanly under clippy" >&2
         grep -E '^(error|warning: unused)' -A4 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
         broken+=("$source")
     fi
@@ -157,4 +192,4 @@ if ((${#broken[@]} > 0)); then
     echo "  No cargo gate compiles these, so cargo build/test/clippy/fmt will all still pass." >&2
     exit 1
 fi
-echo "check-script-sigpipe.sh: OK — all $consumers rust-script entrypoint(s) compile"
+echo "check-script-sigpipe.sh: OK — all $consumers rust-script entrypoint(s) compile and are clippy-clean"
