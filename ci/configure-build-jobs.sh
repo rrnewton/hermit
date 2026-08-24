@@ -92,8 +92,8 @@ fi
 # itself is unchanged; see the carry chain below. The portable wrapper obtains
 # the repository's recorded pin through the canonical checker and carries it
 # here; a pin bump cannot silently retain the old clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7 ]]; then
-    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie bfbe3b14d5d4095c8d23bdb0c4ea278beca7b9c7" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3798935e38ee0d85a2f2e3b91572280cb337af07 ]]; then
+    echo "configure-build-jobs.sh: DBT budget is not bound to calibrated Reverie 3798935e38ee0d85a2f2e3b91572280cb337af07" >&2
     return 2
 fi
 
@@ -572,6 +572,40 @@ REVERIE_DBT_MAX_BUILD_SECONDS=$((
 # protected-evidence FINAL in native/client.c plus its source audit in
 # src/evidence.rs. Neither revision changes a recipe input; bfbe3b14 is
 # build-relevant, so the real Hermit validation still runs below.
+#
+# CARRY TO 3798935e (2026-08-24). The budget carries UNCHANGED. Unlike the
+# ab44bbf7 carry, this one is NOT "the whole subtree is identical" -- the
+# reverie-dbt subtree genuinely differs -- so the argument is made on the two
+# recipe inputs specifically, which is the narrower and honest claim:
+#
+#   git rev-parse bfbe3b14:reverie-dbt/build.rs         -> 0ff8ae24b974
+#   git rev-parse 3798935e:reverie-dbt/build.rs         -> 0ff8ae24b974  IDENTICAL
+#   git rev-parse bfbe3b14:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de
+#   git rev-parse 3798935e:reverie-dbt/vendor/dynamorio -> de352475846e385002c1e4e54604fa0a7647b2de  IDENTICAL
+#   git rev-parse bfbe3b14:reverie-dbt                  -> b693370f9a79f971  (differs)
+#   git rev-parse 3798935e:reverie-dbt                  -> d4549166ea7b9ef3  (differs)
+#
+# The content key is computed at build.rs:472-481 over exactly four inputs:
+# hash_tree(vendor/dynamorio), hash_file(build.rs), CMAKE, CMAKE_GENERATOR.
+# Both file inputs are byte-identical above, and the two environment inputs
+# are host state that a pin move cannot change, so the key is bit-identical at
+# both pins. A miss therefore configures and builds the SAME DynamoRIO source
+# with the SAME build script, and the measured MISS cost cannot have moved.
+# Budget values carry unchanged; the >=5-clean-Hermit-lane-samples replacement
+# bar is unmet.
+#
+# WHAT CHANGED UNDER reverie-dbt, AND WHY IT IS OUTSIDE THE MEASURED REGION:
+# native/client.c (+80/-?), src/evidence.rs, src/lib.rs, src/tools.rs, and four
+# new process-clone test fixtures/tests. build.rs does not reference client.c,
+# and the timed region is bounded at build.rs:542-580 around the cmake
+# configure/build/install of the vendored tree alone. So none of these appear
+# in either the cache key or the elapsed-seconds measurement.
+#
+# BUILD-RELEVANT ANYWAY, on the separate axis: reverie-ptrace/src/task.rs
+# changes (this is the guest-task panic fix, rrnewton/reverie#480) and
+# reverie-dbt sources change, and Hermit compiles both crates. This carry
+# authorizes reusing the BUDGET only; it does not authorize reusing a receipt,
+# and a fresh exact-head Hermit validation runs for this bump.
 
 
 export CARGO_BUILD_JOBS=$REVERIE_DBT_RAW_BUILD_JOBS
