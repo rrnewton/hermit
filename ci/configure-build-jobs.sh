@@ -99,7 +99,7 @@ fi
 
 if [[ -n ${CARGO_BUILD_JOBS:-} ]]; then
     REVERIE_DBT_RAW_BUILD_JOBS=$CARGO_BUILD_JOBS
-    if [[ ${SAFE_CI_IN_SCOPE:-} == 1 ]]; then
+    if [[ ${DAGRUN_IN_SCOPE:-} == 1 ]]; then
         REVERIE_DBT_BUILD_JOBS_SOURCE=runner-child-cargo-build-jobs
     else
         REVERIE_DBT_BUILD_JOBS_SOURCE=inherited-launch-cargo-build-jobs

@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner
+      - name: Initialize dagrun
         run: git submodule update --init agent-utils
       - uses: actions/setup-go@v5
         with:

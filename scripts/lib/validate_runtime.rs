@@ -325,7 +325,7 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
 
 /// Extract one failed DAG node's captured output from the driver's durable log.
 ///
-/// `safe-ci-dag-runner` re-emits a failed step's combined stdout+stderr between
+/// `dagrun` re-emits a failed step's combined stdout+stderr between
 /// `[tag] ----- detail -----` and `[tag] ----- end detail -----`, one line per
 /// prefixed line (scheduler.rs:844-849). Reading THAT region - rather than a
 /// whole-log tail - is what binds the classification to the node that actually
@@ -372,7 +372,7 @@ fn rusage_seconds(who: libc::c_int) -> (f64, f64) {
 /// This is exactly what bash's `times` builtin reports (validate.sh:1614), and it
 /// is why the number must be taken in the top-level process: a subshell - or, here,
 /// a worker thread's local view - would see only its own accounting. Every gate
-/// runs as a child of this process through `safe-ci-dag-runner`, and the runner
+/// runs as a child of this process through `dagrun`, and the runner
 /// waits on each one, so `RUSAGE_CHILDREN` accumulates the whole suite.
 pub fn process_cpu_seconds() -> (f64, f64) {
     let (su, ss) = rusage_seconds(libc::RUSAGE_SELF);

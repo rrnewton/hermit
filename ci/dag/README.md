@@ -1,7 +1,7 @@
-# CI validation lanes as safe-ci-dag-runner DAGs
+# CI validation lanes as dagrun DAGs
 
 This directory holds a declarative migration of Hermit's CI validation lanes
-onto [`safe-ci-dag-runner`](../../agent-utils/common/docs/safe-ci-dag-runner/README.md)
+onto [`dagrun`](../../agent-utils/common/docs/dagrun/README.md)
 (from the `agent-utils` submodule). Each validation *gate* becomes a DAG node
 with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
@@ -58,7 +58,7 @@ This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Portabl
 CI initializes only `agent-utils` instead of all submodules, then executes the
 dependency-free Python runner so per-node performance CSVs are available
 without an install step. `ci/run-dag.sh` also accepts
-`SAFE_CI_DAG_RUNNER` for local or preinstalled binaries.
+`DAGRUN_BIN` for local or preinstalled binaries.
 
 ## Speed-to-signal audit
 

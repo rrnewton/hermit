@@ -8,7 +8,7 @@
 //!
 //! # The single rule this module exists to enforce
 //!
-//! **Nothing validate runs may execute outside `safe-ci-dag-runner`.** Every gate
+//! **Nothing validate runs may execute outside `dagrun`.** Every gate
 //! — preflight submodule init, the Reverie pin check, the manifest gate, each CI
 //! lane node, and each compatibility probe — is a DAG *node*. The driver makes
 //! exactly one kind of call (`run_dag_boxed_ordered`) and never spawns work
@@ -19,7 +19,7 @@
 //!
 //! # Every synthesized node MUST declare its caps — measured, not assumed
 //!
-//! `safe-ci-dag-runner` applies its SMALL "forcing function" floor (1 GiB / 1 core
+//! `dagrun` applies its SMALL "forcing function" floor (1 GiB / 1 core
 //! / 10 s CPU) **only** through its own CLI, behind `--small-default-cap`. A
 //! LIBRARY consumer — which this driver is — gets `DagConfig::default()`, i.e.
 //! `default_step_mem_cap_bytes: None`, `default_step_cpu_count: None`,
@@ -45,11 +45,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use safe_ci_dag_runner::io::dag_from_json;
-use safe_ci_dag_runner::model::DagConfig;
-use safe_ci_dag_runner::model::ResourceHint;
-use safe_ci_dag_runner::model::Step;
-use safe_ci_dag_runner::model::StepClass;
+use dagrun::io::dag_from_json;
+use dagrun::model::DagConfig;
+use dagrun::model::ResourceHint;
+use dagrun::model::Step;
+use dagrun::model::StepClass;
 
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;

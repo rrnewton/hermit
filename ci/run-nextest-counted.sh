@@ -62,7 +62,7 @@ function emit_libtest_count {
         return 2
     fi
 
-    # safe-ci-dag-runner consumes canonical libtest counts from complete step
+    # dagrun consumes canonical libtest counts from complete step
     # output. Nextest's human summary is equally authoritative but has a
     # different spelling, so restate that one parsed summary without guessing.
     if ((status == 0)); then

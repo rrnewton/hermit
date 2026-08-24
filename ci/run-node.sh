@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 #
 # run-node.sh — run one or more named DAG nodes from ci/dag/<lane>.json THROUGH
-# the tracked safe-ci-dag-runner, WITHOUT running their dependencies.
+# the tracked dagrun, WITHOUT running their dependencies.
 #
 # WHY (single-engine invariant): the parallel GitHub fan-out (ci-portable.yml)
 # shards the portable lane across many small jobs. Each shard must execute an
@@ -16,7 +16,7 @@
 # predated its `run --only` node selector. That made GitHub Actions a SECOND
 # execution engine that diverged from the runner: it ignored each node's
 # jobs_flag, timeout, cpu_timeout, and cgroup boxing. This rewrite kills that
-# divergence — every node now runs through the SAME `safe-ci-dag-runner run`
+# divergence — every node now runs through the SAME `dagrun run`
 # entrypoint that scripts/validate.rs and run-dag.sh use, so ci/dag/<lane>.json is the
 # single source of truth for both the command AND its resource policy.
 #
@@ -37,7 +37,7 @@
 #              sub-graph still runs in the right order.
 #
 # Environment:
-#   SAFE_CI_DAG_RUNNER   override the runner executable (mirrors run-dag.sh).
+#   DAGRUN_BIN   override the runner executable (mirrors run-dag.sh).
 #   RUN_NODE_JOBS        outer concurrency across the selected nodes (default 1:
 #                        one node at a time, preserving the historical serial
 #                        shim semantics). Inner per-node parallelism (cargo /
@@ -73,35 +73,35 @@ fi
 
 # Locate the runner. Mirror ci/run-dag.sh's find_runner EXACTLY: an explicit
 # override, then the TRACKED, source-invoked engine resolver
-# (agent-utils/common/bin/safe-ci-dag-runner), then the tracked, source-invoked
+# (agent-utils/common/bin/dagrun), then the tracked, source-invoked
 # Python entrypoint (agent-utils/py/bin), then a resolver already on PATH. NEVER
 # auto-select the untracked prebuilt Rust binary (rs/bin): a compiled artifact
 # can silently drift from its source (the historical cpu_timeout gap), and the
 # CI execution path must stay tracked, deterministic, and self-describing.
 find_runner() {
-    if [[ -n ${SAFE_CI_DAG_RUNNER:-} ]]; then
-        printf '%s\n' "$SAFE_CI_DAG_RUNNER"
+    if [[ -n ${DAGRUN_BIN:-} ]]; then
+        printf '%s\n' "$DAGRUN_BIN"
         return 0
     fi
     local base="$ROOT_DIR/agent-utils"
-    if [[ -x "$base/common/bin/safe-ci-dag-runner" ]]; then
-        printf '%s\n' "$base/common/bin/safe-ci-dag-runner"
+    if [[ -x "$base/common/bin/dagrun" ]]; then
+        printf '%s\n' "$base/common/bin/dagrun"
         return 0
     fi
-    if [[ -x "$base/py/bin/safe-ci-dag-runner" ]]; then
-        printf '%s\n' "$base/py/bin/safe-ci-dag-runner"
+    if [[ -x "$base/py/bin/dagrun" ]]; then
+        printf '%s\n' "$base/py/bin/dagrun"
         return 0
     fi
-    if command -v safe-ci-dag-runner >/dev/null 2>&1; then
-        command -v safe-ci-dag-runner
+    if command -v dagrun >/dev/null 2>&1; then
+        command -v dagrun
         return 0
     fi
     return 1
 }
 
 runner=$(find_runner) || {
-    echo "run-node.sh: safe-ci-dag-runner not found." >&2
-    echo "            Build it with: (cd agent-utils && ./setup) or set SAFE_CI_DAG_RUNNER." >&2
+    echo "run-node.sh: dagrun not found." >&2
+    echo "            Build it with: (cd agent-utils && ./setup) or set DAGRUN_BIN." >&2
     exit 2
 }
 
@@ -112,7 +112,7 @@ mkdir -p "$perf_dir" || {
     exit 2
 }
 
-# Boxing policy. safe-ci-dag-runner boxes fail-closed by default (two-level
+# Boxing policy. dagrun boxes fail-closed by default (two-level
 # cgroup-v2 + a systemd --user scope, or it exits 3). Inside GitHub Actions the
 # runner deliberately SKIPS the systemd --user scope (its skip_in_ci path keys on
 # $GITHUB_ACTIONS / $CI), so the default no-opt-out path would exit 3 in ANY

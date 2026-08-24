@@ -2,7 +2,7 @@
 # Can THIS machine box a CI step, and does a cgroup kill reach a setsid escapee?
 #
 # DIAGNOSTIC ONLY. Never fails its caller, never changes a default, never gates a lane. It answers
-# one question that has been ASSUMED rather than measured: safe-ci-dag-runner skips cgroup boxing
+# one question that has been ASSUMED rather than measured: dagrun skips cgroup boxing
 # whenever $CI or $GITHUB_ACTIONS is set (cgroup.rs reexec_in_scope returns success WITHOUT entering
 # a scope), and the real capability probe sits after that early return, so it never executes on a
 # runner. Every lane therefore runs unboxed on an assumption no one has tested.

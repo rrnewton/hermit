@@ -44,8 +44,8 @@
 
 use std::path::Path;
 
-use safe_ci_dag_runner::model::Step;
-use safe_ci_dag_runner::model::StepOutcome;
+use dagrun::model::Step;
+use dagrun::model::StepOutcome;
 
 use crate::validate_plan::node;
 use crate::validate_plan::shell_join;

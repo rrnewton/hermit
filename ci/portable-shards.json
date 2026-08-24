@@ -14,6 +14,7 @@
     "check.backend_abstraction",
     "check.backend_parity_mutation",
     "check.portability_paths",
+    "check.dagrun_naming",
     "check.check_outcome_consumers",
     "check.script_sigpipe",
     "lint.rustfmt"
