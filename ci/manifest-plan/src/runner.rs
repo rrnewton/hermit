@@ -640,17 +640,39 @@ pub fn prepare_test(
             vec![path, "--run".into()]
         }
         (None, Some(DirectCommand::Shell(command))) => {
+            // The shell form expands $E2E_REPO_ROOT itself, from the cell
+            // environment; nothing to substitute here.
             let mut argv = vec!["bash".into(), "-c".into(), command.clone()];
             if !guest_args.is_empty() {
                 argv.push("--".into());
             }
             argv
         }
-        (None, Some(DirectCommand::Argv(argv))) => argv.clone(),
+        (None, Some(DirectCommand::Argv(argv))) => argv
+            .iter()
+            .map(|word| expand_repo_root(word, &context.root))
+            .collect(),
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
     Ok(guest)
+}
+
+/// The one manifest-visible name for the repository checkout.
+pub const REPO_ROOT_VAR: &str = "E2E_REPO_ROOT";
+
+/// Substitute `$E2E_REPO_ROOT` / `${E2E_REPO_ROOT}` in a `direct:` argv word.
+///
+/// There is no shell in the argv form, so the manifest cannot expand a variable
+/// on its own, and this is the ONLY substitution performed. That narrowness is
+/// deliberate: the alternative considered was "resolve any word that looks like
+/// a relative path against the root", which would silently rewrite operands that
+/// are not paths at all -- `find`'s `-printf %P` format, for one -- and would
+/// make a manifest's meaning depend on what happens to exist on disk.
+fn expand_repo_root(word: &str, root: &Path) -> String {
+    let root = root.to_string_lossy();
+    word.replace(&format!("${{{REPO_ROOT_VAR}}}"), &root)
+        .replace(&format!("${REPO_ROOT_VAR}"), &root)
 }
 
 fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
@@ -713,6 +735,14 @@ pub fn build_spec(
 ) -> Result<CellRunSpec, String> {
     let backend = cell.id.backend.as_deref().unwrap_or("native");
     let mut env = cell_env(&dir, cell.id.mode != "naked");
+    // Cells no longer run with the checkout root as their working directory, so
+    // a `direct:` entry can no longer name a repository file by a bare relative
+    // path. This is how it names one instead: explicitly, and visibly in the
+    // manifest, rather than by depending on where the harness happened to stand.
+    env.insert(
+        REPO_ROOT_VAR.into(),
+        context.root.to_string_lossy().into_owned(),
+    );
     let sabre_path_evidence = (backend == "sabre").then(|| {
         dir.join("captures")
             .join(format!("{}-{attempt}.sabre-path.jsonl", cell.id.mode))
@@ -841,7 +871,12 @@ pub fn build_spec(
         id: cell.id.clone(),
         lane: cell.test.lane.clone(),
         category: cell.category.clone(),
-        cwd: context.root.clone(),
+        // A PRIVATE WORKING DIRECTORY PER CELL, not the shared checkout root.
+        // It lives under the cell's own result directory, which is inside the
+        // repository tree -- deliberately NOT under host /tmp, because Hermit
+        // replaces guest /tmp with an isolated directory and a guest resolved
+        // through host /tmp is refused (hermit-cli/src/bin/hermit/run.rs).
+        cwd: dir.join("cwd"),
         env,
         argv,
         guest_argv,
@@ -865,6 +900,27 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
         fs::remove_dir_all(&tmp).map_err(|e| format!("cannot reset {}: {e}", tmp.display()))?;
     }
     fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    // Reset the private working directory on the same terms as tmp, so a cell
+    // that writes relative paths -- system-utils/file-timestamp-identity makes
+    // ts_dir/ and ts_first.txt, system-utils/shm-coherency-identity makes
+    // shm_backing.bin -- starts each attempt from an identical directory rather
+    // than inheriting residue from an attempt that was killed before its own
+    // cleanup ran.
+    //
+    // THIS DOES NOT COVER BOTH HALVES OF A VERIFY PAIR. `--verify` runs the
+    // guest twice inside ONE invocation, so run 2 sees whatever run 1 left
+    // behind. That is unchanged from the shared-cwd behaviour and is not
+    // something the harness can reach; the point here is that the residue is
+    // now confined to one cell instead of landing in a directory every other
+    // cell is also sitting in.
+    if spec.cwd.starts_with(&spec.cell_dir) {
+        if spec.cwd.exists() {
+            fs::remove_dir_all(&spec.cwd)
+                .map_err(|e| format!("cannot reset {}: {e}", spec.cwd.display()))?;
+        }
+        fs::create_dir_all(&spec.cwd)
+            .map_err(|e| format!("cannot create {}: {e}", spec.cwd.display()))?;
+    }
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
     let stdout_path = captures.join(format!("{}-{index}.stdout", spec.id.mode));
@@ -1596,6 +1652,15 @@ fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
         "fixtures",
         "recording",
         "captures",
+        // The cell's private working directory. Every other ambient directory a
+        // cell can observe -- HOME, XDG_CONFIG_HOME, E2E_TMPDIR, fixtures -- was
+        // already per-cell; the working directory was the one left pointing at
+        // the shared checkout root, and it is a live nondeterminism source. On
+        // btrfs a directory's st_size changes on EVERY entry added or removed,
+        // so anything creating a file in the checkout root -- another agent, a
+        // build, or another cell in this same suite -- changes a value the guest
+        // can see between a verify pair's two executions.
+        "cwd",
     ] {
         fs::create_dir_all(dir.join(child)).map_err(|e| e.to_string())?;
     }
@@ -2453,6 +2518,99 @@ backends_disabled:
 
         fs::set_permissions(source.join("program"), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(prepare_test(&context, &cell, &cell_dir).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A cell must NOT run in the checkout root.
+    ///
+    /// It did until 2026-08-24, and it is a live nondeterminism source rather
+    /// than an untidiness: on btrfs a directory's `st_size` changes on every
+    /// entry added or removed, so anything writing in the checkout root -- another
+    /// agent, a build, or `system-utils/file-timestamp-identity` creating
+    /// `ts_dir/` two cells over -- changes a value the guest can observe between
+    /// a verify pair's two executions. A serial exact-main validate with zero
+    /// peers was already recorded failing because `newfstatat("/home/newton")`
+    /// returned 5788 and then 5810.
+    #[test]
+    fn a_cell_runs_in_its_own_directory_and_never_in_the_checkout_root() {
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-private-cwd-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(&root).unwrap();
+
+        let mut test = recipe(true);
+        test.program = None;
+        test.direct = Some(DirectCommand::Argv(vec![
+            "/bin/echo".into(),
+            // The one substitution the argv form gets: without it a manifest
+            // could no longer name a repository file at all.
+            format!("${REPO_ROOT_VAR}/examples/thing"),
+            "untouched-relative-operand".into(),
+        ]));
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+        };
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+        };
+
+        prepare_dirs(&context.root, &cell_dir).unwrap();
+        let guest = prepare_test(&context, &cell, &cell_dir).unwrap();
+        let spec = build_spec(&context, &cell, cell_dir.clone(), guest, "1", None).unwrap();
+
+        assert_eq!(
+            spec.cwd,
+            cell_dir.join("cwd"),
+            "a cell must run in its own directory"
+        );
+        assert_ne!(
+            spec.cwd, context.root,
+            "a cell must not run in the checkout root"
+        );
+        assert!(
+            spec.cwd.is_dir(),
+            "the private working directory must exist before the run"
+        );
+        assert_eq!(
+            fs::read_dir(&spec.cwd).unwrap().count(),
+            0,
+            "the private working directory must start empty, or its st_size is not stable"
+        );
+        assert_eq!(
+            spec.env.get(REPO_ROOT_VAR).map(String::as_str),
+            Some(context.root.to_string_lossy().as_ref()),
+            "a cell still needs a way to name the repository"
+        );
+        assert!(
+            spec.guest_argv
+                .contains(&root.join("examples/thing").to_string_lossy().into_owned()),
+            "$E2E_REPO_ROOT must be substituted in the argv form, which has no shell: {:?}",
+            spec.guest_argv
+        );
+        assert!(
+            spec.guest_argv
+                .contains(&"untouched-relative-operand".to_string()),
+            "only $E2E_REPO_ROOT is substituted; a bare word must survive verbatim: {:?}",
+            spec.guest_argv
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

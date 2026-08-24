@@ -70,7 +70,7 @@ test:
       - bash
     timeout_seconds: 90
     occasional: false
-    direct: ./examples/race.sh
+    direct: $E2E_REPO_ROOT/examples/race.sh
     observation:
       status: true
       stdout: true

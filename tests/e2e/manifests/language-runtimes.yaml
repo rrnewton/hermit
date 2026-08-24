@@ -198,7 +198,7 @@ test:
     timeout_seconds: 90
     occasional: false
     direct:
-      - ./examples/rand.py
+      - $E2E_REPO_ROOT/examples/rand.py
     observation:
       status: true
       stdout: true
