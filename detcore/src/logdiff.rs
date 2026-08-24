@@ -613,8 +613,30 @@ fn filter_detcore<'a>(v: &[(usize, &'a str)]) -> Vec<(usize, &'a str)> {
 /// runs of the same guest can differ here while agreeing on every committed
 /// scheduling decision.
 ///
-/// Kept as a constant so the string sits beside the code that reads it; grep
-/// for this text to find the producing `info!`.
+/// Kept as a constant so the string sits beside the code that reads it.
+///
+/// THIS COUNTER IS CURRENTLY INERT AND CAN ONLY REPORT ZERO. Read the paragraph
+/// above as history, not as current behaviour. The producer is no longer an
+/// `info!`: commit `08ff51a33e`, "Stop logging a host-timing-dependent
+/// scheduler poll at INFO", demoted it to `trace!` in
+/// `Scheduler::step2_process_blocked`. `count_empty_queue_kicks` is called on
+/// `filter_infos(..)` output, so the message it looks for is filtered out
+/// before the count runs, and every comparison prints
+/// "Logs contain 0 | 0 scheduler empty-run-queue kick messages" whatever the
+/// runs did.
+///
+/// Note that the demotion did not merely hide this counter, it discharged much
+/// of its purpose: the paragraph above says the kick's appearance is decided by
+/// host timing, and that is exactly why it was moved off INFO — measured at 4
+/// divergences in 302 SaBRe cell-runs before and 0 in 612 after. A difference
+/// the counter existed to EXPLAIN no longer reaches the compared stream.
+///
+/// Deliberately not deleted, and deliberately not repointed at the trace
+/// stream. Which of those is right depends on a pending decision about whether
+/// a terminal scheduler message is emitted unconditionally at INFO; if it is,
+/// this becomes live again with no change here. Removing it now would have to
+/// be undone, and repointing it at `trace!` would reintroduce into the
+/// comparison the host-timing dependence `08ff51a33e` removed.
 const SCHEDULER_EMPTY_QUEUE_KICK: &str = "zero threads left anywhere, fizzling.";
 
 /// How many of `v` record the scheduler's empty-run-queue kick.
@@ -2753,6 +2775,14 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     /// A matching pair keeps only its summary, so without this count there is no
     /// record of which shutdown path either run took. Both directions of the
     /// pass are covered: both runs kicked, and neither did.
+    ///
+    /// CAUTION FOR A READER TREATING THIS AS EVIDENCE THE COUNTER WORKS: it is
+    /// not. `log_with_kick()` hand-writes a line carrying an `INFO` prefix, so
+    /// this test exercises the counting function against a synthetic input the
+    /// product no longer produces — the real emitter is a `trace!` and is
+    /// filtered out before counting. See `SCHEDULER_EMPTY_QUEUE_KICK`. The test
+    /// therefore passes whether or not the counter can ever see a real kick,
+    /// which is why the demotion in `08ff51a33e` went unnoticed here.
     #[test]
     fn a_matching_pair_records_the_empty_queue_kick_count() -> std::io::Result<()> {
         let (kicked, kicked_out) = run_diff(log_with_kick(), log_with_kick())?;
