@@ -1700,6 +1700,7 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
             &tmp.join("positive.log"),
             None,
             0,
+            &BTreeMap::new(),
             false,
         );
         if !positive_result.complete
@@ -1744,6 +1745,7 @@ fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
             &tmp.join("negative.log"),
             None,
             0,
+            &BTreeMap::new(),
             false,
         );
         let producer_failed = negative_result.outcomes.iter().any(|outcome| {
@@ -4317,10 +4319,101 @@ fn interrupted_by() -> Option<&'static str> {
 
 // --------------------------------------------------------------- lane execution
 
+/// One node's record of ONE attempt, kept even after a later attempt replaced it.
+///
+/// WHY THIS TYPE EXISTS — a measured erasure, not a hypothetical one.
+///
+/// The retry loop below keeps a `BTreeMap<tag, StepOutcome>` and overwrites the
+/// entry on every retry. That map is what becomes `LaneResult::outcomes` and
+/// therefore the ledger's `gates[]` array, so a node that FAILED on attempt 1
+/// and PASSED on attempt 2 is written to the ledger as a plain `pass` with no
+/// surviving trace. Counted on the live ledger under `ledger/hermit/`:
+/// **67 runs retried a node, 17 of them ended `pass`, and in all 17 the
+/// `gates[]` array records zero failures.** The scalar `env_block_retries`
+/// says a retry happened SOMEWHERE in the lane; it never names the node, the
+/// attempt, or the reason, so no per-node flake rate can be computed from it.
+///
+/// Keeping the attempts as their own rows is what makes a green that needed two
+/// attempts distinguishable from a green that needed one.
+#[derive(Clone)]
+struct NodeAttempt {
+    /// The node's `group.job` tag.
+    tag: String,
+    /// 1-based ordinal. Attempt 1 is the first scheduler pass.
+    attempt: usize,
+    /// `Some(true)`/`Some(false)` when the scheduler REPORTED this attempt.
+    /// `None` means no completion payload arrived for a node that was neither
+    /// dependency-skipped nor an intentional skip — the run learned nothing
+    /// about it, which is deliberately not the same as a failure.
+    ok: Option<bool>,
+    /// Whether a completion payload arrived at all. False is the
+    /// verdict-not-recorded case that a re-run cannot distinguish after the
+    /// fact unless it is written down here.
+    reported: bool,
+    returncode: Option<i64>,
+    /// The runner's typed failure reason for THIS attempt; `""` when it passed
+    /// or was never reported. A later attempt never overwrites it.
+    reason: String,
+    duration_s: f64,
+    aborted: bool,
+    /// Why this attempt's failure was judged retry-eligible, in the same words
+    /// the retry line prints. `None` when it was not retried — because it
+    /// passed, because nothing classified it, or because the budget ran out.
+    retry_class: Option<String>,
+}
+
+/// This node's next attempt ordinal: one more than however many attempts of it
+/// are already recorded.
+///
+/// The ordinal is PER NODE, not per retry round. A node that is dependency-
+/// skipped in round 1 and runs for the first time in round 2 has made ONE
+/// attempt, not two — labelling it `attempt 2` would put it in `retried_nodes`
+/// and make a node that never failed look like a flake, which is the same
+/// over-counting this record exists to prevent in the other direction.
+fn next_attempt_ordinal(attempts: &[NodeAttempt], tag: &str) -> usize {
+    attempts.iter().filter(|a| a.tag == tag).count() + 1
+}
+
+/// Record one attempt the scheduler REPORTED.
+fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
+    NodeAttempt {
+        tag: outcome.tag.clone(),
+        attempt,
+        ok: Some(outcome.ok),
+        reported: true,
+        returncode: outcome.returncode,
+        reason: outcome.reason.clone(),
+        duration_s: outcome.duration_s,
+        aborted: outcome.aborted,
+        retry_class: None,
+    }
+}
+
+/// Record one attempt for which NO completion payload arrived. Every observation
+/// field stays absent rather than defaulting to a zero, because a fabricated
+/// `exit 0`/`0.0s` here would read exactly like a node that ran and passed.
+fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
+    NodeAttempt {
+        tag,
+        attempt,
+        ok: None,
+        reported: false,
+        returncode: None,
+        reason: "no completion payload was reported for this node".into(),
+        duration_s: 0.0,
+        aborted: false,
+        retry_class: None,
+    }
+}
+
 /// One lane's terminal state after any environmental retries.
 struct LaneResult {
     outcomes: Vec<StepOutcome>,
     skipped: Vec<String>,
+    /// Every attempt of every node, in the order they were reported. A node run
+    /// once contributes exactly one row, so this is a superset of `outcomes`
+    /// rather than a parallel structure that can disagree with it.
+    attempts: Vec<NodeAttempt>,
     /// Every non-intentional planned node completed with a non-aborted outcome,
     /// and the whole-run clock did not cut the lane short. Dependency-skipped
     /// and aborted nodes are known but unexecuted, so they are incomplete. This
@@ -4613,6 +4706,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &tmp.join("complete.log"),
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     if !complete.complete
@@ -4665,6 +4759,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &failure_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     if failed.complete
@@ -4695,6 +4790,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &failure_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     let mut kept_tags: Vec<&str> = kept.outcomes.iter().map(|o| o.tag.as_str()).collect();
@@ -4741,6 +4837,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &dependency_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     if dependency_result.complete
@@ -4783,6 +4880,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &aborted_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     let aborted_peer_reported = aborted_result
@@ -4828,6 +4926,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &allowed_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     if !allowed.complete
@@ -4886,6 +4985,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &environmental_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     let retried_tags: BTreeSet<&str> =
@@ -4912,6 +5012,189 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             retried.skipped,
             edge_ready.is_file()
         ));
+    }
+
+    // THE RETRY MUST NOT ERASE THE FLAKE. The lane above is GREEN and its
+    // terminal outcome for `fixture.environmental` is PASS — which is exactly
+    // the shape that used to leave no per-node evidence that anything failed.
+    // Assert the superseded attempt survived, with its own ordinal, its own
+    // failing verdict, and the ground on which it was retried. Without the
+    // attempt history this block cannot be satisfied at all: `attempts` would
+    // hold one PASS row per node.
+    let environmental_attempts: Vec<&NodeAttempt> = retried
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.environmental")
+        .collect();
+    let first_failed = environmental_attempts
+        .iter()
+        .any(|a| a.attempt == 1 && a.ok == Some(false) && a.reported);
+    let second_passed = environmental_attempts
+        .iter()
+        .any(|a| a.attempt == 2 && a.ok == Some(true));
+    let names_its_ground = environmental_attempts
+        .iter()
+        .any(|a| a.attempt == 1 && a.retry_class.as_deref() == Some("bpfjailer-banner"));
+    if environmental_attempts.len() != 2 || !first_failed || !second_passed || !names_its_ground {
+        return Err(format!(
+            "scheduler accounting: a node that FAILED then PASSED was recorded as if it had \
+             passed first time — the retry erased the flake. attempts={:?}",
+            environmental_attempts
+                .iter()
+                .map(|a| (a.attempt, a.ok, a.reported, a.retry_class.clone()))
+                .collect::<Vec<_>>()
+        ));
+    }
+    // The same node must still report its TERMINAL verdict as PASS. Preserving
+    // the first attempt must not turn a recovered node red, or the mechanism
+    // would trade one wrong answer for another.
+    if !retried
+        .outcomes
+        .iter()
+        .any(|o| o.tag == "fixture.environmental" && o.ok)
+    {
+        return Err(
+            "scheduler accounting: preserving the first attempt changed the node's terminal \
+             verdict; the retry must record the flake, not manufacture a failure"
+                .into(),
+        );
+    }
+
+    // ---- the bound-kill ground, and the two refusals that bound it ----------
+    //
+    // The measured instance is `scorecard.compatibility` at SHA 485a0ad4: it
+    // timed out at 120.45s in 1 of 6 runs of that identical commit and passed in
+    // 44.63-45.62s in the other five, while a concurrently started peer held the
+    // shared Cargo build directory. This fixture reproduces the SHAPE — a node
+    // killed by its own wall budget on attempt 1 that completes on attempt 2 —
+    // without reproducing the 120-second cost.
+    let bound_log = tmp.join("bound-kill.log");
+    let bound_first = tmp.join("bound-kill-first-attempt");
+    let bound_cmd = format!(
+        "if test ! -e {first}; then : > {first}; sleep 30; fi",
+        first = validate_plan::shell_quote(&bound_first.to_string_lossy()),
+    );
+    let bound_cfg = DagConfig {
+        steps: vec![step_with_caps(
+            "fixture",
+            "bound_kill",
+            "validate scheduler accounting fixture",
+            bound_cmd,
+            Vec::new(),
+            2,
+            2,
+            64 * 1024 * 1024,
+        )],
+        ..Default::default()
+    };
+    let bound = run_lane_with_env_retries(
+        &bound_cfg,
+        1,
+        true,
+        0,
+        None,
+        &bound_log,
+        None,
+        1,
+        &BTreeMap::new(),
+        false,
+    );
+    let bound_attempts: Vec<&NodeAttempt> = bound
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.tag == "fixture.bound_kill")
+        .collect();
+    let bound_ground = bound_attempts
+        .iter()
+        .find(|a| a.attempt == 1)
+        .and_then(|a| a.retry_class.clone())
+        .unwrap_or_default();
+    if !bound.ok
+        || bound.env_retries != 1
+        || bound_attempts.len() != 2
+        || bound_attempts[0].ok != Some(false)
+        || bound_attempts[1].ok != Some(true)
+        || !bound_ground.starts_with("bound-kill under contention")
+    {
+        return Err(format!(
+            "scheduler accounting: a node killed by its own wall budget was not retried on the \
+             bound-kill ground, or the timed-out attempt was not preserved: ok={} retries={} \
+             attempts={:?} ground={bound_ground:?}",
+            bound.ok,
+            bound.env_retries,
+            bound_attempts.iter().map(|a| (a.attempt, a.ok)).collect::<Vec<_>>()
+        ));
+    }
+
+    // REFUSAL 1: an ordinary product failure is still paid for ONCE. Nothing
+    // classifies it, so it must not be retried even though the budget allows it.
+    let ordinary_only_log = tmp.join("ordinary-only.log");
+    std::fs::write(
+        &ordinary_only_log,
+        "[fixture.plain_red] ----- detail -----\n\
+[fixture.plain_red] assertion failed: 1 == 2\n\
+[fixture.plain_red] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write the ordinary-only log: {e}"))?;
+    let ordinary_only = run_lane_with_env_retries(
+        &DagConfig { steps: vec![step("plain_red", "exit 1")], ..Default::default() },
+        1,
+        true,
+        0,
+        None,
+        &ordinary_only_log,
+        None,
+        2,
+        &BTreeMap::new(),
+        false,
+    );
+    if ordinary_only.ok || ordinary_only.env_retries != 0 || ordinary_only.attempts.len() != 1 {
+        return Err(format!(
+            "scheduler accounting: an unclassified product failure was retried; a genuine red \
+             must cost one attempt, not three: ok={} retries={} attempts={}",
+            ordinary_only.ok,
+            ordinary_only.env_retries,
+            ordinary_only.attempts.len()
+        ));
+    }
+
+    // REFUSAL 2: a registry entry with a ONE-SIDED sample grants no retry. This
+    // is the structural-`no_result` shape the flakiness investigation measured
+    // (eight DBT identities `no_result` 5 of 5 because DBT never publishes a
+    // terminal verify report), and retrying it returns the same answer three
+    // times. The registry reader must reject it on its own numbers.
+    let registry = tmp.join("flaky-cells.json");
+    std::fs::write(
+        &registry,
+        r#"{"schema":1,"cells":[
+             {"cell":"real_flake","observed_pass":9,"observed_fail":1,"measured_at":"2026-08-24"},
+             {"cell":"structural_no_result","observed_pass":0,"observed_fail":5,"measured_at":"2026-08-24"},
+             {"cell":"no_sample_at_all"}
+           ]}"#,
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write the registry fixture: {e}"))?;
+    // SAFETY: the self-test is single-threaded here, and the variable is unset
+    // again immediately below so no later bracket inherits it.
+    unsafe { std::env::set_var("VALIDATE_FLAKY_CELL_REGISTRY", &registry) };
+    let admitted = validate_runtime::measured_unstable_nodes(None);
+    unsafe { std::env::remove_var("VALIDATE_FLAKY_CELL_REGISTRY") };
+    let admitted_names: Vec<&str> = admitted.keys().map(String::as_str).collect();
+    if admitted_names != vec!["real_flake"] {
+        return Err(format!(
+            "scheduler accounting: the measured-instability registry admitted an entry without a \
+             two-sided sample; a 0-pass/5-fail identity is structural, not flaky: admitted={admitted_names:?}"
+        ));
+    }
+    // The same registry must match a DAG node whose tag carries its group.
+    if validate_runtime::measured_unstable_class(&admitted, "test.real_flake").is_none()
+        || validate_runtime::measured_unstable_class(&admitted, "test.structural_no_result")
+            .is_some()
+    {
+        return Err(
+            "scheduler accounting: registry lookup did not match a `group.job` tag, or matched a \
+             refused entry"
+                .into(),
+        );
     }
 
     // An environmental failure may be retried alongside an ordinary failure,
@@ -4982,6 +5265,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         &mixed_log,
         None,
         1,
+        &BTreeMap::new(),
         false,
     );
     let mixed_by_tag: BTreeMap<&str, &StepOutcome> = mixed
@@ -5075,6 +5359,10 @@ fn run_lane_with_env_retries(
     log_path: &Path,
     deadline: Option<u64>,
     max: usize,
+    // Nodes whose failure is retry-eligible because instability was MEASURED,
+    // mapped to the sample that established it. Empty means "no registry was
+    // reachable", and only the environmental classes remain eligible.
+    unstable: &BTreeMap<String, String>,
     record_step_profiles: bool,
 ) -> LaneResult {
     if remaining_budget_s(deadline) == Some(0) {
@@ -5085,6 +5373,9 @@ fn run_lane_with_env_retries(
         return LaneResult {
             outcomes: Vec::new(),
             skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            // Nothing was dispatched, so there is no attempt to record. An empty
+            // list is the honest shape: zero attempts, not one failed attempt.
+            attempts: Vec::new(),
             complete: false,
             ok: false,
             env_retries: 0,
@@ -5110,27 +5401,88 @@ fn run_lane_with_env_retries(
         first.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
     let mut skipped = first.skipped.clone();
     let mut env_retries = 0usize;
+    // Attempt 1 for everything the first pass reported, recorded BEFORE any
+    // retry can replace it in `by_tag`. This is the row that used to vanish.
+    let mut attempts: Vec<NodeAttempt> = order
+        .iter()
+        .filter_map(|tag| by_tag.get(tag))
+        .map(|o| reported_attempt(o, 1))
+        .collect();
+    // A planned node that is neither reported nor dependency-skipped produced no
+    // completion payload at all. Today that node is silently swept into the retry
+    // set; recorded here it stays separable from a node that ran and failed,
+    // which is the distinction a flake-rate measurement cannot make afterwards.
+    attempts.extend(
+        unreported_non_intentional_steps(cfg, &by_tag, &skipped)
+            .into_iter()
+            .map(|tag| unreported_attempt(tag, 1)),
+    );
 
     while env_retries < max {
         let failed: Vec<&StepOutcome> = by_tag.values().filter(|o| !o.ok && !o.aborted).collect();
         if failed.is_empty() {
             break;
         }
+        // Only the ENVIRONMENTAL ground reads the durable log: it classifies the
+        // failing node's own `----- detail -----` region. The other two grounds
+        // read typed fields, so an unreadable log must not suppress them — a
+        // wall-budget kill is a wall-budget kill whether or not the tee has
+        // flushed. Before this split, an empty log broke out of the loop and
+        // disabled every ground at once.
         let log = read_log_settled(log_path);
         if log.is_empty() {
             eprintln!(
                 "validate: WARNING: the durable log is unreadable, so {} failed node(s) cannot be \
-                 classified as environmental; NOT retrying (an unclassifiable red stays RED).",
+                 classified as environmental. The typed grounds (bound-kill, measured \
+                 instability) still apply; an unclassifiable red stays RED.",
                 failed.len()
             );
-            break;
         }
-        let blocked: Vec<(String, &'static str)> = failed
+        // THREE grounds for retrying one failed node, each naming itself in the
+        // record so a reader never has to guess which fired:
+        //
+        //   1. the failing node's OWN `----- detail -----` region classifies as
+        //      an environmental block — a host condition, unchanged behaviour;
+        //   2. the node was killed by its wall or CPU budget. A bound-kill is a
+        //      RESOURCE story, which is exactly how the parent's existing
+        //      taxonomy already reads it: `ci-hub/validate/retry_class.py` maps
+        //      `Completion::KILLED_BY_BOUND` to `RetryClass::TRANSIENT`, "a
+        //      retry may well answer". The measured instance is
+        //      `scorecard.compatibility` at SHA 485a0ad4, which timed out at
+        //      120.45s in 1 of 6 runs of that identical commit while passing in
+        //      44.63-45.62s in the other five; its wrapper burned 0.050 CPU
+        //      seconds over 93.813 wall seconds because a concurrently started
+        //      `test.detcore_parallel` held the shared Cargo build directory.
+        //      Nothing about the tree changed between those runs;
+        //   3. the node is named in the measured-instability registry, whose
+        //      membership rule is a recorded pass/fail sample with provenance.
+        //
+        // WHAT IS DELIBERATELY *NOT* A GROUND — the flakiness investigation's
+        // firmest result, and the one that costs the box the most if ignored. A
+        // verdict that CANNOT be published does not become publishable by being
+        // re-run. At SHA 0f1f6cd0 eight DBT identities reported `no_result` 5
+        // times out of 5 even though both executions completed and printed
+        // deterministic success, because DBT never publishes a terminal verify
+        // report and the invocation-bound pending one is left standing; and
+        // `dbt-unsupported-syscall/ptrace` was pre-comparison `no_result` 5/5.
+        // Those are 100% reproducible, so a retry buys three identical answers
+        // at three times the cost. Accordingly a node that merely reported
+        // nothing is NOT retried on that ground alone: it is recorded (above)
+        // and it rides along in the retry set only when one of the three
+        // grounds fires for something else.
+        let blocked: Vec<(String, String)> = failed
             .iter()
             .filter_map(|o| {
-                validate_runtime::extract_node_detail(&log, &o.tag)
+                let environmental = validate_runtime::extract_node_detail(&log, &o.tag)
                     .and_then(|d| validate_runtime::environmental_block_class(&d))
-                    .map(|c| (o.tag.clone(), c))
+                    .map(str::to_string);
+                environmental
+                    .or_else(|| {
+                        outcome_hit_its_budget(o)
+                            .then(|| format!("bound-kill under contention: {}", o.reason.trim()))
+                    })
+                    .or_else(|| validate_runtime::measured_unstable_class(unstable, &o.tag))
+                    .map(|class| (o.tag.clone(), class))
             })
             .collect();
         if blocked.is_empty() {
@@ -5148,28 +5500,35 @@ fn run_lane_with_env_retries(
         let retry_tags: BTreeSet<String> = steps.iter().map(|step| step.tag()).collect();
         if !blocked.iter().any(|(tag, _)| retry_tags.contains(tag)) {
             eprintln!(
-                "validate: environmental failure has no safe retry because a prerequisite did \
+                "validate: retry-eligible failure has no safe retry because a prerequisite did \
                  not complete successfully and is not part of the retry; NOT retrying."
             );
             break;
         }
         env_retries += 1;
         for (tag, class) in blocked.iter().filter(|(tag, _)| retry_tags.contains(tag)) {
+            // Stamp the ground onto the attempt row that is about to be replaced,
+            // so the record says WHY this node was given another go and not just
+            // that it was. `retry_class` is set on the LATEST recorded attempt of
+            // this node, which is the one the retry supersedes.
+            if let Some(previous) = attempts.iter_mut().rev().find(|a| &a.tag == tag) {
+                previous.retry_class = Some(class.clone());
+            }
             println!(
-                "⚠️  {tag}: ENVIRONMENTAL block ({class}) — host/sandbox condition, not a test \
-                 failure — retrying (attempt {env_retries}/{max})"
+                "⚠️  {tag}: RETRY-ELIGIBLE ({class}) — not accepted as a product failure on this \
+                 attempt — retrying (attempt {}/{})",
+                env_retries + 1,
+                max + 1
             );
         }
         let mut retry_cfg = cfg.clone();
-        retry_cfg.description =
-            format!("{} — environmental retry {env_retries}/{max}", cfg.description);
+        retry_cfg.description = format!("{} — retry {env_retries}/{max}", cfg.description);
         retry_cfg.steps = steps;
         // Retries draw down the same clock. Giving every retry a fresh budget
         // would turn a bounded invocation back into an unbounded one.
         if remaining_budget_s(deadline) == Some(0) {
             eprintln!(
-                "validate: whole-run budget exhausted; NOT starting environmental retry \
-                 {env_retries}/{max}."
+                "validate: whole-run budget exhausted; NOT starting retry {env_retries}/{max}."
             );
             run_timed_out = true;
             break;
@@ -5192,9 +5551,27 @@ fn run_lane_with_env_retries(
             if !by_tag.contains_key(&o.tag) {
                 order.push(o.tag.clone());
             }
+            // The map holds the TERMINAL verdict and is still overwritten, which
+            // is correct: the last attempt is what the node finally did. The
+            // superseded attempt is not destroyed with it — it was appended to
+            // `attempts` before this round started, and this round appends its
+            // own row below.
             by_tag.insert(o.tag.clone(), o.clone());
+            let ordinal = next_attempt_ordinal(&attempts, &o.tag);
+            attempts.push(reported_attempt(o, ordinal));
         }
         skipped = again.skipped.clone();
+        // Only nodes this round actually re-ran can gain an attempt row. A node
+        // left out of the retry set is unchanged, and repeating its earlier row
+        // once per round would inflate the very count this exists to make
+        // trustworthy.
+        for tag in unreported_non_intentional_steps(cfg, &by_tag, &skipped)
+            .into_iter()
+            .filter(|tag| retry_tags.contains(tag))
+        {
+            let ordinal = next_attempt_ordinal(&attempts, &tag);
+            attempts.push(unreported_attempt(tag, ordinal));
+        }
     }
 
     // Retries exhausted with an environmental block still standing is a RED, but
@@ -5234,19 +5611,75 @@ fn run_lane_with_env_retries(
         && skipped.is_empty()
         && outcomes.iter().all(|outcome| !outcome.aborted);
     let ok = outcomes.iter().all(|o| o.ok || o.aborted);
-    LaneResult { outcomes, skipped, complete, ok, env_retries, run_timed_out }
+    LaneResult { outcomes, skipped, attempts, complete, ok, env_retries, run_timed_out }
 }
 
-/// Nodes the runner reported as killed by their wall or CPU budget. The runner's
-/// own `step_failure_reason` produces these strings, so this reads its typed
+/// Print every node that took more than one attempt, and every attempt that
+/// reported nothing.
+///
+/// This is the human-facing half of the same fact the ledger now carries. It is
+/// printed even when the run is GREEN, which is the whole point: a green that
+/// needed a second attempt is the case that used to leave no trace anywhere
+/// except a lane-level counter that names no node.
+fn print_retry_ledger(attempts: &[NodeAttempt]) {
+    let mut retried: BTreeMap<&str, Vec<&NodeAttempt>> = BTreeMap::new();
+    for attempt in attempts {
+        retried.entry(attempt.tag.as_str()).or_default().push(attempt);
+    }
+    retried.retain(|_, rows| rows.len() > 1 || rows.iter().any(|row| !row.reported));
+    if retried.is_empty() {
+        return;
+    }
+    println!(
+        "\nRetried nodes ({}): every attempt is listed, including the ones a later attempt \
+         superseded. A node here did NOT pass first time.",
+        retried.len()
+    );
+    for (tag, rows) in &retried {
+        for row in rows {
+            let verdict = match row.ok {
+                Some(true) => "pass",
+                Some(false) => "fail",
+                None => "no completion payload",
+            };
+            let because = row
+                .retry_class
+                .as_deref()
+                .map(|class| format!(" — retried because: {class}"))
+                .unwrap_or_default();
+            let detail = if row.reason.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", row.reason.trim())
+            };
+            println!(
+                "  {tag} attempt {}/{}: {verdict} ({:.1}s){detail}{because}",
+                row.attempt,
+                rows.len(),
+                row.duration_s
+            );
+        }
+    }
+}
+
+/// Was this node killed by its wall or CPU budget? The runner's own
+/// `step_failure_reason` produces these strings, so this reads its typed
 /// classification rather than re-deriving one.
+///
+/// A bound-kill says nothing about the tree — it says the node did not get to
+/// finish. That is why it is both a `timed_out_nodes` entry in the ledger and a
+/// retry ground above; the two readings must stay the same predicate, or a node
+/// could be retried without being reported as timed out, or the reverse.
+fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
+    let reason = outcome.reason.to_ascii_lowercase();
+    reason.contains("timeout") || reason.contains("timed out")
+}
+
+/// Nodes the runner reported as killed by their wall or CPU budget.
 fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
     outcomes
         .iter()
-        .filter(|o| {
-            let r = o.reason.to_ascii_lowercase();
-            r.contains("timeout") || r.contains("timed out")
-        })
+        .filter(|o| outcome_hit_its_budget(o))
         .map(|o| o.tag.clone())
         .collect()
 }
@@ -5721,6 +6154,9 @@ fn write_ledger(
     ledger: &Path,
     ctx: &LedgerCtx,
     outcomes: &[StepOutcome],
+    // Every attempt of every node, so a retried node's superseded verdict
+    // reaches the row instead of being replaced by the one that followed it.
+    attempts: &[NodeAttempt],
     skipped: &[String],
     wall_s: f64,
     exit_code: u8,
@@ -5751,6 +6187,38 @@ fn write_ledger(
     let gates: Vec<serde_json::Value> = outcomes
         .iter()
         .map(|o| {
+            // Every attempt this node took, oldest first. A node that ran once
+            // carries exactly one entry, so the array is never a special case a
+            // reader has to branch on, and `result` above stays the TERMINAL
+            // verdict rather than being redefined.
+            let node_attempts: Vec<serde_json::Value> = attempts
+                .iter()
+                .filter(|a| a.tag == o.tag)
+                .map(|a| {
+                    serde_json::json!({
+                        "attempt": a.attempt,
+                        // `null` is UNKNOWN and stays UNKNOWN: no completion
+                        // payload arrived, which is not the same as a failure
+                        // and must never be readable as a pass.
+                        "result": a.ok.map(|ok| if ok { "pass" } else { "fail" }),
+                        "reported": a.reported,
+                        "exit_code": a.returncode,
+                        "reason": a.reason,
+                        "aborted": a.aborted,
+                        "real_seconds": a.duration_s,
+                        // Why this attempt was given another go. `null` on the
+                        // last attempt of every node, since nothing followed it.
+                        "retry_class": a.retry_class,
+                    })
+                })
+                .collect();
+            // The FIRST attempt's own verdict, promoted out of the array so the
+            // cheap query -- "how often does this node fail on its first try?"
+            // -- is a field read rather than an array walk. This is the field
+            // the rate measurement keys on, and it is never overwritten by a
+            // later attempt.
+            let first = attempts.iter().find(|a| a.tag == o.tag);
+            let retried = node_attempts.len().saturating_sub(1);
             serde_json::json!({
                 "name": o.tag,
                 "result": if o.ok { "pass" } else { "fail" },
@@ -5758,9 +6226,41 @@ fn write_ledger(
                 "reason": o.reason,
                 "aborted": o.aborted,
                 "real_seconds": o.duration_s,
+                // A green that needed two attempts is not a green that needed
+                // one, and these three fields are what make them different rows.
+                "attempts": node_attempts,
+                "retries": retried,
+                "first_attempt_result": first
+                    .and_then(|a| a.ok)
+                    .map(|ok| if ok { "pass" } else { "fail" }),
+                "first_attempt_reason": first.map(|a| a.reason.clone()),
             })
         })
         .collect();
+    // Nodes that were re-run, and nodes for which no completion payload ever
+    // arrived. The second list is the verdict-capture population: a node that
+    // reported nothing established nothing, and it is deliberately NOT retried
+    // on that ground alone, so it must at least be counted here.
+    let retried_nodes: Vec<&str> = {
+        let mut names: Vec<&str> = attempts
+            .iter()
+            .filter(|a| a.attempt > 1)
+            .map(|a| a.tag.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
+    let unreported_attempt_nodes: Vec<&str> = {
+        let mut names: Vec<&str> = attempts
+            .iter()
+            .filter(|a| !a.reported)
+            .map(|a| a.tag.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
     let record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -5814,6 +6314,14 @@ fn write_ledger(
         // because the host was retried must be distinguishable from a first-pass
         // green.
         "env_block_retries": ctx.env_block_retries,
+        // WHICH nodes were retried, not merely how many rounds the lane spent.
+        // `env_block_retries` alone cannot answer "what flaked?", so a per-node
+        // rate was not computable from any row written before this field.
+        "retried_nodes": retried_nodes,
+        // Nodes that produced no completion payload on some attempt. Separate
+        // from a failure on purpose: the run learned nothing about these, and
+        // the two need opposite fixes.
+        "unreported_attempt_nodes": unreported_attempt_nodes,
         // LIBTEST counts aggregated from the runner's typed step outcomes before
         // verbosity filters their human-facing presentation.
         // `null` is UNKNOWN and stays UNKNOWN: the receipt publisher fails closed
@@ -6856,9 +7364,26 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
 
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut attempts: Vec<NodeAttempt> = Vec::new();
     let mut ok = true;
     let mut execution_complete = true;
     let mut env_retries = 0usize;
+
+    // Read once per invocation, so both lanes apply the same policy and the run
+    // can name the registry it used. An unreachable registry is an empty map,
+    // which widens nothing.
+    let unstable = validate_runtime::measured_unstable_nodes(parent.as_deref());
+    if !unstable.is_empty() {
+        println!(
+            "Retry-eligible on measured instability: {} node(s) — {}",
+            unstable.len(),
+            unstable
+                .iter()
+                .map(|(node, sample)| format!("{node} ({sample})"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
 
     // One clock for the whole invocation. Sequential lanes and retries spend
     // from the same allowance rather than each receiving a fresh 600 seconds.
@@ -6873,6 +7398,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &log_path,
             deadline,
             validate_runtime::env_block_max_retries(),
+            &unstable,
             true,
         )
     };
@@ -6881,6 +7407,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
+    attempts.extend(r.attempts.iter().cloned());
     ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
     env_retries += r.env_retries;
@@ -6891,6 +7418,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             let r2 = lane(second);
             outcomes.extend(r2.outcomes.iter().cloned());
             skipped.extend(r2.skipped.iter().cloned());
+            attempts.extend(r2.attempts.iter().cloned());
             ok = ok && r2.ok;
             execution_complete = execution_complete && r2.complete;
             env_retries += r2.env_retries;
@@ -6914,6 +7442,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         );
     }
     print_cost_table(&outcomes, &skipped);
+    print_retry_ledger(&attempts);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
     //
@@ -7022,6 +7551,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 &ledger,
                 &ctx,
                 &outcomes,
+                &attempts,
                 &skipped,
                 wall,
                 130,
@@ -7214,6 +7744,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             &ledger,
             &ctx,
             &outcomes,
+            &attempts,
             &skipped,
             wall,
             exit_code,
@@ -7461,7 +7992,19 @@ fn stop_test_seam(root: &Path, profile: &str, parent: Option<&Path>) -> RunSumma
     // `suite_complete: false` — a fixture that ran two synthetic gates must never
     // publish a gates_expected obligation, which is what would make it look like
     // a completed full profile.
-    write_ledger(&ledger, &ctx, &outcomes, &[], wall, exit_code, "", false, serde_json::json!({}));
+    // The stop-path fixture runs no DAG, so there is no attempt to record.
+    write_ledger(
+        &ledger,
+        &ctx,
+        &outcomes,
+        &[],
+        &[],
+        wall,
+        exit_code,
+        "",
+        false,
+        serde_json::json!({}),
+    );
 
     let detail = match exit {
         validate_runtime::StopTestExit::Signalled => vec![format!(
