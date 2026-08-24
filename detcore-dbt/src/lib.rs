@@ -16,8 +16,11 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -114,7 +117,11 @@ impl Subscriber for DbtSubscriber {
             metadata.target(),
             visitor.fields
         );
-        unsafe { (self.emit)(line.as_ptr(), line.len()) };
+        // Prefer the caller's --log-file so DBT produces the same artifact as
+        // every other backend; the emitter (stderr) remains the fallback.
+        if !write_to_logfile(&line) {
+            unsafe { (self.emit)(line.as_ptr(), line.len()) };
+        }
     }
 
     fn enter(&self, _span: &span::Id) {}
@@ -172,6 +179,15 @@ impl DbtLogLevel {
 }
 
 fn emit_marker(emit: Emitter, message: &'static [u8]) {
+    // Lifecycle markers follow the records to --log-file so a DBT run leaves
+    // one artifact rather than splitting its diagnostics across two channels.
+    // These fire before tracing is initialized, but the sink does not depend on
+    // it, so the very first marker lands in the file too.
+    if let Ok(text) = std::str::from_utf8(message)
+        && write_to_logfile(text)
+    {
+        return;
+    }
     unsafe { emit(message.as_ptr(), message.len()) };
 }
 
@@ -237,6 +253,66 @@ fn init_dbt_tracing(emit: Emitter) -> bool {
 /// time/CPUID virtualization switches reach the DBT Detcore Tool the same way
 /// they reach the ptrace backend.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
+
+/// Environment variable through which `hermit run --backend dbt` names the
+/// file that `--log-file` selected.
+///
+/// The in-guest client cannot reach the CLI's own log writer: it runs as a
+/// DynamoRIO client inside the guest and its only runtime-provided sink is
+/// [`reverie_dbt::RuntimeEmitter`], which lands on stderr. Without this the DBT
+/// backend ignored `--log-file` and delivered DETLOG on stderr while ptrace
+/// wrote a proper logfile, so a cross-backend log comparison had to special-case
+/// DBT instead of reading the same artifact for every backend.
+///
+/// Passing the path (rather than adding a reverie-side emitter) keeps the fix
+/// inside Hermit: the client opens the file itself and bypasses the emitter.
+/// The guest inherits the variable from `drrun`, the same cross-process channel
+/// [`DETCONFIG_ENV`] already uses.
+///
+/// This is the name `--log-file` already carries (`env = "HERMIT_LOG_FILE"` on
+/// the global option), forwarded to the guest exactly as `HERMIT_LOG` already
+/// is, so the two logging controls reach the in-guest runtime the same way.
+pub const LOGFILE_ENV: &str = "HERMIT_LOG_FILE";
+
+/// The `--log-file` sink, opened once per client process.
+///
+/// `None` when [`LOGFILE_ENV`] is unset or the file cannot be opened; callers
+/// then fall back to the runtime emitter, so a bad path degrades to the old
+/// stderr behaviour instead of losing the log entirely.
+static LOGFILE_SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+
+fn logfile_sink() -> Option<&'static Mutex<File>> {
+    LOGFILE_SINK
+        .get_or_init(|| {
+            let path = std::env::var_os(LOGFILE_ENV)?;
+            if path.is_empty() {
+                return None;
+            }
+            // Append: sibling guest processes in one run inherit the same path
+            // and must not truncate each other's records.
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+                .map(Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Write one already-formatted record to the `--log-file` sink.
+///
+/// Returns `false` when there is no sink or the write fails, so the caller can
+/// fall back to the emitter rather than dropping the record.
+fn write_to_logfile(line: &str) -> bool {
+    let Some(sink) = logfile_sink() else {
+        return false;
+    };
+    let Ok(mut file) = sink.lock() else {
+        return false;
+    };
+    file.write_all(line.as_bytes()).is_ok()
+}
 
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {

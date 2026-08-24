@@ -42,6 +42,13 @@ use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+// Present whenever its consumer `process_status` is: with the `dbt` feature for
+// production, and in ANY test build so the wait-status brackets actually run.
+// Ungated it is dead in the default build -- the one `cargo clippy -- -D
+// warnings` uses -- because the real `run_dbt` is replaced by the feature-off
+// stub and nothing calls `ExitStatus::from_raw`.
+#[cfg(any(feature = "dbt", test))]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
@@ -377,6 +384,28 @@ impl<R: Read, W: Write> Read for TeeReader<R, W> {
 // CLI run flags rather than a cohesive value object; bundling them would not
 // clarify the dispatch shim.
 #[allow(clippy::too_many_arguments)]
+/// The environment entry that carries `--log-file` into the DBT guest.
+///
+/// Kept UNGATED, and separated from `run_dbt`, for one reason: this wiring is
+/// the property the change exists to deliver, and the natural place to test it
+/// -- inside `run_dbt` -- is `#[cfg(feature = "dbt")]`, so a bracket written
+/// there compiles and never executes in the default build that validation and
+/// clippy run. The value is deliberately the literal name rather than
+/// `detcore_dbt::LOGFILE_ENV`, because that crate is an optional dependency and
+/// is absent without the feature; `dbt_log_file_env_matches_the_guest_constant`
+/// ties the two together whenever the feature IS available, so a rename of the
+/// constant cannot silently diverge from this.
+pub(super) const DBT_LOG_FILE_ENV: &str = "HERMIT_LOG_FILE";
+
+/// `Some((name, value))` only when a log file was requested. Returning `None`
+/// rather than an empty value is load-bearing: an unconditional insert would
+/// hand the guest an empty path, which it would treat as a sink it could not
+/// open rather than as "no file requested".
+pub(super) fn dbt_log_file_env(log_file: Option<&Path>) -> Option<(OsString, OsString)> {
+    let path = log_file?;
+    Some((DBT_LOG_FILE_ENV.into(), path.as_os_str().to_owned()))
+}
+
 #[cfg(feature = "dbt")]
 pub(super) fn run_dbt(
     program: &Path,
@@ -385,6 +414,7 @@ pub(super) fn run_dbt(
     verify_allow: VerifyAllow,
     summary: bool,
     log: Option<LevelFilter>,
+    log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
@@ -442,6 +472,12 @@ pub(super) fn run_dbt(
     let mut guest = StdCommand::new(&prepared.program);
     if let Some(level) = log {
         environment.insert("HERMIT_LOG".into(), level.to_string().into());
+    }
+    // Forward --log-file the same way --log is forwarded. Without this the
+    // in-guest client has no sink but the runtime emitter (stderr), so DBT
+    // silently ignored --log-file while every other backend honoured it.
+    if let Some((name, value)) = dbt_log_file_env(log_file) {
+        environment.insert(name, value);
     }
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
@@ -588,6 +624,7 @@ pub(super) fn run_dbt(
     _verify_allow: VerifyAllow,
     _summary: bool,
     _log: Option<LevelFilter>,
+    _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
 ) -> Result<ExitStatus, Error> {
@@ -656,9 +693,20 @@ fn launch_error(drrun: &Path, error: std::io::Error) -> Error {
     ))
 }
 
-#[cfg(feature = "dbt")]
+// `any(feature = "dbt", test)`, not `feature = "dbt"`: the two brackets below
+// are the only check that a signalled death is not reported as a normal exit,
+// and under a plain `feature` gate they compile and NEVER RUN in the default
+// build that validation exercises. A test that cannot execute is not coverage.
+#[cfg(any(feature = "dbt", test))]
 fn process_status(status: std::process::ExitStatus) -> ExitStatus {
-    ExitStatus::Exited(status.code().unwrap_or(1))
+    // `std::process::ExitStatus::code()` is `None` for a process killed by a
+    // signal, so `code().unwrap_or(1)` reported every signalled death as a
+    // normal `Exited(1)`: a guest killed by SIGSEGV came back as "exited
+    // normally with status 1", and `WIFSIGNALED`/`WTERMSIG`/`WCOREDUMP` were
+    // all lost. Convert the raw wait status instead -- `ExitStatus::from_raw`
+    // already decodes exited-vs-signalled and the core-dump flag the same way
+    // the ptrace backend does.
+    ExitStatus::from_raw(status.into_raw())
 }
 
 #[cfg(feature = "dbt")]
@@ -726,7 +774,8 @@ fn write_output(output: &Output) -> Result<(), Error> {
 
 #[cfg(feature = "dbt")]
 fn output_status(output: &Output) -> ExitStatus {
-    ExitStatus::Exited(output.status.code().unwrap_or(1))
+    // Same signal-losing conversion as `process_status`; see the comment there.
+    ExitStatus::from_raw(output.status.into_raw())
 }
 
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
@@ -1039,5 +1088,127 @@ mod tests {
 
         assert!(resolved.is_absolute());
         assert_eq!(resolved, fs::canonicalize(file.path()).unwrap());
+    }
+
+    /// POSITIVE side: a normal exit still reports its code unchanged.
+    #[test]
+    fn dbt_status_preserves_normal_exit_codes() {
+        for code in [0, 1, 42, 255] {
+            let raw = std::process::ExitStatus::from_raw(code << 8);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Exited(code),
+                "a normal exit with code {code} must round-trip"
+            );
+        }
+    }
+
+    /// NEGATIVE side -- the regression this guards. `std::process::ExitStatus::code()`
+    /// is `None` for a signalled death, so the previous `code().unwrap_or(1)`
+    /// reported every one of these as `Exited(1)`, destroying WIFSIGNALED,
+    /// WTERMSIG and WCOREDUMP. A guest killed by SIGSEGV must not come back as
+    /// "exited normally with status 1".
+    #[test]
+    fn dbt_status_preserves_death_by_signal() {
+        for (signum, signal) in [
+            (libc::SIGABRT, reverie::Signal::SIGABRT),
+            (libc::SIGSEGV, reverie::Signal::SIGSEGV),
+            (libc::SIGFPE, reverie::Signal::SIGFPE),
+            (libc::SIGILL, reverie::Signal::SIGILL),
+            (libc::SIGTERM, reverie::Signal::SIGTERM),
+            (libc::SIGKILL, reverie::Signal::SIGKILL),
+            (libc::SIGTRAP, reverie::Signal::SIGTRAP),
+        ] {
+            // without a core dump
+            let raw = std::process::ExitStatus::from_raw(signum);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, false),
+                "death by signal {signum} must be reported as Signaled, not Exited"
+            );
+            // with the core-dump flag set (bit 0x80 of the wait status)
+            let raw = std::process::ExitStatus::from_raw(signum | 0x80);
+            assert_eq!(
+                process_status(raw),
+                ExitStatus::Signaled(signal, true),
+                "the core-dump flag for signal {signum} must survive the conversion"
+            );
+        }
+    }
+
+    /// The property this change exists to deliver: `--log-file` reaches the DBT
+    /// guest. There was no bracket for it at all.
+    ///
+    /// The assertions are chosen to survive the mutations that a weaker test
+    /// would miss, which is the lesson from the git-depth bracket where an
+    /// exhaustive parser check never reached the branch the field existed for:
+    ///
+    ///  * asserting the exact VALUE, not merely that the key is present, so
+    ///    forwarding the wrong variable is caught;
+    ///  * asserting the exact NAME, so reusing `HERMIT_LOG` -- the variable
+    ///    forwarded three lines above in `run_dbt` -- is caught;
+    ///  * asserting `None` for the no-log-file case, so an unconditional insert
+    ///    that hands the guest an empty path is caught. That one matters:
+    ///    `is_some()` alone would pass under it.
+    #[test]
+    fn dbt_log_file_env_carries_the_requested_path_and_nothing_otherwise() {
+        let requested = Path::new("/var/log/hermit/guest-run.log");
+        let (name, value) = dbt_log_file_env(Some(requested))
+            .expect("a requested --log-file must be forwarded to the DBT guest");
+        assert_eq!(
+            name,
+            OsString::from("HERMIT_LOG_FILE"),
+            "the guest reads HERMIT_LOG_FILE; forwarding under any other name, \
+             including the HERMIT_LOG used for the level, is a silent no-op"
+        );
+        assert_ne!(
+            name,
+            OsString::from("HERMIT_LOG"),
+            "HERMIT_LOG carries the LEVEL, not the sink; confusing the two would \
+             both lose the file and corrupt the level"
+        );
+        assert_eq!(
+            value,
+            requested.as_os_str(),
+            "the forwarded value must be the requested path verbatim"
+        );
+
+        assert_eq!(
+            dbt_log_file_env(None),
+            None,
+            "with no --log-file nothing may be inserted; an unconditional insert \
+             would hand the guest an empty path, which it cannot open and cannot \
+             distinguish from a genuine request"
+        );
+    }
+
+    /// A non-UTF-8 path must survive byte-for-byte. The environment is `OsString`
+    /// precisely so this works, and a `to_string_lossy()` anywhere in the
+    /// forwarding would replace the invalid byte with U+FFFD and point the guest
+    /// at a different file.
+    #[test]
+    fn dbt_log_file_env_preserves_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"/tmp/hermit-\xff-run.log".to_vec());
+        let path = Path::new(&raw);
+        let (_, value) = dbt_log_file_env(Some(path)).expect("forwarded");
+        assert_eq!(
+            value.as_bytes(),
+            b"/tmp/hermit-\xff-run.log",
+            "a lossy conversion would silently redirect the guest's log"
+        );
+    }
+
+    /// Ties the ungated literal to the constant the guest actually reads, so the
+    /// two cannot drift. Only checkable when the optional crate is present.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_log_file_env_matches_the_guest_constant() {
+        assert_eq!(
+            DBT_LOG_FILE_ENV,
+            detcore_dbt::LOGFILE_ENV,
+            "the name forwarded here must be the name the in-guest client reads"
+        );
     }
 }
