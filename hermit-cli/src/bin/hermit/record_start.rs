@@ -517,7 +517,8 @@ impl StartOpts {
                 diagnostic_full_trace: false,
                 // Recording does not enable the syscall output-buffer hash, so
                 // a replay verdict here is not a content-parity claim either.
-                compare_io_buffers: false,
+                // Paired with the recorder via one constant; see its doc.
+                compare_io_buffers: hermit::RECORD_REPLAY_HASHES_IO_BUFFERS,
                 keep_logs: false,
                 record_envelope: RecordEnvelope::all_records_v1(),
             },
