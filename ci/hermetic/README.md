@@ -169,8 +169,14 @@ nothing to do with the network:
 
 ```
 [safe-ci] ERROR: systemd --user scope is unavailable; refusing advisory-only containment.
-safe-ci-dag-runner: ERROR: cgroup boxing could not be established ...
+<runner>: ERROR: cgroup boxing could not be established ...
 ```
+
+The `<runner>` prefix is the DAG runner's own program name, not a fixed string:
+it comes from `PROG` in the runner's CLI, so it tracks whatever the tool is
+currently called. Quoting it literally here would rot the moment the tool is
+renamed — which it was, mid-flight, while this branch was open. Grep for the
+`cgroup boxing could not be established` half, which is stable.
 
 That refusal is correct — resource boxing is the runner's primary purpose and it
 declines to pretend. It is also the expected consequence of the stage-1 shape:
