@@ -2113,6 +2113,24 @@ mod tests {
     /// later table rows routed around it.
     ///
     /// Shrinking this list is the goal. Do not grow it without a stated reason.
+    ///
+    /// STATED REASON, `chown` / `fchown` / `fchownat` / `lchown` (#1851). These
+    /// four were reclassified from `PassThrough` to `Determinized` so the
+    /// ptrace path answers the ownership-permission question as the fixed
+    /// virtual root rather than as whatever host identity the backend happens
+    /// to run under. They are added here rather than fail-closed because in a
+    /// copied child there is no virtual root to be consistent with: every
+    /// syscall that establishes that identity already escapes this gate — the
+    /// query family (`getuid`, `geteuid`, `getgid`, `getegid`, `getresuid`,
+    /// `getresgid`) and the setter family (`setuid`, `setgid`, `setreuid`,
+    /// `setresuid`, `setresgid`) are all rows above. Refusing only the
+    /// ownership MUTATION while the identity it is checked against is still
+    /// the host's would not restore the contract; it would just deny an
+    /// operation that natively succeeds, in a window (fork to exec) where the
+    /// ptrace path's emulation is unavailable anyway. `utimensat` is the
+    /// existing precedent: a `Determinized` metadata mutator acknowledged as
+    /// running natively here. This row shrinks when the copied-child ABI can
+    /// carry an emulated identity, not before.
     const ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES: &[&str] = &[
         "accept",
         "accept4",
@@ -2120,6 +2138,7 @@ mod tests {
         "alarm",
         "arch_prctl",
         "bind",
+        "chown",
         "clock_adjtime",
         "clock_getres",
         "clock_gettime",
@@ -2147,6 +2166,8 @@ mod tests {
         "exit",
         "exit_group",
         "fadvise64",
+        "fchown",
+        "fchownat",
         "fcntl",
         "flock",
         "fork",
@@ -2179,6 +2200,7 @@ mod tests {
         "ioprio_get",
         "ioprio_set",
         "kill",
+        "lchown",
         "listen",
         "lseek",
         "lstat",
