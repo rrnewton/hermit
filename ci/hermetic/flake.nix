@@ -44,12 +44,32 @@
         extensions = [ "rust-src" "rustfmt" "clippy" ];
       };
 
-      # Executables that manifests run as a hermit GUEST. Derived from the
-      # `program:` entries in tests/e2e/manifests/*.yaml and the commands their
-      # shell fixtures invoke, not guessed.
+      # Executables that manifests run as a hermit GUEST.
+      #
+      # HOW THIS LIST IS DERIVED, and it is mechanical rather than recalled.
+      # Take every manifest cell with `ci: true`, take its `program:` entry, and
+      # for the shell fixtures among them collect what they `command -v` or
+      # `exec`. That yields 22 distinct executables across 47 fixtures, which
+      # map onto the attributes below.
+      #
+      # The first version of this list was assembled by reading and was
+      # INCOMPLETE: it omitted lua, m4, node, ruby, ssh-keygen, tclsh, uuidgen,
+      # mcookie and hexdump -- nine executables belonging to seven attributes,
+      # every one of them reached by a `ci: true` cell. `tclsh` in particular
+      # was missed by a careful manual pass and found only by the mechanical
+      # one, which is the argument for deriving rather than recalling.
+      #
+      # Those cells fail LOUDLY when a tool is absent rather than skipping --
+      # `uuidgen-random.sh --prepare` runs `command -v uuidgen`, and
+      # `lua-random.sh` has an explicit error path naming both candidates it
+      # tried -- so an omission here costs a red cell, never a green one that
+      # exercised nothing. That is the right direction, and it is also why the
+      # omission was survivable rather than silent.
       guestTools = with pkgs; [
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
+        # Added after the mechanical derivation above; see the note.
+        lua5_4 m4 nodejs openssh ruby tcl util-linux
       ];
 
       # Toolchain and native libraries needed to build Hermit and to compile the

@@ -24,6 +24,15 @@ command -v nix >/dev/null 2>&1 || {
     exit 2
 }
 
+# TLS TO cache.nixos.org. This host proxies egress and terminates TLS with a CA
+# that nix does not trust by default, so a build that must FETCH anything fails
+# with "unable to get local issuer certificate" -- measured, not hypothetical.
+# A warm store hides it: the first cold build on a new host is where it bites.
+# Honour an existing NIX_SSL_CERT_FILE, else fall back to the bundle curl uses.
+if [[ -z "${NIX_SSL_CERT_FILE:-}" && -n "${CURL_CA_BUNDLE:-}" && -f "${CURL_CA_BUNDLE}" ]]; then
+    export NIX_SSL_CERT_FILE="$CURL_CA_BUNDLE"
+fi
+
 NIX=(nix --extra-experimental-features "nix-command flakes")
 runner=()
 if command -v with-proxy >/dev/null 2>&1; then runner=(with-proxy); fi

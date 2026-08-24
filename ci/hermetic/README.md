@@ -5,8 +5,20 @@ the default is stage 3 and the owner's call on the evidence this produces.
 
 ## What this is
 
-A nix-built OCI image that pins the toolchain and every system executable a
+A nix-built OCI image that pins the toolchain and the system executables a
 manifest runs as a hermit guest, plus a runner that executes a command inside it.
+
+**Scope, stated rather than implied.** The mechanism works and is opt-in; that
+is the whole claim. It has NOT been shown to run this project's validation. The
+stage-2 evidence was ONE node, `check.backend_abstraction`, native versus pinned
+root. A full-profile comparison inside the root against the same profile
+natively is stage 3's gate, and until that exists no statement here should be
+read as saying validate runs in the image.
+
+The guest list is derived mechanically from every `ci: true` cell (see the
+comment on `guestTools` in `flake.nix`); it said "every" before that derivation
+existed and was wrong by nine executables, which is why it now says what it
+actually covers and names how the list is produced.
 The shape is stage 1's recommendation unchanged: the existing outer
 `systemd-run`, `validate-lock` and cgroup policy stay, and this adds only the
 filesystem mechanism — one privileged podman container pinned by digest,
