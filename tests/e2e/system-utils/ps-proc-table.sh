@@ -28,21 +28,39 @@ case ${1:-} in
         ps -eo pid,ppid,state,comm --no-headers | sort -n >"$E2E_TMPDIR/table.txt"
         printf 'PS-TABLE\n'
         cat "$E2E_TMPDIR/table.txt"
-        printf 'PS-ROWS %s\n' "$(wc -l <"$E2E_TMPDIR/table.txt" | tr -d '[:space:]')"
+        rows=$(wc -l <"$E2E_TMPDIR/table.txt" | tr -d '[:space:]')
+        printf 'PS-ROWS %s\n' "$rows"
 
         # The guest's own view of itself, via /proc through a second real
         # program, must agree with what the shell already knows.
-        printf 'SELF-COMM %s\n' "$(ps -o comm= -p $$)"
+        self_comm=$(ps -o comm= -p $$)
+        printf 'SELF-COMM %s\n' "$self_comm"
         # Compare ps's view of THIS shell's parent against the shell's own
         # $PPID. Reading /proc/self/stat here instead would be wrong: the awk
         # would be a child of the shell, so its ppid is the shell's pid, and the
         # check would report a mismatch on every correct system.
-        printf 'SELF-PPID-MATCHES %s\n' \
-            "$([ "$(ps -o ppid= -p $$ | tr -d '[:space:]')" = "$PPID" ] && echo yes || echo no)"
+        if [ "$(ps -o ppid= -p $$ | tr -d '[:space:]')" = "$PPID" ]; then
+            ppid_matches=yes
+        else
+            ppid_matches=no
+        fi
+        printf 'SELF-PPID-MATCHES %s\n' "$ppid_matches"
 
         # A directory walk of /proc that is not mediated by ps, to pin the
         # numeric-entry set the two views must share.
-        printf 'PROC-PIDS %s\n' "$(ls -1 /proc | grep -cE '^[0-9]+$' | tr -d '[:space:]')"
+        proc_pids=0
+        for proc_entry in /proc/[0-9]*; do
+            if [ -d "$proc_entry" ]; then
+                proc_pids=$((proc_pids + 1))
+            fi
+        done
+        printf 'PROC-PIDS %s\n' "$proc_pids"
+
+        if [ "$rows" -lt 2 ] || [ -z "$self_comm" ] || \
+            [ "$ppid_matches" != yes ] || [ "$proc_pids" -lt 2 ]; then
+            echo "process-table contract failed: rows=$rows self_comm=$self_comm ppid_matches=$ppid_matches proc_pids=$proc_pids" >&2
+            exit 1
+        fi
         ;;
     *) echo "usage: $0 --prepare|--run" >&2; exit 2 ;;
 esac
