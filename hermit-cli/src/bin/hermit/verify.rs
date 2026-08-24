@@ -52,7 +52,8 @@ pub(crate) struct ComparisonOptions {
     /// events merely because the caller requested that they be captured.
     pub diagnostic_full_trace: bool,
     /// Whether the compared records contain the CONTENT of syscall output
-    /// buffers, i.e. whether the run enabled `--detlog-io-buffers`.
+    /// buffers, i.e. whether the run hashed them. That is ON BY DEFAULT; it is
+    /// false only when the caller passed `--no-detlog-io-buffers`.
     ///
     /// This is not a comparator setting; it describes what the records being
     /// compared can possibly show. See [`ComparisonSpec::compare_io_buffers`].
@@ -190,8 +191,9 @@ pub struct ComparisonSpec {
     /// 44.1% of syscalls (278,824 of 632,228) move bytes through a buffer whose
     /// content the record does not show.
     ///
-    /// Set by `--detlog-io-buffers`. It is recorded here rather than inferred so
-    /// a consumer can require it instead of assuming it.
+    /// True by default, and set false only by `--no-detlog-io-buffers`. It is
+    /// recorded here rather than inferred so a consumer can require it instead
+    /// of assuming it.
     pub compare_io_buffers: bool,
     /// The message envelope selected from the captured log. The compared-message
     /// counts refer exactly to this scope.
