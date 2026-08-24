@@ -233,6 +233,30 @@ pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> 
             } else {
                 // Non-seekable (pipe/fifo/socket): buffer once into a seekable
                 // temporary file so both --verify runs receive identical input.
+                //
+                // NAME THE WAIT BEFORE ENTERING IT. This `io::copy` reads to
+                // EOF, so a stdin that never reaches EOF -- an inherited socket,
+                // a fifo whose writer stays open -- blocks here FOREVER, before
+                // the guest has started. Measured: the process wedges with ZERO
+                // bytes on stdout and stderr and is only cleared by killing it,
+                // which is indistinguishable from a slow run. That
+                // indistinguishability is the whole harm; an unbounded wait that
+                // says what it is waiting for is merely slow, and a reader can
+                // act on it.
+                //
+                // Deliberately UNCONDITIONAL rather than emitted after a delay:
+                // a message that appears only once N seconds have passed makes
+                // hermit's own stderr depend on timing, and this project does
+                // not accept timing-dependent output. Deliberately NOT a
+                // deadline either -- a 12s slow producer is legitimate and
+                // delivers, and nothing can separate "slow" from "never" except
+                // by waiting. This changes no control flow: every input that
+                // worked before still works, byte for byte, on stdout.
+                eprintln!(
+                    "hermit: --verify is buffering stdin from a non-seekable stream so both \
+                     runs receive identical input. If this appears to hang, stdin has not \
+                     reached end-of-file; pass `< /dev/null` when the guest needs no input."
+                );
                 let mut buffered = tempfile::tempfile()?;
                 io::copy(&mut file, &mut buffered)?;
                 buffered.seek(SeekFrom::Start(0))?;
