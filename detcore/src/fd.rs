@@ -87,6 +87,13 @@ struct OpenFileDescription {
     id: OpenFileId,
     /// fd type
     ty: FdType,
+    /// Process named by a pidfd created through `pidfd_open`.
+    ///
+    /// This is shared by descriptor aliases just like the kernel pidfd object.
+    /// `None` means either that this is not a pidfd or that Detcore did not
+    /// observe enough provenance to identify its target.
+    #[serde(default)]
+    pidfd_target: Option<DetPid>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -187,6 +194,7 @@ impl DetFd {
             open_file: Arc::new(Mutex::new(OpenFileDescription {
                 id,
                 ty,
+                pidfd_target: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
                 inode: None,
@@ -312,6 +320,18 @@ impl DetFd {
     /// File type attached to the open file description.
     pub fn ty(&self) -> FdType {
         self.description().ty
+    }
+
+    /// Record the process identity carried by a newly created pidfd.
+    pub(crate) fn set_pidfd_target(&self, target: DetPid) {
+        let mut description = self.description();
+        debug_assert_eq!(description.ty, FdType::Pidfd);
+        description.pidfd_target = Some(target);
+    }
+
+    /// Return the process identity carried by this pidfd, when known.
+    pub(crate) fn pidfd_target(&self) -> Option<DetPid> {
+        self.description().pidfd_target
     }
 
     /// Resource attached to the open file description.
@@ -634,6 +654,23 @@ mod tests {
             None,
             "a later call cannot make externally mutable lock state reliable again"
         );
+    }
+
+    #[test]
+    fn pidfd_target_is_shared_by_descriptor_aliases() {
+        let target = DetPid::from_raw(41);
+        let original = DetFd::new(
+            3,
+            OFlag::O_CLOEXEC,
+            FdType::Pidfd,
+            OpenFileId::new(DetTid::from_raw(7), 0),
+        );
+        let duplicate = original.clone().with_fd(4);
+
+        assert_eq!(original.pidfd_target(), None);
+        original.set_pidfd_target(target);
+        assert_eq!(original.pidfd_target(), Some(target));
+        assert_eq!(duplicate.pidfd_target(), Some(target));
     }
 
     #[test]
