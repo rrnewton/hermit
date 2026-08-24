@@ -63,6 +63,16 @@ fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
 
 const UNIX_AUTOBIND_NAME_LEN: usize = 6;
 
+/// Capacity used for pipes that Detcore makes physically nonblocking.
+///
+/// Linux normally creates 64-KiB pipes on this platform, but silently falls back to two pages
+/// once the creating UID crosses `pipe-user-pages-soft`. That host-global accounting can change
+/// between the two executions of `hermit run --verify`, changing whether the same write succeeds
+/// immediately or enters the scheduler's `InternalIOPolling` retry path. Two pages is the
+/// pressure-mode capacity on supported x86-64 Linux hosts and, unlike 64 KiB, never requires an
+/// unprivileged capacity increase while the soft limit is active.
+const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
+
 fn should_tag_sabre_internal_pipe_io(
     discovers_live_metadata: bool,
     fd_type: FdType,
@@ -2010,7 +2020,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Pipe2,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         // Pipes are unambiguously container-internal: both endpoints are owned by
         // guest processes. Make them physically nonblocking whenever we sequentialize
         // threads -- INCLUDING record/replay modes. This lets a potentially-blocking
@@ -2032,6 +2042,29 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(pipefd) = call.pipefd() {
             let fds: [i32; 2] = memory.read_value(pipefd)?;
+            if internally_nonblocking {
+                let actual_capacity = guest
+                    .inject(
+                        syscalls::Fcntl::new()
+                            .with_fd(fds[0])
+                            .with_cmd(F_SETPIPE_SZ(DETERMINISTIC_PIPE_CAPACITY_BYTES)),
+                    )
+                    .await
+                    .map_err(|error| {
+                        Error::Tool(anyhow::anyhow!(
+                            "failed to pin internal pipe capacity to {} bytes: {}",
+                            DETERMINISTIC_PIPE_CAPACITY_BYTES,
+                            error
+                        ))
+                    })?;
+                if actual_capacity != i64::from(DETERMINISTIC_PIPE_CAPACITY_BYTES) {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "kernel set internal pipe capacity to {} bytes instead of {}",
+                        actual_capacity,
+                        DETERMINISTIC_PIPE_CAPACITY_BYTES
+                    )));
+                }
+            }
             self.add_fd(guest, fds[0], call.flags(), FdType::Pipe)
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
