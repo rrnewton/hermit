@@ -676,7 +676,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         }
     }
     let selected: BTreeSet<CellId> = expected.cells.into_iter().collect();
-    if selected.len() == 0 {
+    if selected.is_empty() {
         return Err("expected E2E plan is empty".into());
     }
     for id in &selected {
