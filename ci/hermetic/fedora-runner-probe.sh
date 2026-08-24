@@ -5,10 +5,16 @@
 # WHAT IT DOES: lists containers, reads their config, and runs `exec` inside them
 # to look at /dev/kvm, the PMU settings and network reachability.
 # WHAT IT DOES NOT DO: it does not register, deregister, start, stop, restart or
-# modify any runner or container; it pulls no images; it writes nothing outside
-# one mktemp directory that it deletes on exit. Every container command below is
-# `ps`, `inspect`, or `exec` of a read-only shell command. Grep for `exec` if you
-# want to check that yourself -- there are no run/pull/rm/stop calls.
+# modify any runner or container; it pulls no images; and it CREATES NO FILES
+# AND DELETES NOTHING -- there is no `rm`, no redirect to a file, and no temp
+# directory anywhere in it. Every container command is `ps`, `inspect`, or
+# `exec` of a read-only shell command; there are no run/pull/rm/stop/start
+# calls. Two things do execute: `curl` (to /dev/null) and, where perf exists,
+# `perf stat -e branches true`. Both are reads, but as root they run as root
+# inside the container, so they are named here rather than glossed.
+#
+# SAFE TO RUN AS ROOT, and you probably must -- see the rootless warning it
+# prints if it cannot see root-owned containers.
 #
 #   usage:  ./fedora-runner-probe.sh          (run as whoever can talk to the runtime;
 #                                              if the containers are root-owned that
@@ -16,7 +22,12 @@
 
 set -uo pipefail
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# There is deliberately NO temp directory and NO `rm` anywhere in this file.
+# An earlier draft created one with `mktemp -d` and removed it on exit, and
+# nothing ever wrote to it. That is the shape of a known near-miss on this
+# project -- an `rm -rf` on a path built from a variable that could come back
+# empty -- so it is gone rather than guarded. The only occurrences of that
+# verb left in this file are in this paragraph.
 
 say()  { printf '\n%s\n' "$*"; }
 line() { printf '  %s\n' "$*"; }
@@ -38,9 +49,40 @@ echo "================ runner probe ================"
 line "container runtime: $RT ($($RT --version 2>/dev/null | head -1))"
 line "host: $(hostname)  kernel: $(uname -r)  as: $(id -un)"
 
+# ROOTLESS BLINDNESS. A rootless podman sees ONLY this user's containers and
+# gives no hint that root-owned ones exist. Measured: run as an ordinary user on
+# a box whose hermit runners run as root, this script found five unrelated
+# user-owned containers and reported on them confidently. A probe that presents
+# a partial picture as the whole is worse than one that finds nothing, so say so
+# loudly and unconditionally rather than only when the list is empty.
+ROOTLESS="unknown"
+if [[ $(id -u) -eq 0 ]]; then
+    ROOTLESS="no (running as root)"
+elif [[ $RT == podman ]]; then
+    case "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" in
+        true)  ROOTLESS="YES" ;;
+        false) ROOTLESS="no (rootful podman as non-root)" ;;
+        *)     ROOTLESS="probably (non-root user, could not query podman)" ;;
+    esac
+else
+    ROOTLESS="unknown (docker client as non-root; the daemon may still be root)"
+fi
+line "rootless: $ROOTLESS"
+
 mapfile -t ALL < <($RT ps --format '{{.Names}}' 2>/dev/null)
+line "containers visible to this user: ${#ALL[@]}${ALL:+ -- ${ALL[*]}}"
+if [[ $ROOTLESS == YES* || $ROOTLESS == probably* ]]; then
+    echo
+    echo "  ****************************************************************"
+    echo "  * WARNING: this is a ROOTLESS container runtime.                *"
+    echo "  * Root-owned containers are INVISIBLE to it. If the runners run *"
+    echo "  * as root -- and hermit's do -- they will NOT appear below, and *"
+    echo "  * any containers that DO appear are probably not the runners.   *"
+    echo "  * RE-RUN WITH sudo BEFORE BELIEVING ANY ANSWER HERE.            *"
+    echo "  ****************************************************************"
+fi
 if [[ ${#ALL[@]} -eq 0 ]]; then
-    line "no running containers visible to this user -- if the runners are root-owned, re-run with sudo"
+    line "no running containers visible to this user"
 fi
 
 # Identify which containers are actually running a GitHub Actions runner.
