@@ -534,19 +534,42 @@ mod tests {
             .expect("DBT comparison must build ComparisonOptions");
         let block = &options[..options.find("\n        },").expect("options block end")];
 
-        let envelope = block
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("record_envelope:"))
-            .map(|value| value.trim().trim_end_matches(',').to_string())
-            .expect(
-                "the DBT comparison must state its record envelope; an unnamed selection is \
-                 exactly the undisclosed filtering the envelope exists to prevent",
-            );
+        let record_envelope_literal = || {
+            block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("record_envelope:"))
+                .map(|value| value.trim().trim_end_matches(',').to_string())
+                .expect(
+                    "the DBT comparison must state its record envelope; an unnamed selection \
+                     is exactly the undisclosed filtering the envelope exists to prevent",
+                )
+        };
         assert_eq!(
-            envelope, "RecordEnvelope::all_records_v1()",
+            record_envelope_literal(),
+            "RecordEnvelope::all_records_v1()",
             "the DBT adapter compares every decoded evidence record. Changing this envelope \
              changes which records are compared, so update the adapter and its evidence \
              together, not just this literal"
+        );
+        // Naming the envelope is worth nothing if the adapter filters the log
+        // on its way in: the verdict would publish `all_records_v1` over an
+        // already-stripped stream, which is exactly the undisclosed filtering
+        // this envelope exists to prevent. `write_canonical_info_with_filter`
+        // invites that at a backend boundary, so pin the unfiltered call.
+        let materialize = source
+            .find("fn materialize_dbt_comparison_log")
+            .expect("DBT comparison log materialization");
+        let body = &source[materialize..];
+        let body = &body[..body.find("\n}\n").expect("materialization body end")];
+        assert!(
+            body.contains("detcore::logdiff::write_canonical_info(path, &mut std::io::sink())"),
+            "the DBT comparison log must be materialized unfiltered; filtering here would \
+             contradict the envelope the verdict publishes"
+        );
+        assert!(
+            !body.contains("write_canonical_info_with_filter"),
+            "filtering at the DBT boundary while the verdict names all_records_v1 publishes a \
+             policy that was not applied"
         );
         // Bind the literal above to the real policy, so renaming the
         // constructor without preserving its meaning fails here too.

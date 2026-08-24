@@ -843,9 +843,19 @@ pub(super) fn run_dbt(
             // Every decoded evidence record is compared, which is what this
             // adapter already did before the envelope was disclosed. Naming it
             // changes no record selection; it states the selection in the
-            // verdict rather than leaving it implicit. Excluding the
-            // transport's own records here would be a filtering change and
-            // needs its own evidence, not a rename.
+            // verdict rather than leaving it implicit.
+            //
+            // The transport does put records about itself in this stream:
+            // `evidence_emit_image_initialization` (reverie-dbt
+            // native/client.c:863) emits one
+            // `INFO reverie_dbt::evidence: protected evidence initialized`
+            // per admitted image, and its `evidence_log_level < 3` guard is
+            // open at the verification default of INFO. They are a compile-time
+            // constant string sent once per sender, so they compare equal
+            // between two runs of a single-process guest. Excluding them is
+            // therefore a separable change, not a prerequisite: it would alter
+            // which records this adapter compares, and it needs its own
+            // evidence about multi-process arrival order, which is host order.
             record_envelope: RecordEnvelope::all_records_v1(),
         },
     )?;
