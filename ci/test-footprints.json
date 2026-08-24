@@ -602,6 +602,15 @@
       "paths": [
         "scripts/check-portable-paths.sh"
       ]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
+      "nodes": [
+        "check.dagrun_naming"
+      ],
+      "paths": [
+        "scripts/check-dagrun-naming.sh"
+      ]
     }
   ],
   "force_full": [

@@ -246,6 +246,11 @@
       "_why": "Standalone checks map to their own portable DAG node.",
       "paths": ["scripts/check-portable-paths.sh"],
       "nodes": ["check.portability_paths"]
+    },
+    {
+      "_why": "Standalone checks map to their own portable DAG node.",
+      "paths": ["scripts/check-dagrun-naming.sh"],
+      "nodes": ["check.dagrun_naming"]
     }
   ]
 }

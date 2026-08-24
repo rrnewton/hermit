@@ -13,7 +13,7 @@
 //!
 //! # Contract
 //!
-//! * **Everything runs as a `safe-ci-dag-runner` node.** Preflight, the manifest
+//! * **Everything runs as a `dagrun` node.** Preflight, the manifest
 //!   gate, every CI-lane node, and every compatibility probe. The driver makes
 //!   exactly one kind of call — `run_dag_boxed_deadline` (unbounded when no
 //!   whole-run budget is supplied) — and never spawns a gate itself. See
@@ -45,7 +45,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! safe-ci-dag-runner = { path = "../agent-utils/rs/dagrun", package = "dagrun" }
+//! dagrun = { path = "../agent-utils/rs/dagrun" }
 //! serde_json = "1"
 //! libc = "0.2"
 //! ```
@@ -91,19 +91,19 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
-use safe_ci_dag_runner::cgroup::aggregate_slice_max_cpus;
-use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::model::DagConfig;
-use safe_ci_dag_runner::model::RunResult;
-use safe_ci_dag_runner::model::Step;
-use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::container_core_budget;
-use safe_ci_dag_runner::perflog::append_step_profiles;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
-use safe_ci_dag_runner::scheduler::steps_violating_run_timeout;
-use safe_ci_dag_runner::scheduler::BoxedCgroups;
-use safe_ci_dag_runner::scheduler::monotonic_now_ns;
-use safe_ci_dag_runner::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
+use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::cgroup::is_in_scope;
+use dagrun::model::DagConfig;
+use dagrun::model::RunResult;
+use dagrun::model::Step;
+use dagrun::model::StepOutcome;
+use dagrun::container_core_budget;
+use dagrun::perflog::append_step_profiles;
+use dagrun::scheduler::run_dag_boxed_deadline;
+use dagrun::scheduler::steps_violating_run_timeout;
+use dagrun::scheduler::BoxedCgroups;
+use dagrun::scheduler::monotonic_now_ns;
+use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 
 use validate_plan::CompatMode;
 
@@ -299,7 +299,7 @@ fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
      \n\
      Run Hermit's local validation suite. Every gate executes as a boxed\n\
-     safe-ci-dag-runner DAG node; nothing runs outside the runner.\n\
+     dagrun DAG node; nothing runs outside the runner.\n\
      \n\
      Levels:\n\
      \x20 quick            Core ptrace run/verify/record smoke tests; no alternate backends.\n\
@@ -640,7 +640,7 @@ fn nested_scope_probe_step(
     cmd: String,
     mode: Option<&str>,
     timeout_s: i64,
-) -> safe_ci_dag_runner::model::Step {
+) -> dagrun::model::Step {
     let mut step = step_with_caps(
         "safe_ci_scope_self_test", job, "Exercise nested per-step cgroup containment",
         cmd, Vec::new(), timeout_s, timeout_s, 512 * 1024 * 1024,
@@ -648,7 +648,7 @@ fn nested_scope_probe_step(
     if let Some(mode) = mode {
         step.env.insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
     }
-    step.env.insert("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS".into(), "1".into());
+    step.env.insert("DAGRUN_NO_STEP_LOGS".into(), "1".into());
     step.hint.preferred_inner_jobs = Some(1);
     step.jobs_flag = Some(String::new());
     step
@@ -679,7 +679,7 @@ fn scheduler_cpu_budget() -> i64 {
 
 fn run_one_nested_scope_probe_step(
     cgroups: BoxedCgroups,
-    step: safe_ci_dag_runner::model::Step,
+    step: dagrun::model::Step,
     run_timeout_s: i64,
 ) -> Result<(), String> {
     let mut cfg = DagConfig::default();
@@ -701,7 +701,7 @@ fn run_one_nested_scope_probe_step(
 
 fn run_one_nested_scope_signal_step(
     cgroups: BoxedCgroups,
-    step: safe_ci_dag_runner::model::Step,
+    step: dagrun::model::Step,
     run_timeout_s: i64,
 ) -> Result<(), String> {
     let mut cfg = DagConfig::default();
@@ -810,12 +810,12 @@ fn nested_scope_self_test() -> Result<String, String> {
         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
         .arg(exe).arg("--self-test")
         .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_OUTER)
-        .env("SAFE_CI_FORCE_SCOPE_ATTEMPT", "1")
-        .env("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", "1")
-        .env_remove("SAFE_CI_IN_SCOPE")
-        .env_remove("SAFE_CI_SCOPE_UNIT")
-        .env_remove("SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES")
-        .env_remove("SAFE_CI_EXPECTED_RUNTIME_MAX_SEC")
+        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+        .env("DAGRUN_NO_STEP_LOGS", "1")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_SCOPE_UNIT")
+        .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
         .output()
         .map_err(|error| format!("cannot launch bounded nested scope self-test: {error}"))?;
     if !output.status.success() {
@@ -1051,7 +1051,7 @@ fn self_test() -> Result<(), String> {
     }
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
-        || cold_compat.hint.classification != safe_ci_dag_runner::model::StepClass::CpuBound
+        || cold_compat.hint.classification != dagrun::model::StepClass::CpuBound
     {
         return Err("cold strict-compat release build lost its declared eight-job width".into());
     }
@@ -1060,7 +1060,7 @@ fn self_test() -> Result<(), String> {
         "/tmp/target/ci/hermit-strict",
     );
     if reused_compat.hint.preferred_inner_jobs.is_some()
-        || reused_compat.hint.classification != safe_ci_dag_runner::model::StepClass::Light
+        || reused_compat.hint.classification != dagrun::model::StepClass::Light
         || !reused_compat.cmd.starts_with("test -x ")
     {
         return Err("prebuilt strict-compat path stopped being a lightweight existence check".into());
@@ -2194,7 +2194,7 @@ fn super_plan_bracket() -> Result<(), String> {
     }
     // Negative: one node with no caps must be REFUSED by the same audit.
     let mut broken = validate_plan::config_from(
-        vec![safe_ci_dag_runner::model::Step {
+        vec![dagrun::model::Step {
             group: "bracket".into(),
             job: "uncapped".into(),
             desc: "inert fixture: declares no caps".into(),
@@ -2988,7 +2988,7 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
 /// particular, preserving their node identity keeps environmental retry and
 /// precise failure attribution working exactly as before.
 fn attach_compatibility_scorecard(
-    steps: &mut Vec<safe_ci_dag_runner::model::Step>,
+    steps: &mut Vec<dagrun::model::Step>,
     lanes: &[&str],
 ) -> Result<(), String> {
     let mut deps = Vec::new();
@@ -3025,7 +3025,7 @@ fn attach_compatibility_scorecard(
 fn nextest_setup_node(
     root: &Path,
     gate: &str,
-) -> Result<safe_ci_dag_runner::model::Step, String> {
+) -> Result<dagrun::model::Step, String> {
     validate_plan::lane_nodes(root, "portable", "", gate)?
         .into_iter()
         .find(|step| step.tag() == "setup.nextest")
@@ -3452,7 +3452,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
 fn super_plan(
     root: &Path,
     tmp: &Path,
-    pre: Vec<safe_ci_dag_runner::model::Step>,
+    pre: Vec<dagrun::model::Step>,
     gate: &str,
 ) -> Result<Plan, String> {
     let gates = validate_super::load_gates(root)?;
@@ -3572,10 +3572,10 @@ enum SelectDecision {
 /// authority. Producer reuse happens once, after unknown-tag validation, so it
 /// covers both dependency-closed subsets and fail-safe full-lane fallbacks.
 fn apply_selective_decision(
-    all: Vec<safe_ci_dag_runner::model::Step>,
+    all: Vec<dagrun::model::Step>,
     total: usize,
     decision: SelectDecision,
-) -> Result<Vec<safe_ci_dag_runner::model::Step>, String> {
+) -> Result<Vec<dagrun::model::Step>, String> {
     let mut steps = match decision {
         SelectDecision::Skip => {
             println!(
@@ -3678,7 +3678,7 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
 fn selective_plan(
     root: &Path,
     args: &Args,
-    pre: Vec<safe_ci_dag_runner::model::Step>,
+    pre: Vec<dagrun::model::Step>,
     gate: &str,
     shallow: bool,
 ) -> Result<Plan, String> {
@@ -3863,7 +3863,7 @@ fn dedupe_identical(steps: &mut Vec<Step>, gate_dep: &str) -> Result<Vec<String>
     }
 
     // Fail closed on a cycle. Nothing downstream detects one: neither
-    // `scripts/validate.rs` nor `safe-ci-dag-runner` topologically checks the
+    // `scripts/validate.rs` nor `dagrun` topologically checks the
     // graph, so a cycle would present as nodes that silently never run -- the
     // same "56 skipped" shape this function just stopped producing, but with no
     // failing node to name. Since unioning dependencies is precisely the
@@ -3923,7 +3923,7 @@ fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
 /// and flush its profile row.
 const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;
 
-fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model::Step {
+fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
         "cargo build --release -p hermit --features third-party-backends".to_string()
@@ -3949,13 +3949,13 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> safe_ci_dag_runner::model
         // 420s and timed out before finishing at be4c0905. The full profile's
         // established eight-job release build completed in 80s on the same
         // host. Declare that width here instead of widening any timeout.
-        step.hint.classification = safe_ci_dag_runner::model::StepClass::CpuBound;
+        step.hint.classification = dagrun::model::StepClass::CpuBound;
         step.hint.preferred_inner_jobs = Some(8);
     }
     step
 }
 
-fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> safe_ci_dag_runner::model::Step {
+fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
@@ -3967,7 +3967,7 @@ fn prepare_fixtures_node_dep(
     _tag: &str,
     fixtures: &Path,
     dep: &str,
-) -> safe_ci_dag_runner::model::Step {
+) -> dagrun::model::Step {
     step_with_caps(
         "compatprep",
         "fixtures",
@@ -3985,7 +3985,7 @@ fn prepare_fixtures_node_dep(
 
 /// `require_e9patch_artifacts`' files-only NSS fixture (validate.sh:4095): keeps
 /// host identity-daemon races out of the e9patch compatibility measurement.
-fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
+fn nsswitch_fixture_node(path: &Path) -> dagrun::model::Step {
     let entries = [
         "aliases", "automount", "ethers", "group", "gshadow", "hosts", "initgroups", "netgroup",
         "netmasks", "networks", "passwd", "protocols", "publickey", "rpc", "services", "shadow",
@@ -4009,7 +4009,7 @@ fn nsswitch_fixture_node(path: &Path) -> safe_ci_dag_runner::model::Step {
     )
 }
 
-fn shard_node(gate: &str, lane: &str, nodes: &str) -> safe_ci_dag_runner::model::Step {
+fn shard_node(gate: &str, lane: &str, nodes: &str) -> dagrun::model::Step {
     step_with_caps(
         "shard",
         &validate_plan::sanitize_job(&format!("{lane}_{}", nodes.replace([',', '.'], "_"))),
@@ -4035,8 +4035,8 @@ fn step_with_caps(
     timeout: i64,
     cpu_timeout: i64,
     mem: i64,
-) -> safe_ci_dag_runner::model::Step {
-    safe_ci_dag_runner::model::Step {
+) -> dagrun::model::Step {
+    dagrun::model::Step {
         group: group.into(),
         job: job.into(),
         desc: desc.into(),
@@ -4044,7 +4044,7 @@ fn step_with_caps(
         cmd,
         deps,
         env: BTreeMap::new(),
-        hint: safe_ci_dag_runner::model::ResourceHint {
+        hint: dagrun::model::ResourceHint {
             rss_baseline_bytes: Some(mem),
             hard_mem_max_bytes: Some(mem),
             ..Default::default()
@@ -4066,7 +4066,7 @@ fn step_with_caps(
 
 /// Per-node cost table, built entirely from typed `StepOutcome` fields.
 fn print_cost_table(outcomes: &[StepOutcome], skipped: &[String]) {
-    println!("\n=== per-node cost (safe-ci-dag-runner) ===");
+    println!("\n=== per-node cost (dagrun) ===");
     println!("{:<44} {:>9}  {:<8} {}", "node", "seconds", "status", "reason/returncode");
     println!("{}", "-".repeat(84));
     let mut total = 0.0_f64;
@@ -4665,7 +4665,7 @@ fn retry_steps_with_satisfied_prerequisites(
     cfg: &DagConfig,
     by_tag: &BTreeMap<String, StepOutcome>,
     mut keep: BTreeSet<String>,
-) -> Vec<safe_ci_dag_runner::model::Step> {
+) -> Vec<dagrun::model::Step> {
     loop {
         let remove: Vec<String> = cfg
             .steps
@@ -4725,7 +4725,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     };
     let mut intentional_skip = step("intentional_skip", "exit 99");
     intentional_skip.skip_reason = Some(
-        safe_ci_dag_runner::model::IntentionalSkipReason::EmptyManifestBucket,
+        dagrun::model::IntentionalSkipReason::EmptyManifestBucket,
     );
 
     // A complete runnable plan plus a typed intentional skip is complete and
@@ -5709,7 +5709,7 @@ const CPU_BUDGET_REASON_PREFIX: &str = "CPU-TIMEOUT >";
 /// Was this node killed by its wall or CPU budget?
 ///
 /// WHY THIS IS NOT A SUBSTRING TEST, which is what it used to be. `reason` is a
-/// closed set produced by `safe_ci_dag_runner::model::step_failure_reason`, and
+/// closed set produced by `dagrun::model::step_failure_reason`, and
 /// one member of that set reads:
 ///
 ///   `received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded`
@@ -5744,7 +5744,7 @@ fn reason_is_budget_breach(reason: &str) -> bool {
 /// cpu_timed_out`. Nothing here hardcodes a message, so a reworded reason does
 /// not silently drift past the predicate — it fails here instead.
 fn budget_reason_bracket() -> Result<String, String> {
-    use safe_ci_dag_runner::model::step_failure_reason;
+    use dagrun::model::step_failure_reason;
     // (label, returncode, oomed, timed_out, pids_tripped, detail_failure, cpu_timed_out)
     let cases: &[(&str, Option<i64>, bool, bool, bool, bool, bool)] = &[
         ("wall budget", None, false, true, false, false, false),

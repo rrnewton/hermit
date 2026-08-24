@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use safe_ci_dag_runner::cgroup::CgroupManager;
-use safe_ci_dag_runner::cgroup::Cgroups;
-use safe_ci_dag_runner::cgroup::ContainmentProof;
-use safe_ci_dag_runner::cgroup::attempt_scope_reexec;
-use safe_ci_dag_runner::cgroup::expected_outer_memory_max_bytes;
-use safe_ci_dag_runner::cgroup::expected_scope_runtime_max_s;
-use safe_ci_dag_runner::cgroup::install_scope_teardown;
-use safe_ci_dag_runner::cgroup::is_in_scope;
-use safe_ci_dag_runner::cgroup::verify_scope_runtime_max;
-use safe_ci_dag_runner::scheduler::BoxedCgroups;
+use dagrun::cgroup::CgroupManager;
+use dagrun::cgroup::Cgroups;
+use dagrun::cgroup::ContainmentProof;
+use dagrun::cgroup::attempt_scope_reexec;
+use dagrun::cgroup::expected_outer_memory_max_bytes;
+use dagrun::cgroup::expected_scope_runtime_max_s;
+use dagrun::cgroup::install_scope_teardown;
+use dagrun::cgroup::is_in_scope;
+use dagrun::cgroup::verify_scope_runtime_max;
+use dagrun::scheduler::BoxedCgroups;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopeRequirement {

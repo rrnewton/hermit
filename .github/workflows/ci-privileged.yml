@@ -99,7 +99,7 @@ jobs:
     # target/debug/test-harness asserts this workflow contains exactly one continue-on-error line (the
     # occasional-KVM one), so a second would fail the DAG correspondence audit.
     #
-    # Answers a question that has been ASSUMED for weeks rather than measured. safe-ci-dag-runner
+    # Answers a question that has been ASSUMED for weeks rather than measured. dagrun
     # skips cgroup boxing whenever $CI or $GITHUB_ACTIONS is set: cgroup.rs reexec_in_scope returns
     # its SUCCESS value without entering a scope, and the real capability probe sits after that
     # early return, so it never executes on a runner. This lane therefore selects
@@ -130,7 +130,7 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 720s env SAFE_CI_DAG_RUNNER=agent-utils/py/bin/safe-ci-dag-runner ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 720s env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true

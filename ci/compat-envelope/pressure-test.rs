@@ -4,7 +4,7 @@
 //! ```cargo
 //! [dependencies]
 //! csv = "1"
-//! safe-ci-dag-runner = { path = "../../agent-utils/rs/dagrun", package = "dagrun" }
+//! dagrun = { path = "../../agent-utils/rs/dagrun" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! ```
@@ -30,21 +30,21 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use safe_ci_dag_runner::io::dag_from_json;
-use safe_ci_dag_runner::io::dag_to_json;
-use safe_ci_dag_runner::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
-use safe_ci_dag_runner::model::DagConfig;
-use safe_ci_dag_runner::model::ResourceHint;
-use safe_ci_dag_runner::model::RunResult;
-use safe_ci_dag_runner::model::Step;
-use safe_ci_dag_runner::model::StepClass;
-use safe_ci_dag_runner::model::StepOutcome;
-use safe_ci_dag_runner::model::effective_cpu_count;
-use safe_ci_dag_runner::model::effective_cpu_timeout;
-use safe_ci_dag_runner::cgroup::aggregate_slice_max_cpus;
-use safe_ci_dag_runner::container_core_budget;
-use safe_ci_dag_runner::scheduler::BoxedCgroups;
-use safe_ci_dag_runner::scheduler::run_dag_boxed_deadline;
+use dagrun::io::dag_from_json;
+use dagrun::io::dag_to_json;
+use dagrun::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
+use dagrun::model::DagConfig;
+use dagrun::model::ResourceHint;
+use dagrun::model::RunResult;
+use dagrun::model::Step;
+use dagrun::model::StepClass;
+use dagrun::model::StepOutcome;
+use dagrun::model::effective_cpu_count;
+use dagrun::model::effective_cpu_timeout;
+use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::container_core_budget;
+use dagrun::scheduler::BoxedCgroups;
+use dagrun::scheduler::run_dag_boxed_deadline;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -108,7 +108,7 @@ fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
 }
 
 fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String> {
-    let already_in_scope = safe_ci_dag_runner::cgroup::is_in_scope();
+    let already_in_scope = dagrun::cgroup::is_in_scope();
     let inherited_marker = env::var(PRESSURE_SCOPE_TIMEOUT_ENV)
         .ok()
         .and_then(|value| value.parse::<i64>().ok());
@@ -686,7 +686,7 @@ impl FreshCheckout {
             )?;
             for required in [
                 "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+                "agent-utils/rs/dagrun/Cargo.toml",
             ] {
                 if !checkout.path.join(required).is_file() {
                     return Err(format!(
@@ -4639,7 +4639,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot write generated-checkout fixture ignore rule: {e}"))?;
     for required in [
         "ci/compat-envelope/pressure-test.rs",
-        "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+        "agent-utils/rs/dagrun/Cargo.toml",
     ] {
         let path = clone_source.join(required);
         fs::create_dir_all(path.parent().expect("required fixture path has parent"))
@@ -4656,7 +4656,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 ".gitignore",
                 "tracked",
                 "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/safe-ci-dag-runner/Cargo.toml",
+                "agent-utils/rs/dagrun/Cargo.toml",
             ])
             .current_dir(&clone_source),
         "stage no-hardlinks clone fixture",

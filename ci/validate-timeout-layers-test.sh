@@ -14,10 +14,10 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-runner=${SAFE_CI_DAG_RUNNER_BIN:-$ROOT_DIR/agent-utils/rs/target/debug/safe-ci-dag-runner}
+runner=${DAGRUN_BIN:-$ROOT_DIR/agent-utils/rs/target/debug/dagrun}
 if [[ ! -x $runner ]]; then
     cargo build --manifest-path agent-utils/rs/Cargo.toml \
-        -p safe-ci-dag-runner --bin safe-ci-dag-runner
+        -p dagrun --bin dagrun
 fi
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/validate-timeout-layers.XXXXXX")

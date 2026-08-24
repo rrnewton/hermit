@@ -245,9 +245,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # run-node.sh now executes nodes THROUGH safe-ci-dag-runner (not a jq+bash
+      # run-node.sh now executes nodes THROUGH dagrun (not a jq+bash
       # shim), so the tracked runner submodule must be present in this job too.
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       # check.script_sigpipe COMPILES all fifteen tracked rust-scripts, and the
       # workflow-wide RUSTFLAGS link them with `-llzma` (Hermit's own build needs
@@ -314,7 +314,7 @@ jobs:
       e2e_count: ${{ steps.cells.outputs.count }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - uses: actions/setup-go@v5
         with:
@@ -500,7 +500,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - uses: actions/setup-go@v5
         with:
@@ -578,7 +578,7 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - uses: Swatinem/rust-cache@v2
         with:
@@ -603,7 +603,7 @@ jobs:
       #
       # Compiling the driver instead of installing the interpreter is not an
       # option here: validate.rs carries an embedded `//! ```cargo` manifest and
-      # depends on `safe_ci_dag_runner` from the agent-utils submodule, so plain
+      # depends on `dagrun` from the agent-utils submodule, so plain
       # `rustc` cannot build it the way the check.skill_discovery node builds its
       # std-only script.
       #
@@ -705,7 +705,7 @@ jobs:
       matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - uses: Swatinem/rust-cache@v2
         with:
@@ -795,7 +795,7 @@ jobs:
       E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slug }}
     steps:
       - uses: actions/checkout@v4
-      - name: Initialize safe-ci-dag-runner submodule
+      - name: Initialize dagrun submodule
         run: git submodule update --init agent-utils
       - name: Dependencies
         run: |
