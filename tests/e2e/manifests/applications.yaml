@@ -322,6 +322,9 @@ test:
           native: Fixed content, identities, timestamps, and configuration make the repository transaction deterministic by construction
       verify:
         ci: true
+        # Bash may inspect inherited PWD before this script can cd, and Git
+        # discovers repositories through cwd ancestors. Start in private /tmp.
+        workdir: /tmp
         backends_enabled:
           - ptrace
         backends_disabled:
