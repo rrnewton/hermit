@@ -1392,7 +1392,7 @@ backends_enabled = []
         let spec = parse_mode(
             r#"
 ci = false
-ci_disabled_reason = "not selected"
+ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
 backends_enabled = ["ptrace"]
 guest_args = { kvm = ["--kvm"] }
 
