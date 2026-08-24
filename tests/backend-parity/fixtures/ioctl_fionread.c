@@ -28,6 +28,19 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "parity_probe.h"
+
+static int get_flags(int fd) {
+#ifdef HERMIT_TEST_FIONREAD_SECOND_GETFL_FAILURE
+    static int calls;
+    if (++calls == 2) {
+        errno = EIO;
+        return -1;
+    }
+#endif
+    return fcntl(fd, F_GETFL);
+}
+
 int main(void) {
     enum { EXPECTED_CHECKS = 6, WROTE_BYTES = 6 };
     int fds[2];
@@ -45,23 +58,33 @@ int main(void) {
     // (1) FIONREAD reports bytes readable; (2) the count equals what we wrote.
     int navail = -1;
     int fionread_ok = ioctl(fds[0], FIONREAD, &navail) == 0;
+    navail = (int)parity_mutate_i64("navail", navail);
+    fionread_ok = (int)parity_mutate_i64("fionread_ok", fionread_ok);
     int navail_exact = navail == WROTE_BYTES;
 
     // (3) FIONBIO sets non-blocking; (4) fcntl F_GETFL reflects O_NONBLOCK.
     int on = 1;
     int fionbio_set = ioctl(fds[0], FIONBIO, &on) == 0;
-    int fl = fcntl(fds[0], F_GETFL);
+    fionbio_set = (int)parity_mutate_i64("fionbio_set", fionbio_set);
+    int fl = get_flags(fds[0]);
     int nonblock_after_set = fl >= 0 && (fl & O_NONBLOCK) ? 1 : 0;
+    nonblock_after_set =
+        (int)parity_mutate_i64("nonblock_after_set", nonblock_after_set);
 
     // (5) FIONBIO clears non-blocking; (6) F_GETFL shows O_NONBLOCK cleared.
     int off = 0;
     int fionbio_clear = ioctl(fds[0], FIONBIO, &off) == 0;
-    fl = fcntl(fds[0], F_GETFL);
+    fionbio_clear = (int)parity_mutate_i64("fionbio_clear", fionbio_clear);
+    fl = get_flags(fds[0]);
     int nonblock_after_clear = fl >= 0 ? ((fl & O_NONBLOCK) != 0) : -1;
 
     close(fds[0]);
     close(fds[1]);
     int clear_readback_ok = fl >= 0;
+    clear_readback_ok =
+        (int)parity_mutate_i64("clear_readback_ok", clear_readback_ok);
+    nonblock_after_clear = (int)parity_mutate_i64(
+        "nonblock_after_clear", nonblock_after_clear);
     int ok = fionread_ok + navail_exact + fionbio_set + nonblock_after_set +
         fionbio_clear + (clear_readback_ok && nonblock_after_clear == 0);
     printf(
