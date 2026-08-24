@@ -939,6 +939,21 @@ pub fn execute_spec(spec: &CellRunSpec, index: &str) -> Result<AttemptResult, St
                             // The process never created a guest.  A report at
                             // this point is stale or otherwise unrelated and
                             // cannot supersede the refusal classification.
+                        } else if report.verdict == "no_result"
+                            && !output.timed_out
+                            && output.status.code().is_some_and(|code| code != 0)
+                        {
+                            // The producer correctly has no comparison to
+                            // report, but an ordinary nonzero process exit is
+                            // still a completed failure rather than unknown
+                            // infrastructure state.
+                            outcome = "FAIL".into();
+                            error_kind = None;
+                            reason = Some(format!(
+                                "{} exited with status {} before producing a terminal comparison",
+                                spec.id.mode,
+                                output.status.code().unwrap()
+                            ));
                         } else if let Err(error) = report.require_canonical_comparison() {
                             outcome = "ERROR".into();
                             error_kind = Some("incomplete-verification-evidence".into());
@@ -2310,6 +2325,76 @@ backends_disabled:
         let chaos = nonzero_with_canonical_receipt("chaos");
         assert_eq!(chaos.outcome, "PASS");
         assert_eq!(chaos.status, Some(7));
+    }
+
+    fn no_result_with_exit_status(status: i32) -> AttemptResult {
+        let dir = std::env::temp_dir().join(format!(
+            "hermit-runner-no-result-bracket-{}-{status}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let verdict = dir.join("verdict.json");
+        let report = serde_json::to_string(&VerificationReport {
+            verified: false,
+            bitwise_parity: false,
+            verdict: "no_result".into(),
+            comparison: None,
+            compared_log_messages: None,
+        })
+        .unwrap();
+        let spec = CellRunSpec {
+            id: CellId {
+                test: "fixture/no-result".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: dir.clone(),
+            env: BTreeMap::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"printf %s "$1" > "$2"; exit "$3""#.into(),
+                "sh".into(),
+                report,
+                verdict.to_string_lossy().into_owned(),
+                status.to_string(),
+            ],
+            guest_argv: vec!["fixture".into()],
+            timeout_seconds: 5,
+            verdict_path: Some(verdict),
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: dir.clone(),
+        };
+        let result = execute_spec(&spec, "1").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn no_result_preserves_the_process_outcome_distinction() {
+        let failed = no_result_with_exit_status(7);
+        assert_eq!(failed.outcome, "FAIL");
+        assert_eq!(failed.error_kind, None);
+        assert_eq!(failed.status, Some(7));
+        assert!(
+            failed
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("before producing a terminal comparison")
+        );
+
+        let unknown = no_result_with_exit_status(0);
+        assert_eq!(unknown.outcome, "ERROR");
+        assert_eq!(
+            unknown.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(unknown.status, Some(0));
     }
 
     #[test]
