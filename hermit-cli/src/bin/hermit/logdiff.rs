@@ -204,18 +204,37 @@ impl LogDiffCLIOpts {
             return self.follow_two_runs(file_b, &options, record_envelope);
         }
 
-        let (summary, records_left, records_right) =
-            match try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!(
-                        "hermit log-diff: could not compare {} and {}: {error}",
-                        self.file_a.display(),
-                        file_b.display()
-                    );
-                    return ExitStatus::Exited(2);
+        let (summary, records_left, records_right) = match try_log_diff_with_records(
+            &self.file_a,
+            file_b,
+            &options,
+            record_envelope,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!(
+                    "hermit log-diff: could not compare {} and {}: {error}",
+                    self.file_a.display(),
+                    file_b.display()
+                );
+                // Replace the pending `no_result` with an explicit refusal.
+                // Leaving the pending report would tell a JSON consumer that
+                // no verdict was reached, which reads as "try again" -- but a
+                // refusal is deterministic and re-running changes nothing.
+                if let Some(path) = &self.json {
+                    let mut report = pending_json_report(&options, record_envelope.policy());
+                    report.verdict = JsonVerdict::Refused;
+                    report.refusal = Some(error.to_string());
+                    if let Err(write_error) = write_json(path, &report) {
+                        eprintln!(
+                            "hermit log-diff: could not record the refusal in {}: {write_error}",
+                            path.display()
+                        );
+                    }
                 }
-            };
+                return ExitStatus::Exited(2);
+            }
+        };
         let records = JsonRecords {
             compared: records_left.min(records_right),
             available_left: records_left,
@@ -467,6 +486,16 @@ fn canonical_comparison_is_unrelaxed(options: &logdiff::LogDiffOpts) -> Result<(
 #[serde(rename_all = "snake_case")]
 enum JsonVerdict {
     NoResult,
+    /// The comparison REFUSED to run -- it did not reach a verdict and it did
+    /// not merely fail to find one.
+    ///
+    /// Distinct from [`Self::NoResult`] on purpose. The JSON is written up front
+    /// as a pending `no_result` so a crash cannot leave a stale report behind,
+    /// which is right; but it meant a caller reading the file could not tell a
+    /// refusal from a legitimate "no verdict reached". They call for different
+    /// actions: `no_result` invites re-running, `refused` says the inputs
+    /// cannot be compared as given and re-running will do the same thing.
+    Refused,
     Matched,
     /// No difference over the records compared so far, with more of at least
     /// one run still unread. This is deliberately *not* `Matched`: a caller who
@@ -512,6 +541,11 @@ struct JsonComparison<'a> {
 #[derive(Serialize)]
 struct JsonReport<'a> {
     verdict: JsonVerdict,
+    /// Why the comparison refused, when `verdict` is `refused`. Absent
+    /// otherwise, so its presence alone distinguishes a refusal from every
+    /// other outcome without parsing the verdict string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
     selected_messages: JsonMessageCounts,
     records: JsonRecords,
     comparison: JsonComparison<'a>,
@@ -558,6 +592,7 @@ fn json_report<'a>(
         .collect();
     JsonReport {
         verdict,
+        refusal: None,
         selected_messages: JsonMessageCounts {
             left: summary.compared_left,
             right: summary.compared_right,
