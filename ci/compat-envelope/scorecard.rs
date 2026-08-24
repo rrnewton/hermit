@@ -105,7 +105,7 @@ struct TrackedCells {
     cells: Vec<TrackedCell>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
@@ -1366,6 +1366,66 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     out.push_str(&format!(
         "  cells with a divergence range   : {observed} of {total}\n"
     ));
+
+    // ⚠️ DISAGREEMENT IS INFORMATION, NOT A COLLISION. Owner ruling. A pressure
+    // test that stresses a cell harder than validate did and reaches a
+    // different result is the system WORKING, so the two provenances are kept
+    // in one array and compared here rather than partitioned into places they
+    // can never meet. Both results and both sample counts are printed, because
+    // "pressure says determinism-failure" means something different at N=1 and
+    // at N=40.
+    let mut conflicts = Vec::new();
+    for cell in &tracked.cells {
+        for tree in cell
+            .observations
+            .iter()
+            .map(|o| o.detcore_tree.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            let at = |p: ObservationProvenance| {
+                cell.observations
+                    .iter()
+                    .find(|o| o.detcore_tree == tree && o.provenance == p)
+            };
+            let (Some(pressure), Some(validate)) = (
+                at(ObservationProvenance::PressureTest),
+                at(ObservationProvenance::Validate),
+            ) else {
+                continue;
+            };
+            if pressure.results != validate.results {
+                conflicts.push((display_id(&cell.id), tree.clone(), pressure, validate));
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        out.push_str(&format!(
+            concat!(
+                "\n  !! {} cell(s) where PRESSURE AND VALIDATE DISAGREE at the same tree.\n",
+                "      This is a finding, not an error: the pressure test may simply have\n",
+                "      stressed the cell harder. Read both results with their sample counts.\n",
+            ),
+            conflicts.len()
+        ));
+        for (id, tree, pressure, validate) in conflicts {
+            let n = |o: &Observation| {
+                o.first_divergent_record
+                    .or(o.first_divergent_scheduler_turn)
+                    .map(|r| r.samples)
+                    .unwrap_or(0)
+            };
+            out.push_str(&format!(
+                "      {id} @ tree {}\n         pressure: {:?} (positions from {} run(s), {} invocation(s))\n         validate: {:?} (positions from {} run(s), {} invocation(s))\n",
+                &tree[..12.min(tree.len())],
+                pressure.results,
+                n(pressure),
+                pressure.invocations.len(),
+                validate.results,
+                n(validate),
+                validate.invocations.len(),
+            ));
+        }
+    }
     if stale_observations > 0 {
         out.push_str(&format!(
             "      {stale_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
@@ -1401,13 +1461,28 @@ fn merge_range(range: &mut Option<ObservedRange>, value: Option<u64>) {
     }
 }
 
+/// What a fold admitted and what it refused, so the caller can report both.
+///
+/// `skipped` is carried out rather than logged in place because a fold that
+/// drops rows silently is strictly worse than one that refuses everything: the
+/// caller cannot then tell a thin batch from a broken one.
+struct FoldOutcome {
+    /// Distinct cells that received an observation.
+    cells: usize,
+    /// Rows admitted, which exceeds `cells` when a campaign repeated a cell.
+    rows: usize,
+    /// (cell identity, joined reasons) for every row that marked itself
+    /// untrustworthy.
+    skipped: Vec<(String, String)>,
+}
+
 fn apply_pressure_summary(
     tracked: &mut TrackedCells,
     summary: &PressureSummary,
     head: &str,
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
-) -> Result<usize, String> {
+) -> Result<FoldOutcome, String> {
     if summary.schema != PRESSURE_SUMMARY_SCHEMA {
         return Err(format!(
             "unsupported pressure summary schema {}",
@@ -1441,44 +1516,82 @@ fn apply_pressure_summary(
     }
 
     let mut seen = BTreeSet::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     let mut prepared = Vec::new();
     for row in &summary.rows {
         // Keyed on (cell, repetition): repeats of one cell are the POINT of a
         // stress campaign, while two rows claiming the same repetition are
         // still a malformed summary that would double-count.
         if !seen.insert((row.cell.clone(), row.repetition)) {
-            return Err(format!(
-                "pressure summary contains duplicate cell {} at repetition {:?}",
+            skipped.push((
                 display_id(&row.cell),
-                row.repetition
+                format!("duplicate row for repetition {:?}", row.repetition),
             ));
+            continue;
         }
+        // OPTION B: a row that marks ITSELF untrustworthy is SKIPPED AND NAMED
+        // rather than vetoing the whole summary.
+        //
+        // WHAT THIS GIVES UP, stated plainly because it is a real trade. The
+        // old behaviour incidentally protected against a SYSTEMIC fault that
+        // damaged some rows detectably and others subtly: the detectable ones
+        // vetoed everything, including the quietly-wrong survivors. That
+        // protection was never targeted -- it fired by coincidence and it
+        // equally voided perfectly good batches, measured at 0 rows admitted
+        // from 20 on a real campaign of which 3 were sound.
+        //
+        // WHAT IT DOES NOT GIVE UP: a row whose artifacts are present but WRONG
+        // was admitted under the old behaviour too, because it sets no
+        // evidence_errors. B does not widen that surface at all.
+        //
+        // The systemic case is handled by LOUDNESS instead of by veto: the
+        // caller prints every skipped cell with its reasons and both counts, so
+        // a batch that skipped 17 of 20 is impossible to mistake for a thin one
+        // and an operator can discard it. Silence here would be strictly worse
+        // than the old veto, which is why `skipped` is reported and never
+        // swallowed.
+        //
+        // Deliberately placed BEFORE the structural checks below: a row with no
+        // readable result row cannot also be expected to carry a well-formed
+        // invocation, and reporting the downstream complaint would bury the
+        // actual cause.
         if !row.evidence_errors.is_empty() {
-            return Err(format!(
-                "pressure summary contains untrustworthy evidence for {}: {}",
-                display_id(&row.cell),
-                row.evidence_errors.join("; ")
-            ));
+            skipped.push((display_id(&row.cell), row.evidence_errors.join("; ")));
+            continue;
         }
         let Some(index) = positions.get(&row.cell).copied() else {
-            return Err(format!(
-                "pressure summary contains unknown cell {}",
-                display_id(&row.cell)
+            skipped.push((
+                display_id(&row.cell),
+                "not a cell in the tracked manifest".to_string(),
             ));
+            continue;
         };
-        if tracked.cells[index].status != CellStatus::Red {
-            return Err(format!(
-                "pressure summary contains green regression cell {}; ordinary validate owns green evidence",
-                display_id(&row.cell)
+        // REFUSAL REMOVED BY OWNER RULING. This used to refuse any row whose
+        // cell was green, on the grounds that "ordinary validate owns green
+        // evidence". Two things were wrong with it. It made the producer and
+        // consumer contradict each other outright -- `--repetitions` only
+        // repeats GREEN cells, so the one command that can produce a
+        // multi-sample range emitted a summary this function rejected on its
+        // first row. And it treated a pressure result that disagrees with
+        // validate as a collision to be prevented, when it is the most
+        // interesting thing the pressure test can produce: stressing a cell
+        // harder and finding it red where validate called it green is the
+        // system working. Disagreement is surfaced by `show` instead of being
+        // refused here.
+        let result = match ObservedResult::parse(&row.result) {
+            Ok(result) => result,
+            Err(why) => {
+                skipped.push((display_id(&row.cell), why));
+                continue;
+            }
+        };
+        let Some(invocation) = row.invocation.clone() else {
+            skipped.push((
+                display_id(&row.cell),
+                "no literal invocation recorded".to_string(),
             ));
-        }
-        let result = ObservedResult::parse(&row.result)?;
-        let invocation = row.invocation.clone().ok_or_else(|| {
-            format!(
-                "pressure summary contains no invocation for {}",
-                display_id(&row.cell)
-            )
-        })?;
+            continue;
+        };
         if invocation.run_id.trim().is_empty()
             || invocation.argv.is_empty()
             || invocation.guest_argv.is_empty()
@@ -1507,10 +1620,13 @@ fn apply_pressure_summary(
                     || attempt.shell_command != invocation.shell_command
             })
         {
-            return Err(format!(
-                "pressure summary contains an incomplete invocation for {}",
-                display_id(&row.cell)
+            skipped.push((
+                display_id(&row.cell),
+                "incomplete invocation: a field is empty, or shell_command does not \
+                 reconstruct from cwd, env and argv"
+                    .to_string(),
             ));
+            continue;
         }
         let turn = row
             .verification
@@ -1531,10 +1647,11 @@ fn apply_pressure_summary(
         if !result.carries_divergence_position()
             && (turn.is_some() || virtual_nanoseconds.is_some())
         {
-            return Err(format!(
-                "non-divergence result for {} carries a divergence position",
-                display_id(&row.cell)
+            skipped.push((
+                display_id(&row.cell),
+                format!("result {} carries a divergence position", row.result),
             ));
+            continue;
         }
         prepared.push((
             index,
@@ -1547,6 +1664,30 @@ fn apply_pressure_summary(
         ));
     }
 
+    // ALL-SKIPPED IS A FAILURE, NOT A QUIET SUCCESS. A batch where every row
+    // was untrustworthy tells you nothing about any cell, and returning Ok(0)
+    // would let a caller print a cheerful "merged 0" that reads as "nothing to
+    // do". The error names every skipped cell, so the refusal carries the same
+    // detail the success path would have.
+    if prepared.is_empty() && !skipped.is_empty() {
+        return Err(format!(
+            "every one of the {} offered row(s) was untrustworthy, so nothing was merged:\n{}",
+            skipped.len(),
+            skipped
+                .iter()
+                .map(|(cell, why)| format!("  {cell}: {why}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    // Distinct from the case above: a summary that OFFERED nothing is a
+    // different fault from one whose every row failed, and conflating them
+    // would hide an empty campaign behind an evidence complaint.
+    if prepared.is_empty() && skipped.is_empty() {
+        return Err("pressure summary contains no rows to merge".into());
+    }
+
+    let prepared_len = prepared.len();
     for (index, result, turn, virtual_nanoseconds, divergent_record, divergent_syscall, invocation) in
         prepared
     {
@@ -1611,13 +1752,17 @@ fn apply_pressure_summary(
                 .then(left.provenance.cmp(&right.provenance))
         });
     }
-    // DISTINCT CELLS, not rows. `seen` is keyed on (cell, repetition) now, so
-    // its length is the number of runs folded; the caller reports cells.
-    Ok(seen
-        .iter()
-        .map(|(cell, _)| cell)
-        .collect::<BTreeSet<_>>()
-        .len())
+    // DISTINCT CELLS, not rows. `seen` is keyed on (cell, repetition), so its
+    // length is the number of runs folded; the caller reports cells.
+    Ok(FoldOutcome {
+        cells: seen
+            .iter()
+            .map(|(cell, _)| cell)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        rows: prepared_len,
+        skipped,
+    })
 }
 
 /// Classify one validate row into the observed-result taxonomy.
@@ -1867,12 +2012,22 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
         );
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
-    let updated = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
+    let outcome = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
-        "compatibility scorecard: merged pressure observations for {updated} red cell(s) at {head}"
+        "compatibility scorecard: merged {} row(s) across {} cell(s) at {head}; {} row(s) skipped",
+        outcome.rows,
+        outcome.cells,
+        outcome.skipped.len()
     );
+    // NAMED INDIVIDUALLY, NEVER JUST COUNTED. A fold that drops rows silently
+    // is worse than one that refuses everything, because the caller cannot then
+    // tell a thin batch from a broken one. A high skip ratio here is the signal
+    // that something systemic went wrong with the campaign.
+    for (cell, why) in &outcome.skipped {
+        println!("  skipped {cell}: {why}");
+    }
     Ok(())
 }
 
@@ -2808,10 +2963,87 @@ fn self_test() -> Result<(), String> {
     if apply_pressure_summary(&mut refusal_target, &infrastructure, "sha-1", "tree-1", &depth_fixture).is_ok() {
         return Err("infrastructure failure was stored as product behavior".into());
     }
+    // ⚠️ THE HEADLINE PROPERTY, OWNER RULING: A BATCH OF N CELLS HAS EXACTLY THE
+    // SAME EFFECT AS N SEPARATE SINGLE-CELL RUNS. Cells have nothing to do with
+    // each other, so one bad row must affect its own cell and nothing else.
+    // Asserted by CONSTRUCTION rather than by inspection: fold one three-row
+    // batch containing a poisoned row, fold the same rows as three separate
+    // single-row summaries, and require the two tracked files to be EQUAL.
+    // Anything that entangles rows -- a whole-fold veto, shared mutable state,
+    // order dependence -- makes these diverge.
+    let poisoned = PressureSummaryRow {
+        evidence_errors: vec!["fixture missing".into()],
+        ..pressure_row("determinism-failure", Some(11), Some(110))
+    };
+    let batch_rows = vec![
+        pressure_repeat(1, "determinism-failure", Some(20), Some(500)),
+        poisoned.clone(),
+        pressure_repeat(2, "replay-failure", Some(30), Some(1000)),
+    ];
+    let mut batched = observed.clone();
+    let batch_outcome = apply_pressure_summary(
+        &mut batched,
+        &pressure_summary("sha-1", "tree-1", batch_rows.clone()),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("batch-equivalence bracket failed on the batch: {e}"))?;
+    let mut singly = observed.clone();
+    let mut singly_skipped = 0usize;
+    for row in batch_rows {
+        match apply_pressure_summary(
+            &mut singly,
+            &pressure_summary("sha-1", "tree-1", vec![row]),
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+        ) {
+            Ok(one) => {
+                if !one.skipped.is_empty() {
+                    singly_skipped += one.skipped.len();
+                }
+            }
+            // A single-row summary whose only row is poisoned is all-skipped,
+            // which is correctly an error. It must still leave the tracked file
+            // untouched, which is what the equality below proves.
+            Err(_) => singly_skipped += 1,
+        }
+    }
+    if batched.cells != singly.cells {
+        return Err(
+            "a batch of rows did not have the same effect as the same rows folded singly".into(),
+        );
+    }
+    if batch_outcome.skipped.len() != singly_skipped || batch_outcome.skipped.len() != 1 {
+        return Err(format!(
+            "batch and single folds disagreed on skipped rows ({} vs {})",
+            batch_outcome.skipped.len(),
+            singly_skipped
+        ));
+    }
+    if batch_outcome.rows != 2 {
+        return Err(format!(
+            "the two sound rows were not both admitted (rows={})",
+            batch_outcome.rows
+        ));
+    }
+
+    // OWNER RULING: A GREEN CELL IS ADMISSIBLE. This bracket used to assert the
+    // opposite. The refusal made the producer and consumer contradict each
+    // other -- `--repetitions` only repeats GREEN cells -- and it suppressed
+    // the most informative thing a pressure test can report: stressing a cell
+    // harder than validate did and finding it red.
     let mut green_target = observed.clone();
     green_target.cells[0].status = CellStatus::Green;
-    if apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture).is_ok() {
-        return Err("periodic pressure evidence was allowed to rewrite a green cell".into());
+    let green_outcome =
+        apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture)
+            .map_err(|e| format!("green-cell admission bracket failed: {e}"))?;
+    if green_outcome.rows != 1 || !green_outcome.skipped.is_empty() {
+        return Err("a green cell was not admitted on equal terms with a red one".into());
+    }
+    if green_target.cells[0].status != CellStatus::Green {
+        return Err("folding pressure evidence changed a cell's status".into());
     }
 
     let native = ResultRow {
@@ -2857,7 +3089,7 @@ fn self_test() -> Result<(), String> {
         return Err("non-native result without a backend was accepted".into());
     }
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, validate-observation, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
