@@ -6,7 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! THE BEHAVIOURAL BRACKET for the determinized `chown` family (#1849).
+//! THE BEHAVIOURAL BRACKET for the determinized `chown` family: issue #1849,
+//! implemented by PR #1851 (https://github.com/rrnewton/hermit/pull/1851). The
+//! audit markers in the product source cite the PR; prose here cites the issue
+//! that describes the defect.
 //!
 //! The unit tests in `detcore::syscall_classification` pin which syscalls are
 //! in the ownership-change set. They cannot see what the dispatch arm returns:
@@ -21,8 +24,12 @@
 //! * the argument half — `ENOENT`, `EBADF`, `ENOTDIR` and the `fchownat` flag
 //!   `EINVAL` still reach the guest, so an arm that returns an unconditional
 //!   `Ok(0)` fails here;
-//! * the side-effect boundary — host ownership, set-id mode bits, and ctime
-//!   remain unchanged, so a "validator" that reissues `chown(-1, -1)` fails.
+//! * the side-effect boundary, which cuts both ways — host *ownership* must be
+//!   unchanged, because the identity half is emulated rather than forwarded;
+//!   but the *metadata consequence* Linux attaches to a successful chown must
+//!   happen, so set-id bits are cleared and ctime moves. An implementation
+//!   that mutates ownership fails the first, and one that skips setattr
+//!   entirely fails the second.
 //!   Metadata virtualization is disabled for this guest so the ctime assertion
 //!   observes the host value instead of comparing two canonical epochs.
 //!
