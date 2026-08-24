@@ -21,6 +21,35 @@ pub struct VerificationReport {
 pub struct ComparisonReport {
     pub strictness: String,
     pub compare_logs: bool,
+    /// REQUIRED, and deliberately so: do not add `#[serde(default)]`.
+    ///
+    /// This field exists to make record selection disclosed, so that a filter
+    /// cannot remove records while the comparison still looks unfiltered.
+    /// Giving it a default would supply the disclosure on the producer's behalf
+    /// — undisclosed selection reported as if it had been stated, which is the
+    /// exact failure the envelope was introduced to prevent. There is also no
+    /// honest value to default to: `all_records_v1` would admit an unstated
+    /// selection as canonical, and `caller_defined` would label a producer that
+    /// said nothing as having said something.
+    ///
+    /// It is consumed only as an admission-gate input, by `is_canonical()` in
+    /// [`VerificationReport::require_canonical_comparison`]. A report that never
+    /// stated its envelope has not supplied admissible canonical evidence, so
+    /// refusing it is the correct answer rather than a strictness accident.
+    ///
+    /// This is NOT the same situation as `comparison` above, which is
+    /// present-but-nullable. There, `null` is a documented producer state and
+    /// treating it as malformed reported a fault against the reader. Here,
+    /// absence is not a producer state of any hermit that emits envelopes; it
+    /// means an older binary — reachable through `HERMIT_BIN` — whose record
+    /// selection is genuinely unknown. Note that the two go opposite ways for
+    /// the same underlying reason: `present_but_nullable_comparison` exists to
+    /// REMOVE serde's default leniency, not to add it.
+    ///
+    /// The refusal names this field, and
+    /// `comparison_record_envelope_is_required_and_unknown_values_are_refused`
+    /// asserts that it does, so an operator can distinguish a producer that
+    /// predates the envelope from a corrupt report.
     pub record_envelope: RecordEnvelopeReport,
 }
 
@@ -274,7 +303,19 @@ mod tests {
             "comparison": {"strictness": "canonical", "compare_logs": true},
             "compared_log_messages": {"left": 1, "right": 1}
         });
-        assert!(VerificationReport::from_json_value(missing).is_err());
+        let error = VerificationReport::from_json_value(missing)
+            .expect_err("a comparison that never states its record envelope is not admissible")
+            .to_string();
+        // The runner surfaces this verbatim as "verification report is
+        // unreadable: {error}". Refusing is only useful if the operator can
+        // tell WHICH producer contract was unmet -- an old binary that predates
+        // the field looks identical to a corrupt file unless the message names
+        // it. Assert the naming rather than trusting serde to keep doing it.
+        assert!(
+            error.contains("record_envelope"),
+            "the refusal must name the missing field so an operator can tell a producer that \
+             predates the envelope from a corrupt report; got: {error}"
+        );
 
         let unknown = serde_json::json!({
             "verified": true,
