@@ -15,6 +15,30 @@ pub struct VerificationReport {
     #[serde(deserialize_with = "present_but_nullable_comparison")]
     pub comparison: Option<ComparisonReport>,
     pub compared_log_messages: Option<ComparedLogMessages>,
+    /// WHERE the divergence began, in scheduler-turn units. `None` when the
+    /// logs matched, when no comparison ran, or when the report predates the
+    /// field.
+    ///
+    /// `#[serde(default)]` is deliberate here and is the OPPOSITE choice from
+    /// `ComparisonReport::record_envelope` above. That field is an admission
+    /// gate, so a missing value must never be supplied on the producer's
+    /// behalf. This one is a diagnostic position: absent means "not located",
+    /// which is exactly what `None` says. Requiring it would turn every
+    /// retained pre-field report into an unreadable-report ERROR and
+    /// misclassify old evidence as an infrastructure fault -- the same trap
+    /// documented on `comparison` just above.
+    #[serde(default)]
+    pub first_divergent_scheduler_turn: Option<u64>,
+    /// WHERE the divergence began, in virtual-nanosecond units. Same
+    /// tolerant-default rationale as the field above.
+    ///
+    /// NOTE both of these are the position of the PRECEDING scheduler COMMIT,
+    /// so when no COMMIT precedes the differing record they collapse to the
+    /// origin and bound the divergence rather than locating it. The record
+    /// index that locates it exactly is a separate field being added by
+    /// hermit#2386; this struct will gain it when that lands.
+    #[serde(default)]
+    pub first_divergent_virtual_nanoseconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -180,6 +204,66 @@ impl VerificationReport {
 mod tests {
     use super::*;
 
+    /// The divergence position must survive the parse. It was already being
+    /// emitted by hermit and already present in the retained report string, but
+    /// this struct dropped it, so no cell could ever report where its
+    /// divergence began.
+    #[test]
+    fn divergence_position_survives_the_parse() {
+        let json = br#"{"verified":false,"bitwise_parity":false,"verdict":"diverged",
+            "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":180,"right":180},
+            "first_divergent_scheduler_turn":4,
+            "first_divergent_virtual_nanoseconds":1767225600002825515}"#;
+        let report = VerificationReport::from_json_slice(json).expect("diverged report parses");
+        assert_eq!(report.first_divergent_scheduler_turn, Some(4));
+        assert_eq!(
+            report.first_divergent_virtual_nanoseconds,
+            Some(1_767_225_600_002_825_515)
+        );
+    }
+
+    /// An EARLIER divergence must report a SMALLER value in both units. This is
+    /// the ordering the whole metric rests on: a fix that moves the divergence
+    /// later has to be visible as a larger number, and a regression as a
+    /// smaller one. Both figures below were measured with `hermit log-diff
+    /// --json` against one real 131-line INFO log, diverged at two different
+    /// depths -- after COMMIT turn 4 and after COMMIT turn 1.
+    #[test]
+    fn an_earlier_divergence_reports_a_smaller_position() {
+        let parse = |turn: u64, nanos: u64| {
+            let json = format!(
+                r#"{{"verified":false,"bitwise_parity":false,"verdict":"diverged",
+                    "comparison":{{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"}},"compared_log_messages":{{"left":180,"right":180}},
+                    "first_divergent_scheduler_turn":{turn},
+                    "first_divergent_virtual_nanoseconds":{nanos}}}"#
+            );
+            VerificationReport::from_json_slice(json.as_bytes()).expect("report parses")
+        };
+        let late = parse(4, 1_767_225_600_002_825_515);
+        let early = parse(1, 1_767_225_600_000_500_000);
+        assert!(
+            early.first_divergent_scheduler_turn < late.first_divergent_scheduler_turn,
+            "an earlier divergence must order before a later one in scheduler turns"
+        );
+        assert!(
+            early.first_divergent_virtual_nanoseconds < late.first_divergent_virtual_nanoseconds,
+            "and in virtual nanoseconds"
+        );
+    }
+
+    /// A report written before the field existed must still parse. Requiring it
+    /// would reclassify every retained pre-field report as an unreadable-report
+    /// infrastructure fault.
+    #[test]
+    fn a_report_without_the_divergence_position_still_parses() {
+        let json = br#"{"verified":true,"bitwise_parity":true,"verdict":"matched",
+            "comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":180,"right":180}}"#;
+        let report = VerificationReport::from_json_slice(json);
+        let report = report.expect("a pre-field report is not malformed");
+        assert_eq!(report.first_divergent_scheduler_turn, None);
+        assert_eq!(report.first_divergent_virtual_nanoseconds, None);
+    }
+
     fn report(strictness: &str, compare_logs: bool, left: u64, right: u64) -> VerificationReport {
         VerificationReport {
             verified: true,
@@ -191,6 +275,8 @@ mod tests {
                 record_envelope: RecordEnvelopeReport::AllRecordsV1,
             }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
         }
     }
 
