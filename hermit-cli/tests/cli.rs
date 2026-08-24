@@ -563,7 +563,20 @@ fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
     let program = dbt_unsupported_syscall_guest()
         .to_str()
         .expect("unsupported-syscall guest path should be UTF-8");
-    let args = ["--log", "info", "run", "--verify", "--", program];
+    // `--allow-unsupported-syscalls` is REQUIRED here now. Forwarding is no
+    // longer what an ordinary run does, and this test is about the AGGREGATION
+    // contract -- exactly one re-emitted warning -- which only has meaning on a
+    // run that forwards and therefore survives to warn. The default is bracketed
+    // separately below rather than by weakening this assertion.
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        program,
+    ];
     let output = hermit(&args);
     assert_success(&output, &args);
     let warning = "syscalls restart_syscall used but not yet supported";
@@ -573,6 +586,35 @@ fn run_ptrace_verify_reemits_unsupported_syscall_warning() {
         "ptrace verify did not re-emit exactly one aggregate warning:\n{}",
         stderr(&output)
     );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-2357): Review the default unsupported-syscall refusal on ptrace.
+/// The new fail-closed default, bracketed on PTRACE and in the DEFAULT build.
+///
+/// The equivalent bracket added beside the DBT aggregation test only runs with
+/// `--features third-party-backends`, so without this one the default that this
+/// change exists to establish is unchecked in the build everyone compiles.
+/// ptrace is the default backend, so this invocation names no backend at all --
+/// it is what an ordinary user runs.
+#[test]
+fn run_ptrace_refuses_unsupported_syscalls_by_default() {
+    let program = dbt_unsupported_syscall_guest()
+        .to_str()
+        .expect("unsupported-syscall guest path should be UTF-8");
+    let args = ["run", "--", program];
+    let output = hermit(&args);
+    assert!(
+        !output.status.success(),
+        "an ordinary ptrace run must refuse an unsupported syscall by default:\n{}",
+        stderr(&output)
+    );
+
+    // The same invocation with the opt-out succeeds, so the refusal is
+    // attributable to the default and not to the guest simply being broken.
+    let allowed_args = ["run", "--allow-unsupported-syscalls", "--", program];
+    let allowed = hermit(&allowed_args);
+    assert_success(&allowed, &allowed_args);
 }
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review DBT normal aggregation and strict failure coverage.

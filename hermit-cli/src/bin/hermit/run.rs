@@ -727,6 +727,17 @@ impl fmt::Display for RunOpts {
         // Write the rest of the flags from the Config itself:
         write!(f, "{}", dop)?;
 
+        // Rendered AFTER `dop` because it is the opt-out from a default, not a
+        // Config field: `dop` can only render `--panic-on-unsupported-syscalls`
+        // when the policy is ON, so nothing here would otherwise record that a
+        // run turned it OFF. Since refusing is the default, omitting this flag
+        // would make the reproducer re-parse as fail-closed and silently
+        // describe a different run. The two flags are mutually exclusive at the
+        // clap layer, so they never both appear.
+        if self.allow_unsupported_syscalls {
+            write!(f, " --allow-unsupported-syscalls")?;
+        }
+
         write!(
             f,
             " -- {}",
@@ -915,7 +926,10 @@ fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
@@ -924,7 +938,10 @@ fn backend_defaults_to_ptrace() {
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(ro.backend, None);
     assert_eq!(ro.selected_backend(), Backend::Ptrace);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
@@ -941,7 +958,7 @@ fn backend_values_parse_and_round_trip() {
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = format!(" --backend={value} -- fakeprog");
+        let normalized = format!(" --backend={value} --panic-on-unsupported-syscalls -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
 }
@@ -1188,7 +1205,10 @@ fn display_runopts2() {
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
@@ -1206,7 +1226,7 @@ fn display_runopts3() {
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(
         format!("{}", ro),
-        " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 -- fakeprog arg1 arg2"
+        " --no-sequentialize-threads --no-virtualize-metadata --epoch=2000-12-31T23:59:59+00:00 --panic-on-unsupported-syscalls -- fakeprog arg1 arg2"
     );
 }
 
@@ -1215,14 +1235,28 @@ fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1");
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls -- fakeprog arg1"
+    );
 }
 
 #[test]
 fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls() {
+    // RE-POINTED, NOT DELETED. This assertion read `!...` and was the test that
+    // pinned the old forwarding default -- exactly the value this change flips.
+    // Deleting it would remove the only unit-level statement of what a plain
+    // run does with an unsupported syscall, so it is inverted and kept, and the
+    // opt-out case below preserves a case that still asserts `false`, so the
+    // pair cannot both be satisfied by a constant.
     let mut normal = RunOpts::parse_from(["fakehermit", "fakeprog"]);
     normal.validate_args_with_perf_support(true).unwrap();
-    assert!(!normal.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
+
+    let mut opted_out =
+        RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
+    opted_out.validate_args_with_perf_support(true).unwrap();
+    assert!(!opted_out.det_opts.det_config.panic_on_unsupported_syscalls);
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     strict.validate_args_with_perf_support(true).unwrap();
@@ -1237,6 +1271,100 @@ fn strict_flag_preserves_deterministic_defaults_and_rejects_unsupported_syscalls
     );
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-2357): Review fail-closed precedence for programmatic RunOpts.
+/// An explicit request for refusal outranks the opt-out when clap is bypassed.
+///
+/// This is the test that makes the `self.strict ||` and
+/// `config.panic_on_unsupported_syscalls ||` terms live. Through clap they
+/// cannot be reached, so without this they would be untestable dead code and
+/// the honest options would be deletion or an unverified comment. A `RunOpts`
+/// built in code reaches the same method with no conflict checking, and there
+/// the terms choose between refusing and forwarding.
+#[test]
+fn explicit_fail_closed_outranks_the_opt_out_when_clap_is_bypassed() {
+    let mut strict_and_allow = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    strict_and_allow.strict = true;
+    strict_and_allow.allow_unsupported_syscalls = true;
+    strict_and_allow
+        .validate_args_with_perf_support(true)
+        .unwrap();
+    assert!(
+        strict_and_allow
+            .det_opts
+            .det_config
+            .panic_on_unsupported_syscalls
+    );
+
+    let mut requested_and_allow = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    requested_and_allow.allow_unsupported_syscalls = true;
+    requested_and_allow
+        .det_opts
+        .det_config
+        .panic_on_unsupported_syscalls = true;
+    requested_and_allow
+        .validate_args_with_perf_support(true)
+        .unwrap();
+    assert!(
+        requested_and_allow
+            .det_opts
+            .det_config
+            .panic_on_unsupported_syscalls
+    );
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-2357): Review the opt-out's mutual exclusion with fail-closed flags.
+/// The clap conflicts the reasoning above depends on are real, not assumed.
+#[test]
+fn the_opt_out_conflicts_with_both_fail_closed_flags_at_the_clap_layer() {
+    for other in ["--strict", "--panic-on-unsupported-syscalls"] {
+        assert!(
+            RunOpts::try_parse_from([
+                "fakehermit",
+                "--allow-unsupported-syscalls",
+                other,
+                "fakeprog",
+            ])
+            .is_err(),
+            "clap accepted --allow-unsupported-syscalls together with {other}"
+        );
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-2357): Review round-trip fidelity of the unsupported-syscall opt-out.
+/// The rendered command line is a reproducer, so the opt-out must survive it.
+///
+/// Refusing is now the default, so a rendered line that omits
+/// `--allow-unsupported-syscalls` re-parses as fail-closed. Rendering the
+/// opt-out is therefore not cosmetic: without it, opting out prints a line
+/// whose behaviour differs from the run that printed it, and the difference is
+/// silent. Asserting the RE-PARSED CONFIG rather than only the string is what
+/// makes this test discriminate.
+#[test]
+fn allow_unsupported_syscalls_survives_the_rendered_reproducer() {
+    let mut opted_out =
+        RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
+    opted_out.validate_args_with_perf_support(true).unwrap();
+    assert!(!opted_out.det_opts.det_config.panic_on_unsupported_syscalls);
+
+    let rendered = format!("{}", opted_out);
+    assert_eq!(rendered, " --allow-unsupported-syscalls -- fakeprog");
+
+    let words = shell_words::split(&rendered).expect("rendered line is valid shell");
+    let mut argv = vec![String::from("fakehermit")];
+    argv.extend(words);
+    let mut reparsed = RunOpts::parse_from(&argv);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert!(
+        !reparsed.det_opts.det_config.panic_on_unsupported_syscalls,
+        "rendered reproducer {rendered:?} re-parsed as fail-closed, so it does \
+         not reproduce the run that printed it"
+    );
+    assert_eq!(format!("{}", reparsed), rendered);
+}
+
 #[test]
 fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
     let default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
@@ -1245,16 +1373,40 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--panic-on-rbc-overshoot", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert!(opts.det_opts.det_config.panic_on_rcb_overshoot);
-    assert_eq!(format!("{}", opts), " --panic-on-rbc-overshoot -- fakeprog");
+    assert_eq!(
+        format!("{}", opts),
+        " --panic-on-unsupported-syscalls --panic-on-rbc-overshoot -- fakeprog"
+    );
 }
 
 #[test]
 fn passthru_optimization_requires_explicit_opt_in() {
-    let mut ro = RunOpts::parse_from(["fakehermit", "--passthru-opt", "fakeprog"]);
+    // `--passthru-opt` now REQUIRES the opt-out. It forwards syscalls without
+    // deterministic handling, which is precisely what fail-closed refuses, and
+    // fail-closed is the default -- so the flag that used to be legal alone is
+    // now half of a rejected combination (see
+    // `passthru_optimization_rejects_fail_closed_modes`). This test still
+    // asserts what its name says, that passthru is off until asked for; the
+    // second flag is what asking for it costs now, not a relaxed assertion.
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--passthru-opt",
+        "--allow-unsupported-syscalls",
+        "fakeprog",
+    ]);
     ro.validate_args_with_perf_support(true).unwrap();
 
     assert!(ro.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", ro), " --passthru-opt -- fakeprog");
+    assert!(!ro.det_opts.det_config.panic_on_unsupported_syscalls);
+    assert_eq!(
+        format!("{}", ro),
+        " --passthru-opt --allow-unsupported-syscalls -- fakeprog"
+    );
+
+    // And passthru is still absent unless asked for.
+    let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    plain.validate_args_with_perf_support(true).unwrap();
+    assert!(!plain.det_opts.det_config.passthru_opt);
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1298,7 +1450,7 @@ fn timeslice_flags_parse_and_round_trip() {
     let rendered = format!("{}", ro);
     assert_eq!(
         rendered,
-        " --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
+        " --panic-on-unsupported-syscalls --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
     );
 
     let mut reparsed_args = vec!["fakehermit".to_owned()];
@@ -1321,7 +1473,10 @@ fn skid_margin_override_parses_and_round_trips() {
     opts.validate_args_with_perf_support(true).unwrap();
 
     assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(format!("{opts}"), " --skid-margin=500 -- fakeprog");
+    assert_eq!(
+        format!("{opts}"),
+        " --skid-margin=500 --panic-on-unsupported-syscalls -- fakeprog"
+    );
 }
 
 #[test]
@@ -1355,7 +1510,7 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
     assert_eq!(opts.skid_margin, Some(500));
     assert_eq!(
         format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
+        " --backend=liteinst --skid-margin=500 --panic-on-unsupported-syscalls -- fakeprog"
     );
 }
 
@@ -1368,7 +1523,10 @@ fn deprecated_preemption_timeout_alias_round_trips_canonically() {
         ro.det_opts.det_config.max_timeslice,
         std::num::NonZeroU64::new(100_000)
     );
-    assert_eq!(format!("{}", ro), " --max-timeslice=100000 -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --panic-on-unsupported-syscalls --max-timeslice=100000 -- fakeprog"
+    );
 }
 
 #[test]
@@ -1379,7 +1537,10 @@ fn deprecated_preemption_timeout_disabled_values_round_trip_canonically() {
         ro.validate_args_with_perf_support(true).unwrap();
 
         assert_eq!(ro.det_opts.det_config.max_timeslice, None);
-        assert_eq!(format!("{}", ro), " --max-timeslice=disabled -- fakeprog");
+        assert_eq!(
+            format!("{}", ro),
+            " --panic-on-unsupported-syscalls --max-timeslice=disabled -- fakeprog"
+        );
     }
 }
 
@@ -1543,7 +1704,7 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     assert!(opts.pin_threads);
     assert_eq!(
         format!("{}", opts),
-        " --network=host --no-namespace --tmp=/tmp -- fakeprog"
+        " --network=host --no-namespace --tmp=/tmp --panic-on-unsupported-syscalls -- fakeprog"
     );
 }
 
@@ -1774,7 +1935,7 @@ fn display_runopts_without_perf_support() {
     ro.validate_args_with_perf_support(false).unwrap();
     assert_eq!(
         format!("{}", ro),
-        " --max-timeslice=disabled -- fakeprog arg1"
+        " --panic-on-unsupported-syscalls --max-timeslice=disabled -- fakeprog arg1"
     );
 }
 
@@ -2315,6 +2476,21 @@ impl RunOpts {
         // exists to exclude it. Written in the same shape as the two lines above
         // so all three defaults read the same way: strict forces it on, and the
         // matching opt-out is the only way off.
+        //
+        // ON THE FIRST TWO TERMS, which look dead and are deliberately kept.
+        // Through clap they ARE unreachable: `allow_unsupported_syscalls`
+        // declares `conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"]`,
+        // so when the opt-out is present both are false, and when it is absent
+        // the third term already forces `true`. But this method is also called
+        // on a `RunOpts` built in code rather than parsed, where clap enforces
+        // nothing, and there the terms decide the result. Keeping them makes an
+        // explicit request for refusal outrank the opt-out, which is the
+        // fail-safe direction; reducing this to `!self.allow_unsupported_syscalls`
+        // would silently forward for such a value. Both terms are executed and
+        // their precedence pinned by
+        // `explicit_fail_closed_outranks_the_opt_out_when_clap_is_bypassed`, and
+        // the clap conflicts themselves by
+        // `the_opt_out_conflicts_with_both_fail_closed_flags_at_the_clap_layer`.
         config.panic_on_unsupported_syscalls =
             self.strict || config.panic_on_unsupported_syscalls || !self.allow_unsupported_syscalls;
         if config.passthru_opt && config.panic_on_unsupported_syscalls {
