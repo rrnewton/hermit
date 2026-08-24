@@ -321,7 +321,150 @@
       "ci_disabled_reason": {
         "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
       },
-      "observations": []
+      "last_tested": {
+        "hermit_sha": "4cd48cbe035d681819a50f4efae3415af6597064",
+        "detcore_tree": "34226bf3aaf149ed604d8d8ef1f23c1e9fd7bdc9",
+        "depth": {
+          "hermit": {
+            "commits": 1932,
+            "first_parent": 1857
+          },
+          "reverie": {
+            "commits": 934,
+            "first_parent": 919
+          }
+        }
+      },
+      "observations": [
+        {
+          "detcore_tree": "34226bf3aaf149ed604d8d8ef1f23c1e9fd7bdc9",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 1932,
+              "first_parent": 1857
+            },
+            "reverie": {
+              "commits": 934,
+              "first_parent": 919
+            }
+          },
+          "hermit_shas": [
+            "4cd48cbe035d681819a50f4efae3415af6597064"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "4cd48cbe035d681819a50f4efae3415af6597064",
+              "run_id": "portable-applications-applications-example-timed-progress-bar-verify-ptrace",
+              "result": "pass",
+              "argv": [
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "ptrace",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                "--env",
+                "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/tmp/hermit-e2e",
+                "--env",
+                "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                "--",
+                "./examples/timed-progress-bar.py"
+              ],
+              "guest_argv": [
+                "./examples/timed-progress-bar.py"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
+              },
+              "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
+              "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "ptrace",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/tmp/hermit-e2e",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                    "--",
+                    "./examples/timed-progress-bar.py"
+                  ],
+                  "guest_argv": [
+                    "./examples/timed-progress-bar.py"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config"
+                  },
+                  "cwd": "/home/newton/work/dev-hermit/worktrees/003/hermit",
+                  "shell_command": "cd /home/newton/work/dev-hermit/worktrees/003/hermit && env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures E2E_TMPDIR=/tmp/hermit-e2e HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config /home/newton/work/dev-hermit/worktrees/003/hermit/target/release/hermit --log info run --base-env=minimal --backend ptrace --strict --verify-strict --verify --verify-json /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-1.json --keep-logs --verify-log-dir /home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/verify-logs/verify-1 --env LC_ALL=C --env TZ=UTC --env HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/home --env XDG_CONFIG_HOME=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/xdg-config --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=/home/newton/work/dev-hermit/worktrees/003/hermit/ignored/compat-envelope/pc-P1/runs/portable-applications-applications-example-timed-progress-bar-verify-ptrace/applications-example-timed-progress-bar-verify-ptrace/fixtures -- ./examples/timed-progress-bar.py"
+                }
+              ]
+            }
+          ],
+          "first_divergent_scheduler_turn": null,
+          "first_divergent_virtual_nanoseconds": null,
+          "first_divergent_record": null,
+          "first_divergent_syscall": null
+        }
+      ]
     },
     {
       "lane": "portable",
