@@ -16,21 +16,31 @@
 //! `verdict: matched, bitwise_parity: true` and printed "Determinism verified",
 //! while the same command with `--detlog-io-buffers` reported `diverged`.
 //!
-//! The coverage fix is `--detlog-io-buffers`. This test guards the other half:
-//! that when content was NOT compared, the verdict says so instead of claiming
-//! determinism outright.
+//! The coverage fix was to make that hashing the DEFAULT rather than an opt-in;
+//! `--no-detlog-io-buffers` now selects the weaker comparison deliberately. This
+//! test guards the other half: that when content was NOT compared, the verdict
+//! says so instead of claiming determinism outright.
 
 use std::path::Path;
 use std::process::Command;
 
 /// Run `/bin/true` under `--verify --verify-strict`, optionally with the
 /// output-buffer hash, and return (stderr, parsed verify JSON).
+///
+/// THE SENSE OF THE FLAG INVERTED, so which branch needs an argument inverted
+/// with it. Buffer hashing is ON BY DEFAULT since the io-buffer default flip,
+/// and the positive `--detlog-io-buffers` spelling no longer parses at all, so
+/// `with_io_buffers == true` is now the plain invocation and it is the FALSE
+/// case that has to ask for the weaker comparison. Every assertion in both
+/// tests below is unchanged; only the way the two cases are selected moved.
+/// The `true` case is now strictly more valuable than before, because it
+/// exercises the configuration an ordinary user actually gets.
 fn verify(with_io_buffers: bool) -> (String, serde_json::Value) {
     let json = tempfile::NamedTempFile::new().expect("temp file");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command.args(["run", "--strict", "--verify", "--verify-strict"]);
-    if with_io_buffers {
-        command.arg("--detlog-io-buffers");
+    if !with_io_buffers {
+        command.arg("--no-detlog-io-buffers");
     }
     command
         .arg("--verify-json")
