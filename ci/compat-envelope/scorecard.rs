@@ -35,7 +35,7 @@ const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 6;
-const PRESSURE_SUMMARY_SCHEMA: u64 = 4;
+const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
@@ -532,6 +532,10 @@ impl ObservedResult {
             "oom" => Ok(Self::Oom),
             "infrastructure-error" => Err(
                 "pressure summary contains an infrastructure error; refusing to store it as product behavior"
+                    .into(),
+            ),
+            "sandbox-denied" => Err(
+                "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
                     .into(),
             ),
             other => Err(format!("unknown pressure result `{other}`")),
@@ -1310,7 +1314,7 @@ struct RetainedDecision {
 
 enum ImportEvidence {
     Retained {
-        results: RetainedCellResults,
+        results: Box<RetainedCellResults>,
         store_positions: bool,
     },
     None,
@@ -2723,7 +2727,7 @@ fn apply_pressure_summary(
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
 ) -> Result<FoldOutcome, String> {
-    if summary.schema != PRESSURE_SUMMARY_SCHEMA {
+    if !matches!(summary.schema, 4 | PRESSURE_SUMMARY_SCHEMA) {
         return Err(format!(
             "unsupported pressure summary schema {}",
             summary.schema
@@ -4942,7 +4946,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -4965,7 +4969,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -4977,7 +4981,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5000,7 +5004,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5015,7 +5019,7 @@ fn retained_coordinate_decision(
             return RetainedDecision {
                 state: RetainedComparisonState::Uncheckable,
                 import: ImportEvidence::Retained {
-                    results: retained,
+                    results: Box::new(retained),
                     store_positions: false,
                 },
                 retained_coordinates,
@@ -5041,7 +5045,7 @@ fn retained_coordinate_decision(
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: false,
             },
             retained_coordinates,
@@ -5055,7 +5059,7 @@ fn retained_coordinate_decision(
         RetainedDecision {
             state: RetainedComparisonState::Fresh,
             import: ImportEvidence::Retained {
-                results: retained,
+                results: Box::new(retained),
                 store_positions: true,
             },
             retained_coordinates,
@@ -5787,9 +5791,7 @@ red/`measured-and-passed` count is **0**.",
     ) || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
-        return Err(
-            "status prose and tables did not use the same manifest-disabled count".into(),
-        );
+        return Err("status prose and tables did not use the same manifest-disabled count".into());
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
@@ -6056,6 +6058,22 @@ red/`measured-and-passed` count is **0**.",
             "reapplying one pressure summary after a write/read round trip duplicated coordinates"
                 .into(),
         );
+    }
+    let sandbox_denied = pressure_summary(
+        "sha-1",
+        "tree-1",
+        vec![pressure_row("sandbox-denied", None, None)],
+    );
+    if apply_pressure_summary(
+        &mut observed,
+        &sandbox_denied,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .is_ok()
+    {
+        return Err("sandbox-denied pressure output was stored as product behavior".into());
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(
