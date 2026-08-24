@@ -179,5 +179,118 @@ else
     line "A 'perf not installed' line means the preconditions above are all you have."
 fi
 
+# ------------------------------- Q5: WHY is perf refused, if it is refused? ---
+# Q4 answers "did `perf stat` exit 0". That is NOT the same question as "can
+# hermit count branches", and the first probe run conflated them. Two reasons:
+#
+#   1. Q4 discards perf's stderr and reports only COUNTED/REFUSED from the exit
+#      status. A perf binary that is simply the wrong version for the running
+#      kernel, or an event name the PMU does not expose, exits nonzero and reads
+#      as "REFUSED" -- which sounds like a permission denial and is not one.
+#   2. NOTHING IN HERMIT RUNS THE `perf` TOOL. reverie calls perf_event_open(2)
+#      directly (reverie-ptrace/src/perf.rs), with exclude_kernel=1 set
+#      explicitly to lower the permission bar. So the only measurement that
+#      settles it is that exact syscall, with those exact attributes.
+#
+# This section makes the syscall itself, twice, and prints the errno by name.
+# The pair is the discriminator -- read the table at the bottom of the output.
+#
+# WHY PYTHON AND NOT rust-script. The repo convention prefers rust-script, but
+# this code has to execute INSIDE whatever the runner container happens to be,
+# where rust-script and cargo are not present and cannot be installed by a
+# read-only probe. python3 is in the runner image, and ctypes needs no compiler
+# and writes no file. If python3 is absent the section says so rather than
+# guessing.
+PERF_PY='
+import ctypes, ctypes.util, platform, struct
+NR = {"x86_64": 298, "aarch64": 241}.get(platform.machine())
+if NR is None:
+    print("arch-unsupported " + platform.machine()); raise SystemExit(0)
+libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+def probe(exclude_kernel):
+    SIZE = 128
+    buf = bytearray(SIZE)
+    struct.pack_into("<IIQQQQQ", buf, 0,
+                     0,                        # type   = PERF_TYPE_HARDWARE
+                     SIZE,                     # size
+                     0,                        # config = PERF_COUNT_HW_INSTRUCTIONS
+                     1 << 60,                  # sample_period (reverie DISABLE_SAMPLE_PERIOD)
+                     0, 0,                     # sample_type, read_format
+                     (1 << 5) if exclude_kernel else 0)   # bit 5 = exclude_kernel
+    cbuf = (ctypes.c_char * SIZE).from_buffer(buf)
+    ctypes.set_errno(0)
+    fd = libc.syscall(ctypes.c_long(NR), ctypes.byref(cbuf),
+                      ctypes.c_long(0),   # pid = 0, this thread
+                      ctypes.c_long(-1),  # cpu = -1, any
+                      ctypes.c_long(-1),  # group_fd
+                      ctypes.c_ulong(8))  # PERF_FLAG_FD_CLOEXEC
+    if fd >= 0:
+        libc.close(ctypes.c_int(fd)); return "OK"
+    import errno as E
+    e = ctypes.get_errno()
+    return E.errorcode.get(e, "errno=%d" % e)
+print("exclude_kernel=1 -> %s   exclude_kernel=0 -> %s" % (probe(True), probe(False)))
+'
+say "Q5. If perf is refused, WHICH mechanism is refusing it?"
+q5_one() {  # $1 = human label, rest = command prefix to run a shell inside the target
+    local label=$1; shift
+    line "$label"
+    line "  user namespace  : $("$@" sh -c 'readlink /proc/self/ns/user' 2>/dev/null)"
+    line "  uid_map         : $("$@" sh -c 'tr "\n" "|" < /proc/self/uid_map' 2>/dev/null)"
+    line "  seccomp         : $("$@" sh -c 'grep -E "^Seccomp" /proc/self/status | tr "\n" " "' 2>/dev/null)"
+    line "  paranoid        : $("$@" sh -c 'cat /proc/sys/kernel/perf_event_paranoid' 2>/dev/null)"
+    line "  lockdown        : $("$@" sh -c 'cat /sys/kernel/security/lockdown 2>/dev/null || echo "(not exposed)"' 2>/dev/null)"
+    line "  PMU event srcs  : $("$@" sh -c 'ls /sys/bus/event_source/devices 2>/dev/null | tr "\n" " " || echo "(none)"' 2>/dev/null)"
+    line "  hypervisor flag : $("$@" sh -c 'grep -qw hypervisor /proc/cpuinfo && echo "PRESENT (this is a VM; vPMU may be absent)" || echo "absent (bare metal)"' 2>/dev/null)"
+    # shellcheck disable=SC2016  # single quotes are deliberate, same reason as Q1:
+    # $(uname -r) and $(perf --version) must expand INSIDE the target, not here.
+    line "  kernel / perf   : $("$@" sh -c 'printf "%s / %s" "$(uname -r)" "$(perf --version 2>/dev/null || echo "perf not installed")"' 2>/dev/null)"
+    line "  perf_event_open : $("$@" python3 -c "$PERF_PY" 2>/dev/null || echo '(python3 unavailable -- cannot make the syscall)')"
+    line "  perf stat stderr: $("$@" sh -c 'command -v perf >/dev/null 2>&1 && (perf stat -e branches true 2>&1 | grep -v "^$" | tail -3 | tr "\n" "|") || echo "(perf not installed)"' 2>/dev/null)"
+}
+line "on the fedora HOST, for comparison:"
+q5_one "  host" env
+if [[ ${#RUNNERS[@]} -eq 0 ]]; then
+    line "no runner containers to compare against"
+else
+    for c in "${RUNNERS[@]}"; do
+        q5_one "inside $c:" "$RT" exec "$c"
+    done
+fi
+say "Q5b. Does the image digest split explain which containers have perf?"
+if [[ ${#RUNNERS[@]} -eq 0 ]]; then
+    line "not applicable -- no runner containers found"
+else
+    line "one row per container, so the correlation is read off the output, not guessed:"
+    for c in "${RUNNERS[@]}"; do
+        iid=$($RT inspect --format '{{.Image}}' "$c" 2>/dev/null)
+        has=$($RT exec "$c" sh -c 'command -v perf >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
+        line "  $c  image=${iid:-?}  perf-installed=${has:-?}"
+    done
+    line "NOTE: ci-hub/runners/Containerfile has NEVER installed perf or linux-tools"
+    line "(checked over its whole git history). So a container that HAS perf did not"
+    line "get it from either image build, and the digest split cannot be the whole story."
+fi
+say "HOW TO READ Q5 -- the pair of perf_event_open results is the discriminator"
+line "exclude_kernel=1 OK,     exclude_kernel=0 EACCES"
+line "     -> NORMAL for perf_event_paranoid=2. Hermit is FINE: reverie sets"
+line "        exclude_kernel=1 (reverie-ptrace/src/perf.rs:222,817). A 'REFUSED'"
+line "        from the perf TOOL alongside this is a tooling artefact, not a"
+line "        capability problem."
+line "BOTH ENOENT / ENODEV / EOPNOTSUPP"
+line "     -> NO PMU IS EXPOSED AT ALL. Cross-check the hypervisor flag and the"
+line "        PMU event-source list above. This is the case that makes the 'pmu'"
+line "        label aspirational, and it is a hardware/vPMU question, not a"
+line "        permissions one."
+line "BOTH EACCES"
+line "     -> a paranoid/capability denial that WOULD break hermit. Check whether"
+line "        'user namespace' inside differs from the host line: a container in"
+line "        its own userns reports CapEff 000001ffffffffff while holding no real"
+line "        capability in the initial namespace, so CapEff alone proves nothing."
+line "BOTH EPERM"
+line "     -> a filter, not the paranoid sysctl. seccomp (check the Seccomp line;"
+line "        --privileged normally sets it to 0) or an LSM/lockdown policy."
+
 say "================ end of probe ================"
 line "Nothing was modified. No images pulled, no containers started or stopped."
