@@ -79,6 +79,7 @@ use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 #[cfg(feature = "dbt")]
 use super::verify::verification_log_level;
+#[cfg(feature = "dbt")]
 use super::verify::write_pending_verification_json;
 #[cfg(feature = "dbt")]
 use super::verify::write_verification_json;
