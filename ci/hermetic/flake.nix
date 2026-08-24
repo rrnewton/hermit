@@ -74,10 +74,38 @@
 
       # Toolchain and native libraries needed to build Hermit and to compile the
       # project's C fixtures INSIDE the root with the pinned compiler.
+      # A NIX IMAGE GIVES YOU PACKAGES AT STORE PATHS AND NO FHS SEARCH PATHS.
+      # That single fact caused three separate build failures here, each hidden
+      # until the one before it was fixed, and it is worth stating once:
+      #
+      #   1. nixpkgs splits these packages. The default output has
+      #      `lib/libunwind-ptrace.so`; the `.pc` file and the headers live in
+      #      `.dev`. With only the default output `ls /lib/libunwind*` looked
+      #      right while `find / -name 'libunwind*.pc'` returned NOTHING.
+      #   2. Adding `.dev` is necessary and NOT sufficient. The `.pc` files then
+      #      exist, at their own store paths, and pkg-config's compiled-in search
+      #      path contains only pkg-config's OWN store path -- so nothing finds
+      #      them. `unwind-sys`'s build script panicked with "The system library
+      #      `libunwind-ptrace` ... was not found". Hence PKG_CONFIG_PATH below.
+      #   3. The C compiler has the same problem independently. With pkg-config
+      #      fixed, reverie-sabre's vendored libelf failed on
+      #      `fatal error: zlib.h: No such file or directory`, because nothing
+      #      populates /usr/include either. Hence CPATH and LIBRARY_PATH below.
+      #
+      # `openssl.dev` was already listed and had defects 2 and 3 the whole time;
+      # it simply was never exercised. Deriving all three paths from ONE list is
+      # what stops the contents and the search paths drifting apart again.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl ];
+
+      # `rust-script` is a BUILD tool here, not a guest. Every entrypoint under
+      # scripts/ and ci/ carries `#!/usr/bin/env -S rust-script --force` -- the
+      # project's own script convention -- so without it the validate entrypoint
+      # itself cannot execute inside the root, which was measured: `command -v
+      # rust-script` returned nothing while python3, make, cargo and gcc all
+      # resolved. Pinned by the same lock as everything else.
       buildTools = with pkgs; [
-        rustToolchain gcc binutils gnumake cmake pkg-config
-        libunwind elfutils zlib openssl.dev
-      ];
+        rustToolchain gcc binutils gnumake cmake pkg-config rust-script
+      ] ++ nativeLibs ++ map (p: p.dev) nativeLibs;
     in
     {
       packages.${system} = {
@@ -110,6 +138,22 @@
               # The run is offline by construction; make a stray fetch fail loudly
               # rather than silently reach a network that a rebuild will not have.
               "CARGO_NET_OFFLINE=true"
+              # WITHOUT THIS, EVERY `.pc` FILE IN THE IMAGE IS UNREACHABLE.
+              # A nix image does not populate /lib/pkgconfig; each package keeps
+              # its own `lib/pkgconfig` under its store path, and pkg-config's
+              # compiled-in search path contains only pkg-config's OWN store
+              # path. Measured 2026-08-24 inside the built image:
+              #   PKG_CONFIG_PATH=<unset>
+              #   pkg-config --variable pc_path pkg-config
+              #     -> /nix/store/...-pkg-config-0.29.2/lib/pkgconfig:.../share/pkgconfig
+              # so `libunwind-ptrace.pc` was present at its store path and still
+              # not findable, and the `unwind-sys` build script panicked. Note
+              # that `openssl.dev` had the same defect and simply was not
+              # exercised -- adding a `.dev` output is necessary and NOT
+              # sufficient; it must also be on the search path.
+              "PKG_CONFIG_PATH=${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs}"
+              "CPATH=${pkgs.lib.makeSearchPathOutput "dev" "include" nativeLibs}"
+              "LIBRARY_PATH=${pkgs.lib.makeLibraryPath nativeLibs}"
             ];
             WorkingDir = "/src";
           };
