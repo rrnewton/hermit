@@ -78,7 +78,12 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         (
             "passthru-opt writev verification",
             false,
-            Some("--passthru-opt"),
+            // --passthru-opt cannot coexist with fail-closed unsupported-syscall
+            // handling, and refusing is now the DEFAULT rather than a strict-mode
+            // extra, so this arm must ask for forwarding explicitly. Without it the
+            // run bails before the guest starts and this test never reaches the
+            // determinism check it exists for.
+            Some(&["--passthru-opt", "--allow-unsupported-syscalls"][..]),
         ),
     ] {
         let mut verify = Command::new("timeout");
@@ -89,8 +94,8 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         if strict {
             verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
         }
-        if let Some(arg) = extra_arg {
-            verify.arg(arg);
+        if let Some(args) = extra_arg {
+            verify.args(args);
         }
         verify.arg("--").arg(&guest);
         let verify_output = command_output(verify, label);
