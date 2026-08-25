@@ -29,6 +29,7 @@ use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
@@ -205,7 +206,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         "Internal violation: pause should never return from the scheduler except by interruption!"
                     )
                 }
-                ResumeStatus::Signaled => Err(reverie::Error::Errno(Errno::EINTR)),
+                ResumeStatus::Signaled(_) => Err(reverie::Error::Errno(Errno::EINTR)),
             }
         } else {
             info!(
@@ -384,17 +385,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
-        if !guest
+        let source = guest.thread_state().dettid;
+        let value = if !guest
             .config()
             .backend_requires_thread_directed_process_signals
         {
-            return Ok(self.record_or_replay(guest, call).await?);
+            self.record_or_replay(guest, call).await?
+        } else {
+            let targeted = syscalls::Tgkill::new()
+                .with_tgid(tgid)
+                .with_tid(tid.as_raw())
+                .with_sig(call.sig());
+            self.record_or_replay(guest, targeted).await?
+        };
+        if tid != source
+            && let Ok(signal) = Signal::try_from(call.sig())
+        {
+            notify_signal_pending(guest, tid, signal).await;
         }
-        let targeted = syscalls::Tgkill::new()
-            .with_tgid(tgid)
-            .with_tid(tid.as_raw())
-            .with_sig(call.sig());
-        Ok(self.record_or_replay(guest, targeted).await?)
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

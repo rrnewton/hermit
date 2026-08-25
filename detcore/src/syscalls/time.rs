@@ -300,7 +300,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
         match resource_request(guest, request).await {
             ResumeStatus::Normal => Ok(0),
-            ResumeStatus::Signaled => {
+            ResumeStatus::Signaled(_) => {
                 let now = thread_observe_time(guest).await;
                 let delta = remaining_sleep_duration(target_time, now);
                 let addr2 = call.rem();
