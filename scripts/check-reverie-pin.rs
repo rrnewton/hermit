@@ -1382,10 +1382,29 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 /// with NO guard at all (10 at default thread count, 20 at `--test-threads=32`)
 /// and failed 0 times.
 ///
-/// So this guard is **hardening against a real non-atomicity, not a reproduced
-/// failure.** It is kept because the two-instant read is genuinely there and a
-/// stricter git would reject it; do not cite it as a fix for observed flakiness
-/// without re-measuring first.
+/// ⚠️ THAT 0-OF-30 IS A REAL OBSERVATION AND THE CONCLUSION DRAWN FROM IT WAS
+/// WRONG. This comment used to say the guard was "hardening against a real
+/// non-atomicity, not a reproduced failure", and told the reader not to cite it
+/// as a fix for observed flakiness. `agent(hermit-001)` took that invitation and
+/// falsified it by mutation -- same box, same minutes, one line changed:
+///
+/// | variant | result |
+/// | --- | --- |
+/// | `under_git_env` made a no-op | **FAILED 9 of 10 runs** |
+/// | head as submitted | **FAILED 0 of 10 runs**, 45/45 every time |
+///
+/// The failing SET varied between runs -- `a_nonempty_unrecognized_cache_is_refused`,
+/// `advisory_case2_bump_all_the_way_is_silent`,
+/// `advisory_case3_bump_short_of_master` -- which is a RACE SIGNATURE, not a
+/// broken assertion. **THIS GUARD FIXES REPRODUCED FLAKINESS. CITE IT AS ONE,
+/// AND DO NOT DELETE IT.**
+///
+/// ⚠️ WHY THE 0-OF-30 MISSED IT, AS FAR AS THE RECORD SUPPORTS: the mutation
+/// ran at LOAD AVERAGE ~39 throughout; the 30x run recorded no load figure. A
+/// race that needs contention does not appear on a quiet box, and raising
+/// `--test-threads` alone did not supply it. AN ABSENCE OF FAILURES AT AN
+/// UNRECORDED LOAD IS NOT EVIDENCE OF ABSENCE -- state the load, or the number
+/// invites exactly the deletion this paragraph now exists to prevent.
 ///
 /// ⚠️ DO NOT NEST. Two read acquisitions on one thread is recursive read
 /// locking, which `std::sync::RwLock` does not promise is safe -- a writer
@@ -3969,8 +3988,12 @@ mod tests {
     /// ran 30 times with no guard at all and failed 0 times. See
     /// [`under_git_env`] for the full table and the positive control.
     ///
-    /// The lock is kept as hardening for the genuine two-instant read, not as a
-    /// fix for observed flakiness.
+    /// ⚠️ AND THE CONCLUSION THAT ONCE FOLLOWED THAT 0-OF-30 IS FALSIFIED.
+    /// Mutating `under_git_env` to a no-op FAILED 9 OF 10 RUNS at load average
+    /// ~39, against 0 of 10 for the head as submitted, with the failing set
+    /// varying between runs. The lock fixes REPRODUCED flakiness; it is not
+    /// speculative hardening, and it must not be deleted as such. See
+    /// [`under_git_env`].
     ///
     /// The write side takes the WRITE lock; the read side is taken by
     /// [`under_git_env`], and readers still run concurrently with each other --
