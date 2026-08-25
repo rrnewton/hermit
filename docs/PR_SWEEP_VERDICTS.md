@@ -179,7 +179,7 @@ Measured cost of getting this wrong: in the 2026-08-25 sweep of hermit's 46 open
 they been auto-classified as absent, 21 verdicts would have been wrong in the
 direction that wastes a receipt and re-lands existing work.
 
-### 6. Backend presence, before you blame a red on the pull request
+### 7. Backend presence, before you blame a red on the pull request
 
 **A red you see while assessing may belong to your box, not to the branch.**
 Backend absence is not reported uniformly, and one form MANUFACTURES failures:
