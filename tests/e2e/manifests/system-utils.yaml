@@ -1777,6 +1777,69 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this entry
           liteinst: No custom edge-case arguments have been calibrated for this entry
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
+  - id: system-utils/nscd-neutralised
+    description: The host nscd socket and cache are hidden from the guest by an empty read-only mount
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    timeout_seconds: 60
+    occasional: false
+    program: tests/e2e/system-utils/nscd-neutralised.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: Natively the control is absent by definition, so this is the cell's RED arm and must not run as a green cell
+        ci_disabled_reason: 'NOT-EXERCISED: running natively removes the control under test; that arm is the demonstrated red, not a passing cell.'
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          kvm: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          sabre: The mount is container setup and backend-independent; ptrace is the canonical required witness
+          liteinst: The mount is container setup and backend-independent; ptrace is the canonical required witness
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The control is established at container setup; the verify cell owns it
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: A container-setup assertion has no scheduling surface for chaos to explore
+          dbt: A container-setup assertion has no scheduling surface for chaos to explore
+          kvm: A container-setup assertion has no scheduling surface for chaos to explore
+          sabre: A container-setup assertion has no scheduling surface for chaos to explore
+          liteinst: A container-setup assertion has no scheduling surface for chaos to explore
+        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify cell owns this contract.'
+      custom:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The verify cell already self-asserts the mount; a custom arm adds no observation
+          dbt: The verify cell already self-asserts the mount; a custom arm adds no observation
+          kvm: The verify cell already self-asserts the mount; a custom arm adds no observation
+          sabre: The verify cell already self-asserts the mount; a custom arm adds no observation
+          liteinst: The verify cell already self-asserts the mount; a custom arm adds no observation
+        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
   - id: system-utils/harness-width-contract
     description: The system-utils bucket runs at the measured deterministic worker width of one
     lane: portable
