@@ -18,6 +18,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
     Stat,
@@ -59,6 +61,7 @@ enum ProcfsKind {
     Fdinfo,
     AioNr,
     AioMaxNr,
+    PipeMaxSize,
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -457,6 +460,12 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
             "/proc/sys/fs/aio-nr" => ProcfsKind::AioNr,
             "/proc/sys/fs/aio-max-nr" => ProcfsKind::AioMaxNr,
+            // The ceiling that decides whether a guest may raise a pipe above
+            // the pinned capacity. Reported raw it is the HOST's sysctl, so a
+            // guest that reads it and acts on it branches on the machine.
+            // Reported as the pinned capacity, it agrees with what
+            // `F_SETPIPE_SZ` actually allows.
+            "/proc/sys/fs/pipe-max-size" => ProcfsKind::PipeMaxSize,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-927): Review host-global PTY count normalization.
             "/proc/sys/kernel/pty/nr" => ProcfsKind::PtyNr,
@@ -704,6 +713,7 @@ impl ProcfsFile {
             ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
             ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
+            ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
@@ -1830,6 +1840,28 @@ fn sanitize_swaps(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-933): Review the /proc/sys/fs/aio-nr policy.
+/// Report the deterministic pipe ceiling rather than the host's sysctl.
+///
+/// `/proc/sys/fs/pipe-max-size` is host-global and commonly differs by a factor
+/// of sixteen between a default host (1048576) and a hardened one (65536). A
+/// guest that reads it branches on the machine it happens to be running on.
+///
+/// The value returned is [`DETERMINISTIC_PIPE_CAPACITY_BYTES`], which is also
+/// the ceiling `F_SETPIPE_SZ` enforces, so what the guest is told and what the
+/// guest is allowed are the same number by construction rather than by two
+/// constants agreeing today.
+///
+/// A file whose contents are not a plain integer is not this sysctl; return
+/// empty rather than inventing a value, matching `sanitize_aio_nr`.
+fn sanitize_pipe_max_size(contents: &[u8]) -> Vec<u8> {
+    let Ok(value) = std::str::from_utf8(contents) else {
+        return Vec::new();
+    };
+    value.trim().parse::<u64>().ok().map_or_else(Vec::new, |_| {
+        format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes()
+    })
+}
+
 fn sanitize_aio_nr(contents: &[u8]) -> Vec<u8> {
     let Ok(value) = std::str::from_utf8(contents) else {
         return Vec::new();
@@ -4702,6 +4734,29 @@ malformed buddy row\n"
             b"0\t0\t45\t0\t0\t0\n"
         );
         assert!(sanitize_dentry_state(b"").is_empty());
+    }
+
+    /// The advertised ceiling must be the ENFORCED ceiling, not the host's.
+    ///
+    /// A default host reports 1048576 and a hardened one 65536 -- a factor of
+    /// sixteen. A guest that reads this and branches on it was branching on the
+    /// machine. Both now read as the pinned capacity, which is the same number
+    /// `F_SETPIPE_SZ` will actually grant.
+    #[test]
+    fn pipe_max_size_reports_the_enforced_ceiling_not_the_host() {
+        let expected = format!("{DETERMINISTIC_PIPE_CAPACITY_BYTES}\n").into_bytes();
+        assert_eq!(sanitize_pipe_max_size(b"1048576\n"), expected);
+        assert_eq!(sanitize_pipe_max_size(b"65536\n"), expected);
+        assert_eq!(sanitize_pipe_max_size(b"4096\n"), expected);
+    }
+
+    /// Contents that are not a plain integer are not this sysctl. Return empty
+    /// rather than inventing a ceiling, matching `sanitize_aio_nr`.
+    #[test]
+    fn pipe_max_size_invents_nothing_from_unparsable_contents() {
+        assert!(sanitize_pipe_max_size(b"").is_empty());
+        assert!(sanitize_pipe_max_size(b"not a number\n").is_empty());
+        assert!(sanitize_pipe_max_size(&[0xff, 0xfe]).is_empty());
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
