@@ -147,6 +147,60 @@ This check has already reversed a published verdict. A draft classified
 because porting it would have REGRESSED current accounting. The symbol verdict
 was right about the past fact and wrong as an action.
 
+Two closed drafts make the failure mode concrete:
+
+- [Hermit #2308](https://github.com/rrnewton/hermit/pull/2308) had exact patch
+  content and symbols absent from `main`, but its keep-going mechanism had been
+  implemented more strongly. The mechanism check therefore found supersession,
+  not a genuinely pending change. The effect check rejected the remaining
+  cumulative `by_tag` closure because it would have replaced newer
+  latest-attempt and unreported-node accounting.
+- [Hermit #2410](https://github.com/rrnewton/hermit/pull/2410) deleted five
+  unchanged demo files and merged cleanly. While the draft sat, commit
+  `be5cc1a79f` added a workflow that executes `demos/05-qemu-busybox.sh` and
+  watches that file, `demos/boot_qemu.sh`, and the two files under
+  `demos/qemu-busybox/**`. Landing the deletion would therefore have left a
+  tracked workflow pointing at missing runtime inputs. The unchanged blobs were
+  not dead weight; they had become load-bearing without changing themselves.
+
+#### Deletions invert the marker test
+
+For an additions-only change, content present on `main` can support an
+already-landed verdict. For a deletions-only change, that same observation
+proves the literal deletion did not land; it does not prove the deletion remains
+safe or valid to land now.
+
+Before accepting a deletion, scan current callers of every removed path or
+interface, including files added after the pull request's base:
+
+```console
+git fetch origin main
+git grep -n -F '<removed path or interface>' origin/main
+git log --oneline "$BASE"..origin/main -- <its callers and containing directory>
+```
+
+A clean merge says Git can perform the deletion. It does not say current code
+can run afterward.
+
+#### A stated prerequisite can become false while the draft waits
+
+Treat every phrase such as "migrated first", "landed separately", "now lives
+at", or "no callers remain" as a live precondition, not historical evidence.
+Verify it against the current remote tree before landing:
+
+```console
+git -C <repository> fetch origin main
+git -C <repository> cat-file -e origin/main:<required-path>
+git -C <repository> show origin/main:<required-path>
+```
+
+For #2410, the description named four replacement paths in `dev-hermit` and
+said they had migrated first. All four were absent from current
+`dev-hermit/main`. That one check independently invalidated the deletion even
+before the new Hermit workflow caller was considered. A prerequisite verified
+when the draft was written can disappear, be renamed, or never land at all;
+re-read it at the landing tip.
+
 ### 6. A symbol absent from BOTH sides means the check cannot speak
 
 ⚠️ **A marker absent at the merge base AND absent on main does not mean unlanded.
@@ -215,7 +269,7 @@ than about the branch or about main.
 | **partial** | mechanism landed, unique content remains | extract the residual; do NOT close |
 | **indeterminate** | rule cannot decide — no extractable symbols, or every symbol pre-existed | human read; do NOT guess |
 | **blocked on a cross-repo dependency** | content and mechanism both absent, but the capability its tests assert has not landed in `reverie` or `agent-utils`, or hermit's pin does not include it | LEAVE OPEN and NAME THE SUCCESSOR; landing it creates a red |
-| **supersede-and-regress** | mechanism landed AND main has moved further in the same files | do NOT port; extract any residual, then close citing the superseding commit |
+| **supersede-and-regress** | landing would weaken newer invariants, remove a current dependency, or rely on a prerequisite that is now false | do NOT port; extract any residual, then close citing the newer mechanism or dependency |
 
 Docs-only and config-only pull requests add no symbols and land in
 **indeterminate** by construction. That is a correct verdict, not a failure of
