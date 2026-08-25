@@ -1222,6 +1222,111 @@ fn tracked_from(
     })
 }
 
+/// Which command is writing, for `enforce_writer_boundary`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Writer {
+    /// `update`: owns the manifest-derived ratchet fields.
+    Update,
+    /// `update-observations` and `observe-results`: own `observations` only.
+    Observations,
+}
+
+/// REFUSE A WRITE THAT CROSSED THE WRITER BOUNDARY.
+///
+/// `cells.json` has two authorities living in one tool, and until this existed
+/// the split was correct only by convention. `update` derives the ratchet from
+/// the manifest and the expected plan; the observation writers merge measured
+/// evidence. Neither may touch the other's fields, and a future edit that
+/// quietly crossed over would corrupt either the ratchet or the evidence with
+/// nothing to catch it.
+///
+/// This compares the file BEFORE and AFTER rather than auditing each mutation
+/// site, so it keeps holding as the code moves. It is deliberately a refusal,
+/// not a warning: a boundary that can be crossed with a printed complaint is
+/// not a boundary.
+fn enforce_writer_boundary(
+    before: &TrackedCells,
+    after: &TrackedCells,
+    writer: Writer,
+) -> Result<(), String> {
+    let index = |cells: &TrackedCells| -> BTreeMap<CellId, TrackedCell> {
+        cells
+            .cells
+            .iter()
+            .map(|cell| (cell.id.clone(), cell.clone()))
+            .collect()
+    };
+    let (old, new) = (index(before), index(after));
+    match writer {
+        Writer::Update => {
+            // `update` legitimately adds and removes cells when the manifest
+            // changes, so only cells present on BOTH sides are compared. What it
+            // must never do is alter measured evidence.
+            for (id, old_cell) in &old {
+                let Some(new_cell) = new.get(id) else { continue };
+                if old_cell.observations != new_cell.observations {
+                    return Err(format!(
+                        "writer boundary violated: `update` changed observations on                          {}/{}/{}. Observations are owned by `update-observations`                          and `observe-results`; `update` may only carry them forward                          verbatim.",
+                        id.test, id.mode, id.backend
+                    ));
+                }
+            }
+            // A cell the manifest has just introduced cannot already carry
+            // evidence; that would mean evidence was invented rather than measured.
+            for (id, new_cell) in &new {
+                if !old.contains_key(id) && !new_cell.observations.is_empty() {
+                    return Err(format!(
+                        "writer boundary violated: `update` created {}/{}/{} already                          carrying observations. A new cell has never been measured.",
+                        id.test, id.mode, id.backend
+                    ));
+                }
+            }
+        }
+        Writer::Observations => {
+            // An observation writer merges evidence into cells that already
+            // exist. It may not change the population, and it may not touch a
+            // single ratchet field.
+            if old.len() != new.len() {
+                return Err(format!(
+                    "writer boundary violated: an observation writer changed the cell                      population from {} to {}. Only `update` may add or remove cells.",
+                    old.len(),
+                    new.len()
+                ));
+            }
+            for (id, old_cell) in &old {
+                let Some(new_cell) = new.get(id) else {
+                    return Err(format!(
+                        "writer boundary violated: an observation writer removed                          {}/{}/{}.",
+                        id.test, id.mode, id.backend
+                    ));
+                };
+                let changed = |field: &str| {
+                    format!(
+                        "writer boundary violated: an observation writer changed `{field}`                          on {}/{}/{}. That field is owned by `update`, which derives it                          from the manifest and the expected plan.",
+                        id.test, id.mode, id.backend
+                    )
+                };
+                if old_cell.enabled != new_cell.enabled {
+                    return Err(changed("enabled"));
+                }
+                if old_cell.status != new_cell.status {
+                    return Err(changed("status"));
+                }
+                if old_cell.ci_disabled_reason != new_cell.ci_disabled_reason {
+                    return Err(changed("ci_disabled_reason"));
+                }
+            }
+        }
+    }
+    if before.schema != after.schema && writer == Writer::Observations {
+        return Err(
+            "writer boundary violated: an observation writer changed the schema version"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     let path = root.join(CELLS);
     if !path.exists() {
@@ -1268,12 +1373,16 @@ fn update_tracked(
     allow_cell_removal: bool,
 ) -> Result<(), String> {
     let derived = derive(root)?;
+    let existing = load_existing(root)?;
     let cells = tracked_from(
         &derived,
-        load_existing(root)?,
+        existing.clone(),
         allow_green_removal,
         allow_cell_removal,
     )?;
+    if let Some(before) = existing.as_ref() {
+        enforce_writer_boundary(before, &cells, Writer::Update)?;
+    }
     fs::write(root.join(SCORECARD), render_scorecard(&derived))
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_cells(&cells)?)
@@ -2022,7 +2131,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         );
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let before = tracked.clone();
     let updated = apply_validate_results(&mut tracked, &rows, &head, &detcore_tree, &depth)?;
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
@@ -2064,7 +2175,9 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
         );
     }
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let before = tracked.clone();
     let outcome = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
+    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     fs::write(root.join(CELLS), encoded_cells(&tracked)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     println!(
@@ -3175,8 +3288,94 @@ fn self_test() -> Result<(), String> {
     if malformed.id().is_some() {
         return Err("non-native result without a backend was accepted".into());
     }
+    // --- writer-boundary bracket -------------------------------------------
+    // The two authorities in this file must not touch each other's fields. A
+    // guard that is never exercised is a guard nobody knows is broken, so each
+    // direction is asserted to REFUSE, and the legal no-op is asserted to pass.
+    let boundary_cell = |observations: Vec<Observation>, status: CellStatus| TrackedCell {
+        id: CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/boundary".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        },
+        enabled: true,
+        status,
+        ci_disabled_reason: None,
+        last_tested: None,
+        observations,
+    };
+    let sample = Observation {
+        detcore_tree: "tree".into(),
+        provenance: ObservationProvenance::PressureTest,
+        depth: BTreeMap::new(),
+        hermit_shas: BTreeSet::new(),
+        results: BTreeSet::new(),
+        invocations: BTreeSet::new(),
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+    };
+    let with_evidence = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Red)],
+    };
+    let evidence_dropped = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Red)],
+    };
+    let ratchet_moved = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![boundary_cell(vec![sample.clone()], CellStatus::Green)],
+    };
+    if enforce_writer_boundary(&with_evidence, &evidence_dropped, Writer::Update).is_ok() {
+        return Err("writer boundary allowed `update` to drop measured observations".into());
+    }
+    if enforce_writer_boundary(&with_evidence, &ratchet_moved, Writer::Observations).is_ok() {
+        return Err("writer boundary allowed an observation writer to move `status`".into());
+    }
+    if enforce_writer_boundary(&with_evidence, &evidence_dropped, Writer::Observations).is_err() {
+        return Err(
+            "writer boundary refused an observation writer for changing observations, \
+             which is the field it owns"
+                .into(),
+        );
+    }
+    if enforce_writer_boundary(&with_evidence, &ratchet_moved, Writer::Update).is_err() {
+        return Err(
+            "writer boundary refused `update` for changing `status`, which is the field \
+             it owns"
+                .into(),
+        );
+    }
+    let population_grown = TrackedCells {
+        schema: SCHEMA,
+        cells: vec![
+            boundary_cell(vec![sample], CellStatus::Red),
+            TrackedCell {
+                id: CellId {
+                    lane: "portable".into(),
+                    category: "fixture".into(),
+                    test: "fixture/second".into(),
+                    mode: "verify".into(),
+                    backend: "ptrace".into(),
+                },
+                enabled: true,
+                status: CellStatus::Red,
+                ci_disabled_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+            },
+        ],
+    };
+    if enforce_writer_boundary(&with_evidence, &population_grown, Writer::Observations).is_ok() {
+        return Err("writer boundary allowed an observation writer to add a cell".into());
+    }
+
     println!(
-        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, and infrastructure-refusal brackets pass"
+        "compatibility scorecard self-test: provenance, distinct-evidence, result, selected-chaos, ratchet, observation-range, batch-equivalence, green-admission, validate-observation, source-identity, writer-boundary, and infrastructure-refusal brackets pass"
     );
     Ok(())
 }
