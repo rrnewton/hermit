@@ -14,6 +14,7 @@ use std::thread;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RunContext;
+use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
@@ -94,6 +95,10 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
         }
     }
     args
+}
+
+fn scheduled_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
+    ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))
 }
 
 fn required_value(values: &mut impl Iterator<Item = String>, option: &str) -> String {
@@ -1013,14 +1018,14 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
 /// must not discard rows that completed before the timeout.
 fn for_each_parallel<T: Send>(
     count: usize,
-    jobs: usize,
+    capacity: ScheduledWorkerCapacity,
     execute: impl Fn(usize) -> T + Sync,
     mut consume: impl FnMut(usize, T),
 ) {
     if count == 0 {
         return;
     }
-    let workers = jobs.clamp(1, count);
+    let workers = capacity.workers_for(count);
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel();
     thread::scope(|scope| {
@@ -1060,8 +1065,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
-    let context =
-        RunContext::from_env(root.to_path_buf(), args.prebuilt).unwrap_or_else(|e| fail(e));
+    let capacity = scheduled_worker_capacity(args);
+    let context = RunContext::from_env(root.to_path_buf(), args.prebuilt)
+        .unwrap_or_else(|e| fail(e))
+        .with_scheduled_worker_capacity(capacity);
     let results_path = args.results.clone().unwrap_or_else(|| {
         context
             .result_root
@@ -1078,11 +1085,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     fs::write(&results_path, b"").unwrap();
     let mut indexed_results = Vec::new();
     let mut failed = false;
-    let jobs = args.jobs.unwrap_or(1);
     let expected = cells.len();
     for_each_parallel(
         expected,
-        jobs,
+        capacity,
         |index| {
             let cell = &cells[index];
             match run_cell(&context, cell) {
@@ -1145,7 +1151,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         println!(
             "test-harness: completed {} cell(s) with up to {} concurrent worker(s)",
             results.len(),
-            jobs.min(expected)
+            capacity.workers_for(expected)
         );
     }
     write_junit(&junit, &results).unwrap();
@@ -1169,9 +1175,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
+
     use super::audit_privileged_unboxed_guard;
     use super::command_jobs;
     use super::for_each_parallel;
+    use super::parse;
+    use super::scheduled_worker_capacity;
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.
         if [[ ${GITHUB_ACTIONS:-} != true ]]; then
@@ -1214,13 +1224,25 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_jobs_uses_the_parsed_worker_capacity() {
+        let default = scheduled_worker_capacity(&parse(std::iter::empty()));
+        assert_eq!(default.configured(), 1);
+
+        let explicit =
+            scheduled_worker_capacity(&parse(["--jobs", "7"].into_iter().map(str::to_string)));
+        assert_eq!(explicit.configured(), 7);
+        assert_eq!(explicit.workers_for(12), 7);
+        assert_eq!(explicit.workers_for(1), 1);
+    }
+
+    #[test]
     fn parallel_runner_delivers_every_completion_before_returning() {
         let active = AtomicUsize::new(0);
         let maximum = AtomicUsize::new(0);
         let consumed = Mutex::new(Vec::new());
         for_each_parallel(
             8,
-            4,
+            ScheduledWorkerCapacity::new(4),
             |index| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum.fetch_max(now, Ordering::SeqCst);
