@@ -671,6 +671,54 @@ Three ways to make it able to fail, in decreasing order of strength:
 on both sides (check 6) is the same defect wearing sweep clothing: it reports no
 difference because it looked at nothing. Check 6 exists because that happened.
 
+### 13. A symbol on the branch and absent from `main` is not yet a residual — it may be a RENAME
+
+Check 2 warns that a symbol *present* on `main` need not mean the mechanism
+landed. This is the **other direction**, and it produces the more expensive
+mistake, because it invents work rather than skipping it: a symbol that is
+absent at the merge base **and** absent from `main` reads exactly like the one
+thing a superseded branch still uniquely carries. That is the signature of a
+genuine loss, so it is acted on — and a rename forges it perfectly.
+
+**A function name is not a mechanism. Hash the body.**
+
+Measured on `#2178` (35 files, 14 real conflicts, 13 days stale). Of its 11
+distinctive identifiers in `hermit-cli/tests/flock_exclusion.rs`, six were absent
+at its own merge base and present on `main` — properly landed under check 1 —
+four were common words carrying no signal, and exactly one,
+`replay_reissues_every_flock_against_the_kernel`, was absent on **both** sides.
+On the symbol rule alone that is a residual, and the disposition would have been
+"extract the surviving test".
+
+It was not a residual. `main` carries the same test as
+`replay_reissues_every_flock_for_a_materialized_file`. The eighteen-line
+assertion body — the `requested` / `injected` counters, the `requested > 0`
+anti-vacuity guard, and the failure message verbatim — is **byte-identical**,
+`sha1 4c03071d9b639807e36556fdcb6e0245ec0408e9` on both sides. Only the name
+differs. Landing the "residual" would have committed a duplicate test.
+
+The cheap settling move, before believing any absent-on-main symbol:
+
+```bash
+# not the name -- a distinctive line from the body, and the payload's hash
+git grep -F 'replay re-issued {injected} of {requested} flock calls' "$MAIN" -- .
+git show "$PR:$file" | sed -n "$a,$b p" | sha1sum   # vs the candidate on main
+```
+
+A message string survives a rename; a symbol does not. This is why check 10 ends
+by telling you to grep **distinctive string literals as well as symbols** — the
+literal is the rename-proof handle, and here it was the only thing that spoke.
+
+Note what did *not* settle it. `main`'s file was 951 lines against the branch's
+491, and its versions of all four `add/add` fixtures were larger — up to 3.7x on
+`tests/c/flock_exclusion.c`. **Size is not content**; it is the same
+argument-from-bulk that check 10 already rejects for blob counts. `main` was also
+strictly stronger in a way no name or size check reveals: a second call site
+asserts `injected == requested + 1`, a tighter invariant the branch never had.
+
+Final verdict on `#2178`: **fully superseded, zero residual** — closed, not
+rebased. The 14 conflicts were never worth resolving.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
@@ -762,7 +810,12 @@ night establishing that:
 |---|---|
 | `dev-hermit` | reached zero by **merging**, not closing |
 | `reverie` | all 23 open classified; **zero** already-landed, 16 genuinely pending, 2 indeterminate |
-| `hermit` | sweeps found **zero** closable; several land candidates |
+| `hermit` | sweeps found **one** closable (`#2178`); several land candidates |
+
+`#2178` is the first genuinely closable hermit row any sweep has returned, and it
+took check 13 to see it: every cheaper signal said PARTIAL. Treat "zero closable"
+as the strong prior it has earned, not as a rule — but note that the one
+exception was found by hashing a body, not by counting files or names.
 
 **Two near-misses, both caught by the residual check (check 3), both PARTIAL
 rather than closable.** One had its mechanism landed, both test files present on
