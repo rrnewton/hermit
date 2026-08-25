@@ -2558,11 +2558,29 @@ mod tests {
     #[test]
     fn the_tmpfs_explanation_is_withheld_where_it_does_not_apply() {
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        // ⚠️ BUILT FROM $HOME RATHER THAN WRITTEN AS A LITERAL, and the property
+        // under test is unchanged: this must be a path OUTSIDE /tmp, and a home
+        // directory is the realistic such path. A literal home path here made
+        // `scripts/check-portable-paths.sh` red on main -- correctly, because
+        // that gate rejects a developer-specific path anywhere in a tracked
+        // build or run file, tests and COMMENTS included. (Spelling one out even
+        // to explain this trips it, which is the gate working, not overreach.)
+        // The fallback keeps the test meaningful where HOME is unset, and is
+        // still not under /tmp.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/nonexistent-home".to_string());
+        let outside_path = std::path::PathBuf::from(home).join("wt");
         let outside = format!(
             "{}",
-            super::kvm_cwd_resolution_error(std::path::Path::new("/home/u/wt"), &not_found)
+            super::kvm_cwd_resolution_error(&outside_path, &not_found)
         );
         assert!(!outside.contains("tmpfs"), "not a /tmp path: {outside}");
+        // The path chosen must actually exercise the branch: if HOME were ever
+        // under /tmp, this test would be asserting nothing.
+        assert!(
+            !outside_path.starts_with("/tmp"),
+            "the not-under-/tmp case must not be driven by a /tmp path: {}",
+            outside_path.display()
+        );
 
         // `/tmp` itself resolves in the guest -- the mount POINT exists -- so a
         // failure there is something else and must not be mislabelled.
