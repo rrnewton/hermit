@@ -194,7 +194,10 @@ fn has_any(line: &str, needles: &[&str]) -> bool {
 /// Split out of the old inline test so the same anchors can be applied per BLOCK
 /// (see [`diagnostic_blocks`]) instead of per physical line.
 fn has_toolchain_phrase(line: &str) -> bool {
-    (line.contains("fatal error: ") && line.matches(':').count() >= 2)
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error: failed to write ")
+        || trimmed.starts_with("rm: cannot remove ")
+        || (line.contains("fatal error: ") && line.matches(':').count() >= 2)
         || line.contains("cmake error")
         || has_any(
             line,
@@ -215,25 +218,26 @@ fn has_toolchain_phrase(line: &str) -> bool {
                 // rustc's incremental link_or_copy step, which says "unable to
                 // copy" where the sibling path says "could not write output to";
                 "unable to copy",
-                // cargo's build-script spawn failure, whose denial sits two
-                // `Caused by:` lines below this phrase (hence the block scan);
+                // A same-line cargo spawn denial retains the historical
+                // classification. Cross-line matching is narrower and handled
+                // by `has_cross_line_toolchain_phrase` below.
                 "could not execute process",
                 // `cp -a`/`ln -s` refusing to make a link, which "can't create"
                 // above does not spell the same way.
                 "cannot create symbolic link",
-                // rustc/clippy failing to write a .rmeta or .o. Deliberately
-                // anchored WITH the `error: ` prefix, unlike its siblings above:
-                // "failed to write" on its own is ordinary English that a guest
-                // could plausibly print next to a legitimate EPERM, and Form 2
-                // would then excuse a real red. rustc always emits the prefix.
-                "error: failed to write ",
-                // coreutils `rm` refusing to unlink a scratch file, seen when a
-                // fixture cleans up its own /tmp work. Prefixed with the program
-                // name for the same reason as the line above: "cannot remove" on
-                // its own is ordinary English.
-                "rm: cannot remove",
+                // The rustc and coreutils anchors are handled above as
+                // line-prefix checks. They MUST NOT use this substring matcher:
+                // guest prose can quote the complete diagnostic text next to a
+                // real EPERM, and that must remain a product red.
             ],
         )
+}
+
+/// Tool syntax proven safe to join with a denial elsewhere in the same Cargo
+/// diagnostic block. Generic phrases such as "could not open" stay same-line
+/// only: product prose can contain them above an indented guest EPERM.
+fn has_cross_line_toolchain_phrase(line: &str) -> bool {
+    line.trim_start().starts_with("could not execute process ")
 }
 
 /// Group `lower` into diagnostic blocks: one leading line plus its continuations.
@@ -360,6 +364,12 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         ) {
             return Some("proxy-egress");
         }
+        // Form 2a: legacy same-line toolchain denial. The conjunction remains
+        // same-line so generic product prose cannot borrow a denial from a later
+        // indented line in its block.
+        if has_denial(line) && has_toolchain_phrase(line) {
+            return Some("toolchain-eperm");
+        }
         // Form 5 (NEW): a banner-less git FS denial. Requires BOTH a git-fatal
         // shape and a denial on the same line, so a guest test that merely prints
         // "permission denied" cannot trip it.
@@ -382,12 +392,15 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
             vcs_hit = true;
         }
     }
-    // Form 2: a banner-less denial reported by a build tool, matched WITHIN ONE
-    // DIAGNOSTIC BLOCK rather than one physical line. See `diagnostic_blocks`.
-    if diagnostic_blocks(&lower)
-        .iter()
-        .any(|block| block.iter().any(|l| has_denial(l)) && block.iter().any(|l| has_toolchain_phrase(l)))
-    {
+    // Form 2b: the measured Cargo spawn diagnostic puts its denial in a
+    // continuation line. Only that structural phrase may join evidence across
+    // one diagnostic block; generic legacy phrases remain same-line above.
+    if diagnostic_blocks(&lower).iter().any(|block| {
+        block.iter().any(|line| has_denial(line))
+            && block
+                .iter()
+                .any(|line| has_cross_line_toolchain_phrase(line))
+    }) {
         return Some("toolchain-eperm");
     }
     if vcs_hit {
@@ -1551,8 +1564,14 @@ pub fn self_test() -> Result<String, String> {
         // Guest prose that happens to contain "failed to write" beside a real
         // EPERM. This is why that one anchor carries the `error: ` prefix.
         "guest wrote: failed to write /tmp/scratch: Operation not permitted",
-        // Likewise for "cannot remove": only coreutils' own prefixed form counts.
+        // Likewise for the exact prefixes: quoting the complete diagnostic
+        // inside guest/product prose must not earn an environmental retry.
         "guest wrote: cannot remove the lock file: Operation not permitted",
+        "guest wrote: error: failed to write /tmp/scratch: Operation not permitted",
+        "guest wrote: rm: cannot remove /tmp/scratch: Permission denied",
+        // Generic tool-like prose and a denial on different lines in one
+        // indented product block must not qualify for the Cargo-only widening.
+        "test failed: could not open expected output\n  guest errno: Permission denied",
     ];
     let mut refused = 0usize;
     for text in refuse {

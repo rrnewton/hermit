@@ -333,7 +333,8 @@ fn usage() -> &'static str {
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
      \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-6 requalification.\n\
      \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
-     \x20                  declared caps; deps outside the selection are dropped.\n\
+     \x20                  declared caps; outside deps are dropped; preflight tags\n\
+     \x20                  reuse validate's canonical preflight nodes.\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
@@ -1496,6 +1497,7 @@ fn self_test() -> Result<(), String> {
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
     no_result_propagation_bracket()?;
+    possible_missing_artifact_bracket()?;
     selective_subset_bracket(&root)?;
     only_plan_bracket(&root)?;
     self_output_bracket()?;
@@ -2377,9 +2379,20 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         ));
     }
     let tags: Vec<String> = plan.cfg.steps.iter().map(|step| step.tag()).collect();
-    let unique: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
-    if unique.len() != tags.len() {
+    let actual_tags: BTreeSet<String> = tags.iter().cloned().collect();
+    if actual_tags.len() != tags.len() {
         return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
+    }
+    let mut expected_tags: BTreeSet<String> =
+        validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+            .iter()
+            .map(|step| step.tag())
+            .collect();
+    expected_tags.extend(selected_tags.iter().cloned());
+    if actual_tags != expected_tags {
+        return Err(format!(
+            "only bracket: plan did not contain exactly preflight plus requested nodes: expected={expected_tags:?} actual={actual_tags:?}"
+        ));
     }
     if plan.cfg.steps.iter().any(|step| {
         step.group == "shard" || step.cmd.contains("ci/run-node.sh")
@@ -2393,23 +2406,28 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             .iter()
             .find(|step| step.tag() == expected.tag())
             .ok_or_else(|| format!("only bracket: selected node {} was dropped", expected.tag()))?;
+        let mut expected_deps: Vec<String> = expected
+            .deps
+            .iter()
+            .filter(|dependency| selected_tags.contains(*dependency))
+            .cloned()
+            .collect();
+        if expected_deps.is_empty() {
+            expected_deps.push("gate.manifest".into());
+        }
+        if actual.deps != expected_deps {
+            return Err(format!(
+                "only bracket: selected node {} has wrong transformed deps: expected={expected_deps:?} actual={:?}",
+                actual.tag(),
+                actual.deps
+            ));
+        }
         let mut normalized_expected = expected.clone();
-        normalized_expected.deps = actual.deps.clone();
+        normalized_expected.deps = expected_deps;
         if format!("{actual:?}") != format!("{normalized_expected:?}") {
             return Err(format!(
                 "only bracket: selected node {} did not retain its command/caps: expected={normalized_expected:?} actual={actual:?}",
                 expected.tag()
-            ));
-        }
-        if actual
-            .deps
-            .iter()
-            .any(|dependency| !selected_tags.contains(dependency) && dependency != "gate.manifest")
-        {
-            return Err(format!(
-                "only bracket: selected node {} retained an outside dependency: {:?}",
-                actual.tag(),
-                actual.deps
             ));
         }
     }
@@ -2448,6 +2466,35 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         return Err(format!(
             "only bracket: manifest producer appeared {producer_count} times, expected once"
         ));
+    }
+    let producer_tags: BTreeSet<String> = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    let canonical_preflight = validate_plan::preflight_nodes(root, has_cmd("with-proxy"));
+    let preflight_tags: BTreeSet<String> = canonical_preflight
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    if producer_tags != preflight_tags {
+        return Err(format!(
+            "only bracket: selecting the shared producer admitted non-preflight nodes: {producer_tags:?}"
+        ));
+    }
+    let canonical_producer = canonical_preflight
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .ok_or("only bracket: canonical preflight omitted its manifest producer")?;
+    let planned_producer = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .expect("counted exactly once above");
+    if format!("{planned_producer:?}") != format!("{canonical_producer:?}") {
+        return Err("only bracket: selected producer is not the canonical validate preflight node".into());
     }
 
     let unknown_args = parse_argv(&[
@@ -3538,10 +3585,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let base = validate_plan::lane_config(root, lane)?;
         let mut lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
         // The lane is independently runnable, so it carries its own manifest-plan
-        // producer. Validate's preflight already carries the same tag. Reuse that
+        // producer. Validate's canonical preflight already carries the same tag
+        // and deliberately owns that producer's validation-time cap. Reuse the
         // preflight node before filtering; otherwise `--only setup.manifest_plan`
         // creates a duplicate tag and a consumer selected with the producer keeps
-        // an ambiguous edge.
+        // an ambiguous edge. Every non-preflight selected node retains its lane cap.
         validate_plan::reuse_preflight_manifest_producer(
             &mut lane_steps,
             &format!("--only lane {lane}"),
@@ -3590,9 +3638,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         }
         // SAY that this mode assumes an already-built tree, and name the build
         // edges it just dropped. Without this the mode is silent about its own
-        // precondition: a selected node whose artifact was never built dies with
-        // a 0-second exit 127 (the shell's "command not found"), which reads as a
-        // crash rather than as "you have not built this yet".
+        // precondition. A fast exit 127 may mean one of those artifacts is absent,
+        // but it can also mean a missing host tool or a command typo, so both the
+        // pre-run and post-run diagnostics keep that distinction explicit.
         dropped.remove(gate);
         if dropped.is_empty() {
             eprintln!(
@@ -3603,8 +3651,8 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             eprintln!(
                 "validate: --only assumes an already-built tree. Dropped {} dependency edge(s) \
                  whose outputs must ALREADY exist: {}. Build them first (or name them in the \
-                 selection); a selected node exiting 127 in ~0s means its artifact is missing, \
-                 not that it crashed.",
+                 selection). A selected node exiting 127 in ~0s MAY indicate one is absent; \
+                 inspect the node command too, because a missing host tool or typo is also 127.",
                 dropped.len(),
                 dropped.iter().cloned().collect::<Vec<_>>().join(", ")
             );
@@ -4913,6 +4961,25 @@ fn verdict_refusals(
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
     if execution_complete { exit_code } else { exit_code.max(1) }
+}
+
+/// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
+/// documented contract deliberately drops build dependencies. It is never a
+/// verdict override and is not inferred for full or other focused profiles.
+fn possible_missing_artifact_nodes<'a>(
+    selection_mode: &str,
+    outcomes: &'a [StepOutcome],
+) -> Vec<&'a str> {
+    if selection_mode != "only" {
+        return Vec::new();
+    }
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            !outcome.ok && outcome.returncode == Some(127) && outcome.duration_s < 5.0
+        })
+        .map(|outcome| outcome.tag.as_str())
+        .collect()
 }
 
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
@@ -8631,6 +8698,40 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn possible_missing_artifact_bracket() -> Result<(), String> {
+    let row = |tag: &str, ok: bool, returncode: Option<i64>, duration_s: f64| StepOutcome {
+        tag: tag.into(),
+        ok,
+        duration_s,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        returncode,
+        reason: String::new(),
+        aborted: false,
+    };
+    let outcomes = vec![
+        row("fixture.missing", false, Some(127), 1.0),
+        row("fixture.slow_127", false, Some(127), 5.0),
+        row("fixture.other_exit", false, Some(126), 1.0),
+        row("fixture.passed", true, Some(0), 1.0),
+    ];
+    if possible_missing_artifact_nodes("only", &outcomes) != vec!["fixture.missing"] {
+        return Err("missing-artifact hint did not select exactly the fast --only exit-127 row".into());
+    }
+    for mode in ["full", "targeted", "selective"] {
+        if !possible_missing_artifact_nodes(mode, &outcomes).is_empty() {
+            return Err(format!(
+                "missing-artifact hint escaped --only into selection mode {mode}"
+            ));
+        }
+    }
+    println!(
+        "  missing-artifact hint: 1 --only candidate / 3 non-qualifying shapes; other profiles silent"
+    );
+    Ok(())
+}
+
 fn no_result_propagation_bracket() -> Result<(), String> {
     let outcome = |tag: &str, returncode: i64, aborted: bool| StepOutcome {
         tag: tag.into(),
@@ -9334,7 +9435,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 vec![
                     "force-full policy brackets, shell quoting, corpus counts, super gate table, \
                      envelope scoring/comparison, ledger cache, receipt eligibility, and the \
-                     selective subset builder all passed"
+                     selective/only subset builders all passed"
                         .into(),
                     "policy/data brackets are inert; the cgroup bracket runs only inside a bounded \
                      disposable scope and neither publishes nor writes the real ledger"
@@ -9559,7 +9660,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let _ = Command::new("git").args(["status", "--short"]).status();
         return RunSummary::refused(
             2,
-            &level_name,
+            &profile_name,
             "the dirty-working-tree gate",
             vec![
                 "HEAD has uncommitted working-tree changes, so a record anchored to it would \
@@ -9581,7 +9682,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
             return RunSummary::refused(
                 2,
-                &level_name,
+                &profile_name,
                 "the rebase-freshness gate",
                 msg.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
             );
@@ -9593,7 +9694,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Err(e) = std::fs::create_dir_all(&tmp) {
         return RunSummary::refused(
             2,
-            &level_name,
+            &profile_name,
             "run-state setup",
             vec![format!("cannot create {}: {e}", tmp.display())],
         );
@@ -9605,7 +9706,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             eprintln!("validate: cannot build the execution plan: {e}");
             return RunSummary::refused(
                 2,
-                &level_name,
+                &profile_name,
                 "plan construction",
                 vec![
                     e,
@@ -10430,20 +10531,16 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     } else {
         None
     };
-    // Exit 127 is the shell's "command not found", so a node that dies with it in
-    // roughly no time did not run and fail — its executable was never built. Say
-    // that, because a bare 0-second 127 in the table is indistinguishable from a
-    // crash, and a misread there costs far more than the line costs to print.
-    let missing_artifact: Vec<&str> = outcomes
-        .iter()
-        .filter(|o| !o.ok && o.returncode == Some(127) && o.duration_s < 5.0)
-        .map(|o| o.tag.as_str())
-        .collect();
+    // `--only` deliberately drops build dependencies, so a fast 127 there is
+    // useful evidence of an absent prerequisite. It is still a red result and
+    // only a possibility: exit 127 can also mean a missing host tool or typo.
+    let missing_artifact = possible_missing_artifact_nodes(plan.selection_mode, &outcomes);
     if !missing_artifact.is_empty() {
         eprintln!(
-            "validate: NOTE: {} node(s) exited 127 (command not found) in under 5s: {}. \
-             That is a MISSING BUILD ARTIFACT, not a test failure — the node's executable does \
-             not exist in this checkout. Build it, then re-run.",
+            "validate: NOTE: {} --only node(s) exited 127 (command not found) in under 5s: {}. \
+             Because --only drops outside dependencies, this MAY mean a required build artifact \
+             is absent; it remains a RED test/configuration failure. Build the named dependencies \
+             and re-run, or inspect the node command for a missing tool or typo.",
             missing_artifact.len(),
             missing_artifact.join(", ")
         );
