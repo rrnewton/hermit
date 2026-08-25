@@ -180,6 +180,79 @@ impl CompatMode {
     }
 }
 
+/// What the compatibility summary should DO about one measured row.
+///
+/// Extracted as a pure function of (mode, outcome, table membership) so the decision can be
+/// bracketed without running a guest, and so the reporting text and the blocking verdict cannot
+/// drift apart -- they are now two readings of the same value rather than two independent
+/// branches of one `if`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatDisposition {
+    /// Passed, and nothing in the tables says otherwise.
+    Passed,
+    /// Passed while listed as known fail-closed. The EXPECTATION is stale, not the run.
+    PassedButListedFailClosed,
+    /// Failed, listed, and exempted. This is `Strict`'s historical behaviour and is deliberately
+    /// confined to it.
+    KnownFailClosedExempt,
+    /// Failed while listed as known fail-closed, and STILL BLOCKING. Reporting the row's reason
+    /// is not the same as excusing it; this variant exists so the reason can be printed without
+    /// the failure being downgraded.
+    KnownFailClosedBlocking,
+    /// Failed as a bounded portable diagnostic: nonblocking by prior policy.
+    PortableDiagnostic,
+    /// Failed with nothing to say about it.
+    Blocking,
+}
+
+impl CompatDisposition {
+    /// Whether this row must fail the run.
+    ///
+    /// The ONE property that must not regress while reporting improves. `KnownFailClosedBlocking`
+    /// is deliberately blocking: a listed row under `PortableStrict` was already blocking before
+    /// the reason was printed, and printing it must not change that.
+    pub fn is_blocking(self) -> bool {
+        matches!(self, CompatDisposition::KnownFailClosedBlocking | CompatDisposition::Blocking)
+    }
+}
+
+/// Classify one measured compatibility row.
+///
+/// Pure: it takes membership as booleans rather than the tables themselves, so a bracket can
+/// exercise every combination without constructing or planting a corpus, and so production
+/// keeps reading the real tables.
+///
+/// `Strict` keeps its exemption. `PortableStrict` gains REPORTING ONLY. Every other mode --
+/// `Sabre`, `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
+/// blocking exactly as before.
+pub fn classify_compat_outcome(
+    mode: CompatMode,
+    ok: bool,
+    listed_failclosed: bool,
+    listed_diagnostic: bool,
+) -> CompatDisposition {
+    // Only the two strict modes consult the fail-closed table at all; it describes what
+    // `--strict` refuses, which says nothing about the other backends.
+    let consults_failclosed =
+        matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) && listed_failclosed;
+    if ok {
+        if consults_failclosed {
+            return CompatDisposition::PassedButListedFailClosed;
+        }
+        return CompatDisposition::Passed;
+    }
+    if consults_failclosed {
+        return match mode {
+            CompatMode::Strict => CompatDisposition::KnownFailClosedExempt,
+            _ => CompatDisposition::KnownFailClosedBlocking,
+        };
+    }
+    if mode == CompatMode::PortableStrict && listed_diagnostic {
+        return CompatDisposition::PortableDiagnostic;
+    }
+    CompatDisposition::Blocking
+}
+
 /// Build a fully-declared node. This is the ONLY node constructor the plan
 /// modules use, so a node cannot be created without caps. It is `pub(crate)` in
 /// spirit — `validate_super` and `validate_envelope` call it precisely so that
