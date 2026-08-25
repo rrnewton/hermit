@@ -7495,7 +7495,11 @@ fn product_front_door_bracket() -> Result<(), String> {
     }
 
     let commit = "0123456789abcdef0123456789abcdef01234567";
-    let host = "devbig014";
+    // Synthetic like the commit and boot_id above it. A real machine name here
+    // is inert today but is how a fixture turns into a host dependency, and
+    // scripts/check-portable-paths.sh refuses literal hostnames in tracked
+    // build/run files for exactly that reason.
+    let host = "test-host-0";
     let boot_id = "11111111-2222-3333-4444-555555555555";
     let authority = serde_json::json!({
         "schema_version": 1,

@@ -202,6 +202,45 @@ root.
 local validation may opt into them; running them requires the matching
 capability, not just removing `--ignored`.
 
+### KVM memory-hash repeatability: why the guest must be statically linked
+
+`kvm_memory_hashes_repeat_for_a_static_guest`
+(`hermit-cli/tests/kvm_info_log_determinism.rs`) asserts that KVM produces
+identical stack and heap **content** hashes across two runs of the same guest. It
+uses a **statically linked** guest deliberately, and that restriction is the
+whole scope of the claim.
+
+**A dynamically linked guest fails this property today, and not marginally.**
+Measured on **devbig030**:
+
+| guest | backend | stack-content hashes differing run to run |
+| --- | --- | --- |
+| `/bin/echo hello` (dynamic) | KVM | **98 of 113** |
+| `/bin/echo hello` (dynamic) | ptrace | **0 of 193** |
+
+The cause is known and tracked rather than papered over: the KVM backend never
+delivers `rdtsc` to the Reverie `Tool`, so Detcore's existing virtualization never
+runs and the guest reads a raw host-derived cycle counter, which the dynamic
+loader then leaves on the stack. See
+<https://github.com/rrnewton/reverie/issues/448>.
+
+A static binary executes **zero** `rdtsc` (measured: 0, against 10 for every
+dynamically linked guest tested), which is exactly why the property holds there
+and only there.
+
+When #448 lands, the static restriction should be removed and that test should
+pass for a dynamic guest too — that is the intended signal.
+
+> **Why this measurement lives here and not beside the test.** The figures above
+> are only meaningful with the host they were taken on, and this project's
+> reporting standard requires naming it. `scripts/check-portable-paths.sh`
+> forbids literal hostnames in `.rs`, `.sh`, `.py` and similar build/run files —
+> correctly, because a hostname in code is how a real host dependency starts —
+> but it does not scan `.md`. Recording the provenance here keeps the measurement
+> auditable without weakening that gate or writing a hostname into a test file.
+> Renaming the host to something generic was rejected: it would leave a sentence
+> that reads as evidence and carries none.
+
 ## Expected failure signatures
 
 Match observed output to a cause before filing a bug. Exact strings live in
