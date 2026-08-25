@@ -27,7 +27,7 @@ fn command_output(mut command: Command, label: &str) -> Output {
 }
 
 #[test]
-fn zero_copy_pipe_syscalls_fall_back_only_in_strict_mode() {
+fn zero_copy_pipe_syscalls_allow_explicit_compatibility_passthrough() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -82,13 +82,14 @@ fn zero_copy_pipe_syscalls_fall_back_only_in_strict_mode() {
                 "run",
                 "--backend=ptrace",
                 "--base-env=minimal",
+                "--allow-unsupported-syscalls",
                 "--",
             ])
             .arg(&guest)
             .arg("passthrough");
         command_output(
             compatibility,
-            &format!("{syscall} non-strict compatibility run"),
+            &format!("{syscall} explicit compatibility run"),
         );
     }
 }
