@@ -11,6 +11,90 @@ pull request whose work is not on main destroys it. Everything here is arranged
 to make that error expensive to commit and cheap to catch. When the checks
 disagree, the safe answer is "needs a human read", not "close it".
 
+## The rule underneath every check: most wrong verdicts are UNCONTROLLED INPUTS, not bad reasoning
+
+Every check in this document exists because somebody was wrong first. Reading
+them back, the striking thing is what KIND of wrong they were. Very few were
+faulty reasoning about correct information. Most were **correct reasoning about
+an input nobody had verified** — a command whose output did not mean what its
+shape suggested, a snapshot that had gone stale, a message taken at face value.
+
+That distinction decides the countermeasure, and getting it backwards is why
+these keep recurring. Faulty reasoning is answered by thinking harder. An
+uncontrolled input is not: the agent was already being careful, and care applied
+to a false premise produces a *more confident* wrong answer, not a safer one.
+**An uncontrolled input can only be answered mechanically — by a check that
+fails loudly, not by a rule someone has to remember.**
+
+Worked from one night's errors, deliberately including the coordinator's,
+because the failure is structural rather than a property of any one agent:
+
+| what went wrong | kind | what care would have done |
+|---|---|---|
+| `git rev-parse` ECHOES an unresolvable argument to stdout, so a missing file read as "different blob" and a triage reported `absent=0` on every row | uncontrolled input | nothing — the output looked exactly like a sha |
+| `gh-merge-verified 2>&1 \| tail -3` hid the tool's real exit path, and a **P0 was filed against a tool that was correct** | uncontrolled input | nothing — the visible lines were true |
+| `hermit-install/build.rs` returns silently unless `PROFILE == "release"`, so a debug build stages no SaBRe and the backend reports "not found in the Hermit installation" | uncontrolled input | nothing — the error names a real, wrong cause |
+| a LiteInst hypothesis about a `thread_local` conversion, refuted by the same agent's own earlier review of that conversion | faulty reasoning | this one, yes |
+| a queue snapshot broadcast as live state; two of six "newly free" heads were already CLOSED | uncontrolled input | nothing — the list was accurate when taken |
+| a duplicate assumed to be out of routing because it was closed | uncontrolled input | nothing — closed rows really are usually done |
+| a fleet-wide instruction issued from a message that was never verified | uncontrolled input | nothing — the message was plausible |
+
+Six of seven. The countermeasure in every one of those rows is a command, not a
+resolution: read the exit status directly rather than through a pipe; re-query
+instead of quoting a snapshot; check `--verify --quiet`; name the profile a
+build script requires. That is what the numbered checks below ARE — each one is
+an input somebody trusted, converted into something you run.
+
+So when a check here surprises you, the useful reaction is not "I should have
+been more careful." It is **"what did I read that did not mean what I thought,
+and what command would have said so."** Then add that command here.
+
+### The same shape in the tools: `rebase --quit` versus `merge --abort`
+
+The clearest live instance, because both halves of it are uncontrolled inputs.
+
+**Wrong path.** In a linked worktree, `.git` is a file that points at the
+worktree-specific Git directory; it is not a directory to search directly.
+The authoritative state path is whatever Git reports with `git rev-parse
+--git-dir`, typically `$GIT_COMMON_DIR/worktrees/<name>/rebase-merge` or
+`.../rebase-apply`. Ask Git rather than guessing:
+
+```bash
+GD=$(git rev-parse --git-dir)          # authoritative worktree-local git dir
+ls -d "$GD"/rebase-merge "$GD"/rebase-apply 2>/dev/null
+ls -d "$(git rev-parse --git-common-dir)"/worktrees/*/rebase-* 2>/dev/null
+```
+
+**Wrong verb.** Having found orphaned state, `--quit` and `--abort` are not
+interchangeable:
+
+| command | effect on the local checkout |
+|---|---|
+| `git rebase --quit` | stops the rebase without resetting HEAD, the index, or the working tree; with `--autostash`, Git saves the temporary autostash in the stash list |
+| `git rebase --abort` | aborts the rebase and resets HEAD to the original pre-rebase tip |
+| `git merge --abort` | attempts to reconstruct the pre-merge state, may fail when uncommitted changes predated the merge, and cannot clear rebase state |
+
+For orphaned rebase state after a landing, `rebase --abort` changes only the
+local checkout: it can move local HEAD back to the pre-rebase tip even though
+the remote landing remains intact. Prefer `git rebase --quit` when the current
+HEAD, index, and working tree are the state to preserve; never recursively
+delete the state directory, which can leave Git metadata inconsistent. Snapshot
+and verify the local state, and inspect any autostash explicitly:
+
+```bash
+before_head=$(git rev-parse HEAD)
+before_status=$(git status --short)
+git rebase --quit
+test "$(git rev-parse HEAD)" = "$before_head"
+test "$(git status --short)" = "$before_status"
+git stash list
+# If --autostash was used, identify and preserve the saved autostash entry.
+```
+
+A tailed rebase hides its own failure exactly as a tailed push hides a
+rejection, for the identical reason (`$?` after a pipeline is the LAST
+command's status). Read the status of both directly.
+
 ## Why absence is so often reported wrongly: landing rewrites the SHA
 
 `rrnewton/hermit` has **merge commits disabled** — `allow_merge_commit=false`,
