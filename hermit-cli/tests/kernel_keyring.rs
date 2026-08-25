@@ -94,15 +94,14 @@ fn keyctl_enosys_flag(output: &Output, label: &str) -> String {
         .to_string()
 }
 
-/// Non-strict runs must pass kernel-keyring syscalls through to the host rather
-/// than forcing the deterministic `ENOSYS` boundary that only applies to strict
-/// / fail-closed mode. This is a regression guard for the enabled rr `keyctl`
-/// compatibility test, whose guest requires a working host keyring under plain
-/// `hermit run`. The check is host-independent: it compares the guest's
-/// ENOSYS-or-not verdict natively against the same guest under non-strict
-/// Hermit, so it holds whether or not the host kernel has `CONFIG_KEYS`.
+/// The explicit unsupported-syscall compatibility opt-out must pass
+/// kernel-keyring syscalls through to the host rather than forcing the default
+/// fail-closed `ENOSYS` boundary. This is a regression guard for the enabled rr
+/// `keyctl` compatibility test. The check is host-independent: it compares the
+/// guest's ENOSYS-or-not verdict natively against the same guest under the
+/// opt-out, so it holds whether or not the host kernel has `CONFIG_KEYS`.
 #[test]
-fn kernel_keyring_passes_through_in_non_strict_mode() {
+fn kernel_keyring_passes_through_with_compatibility_opt_out() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -124,8 +123,8 @@ fn kernel_keyring_passes_through_in_non_strict_mode() {
     let native_output = command_output(native, "native keyctl passthrough");
     let native_flag = keyctl_enosys_flag(&native_output, "native keyctl passthrough");
 
-    // Non-strict Hermit (no --strict, no --panic-on-unsupported-syscalls): the
-    // keyring syscall must reach the host and observe the same verdict.
+    // The explicit compatibility opt-out must let the keyring syscall reach
+    // the host and observe the same verdict.
     let mut hermit = Command::new("timeout");
     hermit
         .args(["--kill-after", "5s", "90s"])
@@ -135,15 +134,19 @@ fn kernel_keyring_passes_through_in_non_strict_mode() {
             "run",
             "--backend=ptrace",
             "--base-env=minimal",
+            "--allow-unsupported-syscalls",
             "--",
         ])
         .arg(&guest);
-    let hermit_output = command_output(hermit, "non-strict Hermit keyctl passthrough");
-    let hermit_flag = keyctl_enosys_flag(&hermit_output, "non-strict Hermit keyctl passthrough");
+    let hermit_output = command_output(hermit, "explicit Hermit keyctl compatibility opt-out");
+    let hermit_flag = keyctl_enosys_flag(
+        &hermit_output,
+        "explicit Hermit keyctl compatibility opt-out",
+    );
 
     assert_eq!(
         hermit_flag, native_flag,
-        "non-strict Hermit forced a different keyctl result than the host: \
+        "Hermit's explicit compatibility opt-out produced a different keyctl result than the host: \
          native reported `{native_flag}`, Hermit reported `{hermit_flag}` \
          (a Hermit-forced ENOSYS here would break the rr keyctl compatibility test)"
     );
