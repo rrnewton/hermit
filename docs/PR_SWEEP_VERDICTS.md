@@ -1749,6 +1749,43 @@ actionable by someone who never read the pull request.
 invites a rebase. "DBT emits the host TID instead of a virtualized DetPid" is a
 defect somebody can fix.
 
+## A hold keyed on "the related task is still open" can never clear
+
+⚠️ **If the board withholds a head because a task is open, and that task is the
+one the head closes, the hold is self-sustaining: the change that would close the
+task is the change the hold is preventing.** It never times out and it never
+resolves, because nothing else can close the task either.
+
+**Measured 2026-08-25.** hermit#2594 was held on `hoist_the_backend_name` being
+open. That task's stated fix is the two-line hoist in `hermit-cli/src/backend_stats.rs`
+that hermit#2594 *is*. The head landed at 18:17:32Z as `9fd184ad6e` and the task
+closed against that commit at 18:46Z — the hold's own precondition was satisfied
+only by defeating the hold.
+
+**This is a class, not an incident, and the board has paid for it before.** The
+same shape is already recorded in `ci-hub/landing/task_pr_join.py`, where
+requiring `_task_is_open()` "excluded exactly the population this join exists to
+find, so population C silently emptied as the lifecycle took effect". Both are
+one mistake: **an open task is evidence that work is OUTSTANDING, and a head is
+how outstanding work stops being outstanding.** Reading the first as a reason to
+withhold the second inverts what the signal means.
+
+**The test to apply before adding any task-state hold:** ask what closes the task
+if the hold holds. If the answer is "the thing being held", the hold is circular
+and must not be added.
+
+Two properly-shaped alternatives, neither circular:
+
+- Key the hold on the task being **unowned or unclaimed** — nobody is driving it,
+  which a landing does not fix.
+- Key it on the head **not naming a task at all**, which is the #244 hazard the
+  join above exists to catch and which landing genuinely does not resolve.
+
+⚠️ **And a hold is only as visible as its reason.** This one surfaced because a
+human read the board and asked why the head had not moved; nothing in the board's
+own output said "held, because a related task is open". A hold that cannot state
+its precondition cannot be checked for circularity by the next reader.
+
 ## What sweeps have actually returned
 
 **Measured, not assumed: six sweeps across `hermit`, `reverie` and `dev-hermit`
