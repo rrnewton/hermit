@@ -1857,11 +1857,14 @@ stricter than the parser reports false absence** — the exact direction the thi
 bullet below warns about, committed by the recipe printed next to the warning.
 
 `ci-hub/health/approval_binding.py` normalises before it matches. It strips
-block-level prefixes (`#{1,6} `, `> `, `- `) and wrapping emphasis or backticks
-**to a fixpoint**, then applies `^APPROVED-AT:\s*(claude|codex)\s+[0-9a-f]{40}$`
-**case-insensitively**. Measured against `strip_decoration` + `parse_marker` at
-`origin/main`, with a plain line and a prose mention as controls in both
-directions:
+block-level prefixes (`#{1,6} `, `> `, and any of `-`, `+`, `*` as a list marker)
+and wrapping emphasis or backticks **to a fixpoint**, then applies
+`^APPROVED-AT:\s*(claude|codex)\s+[0-9a-f]{40}$` **case-insensitively**. Measured
+against `strip_decoration` + `parse_marker` at `origin/main`, with a plain line
+and a prose mention as controls in both directions — and replayed through the
+route that actually decides, `marker_lines` → `_undecorate_block` →
+`parse_marker`, because a table derived from a function pair nothing calls would
+describe nothing; **10 of 10 rows agree between the two routes**:
 
 | line, all naming the same head        | the grep | the parser |
 | ------------------------------------- | -------- | ---------- |
@@ -1907,9 +1910,12 @@ Four consequences worth keeping:
   the *authoritative* instrument, not merely a stricter one: strictness beyond
   the parser manufactures absence rather than proving it.
 - **A tightening needs a control that must still match.** The old recipe's
-  defect is invisible without one — every row above except the first two is a
-  silent miss, and only the plain control distinguishes "this pattern is precise"
-  from "this pattern matches nothing".
+  defect is invisible without one — every row above except the first and the
+  last two is a silent miss, seven of them, and only the plain control
+  distinguishes "this pattern is precise" from "this pattern matches nothing".
+  The last two rows are not misses: the grep and the parser *agree* there, and
+  the `CODEX-LANE` row is the case **neither** catches, so a bullet that swept
+  it in would tell a reader the parser handles a variant it does not.
 - **Say which instrument produced the number.** "2 of 185" means nothing without
   "whole-line match on raw comment text, not through the parser". A count is a
   measurement and carries its method or it carries nothing.
