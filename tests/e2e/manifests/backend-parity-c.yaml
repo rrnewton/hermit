@@ -5698,11 +5698,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
           kvm: KVM does not complete a guest on the authoring host; qualify KVM separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
+          liteinst: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; requalify after the LiteInst startup failure is fixed
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): a native run necessarily differs from itself here, since unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is not a discriminating oracle for a contract whose whole claim is that those fields are virtualized.'
@@ -5764,11 +5764,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
           kvm: KVM livelocks at guest startup on the current host; qualify KVM separately -- also a priority for this guest
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
+          liteinst: Exact-current-main qualification with a staged, positively activated LiteInst runtime timed out opening the tracee pidfd in 21 of 21 isolated and paired-load runs before producing a terminal comparison; requalify after the LiteInst startup failure is fixed
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: Native output is IDENTICAL to Hermit''s here (measured), because the probe is relocation-invariant by construction -- so a native run is a useful sanity check but not a discriminating oracle, and gating on it would assert nothing'
