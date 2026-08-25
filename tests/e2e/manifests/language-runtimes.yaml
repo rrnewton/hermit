@@ -403,7 +403,7 @@ test:
         backends_disabled:
           dbt: DBT Perl qualification is tracked by backend compatibility
           kvm: KVM interpreter coverage requires separate privileged qualification
-          sabre: SaBRe requires its external runtime
+          sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites
           liteinst: LiteInst Perl qualification is tracked by backend compatibility
       replay:
         ci: false
