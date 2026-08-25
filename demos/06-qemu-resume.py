@@ -21,8 +21,11 @@ from demo_common import (  # noqa: E402
     check_dependencies,
     compare_runs,
     copy_file,
+    default_qemu_assets,
+    display_path,
     extract_info_tail,
     hash_file,
+    hermit_tmp_args,
     load_anchor,
     make_run_dir,
     print_comparison,
@@ -48,7 +51,7 @@ HERMIT = Path(os.environ.get("HERMIT_RELEASE", HERMIT_REPO / "target/release/her
 # Read at import, before anything can put HERMIT_RELEASE back into the environment
 # (demo 5 does exactly that), which would otherwise make this always true.
 HERMIT_PINNED = "HERMIT_RELEASE" in os.environ
-ASSETS = Path(os.environ.get("QEMU_ASSETS", ROOT / "ignored/qemu-linux"))
+ASSETS = Path(os.environ.get("QEMU_ASSETS", default_qemu_assets(ROOT)))
 QEMU = os.environ.get("QEMU_BIN", shutil.which("qemu-system-x86_64") or "")
 TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "120"))
 # Run hermit through the bounded entry point rather than bare. The orphan this
@@ -249,6 +252,7 @@ def main() -> int:
             str(TIMEOUT + 60),
             str(HERMIT),
             "run",
+            *hermit_tmp_args(ROOT),
             "--strict",
             "--no-rcb-time",
             "--target-timeslice",
@@ -356,7 +360,7 @@ def main() -> int:
             anchor_path = save_anchor(command_root, current)
             print(
                 "PASS: saved first run for this command at {}".format(
-                    anchor_path.relative_to(ROOT)
+                    display_path(anchor_path, ROOT)
                 )
             )
         else:
@@ -370,10 +374,10 @@ def main() -> int:
             result = "SUCCESS" if passed else "PARTIAL"
 
         if saved_snapshot:
-            print("Post-command snapshot: {}".format(archived_disk.relative_to(ROOT)))
+            print("Post-command snapshot: {}".format(display_path(archived_disk, ROOT)))
             print("Post-command SHA-256: {}".format(hash_file(archived_disk)))
         print(
-            "Run metadata: {}".format((run_dir / "run-metadata.json").relative_to(ROOT))
+            "Run metadata: {}".format(display_path(run_dir / "run-metadata.json", ROOT))
         )
         print("\n=== {}: {} ===".format(DEMO_LABEL, result))
         return 1 if result == "PARTIAL" else 0
