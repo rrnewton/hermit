@@ -1321,16 +1321,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_oldset(Some(old_mask_addr))
                 .with_sigsetsize(std::mem::size_of::<u64>());
             guest.inject_with_retry(block_signals).await?;
+            let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
             let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
             let mut pending_signal = false;
             let result: Result<i64, Error> = loop {
-                // Type adaptation only: `Signaled` now carries the waking signals,
-                // but this wait4 path keeps its existing all-signals-interrupt
-                // behavior. See the waitid loop for the mask-filtered variant.
-                let signaled = matches!(
+                let signaled = resume_interrupts_wait(
                     wait_for_child_lifecycle(guest, spec).await,
-                    ResumeStatus::Signaled(_)
+                    &guest_signal_mask,
                 );
                 pending_signal |= signaled;
                 let (ready, has_child) = ready_child_wait(guest, spec).await;
