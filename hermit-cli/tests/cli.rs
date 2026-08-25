@@ -3433,6 +3433,10 @@ fn tracer_panic_and_guest_failure_have_different_exit_codes() {
 ///
 /// ⚠️ MEASURED BEFORE THE FIX, at main `b92c2227fc`: all three arms returned 1
 /// and emitted NO classification at all, so `$?` and stderr agreed on nothing.
+/// (That measurement is dated: `#2558` has since moved hermit-internal failures
+/// to exit 125, so two of those three arms now return 125 on `main` even
+/// without this change. What is still missing there, and what this test is
+/// about, is the classification — 125 says *hermit failed*, not *which way*.)
 /// The information was never missing — reverie hands hermit a typed
 /// `RunError::ExitStatus`, and `with_container` discarded it with
 /// `.context(..)?`. This test fails if that discard comes back.

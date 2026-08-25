@@ -437,6 +437,24 @@ const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
 /// only ever REDUCE collisions, never remove them. Spending a second reserved
 /// number to separate two *internal* failures buys the least and costs the most.
 ///
+/// ⚠️ ONE RESERVED CODE ALREADY EXISTS, AND THIS DOES NOT REPLACE IT.
+/// [`HERMIT_INTERNAL_FAILURE_EXIT`] is 125, so `$?` already separates "hermit
+/// itself failed" from "the guest exited". The argument above is against a
+/// SECOND reserved number — one that would try to separate `cli-error` from
+/// `container-child-exit`, both of which are hermit-internal failures and both
+/// of which correctly exit 125. The two mechanisms answer different questions
+/// and are meant to be read together:
+///
+///   * the exit code answers *was this hermit or the guest* — cheap, available
+///     to any caller reading `$?`, and necessarily lossy;
+///   * this marker answers *which internal failure* — unbounded, so it costs no
+///     further code from a space the guest already owns.
+///
+/// A reader deciding whether a reserved code is available for some third
+/// purpose should take this as: one is spent, deliberately, and the reason not
+/// to spend another is the collision argument above — not an absence of any
+/// reserved code.
+///
 /// ⚠️ AND WHY NOT THE VERIFICATION JSON, which is the other candidate and looks
 /// structurally stronger. Measured on `main` at `b92c2227fc`, it cannot see
 /// these cases at all:
