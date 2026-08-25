@@ -302,6 +302,13 @@
       "test": "backend-parity-c/mmap-layout-pointer-order"
     },
     {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mmap-layout-pointer-order"
+    },
+    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "portable",
@@ -527,6 +534,13 @@
     },
     {
       "backend": "ptrace",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/stat-metadata-identity"
+    },
+    {
+      "backend": "liteinst",
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
