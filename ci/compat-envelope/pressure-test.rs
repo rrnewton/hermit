@@ -1727,7 +1727,7 @@ fn series_coordinates(attempts: &[JsonValue]) -> Option<JsonValue> {
             located.insert(key.to_string(), JsonValue::from(value));
         }
     }
-    (!located.is_empty()).then(|| JsonValue::Object(located))
+    (!located.is_empty()).then_some(JsonValue::Object(located))
 }
 
 /// Build one series row per retained cell result.
@@ -1917,10 +1917,12 @@ fn emit_series(results: &Path) -> Result<(), String> {
 
 /// The SHORT host, which is what the shard path is keyed on.
 ///
-/// `HOSTNAME` is frequently the FQDN. Sharding on `devbig014.some.domain` rather
-/// than `devbig014` would put one machine's rows in a different shard depending
+/// `HOSTNAME` is frequently the FQDN. Sharding on `somehost.some.domain` rather
+/// than `somehost` would put one machine's rows in a different shard depending
 /// on how its resolver happened to be configured, so the first label is taken
-/// deliberately rather than incidentally.
+/// deliberately rather than incidentally. The example host is deliberately
+/// generic: scripts/check-portable-paths.sh rejects a literal developer host
+/// anywhere in a tracked build/run file, comments included.
 /// Checks for the series emission mapping.
 ///
 /// Every one of these is a decision that would be invisible in the store if it
