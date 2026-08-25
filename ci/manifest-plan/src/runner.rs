@@ -3572,6 +3572,54 @@ backends_disabled:
     }
 
     #[test]
+    fn failed_preparation_surfaces_its_own_diagnostic() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-preparation-diagnostic-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let cell_dir = root.join("cell");
+        fs::create_dir_all(cell_dir.join("captures")).unwrap();
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: root.join("results"),
+            build_root: root.join("build"),
+            run_id: "fixture".into(),
+            source_sha: "0".repeat(40),
+            source_dirty: false,
+            prebuilt: false,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let error = run_preparation(
+            &context,
+            &cell_dir,
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "printf 'error: failed to write fixture: Permission denied\\n' >&2; exit 17".into(),
+            ],
+            5,
+        )
+        .unwrap_err();
+        assert!(error.contains("fixture preparation failed for /bin/sh: exited 17"));
+        assert!(error.contains("error: failed to write fixture: Permission denied"));
+        assert!(!error.contains("no output was captured"));
+
+        fs::remove_file(cell_dir.join("captures/prepare.stderr")).unwrap();
+        let empty = with_diagnostic(
+            "fixture preparation failed".into(),
+            &cell_dir.join("captures"),
+        );
+        assert!(empty.contains("no output was captured"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn prebuilt_copy_cannot_inherit_or_accept_a_nonexecutable_guest() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-prebuilt-bracket-{}",
