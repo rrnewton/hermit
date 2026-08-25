@@ -753,7 +753,7 @@ fn sabre_unavailable_reason() -> Option<String> {
 
 #[cfg(not(feature = "sabre"))]
 fn sabre_unavailable_reason() -> Option<String> {
-    Some("SaBRe support was not included in this build".to_owned())
+    Some("the `sabre` feature is not enabled in this build; rebuild with `--features sabre` (or `--features third-party-backends`). This says nothing about whether SaBRe works on this machine -- it has not been checked".to_owned())
 }
 
 #[cfg(feature = "e9patch")]
@@ -766,7 +766,7 @@ fn e9patch_unavailable_reason() -> Option<String> {
 
 #[cfg(not(feature = "e9patch"))]
 fn e9patch_unavailable_reason() -> Option<String> {
-    Some("e9patch support was not included in this build".to_owned())
+    Some("the `e9patch` feature is not enabled in this build; rebuild with `--features e9patch` (or `--features third-party-backends`). This says nothing about whether e9patch works on this machine -- it has not been checked".to_owned())
 }
 
 #[cfg(feature = "dbt")]
@@ -783,7 +783,7 @@ fn dbt_unavailable_reason() -> Option<String> {
 #[cfg(not(feature = "dbt"))]
 // TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
 fn dbt_unavailable_reason() -> Option<String> {
-    Some("DBT support was not included in this build".to_owned())
+    Some("the `dbt` feature is not enabled in this build; rebuild with `--features dbt` (or `--features third-party-backends`). This says nothing about whether DynamoRIO works on this machine -- it has not been checked".to_owned())
 }
 
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
@@ -2216,6 +2216,47 @@ pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Resu
 
 #[cfg(test)]
 mod tests {
+
+    /// A build-flag message must not assert a machine condition it never tested.
+    ///
+    /// ⚠️ THIS IS THE FOURTH DIAGNOSTIC TONIGHT THAT NAMED AN UNESTABLISHED CAUSE,
+    /// after the sigpipe checker, the manifest gate and the LiteInst pidfd error.
+    /// "DBT support was not included in this build" reads as "this machine cannot
+    /// run DBT", and cost four or five unnecessary abstentions across the fleet --
+    /// agents declined to make DBT claims on a box where DynamoRIO is installed
+    /// and `--features dbt` builds and runs. The absence is a build flag, and the
+    /// message must say which flag and admit what it did not check.
+    #[test]
+    fn an_unbuilt_backend_names_the_flag_and_claims_nothing_about_the_machine() {
+        for (backend, flag) in [
+            (Backend::Dbt, "dbt"),
+            (Backend::Sabre, "sabre"),
+            (Backend::E9patch, "e9patch"),
+        ] {
+            let Some(reason) = backend.unavailable_reason() else {
+                // Built in on this configuration; nothing to assert.
+                continue;
+            };
+            // ⚠️ KEY THE FILTER ON THE CONDITION, NOT ON THE NEW WORDING. My first
+            // version skipped unless the message already said "not enabled in this
+            // build" -- so reverting to the old "support was not included in this
+            // build" fell through the filter and the test passed. A guard that only
+            // recognises the fixed form cannot catch the regression it exists for.
+            // "build" appears in both wordings and in neither of the runtime ones.
+            if !reason.contains("build") {
+                // Unavailable for a REAL, tested reason (missing runtime, etc.).
+                continue;
+            }
+            assert!(
+                reason.contains(flag),
+                "{backend:?}: a build-flag message must name the flag to rebuild with, got: {reason}"
+            );
+            assert!(
+                reason.contains("has not been checked"),
+                "{backend:?}: a build-flag message must not imply the machine was tested, got: {reason}"
+            );
+        }
+    }
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
