@@ -9,11 +9,63 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# EX_TEMPFAIL. scripts/validate.rs:5365 reserves 75 as "the only nonzero code that
+# is not a product failure", outcome_is_no_result() classifies it `no_result`, and
+# ci/lint-checks-node.sh already exits 75 for the sibling case (uninitialized
+# submodules).
+#
+# ⚠️ SHARING A CODE NEEDS AN ARGUMENT, not just a precedent -- a code shared by two
+# conditions is a collapsed value when they want different reactions. Here a new code
+# is not merely unnecessary, it is UNAVAILABLE: validate.rs recognises exactly one
+# no-result value, so any other number is classified a FAILURE and would reintroduce
+# the false main-red this exists to remove. The two conditions also want the same
+# reaction -- nothing was evaluated, fix the environment, re-run -- and differ only in
+# which fix, which the message carries. The full argument is in ci/lint-checks-node.sh.
+NO_RESULT_EXIT_CODE = 75
+
+
+class NoParentAdapter(RuntimeError):
+    """The dev-hermit parent adapter is not reachable from this checkout.
+
+    ⚠️ THIS IS A SETUP CONDITION, NOT A FINDING, AND THE DISTINCTION IS EXPENSIVE
+    HERE. `run_canonical_adapter_contract(refuse=False)` deliberately exercises the
+    REAL parent adapter -- that is the whole point of the non-refusing arm -- so
+    when the parent is absent the contract cannot be tested at all. It has not
+    failed; it has not passed; it was not evaluated.
+
+    Reported as a failure it manufactures a MAIN-RED, which is a standing P0 here,
+    and it does so from the DEFAULT working layout: agents are told to land from a
+    detached worktree under /tmp, whose ancestors are only /tmp and /. So the false
+    reading is the common one and the true one is the exception. Measured
+    2026-08-25 on clean main from /tmp: the old `next(...)` raised a BARE
+    StopIteration -- no message, no path, nothing naming the directory -- and
+    `make lint-checks` surfaced it as `Error 1`. Telling a precondition from a
+    finding required reading this file's source.
+
+    ⚠️ AND DO NOT "FIX" THIS BY INVENTING A PARENT. Planting a shadow adapter, or
+    falling back to the refusing arm's temporary one, would make the non-refusing
+    arm pass while testing nothing -- a green that means less than the red it
+    replaced. Absence of the parent is a no_result, and only a no_result.
+    """
+
+
+def find_parent_adapter() -> Path | None:
+    """The nearest ancestor carrying the parent ledger adapter, or None.
+
+    Returns rather than raises so the caller decides what absence means. The
+    previous spelling put that decision inside `next()`, which can only raise.
+    """
+    for candidate in ROOT.parents:
+        if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file():
+            return candidate
+    return None
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
 
@@ -335,11 +387,13 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             # Exercise the REAL parent adapter, redirected only through its
             # explicit stop-test root. This proves the producer/consumer
             # contract without appending the machine's authoritative ledger.
-            parent = next(
-                candidate
-                for candidate in ROOT.parents
-                if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file()
-            )
+            parent = find_parent_adapter()
+            if parent is None:
+                raise NoParentAdapter(
+                    "the dev-hermit parent adapter "
+                    "(ci-hub/ledger/validate_rows.py) is not on any ancestor of "
+                    f"{ROOT}"
+                )
         raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
         raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
         env = os.environ.copy()
@@ -483,4 +537,22 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except NoParentAdapter as exc:
+        # Exit 75, not 1: `make lint-checks` and the check.lint_checks DAG node
+        # both treat any nonzero as a failure, and a failure here reads as main
+        # being red. Naming the directory is half the fix -- the old bare
+        # StopIteration named nothing at all.
+        print(
+            f"test_validate_stop_paths: NO RESULT -- {exc}.\n"
+            "  This is a SETUP condition, not a test failure: the canonical-adapter\n"
+            "  contract exercises the REAL parent adapter and there is none reachable\n"
+            f"  from {ROOT}.\n"
+            "  Every other assertion in this file ran and passed; only the two\n"
+            "  canonical-adapter cases were skipped.\n"
+            "  To run them, invoke from a checkout nested under the dev-hermit parent\n"
+            "  (canonically ~/work/dev-hermit/hermit), not from a detached worktree.",
+            file=sys.stderr,
+        )
+        raise SystemExit(NO_RESULT_EXIT_CODE) from None
