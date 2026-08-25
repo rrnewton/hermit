@@ -15,5 +15,5 @@ if ! verify_guest "timestamped date output" "$repo_root/examples/date.sh"; then
   failures=$((failures + 1))
 fi
 
-((failures == 0)) || fail "$failures time/clock target(s) failed strict L2"
+((failures == 0)) || fail "$failures time/clock target(s) failed verification"
 stress_success "time, clocks, sleeps, and timestamps"

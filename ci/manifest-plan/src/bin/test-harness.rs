@@ -355,6 +355,7 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
         &root.join("tests/backend-parity/split_asymmetric_pr.py"),
         &["--self-test"],
     );
+    audit_determinism_stress_evidence(root);
     run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
     // The DBT budget wrapper gates roughly twenty portable nodes and fails
     // CLOSED on a pin it is not calibrated for. Nothing else notices: a
@@ -556,6 +557,21 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
             ));
         }
         fail(format!("{} {} failed", program.display(), args.join(" ")));
+    }
+}
+
+fn audit_determinism_stress_evidence(root: &Path) {
+    let program = root.join("tests/e2e/lib/determinism-stress/common.sh");
+    let status = Command::new(&program)
+        .env("DETERMINISM_STRESS_EVIDENCE_SELF_TEST", "1")
+        .current_dir(root)
+        .status()
+        .unwrap_or_else(|error| fail(format!("cannot execute {}: {error}", program.display())));
+    if !status.success() {
+        fail(format!(
+            "{} failed its comparison-evidence self-test",
+            program.display()
+        ));
     }
 }
 

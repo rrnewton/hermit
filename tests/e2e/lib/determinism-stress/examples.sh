@@ -23,5 +23,5 @@ for example in "${expected[@]}"; do
   fi
 done
 
-((failures == 0)) || fail "$failures example program(s) failed strict L2"
+((failures == 0)) || fail "$failures example program(s) failed verification"
 stress_success "all examples/ programs"

@@ -176,6 +176,10 @@ const PARITY_CANONICALIZATIONS: &[&str] = &[CANON_ADDRESS_ORDINAL_V1];
 pub struct ComparisonSpec {
     /// The strictness label the comparison ran under.
     pub strictness: LogCompareStrictness,
+    /// Human-readable name for the exact comparison policy. Derived in the same
+    /// exhaustive match as the diff flags so evidence cannot name a different
+    /// policy from the one that ran.
+    pub display_name: &'static str,
     /// Whether the internal event stream was compared at all. When
     /// `false` only stdout/stderr/exit status were compared and the strictness
     /// fields describe a log comparison that did not run — a consumer must not
@@ -292,42 +296,60 @@ impl ComparisonSpec {
         // Map the strictness label onto the concrete diff flags AND the versioned
         // policy tokens in one place, so the flags the engine sees, the tokens
         // the verdict reports, and the strictness label can never drift apart.
-        let (strip_lines, canonicalize_addresses, full_trace, exact_remainder, log_scope) =
-            match strictness {
-                // Lossy wholesale normalization: numbers/addresses/paths/timestamps
-                // erased; the remainder is NOT compared exactly.
-                LogCompareStrictness::Stripped => {
-                    debug_assert!(!diagnostic_full_trace);
-                    (true, false, false, false, ComparedLogScope::Deterministic)
-                }
-                // Parity (BitwiseInfoV1): strip only the wall-clock prefix,
-                // canonicalize addresses, and compare every INFO message admitted
-                // by the selected named record envelope exactly.
-                // The explicit verbose diagnostic mode compares the all-level
-                // superset without changing the canonicalization policy.
-                LogCompareStrictness::Canonical => (
+        let (
+            strip_lines,
+            canonicalize_addresses,
+            full_trace,
+            exact_remainder,
+            log_scope,
+            stripped_prefixes,
+            canonicalizations,
+            display_name,
+        ) = match strictness {
+            // Lossy wholesale normalization: numbers/addresses/paths/timestamps
+            // erased; the remainder is NOT compared exactly.
+            LogCompareStrictness::Stripped => {
+                debug_assert!(!diagnostic_full_trace);
+                (
+                    true,
                     false,
-                    true,
-                    true,
-                    true,
-                    if diagnostic_full_trace {
-                        ComparedLogScope::FullTrace
-                    } else {
-                        ComparedLogScope::Info
-                    },
-                ),
-            };
-        let (stripped_prefixes, canonicalizations): (&[&str], &[&str]) = match strictness {
-            LogCompareStrictness::Stripped => (
-                &[STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1],
-                // Under stripping, addresses are ERASED (to a single `<ADDR>`
-                // token), not canonicalized; there is no ordinal preserved.
-                &[],
+                    false,
+                    false,
+                    ComparedLogScope::Deterministic,
+                    &[STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1][..],
+                    // Under stripping, addresses are ERASED (to a single `<ADDR>`
+                    // token), not canonicalized; there is no ordinal preserved.
+                    &[][..],
+                    "Stripped",
+                )
+            }
+            // Canonical parity: strip only the wall-clock prefix,
+            // canonicalize addresses, and compare every INFO message admitted
+            // by the selected named record envelope exactly.
+            // The explicit verbose diagnostic mode compares the all-level
+            // superset without changing the canonicalization policy.
+            LogCompareStrictness::Canonical => (
+                false,
+                true,
+                true,
+                true,
+                if diagnostic_full_trace {
+                    ComparedLogScope::FullTrace
+                } else {
+                    ComparedLogScope::Info
+                },
+                PARITY_STRIPPED_PREFIXES,
+                PARITY_CANONICALIZATIONS,
+                if diagnostic_full_trace {
+                    "BitwiseFullTraceV1"
+                } else {
+                    "BitwiseInfoV1"
+                },
             ),
-            LogCompareStrictness::Canonical => (PARITY_STRIPPED_PREFIXES, PARITY_CANONICALIZATIONS),
         };
         ComparisonSpec {
             strictness,
+            display_name,
             compare_logs,
             compare_io_buffers,
             log_scope,
@@ -1161,6 +1183,73 @@ fn compare_two_runs_with_unsupported_scan(
     }
 }
 
+/// Name only relaxations in the comparison itself. Execution policy such as
+/// time or metadata virtualization remains in the typed report fields; folding
+/// it into this string would make `none` depend on an open-ended list of run
+/// options instead of the comparator contract this evidence describes.
+fn comparison_relaxations(comparison: &ComparisonSpec) -> Option<String> {
+    let policy_shape_matches = match comparison.strictness {
+        LogCompareStrictness::Stripped => {
+            comparison.display_name == "Stripped"
+                && comparison.strip_lines
+                && !comparison.canonicalize_addresses
+                && !comparison.full_trace
+                && !comparison.exact_remainder
+                && comparison.log_scope == ComparedLogScope::Deterministic
+                && comparison.stripped_prefixes
+                    == [STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1]
+                && comparison.canonicalizations.is_empty()
+        }
+        LogCompareStrictness::Canonical => {
+            !comparison.strip_lines
+                && comparison.canonicalize_addresses
+                && comparison.full_trace
+                && comparison.exact_remainder
+                && matches!(
+                    (comparison.log_scope, comparison.display_name),
+                    (ComparedLogScope::Info, "BitwiseInfoV1")
+                        | (ComparedLogScope::FullTrace, "BitwiseFullTraceV1")
+                )
+                && comparison.stripped_prefixes == PARITY_STRIPPED_PREFIXES
+                && comparison.canonicalizations == PARITY_CANONICALIZATIONS
+        }
+    };
+    if !policy_shape_matches
+        || !comparison.record_envelope.is_canonical()
+        || comparison.ignore_lines
+        || comparison.skip_commit
+        || comparison.skip_detlog
+    {
+        return None;
+    }
+
+    let mut relaxations = Vec::new();
+    if comparison.strictness == LogCompareStrictness::Stripped {
+        relaxations.push(STRIP_UNSAFE_NORMALIZATION_V1);
+    }
+    if !comparison.compare_io_buffers {
+        relaxations.push("--no-detlog-io-buffers");
+    }
+    Some(if relaxations.is_empty() {
+        "none".to_owned()
+    } else {
+        relaxations.join(",")
+    })
+}
+
+fn comparison_evidence_line(comparison: &ComparisonSpec) -> Option<String> {
+    if !comparison.compare_logs {
+        return None;
+    }
+    Some(match comparison_relaxations(comparison) {
+        Some(relaxations) => format!(
+            ":: comparison={} relaxations={relaxations}",
+            comparison.display_name
+        ),
+        None => ":: comparison=unknown relaxations=unknown".to_owned(),
+    })
+}
+
 /// Announce a verification verdict only after its machine-readable report has
 /// been published.
 ///
@@ -1172,6 +1261,12 @@ pub fn announce_verification_outcome(
     success_message: &str,
     failure_message: &str,
 ) {
+    // Announce the comparison only after any requested machine-readable report
+    // has been durably published. Output-only fallbacks did not compare an
+    // internal log and therefore must not claim a comparison policy.
+    if let Some(evidence) = comparison_evidence_line(&outcome.comparison) {
+        eprintln!("{evidence}");
+    }
     match outcome.verdict {
         Verdict::Matched => eprintln!(":: {}", success_message.green().bold()),
         Verdict::Diverged => eprintln!(":: {}", failure_message.red().bold()),
@@ -1711,12 +1806,23 @@ mod tests {
             LogCompareStrictness::Stripped,
             true,
             false,
-            false,
+            true,
             RecordEnvelopePolicy::AllRecordsV1,
             true,
         );
         assert!(stripped.strip_lines);
         assert!(!stripped.full_trace);
+        assert_eq!(stripped.display_name, "Stripped");
+        assert_eq!(
+            stripped.stripped_prefixes,
+            [STRIP_WALL_CLOCK_PREFIX_V1, STRIP_UNSAFE_NORMALIZATION_V1]
+        );
+        assert_eq!(
+            comparison_evidence_line(&stripped).as_deref(),
+            Some(
+                ":: comparison=Stripped relaxations=unsafe-numeric-address-and-path-normalization/v1"
+            )
+        );
         assert_eq!(
             stripped.log_comparison_mode(),
             LogComparisonMode::Deterministic
@@ -1734,8 +1840,42 @@ mod tests {
         assert!(canonical.canonicalize_addresses);
         assert!(canonical.exact_remainder);
         assert!(canonical.full_trace);
+        assert_eq!(canonical.display_name, "BitwiseInfoV1");
+        assert_eq!(canonical.stripped_prefixes, PARITY_STRIPPED_PREFIXES);
+        assert_eq!(canonical.canonicalizations, PARITY_CANONICALIZATIONS);
+        assert_eq!(
+            comparison_evidence_line(&canonical).as_deref(),
+            Some(":: comparison=BitwiseInfoV1 relaxations=none")
+        );
         assert_eq!(canonical.log_scope, ComparedLogScope::Info);
         assert_eq!(canonical.log_comparison_mode(), LogComparisonMode::Info);
+
+        let no_io_buffers = ComparisonSpec {
+            compare_io_buffers: false,
+            ..canonical
+        };
+        assert_eq!(
+            comparison_evidence_line(&no_io_buffers).as_deref(),
+            Some(":: comparison=BitwiseInfoV1 relaxations=--no-detlog-io-buffers")
+        );
+
+        let invalid_policy_shape = ComparisonSpec {
+            skip_commit: true,
+            ..canonical
+        };
+        assert_eq!(
+            comparison_evidence_line(&invalid_policy_shape).as_deref(),
+            Some(":: comparison=unknown relaxations=unknown")
+        );
+
+        let invalid_display_name = ComparisonSpec {
+            display_name: "Stripped",
+            ..canonical
+        };
+        assert_eq!(
+            comparison_evidence_line(&invalid_display_name).as_deref(),
+            Some(":: comparison=unknown relaxations=unknown")
+        );
 
         let diagnostic = ComparisonSpec::new(
             LogCompareStrictness::Canonical,
@@ -1746,6 +1886,16 @@ mod tests {
             true,
         );
         assert_eq!(diagnostic.log_scope, ComparedLogScope::FullTrace);
+        assert_eq!(diagnostic.display_name, "BitwiseFullTraceV1");
+        assert_eq!(
+            comparison_evidence_line(&diagnostic).as_deref(),
+            Some(":: comparison=BitwiseFullTraceV1 relaxations=none")
+        );
+        let output_only = ComparisonSpec {
+            compare_logs: false,
+            ..canonical
+        };
+        assert_eq!(comparison_evidence_line(&output_only), None);
         assert_eq!(
             diagnostic.log_comparison_mode(),
             LogComparisonMode::FullTrace
@@ -2352,6 +2502,10 @@ mod tests {
         assert_eq!(
             parsed["comparison"]["strictness"],
             serde_json::json!("canonical")
+        );
+        assert_eq!(
+            parsed["comparison"]["display_name"],
+            serde_json::json!("BitwiseInfoV1")
         );
         assert_eq!(
             parsed["comparison"]["strip_lines"],
