@@ -1693,7 +1693,10 @@ fn apply_pressure_summary(
             .as_ref()
             .and_then(|report| report.first_divergent_syscall);
         if !result.carries_divergence_position()
-            && (turn.is_some() || virtual_nanoseconds.is_some())
+            && (turn.is_some()
+                || virtual_nanoseconds.is_some()
+                || divergent_record.is_some()
+                || divergent_syscall.is_some())
         {
             skipped.push((
                 display_id(&row.cell),
@@ -1736,6 +1739,11 @@ fn apply_pressure_summary(
     }
 
     let prepared_len = prepared.len();
+    let prepared_cells = prepared
+        .iter()
+        .map(|(index, _, _, _, _, _, _)| *index)
+        .collect::<BTreeSet<_>>()
+        .len();
     for (index, result, turn, virtual_nanoseconds, divergent_record, divergent_syscall, invocation) in
         prepared
     {
@@ -1800,14 +1808,10 @@ fn apply_pressure_summary(
                 .then(left.provenance.cmp(&right.provenance))
         });
     }
-    // DISTINCT CELLS, not rows. `seen` is keyed on (cell, repetition), so its
-    // length is the number of runs folded; the caller reports cells.
+    // DISTINCT ADMITTED CELLS, not rows. Skipped rows must not inflate this
+    // count; the caller reports admitted rows, admitted cells, and skips separately.
     Ok(FoldOutcome {
-        cells: seen
-            .iter()
-            .map(|(cell, _)| cell)
-            .collect::<BTreeSet<_>>()
-            .len(),
+        cells: prepared_cells,
         rows: prepared_len,
         skipped,
     })
@@ -3019,10 +3023,11 @@ fn self_test() -> Result<(), String> {
     // single-row summaries, and require the two tracked files to be EQUAL.
     // Anything that entangles rows -- a whole-fold veto, shared mutable state,
     // order dependence -- makes these diverge.
-    let poisoned = PressureSummaryRow {
+    let mut poisoned = PressureSummaryRow {
         evidence_errors: vec!["fixture missing".into()],
         ..pressure_row("determinism-failure", Some(11), Some(110))
     };
+    poisoned.cell.test = "fixture/poisoned".into();
     let batch_rows = vec![
         pressure_repeat(1, "determinism-failure", Some(20), Some(500)),
         poisoned.clone(),
@@ -3075,6 +3080,40 @@ fn self_test() -> Result<(), String> {
             "the two sound rows were not both admitted (rows={})",
             batch_outcome.rows
         ));
+    }
+    if batch_outcome.cells != 1 {
+        return Err(format!(
+            "the skipped cell was counted as merged (cells={})",
+            batch_outcome.cells
+        ));
+    }
+
+    // Every divergence coordinate is guarded by the result class. The record
+    // and syscall fields were added after the original turn/nanosecond check;
+    // omitting either here would let a PASS carry a contradictory divergence.
+    for (label, record, syscall) in
+        [("record", Some(1), None), ("syscall", None, Some(1))]
+    {
+        let mut contradictory = pressure_row("pass", None, None);
+        let verification = contradictory
+            .verification
+            .as_mut()
+            .expect("pressure fixture carries a verification report");
+        verification.first_divergent_record = record;
+        verification.first_divergent_syscall = syscall;
+        if apply_pressure_summary(
+            &mut refusal_target,
+            &pressure_summary("sha-1", "tree-1", vec![contradictory]),
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+        )
+        .is_ok()
+        {
+            return Err(format!(
+                "a pass carrying a divergent {label} was accepted"
+            ));
+        }
     }
 
     // OWNER RULING: A GREEN CELL IS ADMISSIBLE. This bracket used to assert the
