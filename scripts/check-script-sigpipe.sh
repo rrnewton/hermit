@@ -51,6 +51,67 @@ fixture="scripts/lib/tests/sigpipe_smoke.rs"
 command -v rustc >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: rustc is required" >&2; exit 2; }
 command -v realpath >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: realpath is required" >&2; exit 2; }
 command -v cargo >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: cargo is required" >&2; exit 2; }
+
+# Classify the CHECKOUT's submodule state, printing one of:
+#   clean         every submodule is present and at its recorded revision
+#   unpopulated:… one or more submodules were never checked out
+#   wrongrev:…    present, but at a revision other than the recorded gitlink
+#
+# ⚠️ THREE STATES, NOT TWO, AND THEY NEED THREE DIFFERENT ACTIONS. This gate
+# already learned once that "does not compile" is a claim about the CODE while an
+# unresolvable path dependency is a claim about the CHECKOUT (4c92c6b567). The
+# neighbouring case was still collapsed: a submodule that is POPULATED BUT AT THE
+# WRONG REVISION produces perfectly ordinary compile errors -- `struct
+# dagrun::Step has no field named jobs_env` -- so it fell through to "does not
+# compile" and read as a product red. Not hypothetical: it cost the author of the
+# earlier fix a diagnosis cycle on this very script, while knowing about the trap.
+#
+# ⚠️ AND IT DOES NOT USE `git submodule status`, WHICH LIES IN A LINKED WORKTREE.
+# Measured here: with agent-utils populated and checked out at 8b0e2c0f, that
+# command reported `-3ccfd127 agent-utils` -- the '-' meaning NOT CHECKED OUT,
+# for a directory that is plainly checked out, and quoting the recorded revision
+# rather than the actual one. Classifying on that prefix would have reported
+# every wrong-rev submodule as unpopulated and sent the reader to the wrong
+# remedy, which is the same defect this function exists to remove. So the state
+# is derived from three direct facts instead: the recorded gitlink from the
+# index, whether the directory has contents, and the submodule's own HEAD.
+# Takes the generated package manifest, and considers ONLY the submodules that
+# manifest actually depends on.
+#
+# ⚠️ THIS SCOPING IS WHAT STOPS THE FIX BECOMING THE SAME DEFECT INVERTED. This
+# checkout normally has third-party/rr unpopulated, which is fine and expected.
+# An unscoped check would blame it for ANY compile failure in ANY script and turn
+# every genuine red into "check your submodule" -- trading one misleading claim
+# for another. rust-script writes the path dependency into the generated
+# manifest, so a script that needs agent-utils names it there and a script that
+# does not, does not.
+submodule_diagnosis() {
+    local manifest=$1
+    local unpop='' wrong='' path recorded actual
+    while IFS= read -r path; do
+        [[ -n $path ]] || continue
+        grep -q "/$path/" "$manifest" 2>/dev/null || continue
+        recorded=$(git ls-tree HEAD "$path" 2>/dev/null | awk '{print $3}')
+        [[ -n $recorded ]] || continue
+        if [[ -z $(ls -A "$path" 2>/dev/null) ]]; then
+            unpop+=" $path"
+            continue
+        fi
+        actual=$(git -C "$path" rev-parse HEAD 2>/dev/null)
+        if [[ -n $actual && $actual != "$recorded" ]]; then
+            wrong+=" $path"
+        fi
+    done < <(git ls-files --stage | awk '$1 == "160000" {print $4}')
+    if [[ -n $unpop ]]; then
+        printf 'unpopulated:%s' "$unpop"
+    elif [[ -n $wrong ]]; then
+        printf 'wrongrev:%s' "$wrong"
+    else
+        printf 'clean'
+    fi
+}
+
+
 command -v rust-script >/dev/null 2>&1 || { echo "check-script-sigpipe.sh: rust-script is required (cargo install rust-script)" >&2; exit 2; }
 
 tmp="$(mktemp -d)"
@@ -223,8 +284,23 @@ for source in "${entrypoints[@]}"; do
             echo "check-script-sigpipe.sh: REFUSED — cannot build $source because a path" >&2
             echo "  dependency could not be resolved: ${missing_dep:-<see cargo output below>}" >&2
             echo "  THIS IS NOT A COMPILE FAILURE and says nothing about the script." >&2
-            echo "  A submodule is almost certainly unpopulated in this checkout. Run:" >&2
-            echo "      git submodule update --init agent-utils" >&2
+            # No longer a guess: ask the checkout directly. The hedge existed
+            # only because the earlier version had no way to tell.
+            resolved=$(submodule_diagnosis "$package/Cargo.toml")
+            case "$resolved" in
+                unpopulated:*)
+                    echo "  CONFIRMED UNPOPULATED:${resolved#unpopulated:} — never checked out. Run:" >&2
+                    echo "      git submodule update --init${resolved#unpopulated:}" >&2
+                    ;;
+                wrongrev:*)
+                    echo "  The submodule is PRESENT but at the WRONG REVISION:${resolved#wrongrev:}" >&2
+                    echo "      git submodule update --init${resolved#wrongrev:}" >&2
+                    ;;
+                *)
+                    echo "  Submodules look correct, so this is a path-dependency problem of" >&2
+                    echo "  another kind — read the cargo output below rather than assuming." >&2
+                    ;;
+            esac
             echo "  and re-run this gate. Reporting it as 'does not compile' previously" >&2
             echo "  produced a false main-red claim about two scripts that build fine." >&2
             grep -E '^(error|Caused by:)' -A2 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
@@ -233,6 +309,35 @@ for source in "${entrypoints[@]}"; do
             # about why.
             exit 2
         fi
+        # ⚠️ BEFORE CALLING IT A COMPILE FAILURE, ASK WHETHER THE CHECKOUT CAN
+        # SUPPORT THE CLAIM. A submodule at the WRONG REVISION produces ordinary
+        # compile errors -- missing struct fields, unknown methods -- that look
+        # exactly like a broken script. The reader needs `git submodule update`,
+        # not a code fix, and nothing in cargo's output says so.
+        diagnosis=$(submodule_diagnosis "$package/Cargo.toml")
+        case "$diagnosis" in
+            unpopulated:*)
+                echo "check-script-sigpipe.sh: REFUSED — cannot judge $source: submodule(s) UNPOPULATED:${diagnosis#unpopulated:}" >&2
+                echo "  THIS IS NOT A COMPILE FAILURE and says nothing about the script." >&2
+                echo "  The submodule was never checked out. Run:" >&2
+                echo "      git submodule update --init${diagnosis#unpopulated:}" >&2
+                exit 2
+                ;;
+            wrongrev:*)
+                echo "check-script-sigpipe.sh: REFUSED — cannot judge $source: submodule(s) at the WRONG REVISION:${diagnosis#wrongrev:}" >&2
+                echo "  THIS IS NOT A COMPILE FAILURE and says nothing about the script." >&2
+                echo "  The submodule IS present, but at a revision other than the one this" >&2
+                echo "  commit records, so its API does not match what the script expects." >&2
+                echo "  That produces ordinary-looking compile errors. Recorded vs checked out:" >&2
+                for sm in ${diagnosis#wrongrev:}; do
+                    echo "      $sm  recorded=$(git ls-tree HEAD "$sm" | awk '{print $3}')  checked-out=$(git -C "$sm" rev-parse HEAD 2>/dev/null)" >&2
+                done
+                echo "  Run:" >&2
+                echo "      git submodule update --init${diagnosis#wrongrev:}" >&2
+                exit 2
+                ;;
+        esac
+        # Submodules are clean, so a compile failure IS a claim about the code.
         echo "check-script-sigpipe.sh: FAIL — $source does not compile cleanly under clippy" >&2
         grep -E '^(error|warning: unused)' -A4 "$tmp/check.out" >&2 || cat "$tmp/check.out" >&2
         broken+=("$source")
