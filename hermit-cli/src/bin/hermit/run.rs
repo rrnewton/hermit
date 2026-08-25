@@ -2020,9 +2020,12 @@ pub enum GuestProgramFault {
 
 impl GuestProgramFault {
     pub fn exit_code(self) -> i32 {
+        // Named rather than written out, so `tests/cli.rs` can assert the SAME
+        // definition instead of a second copy of the number. Copying it here is
+        // how the internal-failure code went stale in eight tests.
         match self {
-            Self::NotFound => 127,
-            Self::NotExecutable => 126,
+            Self::NotFound => hermit::GUEST_PROGRAM_NOT_FOUND_EXIT,
+            Self::NotExecutable => hermit::GUEST_PROGRAM_NOT_EXECUTABLE_EXIT,
         }
     }
 
