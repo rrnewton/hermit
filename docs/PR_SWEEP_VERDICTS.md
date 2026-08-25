@@ -719,6 +719,99 @@ asserts `injected == requested + 1`, a tighter invariant the branch never had.
 Final verdict on `#2178`: **fully superseded, zero residual** — closed, not
 rebased. The 14 conflicts were never worth resolving.
 
+### 14. A rejection set enumerated as VALUES silently narrows every time the value advances
+
+An assertion of the form "reject these specific inputs" is a test that stops
+testing. Each time the thing it guards moves, the listed values drift further
+from the boundary that matters, and the test keeps passing while checking less.
+It cannot fail for the reason its name gives, and nothing announces the moment
+it went quiet.
+
+**Derive the rejection set from the compatibility rule instead of listing it.**
+
+Measured on `hermit-cli/src/metadata.rs`, the record/replay version gate — which
+exists precisely to stop a build replaying a stream whose schema it does not
+understand. Two instances, which is what makes it a pattern rather than a bug:
+
+| where | assertion | what it actually says at `RECORD_VERSION = 0x10e` |
+|---|---|---|
+| `main` | rejects `0x10a`, `0x10c`, `0x105`, `0x110` | four fixed points, none near the boundary |
+| `#2176` | rejects `0x109` only | true for **every** version except `0x109` |
+
+`#2176`'s is the clearer illustration: `!compatible_with(0x109)` passes at
+`0x10a`, `0x10e`, `0x10f`, `0x999`. The moment the constant leaves `0x109` the
+test runs, passes, and asserts nothing about the schema advance it is named for.
+
+The comparison rule is exact equality, so the property to assert is *every other
+version is refused*. Re-derive the cases from the constant and the window travels
+with it:
+
+```rust
+let current = RECORD_VERSION.0;
+for delta in 1..=16u32 {
+    assert!(!RECORD_VERSION.compatible_with(&RecordVersion(current - delta)));
+    assert!(!RECORD_VERSION.compatible_with(&RecordVersion(current + delta)));
+}
+```
+
+⚠️ **But check what the list was doing BY ACCIDENT before you delete it.**
+`!compatible_with(0x10a)` also fails if someone *sets* `RECORD_VERSION` to
+`0x10a`. A derived window cannot catch that — it re-derives from whatever the
+constant currently says. Replacing the list without replacing that second job
+trades a stale check for a weaker one, which is check-list-shaped goalpost
+moving. Restore it explicitly, and prefer a **compile-time** assertion where both
+sides are constants, because it cannot be skipped, filtered or left unrun:
+
+```rust
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x10e;
+const _: () = assert!(RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION, "...");
+```
+
+The two guards are complementary, and each was demonstrated able to fail at
+exactly what the other misses: regressing the constant `0x10e -> 0x10a` breaks
+the **build** while the derived window passes; relaxing `compatible_with` to
+tolerate one version of drift fails the **window** while the floor passes. If a
+replacement guard cannot be shown to fail where the old one did, it is weaker,
+whatever else it improves.
+
+The hazard is not hypothetical. A long-stale branch that bumped `0x109 -> 0x10a`
+against a base predating `main`'s advance to `0x10e` regresses the constant the
+moment its conflict is resolved by taking the branch side — **and the same hunk
+deletes the enumerated assertion that would have caught it.** The regression and
+the loss of its detector arrive together, neither visible in the other's diff.
+
+Generalises past version gates: any allowlist, denylist, skip list, or
+`backends_disabled` map enumerated as values has this shape.
+
+#### The merge rule this implies: constant FORWARD, set as a UNION
+
+The two halves above are one finding seen from two directions, and the merge rule
+falls out of it. When a branch and `main` have both edited a **monotonic
+constant** and the **set that pins it**:
+
+> Merge the constant **FORWARD** — to the maximum of the two, plus one if either
+> side's schema changed. Merge the pinning set as a **UNION** — every value
+> either side rejects, plus the other side's current value.
+
+Taking one side of *both* is the failure, and it is worse than either alone
+because **it loses a regression and its detector together**. The branch's
+constant is lower, so "theirs" regresses it; the branch's rejection set predates
+`main`'s recent values, so the same resolution deletes precisely the assertion
+that would have gone red. Neither half is visible in the other's diff hunk, and
+the merge is clean — no tool flags it.
+
+Concretely, for the pair above: `0x10f`, not `0x10a`; and a rejection set that
+still refuses `0x10a` and `0x10c` from `main` **and** now refuses `0x10e`.
+Resolving that test by taking either side wholesale is wrong in both directions.
+
+⚠️ **The same shape applies to a rationale comment.** A conflict can resolve
+cleanly while deleting the paragraph that records *why* a value is what it is —
+including an owner ruling written into the code after the branch forked. That is
+not a merge error any tool reports; the result compiles, passes, and has quietly
+lost the reason. When resolving a conflict in a file whose comments carry
+decisions, diff the comment block separately from the code and carry it forward
+deliberately.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
