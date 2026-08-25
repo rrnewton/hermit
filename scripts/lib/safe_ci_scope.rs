@@ -4,6 +4,8 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -17,6 +19,34 @@ use dagrun::cgroup::install_scope_teardown;
 use dagrun::cgroup::is_in_scope;
 use dagrun::cgroup::verify_scope_runtime_max;
 use dagrun::scheduler::BoxedCgroups;
+
+/// True while a check that is EXPECTED to refuse is running.
+///
+/// The self-test drives every refusal path on purpose, so those paths emit
+/// diagnostics on a healthy run. Routing them through a distinct marker keeps
+/// `[safe-ci] ERROR:` meaning "something is actually wrong": a grep, a log
+/// scraper, or a person skimming a green run must not be told it failed.
+static EXPECTED_REFUSAL: AtomicBool = AtomicBool::new(false);
+
+/// The marker for diagnostics emitted while a refusal is being verified.
+fn diag_marker() -> &'static str {
+    if EXPECTED_REFUSAL.load(Ordering::Relaxed) {
+        "[safe-ci] expected-refusal:"
+    } else {
+        "[safe-ci] ERROR:"
+    }
+}
+
+/// Run a check whose refusal is the assertion, not a fault.
+///
+/// Scoped rather than set for the whole self-test: a POSITIVE control inside
+/// the same self-test must still report a genuine fault as ERROR.
+fn expecting_refusal<T>(check: impl FnOnce() -> T) -> T {
+    EXPECTED_REFUSAL.store(true, Ordering::Relaxed);
+    let observed = check();
+    EXPECTED_REFUSAL.store(false, Ordering::Relaxed);
+    observed
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScopeRequirement {
@@ -145,7 +175,8 @@ fn verify_outer_scope_limits_at(scope: &Path, expected_memory_max: i64) -> bool 
     let oom_control = scope.join("memory.oom.group");
     if let Err(error) = fs::write(&oom_control, "1") {
         eprintln!(
-            "[safe-ci] ERROR: outer memory.oom.group=1 write failed at {} ({error})",
+            "{} outer memory.oom.group=1 write failed at {} ({error})",
+            diag_marker(),
             oom_control.display()
         );
         return false;
@@ -165,8 +196,9 @@ fn outer_scope_limit_readback_matches(scope: &Path, expected_memory_max: i64) ->
     let swap_ok = memory_swap_max.as_deref() == Some("0");
     let oom_group_ok = memory_oom_group.as_deref() == Some("1");
     eprintln!(
-        "[safe-ci] outer cgroup audit at {}: memory.max={} ({}), memory.swap.max={} ({}), \
+        "[safe-ci]{} outer cgroup audit at {}: memory.max={} ({}), memory.swap.max={} ({}), \
          memory.oom.group={} ({})",
+        if EXPECTED_REFUSAL.load(Ordering::Relaxed) { " expected-refusal:" } else { "" },
         scope.display(),
         memory_max.as_deref().unwrap_or("UNREADABLE"),
         if memory_ok { "bound" } else { "MISMATCH" },
@@ -180,12 +212,16 @@ fn outer_scope_limit_readback_matches(scope: &Path, expected_memory_max: i64) ->
 
 fn outer_scope_limits_observed(proof: Option<&ContainmentProof>, expected_memory_max: i64) -> bool {
     let Some(proof) = proof else {
-        eprintln!("[safe-ci] ERROR: outer cgroup limit audit has no live containment proof");
+        eprintln!(
+            "{} outer cgroup limit audit has no live containment proof",
+            diag_marker()
+        );
         return false;
     };
     let Some(scope) = promised_scope_ancestor(proof) else {
         eprintln!(
-            "[safe-ci] ERROR: observed cgroup {} has no ancestor matching promised unit {}",
+            "{} observed cgroup {} has no ancestor matching promised unit {}",
+            diag_marker(),
             proof.cgroup.display(),
             proof.unit.as_deref().unwrap_or("<missing>")
         );
@@ -392,11 +428,12 @@ pub fn self_test() -> Result<String, String> {
         if !invocation_owns_promised_scope(&exact_owner) {
             return Err("the exact promised scope did not retain outer teardown ownership".into());
         }
-        if invocation_owns_promised_scope(&proof)
-            || invocation_owns_promised_scope(&scope_supervisor)
-            || invocation_owns_promised_scope(&nested_supervisor)
-            || invocation_owns_promised_scope(&no_promise)
-        {
+        if expecting_refusal(|| {
+            invocation_owns_promised_scope(&proof)
+                || invocation_owns_promised_scope(&scope_supervisor)
+                || invocation_owns_promised_scope(&nested_supervisor)
+                || invocation_owns_promised_scope(&no_promise)
+        }) {
             return Err(
                 "an inherited or unpromised topology claimed outer-scope teardown ownership".into(),
             );
@@ -407,24 +444,24 @@ pub fn self_test() -> Result<String, String> {
 
         let mut missing = proof.clone();
         missing.unit = Some("missing.scope".into());
-        if outer_scope_limits_observed(Some(&missing), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&missing), 104857600)) {
             return Err("a missing promised scope ancestor was accepted".into());
         }
         let mut partial = proof.clone();
         partial.unit = Some("fixture".into());
-        if outer_scope_limits_observed(Some(&partial), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&partial), 104857600)) {
             return Err("a partial promised scope name was accepted".into());
         }
         fs::write(scope.join("memory.max"), "104849408\n")
             .map_err(|error| format!("cannot mutate memory.max fixture: {error}"))?;
-        if outer_scope_limits_observed(Some(&proof), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("a memory.max mismatch was accepted".into());
         }
         fs::remove_file(scope.join("memory.max"))
             .map_err(|error| format!("cannot remove memory.max fixture: {error}"))?;
         fs::create_dir(scope.join("memory.max"))
             .map_err(|error| format!("cannot make memory.max unreadable: {error}"))?;
-        if outer_scope_limits_observed(Some(&proof), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("an unreadable memory.max was accepted".into());
         }
         fs::remove_dir(scope.join("memory.max"))
@@ -433,14 +470,14 @@ pub fn self_test() -> Result<String, String> {
             .map_err(|error| format!("cannot restore memory.max fixture: {error}"))?;
         fs::write(scope.join("memory.swap.max"), "1\n")
             .map_err(|error| format!("cannot mutate memory.swap.max fixture: {error}"))?;
-        if outer_scope_limits_observed(Some(&proof), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("a nonzero outer swap limit was accepted".into());
         }
         fs::remove_file(scope.join("memory.swap.max"))
             .map_err(|error| format!("cannot remove memory.swap.max fixture: {error}"))?;
         fs::create_dir(scope.join("memory.swap.max"))
             .map_err(|error| format!("cannot make memory.swap.max unreadable: {error}"))?;
-        if outer_scope_limits_observed(Some(&proof), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("an unreadable memory.swap.max was accepted".into());
         }
         fs::remove_dir(scope.join("memory.swap.max")).map_err(|error| {
@@ -450,14 +487,14 @@ pub fn self_test() -> Result<String, String> {
             .map_err(|error| format!("cannot restore memory.swap.max fixture: {error}"))?;
         fs::write(scope.join("memory.oom.group"), "0\n")
             .map_err(|error| format!("cannot mutate memory.oom.group fixture: {error}"))?;
-        if outer_scope_limit_readback_matches(&scope, 104857600) {
+        if expecting_refusal(|| outer_scope_limit_readback_matches(&scope, 104857600)) {
             return Err("a zero outer OOM-group readback was accepted".into());
         }
         fs::remove_file(scope.join("memory.oom.group"))
             .map_err(|error| format!("cannot remove OOM-group fixture: {error}"))?;
         fs::create_dir(scope.join("memory.oom.group"))
             .map_err(|error| format!("cannot plant unwritable OOM-group fixture: {error}"))?;
-        if outer_scope_limits_observed(Some(&proof), 104857600) {
+        if expecting_refusal(|| outer_scope_limits_observed(Some(&proof), 104857600)) {
             return Err("an unwritable outer OOM-group control was accepted".into());
         }
         Ok(())
