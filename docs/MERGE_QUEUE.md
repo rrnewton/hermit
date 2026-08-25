@@ -158,6 +158,57 @@ the script's SHA-256 before execution. It never executes a verifier from the PR
 under test; otherwise a PR could authorize itself without changing the gate
 workflow.
 
+## Landing from a linked worktree: two false negatives
+
+Most agents land from `git worktree` checkouts, where two ordinary habits silently
+report the wrong thing. Both cost real time on 2026-08-25.
+
+### `.git/rebase-merge` does not exist in a linked worktree
+
+Checking for an interrupted rebase with
+
+```bash
+ls .git/rebase-merge          # FALSE NEGATIVE in a linked worktree
+```
+
+always reports "no rebase in progress", because a linked worktree keeps its
+per-worktree state elsewhere. The real path is
+
+```bash
+ls "$(git rev-parse --git-dir)/rebase-merge"        # correct anywhere
+# e.g. .git/worktrees/<worktree-name>/rebase-merge
+```
+
+`git rev-parse --git-dir` resolves to the per-worktree directory, so it is right
+in both a normal clone and a worktree. Measured: a completed-but-unswept
+`rebase-merge` left from an earlier branch blocked every subsequent `git rebase`
+in that worktree, while the wrong-path check said there was nothing there.
+
+**Clear it with `git rebase --quit`, not `rm -fr`.** `--quit` abandons the stale
+rebase state without moving `HEAD` or touching stashes; the `rm -fr` the git
+error message suggests is fine only once you have confirmed what is in the
+directory, and its `head-name`/`orig-head`/`onto` files tell you whose rebase it
+was before you delete anyone's work.
+
+### A tailed command hides its own failure, the same way a piped push does
+
+`ci-hub/bin/git-push-verified` exists because `git push ... | tail` reports
+`tail`'s exit status, so a REJECTED push reads as success. The same trick hides a
+failed rebase:
+
+```bash
+git rebase origin/main 2>&1 | tail -1     # may print a fragment of an ERROR
+```
+
+A rebase that aborts prints a multi-line explanation; tailing it can surface a
+harmless-looking last line such as `valuable there.` while the rebase did not
+run at all. The tell is that `HEAD` did not move — check that, not the text.
+
+Read the status of a landing command directly, then **verify by content on the
+remote**: `git fetch` and compare the blobs you meant to change. Exit status
+answers "did the command succeed"; only the remote answers "did the change
+arrive".
+
 ## Repository settings
 
 The `main` branch rulesets must:
