@@ -189,6 +189,101 @@ fn has_any(line: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| line.contains(n))
 }
 
+/// Build-tool / compiler / linker phrasing for a Form-2 denial, in lowercase.
+///
+/// Split out of the old inline test so the same anchors can be applied per BLOCK
+/// (see [`diagnostic_blocks`]) instead of per physical line.
+fn has_toolchain_phrase(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("error: failed to write ")
+        || trimmed.starts_with("rm: cannot remove ")
+        || (line.contains("fatal error: ") && line.matches(':').count() >= 2)
+        || line.contains("cmake error")
+        || has_any(
+            line,
+            &[
+                "cannot open",
+                "error opening",
+                "failed to open",
+                "could not open",
+                "opening dependency file",
+                "could not write output to",
+                "couldn't create the temp file",
+                "can't create",
+                "cannot execute",
+                "could not create temporary file",
+                "failed to build archive at",
+                // MEASURED 2026-08-17, five phrasings of one host condition that
+                // reached a node's output and were classified as product reds:
+                // rustc's incremental link_or_copy step, which says "unable to
+                // copy" where the sibling path says "could not write output to";
+                "unable to copy",
+                // A same-line cargo spawn denial retains the historical
+                // classification. Cross-line matching is narrower and handled
+                // by `has_cross_line_toolchain_phrase` below.
+                "could not execute process",
+                // `cp -a`/`ln -s` refusing to make a link, which "can't create"
+                // above does not spell the same way.
+                "cannot create symbolic link",
+                // The rustc and coreutils anchors are handled above as
+                // line-prefix checks. They MUST NOT use this substring matcher:
+                // guest prose can quote the complete diagnostic text next to a
+                // real EPERM, and that must remain a product red.
+            ],
+        )
+}
+
+/// Tool syntax proven safe to join with a denial elsewhere in the same Cargo
+/// diagnostic block. Generic phrases such as "could not open" stay same-line
+/// only: product prose can contain them above an indented guest EPERM.
+fn has_cross_line_toolchain_phrase(line: &str) -> bool {
+    line.trim_start().starts_with("could not execute process ")
+}
+
+/// Group `lower` into diagnostic blocks: one leading line plus its continuations.
+///
+/// WHY THIS EXISTS. Form 2 used to require the denial phrase and the build-tool
+/// phrase on the SAME physical line. Cargo does not oblige. Measured verbatim:
+///
+/// ```text
+/// error: failed to run custom build command for `libm v0.2.16`
+///
+/// Caused by:
+///   could not execute process .../build-script-build (never executed)
+///
+/// Caused by:
+///   Permission denied (os error 13)
+/// ```
+///
+/// The line carrying the tool phrase has no denial and the line carrying the
+/// denial has no tool phrase, so neither line satisfied both and a host denial
+/// was recorded as a product failure.
+///
+/// WHY THIS DOES NOT WEAKEN THE SCOPING RULE. This does NOT widen the search to
+/// the whole region — that is what would let an unrelated concurrent denial
+/// excuse a real red, and it stays forbidden. A block ends at the next
+/// UNINDENTED line, so a jail banner (`An action was blocked on this server…`,
+/// unindented) always starts its own block and can never be absorbed into a
+/// genuine compiler error's block. A gcc error keeps its indented source excerpt
+/// and nothing else. Continuations are: blank lines, indented lines, and the
+/// bare `Caused by:` header, which is exactly cargo's own error grouping.
+fn diagnostic_blocks(lower: &str) -> Vec<Vec<&str>> {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in lower.lines() {
+        let trimmed = line.trim_start();
+        let continues = trimmed.is_empty()
+            || line.starts_with(' ')
+            || line.starts_with('\t')
+            || trimmed.starts_with("caused by:");
+        if continues && !blocks.is_empty() {
+            blocks.last_mut().expect("checked non-empty").push(line);
+        } else {
+            blocks.push(vec![line]);
+        }
+    }
+    blocks
+}
+
 /// Classify a failed gate's output as an ENVIRONMENTAL block, naming the class.
 ///
 /// Returns `None` for a genuine product/test failure. Misclassifying a real
@@ -269,30 +364,10 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         ) {
             return Some("proxy-egress");
         }
-        if !has_denial(line) {
-            continue;
-        }
-        // Form 2: a banner-less denial reported by a build tool. Anchored on
-        // compiler / build-system / linker phrasing.
-        if (line.contains("fatal error: ") && line.matches(':').count() >= 2)
-            || line.contains("cmake error")
-            || has_any(
-                line,
-                &[
-                    "cannot open",
-                    "error opening",
-                    "failed to open",
-                    "could not open",
-                    "opening dependency file",
-                    "could not write output to",
-                    "couldn't create the temp file",
-                    "can't create",
-                    "cannot execute",
-                    "could not create temporary file",
-                    "failed to build archive at",
-                ],
-            )
-        {
+        // Form 2a: legacy same-line toolchain denial. The conjunction remains
+        // same-line so generic product prose cannot borrow a denial from a later
+        // indented line in its block.
+        if has_denial(line) && has_toolchain_phrase(line) {
             return Some("toolchain-eperm");
         }
         // Form 5 (NEW): a banner-less git FS denial. Requires BOTH a git-fatal
@@ -316,6 +391,17 @@ pub fn environmental_block_class(output: &str) -> Option<&'static str> {
         {
             vcs_hit = true;
         }
+    }
+    // Form 2b: the measured Cargo spawn diagnostic puts its denial in a
+    // continuation line. Only that structural phrase may join evidence across
+    // one diagnostic block; generic legacy phrases remain same-line above.
+    if diagnostic_blocks(&lower).iter().any(|block| {
+        block.iter().any(|line| has_denial(line))
+            && block
+                .iter()
+                .any(|line| has_cross_line_toolchain_phrase(line))
+    }) {
+        return Some("toolchain-eperm");
     }
     if vcs_hit {
         return Some("vcs-fs-denial");
@@ -1383,6 +1469,48 @@ pub fn self_test() -> Result<String, String> {
             "vcs-fs-denial",
             "error: chmod on /tmp/check-reverie-pin-x/.git/config.lock failed: Permission denied",
         ),
+        // NEW class 3: three phrasings of one host condition, all MEASURED on a
+        // jailed dev host on 2026-08-17 and all previously recorded as product
+        // reds. Paths below are shortened; only the phrasing is under test.
+        //
+        // (a) cargo's build-script spawn denial. The tool phrase and the denial
+        //     are on DIFFERENT lines, two `Caused by:` apart; this is the case
+        //     that forced the block scan. Verbatim from build.runtime_release.
+        (
+            "toolchain-eperm",
+            "error: failed to run custom build command for `libm v0.2.16`\n\n\
+             Caused by:\n  \
+             could not execute process /w/target/release/build/libm-a0/build-script-build \
+             (never executed)\n\n\
+             Caused by:\n  \
+             Permission denied (os error 13)",
+        ),
+        // (b) rustc's incremental copy step. One line, but "unable to copy" was
+        //     not an anchor while its sibling "could not write output to" was.
+        (
+            "toolchain-eperm",
+            "error: unable to copy /w/target/debug/incremental/x-1/s-a-working/y.o to \
+             /w/target/debug/deps/x-2.y.rcgu.o: Operation not permitted (os error 1)",
+        ),
+        // (c) a link denial from `cp -a`. Carried the jail banner when measured,
+        //     so Form 1 caught it; this bracket is the banner-less form, which
+        //     "can't create" above does not spell the same way.
+        (
+            "toolchain-eperm",
+            "cp: cannot create symbolic link '/tmp/tmp.zIdYFwxfiQ/detcore/.ignore': \
+             Operation not permitted",
+        ),
+        // (e) coreutils rm refusing to unlink a fixture scratch file.
+        (
+            "toolchain-eperm",
+            "rm: cannot remove '/tmp/tmp.smlR46sit2': Operation not permitted",
+        ),
+        // (d) clippy-driver failing to write a .rmeta, measured in lint.clippy.
+        (
+            "toolchain-eperm",
+            "error: failed to write /w/target/debug/deps/librustbin_futex_and_print-06f5.rmeta: \
+             Operation not permitted (os error 1)",
+        ),
     ];
     let mut accepted = 0usize;
     for (want, text) in accept {
@@ -1414,6 +1542,36 @@ pub fn self_test() -> Result<String, String> {
         "guest wrote: permission denied",
         "guest wrote: cannot create temp file for here-document: Operation not permitted",
         "",
+        // The block scan must not turn a GENUINE compile failure into a retry.
+        // Verbatim cc output from breaking tests/backend-parity/fixtures/
+        // mkdir_rmdir.c on purpose, indented source excerpt and all: no denial
+        // anywhere, so no block can qualify.
+        "/w/tests/backend-parity/fixtures/mkdir_rmdir.c:102:1: error: unknown type name 'this'\n  \
+         102 | this is not valid C and must fail to compile;\n      \
+         | ^~~~\n\
+         collect2: error: ld returned 1 exit status",
+        // A block must not ABSORB an unrelated denial. The compile error and the
+        // stray denial are separate unindented lines, so they are separate
+        // blocks: the error block has no denial and the denial block has no tool
+        // phrase. This is the property that keeps the scoping rule honest.
+        "error[E0308]: mismatched types\n   \
+         expected `u32`, found `i64`\n\
+         Permission denied (os error 13)",
+        // Same shape with the denial in the INDENTED continuation of a product
+        // failure: still refused, because no tool phrase joins it.
+        "error: test harness reported a failure\n  \
+         guest wrote: permission denied",
+        // Guest prose that happens to contain "failed to write" beside a real
+        // EPERM. This is why that one anchor carries the `error: ` prefix.
+        "guest wrote: failed to write /tmp/scratch: Operation not permitted",
+        // Likewise for the exact prefixes: quoting the complete diagnostic
+        // inside guest/product prose must not earn an environmental retry.
+        "guest wrote: cannot remove the lock file: Operation not permitted",
+        "guest wrote: error: failed to write /tmp/scratch: Operation not permitted",
+        "guest wrote: rm: cannot remove /tmp/scratch: Permission denied",
+        // Generic tool-like prose and a denial on different lines in one
+        // indented product block must not qualify for the Cargo-only widening.
+        "test failed: could not open expected output\n  guest errno: Permission denied",
     ];
     let mut refused = 0usize;
     for text in refuse {
@@ -1921,8 +2079,10 @@ pub fn self_test() -> Result<String, String> {
 
     Ok(format!(
         "runtime: environmental classifier bracketed {accepted} accept / {refused} refuse \
-         (incl. the 2 NEW classes), node-detail extraction 1 hit / 2 miss (incl. partial), retry verdict \
-         1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, CPU-vs-wall hints \
+         (incl. the proxy/VCS classes and the 5 measured build-tool phrasings, one of them \
+         spanning a cargo Caused-by block), node-detail extraction 1 hit / 2 miss (incl. partial), \
+         retry verdict 1 confirmed / 1 refuted / 1 unconfirmed with all 3 refuted shapes, \
+         CPU-vs-wall hints \
          2 fire / 2 silent, nesting 1 ancestor-accept / 3 refuse, invocation lock \
          {lock_accept} accept (incl. the sequential re-claim) / {lock_refuse} concurrent-refuse / \
          {lock_safety_refuse} safety-refuse, \

@@ -332,7 +332,9 @@ fn usage() -> &'static str {
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
      \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-6 requalification.\n\
-     \x20 --only <lane> <group.job>[,...]  Run ONE DAG shard (no deps).\n\
+     \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
+     \x20                  declared caps; outside deps are dropped; preflight tags\n\
+     \x20                  reuse validate's canonical preflight nodes.\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
      \x20 --shallow-select              Like --selective but pin the baseline to HEAD~1.\n\
      \x20 --baseline <sha>              Known-green baseline commit for --selective.\n\
@@ -1495,7 +1497,9 @@ fn self_test() -> Result<(), String> {
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
     no_result_propagation_bracket()?;
+    possible_missing_artifact_bracket()?;
     selective_subset_bracket(&root)?;
+    only_plan_bracket(&root)?;
     self_output_bracket()?;
     product_front_door_bracket()?;
     product_front_door_process_bracket()?;
@@ -2330,6 +2334,190 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
          ({} edge(s) pruned); flaky-tests selector reused its manifest producer; \
          full/no-baseline fallback has one acyclic producer; 1 unknown-tag refusal",
         sel.pruned_edges
+    );
+    Ok(())
+}
+
+/// Bracket `--only` against the real portable lane and the real plan builder.
+///
+/// This specifically guards against the historical implementation: a synthetic
+/// `shard.*` step that nested `ci/run-node.sh`, discarded the selected node's
+/// resource contract, and duplicated the lane's manifest producer.
+fn only_plan_bracket(root: &Path) -> Result<(), String> {
+    let lane = "portable";
+    let all = validate_plan::lane_nodes(root, lane, "", "gate.manifest")?;
+    let all_tags: BTreeSet<String> = all.iter().map(|step| step.tag()).collect();
+    let (child, parent) = all
+        .iter()
+        .find_map(|step| {
+            step.deps
+                .iter()
+                .find(|dependency| all_tags.contains(*dependency))
+                .map(|dependency| (step.clone(), dependency.clone()))
+        })
+        .ok_or("only bracket: portable lane has no intra-lane dependency")?;
+    let parent_step = all
+        .iter()
+        .find(|step| step.tag() == parent)
+        .cloned()
+        .ok_or_else(|| format!("only bracket: selected parent {parent} is absent"))?;
+    let selected_tags: BTreeSet<String> = [child.tag(), parent.clone()].into_iter().collect();
+    let args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        format!("{parent},{}", child.tag()),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: CLI refused a valid selection with exit {code}"))?;
+    let plan = build_plan(root, &args, &std::env::temp_dir().join("validate-only-plan"))?;
+    if plan.selection_mode != "only" || plan.suite_complete || plan.second.is_some() {
+        return Err(format!(
+            "only bracket: focused plan authority changed: mode={} complete={} second={}",
+            plan.selection_mode,
+            plan.suite_complete,
+            plan.second.is_some()
+        ));
+    }
+    let tags: Vec<String> = plan.cfg.steps.iter().map(|step| step.tag()).collect();
+    let actual_tags: BTreeSet<String> = tags.iter().cloned().collect();
+    if actual_tags.len() != tags.len() {
+        return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
+    }
+    let mut expected_tags: BTreeSet<String> =
+        validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+            .iter()
+            .map(|step| step.tag())
+            .collect();
+    expected_tags.extend(selected_tags.iter().cloned());
+    if actual_tags != expected_tags {
+        return Err(format!(
+            "only bracket: plan did not contain exactly preflight plus requested nodes: expected={expected_tags:?} actual={actual_tags:?}"
+        ));
+    }
+    if plan.cfg.steps.iter().any(|step| {
+        step.group == "shard" || step.cmd.contains("ci/run-node.sh")
+    }) {
+        return Err("only bracket: selected node was wrapped in a nested runner".into());
+    }
+    for expected in [&parent_step, &child] {
+        let actual = plan
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == expected.tag())
+            .ok_or_else(|| format!("only bracket: selected node {} was dropped", expected.tag()))?;
+        let mut expected_deps: Vec<String> = expected
+            .deps
+            .iter()
+            .filter(|dependency| selected_tags.contains(*dependency))
+            .cloned()
+            .collect();
+        if expected_deps.is_empty() {
+            expected_deps.push("gate.manifest".into());
+        }
+        if actual.deps != expected_deps {
+            return Err(format!(
+                "only bracket: selected node {} has wrong transformed deps: expected={expected_deps:?} actual={:?}",
+                actual.tag(),
+                actual.deps
+            ));
+        }
+        let mut normalized_expected = expected.clone();
+        normalized_expected.deps = expected_deps;
+        if format!("{actual:?}") != format!("{normalized_expected:?}") {
+            return Err(format!(
+                "only bracket: selected node {} did not retain its command/caps: expected={normalized_expected:?} actual={actual:?}",
+                expected.tag()
+            ));
+        }
+    }
+    let actual_child = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == child.tag())
+        .expect("checked above");
+    if !actual_child.deps.contains(&parent) {
+        return Err("only bracket: dependency inside the selection was dropped".into());
+    }
+    let base = validate_plan::lane_config(root, lane)?;
+    validate_plan::assert_config_carried(&base, &plan.cfg)
+        .map_err(|error| format!("only bracket: lane config was not carried: {error}"))?;
+
+    let producer_args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: CLI refused producer selection with exit {code}"))?;
+    let producer_plan = build_plan(
+        root,
+        &producer_args,
+        &std::env::temp_dir().join("validate-only-producer-plan"),
+    )?;
+    let producer_count = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .count();
+    if producer_count != 1 {
+        return Err(format!(
+            "only bracket: manifest producer appeared {producer_count} times, expected once"
+        ));
+    }
+    let producer_tags: BTreeSet<String> = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    let canonical_preflight = validate_plan::preflight_nodes(root, has_cmd("with-proxy"));
+    let preflight_tags: BTreeSet<String> = canonical_preflight
+        .iter()
+        .map(|step| step.tag())
+        .collect();
+    if producer_tags != preflight_tags {
+        return Err(format!(
+            "only bracket: selecting the shared producer admitted non-preflight nodes: {producer_tags:?}"
+        ));
+    }
+    let canonical_producer = canonical_preflight
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .ok_or("only bracket: canonical preflight omitted its manifest producer")?;
+    let planned_producer = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .expect("counted exactly once above");
+    if format!("{planned_producer:?}") != format!("{canonical_producer:?}") {
+        return Err("only bracket: selected producer is not the canonical validate preflight node".into());
+    }
+
+    let unknown_args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        "no.such_node".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: parser refused unknown-tag bracket with exit {code}"))?;
+    let error = build_plan(
+        root,
+        &unknown_args,
+        &std::env::temp_dir().join("validate-only-unknown-plan"),
+    )
+    .err()
+    .ok_or("only bracket: unknown node tag was accepted")?;
+    if !error.contains("unknown node tag") || !error.contains("Selectable tags") {
+        return Err(format!(
+            "only bracket: unknown-tag refusal omitted its diagnosis or choices: {error}"
+        ));
+    }
+    println!(
+        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique"
     );
     Ok(())
 }
@@ -3364,11 +3552,112 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         });
     }
 
-    // Focused single-shard mode: run one already-built DAG shard, no deps.
+    // Focused single-node mode: run the SELECTED lane node(s) as ordinary steps
+    // of THIS run's own boxed DAG.
+    //
+    // This used to synthesise one `shard.<lane>_<node>` wrapper whose command was
+    // `./ci/run-node.sh <lane> <nodes>`, i.e. a SECOND `safe-ci-dag-runner`
+    // underneath the one already driving this run. That nesting broke `--only`
+    // outright, in two separate ways:
+    //
+    //   * The inner runner establishes and then reads back its OWN outer systemd
+    //     scope. Inside validate's scope it does not own one, so the readback of
+    //     MemoryMax/MemorySwapMax/memory.oom.group failed and it refused with
+    //     "the run is not safely contained" — 0s, exit 3, before any work ran.
+    //   * The wrapper invented caps (7200s wall / 7200s CPU / 16 GiB) in place of
+    //     whatever the selected node actually declares, so a node budgeted at 900s
+    //     in the full plan got eight hours here and `--run-timeout` below 7200 was
+    //     refused outright.
+    //
+    // Selecting the real node directly cures both and STRENGTHENS containment:
+    // the node now runs under this run's two-level boxing with per-step cgroups,
+    // carrying its own declared wall/CPU/memory caps, exactly as it does in a full
+    // run. That identity is the whole point of a reproducer — a focused rerun must
+    // reproduce what the full run did to that node, budgets included.
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
         let mut steps = pre;
-        steps.push(shard_node(gate, lane, nodes));
-        let cfg = validate_plan::config_from(steps, "single DAG shard");
+        // Preflight tags already in the plan; naming one is satisfied by the
+        // preflight itself and must not be looked up in the lane file.
+        let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
+        // CARRY the lane's top-level config. `config_from` would substitute
+        // DagConfig::default(), dropping resource_caps and default_step_timeout;
+        // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
+        let base = validate_plan::lane_config(root, lane)?;
+        let mut lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
+        // The lane is independently runnable, so it carries its own manifest-plan
+        // producer. Validate's canonical preflight already carries the same tag
+        // and deliberately owns that producer's validation-time cap. Reuse the
+        // preflight node before filtering; otherwise `--only setup.manifest_plan`
+        // creates a duplicate tag and a consumer selected with the producer keeps
+        // an ambiguous edge. Every non-preflight selected node retains its lane cap.
+        validate_plan::reuse_preflight_manifest_producer(
+            &mut lane_steps,
+            &format!("--only lane {lane}"),
+        )?;
+        let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
+
+        let requested: Vec<String> = nodes
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        if requested.is_empty() {
+            return Err("--only needs at least one <group.job> node tag".into());
+        }
+        // Refuse an unknown tag HERE, naming what is selectable, instead of
+        // letting it travel into a child process that reports it 90s later.
+        let unknown: Vec<&String> = requested
+            .iter()
+            .filter(|t| !available.contains(*t) && !preflight.contains(*t))
+            .collect();
+        if !unknown.is_empty() {
+            let mut known: Vec<&str> = available.iter().map(String::as_str).collect();
+            known.extend(preflight.iter().map(String::as_str));
+            known.sort_unstable();
+            return Err(format!(
+                "--only: unknown node tag(s) in lane {lane}: {}. Selectable tags: {}",
+                unknown.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
+                known.join(", ")
+            ));
+        }
+        let selected: BTreeSet<String> =
+            requested.iter().filter(|t| available.contains(*t)).cloned().collect();
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
+            // Same selection semantics run-node.sh documented for `run --only`:
+            // edges to steps OUTSIDE the selection are dropped (their outputs are
+            // assumed already built), edges AMONG the selection are preserved so a
+            // selected sub-graph still runs in order.
+            dropped.extend(step.deps.iter().filter(|d| !selected.contains(*d)).cloned());
+            step.deps.retain(|d| selected.contains(d));
+            if step.deps.is_empty() {
+                step.deps.push(gate.to_string());
+            }
+            steps.push(step);
+        }
+        // SAY that this mode assumes an already-built tree, and name the build
+        // edges it just dropped. Without this the mode is silent about its own
+        // precondition. A fast exit 127 may mean one of those artifacts is absent,
+        // but it can also mean a missing host tool or a command typo, so both the
+        // pre-run and post-run diagnostics keep that distinction explicit.
+        dropped.remove(gate);
+        if dropped.is_empty() {
+            eprintln!(
+                "validate: --only runs the selected node(s) against the CURRENT tree; \
+                 nothing they depend on is rebuilt first."
+            );
+        } else {
+            eprintln!(
+                "validate: --only assumes an already-built tree. Dropped {} dependency edge(s) \
+                 whose outputs must ALREADY exist: {}. Build them first (or name them in the \
+                 selection). A selected node exiting 127 in ~0s MAY indicate one is absent; \
+                 inspect the node command too, because a missing host tool or typo is also 127.",
+                dropped.len(),
+                dropped.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+        let cfg = validate_plan::config_from_base(&base, steps, "selected DAG node(s)");
         return Ok(Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -4333,22 +4622,12 @@ fn nsswitch_fixture_node(path: &Path) -> dagrun::model::Step {
     )
 }
 
-fn shard_node(gate: &str, lane: &str, nodes: &str) -> dagrun::model::Step {
-    step_with_caps(
-        "shard",
-        &validate_plan::sanitize_job(&format!("{lane}_{}", nodes.replace([',', '.'], "_"))),
-        &format!("DAG shard {lane}:{nodes}"),
-        format!(
-            "./ci/run-node.sh {} {}",
-            validate_plan::shell_quote(lane),
-            validate_plan::shell_quote(nodes)
-        ),
-        vec![gate.to_string()],
-        7200,
-        7200,
-        16 * 1024 * 1024 * 1024,
-    )
-}
+// `shard_node` used to live here: it wrapped the selected node in a synthetic
+// `shard.*` step whose command was `./ci/run-node.sh`, nesting a second
+// safe-ci-dag-runner under this one. See the `Focused::Only` branch in
+// `build_plan` for why that broke `--only` and what replaced it. `ci/run-node.sh`
+// itself is UNCHANGED and still serves the hosted GitHub fan-out, which really
+// does need a standalone runner per shard job.
 
 fn step_with_caps(
     group: &str,
@@ -4682,6 +4961,25 @@ fn verdict_refusals(
 /// partial run into exit zero.
 fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
     if execution_complete { exit_code } else { exit_code.max(1) }
+}
+
+/// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
+/// documented contract deliberately drops build dependencies. It is never a
+/// verdict override and is not inferred for full or other focused profiles.
+fn possible_missing_artifact_nodes<'a>(
+    selection_mode: &str,
+    outcomes: &'a [StepOutcome],
+) -> Vec<&'a str> {
+    if selection_mode != "only" {
+        return Vec::new();
+    }
+    outcomes
+        .iter()
+        .filter(|outcome| {
+            !outcome.ok && outcome.returncode == Some(127) && outcome.duration_s < 5.0
+        })
+        .map(|outcome| outcome.tag.as_str())
+        .collect()
 }
 
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
@@ -8400,6 +8698,40 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn possible_missing_artifact_bracket() -> Result<(), String> {
+    let row = |tag: &str, ok: bool, returncode: Option<i64>, duration_s: f64| StepOutcome {
+        tag: tag.into(),
+        ok,
+        duration_s,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        returncode,
+        reason: String::new(),
+        aborted: false,
+    };
+    let outcomes = vec![
+        row("fixture.missing", false, Some(127), 1.0),
+        row("fixture.slow_127", false, Some(127), 5.0),
+        row("fixture.other_exit", false, Some(126), 1.0),
+        row("fixture.passed", true, Some(0), 1.0),
+    ];
+    if possible_missing_artifact_nodes("only", &outcomes) != vec!["fixture.missing"] {
+        return Err("missing-artifact hint did not select exactly the fast --only exit-127 row".into());
+    }
+    for mode in ["full", "targeted", "selective"] {
+        if !possible_missing_artifact_nodes(mode, &outcomes).is_empty() {
+            return Err(format!(
+                "missing-artifact hint escaped --only into selection mode {mode}"
+            ));
+        }
+    }
+    println!(
+        "  missing-artifact hint: 1 --only candidate / 3 non-qualifying shapes; other profiles silent"
+    );
+    Ok(())
+}
+
 fn no_result_propagation_bracket() -> Result<(), String> {
     let outcome = |tag: &str, returncode: i64, aborted: bool| StepOutcome {
         tag: tag.into(),
@@ -9103,7 +9435,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
                 vec![
                     "force-full policy brackets, shell quoting, corpus counts, super gate table, \
                      envelope scoring/comparison, ledger cache, receipt eligibility, and the \
-                     selective subset builder all passed"
+                     selective/only subset builders all passed"
                         .into(),
                     "policy/data brackets are inert; the cgroup bracket runs only inside a bounded \
                      disposable scope and neither publishes nor writes the real ledger"
@@ -9328,7 +9660,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         let _ = Command::new("git").args(["status", "--short"]).status();
         return RunSummary::refused(
             2,
-            &level_name,
+            &profile_name,
             "the dirty-working-tree gate",
             vec![
                 "HEAD has uncommitted working-tree changes, so a record anchored to it would \
@@ -9350,7 +9682,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             eprintln!("validate: refusing to validate a stale base.\n  {msg}");
             return RunSummary::refused(
                 2,
-                &level_name,
+                &profile_name,
                 "the rebase-freshness gate",
                 msg.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
             );
@@ -9362,7 +9694,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     if let Err(e) = std::fs::create_dir_all(&tmp) {
         return RunSummary::refused(
             2,
-            &level_name,
+            &profile_name,
             "run-state setup",
             vec![format!("cannot create {}: {e}", tmp.display())],
         );
@@ -9374,7 +9706,7 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
             eprintln!("validate: cannot build the execution plan: {e}");
             return RunSummary::refused(
                 2,
-                &level_name,
+                &profile_name,
                 "plan construction",
                 vec![
                     e,
@@ -10199,6 +10531,20 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     } else {
         None
     };
+    // `--only` deliberately drops build dependencies, so a fast 127 there is
+    // useful evidence of an absent prerequisite. It is still a red result and
+    // only a possibility: exit 127 can also mean a missing host tool or typo.
+    let missing_artifact = possible_missing_artifact_nodes(plan.selection_mode, &outcomes);
+    if !missing_artifact.is_empty() {
+        eprintln!(
+            "validate: NOTE: {} --only node(s) exited 127 (command not found) in under 5s: {}. \
+             Because --only drops outside dependencies, this MAY mean a required build artifact \
+             is absent; it remains a RED test/configuration failure. Build the named dependencies \
+             and re-run, or inspect the node command for a missing tool or typo.",
+            missing_artifact.len(),
+            missing_artifact.join(", ")
+        );
+    }
 
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
