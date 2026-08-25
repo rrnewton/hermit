@@ -1426,15 +1426,57 @@ Do not poll it unboundedly and do not infer from it. When it matters, **answer
 the question locally instead** — this needs no API and works from a
 proxy-blocked box:
 
-```console
-git fetch -q <remote> refs/heads/<branch>:h refs/heads/main:m
-git merge-tree --write-tree m h >/dev/null && echo MERGES-CLEAN || echo CONFLICTS
+```bash
+git fetch -q --force <remote> \
+    "refs/heads/<branch>:refs/tmp/mergecheck/head" \
+    "refs/heads/main:refs/tmp/mergecheck/base" \
+  || { echo "FETCH FAILED — not a merge answer" >&2; exit 2; }
+git merge-tree --write-tree refs/tmp/mergecheck/base refs/tmp/mergecheck/head >/dev/null
+case $? in
+  0) echo MERGES-CLEAN ;;
+  1) echo CONFLICTS ;;
+  *) echo "merge-tree ERROR — not a merge answer" >&2; exit 2 ;;
+esac
 ```
 
 That computes the same thing GitHub is computing, from objects you already have,
 with an exit status you can read directly. `mergeable` is then a convenience to
 be believed when it says `MERGEABLE` or `CONFLICTING`, and ignored when it does
 not.
+
+⚠️ **THREE DETAILS OF THAT RECIPE ARE LOAD-BEARING, AND THE OBVIOUS SHORTER FORM
+LIES IN BOTH DIRECTIONS.** This section landed first with
+`git fetch -q <remote> refs/heads/<branch>:h refs/heads/main:m` followed by
+`git merge-tree --write-tree m h >/dev/null && echo MERGES-CLEAN || echo CONFLICTS`.
+Measured on git 2.53.0, that form:
+
+- **printed `CONFLICTS` for a ref that does not exist.** `merge-tree --write-tree`
+  exits **1 for a real conflict and 1 for a bad ref alike**, so a typo'd or
+  deleted branch is indistinguishable from a genuine conflict. Hence the `case`
+  on the exit code rather than `&&`/`||`, and hence checking the fetch first —
+  once both refs are known to exist and be fresh, `1` really does mean conflict.
+- **printed `MERGES-CLEAN` about a base it never fetched.** `:h` and `:m` are
+  unqualified destinations, so they resolve to *local branches*. With a
+  pre-existing local `m`, the update is not fast-forward, **fetch refuses it,
+  `-q` hides the message, the unchecked exit status is discarded, and
+  `merge-tree` then answers about the ref the user already had** — measured
+  output `fetch exit=1`, `m` still at the user's own commit, recipe prints
+  `MERGES-CLEAN`. Hence `--force`, the namespaced `refs/tmp/mergecheck/*`, and
+  the `||` on the fetch.
+- **left two stray branches** named `h` and `m` in the reader's repository.
+
+All three outcomes of the corrected form, measured in the same clone that broke
+the original:
+
+    conflicting     -> CONFLICTS
+    feat (clean)    -> MERGES-CLEAN
+    no-such-branch  -> FETCH FAILED — not a merge answer
+
+⚠️ **The general rule, which is this document's own and was violated by its own
+recipe: an exit code is a claim about the environment as much as about the code.**
+A block offered as the reliable answer to a question the API answers unreliably
+has to be at least as trustworthy as what it replaces, and `MERGES-CLEAN` about a
+base you never fetched is worse than the `UNKNOWN` it was written to replace.
 
 ⚠️ **It also goes BACKWARDS, so a good reading is not durable either.**
 hermit#2587 read `MERGEABLE/CLEAN` at t+20s and `UNKNOWN/UNKNOWN` again a few
