@@ -212,6 +212,20 @@ fn should_tag_sabre_internal_pipe_io(
         && !logically_nonblocking
 }
 
+fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, Errno> {
+    if status_flags & OFlag::O_PATH.bits() != 0 {
+        return Err(Errno::EBADF);
+    }
+    match whence {
+        Whence::SEEK_SET
+        | Whence::SEEK_CUR
+        | Whence::SEEK_END
+        | Whence::SEEK_DATA
+        | Whence::SEEK_HOLE => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -1448,17 +1462,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Lseek,
     ) -> Result<i64, Error> {
         let timer_slack_binding = self.timer_slack_binding(guest, call.fd())?;
-        if timer_slack_binding.is_some() {
-            let status_flags = guest
-                .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.status_flags())?;
-            if status_flags & libc::O_PATH != 0 {
-                return Err(Errno::EBADF.into());
-            }
+        let (fd_type, status_flags, procfs_position) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (detfd.ty(), detfd.status_flags(), detfd.procfs_position())
+            })?;
+        if fd_type == FdType::Rng {
+            return random_device_lseek_result(status_flags, call.whence()).map_err(Into::into);
         }
-        let procfs_position = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position())?;
+        if timer_slack_binding.is_some() && status_flags & libc::O_PATH != 0 {
+            return Err(Errno::EBADF.into());
+        }
         let Some((current, snapshot_len)) = procfs_position else {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#1044): Regular-file lseek must
@@ -4030,6 +4043,8 @@ mod procfs_wiring_guard {
 #[cfg(test)]
 mod test {
     use nix::fcntl::OFlag;
+    use reverie::syscalls::FromToRaw;
+    use reverie::syscalls::Whence;
 
     use super::Errno;
     use super::TimerSlackBinding;
@@ -4037,6 +4052,7 @@ mod test {
     use super::canonicalize_tcp_info;
     use super::classify_timer_slack_binding;
     use super::parse_timer_slack_write;
+    use super::random_device_lseek_result;
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
@@ -4083,6 +4099,37 @@ mod test {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn random_device_lseek_matches_linux_noop_llseek() {
+        for whence in [
+            Whence::SEEK_SET,
+            Whence::SEEK_CUR,
+            Whence::SEEK_END,
+            Whence::SEEK_DATA,
+            Whence::SEEK_HOLE,
+        ] {
+            for status_flags in [
+                OFlag::empty().bits(),
+                OFlag::O_WRONLY.bits(),
+                OFlag::O_RDWR.bits(),
+            ] {
+                assert_eq!(random_device_lseek_result(status_flags, whence), Ok(0));
+            }
+            assert_eq!(
+                random_device_lseek_result(OFlag::O_PATH.bits(), whence),
+                Err(Errno::EBADF)
+            );
+        }
+        assert_eq!(
+            random_device_lseek_result(OFlag::empty().bits(), Whence::from_raw(99)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            random_device_lseek_result(OFlag::O_PATH.bits(), Whence::from_raw(99)),
+            Err(Errno::EBADF)
+        );
     }
 
     #[test]
