@@ -5,21 +5,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Determinize socket inode numbers in `NETLINK_SOCK_DIAG` dump replies.
+//! Determinize socket identities in `NETLINK_SOCK_DIAG` dump replies.
 //!
 //! Tools such as `ss` enumerate sockets over an `AF_NETLINK`/`NETLINK_SOCK_DIAG`
 //! socket and receive a binary, multipart `nlmsghdr`-framed reply. Each
 //! `SOCK_DIAG_BY_FAMILY` message carries a family-specific body whose socket
-//! inode number (`udiag_ino` for `AF_UNIX`, `ndiag_ino` for `AF_NETLINK`) is
-//! assigned by a host-global kernel counter and therefore differs on every run.
+//! inode number (`udiag_ino` for `AF_UNIX`, `ndiag_ino` for `AF_NETLINK`) and
+//! the two-word socket cookie are assigned by host-global kernel state and
+//! therefore differ on every run.
 //! `AF_UNIX` bodies additionally carry a `UNIX_DIAG_PEER` attribute holding the
 //! peer socket's inode. Those numbers leak into guest-visible output (for
 //! example `ss -a`), breaking `--strict --verify`.
 //!
 //! detcore already zeroes the same inodes in the procfs *text* interfaces
 //! (`/proc/net/unix`, `/proc/net/netlink`; see `crate::procfs`). This module
-//! applies the identical zeroing to the *binary* `SOCK_DIAG` path so both paths
-//! agree.
+//! removes those inodes and the binary-only socket cookies from the
+//! `SOCK_DIAG` path so neither interface leaks host socket identities.
 //!
 //! The parser is deliberately pure and fail-open: on any framing inconsistency
 //! it leaves the buffer untouched (mirroring the procfs sanitizers' fail-open
@@ -43,6 +44,8 @@ const SOCK_DIAG_BY_FAMILY: u16 = 20;
 
 /// Offset of `udiag_ino` within `struct unix_diag_msg`.
 const UNIX_DIAG_INO_OFFSET: usize = 4;
+/// Offset of `udiag_cookie` within `struct unix_diag_msg`.
+const UNIX_DIAG_COOKIE_OFFSET: usize = 8;
 /// `sizeof(struct unix_diag_msg)` — attributes begin immediately after.
 const UNIX_DIAG_MSG_LEN: usize = 16;
 /// `UNIX_DIAG_PEER` attribute type (payload is the peer's `__u32` inode).
@@ -50,6 +53,15 @@ const UNIX_DIAG_PEER: u16 = 2;
 
 /// Offset of `ndiag_ino` within `struct netlink_diag_msg`.
 const NETLINK_DIAG_INO_OFFSET: usize = 16;
+/// Offset of `ndiag_cookie` within `struct netlink_diag_msg`.
+const NETLINK_DIAG_COOKIE_OFFSET: usize = 20;
+/// `sizeof(struct netlink_diag_msg)`.
+const NETLINK_DIAG_MSG_LEN: usize = 28;
+
+/// Offset of `idiag_cookie` within `struct inet_diag_msg`, shared by `AF_INET`
+/// and `AF_INET6`: four leading bytes followed by the first 40 bytes of
+/// `struct inet_diag_sockid`.
+const INET_DIAG_COOKIE_OFFSET: usize = 44;
 
 /// Offset of `idiag_inode` within `struct inet_diag_msg`, shared by `AF_INET`
 /// and `AF_INET6`: four leading bytes, then a 48-byte `inet_diag_sockid`, then
@@ -58,14 +70,22 @@ const NETLINK_DIAG_INO_OFFSET: usize = 16;
 /// Confirmed against the installed headers rather than counted by hand --
 /// `offsetof(struct inet_diag_msg, idiag_inode)` is 68 and `sizeof` is 72.
 const INET_DIAG_INO_OFFSET: usize = 68;
+/// `sizeof(struct inet_diag_msg)`.
+const INET_DIAG_MSG_LEN: usize = 72;
 
-/// Zero every socket inode number in a `NETLINK_SOCK_DIAG` multipart reply.
+/// Each socket cookie is two adjacent `u32` words.
+const SOCK_DIAG_COOKIE_LEN: usize = 8;
+
+/// Zero every host-assigned socket identity in a `NETLINK_SOCK_DIAG` reply.
 ///
-/// Returns `true` when `buf` was rewritten (at least one non-zero inode was
+/// This includes inode numbers, two-word socket cookies, and `UNIX_DIAG_PEER`
+/// inode attributes.
+///
+/// Returns `true` when `buf` was rewritten (at least one non-zero identity was
 /// zeroed) and the stream parsed consistently. Returns `false` — leaving `buf`
 /// unchanged — when the bytes do not match the expected netlink framing
-/// (fail-open) or when there were no non-zero inodes to zero.
-pub fn sanitize_sock_diag_inodes(buf: &mut [u8]) -> bool {
+/// (fail-open) or when there were no non-zero identities to zero.
+pub fn sanitize_sock_diag_identities(buf: &mut [u8]) -> bool {
     match rewritten(buf) {
         Some(next) => {
             buf.copy_from_slice(&next);
@@ -88,7 +108,7 @@ struct Span {
     bytes: Vec<u8>,
 }
 
-/// Parse the multipart stream, zeroing inode fields and canonicalizing the
+/// Parse the multipart stream, zeroing identity fields and canonicalizing the
 /// order of the diag messages. Returns `Some(copy)` when it parsed consistently
 /// and changed something, otherwise `None` (fail-open / nothing to do).
 fn rewritten(buf: &[u8]) -> Option<Vec<u8>> {
@@ -123,12 +143,12 @@ fn rewritten(buf: &[u8]) -> Option<Vec<u8>> {
 
     let mut modified = false;
 
-    // Zero the socket inode numbers inside every diag message.
+    // Zero the host-assigned socket identities inside every diag message.
     for span in &mut spans {
         if span.nlmsg_type == SOCK_DIAG_BY_FAMILY {
             let end = span.nlmsg_len.min(span.bytes.len());
             if NLMSG_HDRLEN < end {
-                zero_family_inodes(&mut span.bytes, NLMSG_HDRLEN, end, &mut modified);
+                zero_family_identities(&mut span.bytes, NLMSG_HDRLEN, end, &mut modified);
             }
         }
     }
@@ -181,22 +201,53 @@ fn rewritten(buf: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Zero the inode field(s) of one `SOCK_DIAG_BY_FAMILY` body, dispatched on the
-/// address family stored in its first byte. Bounds are always re-checked; an
-/// unknown or truncated family is left untouched.
-fn zero_family_inodes(out: &mut [u8], body: usize, end: usize, modified: &mut bool) {
+/// Zero the identity field(s) of one `SOCK_DIAG_BY_FAMILY` body, dispatched on
+/// the address family stored in its first byte. The complete fixed-size family
+/// body must be present before any field is changed, so an unknown or truncated
+/// family is left untouched.
+fn zero_family_identities(out: &mut [u8], body: usize, end: usize, modified: &mut bool) {
     let family = out[body] as i32;
     match family {
         libc::AF_UNIX => {
+            if !fixed_body_is_present(body, UNIX_DIAG_MSG_LEN, end, out.len()) {
+                return;
+            }
             zero_u32(out, body + UNIX_DIAG_INO_OFFSET, end, modified);
+            zero_bytes(
+                out,
+                body + UNIX_DIAG_COOKIE_OFFSET,
+                SOCK_DIAG_COOKIE_LEN,
+                end,
+                modified,
+            );
             zero_unix_peer_attrs(out, body + UNIX_DIAG_MSG_LEN, end, modified);
         }
         libc::AF_NETLINK => {
+            if !fixed_body_is_present(body, NETLINK_DIAG_MSG_LEN, end, out.len()) {
+                return;
+            }
             zero_u32(out, body + NETLINK_DIAG_INO_OFFSET, end, modified);
+            zero_bytes(
+                out,
+                body + NETLINK_DIAG_COOKIE_OFFSET,
+                SOCK_DIAG_COOKIE_LEN,
+                end,
+                modified,
+            );
         }
         // `ss -t`/`ss -u` and anything else reading the socket table. Both
         // families share `struct inet_diag_msg`, so they share the offset.
         libc::AF_INET | libc::AF_INET6 => {
+            if !fixed_body_is_present(body, INET_DIAG_MSG_LEN, end, out.len()) {
+                return;
+            }
+            zero_bytes(
+                out,
+                body + INET_DIAG_COOKIE_OFFSET,
+                SOCK_DIAG_COOKIE_LEN,
+                end,
+                modified,
+            );
             zero_u32(out, body + INET_DIAG_INO_OFFSET, end, modified);
         }
         // AF_VSOCK and AF_XDP also register socket-diag handlers on this
@@ -209,6 +260,11 @@ fn zero_family_inodes(out: &mut [u8], body: usize, end: usize, modified: &mut bo
         // acknowledged gap. Add them alongside a populated dump, not before.
         _ => {}
     }
+}
+
+fn fixed_body_is_present(body: usize, len: usize, end: usize, buffer_len: usize) -> bool {
+    body.checked_add(len)
+        .is_some_and(|body_end| body_end <= end && body_end <= buffer_len)
 }
 
 /// Walk the routing attributes trailing a `unix_diag_msg`, zeroing the peer
@@ -234,8 +290,19 @@ fn zero_unix_peer_attrs(out: &mut [u8], mut attr: usize, end: usize, modified: &
 
 /// Zero the `u32` at `at` when it is fully in bounds and currently non-zero.
 fn zero_u32(out: &mut [u8], at: usize, end: usize, modified: &mut bool) {
-    if at + 4 <= end && at + 4 <= out.len() && out[at..at + 4] != [0, 0, 0, 0] {
-        out[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+    zero_bytes(out, at, 4, end, modified);
+}
+
+/// Zero an exact byte range when it is fully in bounds and currently non-zero.
+fn zero_bytes(out: &mut [u8], at: usize, len: usize, end: usize, modified: &mut bool) {
+    let Some(range_end) = at.checked_add(len) else {
+        return;
+    };
+    if range_end <= end
+        && range_end <= out.len()
+        && out[at..range_end].iter().any(|&byte| byte != 0)
+    {
+        out[at..range_end].fill(0);
         *modified = true;
     }
 }
@@ -259,15 +326,17 @@ mod tests {
     }
 
     /// A `unix_diag_msg` (16 bytes) followed by a `UNIX_DIAG_PEER` attribute.
-    fn unix_diag_body(ino: u32, peer_ino: u32) -> Vec<u8> {
+    fn unix_diag_body(ino: u32, cookie: [u32; 2], peer_ino: u32) -> Vec<u8> {
         let mut body = vec![
             libc::AF_UNIX as u8, // udiag_family
-            0,                   // udiag_type
+            0x5a,                // udiag_type sentinel
             1,                   // udiag_state
-            0,                   // pad
+            0xa5,                // pad sentinel
         ];
         body.extend_from_slice(&ino.to_ne_bytes()); // udiag_ino
-        body.extend_from_slice(&[0u8; 8]); // udiag_cookie[2]
+        for word in cookie {
+            body.extend_from_slice(&word.to_ne_bytes()); // udiag_cookie[2]
+        }
         assert_eq!(body.len(), UNIX_DIAG_MSG_LEN);
         // UNIX_DIAG_PEER attribute: rta_len, rta_type, u32 payload.
         let rta_len = (RTA_HDRLEN + 4) as u16;
@@ -277,20 +346,34 @@ mod tests {
         body
     }
 
-    /// A `netlink_diag_msg` with `ndiag_ino` at offset 16.
-    fn netlink_diag_body(ino: u32) -> Vec<u8> {
+    /// A complete `netlink_diag_msg`.
+    fn netlink_diag_body(ino: u32, cookie: [u32; 2]) -> Vec<u8> {
         let mut body = vec![
             libc::AF_NETLINK as u8, // ndiag_family
-            0,                      // ndiag_type
-            0,                      // ndiag_protocol
+            0x5a,                   // ndiag_type sentinel
+            0xa5,                   // ndiag_protocol sentinel
             1,                      // ndiag_state
         ];
         body.extend_from_slice(&0x4000_0000u32.to_ne_bytes()); // ndiag_portid
-        body.extend_from_slice(&0u32.to_ne_bytes()); // ndiag_dst_portid
-        body.extend_from_slice(&0u32.to_ne_bytes()); // ndiag_dst_group
+        body.extend_from_slice(&0x2233_4455u32.to_ne_bytes()); // ndiag_dst_portid
+        body.extend_from_slice(&0x6677_8899u32.to_ne_bytes()); // ndiag_dst_group
         body.extend_from_slice(&ino.to_ne_bytes()); // ndiag_ino
-        body.extend_from_slice(&[0u8; 8]); // ndiag_cookie[2]
-        assert_eq!(body.len(), NETLINK_DIAG_INO_OFFSET + 4 + 8);
+        for word in cookie {
+            body.extend_from_slice(&word.to_ne_bytes()); // ndiag_cookie[2]
+        }
+        assert_eq!(body.len(), NETLINK_DIAG_MSG_LEN);
+        body
+    }
+
+    /// A complete `inet_diag_msg` with non-identity bytes left as sentinels.
+    fn inet_diag_body(family: i32, ino: u32, cookie: [u32; 2]) -> Vec<u8> {
+        let mut body = vec![0xa5; INET_DIAG_MSG_LEN];
+        body[0] = family as u8;
+        for (index, word) in cookie.into_iter().enumerate() {
+            let at = INET_DIAG_COOKIE_OFFSET + index * 4;
+            body[at..at + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        body[INET_DIAG_INO_OFFSET..INET_DIAG_INO_OFFSET + 4].copy_from_slice(&ino.to_ne_bytes());
         body
     }
 
@@ -298,43 +381,68 @@ mod tests {
         u32::from_ne_bytes(buf[at..at + 4].try_into().unwrap())
     }
 
+    fn assert_only_identity_ranges_are_zeroed(
+        mut body: Vec<u8>,
+        identity_ranges: &[(usize, usize)],
+    ) {
+        let mut expected = body.clone();
+        for &(start, len) in identity_ranges {
+            expected[start..start + len].fill(0);
+        }
+        let mut modified = false;
+        let end = body.len();
+        zero_family_identities(&mut body, 0, end, &mut modified);
+        assert!(modified);
+        assert_eq!(body, expected, "non-identity sentinel bytes changed");
+    }
+
     #[test]
-    fn zeroes_unix_and_netlink_inodes_and_peer() {
+    fn zeroes_unix_and_netlink_identities_and_peer() {
         let mut buf = Vec::new();
         push_message(
             &mut buf,
             SOCK_DIAG_BY_FAMILY,
-            &unix_diag_body(0x1122_3344, 0x5566_7788),
+            &unix_diag_body(0x1122_3344, [0x0102_0304, 0x0506_0708], 0x5566_7788),
         );
         let unix_body = NLMSG_HDRLEN;
         let netlink_start = buf.len();
         push_message(
             &mut buf,
             SOCK_DIAG_BY_FAMILY,
-            &netlink_diag_body(0x99aa_bbcc),
+            &netlink_diag_body(0x99aa_bbcc, [0x1112_1314, 0x1516_1718]),
         );
         // A trailing NLMSG_DONE (type 3) as real dumps emit.
         push_message(&mut buf, 3, &0i32.to_ne_bytes());
 
-        // Preconditions: inodes are the non-zero host values.
         assert_eq!(
             read_u32(&buf, unix_body + UNIX_DIAG_INO_OFFSET),
             0x1122_3344
         );
+        assert_eq!(
+            read_u32(&buf, unix_body + UNIX_DIAG_COOKIE_OFFSET),
+            0x0102_0304
+        );
 
-        assert!(sanitize_sock_diag_inodes(&mut buf));
+        assert!(sanitize_sock_diag_identities(&mut buf));
 
-        // unix udiag_ino zeroed.
         assert_eq!(read_u32(&buf, unix_body + UNIX_DIAG_INO_OFFSET), 0);
-        // UNIX_DIAG_PEER inode zeroed (attr payload after the 16-byte struct + 4-byte rta header).
+        assert_eq!(
+            &buf[unix_body + UNIX_DIAG_COOKIE_OFFSET
+                ..unix_body + UNIX_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN],
+            &[0; SOCK_DIAG_COOKIE_LEN]
+        );
         assert_eq!(
             read_u32(&buf, unix_body + UNIX_DIAG_MSG_LEN + RTA_HDRLEN),
             0
         );
-        // netlink ndiag_ino zeroed; portid (offset 4) preserved.
         assert_eq!(
             read_u32(&buf, netlink_start + NLMSG_HDRLEN + NETLINK_DIAG_INO_OFFSET),
             0
+        );
+        assert_eq!(
+            &buf[netlink_start + NLMSG_HDRLEN + NETLINK_DIAG_COOKIE_OFFSET
+                ..netlink_start + NLMSG_HDRLEN + NETLINK_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN],
+            &[0; SOCK_DIAG_COOKIE_LEN]
         );
         assert_eq!(
             read_u32(&buf, netlink_start + NLMSG_HDRLEN + 4),
@@ -343,13 +451,80 @@ mod tests {
     }
 
     #[test]
+    fn preserves_non_identity_sentinels_for_every_supported_family() {
+        assert_only_identity_ranges_are_zeroed(
+            unix_diag_body(0x1122_3344, [0x0102_0304, 0x0506_0708], 0x5566_7788),
+            &[
+                (UNIX_DIAG_INO_OFFSET, 4),
+                (UNIX_DIAG_COOKIE_OFFSET, SOCK_DIAG_COOKIE_LEN),
+                (UNIX_DIAG_MSG_LEN + RTA_HDRLEN, 4),
+            ],
+        );
+        assert_only_identity_ranges_are_zeroed(
+            netlink_diag_body(0x1122_3344, [0x0102_0304, 0x0506_0708]),
+            &[
+                (NETLINK_DIAG_INO_OFFSET, 4),
+                (NETLINK_DIAG_COOKIE_OFFSET, SOCK_DIAG_COOKIE_LEN),
+            ],
+        );
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            assert_only_identity_ranges_are_zeroed(
+                inet_diag_body(family, 0x1122_3344, [0x0102_0304, 0x0506_0708]),
+                &[
+                    (INET_DIAG_COOKIE_OFFSET, SOCK_DIAG_COOKIE_LEN),
+                    (INET_DIAG_INO_OFFSET, 4),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_family_bodies_are_left_untouched() {
+        let cases = [
+            (
+                unix_diag_body(1, [2, 3], 4),
+                UNIX_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN - 1,
+                UNIX_DIAG_MSG_LEN - 1,
+            ),
+            (
+                netlink_diag_body(1, [2, 3]),
+                NETLINK_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN - 1,
+                NETLINK_DIAG_MSG_LEN - 1,
+            ),
+            (
+                inet_diag_body(libc::AF_INET, 1, [2, 3]),
+                INET_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN - 1,
+                INET_DIAG_MSG_LEN - 1,
+            ),
+            (
+                inet_diag_body(libc::AF_INET6, 1, [2, 3]),
+                INET_DIAG_COOKIE_OFFSET + SOCK_DIAG_COOKIE_LEN - 1,
+                INET_DIAG_MSG_LEN - 1,
+            ),
+        ];
+        for (full, cookie_truncation, fixed_body_truncation) in cases {
+            for truncated_len in [cookie_truncation, fixed_body_truncation] {
+                let mut truncated = full[..truncated_len].to_vec();
+                let original = truncated.clone();
+                let mut modified = false;
+                let end = truncated.len();
+                zero_family_identities(&mut truncated, 0, end, &mut modified);
+                assert!(!modified, "family={} len={truncated_len}", full[0]);
+                assert_eq!(
+                    truncated, original,
+                    "family={} len={truncated_len}",
+                    full[0]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn canonicalizes_diag_message_order() {
-        // Two netlink diag messages in "wrong" order followed by NLMSG_DONE.
-        // ndiag_ino differs so, after zeroing, they still differ by portid and
-        // must sort into a stable order regardless of arrival order.
-        let hi = netlink_diag_body(0x1111_1111); // portid 0x40000000 (fixed in helper)
-        let mut lo = netlink_diag_body(0x2222_2222);
-        // Give `lo` a smaller portid so it sorts first after inode zeroing.
+        let hi = netlink_diag_body(0x1111_1111, [0xaaaa_aaaa, 0xbbbb_bbbb]);
+        let mut lo = netlink_diag_body(0x2222_2222, [0xcccc_cccc, 0xdddd_dddd]);
+        // Give `lo` a smaller stable portid; inode and cookie fields must be
+        // zero before these messages are compared and sorted.
         lo[4..8].copy_from_slice(&0x1000_0000u32.to_ne_bytes());
 
         let build = |first: &[u8], second: &[u8]| {
@@ -362,28 +537,27 @@ mod tests {
 
         let mut forward = build(&lo, &hi);
         let mut reverse = build(&hi, &lo);
-        assert!(sanitize_sock_diag_inodes(&mut forward));
-        assert!(sanitize_sock_diag_inodes(&mut reverse));
+        assert!(sanitize_sock_diag_identities(&mut forward));
+        assert!(sanitize_sock_diag_identities(&mut reverse));
         assert_eq!(
             forward, reverse,
             "diag messages must be canonicalized to the same order regardless of arrival order"
         );
-        // Length is preserved exactly.
         assert_eq!(forward.len(), reverse.len());
     }
 
     #[test]
     fn already_zero_reports_no_change() {
         let mut buf = Vec::new();
-        push_message(&mut buf, SOCK_DIAG_BY_FAMILY, &unix_diag_body(0, 0));
-        assert!(!sanitize_sock_diag_inodes(&mut buf));
+        push_message(&mut buf, SOCK_DIAG_BY_FAMILY, &unix_diag_body(0, [0, 0], 0));
+        assert!(!sanitize_sock_diag_identities(&mut buf));
     }
 
     #[test]
     fn fail_open_on_truncated_header() {
         let mut buf = vec![0xAB; NLMSG_HDRLEN - 1];
         let original = buf.clone();
-        assert!(!sanitize_sock_diag_inodes(&mut buf));
+        assert!(!sanitize_sock_diag_identities(&mut buf));
         assert_eq!(buf, original);
     }
 
@@ -396,9 +570,9 @@ mod tests {
         buf.extend_from_slice(&0u16.to_ne_bytes());
         buf.extend_from_slice(&0u32.to_ne_bytes());
         buf.extend_from_slice(&0u32.to_ne_bytes());
-        buf.extend_from_slice(&unix_diag_body(0x1234, 0));
+        buf.extend_from_slice(&unix_diag_body(0x1234, [0x5678, 0x9abc], 0));
         let original = buf.clone();
-        assert!(!sanitize_sock_diag_inodes(&mut buf));
+        assert!(!sanitize_sock_diag_identities(&mut buf));
         assert_eq!(
             buf, original,
             "malformed framing must leave the buffer untouched"
@@ -408,17 +582,17 @@ mod tests {
     #[test]
     fn empty_buffer_is_noop() {
         let mut buf: Vec<u8> = Vec::new();
-        assert!(!sanitize_sock_diag_inodes(&mut buf));
+        assert!(!sanitize_sock_diag_identities(&mut buf));
     }
 
     #[test]
     fn non_diag_messages_are_untouched() {
-        // An NLMSG_ERROR (type 2) carrying inode-looking bytes must be preserved.
+        // An NLMSG_ERROR carrying identity-looking bytes must be preserved.
         let mut buf = Vec::new();
-        let payload = unix_diag_body(0x1122_3344, 0x5566_7788);
+        let payload = unix_diag_body(0x1122_3344, [0x0102_0304, 0x0506_0708], 0x5566_7788);
         push_message(&mut buf, 2, &payload);
         let original = buf.clone();
-        assert!(!sanitize_sock_diag_inodes(&mut buf));
+        assert!(!sanitize_sock_diag_identities(&mut buf));
         assert_eq!(buf, original);
     }
 }
