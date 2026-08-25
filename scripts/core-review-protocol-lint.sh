@@ -118,18 +118,48 @@ fail() {
 }
 
 # (a) Adversarial review happened for both reviewers (any round 1..4).
+#
+# STATE THE OBSERVATION, NOT A CAUSE THIS GATE CANNOT SEE. A label is a cache,
+# not the event: this script reads label names and has no view of reviews,
+# commits, or which revision anything was approved against. "codex has not
+# approved the current revision" is a DIAGNOSIS; "the label is absent from the
+# supplied set" is the OBSERVATION, and only the second is established here.
+#
+# The distinction is not pedantry. An absent approval label has more than one
+# cause, and the routine one is not misconduct: the invalidator strips
+# passed-review-* when a new commit lands, so "approved, then the PR moved" and
+# "never approved" look identical from here. Naming only the second sends the
+# author to argue with a reviewer instead of re-requesting review after a push.
+#
+# Where the gate CAN narrow it, it does: the round label is evidence it holds.
+# This is why the message below is not a flat "could be anything" -- an
+# unconditional list of candidates would be the same defect wearing humility.
+missing_approval() {
+    local reviewer=$1
+    if has_label_matching "adversarial-review-${reviewer}${REVIEW_ROUND_RANGE}"; then
+        fail "passed-review-${reviewer} is absent from the supplied labels, but \
+adversarial-review-${reviewer}[1-4] is present. Review ran; the approval label is not here. \
+Either ${reviewer} has not approved, or it approved an earlier revision and a later push \
+invalidated the label -- re-request review at the current head."
+    else
+        fail "passed-review-${reviewer} is absent from the supplied labels, and so is \
+adversarial-review-${reviewer}[1-4]: no round label for ${reviewer} is present at all. \
+No ${reviewer} review is recorded on this PR."
+    fi
+}
+
 if ! has_label_matching "adversarial-review-codex${REVIEW_ROUND_RANGE}"; then
-    fail "no adversarial review from codex (need one of adversarial-review-codex1..4)."
+    fail "no adversarial-review-codex[1-4] label is present in the supplied labels \
+(need one of adversarial-review-codex1..4)."
 fi
 if ! has_label_matching "adversarial-review-claude${REVIEW_ROUND_RANGE}"; then
-    fail "no adversarial review from claude (need one of adversarial-review-claude1..4)."
+    fail "no adversarial-review-claude[1-4] label is present in the supplied labels \
+(need one of adversarial-review-claude1..4)."
 fi
 
 # (b) The latest reviews approved.
-has_label passed-review-codex \
-    || fail "missing passed-review-codex (codex has not approved the current revision)."
-has_label passed-review-claude \
-    || fail "missing passed-review-claude (claude has not approved the current revision)."
+has_label passed-review-codex || missing_approval codex
+has_label passed-review-claude || missing_approval claude
 
 # (c) Required PR-body sections.
 for section in "Summary" "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
