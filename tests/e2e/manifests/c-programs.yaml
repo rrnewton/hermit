@@ -2511,9 +2511,57 @@ test:
           liteinst: Record/replay is unsupported by LiteInst
       chaos:
         ci: false
-        backends_enabled: []
+        ci_disabled_reason: >-
+          Measured 2026-08-25 by agent(hermit-007). 32 seeds under --chaos --strict gave 32 of 32 passes and 0 failures, but only 6 distinct observation classes against this cell's own assert.min_distinct of 16. The other two cells in this ratchet met their oracles - thread-sync-determinism 14 distinct, thread-contention 32. Reconcile the 16 before enabling - either diversity regressed from the 32 classes the description records, or the threshold does not describe what the harness hashes, which is status plus stdout.
+        # Three producers each write twelve records in fixed per-producer order to one
+        # pipe, so stdout can expose 36! / (12!^3) = 3384731762521200 classes. The
+        # mechanically selected prefix 0..31 produced 32 classes under strict INFO
+        # verification. Keeping the same work but printing a fixed valid record order
+        # collapsed the population to one class.
+        seeds:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+        guest_args:
+          ptrace:
+            - pipe-order
+        outcome_classes: 3384731762521200
+        assert:
+          min_distinct: 16
+          min_passes: 1
+          min_failures: 0
+        backends_enabled:
+          - ptrace
         backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
           dbt: Chaos scheduling is unsupported by DBT
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
@@ -9619,10 +9667,58 @@ test:
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
       chaos:
-        ci: false
-        backends_enabled: []
+        ci: true
+        # Four workers each record their unique ID once while holding the same mutex,
+        # so the observable condvar completion order has exactly 4! = 24 classes. The
+        # mechanically selected prefix 0..31 produced 14 classes with normalized
+        # entropy 0.759077 under strict INFO verification. Keeping all condition-
+        # variable work but printing the positions instead collapsed the same
+        # population to one class and zero entropy.
+        seeds:
+          - 0
+          - 1
+          - 2
+          - 3
+          - 4
+          - 5
+          - 6
+          - 7
+          - 8
+          - 9
+          - 10
+          - 11
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+          - 18
+          - 19
+          - 20
+          - 21
+          - 22
+          - 23
+          - 24
+          - 25
+          - 26
+          - 27
+          - 28
+          - 29
+          - 30
+          - 31
+        guest_args:
+          ptrace:
+            - condvar
+        outcome_classes: 24
+        assert:
+          min_distinct: 6
+          min_passes: 1
+          min_failures: 0
+          min_normalized_entropy: 0.4
+        backends_enabled:
+          - ptrace
         backends_disabled:
-          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
           dbt: Chaos scheduling is unsupported by DBT
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
