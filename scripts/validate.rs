@@ -2383,6 +2383,7 @@ fn super_plan_bracket() -> Result<(), String> {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
+            fail_fast_family: None,
         }],
         "caps-audit negative bracket",
     );
@@ -3767,19 +3768,25 @@ fn super_plan(
                 ))
             }
             None => {
-                // Fail-fast chaining inside a `run_exact_detcore_cases` family.
+                // Fail-fast chaining inside a `run_exact_detcore_cases` family. The edge
+                // preserves the established serial order; the explicit family also preserves
+                // eager cancellation if a later plan transformation makes two members runnable.
                 let mut deps = deps;
-                if let Some(f) = family(&g.label) {
+                let declared_family = family(&g.label);
+                if let Some(f) = declared_family.as_ref() {
                     if let Some((pf, ptag)) = &prev_family {
-                        if *pf == f {
+                        if pf == f {
                             deps = vec![ptag.clone()];
                         }
                     }
-                    prev_family = Some((f, format!("super.{}", g.job)));
+                    prev_family = Some((f.clone(), format!("super.{}", g.job)));
                 } else {
                     prev_family = None;
                 }
-                steps.push(validate_super::gate_node(g, deps));
+                let mut step = validate_super::gate_node(g, deps);
+                step.fail_fast_family =
+                    declared_family.map(|family| format!("super.{family}"));
+                steps.push(step);
             }
         }
     }
@@ -4297,6 +4304,7 @@ fn step_with_caps(
         write_domains: None,
         write_domain_guarantee: None,
         explains: Vec::new(),
+        fail_fast_family: None,
     }
 }
 
@@ -4681,6 +4689,21 @@ fn clamp_cpu(plan: &mut Plan, cap: i64) {
         };
         for s in cfg.steps.iter_mut() {
             s.cpu_timeout = if s.cpu_timeout > 0 { s.cpu_timeout.min(cap) } else { cap };
+        }
+    }
+}
+
+/// Give every validation node an explicit fail-fast family.
+///
+/// A node that already names a shared family keeps it. Every other node gets its own tag, so its
+/// failure still blocks true dependents through the DAG edges without cancelling unrelated work.
+/// The runner's global eager-exit default remains available to every graph that does not opt in.
+fn assign_fail_fast_families(plan: &mut Plan) {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for step in &mut cfg.steps {
+            if step.fail_fast_family.is_none() {
+                step.fail_fast_family = Some(step.tag());
+            }
         }
     }
 }
@@ -5483,6 +5506,95 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .iter()
                 .map(|outcome| (outcome.tag.as_str(), outcome.aborted))
                 .collect::<Vec<_>>()
+        ));
+    }
+
+    // Scoped eager-exit keeps BOTH promises in one run: the failing family is still cut short
+    // and its true dependent is skipped, while a different family completes. Checking only the
+    // independent pass would also accept a blanket keep-going implementation.
+    let scoped_log = tmp.join("scoped-eager-exit.log");
+    std::fs::write(
+        &scoped_log,
+        "[fixture.family_failure] ----- detail -----\n[fixture.family_failure] ordinary test failure\n[fixture.family_failure] ----- end detail -----\n",
+    )
+    .map_err(|e| format!("scheduler accounting: cannot write {}: {e}", scoped_log.display()))?;
+    let mut family_failure = step("family_failure", "sleep 0.1; exit 1");
+    let mut family_peer = step("family_peer", "sleep 5");
+    let mut family_dependent = step("family_dependent", "true");
+    family_dependent.deps = vec!["fixture.family_failure".into()];
+    let marker = tmp.join("independent-family-completed");
+    let independent = step(
+        "independent_family",
+        &format!(
+            "sleep 0.3; : > {}",
+            validate_plan::shell_quote(&marker.to_string_lossy())
+        ),
+    );
+    for member in [&mut family_failure, &mut family_peer, &mut family_dependent] {
+        member.fail_fast_family = Some("fixture.failure-family".into());
+    }
+    let mut scoped_plan = Plan {
+        cfg: DagConfig {
+            steps: vec![family_failure, family_peer, family_dependent, independent],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assign_fail_fast_families(&mut scoped_plan);
+    let scoped_families: BTreeMap<String, String> = scoped_plan
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.fail_fast_family.clone().unwrap_or_default()))
+        .collect();
+    if scoped_families["fixture.family_peer"] != "fixture.failure-family"
+        || scoped_families["fixture.independent_family"] != "fixture.independent_family"
+    {
+        return Err(format!(
+            "scheduler accounting: plan family assignment changed an explicit family or failed to scope an ordinary node by its tag: {scoped_families:?}"
+        ));
+    }
+    let scoped = run_lane_with_env_retries(
+        &scoped_plan.cfg,
+        3,
+        false,
+        0,
+        None,
+        &scoped_log,
+        None,
+        1,
+        &BTreeMap::new(),
+        false,
+    );
+    let scoped_by_tag: BTreeMap<&str, &StepOutcome> = scoped
+        .outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect();
+    let same_family_aborted = scoped_by_tag
+        .get("fixture.family_peer")
+        .is_some_and(|outcome| outcome.aborted);
+    let independent_completed = scoped_by_tag
+        .get("fixture.independent_family")
+        .is_some_and(|outcome| outcome.ok && !outcome.aborted);
+    if scoped.ok
+        || scoped.complete
+        || !same_family_aborted
+        || scoped.skipped != ["fixture.family_dependent".to_string()]
+        || !independent_completed
+        || !marker.is_file()
+    {
+        return Err(format!(
+            "scheduler accounting: scoped eager-exit did not cancel its own family, skip its dependent, and complete an independent family: complete={} ok={} skipped={:?} outcomes={:?} marker={}",
+            scoped.complete,
+            scoped.ok,
+            scoped.skipped,
+            scoped
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.aborted))
+                .collect::<Vec<_>>(),
+            marker.is_file()
         ));
     }
 
@@ -8756,6 +8868,8 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
         }
     };
 
+    assign_fail_fast_families(&mut plan);
+
     // Nested validate payloads are ordinary DAG children. Carry the selected
     // level through the plan so `--verbosity 5` does not become level 1 at the
     // nested strict-compat boundary (and default level 1 stays bounded there).
@@ -9205,22 +9319,17 @@ fn run(durable_slot: &mut Option<DurableLog>) -> RunSummary {
     run_timed_out = run_timed_out || r.run_timed_out;
 
     if let Some(second) = &plan.second {
-        if ok || keep_going {
-            let r2 = lane(second);
-            outcomes.extend(r2.outcomes.iter().cloned());
-            skipped.extend(r2.skipped.iter().cloned());
-            attempts.extend(r2.attempts.iter().cloned());
-            ok = ok && r2.ok;
-            execution_complete = execution_complete && r2.complete;
-            env_retries += r2.env_retries;
-            run_timed_out = run_timed_out || r2.run_timed_out;
-        } else {
-            eprintln!(
-                "validate: first lane failed; the second planned lane was not run (eager exit), \
-                 so validation is incomplete."
-            );
-            execution_complete = false;
-        }
+        // Sequential lanes are separate fail-fast families. A failure in the first lane must not
+        // suppress the second: the lane runner still cancels failed-family peers and skips true
+        // dependents, while the second lane records its own real outcomes.
+        let r2 = lane(second);
+        outcomes.extend(r2.outcomes.iter().cloned());
+        skipped.extend(r2.skipped.iter().cloned());
+        attempts.extend(r2.attempts.iter().cloned());
+        ok = ok && r2.ok;
+        execution_complete = execution_complete && r2.complete;
+        env_retries += r2.env_retries;
+        run_timed_out = run_timed_out || r2.run_timed_out;
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
