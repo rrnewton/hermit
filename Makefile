@@ -116,60 +116,7 @@ lint: ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, c
 			exit 1; \
 		fi
 	@git diff --check
-# scripts/test_validate_stop_paths.py is NOT in this target, deliberately, and
-# this comment is here so its absence reads as a decision rather than an
-# oversight. It exits 1 on clean main -- reproduced 3 of 3 -- for TWO
-# independent reasons, neither of them a flake:
-#
-#   1. wait_for_text allows 10 seconds for validate.rs to print
-#      VALIDATE_STOP_TEST_READY, but validate.rs is a rust-script and on a cold
-#      cache must COMPILE first. Measured: 36s. That is why the failure appeared
-#      to vary between runs -- it was tracking cache warmth.
-#   2. With the cache warm it gets further and still fails, on
-#      `assert len(shards) == 1` with shards == []. The run now writes to the
-#      canonical parent ledger via ci-hub/ledger/validate_rows.py
-#      (ledger/hermit/<host>/<month>.jsonl), not to the local shard this
-#      assertion looks for. The test rotted when the ledger moved.
-#
-# It stays runnable and it stays a real contract for the stop path; it is only
-# out of the pre-flight. A target that is red by construction teaches people to
-# ignore it within a day.
-#
-# ⚠️ WHAT IS GOING UNENFORCED, BECAUSE "IT NEVER PASSED" IS NOT THE SAME AS
-# "IT COVERED NOTHING", AND THE DIFFERENCE DECIDES WHETHER ANYONE REPAIRS IT.
-# main() runs EIGHT contract groups BEFORE the rotted assertion, and Python
-# raises at the first failure, so reaching line 308 proves all eight PASSED on
-# every run:
-#     run_signal(SIGTERM / SIGINT / SIGHUP, expect_record=True)    3
-#     run_signal(SIGKILL,  expect_record=False)                    1
-#     run_signal(SIGTERM,  prior_failure=True)                     1
-#     run_signal(SIGTERM,  lock_proven=True)                       1
-#     run_signal(SIGTERM,  forged_owner=True)                      1
-#     run_incomplete_exit()                                        1
-# Those pin the stop-path signal semantics AND the schema-5 receipt provenance:
-# admission == "ci-hub-validate-lock", concurrent_validates == 0,
-# concurrency_proof == "validate_lock_owner_ancestry", git_depth > 0, and --
-# via forged_owner -- that a CALLER-SELECTED owner value can never establish
-# admission. Those are landing-authority fields. That is what is lost here, not
-# nothing.
-#
-# ONE MOVED SHARD LOCATION RESTORES ALL EIGHT. The only rotted assertion is
-# `assert len(shards) == 1` looking for a local shard the run no longer writes;
-# it now publishes to ledger/hermit/<host>/<month>.jsonl through the parent
-# adapter, which the failure output states outright. Tracked as its own task,
-# `tg restore_stop_path_test`, so this comment is not the only
-# record of a repair nobody owns.
-#
-# I did NOT "fix" (2) by editing the assertion to match what the code now does.
-# That is the shape this project refuses elsewhere, and the right repair needs
-# whoever owns the stop path to say which location is correct.
-#
-# TO RUN IT: from a checkout NESTED UNDER the dev-hermit parent, with the
-# agent-utils submodule initialised. The test walks ROOT.parents for a directory
-# containing ci-hub/ledger/validate_rows.py, so an un-nested checkout dies with
-# StopIteration at line 213, and a missing submodule makes validate.rs exit 1
-# before READY now that it needs agent-utils/rs/dagrun. Both look like the test
-# failing and are neither -- that mislocation cost two separate verifications.
+	python3 scripts/test_validate_stop_paths.py
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
