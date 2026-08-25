@@ -14,8 +14,9 @@
 #                           and BusyBox initramfs (bzImage, initramfs.cpio.gz).
 #   ./clean.sh --dry-run    print what would be removed without deleting.
 #
-# The demo asset directory defaults to <repo>/ignored/qemu-linux and honors the
-# same QEMU_ASSETS override the demos use. Only the specific paths the demo
+# The demo asset directory defaults to <repo>/ignored/qemu-linux, or to a host-visible
+# checkout-scoped /var/tmp directory when the checkout itself is under /tmp, and
+# honors the same QEMU_ASSETS override the demos use. Only the specific paths the demo
 # suite creates are removed; unrelated content in the asset directory (other
 # initramfs variants, scx logs, the shell boot apparatus) is left untouched.
 
@@ -23,7 +24,9 @@ set -euo pipefail
 
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/.." && pwd)"
-ASSETS="${QEMU_ASSETS:-$ROOT/ignored/qemu-linux}"
+# shellcheck source=lib/qemu-paths.sh
+source "$DEMO_DIR/lib/qemu-paths.sh"
+ASSETS="${QEMU_ASSETS:-$(qemu_default_assets "$ROOT")}"
 
 distclean=0
 dry_run=0

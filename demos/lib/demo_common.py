@@ -50,6 +50,43 @@ FILE_INODE_RE = re.compile(r"FileContents\(\d+\)")
 USER_ADDR_RE = re.compile(r"0x7f[0-9a-f]{6,}")
 
 
+def _under_host_tmp(root: Path) -> bool:
+    """Whether ``root`` resolves inside the host's ``/tmp`` tree."""
+    try:
+        Path(root).resolve().relative_to("/tmp")
+    except ValueError:
+        return False
+    return True
+
+
+def default_qemu_assets(root: Path) -> Path:
+    """Return a host-visible, checkout-scoped default for persistent QEMU assets."""
+    root = Path(root).resolve()
+    if not _under_host_tmp(root):
+        return root / "ignored/qemu-linux"
+    # Hermit mounts a private tmpfs over /tmp. Keep persistent QEMU inputs outside it,
+    # and include the canonical checkout identity so concurrent clones cannot share or
+    # clean each other's snapshots.
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+    return Path("/var/tmp") / "hermit-qemu-strict-l2-{}-{}".format(
+        os.getuid(), digest
+    )
+
+
+def hermit_tmp_args(root: Path) -> List[str]:
+    """Keep checkout-local QEMU controller/runtime paths visible to a traced guest."""
+    return ["--tmp=/tmp"] if _under_host_tmp(root) else []
+
+
+def display_path(path: Path, root: Path) -> str:
+    """Render a repo-relative path when possible, otherwise a stable absolute path."""
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(Path(root).resolve()))
+    except ValueError:
+        return str(path)
+
+
 def hash_file(path: Path) -> str:
     """Return the SHA-256 digest of a file."""
     digest = hashlib.sha256()

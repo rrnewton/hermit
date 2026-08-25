@@ -45,6 +45,7 @@ def _config() -> GuestConfig:
         vmlinux=_required_path("DEMO07_VMLINUX"),
         snapshot_disk=_required_path("DEMO07_SNAPSHOT_DISK"),
         snapshot_name=os.environ.get("DEMO07_SNAPSHOT_NAME", "hermit-boot"),
+        advance_command=DEFAULT_ADVANCE_COMMAND,
         artifact_dir=_required_path("DEMO07_ARTIFACTS"),
         qemu_bios=_optional_path("DEMO07_QEMU_BIOS"),
         qemu_library_path=_optional_path("DEMO07_QEMU_LIBRARY_PATH"),
