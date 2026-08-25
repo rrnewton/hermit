@@ -2325,6 +2325,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         };
         let spec = build_spec(
             &context,
