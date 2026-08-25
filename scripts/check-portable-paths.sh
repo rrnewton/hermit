@@ -17,6 +17,7 @@ is_build_or_run_file() {
 }
 
 is_excluded() {
+    [[ $1 == ci/compat-envelope/cells.json ]] && return 0
     case "/$1/" in
         */.git/* | */ignored/* | */experiments/* | */scratch/* | */target/* \
             | */third-party/* | */vendor/* | */scripts/check-portable-paths.sh/)
@@ -77,6 +78,27 @@ self_test() {
     printf 'cache_dir="/home/ci-portability-owner/.cache/hermit"\n' >"$fixture"
     if scan_file "$fixture" >/dev/null; then
         echo "portability self-test failed to reject a literal developer home" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+
+    is_excluded ci/compat-envelope/cells.json || {
+        echo "portability self-test failed to exclude literal compatibility evidence" >&2
+        rm -f "$fixture"
+        return 1
+    }
+    if is_excluded ci/compat-envelope/scorecard.rs; then
+        echo "portability self-test excluded live compatibility code" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+    if is_excluded archived/ci/compat-envelope/cells.json; then
+        echo "portability self-test widened the literal evidence exclusion" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+    if is_build_or_run_file fixtures/evidence.txt; then
+        echo "portability self-test unexpectedly scans arbitrary text evidence" >&2
         rm -f "$fixture"
         return 1
     fi

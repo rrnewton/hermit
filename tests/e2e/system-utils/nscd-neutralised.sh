@@ -19,7 +19,7 @@
 # The two-run comparison cannot detect this control, and the reason is
 # structural: the comparison asks whether the two runs AGREE, and this control's
 # whole job is to make them agree. It succeeds identically whether or not the
-# control exists. Measured 2026-08-25 on devbig014: three back-to-back native
+# control exists. Measured 2026-08-25 on a dedicated host: three back-to-back native
 # lookups produced BYTE-IDENTICAL nscd interaction (one connect() to the socket
 # each, zero /etc/passwd opens, pid prefixes stripped). The only channel that
 # could make the pair disagree is a cache entry expiring between the two runs,
