@@ -1497,6 +1497,7 @@ fn self_test() -> Result<(), String> {
     requalification_plan_bracket(&root)?;
     no_result_propagation_bracket()?;
     selective_subset_bracket(&root)?;
+    only_plan_bracket(&root)?;
     self_output_bracket()?;
     product_front_door_bracket()?;
     product_front_door_process_bracket()?;
@@ -2331,6 +2332,145 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
          ({} edge(s) pruned); flaky-tests selector reused its manifest producer; \
          full/no-baseline fallback has one acyclic producer; 1 unknown-tag refusal",
         sel.pruned_edges
+    );
+    Ok(())
+}
+
+/// Bracket `--only` against the real portable lane and the real plan builder.
+///
+/// This specifically guards against the historical implementation: a synthetic
+/// `shard.*` step that nested `ci/run-node.sh`, discarded the selected node's
+/// resource contract, and duplicated the lane's manifest producer.
+fn only_plan_bracket(root: &Path) -> Result<(), String> {
+    let lane = "portable";
+    let all = validate_plan::lane_nodes(root, lane, "", "gate.manifest")?;
+    let all_tags: BTreeSet<String> = all.iter().map(|step| step.tag()).collect();
+    let (child, parent) = all
+        .iter()
+        .find_map(|step| {
+            step.deps
+                .iter()
+                .find(|dependency| all_tags.contains(*dependency))
+                .map(|dependency| (step.clone(), dependency.clone()))
+        })
+        .ok_or("only bracket: portable lane has no intra-lane dependency")?;
+    let parent_step = all
+        .iter()
+        .find(|step| step.tag() == parent)
+        .cloned()
+        .ok_or_else(|| format!("only bracket: selected parent {parent} is absent"))?;
+    let selected_tags: BTreeSet<String> = [child.tag(), parent.clone()].into_iter().collect();
+    let args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        format!("{parent},{}", child.tag()),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: CLI refused a valid selection with exit {code}"))?;
+    let plan = build_plan(root, &args, &std::env::temp_dir().join("validate-only-plan"))?;
+    if plan.selection_mode != "only" || plan.suite_complete || plan.second.is_some() {
+        return Err(format!(
+            "only bracket: focused plan authority changed: mode={} complete={} second={}",
+            plan.selection_mode,
+            plan.suite_complete,
+            plan.second.is_some()
+        ));
+    }
+    let tags: Vec<String> = plan.cfg.steps.iter().map(|step| step.tag()).collect();
+    let unique: BTreeSet<&str> = tags.iter().map(String::as_str).collect();
+    if unique.len() != tags.len() {
+        return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
+    }
+    if plan.cfg.steps.iter().any(|step| {
+        step.group == "shard" || step.cmd.contains("ci/run-node.sh")
+    }) {
+        return Err("only bracket: selected node was wrapped in a nested runner".into());
+    }
+    for expected in [&parent_step, &child] {
+        let actual = plan
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == expected.tag())
+            .ok_or_else(|| format!("only bracket: selected node {} was dropped", expected.tag()))?;
+        let mut normalized_expected = expected.clone();
+        normalized_expected.deps = actual.deps.clone();
+        if format!("{actual:?}") != format!("{normalized_expected:?}") {
+            return Err(format!(
+                "only bracket: selected node {} did not retain its command/caps: expected={normalized_expected:?} actual={actual:?}",
+                expected.tag()
+            ));
+        }
+        if actual
+            .deps
+            .iter()
+            .any(|dependency| !selected_tags.contains(dependency) && dependency != "gate.manifest")
+        {
+            return Err(format!(
+                "only bracket: selected node {} retained an outside dependency: {:?}",
+                actual.tag(),
+                actual.deps
+            ));
+        }
+    }
+    let actual_child = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == child.tag())
+        .expect("checked above");
+    if !actual_child.deps.contains(&parent) {
+        return Err("only bracket: dependency inside the selection was dropped".into());
+    }
+    let base = validate_plan::lane_config(root, lane)?;
+    validate_plan::assert_config_carried(&base, &plan.cfg)
+        .map_err(|error| format!("only bracket: lane config was not carried: {error}"))?;
+
+    let producer_args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: CLI refused producer selection with exit {code}"))?;
+    let producer_plan = build_plan(
+        root,
+        &producer_args,
+        &std::env::temp_dir().join("validate-only-producer-plan"),
+    )?;
+    let producer_count = producer_plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
+        .count();
+    if producer_count != 1 {
+        return Err(format!(
+            "only bracket: manifest producer appeared {producer_count} times, expected once"
+        ));
+    }
+
+    let unknown_args = parse_argv(&[
+        "--only".into(),
+        lane.into(),
+        "no.such_node".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: parser refused unknown-tag bracket with exit {code}"))?;
+    let error = build_plan(
+        root,
+        &unknown_args,
+        &std::env::temp_dir().join("validate-only-unknown-plan"),
+    )
+    .err()
+    .ok_or("only bracket: unknown node tag was accepted")?;
+    if !error.contains("unknown node tag") || !error.contains("Selectable tags") {
+        return Err(format!(
+            "only bracket: unknown-tag refusal omitted its diagnosis or choices: {error}"
+        ));
+    }
+    println!(
+        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique"
     );
     Ok(())
 }
@@ -3396,7 +3536,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // DagConfig::default(), dropping resource_caps and default_step_timeout;
         // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
         let base = validate_plan::lane_config(root, lane)?;
-        let lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
+        let mut lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
+        // The lane is independently runnable, so it carries its own manifest-plan
+        // producer. Validate's preflight already carries the same tag. Reuse that
+        // preflight node before filtering; otherwise `--only setup.manifest_plan`
+        // creates a duplicate tag and a consumer selected with the producer keeps
+        // an ambiguous edge.
+        validate_plan::reuse_preflight_manifest_producer(
+            &mut lane_steps,
+            &format!("--only lane {lane}"),
+        )?;
         let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
 
         let requested: Vec<String> = nodes
