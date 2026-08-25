@@ -1464,8 +1464,8 @@ git fetch -q --force <remote> \
   || { echo "FETCH FAILED — not a merge answer" >&2; exit 2; }
 git merge-tree --write-tree refs/tmp/mergecheck/base refs/tmp/mergecheck/head >/dev/null
 case $? in
-  0) echo MERGES-CLEAN ;;
-  1) echo CONFLICTS ;;
+  0) echo MERGES-CLEAN; exit 0 ;;
+  1) echo CONFLICTS;    exit 1 ;;
   *) echo "merge-tree ERROR — not a merge answer" >&2; exit 2 ;;
 esac
 ```
@@ -1496,12 +1496,65 @@ Measured on git 2.53.0, that form:
   the `||` on the fetch.
 - **left two stray branches** named `h` and `m` in the reader's repository.
 
-All three outcomes of the corrected form, measured in the same clone that broke
-the original:
+⚠️ **A FOURTH detail, added after the three above landed: the verdict has to be
+in the EXIT STATUS, not only on stdout.** As first corrected, the `case` echoed
+its verdict and then fell out of `esac`, so the block exited **0 for
+`CONFLICTS`** as well as for `MERGES-CLEAN`. Extracted verbatim from the
+committed document and run:
 
-    conflicting     -> CONFLICTS
-    feat (clean)    -> MERGES-CLEAN
-    no-such-branch  -> FETCH FAILED — not a merge answer
+```console
+feat (genuinely clean)          stdout=MERGES-CLEAN   exit status=0
+conflicting (genuine conflict)  stdout=CONFLICTS      exit status=0
+```
+
+Which is a false green one layer up, at the caller — the same recipe wrapped in
+the obvious `if`:
+
+```console
+if <recipe>; then echo LANDABLE; else echo NOT LANDABLE; fi
+  feat        -> LANDABLE
+  conflicting -> LANDABLE      <-- and it genuinely conflicts
+```
+
+Hence the explicit `exit 0` / `exit 1` / `exit 2`. **Three outcomes, and all
+three have to be spellable by a caller that reads only the status**, or
+*could-not-determine* gets read as one of the other two — which is the whole
+argument of this section applied to its own remedy. This one survived the round
+of review that fixed the other three, because every check run on it read the
+printed word rather than the status.
+
+⚠️ **And the reason checking the fetch is not optional once the refs are
+namespaced.** `refs/tmp/mergecheck/*` does not appear in `git branch`, and it
+persists between runs, so an unchecked fetch leaves a stale ref *about a
+different branch* to answer from. Measured on the intermediate form — forced
+refspecs, namespaced refs, no fetch check:
+
+```console
+step 1: check 'feat'      (genuinely clean)     ->  MERGES-CLEAN
+        git branch now shows only:  * main
+step 2: check 'conflicting', typed 'conflcting' ->  MERGES-CLEAN
+step 3: check 'conflicting', spelled correctly  ->  CONFLICTS
+```
+
+Steps 2 and 3 ask about the same branch and disagree. `MERGES-CLEAN` about a head
+you did not ask about is the same class as `MERGES-CLEAN` about a base you never
+fetched. **It is a trade rather than a strict improvement, and the axis matters:**
+the namespaced typo fails **loudly but invisibly-in-evidence** (`rc=128`, a
+one-line `fatal: couldn't find remote ref` on stderr, and a stale ref that
+`git branch` will not show you), while the old non-fast-forward fails **silently
+but visibly** (`rc=1`, *zero* bytes of stderr, and a stale ref you can see with
+`git branch`).
+Both measured. Forcing the refspec without checking the fetch does not fix the
+recipe; it moves the evidence somewhere a reader is less likely to look. Only
+checking the fetch fixes it.
+
+All three outcomes of the corrected form, measured in the same clone that broke
+the original — **with the exit status, because the printed word is exactly the
+channel this section says not to trust:**
+
+    conflicting     -> CONFLICTS                         rc=1
+    feat (clean)    -> MERGES-CLEAN                      rc=0
+    no-such-branch  -> FETCH FAILED — not a merge answer  rc=2
 
 ⚠️ **The general rule, which is this document's own and was violated by its own
 recipe: an exit code is a claim about the environment as much as about the code.**
