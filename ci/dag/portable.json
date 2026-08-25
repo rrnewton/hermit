@@ -84,6 +84,20 @@
                "hard_mem_max_bytes": 536870912, "classification": "light"}
     },
     {
+      "group": "check",
+      "job": "run_node_args",
+      "desc": "Guard ci/run-node.sh's argument contract (refusals + single-node edit)",
+      "description": "Until 2026-08-25 ci/run-node.sh read two positional arguments and IGNORED the rest, so `ci/run-node.sh portable test.detcore_unit -E 'test(=cpuid_leaf_count)'` ran the whole 534-test node and printed PASS with the filter silently dropped -- a full-node green read as a one-test green. This node runs ci/run-node-args-test.sh, which asserts the five refusals and that `-- <args>` edits exactly one node's command and nothing else in the DAG. Mutation-checked 2026-08-25: restoring the silent-swallow branch makes it exit 1 on 'expected exit 2, got 0'. It executes no DAG node and needs no build artifacts (RUN_NODE_PRINT_ONLY stops after writing the scratch DAG), which is why it sits in preflight.",
+      "cmd": "./ci/run-node-args-test.sh",
+      "timeout": 120,
+      "hint": {
+        "est_duration_s": 1,
+        "rss_baseline_bytes": 67108864,
+        "hard_mem_max_bytes": 536870912,
+        "classification": "light"
+      }
+    },
+    {
       "group": "check", "job": "check_outcome_consumers",
       "desc": "Run the check-outcome consumer regression and the merge-gate policy lint",
       "description": "These two scripts guard the merge-gate status classifier, and until 2026-08-23 NO DAG NODE RAN EITHER OF THEM. PR #2363's test plan cited check.script_sigpipe as their coverage; that node is a SIGPIPE and rust-script compile guard and both of these are plain bash, so it never executed them and the coverage claim was false. A guard nothing runs is indistinguishable from a guard that passes, which is the defect class the classifier change itself was fixing. Measured 2026-08-23: with the classifier mutated to report a failing check as PASSED, this node exits 1 on `mismatch: completed/failure expected=FAILED python=PASSED shell=PASSED`, while the DAG without this node stays green because nothing runs either script.",
