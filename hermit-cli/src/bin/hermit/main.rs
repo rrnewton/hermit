@@ -175,12 +175,15 @@ use hermit::ExitStatus;
 
 use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
+use self::container::ContainerChildExit;
+use self::container::ContainerChildPanic;
 use self::global_opts::GlobalOpts;
 use self::instruction_map::InstructionMapOpts;
 use self::logdiff::LogDiffCLIOpts;
 use self::oci::OciOpts;
 use self::record::RecordOpts;
 use self::replay::ReplayOpts;
+use self::run::GuestProgramFault;
 use self::run::RunOpts;
 use self::strace::StraceOpts;
 use self::verify::write_pending_verification_json;
@@ -392,8 +395,9 @@ fn main() {
     command
         .main(&global)
         .unwrap_or_else(|err| {
+            let status = ExitStatus::Exited(failure_exit_code(&err));
             display_error(err);
-            ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT)
+            status
         })
         .raise_or_exit();
 }
@@ -427,8 +431,83 @@ fn main() {
 /// `HERMIT_TASK_PANIC` marker on stderr or the verification JSON; this makes the
 /// cheap check — `$?` — stop actively lying.
 const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+/// Machine-readable classification of a hermit-internal failure, on stderr.
+///
+/// ⚠️ WHY A STDERR MARKER AND NOT A SECOND EXIT CODE. Every value in `0..=255`
+/// is a legal guest exit status and both channels a process has — code and
+/// terminating signal — are already spoken for by the guest, so exit codes can
+/// only ever REDUCE collisions, never remove them. Spending a second reserved
+/// number to separate two *internal* failures buys the least and costs the most.
+///
+/// ⚠️ AND WHY NOT THE VERIFICATION JSON, which is the other candidate and looks
+/// structurally stronger. Measured on `main` at `b92c2227fc`, it cannot see
+/// these cases at all:
+///   * `--verify-json` is clap-`requires`-gated on `--verify`, so a plain
+///     `hermit run` has no channel — measured: `error: the following required
+///     arguments were not provided: --verify`;
+///   * with both flags, an `--log-file` failure still writes NO record — the
+///     stamp lives inside `Subcommand::main`, and `open_log_file` fails above it;
+///   * a bad flag never reaches hermit's code at all (clap exits 2 itself).
+///
+/// A channel that is absent for the common invocation cannot be the mechanism
+/// that distinguishes failure classes. It remains the right home for a RICH
+/// verdict when a path was requested; it is not an alternative to this.
+///
+/// stderr has neither limitation: it always exists, it has no 256-value ceiling,
+/// and it needs no new plumbing — only that the typed status stop being
+/// discarded, which is what [`ContainerChildExit`] now prevents.
+/// The exit code for a failure, DERIVED FROM ITS CLASS rather than hardcoded.
+///
+/// ⚠️ THIS IS THE PIECE THAT WAS MISSING, AND ITS ABSENCE IS WHY ONE DEFECT KEPT
+/// REAPPEARING. The failure's class is reconstructed at three boundaries and was
+/// then thrown away again here, because the exit-code decision was a constant
+/// that consulted nothing. Every new distinction therefore needed its own patch.
+/// Expressed as a mapping FROM the class, the next distinction is a line in this
+/// match instead of another fix to the same shape.
+///
+/// Most classes deliberately still map to 125: separating two INTERNAL failures
+/// does not justify spending a reserved number, since every value in `0..=255`
+/// is a legal guest status — that is the argument at
+/// [`HERMIT_INTERNAL_FAILURE_EXIT`] and it is unchanged. A GUEST-SIDE fault is
+/// the case that does justify one, and 127/126 are the established GNU
+/// `env`/`chroot`/`timeout` conventions that 125 itself came from. The two
+/// positions are consistent: the code channel exists to tell hermit's failures
+/// apart from the guest's, not to subdivide hermit's own.
+fn failure_exit_code(error: &Error) -> i32 {
+    match error.downcast_ref::<GuestProgramFault>() {
+        Some(fault) => fault.exit_code(),
+        None => HERMIT_INTERNAL_FAILURE_EXIT,
+    }
+}
+
+fn classify_failure(error: &Error) -> String {
+    // ONE discriminant, read once, covering all three flattenings.
+    if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
+        // The child died with a status IT DID NOT CHOOSE: a kill, a fault, a
+        // panic no handler caught. Nothing reported it; reverie observed it.
+        return format!("HERMIT_INTERNAL_FAILURE class=container-child-exit status={status:?}");
+    }
+    if let Some(fault) = error.downcast_ref::<GuestProgramFault>() {
+        // ⚠️ A GUEST-SIDE FACT, NOT A HERMIT FAILURE. Hermit worked; the path it
+        // was handed is not executable. Bucketing this with `cli-error` told a
+        // caller "hermit is broken" for what is almost always a typo.
+        return format!("HERMIT_INTERNAL_FAILURE class={}", fault.class());
+    }
+    if error.downcast_ref::<ContainerChildPanic>().is_some() {
+        // The child PANICKED and the panic was caught and reported. Still the
+        // tracer breaking, not the CLI refusing -- which is the distinction the
+        // `kind` discriminant on SerializableError exists to carry.
+        return "HERMIT_INTERNAL_FAILURE class=container-child-panic".to_string();
+    }
+    // Everything else: bad flag, unwritable log path, unreadable program.
+    "HERMIT_INTERNAL_FAILURE class=cli-error".to_string()
+}
 
 fn display_error(error: Error) {
+    // Emitted BEFORE the prose so a reader piping stderr sees the class first,
+    // and so a truncated capture still carries it.
+    eprintln!("{}", classify_failure(&error));
+
     let mut chain = error.chain();
 
     if let Some(error) = chain.next() {

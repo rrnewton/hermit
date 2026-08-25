@@ -38,6 +38,7 @@ use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 
+use super::container::Classified;
 use super::container::IdentityGuard;
 use super::container::RunGuarded;
 use super::container::deterministic_container;
@@ -451,7 +452,7 @@ impl StartOpts {
                             })
                             .map_err(SerializableError::from)
                         })
-                        .context("Container exited unexpectedly")??;
+                        .classified()?;
                     hermit.commit_recording(data, exit_status)?
                 }
                 None => container
@@ -462,7 +463,7 @@ impl StartOpts {
                         let command = self.guest_command().map_err(SerializableError::from)?;
                         hermit.record(command).map_err(SerializableError::from)
                     })
-                    .context("Container exited unexpectedly")??,
+                    .classified()?,
             };
 
             eprintln!(
@@ -517,7 +518,7 @@ impl StartOpts {
                 }
                 .map_err(SerializableError::from)
             })
-            .context("Container exited unexpectedly")??;
+            .classified()?;
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
@@ -531,7 +532,7 @@ impl StartOpts {
                 hermit::replay_with_output_and_mounts(data_dir, &self.mount)
                     .map_err(SerializableError::from)
             })
-            .context("Container exited unexpectedly")??;
+            .classified()?;
 
         let outcome = compare_two_runs(
             ComparedRun {
@@ -606,7 +607,7 @@ impl StartOpts {
                 }
                 .map_err(SerializableError::from)
             })
-            .context("Container exited unexpectedly")??;
+            .classified()?;
 
         eprintln!(":: {}", "Replaying...".yellow().bold());
 
@@ -656,7 +657,7 @@ impl StartOpts {
                 hermit::replay_with_gdbserver_and_mounts(data_dir, gdbserver_port, &self.mount)
                     .map_err(SerializableError::from)
             })
-            .context("Container exited unexpectedly")??;
+            .classified()?;
         let _ = gdb_client.wait();
         Ok(result)
     }
