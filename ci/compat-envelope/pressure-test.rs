@@ -3,6 +3,7 @@
 //!
 //! ```cargo
 //! [dependencies]
+//! chrono = "0.4"
 //! csv = "1"
 //! dagrun = { path = "../../agent-utils/rs/dagrun" }
 //! serde = { version = "1", features = ["derive"] }
@@ -24,7 +25,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::io::Write as _;
 use std::process::Command;
+use std::process::Stdio;
 use std::process::ExitCode;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -1358,6 +1361,13 @@ fn run() -> Result<(), String> {
             // enforces that boundary before reading any evidence.
             summarize(&root, &results, true, None)?;
         }
+        "emit-series" => {
+            let (results, output, _) = result_options(&root, &mut args, false, false)?;
+            if output.is_some() {
+                return Err("emit-series does not accept --output".into());
+            }
+            emit_series(&results)?;
+        }
         "self-test" => {
             if args.next().is_some() {
                 return Err("self-test accepts no options".into());
@@ -1643,6 +1653,399 @@ fn require_empty_result_dir(results: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The four coordinate keys the series store accepts, in its own order.
+///
+/// ⚠️ FOUR DIFFERENT KEYSPACES. Record numbers, syscall counts, scheduler turns
+/// and virtual nanoseconds describe ONE divergence from four angles and must
+/// never be compared or minimised across axes. They are carried through
+/// verbatim, one value per run, and the reader derives ranges per coordinate.
+const SERIES_COORDINATES: [&str; 4] = [
+    "first_divergent_record",
+    "first_divergent_syscall",
+    "first_divergent_scheduler_turn",
+    "first_divergent_virtual_nanoseconds",
+];
+
+/// Map a pressure-test cell outcome onto the series store's vocabulary.
+///
+/// ⚠️ `FAIL` BECOMES `diverged`, INCLUDING WHEN NO POSITION WAS LOCATED. The row
+/// is still emitted, carrying no `coordinates` object, which is the store's
+/// `diverged-unlocated` state and a legitimate one: refusing it would force a
+/// producer to invent a position it does not have. Skipping such a row instead
+/// would make the store silently UNDER-COUNT exactly the cells that could not
+/// locate a divergence -- the population most worth counting.
+///
+/// The non-verdict outcomes stay non-verdict. An infrastructure timeout recorded
+/// as a product divergence is how a flake becomes a false regression.
+fn series_outcome(outcome: &str) -> Result<&'static str, String> {
+    Ok(match outcome {
+        "PASS" => "passed",
+        "FAIL" => "diverged",
+        "TIMEOUT" => "timeout",
+        "NO_RESULT" => "no_result",
+        "ERROR" => "errored",
+        other => return Err(format!("unmapped pressure outcome {other:?}")),
+    })
+}
+
+/// `<test>/<mode>/<backend>` — the store's cell identity.
+fn series_cell(test: &str, mode: &str, backend: Option<&str>) -> String {
+    format!("{test}/{mode}/{}", backend.unwrap_or("none"))
+}
+
+/// The repetition ordinal, read from the retained directory name.
+///
+/// `plan` names a repeated cell `{base}-repetition-{n:04}`. A campaign with no
+/// `--repetitions` produces one run of the cell, which is ordinal 0. Returning 0
+/// rather than failing is deliberate: a single-run campaign is a series of
+/// length one, not an error.
+fn series_run_index(dir_name: &str) -> u64 {
+    dir_name
+        .rsplit_once("-repetition-")
+        .and_then(|(_, n)| n.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Pull the located coordinates out of a row's attempts.
+///
+/// FIRST attempt that located each coordinate wins, matching the runner's own
+/// `attempts.iter().find_map(..)` rule: a passing retry must not erase a
+/// divergence a previous attempt found. Absent and explicitly-null are both
+/// treated as "not located" and simply omitted, so the object is present only
+/// when it carries something.
+fn series_coordinates(attempts: &[JsonValue]) -> Option<JsonValue> {
+    let mut located = serde_json::Map::new();
+    for key in SERIES_COORDINATES {
+        if let Some(value) = attempts.iter().find_map(|attempt| {
+            attempt
+                .pointer(&format!("/verification/{key}"))
+                .or_else(|| attempt.get(key))
+                .and_then(JsonValue::as_u64)
+        }) {
+            located.insert(key.to_string(), JsonValue::from(value));
+        }
+    }
+    (!located.is_empty()).then(|| JsonValue::Object(located))
+}
+
+/// Build one series row per retained cell result.
+///
+/// Separated from the filesystem and the subprocess so every mapping decision is
+/// testable without a campaign on disk.
+fn series_rows(
+    metadata: &RunMetadata,
+    results: &[(String, ResultRow)],
+    emitted_at: &str,
+) -> Result<Vec<JsonValue>, String> {
+    let mut rows = Vec::new();
+    for (dir_name, row) in results {
+        let outcome = series_outcome(&row.outcome)?;
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            "cell".into(),
+            JsonValue::from(series_cell(&row.test, &row.mode, row.backend.as_deref())),
+        );
+        // The tree this measurement is attributed to. See the note below on why
+        // the binary's provenance rides alongside rather than replacing it.
+        payload.insert("tree".into(), JsonValue::from(metadata.hermit_sha.clone()));
+        payload.insert(
+            "run_index".into(),
+            JsonValue::from(series_run_index(dir_name)),
+        );
+        payload.insert("outcome".into(), JsonValue::from(outcome));
+        if let Some(coordinates) = series_coordinates(&row.attempts) {
+            payload.insert("coordinates".into(), coordinates);
+        }
+        // ⚠️ NON-IDENTITY, AND RECORDED ON PURPOSE. `tree` above is the CHECKOUT
+        // sha, which is what every other store keys on today, so it stays the
+        // identity and this store merges with the others. But a checkout sha is
+        // not the provenance of the binary that produced the measurement, and
+        // recording only it is how a result gets attributed to a commit that
+        // never built it. Carrying the run's dirty flag beside the key means a
+        // later audit can at least SEE the discrepancy instead of having to
+        // reconstruct it from artefacts that may no longer exist.
+        payload.insert(
+            "source_tree_dirty".into(),
+            JsonValue::from(metadata.source_tree_dirty),
+        );
+
+        let mut envelope = serde_json::Map::new();
+        envelope.insert("schema".into(), JsonValue::from("stress-series/v1"));
+        envelope.insert(
+            "event_id".into(),
+            JsonValue::from(format!("{}-{}", row.run_id, dir_name)),
+        );
+        envelope.insert("event_type".into(), JsonValue::from("series.cell"));
+        envelope.insert("emitted_at".into(), JsonValue::from(emitted_at));
+        envelope.insert("team".into(), JsonValue::from("hermit"));
+        envelope.insert("host".into(), JsonValue::from(series_host()));
+        envelope.insert("run_id".into(), JsonValue::from(row.run_id.clone()));
+        envelope.insert(
+            "producer".into(),
+            serde_json::json!({
+                "source": "observed",
+                "tool": "pressure-test",
+                "tool_version": "1",
+            }),
+        );
+        envelope.insert("series".into(), JsonValue::Object(payload));
+        rows.push(JsonValue::Object(envelope));
+    }
+    Ok(rows)
+}
+
+/// Publish a retained campaign's per-cell results to the parent's series spool.
+///
+/// This is the call site the store was missing. Everything it needs already
+/// existed: the schema, the linter, the reader, the invariants and the published
+/// path. What did not exist was anything that WROTE, so the store stayed empty
+/// while four plan steps closed around it.
+///
+/// ⚠️ IT CALLS THE PARENT'S LINTER RATHER THAN REIMPLEMENTING IT. `validate_row`
+/// carries a cross-field rule that took real thought, and a second copy of it in
+/// Rust would drift the first time either side changed. The rows are handed to
+/// `ci-hub/series/series.py append`, which refuses the batch WHOLE if any row is
+/// malformed, so a partial campaign can never reach the spool.
+///
+/// Deliberately NOT wired into `summarize`: emitting is a write with a
+/// side-effect outside this repository, and it should be asked for.
+fn emit_series(results: &Path) -> Result<(), String> {
+    let parent = std::env::var("DEV_HERMIT_PARENT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            // Say it, do not skip silently. A campaign that emitted nothing
+            // because the parent was not configured must not be indistinguishable
+            // from one that had nothing to emit.
+            "DEV_HERMIT_PARENT is not set, so there is no series store to write to. \
+             Set it to the dev-hermit checkout root and re-run."
+                .to_string()
+        })?;
+
+    let metadata_path = results.join("run.json");
+    let metadata: RunMetadata = serde_json::from_str(
+        &fs::read_to_string(&metadata_path)
+            .map_err(|e| format!("cannot read {}: {e}", metadata_path.display()))?,
+    )
+    .map_err(|e| format!("invalid {}: {e}", metadata_path.display()))?;
+
+    // Deliberately NOT the checkout-HEAD guard `summarize` applies. That guard is
+    // right for reading a campaign you are standing in; emitting a RETAINED
+    // campaign from a checkout that has since moved is the normal case, and the
+    // tree being attributed is recorded in the campaign, not read from git.
+    let mut collected: Vec<(String, ResultRow)> = Vec::new();
+    let entries = fs::read_dir(results)
+        .map_err(|e| format!("cannot read {}: {e}", results.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot walk {}: {e}", results.display()))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let result_file = entry.path().join("results.jsonl");
+        if !result_file.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&result_file)
+            .map_err(|e| format!("cannot read {}: {e}", result_file.display()))?;
+        let lines: Vec<_> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() != 1 {
+            return Err(format!(
+                "{} contains {} nonempty rows; expected exactly one",
+                result_file.display(),
+                lines.len()
+            ));
+        }
+        let row: ResultRow = serde_json::from_str(lines[0])
+            .map_err(|e| format!("invalid {}: {e}", result_file.display()))?;
+        collected.push((entry.file_name().to_string_lossy().into_owned(), row));
+    }
+    if collected.is_empty() {
+        return Err(format!(
+            "no per-cell results under {}; nothing to emit",
+            results.display()
+        ));
+    }
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let emitted_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let rows = series_rows(&metadata, &collected, &emitted_at)?;
+    let mut payload = String::new();
+    for row in &rows {
+        payload.push_str(
+            &serde_json::to_string(row).map_err(|e| format!("cannot encode a series row: {e}"))?,
+        );
+        payload.push('\n');
+    }
+
+    let script = Path::new(&parent).join("ci-hub/series/series.py");
+    if !script.is_file() {
+        return Err(format!(
+            "{} does not exist; DEV_HERMIT_PARENT does not look like a dev-hermit checkout",
+            script.display()
+        ));
+    }
+    let mut child = Command::new("python3")
+        .arg(&script)
+        .arg("append")
+        .arg("--parent")
+        .arg(&parent)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", script.display()))?;
+    child
+        .stdin
+        .take()
+        .ok_or("series append stdin unavailable")?
+        .write_all(payload.as_bytes())
+        .map_err(|e| format!("cannot send rows to the series writer: {e}"))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("series append did not terminate readably: {e}"))?;
+    if !status.success() {
+        // The linter refused, and it refused the batch whole. Do not paper over
+        // it: nothing was written and the caller needs to know which row is bad.
+        return Err(format!(
+            "the series writer REFUSED the batch (exit {:?}); nothing was written",
+            status.code()
+        ));
+    }
+    println!("emitted {} series row(s) to {parent}", rows.len());
+    Ok(())
+}
+
+/// The SHORT host, which is what the shard path is keyed on.
+///
+/// `HOSTNAME` is frequently the FQDN. Sharding on `devbig014.some.domain` rather
+/// than `devbig014` would put one machine's rows in a different shard depending
+/// on how its resolver happened to be configured, so the first label is taken
+/// deliberately rather than incidentally.
+/// Checks for the series emission mapping.
+///
+/// Every one of these is a decision that would be invisible in the store if it
+/// were wrong: a mislabelled outcome, a dropped row, or an ordinal that made a
+/// five-run series look like five separate single runs.
+fn series_self_test() -> Result<(), String> {
+    for (outcome, expected) in [
+        ("PASS", "passed"),
+        ("FAIL", "diverged"),
+        ("TIMEOUT", "timeout"),
+        ("NO_RESULT", "no_result"),
+        ("ERROR", "errored"),
+    ] {
+        let got = series_outcome(outcome)?;
+        if got != expected {
+            return Err(format!("{outcome} mapped to {got:?}, expected {expected:?}"));
+        }
+    }
+    // An outcome nobody mapped must REFUSE, not be guessed into the nearest
+    // bucket. A wrong bucket is a permanent wrong row in an append-only store.
+    if series_outcome("SOMETHING_NEW").is_ok() {
+        return Err("an unmapped pressure outcome must refuse, not be guessed".into());
+    }
+
+    if series_cell("applications/timed-progress-bar", "verify", Some("ptrace"))
+        != "applications/timed-progress-bar/verify/ptrace"
+    {
+        return Err("cell identity must be <test>/<mode>/<backend>".into());
+    }
+
+    if series_run_index("a-cell-repetition-0004") != 4 {
+        return Err("the repetition ordinal must come from the retained directory".into());
+    }
+    if series_run_index("a-cell-with-no-suffix") != 0 {
+        return Err("a single-run campaign is a series of length one, ordinal 0".into());
+    }
+
+    // Absent and explicitly-null are both "not located" and must produce NO
+    // coordinates object, so a diverged row stays diverged-unlocated rather
+    // than carrying an empty one.
+    if series_coordinates(&[serde_json::json!({"verification": {"first_divergent_record": null}})])
+        .is_some()
+    {
+        return Err("a null coordinate must not produce a coordinates object".into());
+    }
+    let located = series_coordinates(&[
+        serde_json::json!({"verification": {"first_divergent_record": null}}),
+        serde_json::json!({"verification": {"first_divergent_record": 98}}),
+    ])
+    .ok_or("a located coordinate must produce a coordinates object")?;
+    if located.pointer("/first_divergent_record").and_then(JsonValue::as_u64) != Some(98) {
+        return Err("the first attempt that located a coordinate must win".into());
+    }
+
+    // ⚠️ THE ONE THAT MATTERS MOST. A red cell whose position could not be
+    // located must still EMIT A ROW, marked diverged and carrying no
+    // coordinates. Skipping it would make the store silently under-count
+    // exactly the cells that could not locate a divergence.
+    let metadata = RunMetadata {
+        schema: RUN_SCHEMA,
+        hermit_sha: "d601651a3a0f4865b72af50a9c5967eaf60c351a".into(),
+        detcore_tree: "0".repeat(40),
+        source_tree_dirty: false,
+        run_timeout_seconds: 60,
+        mode: None,
+        test: None,
+        backend: None,
+        cell_timeout_seconds: None,
+        sample: None,
+        seed: None,
+        unavailable_cells: 0,
+        repetitions: None,
+        run_id_prefix: None,
+        green: false,
+        jobs: 1,
+        eligible_cells: 0,
+        cells: Vec::new(),
+    };
+    let row = ResultRow {
+        schema: 4,
+        run_id: "campaign".into(),
+        hermit_sha: metadata.hermit_sha.clone(),
+        source_tree_dirty: false,
+        test: "language-runtimes/node-v8-jit".into(),
+        category: "language-runtimes".into(),
+        lane: "portable".into(),
+        mode: "verify".into(),
+        backend: Some("ptrace".into()),
+        classification: "required".into(),
+        outcome: "FAIL".into(),
+        argv: Vec::new(),
+        guest_argv: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: String::new(),
+        shell_command: String::new(),
+        attempts: Vec::new(),
+        reason: None,
+        error_kind: None,
+    };
+    let rows = series_rows(
+        &metadata,
+        &[("a-cell-repetition-0000".to_string(), row)],
+        "2026-08-25T00:00:00Z",
+    )?;
+    if rows.len() != 1 {
+        return Err("a diverged-but-unlocated cell must still emit exactly one row".into());
+    }
+    let payload = rows[0]
+        .get("series")
+        .ok_or("emitted row carries no series payload")?;
+    if payload.get("outcome").and_then(JsonValue::as_str) != Some("diverged") {
+        return Err("an unlocated divergence must still be recorded as diverged".into());
+    }
+    if payload.get("coordinates").is_some() {
+        return Err("an unlocated divergence must carry NO coordinates object".into());
+    }
+    Ok(())
+}
+
+fn series_host() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|h| h.split('.').next().unwrap_or("").to_string())
+        .filter(|h| !h.is_empty() && !h.contains('/') && h != "." && h != "..")
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 fn default_result_root(root: &Path) -> Result<PathBuf, String> {
@@ -4263,6 +4666,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
 
 fn self_test(root: &Path) -> Result<(), String> {
     safe_ci_scope::self_test()?;
+    series_self_test()?;
     // The checked files remain immutable throughout this self-test. Production
     // plan/run still checks at its command boundary before constructing a plan.
     let checked_scorecard = check_scorecard(root)?;
