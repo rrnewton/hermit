@@ -84,7 +84,6 @@ set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
-RUNNER="$ROOT/agent-utils/bin/safe-ci-dag-runner"
 
 cpu_budget=240
 wall=""
@@ -98,6 +97,17 @@ diag_fd=""
 diag_log=""
 
 die() { echo "hermit-box-run: $*" >&2; exit 2; }
+
+RUNNER=""
+for candidate in \
+  "$ROOT/agent-utils/bin/dagrun" \
+  "$ROOT/agent-utils/bin/safe-ci-dag-runner"; do
+  if [ -x "$candidate" ]; then
+    RUNNER="$candidate"
+    break
+  fi
+done
+[ -n "$RUNNER" ] || die "agent-utils contains neither bin/dagrun nor bin/safe-ci-dag-runner"
 
 while [ $# -gt 0 ]; do
   case "$1" in
