@@ -17,10 +17,10 @@ is_build_or_run_file() {
 }
 
 is_excluded() {
+    [[ $1 == ci/compat-envelope/cells.json ]] && return 0
     case "/$1/" in
         */.git/* | */ignored/* | */experiments/* | */scratch/* | */target/* \
-            | */third-party/* | */vendor/* | */ci/compat-envelope/cells.json/ \
-            | */scripts/check-portable-paths.sh/)
+            | */third-party/* | */vendor/* | */scripts/check-portable-paths.sh/)
             return 0 ;;
         *) return 1 ;;
     esac
@@ -89,6 +89,11 @@ self_test() {
     }
     if is_excluded ci/compat-envelope/scorecard.rs; then
         echo "portability self-test excluded live compatibility code" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+    if is_excluded archived/ci/compat-envelope/cells.json; then
+        echo "portability self-test widened the literal evidence exclusion" >&2
         rm -f "$fixture"
         return 1
     fi
