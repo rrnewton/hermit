@@ -228,17 +228,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Invalid arguments return immediately from the kernel and therefore are
         // not signal-only waits.
-        let Some(mask_addr) = call.mask() else {
-            return self.record_or_replay_blocking(guest, call.into()).await;
-        };
         if call.sigsetsize() != KERNEL_SIGSET_SIZE {
-            return self.record_or_replay_blocking(guest, call.into()).await;
+            return Err(Errno::EINVAL.into());
         }
-
-        let temporary_mask: u64 = match guest.memory().read_value(mask_addr.cast()) {
-            Ok(mask) => mask,
-            Err(_) => return self.record_or_replay_blocking(guest, call.into()).await,
+        let Some(mask_addr) = call.mask() else {
+            return Err(Errno::EFAULT.into());
         };
+
+        let temporary_mask: u64 = guest
+            .memory()
+            .read_value(mask_addr.cast())
+            .map_err(|_| Errno::EFAULT)?;
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
         let pending_guard = stack.commit()?;

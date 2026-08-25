@@ -169,14 +169,22 @@ fn signal_guest() -> &'static Path {
         .as_path()
 }
 
-fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
+fn run_signal_scenario_on_backend(
+    backend: Option<&str>,
+    scenario: &str,
+    expected_stdout: &str,
+    runs: usize,
+) {
     let _guard = hermit_signal_lock();
     let mut baseline = None;
 
-    for iteration in 0..DETERMINISM_RUNS {
+    for iteration in 0..runs {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command.arg("run");
+        if let Some(backend) = backend {
+            command.arg(format!("--backend={backend}"));
+        }
         command.args([
-            "run",
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
@@ -206,6 +214,10 @@ fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
             baseline = Some(output.stdout);
         }
     }
+}
+
+fn run_signal_scenario(scenario: &str, expected_stdout: &str) {
+    run_signal_scenario_on_backend(None, scenario, expected_stdout, DETERMINISM_RUNS);
 }
 
 #[test]
@@ -255,6 +267,25 @@ fn signal_interrupts_rt_sigtimedwait_despite_sa_restart() {
     run_signal_scenario(
         "sigtimedwait-sa-restart",
         "rt_sigtimedwait interrupted deliveries=1 pending=SIGUSR2\n",
+    );
+}
+
+#[test]
+fn sigsuspend_invalid_arguments_preserve_linux_error_order() {
+    run_signal_scenario(
+        "sigsuspend-invalid-arguments",
+        "rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT\n",
+    );
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
+    run_signal_scenario_on_backend(
+        Some("dbt"),
+        "sigsuspend-invalid-arguments",
+        "rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT\n",
+        1,
     );
 }
 
