@@ -3850,18 +3850,7 @@ fn every_record_container_site_classifies_a_child_fault_by_name() {
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
 
-    // One row per `run_guarded` site in `record_start.rs`, with a spelling that
-    // reaches it. The last two are the sites that had no coverage at all.
-    let sites: [(&str, &[&str]); 6] = [
-        ("record.main", &[]),
-        ("record.main.deadline", &["--record-timeout", "600"]),
-        ("record_verify.record", &["--verify"]),
-        ("record_verify.replay", &["--verify"]),
-        ("record_verify_debug.record", &["--verify-with-gdbex", "quit"]),
-        ("record_verify_debug.replay", &["--verify-with-gdbex", "quit"]),
-    ];
-
-    for (site, extra) in sites {
+    for (site, extra) in RECORD_FAULT_SITES {
         for (fault, class) in [
             ("segv", "container-child-exit"),
             ("panic", "container-child-panic"),
@@ -3901,5 +3890,107 @@ fn a_fault_aimed_at_no_existing_site_fires_nowhere() {
         "a fault aimed at a site that does not exist must fire nowhere; firing anyway \
          means the site filter is not consulted and the by-name test above is vacuous\
          \nstderr:\n{stderr}"
+    );
+}
+
+/// One row per `run_guarded_at` site in `record_start.rs`, with a spelling that
+/// reaches it. Kept at module scope so
+/// `no_container_site_is_unreachable_by_the_fault_injector` can hold the source
+/// to it.
+const RECORD_FAULT_SITES: [(&str, &[&str]); 6] = [
+    ("record.main", &[]),
+    ("record.main.deadline", &["--record-timeout", "600"]),
+    ("record_verify.record", &["--verify"]),
+    ("record_verify.replay", &["--verify"]),
+    ("record_verify_debug.record", &["--verify-with-gdbex", "quit"]),
+    ("record_verify_debug.replay", &["--verify-with-gdbex", "quit"]),
+];
+
+/// Sites that exist but are deliberately not driven by the `record` table above,
+/// each with the reason. An entry here is a DECLARATION, not an exemption from
+/// thought: it says a different test already reaches this site.
+const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 1] = [(
+    "with_container",
+    "the `run` path; covered by the existing run-mode fault-injection tests",
+)];
+
+/// ⚠️ A CLASSIFICATION SITE CANNOT SILENTLY OPT OUT OF BEING ADDRESSABLE.
+///
+/// This is the invariant made STRUCTURAL rather than left as a convention. Two
+/// sites -- the replay stages -- were untestable for as long as they existed, and
+/// nothing said so; they were discovered by a human reading the code. The failure
+/// mode is not that a test broke, it is that no test could ever have existed, and
+/// silence is indistinguishable from coverage.
+///
+/// So: every `run_guarded_at("...")` label in the sources is extracted here and
+/// must appear either in [`RECORD_FAULT_SITES`] or in
+/// [`FAULT_SITES_DRIVEN_ELSEWHERE`] with a reason. A site added without a row
+/// fails THIS test by name, at the moment it is added, rather than being
+/// untestable by default and noticed years later.
+#[test]
+fn no_container_site_is_unreachable_by_the_fault_injector() {
+    const SOURCES: [(&str, &str); 2] = [
+        (
+            "record_start.rs",
+            include_str!("../src/bin/hermit/record_start.rs"),
+        ),
+        (
+            "container.rs",
+            include_str!("../src/bin/hermit/container.rs"),
+        ),
+    ];
+
+    let mut declared: Vec<(String, String)> = Vec::new();
+    for (file, text) in SOURCES {
+        for (needle, close) in [("run_guarded_at(\"", '"'), ("inject_test_fault(\"", '"')] {
+            let mut rest = text;
+            while let Some(at) = rest.find(needle) {
+                rest = &rest[at + needle.len()..];
+                if let Some(end) = rest.find(close) {
+                    declared.push((file.to_string(), rest[..end].to_string()));
+                }
+            }
+        }
+    }
+    assert!(
+        !declared.is_empty(),
+        "extracted zero site labels from the sources; this test would pass \
+         vacuously and prove nothing about coverage"
+    );
+
+    let covered: Vec<&str> = RECORD_FAULT_SITES
+        .iter()
+        .map(|(site, _)| *site)
+        .chain(FAULT_SITES_DRIVEN_ELSEWHERE.iter().map(|(site, _)| *site))
+        .collect();
+
+    let mut unreachable: Vec<String> = declared
+        .iter()
+        .filter(|(_, site)| !covered.contains(&site.as_str()))
+        .map(|(file, site)| format!("{file}: {site}"))
+        .collect();
+    unreachable.sort();
+    unreachable.dedup();
+    assert!(
+        unreachable.is_empty(),
+        "these container sites can be faulted but no test aims at them, so their \
+         classification would be asserted rather than measured -- add a row to \
+         RECORD_FAULT_SITES, or to FAULT_SITES_DRIVEN_ELSEWHERE with the test that \
+         covers it:\n  {}",
+        unreachable.join("\n  ")
+    );
+
+    // And the other direction: a row naming a site that no longer exists is a test
+    // aimed at nothing, which passes while covering less than it claims.
+    let existing: Vec<&str> = declared.iter().map(|(_, s)| s.as_str()).collect();
+    let stale: Vec<&str> = covered
+        .iter()
+        .copied()
+        .filter(|site| !existing.contains(site))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these rows name a site that no longer exists in the sources, so they aim \
+         at nothing: {stale:?}"
     );
 }
