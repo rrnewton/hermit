@@ -63465,11 +63465,9 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "kvm",
-      "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "enabled": false,
+      "status": "not-applicable",
+      "not_applicable_reason": "KVM requires the privileged runner",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -63492,10 +63490,7 @@
       "mode": "verify",
       "backend": "ptrace",
       "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "status": "green",
       "observations": [],
       "measurement": "never-measured"
     },
@@ -63505,11 +63500,9 @@
       "test": "system-utils/example-date",
       "mode": "verify",
       "backend": "sabre",
-      "enabled": true,
-      "status": "red",
-      "ci_disabled_reason": {
-        "reason": "This enabled verify cell is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated canonical verification qualifies every enabled backend."
-      },
+      "enabled": false,
+      "status": "not-applicable",
+      "not_applicable_reason": "Required date/clock virtual-time support remains owner-gated for SaBRe",
       "observations": [],
       "measurement": "never-measured"
     },
