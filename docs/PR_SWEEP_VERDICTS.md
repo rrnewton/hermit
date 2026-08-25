@@ -1516,6 +1516,60 @@ returned MERGES-CLEAN — definitively, in one command.
 Related: `mergeStateStatus` carries the same third value (`UNKNOWN`) and the same
 caveat. And note the separate trap in the other direction — a head does not need
 rebasing to be mergeable; see the two-commits-behind case below.
+## Run the gate that covers the file's TYPE, not the one covering your change
+
+⚠️ **Deliberately not a numbered check**, for the reason given below in the
+two-lane section: numbered additions collide by construction.
+
+**A new file joins a gate's population by existing.** So the gate you must run is
+the one that covers the file's TYPE — not the one that covers your change's
+subject. Adding a shell script to a Rust change puts you in the shellcheck
+population whether or not you were thinking about shell.
+
+The failure is quiet in a specific way: the gate you *did* run passes honestly,
+because the thing it covers really is fine. Nothing lies. The population simply
+grew somewhere you were not looking.
+
+**Three instances in one night, all mine, which is why this is written down
+rather than assumed obvious:**
+
+| landed as | what I ran | what I owed | result |
+| --- | --- | --- | --- |
+| `b120fe5d76` (hermit#2573) | `rust-script --force … --help` | `scripts/check-script-sigpipe.sh` | two portable gates red on main |
+| `962fad5e` (dev-hermit) | `rustfmt` on the changed files | the push gate's own file list | ten unformatted files landed |
+| `e706d05d` (dev-hermit) | `shellcheck` on the four files that SOURCE the new one | `shellcheck` on the new file | `shellcheck` red on main, SC2148 |
+
+Each has a different-looking cause and the same shape:
+
+1. **`--help` proves compilation, not cleanliness.** A rust-script compiles when
+   invoked, so `--help` really does prove it builds — which is why it feels
+   sufficient. It runs no clippy. `check-script-sigpipe.sh` says so in its own
+   failure text: *"No cargo gate compiles these, so cargo build/test/clippy/fmt
+   will all still pass."*
+2. **I formatted the files and the push gate agreed with me.** It had refused the
+   push once, naming a file; after formatting it passed — and the commit it passed
+   still contained ten unformatted files. Verified afterwards in a scratch worktree
+   at that commit. A gate that passes what it just refused is worth its own
+   investigation, but the lesson here is narrower: *its* agreement was not
+   *evidence* I had run the right check.
+3. **I checked the consumers, not the artefact.** The new file was
+   `lint-exclusions.sh`, sourced by four enumerators. I shellchecked all four and
+   not the file itself, which had no shebang and no `shell` directive.
+
+**The check, and it is one question:**
+
+> For every file this change ADDS — not modifies — which gate's population does it
+> now belong to, and did I run that gate?
+
+`git status --short` marks additions with `??` before staging and `A` after. That
+list is the input to the question. Modified files are usually already covered;
+**it is the added ones that move a boundary.**
+
+This is the same family as the coverage-boundary checks elsewhere in this
+document, seen from the author's side rather than the gate's: those ask whether a
+gate's population is missing files it should hold, this asks whether YOUR file
+just joined a population you never ran. A gate can be correctly defined and still
+never see your work, because you never invoked it.
 
 ## Landing a two-lane head: the ordering
 
