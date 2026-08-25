@@ -822,6 +822,60 @@ Neither agent was careless. **Do not treat an assignment reaching you as evidenc
 that the head is free** — claim-check the pull request itself.
 
 
+### 15. On a head that has sat, diff the MERGE BASE — the main diff is the change PLUS everything main did meanwhile
+
+Check 9 is about what a *merge writes*. This one is about what a *reviewer reads*,
+and it fires earlier: before any merge is attempted, on the diff you open to
+decide what the change even is.
+
+`git diff origin/main <head>` on a stale head is not the change. It is the change
+**minus** every commit main has gained since the base — which renders as
+**deletions the author never wrote**. Two failure modes, opposite directions:
+
+- the reviewer sees a wall of deletions and rejects a small correct change; or
+- the reviewer accepts that reading, merges, and **reverts work that landed while
+  the head sat**.
+
+**Measured on four heads in one afternoon, 2026-08-25.** For each, the same head
+read two ways:
+
+| PR | merge-base diff (the change) | `origin/main` diff (change + staleness) | what the main-diff reading would have reverted |
+| --- | --- | --- | --- |
+| #2552 | manifests + derived artifacts | + `portable.json −9`, `portable-shards.json −1` | `check.backend_parity_suites`, landed **20 minutes earlier** |
+| #2556 | **1 file, +118/−15** | 8 files, 252 deletions | the chaos ratchet landed **6 minutes earlier**, and 50 lines of THIS document |
+| #2216 | **3 files, +1051/−10** | 30 files, 1,109 deletions | `c-programs.yaml −106`, `determinism-stress-c.yaml −54` — a ratchet landed the **same day** |
+| #2549 | **1 file, +61/−4** | 65 files, **3,420** deletions | `overflow-gid-resolves.sh −60` — a regression cell landed the **same day** |
+
+In every row the two readings tell opposite stories, and in every row the
+merge-base diff is the honest one. Nothing in the tooling flags the difference:
+both are valid `git diff` invocations that exit 0.
+
+**The rule.**
+
+```console
+BASE=$(git merge-base origin/main "$HEAD")
+git diff --stat "$BASE" "$HEAD"      # THE CHANGE — review this
+git diff --stat origin/main "$HEAD"  # change + staleness — a MERGE-RISK signal only
+```
+
+Read the first to judge the change. Read the second only to answer a different
+question: *how much has main moved under this head, and does anything it would
+displace matter?* A large gap between them is not a finding about the author —
+it is a rebase requirement.
+
+> [!WARNING]
+> **Take `$HEAD` from the branch ref, not `refs/pull/N/head`.** On #2216 the pull
+> ref resolved 387 commits behind the branch ref, so a review taken from it
+> diffed the wrong head against the wrong base and showed 418 files with 173,238
+> deletions — none of them the author's. `git ls-remote origin refs/heads/<branch>`
+> and the API agreed; only the pull ref was stale. Wrong head and wrong base
+> compound.
+
+This sits beside check 14 for a reason. That rule says **the task view is not
+ownership**; this one says **the main diff is not the change**. Both are cases
+where the view you reach for first is the wrong one, and both fail silently.
+
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
