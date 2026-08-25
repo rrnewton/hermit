@@ -39,6 +39,74 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+/// Signals hermit takes from the guest's namespace, and what a guest loses.
+///
+/// ⚠️ ENUMERATED BY MEASUREMENT, NOT BY READING (2026-08-25). Every signal 1..64
+/// was run under two delivery paths -- self-directed `raise` and a sibling
+/// thread's `pthread_kill` -- with a native run as the control for each. Exactly
+/// TWO differ from native, and they fail in different ways at different points:
+///
+///   SIGSTKFLT (16)  `rt_sigaction` is NO-OPED below, so the handler is never
+///                   installed and the default disposition terminates the guest:
+///                   observed exit 144 (= 128 + 16).
+///   SIGTRAP    (5)  `rt_sigaction` passes through and the handler IS installed,
+///                   but ptrace consumes every SIGTRAP (syscall stops, seccomp
+///                   stops, breakpoints), so the handler never runs. ⚠️ THE GUEST
+///                   THEN EXITS 0 WITH NO DIAGNOSTIC AT ALL -- a clean pass that
+///                   behaved differently from native, which no cell can catch.
+///
+/// Everything else in 1..31 matches native exactly; 9/19 and 32/33 refuse
+/// `sigaction` natively too and are not hermit's. Realtime 34..64 fail by a
+/// different mechanism (they cannot be represented at the reverie ptrace
+/// boundary) and are tracked separately -- they are not appropriation.
+const APPROPRIATED_SIGNALS: [(i32, &str); 2] = [
+    (
+        libc::SIGTRAP,
+        "ptrace consumes every SIGTRAP (syscall/seccomp stops, breakpoints)",
+    ),
+    (
+        libc::SIGSTKFLT,
+        "reverie uses it as PERF_EVENT_SIGNAL, the PMU preemption timer",
+    ),
+];
+
+/// Say, once per installation, that a guest handler will never run.
+///
+/// ⚠️ WHY A DIAGNOSTIC AND NOT A REFUSAL. Returning `EINVAL` from `sigaction`
+/// was considered and deliberately rejected for SIGSTKFLT -- see the comment at
+/// the no-op below: the Go runtime registers that handler, and refusing would
+/// break every Go guest at startup. That reasoning generalises: installing a
+/// handler defensively is common, actually raising these signals is rare, so
+/// refusal breaks MORE programs than the current behaviour. The contract
+/// question of what a guest is owed here is genuinely open.
+///
+/// What is NOT open is that hermit currently says NOTHING. This line commits to
+/// no policy, breaks no conforming program, and turns a silent wrong answer into
+/// a visible one -- the same reasoning as the `HERMIT_INTERNAL_FAILURE` marker.
+/// The decision, separated from the reporting so a test can exercise THIS and
+/// not a copy of it. A unit test that re-implements a predicate keeps passing
+/// when the real one is gutted -- measured in this project's own pipe work,
+/// where deleting the production wiring left every unit test green.
+fn appropriated_reason(signum: i32, handler: u64) -> Option<&'static str> {
+    // SIG_DFL (0) and SIG_IGN (1) lose nothing: the guest is not asking to be
+    // called back, so there is no expectation to disappoint.
+    if handler <= 1 {
+        return None;
+    }
+    APPROPRIATED_SIGNALS
+        .iter()
+        .find(|(s, _)| *s == signum)
+        .map(|(_, why)| *why)
+}
+
+fn warn_appropriated_signal(signum: i32, handler: u64) {
+    if let Some(why) = appropriated_reason(signum, handler) {
+        tracing::warn!(
+            "HERMIT_APPROPRIATED_SIGNAL signum={signum} effect=handler-installed-but-never-invoked reason={why}"
+        );
+    }
+}
+
 // NB: note kernel has different notation of sigaction, we cannot
 // use libc's sigaction here unfortunately. See:
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
@@ -270,6 +338,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigaction,
     ) -> Result<i64, Error> {
+        // Both appropriated signals are reported here, at the one point where the
+        // guest states its expectation. SIGTRAP falls through to the ordinary
+        // path below (its handler really is installed; ptrace just eats the
+        // signal), so this must run before the SIGSTKFLT early return.
+        if let Some(action) = call.action() {
+            let handler = guest
+                .memory()
+                .read_value(AddrMut::<u64>::from_raw(action.as_raw()).unwrap())
+                .unwrap_or(0);
+            warn_appropriated_signal(call.signum(), handler);
+        }
+
         // PERF_EVENT_SIGNAL is reserved.
         if call.signum() == reverie::PERF_EVENT_SIGNAL as i32 {
             // The go runtime attempts to register this (unused) signal handler.  We will never
@@ -642,5 +722,52 @@ mod tests {
         assert!(!can_forward_process_group_signal(0, libc::SIGKILL, false));
         assert!(!can_forward_process_group_signal(-1, libc::SIGKILL, false));
         assert!(!can_forward_process_group_signal(-42, libc::SIGKILL, true));
+    }
+}
+
+#[cfg(test)]
+mod appropriated_signal_tests {
+    use super::*;
+
+    /// The set is closed, and it is closed BY MEASUREMENT: every signal 1..64 was
+    /// run under two delivery paths against a native control, and exactly these
+    /// two differ. If a third is ever appropriated it must be added here, because
+    /// the diagnostic is the only thing that makes the loss visible.
+    #[test]
+    fn the_appropriated_set_is_exactly_sigtrap_and_sigstkflt() {
+        let signums: Vec<i32> = APPROPRIATED_SIGNALS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(signums, vec![libc::SIGTRAP, libc::SIGSTKFLT]);
+        // SIGSTKFLT is appropriated because reverie uses it as the PMU timer, so
+        // the two must not drift apart.
+        assert_eq!(libc::SIGSTKFLT, reverie::PERF_EVENT_SIGNAL as i32);
+    }
+
+    /// ⚠️ SIG_DFL and SIG_IGN LOSE NOTHING. A guest that is not asking to be
+    /// called back has no expectation to disappoint, and warning there would make
+    /// the marker noise instead of signal -- Go registers SIGSTKFLT routinely.
+    #[test]
+    fn only_a_real_handler_is_reported() {
+        for signum in [libc::SIGTRAP, libc::SIGSTKFLT] {
+            assert!(!reports(signum, 0), "SIG_DFL must not warn");
+            assert!(!reports(signum, 1), "SIG_IGN must not warn");
+            assert!(reports(signum, 0x4000_1234), "a real handler must warn");
+        }
+    }
+
+    /// An ordinary signal is delivered normally and must never be reported.
+    #[test]
+    fn an_unappropriated_signal_is_never_reported() {
+        for signum in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT, 10, 30] {
+            assert!(
+                !reports(signum, 0x4000_1234),
+                "signal {signum} is not appropriated"
+            );
+        }
+    }
+
+    /// Calls the REAL predicate. Deliberately not a re-implementation: a
+    /// mirrored copy would keep passing if `appropriated_reason` were gutted.
+    fn reports(signum: i32, handler: u64) -> bool {
+        appropriated_reason(signum, handler).is_some()
     }
 }
