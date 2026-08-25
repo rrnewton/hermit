@@ -1754,6 +1754,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/startup_tls_guards.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false)",
+      "why": "tests/c/startup_tls_guards.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml (explicit mode selection; ci=false): prints the x86-64 glibc TLS stack canary, pointer guard, and AT_RANDOM bytes so canonical verification detects a backend that replaces startup randomness only after glibc has consumed it"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/startup_surface_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
       "why": "tests/c/startup_surface_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: prints argv, environ in order, the full auxv vector including the AT_RANDOM bytes and the raw vDSO base, and the initial stack layout, and branches on those values so verify's double run asserts identity of both the inputs and the decisions made from them"

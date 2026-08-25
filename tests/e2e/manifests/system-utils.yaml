@@ -1532,6 +1532,73 @@ test:
           liteinst: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           ptrace: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           sabre: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
+  - id: system-utils/startup-tls-guards
+    description: the x86-64 glibc TLS stack canary and pointer guard initialized before main are identical across repeated runs
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    timeout_seconds: 120
+    occasional: false
+    program: tests/c/startup_tls_guards.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: 'MEASURED-BUT-NOT-QUALIFIED: ptrace canonical verification passed while SaBRe canonical verification diverged on both glibc TLS guards even though AT_RANDOM matched. Measured three times at Hermit 7c102994680aa334196b0dee28554dbfe5a441c2; the current port records a fresh focused rerun in its review. Keep both backends enabled for explicit runs, and enable CI only after deterministic startup bytes reach glibc before guard initialization.'
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Qualify the DBT startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
+          kvm: Qualify the KVM startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
+          liteinst: Qualify the LiteInst startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
+      naked:
+        ci: false
+        ci_disabled_reason: Native execution intentionally receives fresh kernel AT_RANDOM bytes, so repeated TLS guards differ by design
+        backends_enabled: []
+        backends_disabled:
+          native: Native execution intentionally receives fresh kernel AT_RANDOM bytes and therefore different TLS guards on every run
+      chaos:
+        ci: false
+        ci_disabled_reason: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+        backends_enabled: []
+        backends_disabled:
+          dbt: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          kvm: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          liteinst: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          ptrace: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+          sabre: Guard initialization happens before chaos scheduling and is not the schedule-diversity contract
+      custom:
+        ci: false
+        ci_disabled_reason: No custom Hermit arguments are needed because verify's repeated-run comparison is the contract
+        backends_enabled: []
+        backends_disabled:
+          dbt: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          kvm: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          liteinst: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          ptrace: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+          sabre: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay ownership of startup TLS guards is a separate contract from repeated-run verification
+        backends_enabled: []
+        backends_disabled:
+          dbt: Record/replay ownership of startup TLS guards is a separate contract
+          kvm: Record/replay ownership of startup TLS guards is a separate contract
+          liteinst: Record/replay ownership of startup TLS guards is a separate contract
+          ptrace: Record/replay ownership of startup TLS guards is a separate contract
+          sabre: Record/replay ownership of startup TLS guards is a separate contract
   - id: system-utils/shm-coherency-identity
     description: what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates
     lane: portable
