@@ -190,7 +190,37 @@ mkdir -p "$scratch_dir" || {
     echo "run-node.sh: could not create scratch dir: $scratch_dir" >&2
     exit 2
 }
-scratch_dag="$scratch_dir/${lane}.${sel}.effective.json"
+
+# ⚠️ THE SELECTION CANNOT GO INTO THE FILENAME UNCONDITIONALLY.
+#
+# `$sel` is a comma-joined MULTI-NODE selection in CI — ci-portable.yml passes
+# `jq -r '.preflight_nodes|join(",")'`, which is 11 tags and 251 bytes — and
+# "<lane>." + sel + ".effective.json" costs 24 bytes of overhead, so anything
+# past 231 bytes of selection overflows NAME_MAX (255). The scratch write then
+# died with `OSError: [Errno 36] File name too long` and run-node.sh exited 2,
+# taking out the WHOLE preflight job while every single-node use kept working.
+#
+# ⚠️ AND NOTE WHY NOTHING CAUGHT IT: until the scratch DAG became unconditional,
+# the filename was built INSIDE the `--` branch, which refuses a multi-node
+# selection three lines earlier ("'--' requires exactly one node tag"). A long
+# `$sel` was structurally unreachable. The guard did not move; the code it was
+# protecting moved out from behind it.
+#
+# Keep the readable name whenever it fits — that is the single-node iteration
+# case, and ci/run-node-args-test.sh asserts that exact path by name — and
+# digest anything longer. The digest is a pure function of the selection, so a
+# repeated run of the same selection still reuses one file.
+scratch_name() {
+    local lane=$1 sel=$2 name
+    name="${lane}.${sel}.effective.json"
+    if ((${#name} <= 200)); then
+        printf '%s\n' "$name"
+        return 0
+    fi
+    printf '%s.%s.effective.json\n' "$lane" \
+        "$(printf '%s' "$sel" | sha1sum | cut -d' ' -f1 | cut -c1-16)"
+}
+scratch_dag="$scratch_dir/$(scratch_name "$lane" "$sel")"
 RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" RUN_NODE_CPU_TIMEOUT="$lane_cpu_timeout" \
     python3 -c '
 import json, os, sys

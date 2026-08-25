@@ -96,6 +96,36 @@ else
     printf 'run-node-args-test: ok — the refusal prints the supported form\n'
 fi
 
+# ⚠️ A REAL CI SELECTION MUST SURVIVE THE SCRATCH-DAG WRITE.
+#
+# Every check above passes a SINGLE node tag, but ci-portable.yml invokes this
+# script with a comma-joined MULTI-NODE selection — `preflight_nodes` is 11 tags
+# and 251 bytes. When the selection went into the scratch filename, that
+# overflowed NAME_MAX (255) and run-node.sh exited 2 with `File name too long`
+# for the entire preflight job, while every single-node case here stayed green.
+# A guard file whose cases are all one node cannot see that, so the real
+# selection is read from ci/portable-shards.json rather than written down here.
+#
+# The runner is stubbed to /bin/true, so this still executes NO node: the scratch
+# write happens before find_runner, which is exactly the part under test.
+long_sel=$(python3 -c '
+import json
+print(",".join(json.load(open("ci/portable-shards.json"))["preflight_nodes"]))')
+if [[ -z $long_sel ]]; then
+    fail "could not read preflight_nodes from ci/portable-shards.json"
+else
+    long_output=$(run_local env DAGRUN_BIN=/bin/true "$RUN_NODE" "$LANE" "$long_sel" 2>&1)
+    long_status=$?
+    if ((long_status != 0)); then
+        fail "the real ${#long_sel}-byte preflight selection was refused: exit $long_status.
+  This is the selection ci-portable.yml passes, so a failure here reddens the whole job.
+  Output: $long_output"
+    else
+        printf 'run-node-args-test: ok — a %d-byte CI selection writes its scratch DAG\n' \
+            "${#long_sel}"
+    fi
+fi
+
 # The append case. RUN_NODE_PRINT_ONLY stops before execution, so this asserts
 # the edited command itself rather than a node's outcome.
 tracked_cmd=$(python3 -c '
@@ -211,4 +241,4 @@ if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 single-node edit, lane CPU budget carried, no unexplained drift\n'
+printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, 1 single-node edit, lane CPU budget carried, no unexplained drift\n'
