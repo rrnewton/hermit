@@ -1835,6 +1835,156 @@ removable with `rm`. A guard that cannot be pulled quickly turns a false refusal
 into an outage of unbounded length, and the deadlock above lasted only as long as
 it took to diagnose because pulling it was always available.
 
+## An instrument that only looks for good news reports a clean board
+
+⚠️ **A checker built to recognise the success condition usually has no channel
+for the failure condition, so "no problems found" is manufactured rather than
+observed.** The positive marker gets a grammar, a parser and a counter; the
+negative marker gets whatever falls through. Then absence of a finding is read as
+absence of the fault, and the one state nobody investigates is the state the
+instrument cannot represent.
+
+This is not the same as a checker being wrong. Each instance below is *correct*
+on everything it looks at. The defect is the shape of the question — and the third
+instance is this document's own lane-status board, which merged a blocked head.
+
+### Instance 1 — the malformed-binding detector shares the grammar's anchor
+
+`ci-hub/health/approval_binding.py` deliberately carries a second regex beside the
+approval grammar, and its comment says why: *"LOUD ON THE UNKNOWN. A line that is
+plainly trying to be a verdict binding … but which matches neither grammar is
+reported, never ignored. Silently skipping an unrecognised variant is how variant
+three went unnoticed."* Exactly the right instinct. But both regexes are anchored
+at line start:
+
+```python
+approve = re.compile(r"^APPROVED-AT:\s*(claude|codex)\s+([0-9a-f]{40})$", re.I)
+suspect = re.compile(r"^(?:APPROV|CHANGES-REQUESTED|REQUEST\s+CHANGES|…)[^\n]*\b[0-9a-f]{40}\b", re.I)
+```
+
+`undecorate()` strips *symmetric* wrappers (`**…**`, `` `…` ``) before matching, so
+whole-line emphasis is handled. A **leading** marker is not symmetric and is not
+stripped. Measured against the four forms seen in the wild:
+
+| line form | binds? | flagged malformed? |
+|---|---|---|
+| `APPROVED-AT: claude <sha>` | **yes** | – |
+| bold + backtick wrapper, no lane token | no | yes |
+| `APPROVED-AT: <sha>` — bare, no lane token | no | yes |
+| `## APPROVED-AT: claude <sha>` — heading | **no** | **no** |
+
+The last row is the whole finding. That line has the lane token, the colon and a
+correct 40-hex head; only `## ` defeats it. And the *one decoration that defeats
+the anchor defeats both regexes*, so the near-miss detector is blind to precisely
+the near-misses that are near-missing because of the anchor. Two live heads
+carried a real, current, correct-sha review in that form and the board showed them
+as un-reviewed.
+
+**Fix:** strip a leading `#{1,6}\s+` (and list markers) in `undecorate()` alongside
+the wrappers. ⚠️ **This relaxation cannot admit anything new, which is why it is
+safe to adopt without re-auditing the corpus:** the strict grammar still has to
+match afterwards, so stripping decoration can only promote a line that was
+*already* a well-formed binding modulo decoration. A relaxation that widens what
+is *read* while leaving what is *accepted* unchanged has no false-positive
+surface.
+
+### Instance 2 — the detector is gated behind the label it exists to validate
+
+The malformed counter lives inside `lane_shas()`, and `lane_shas()` is only called
+for pull requests that already carry a tracked `passed-review-*` label. So the
+scan runs on heads that have already been credited with a lane, and never on heads
+whose binding failed.
+
+**Measured 2026-08-25, same repository, same moment:**
+
+```console
+$ approval_binding.py --repo rrnewton/hermit --json | jq .malformed_source_lines
+0
+
+$ # independent sweep of every PR touched that day, counting lines where an
+$ # APPROVED-AT keyword shares a line with a 40-hex sha but the grammar rejects it
+18 unparseable attempted bindings across 14 pull requests
+```
+
+hermit#2589 alone carries two and is reported as zero: it has no
+`passed-review-*` label, so it is never examined. **A binding that failed so badly
+it never earned a label is exactly the binding the detector cannot see**, and the
+counter reads `0` with total confidence.
+
+**Fix:** scan for the negative marker over the *candidate* population, not the
+*credited* one. The set to sweep is "pull requests whose comments mention the
+verdict keyword", which is strictly larger than "pull requests carrying the
+success label" and does not depend on the thing being measured.
+
+### Instance 3 — a sweep that extracts only the success marker cannot see a block
+
+⚠️ **This one caused a bad merge, and the instrument was this document's own
+lane-status board.**
+
+The board was built by extracting `APPROVED-AT:` lines and comparing them to the
+head. It never extracted `CHANGES-REQUESTED-AT:`. Both markers share a grammar, a
+comment stream and a chronology; only one was read. So a head carrying a bound,
+current, correctly-formatted **block** rendered on the board exactly like a head
+that had simply not been reviewed yet — and a head carrying an approval *followed*
+by a block rendered as **ready to land**.
+
+**hermit#2591, measured.** A reviewer posted `CHANGES-REQUESTED-AT: claude <head>`
+at the exact current head. The lane-status still showed the earlier approval, a
+lander read "carries a valid non-author lane", and the head merged over the block
+at 18:09:01Z. The content that landed was worse than no change: three defects the
+block existed to stop, including a recipe that fails on its second run.
+
+**hermit#2176, the same blindness caught before it cost anything.** Re-running the
+sweep with both markers showed `claude=BLOCKED` at the current head. The
+approval-only board had it as "awaiting a codex lane" — which would have routed the
+only codex-family agent on the fleet onto a blocked head.
+
+Note that `approval_binding.py` gets this **right**: a rejection calls
+`found.clear()`, so the authority correctly reported `UNDETERMINED`. The defect was
+in a downstream sweep that reimplemented half of the authority's grammar. That is
+the general hazard — *a consumer that re-implements only the half of a protocol it
+is interested in inherits none of the other half's protections.*
+
+**Fix:** extract both verdict markers and let the **newest verdict per lane** win,
+which is the rule the authority already applies. A lane then has three states, not
+two, and a board that cannot distinguish them must say so on its face rather than
+render blocked and unreviewed identically.
+
+### The fix shape, and it is already in this codebase twice
+
+Both instances share one repair: **give the negative outcome a first-class value
+and a counter of its own, sourced independently of the positive path.** This
+project has built that twice already, and they are the models to copy.
+
+- **`detcore/src/logdiff.rs` — `verdict: no_result`.** A comparison that could not
+  read its inputs refuses instead of reporting a match, and the refusal is a named
+  verdict rather than a fallthrough. Its regression tests are named for the
+  property: `nothing_written_yet_is_a_no_result_not_a_match`,
+  `empty_selection_is_a_no_result_not_a_match`. `AGENTS.md` states the policy
+  directly — *"an unreadable or truncated comparison must refuse with `verdict:
+  no_result` rather than report a match."*
+- **`approval_binding.py` — `landing_observability()`.** It *refuses an empty
+  window* — *"zero commits measured is not zero unobserved landings, it is no
+  measurement"* — and where coverage cannot be established it emits the literal
+  string `"NOT MEASURED"` instead of a number it cannot justify. The same file
+  therefore contains both the defect and its cure.
+
+### The check to apply
+
+For any guard, gate, counter or comparator, ask:
+
+1. **What does it output when it cannot evaluate?** If that is indistinguishable
+   from a pass, it only looks for good news.
+2. **Does its negative channel share the positive's parsing, gating, or source of
+   truth?** If so it inherits the blind spot, and the two will fail together on
+   exactly the inputs that matter. Independence of the negative channel is the
+   property, not merely its existence.
+3. **Is the population it scans defined by the thing it is measuring?** A detector
+   that only inspects already-credited artifacts cannot find the uncredited ones.
+
+⚠️ **And report the denominator.** "Zero malformed" and "zero out of a population
+I could not enumerate" are different claims, and only one of them is evidence.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
