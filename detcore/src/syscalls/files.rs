@@ -4202,6 +4202,17 @@ mod test {
         let pin_result = unsafe { libc::fcntl(created[0], libc::F_SETPIPE_SZ, -1) };
         assert_eq!(pin_result, -1);
         let pin_error = Errno::last();
+        // Pin the errno, not just the failure. Without this the test asserts only that
+        // `fcntl` returned -1, so it would still pass if the call failed for a reason we
+        // did not engineer -- an invalid `created[0]` fails EBADF, every assertion below
+        // still holds, and the capacity-pin path is never exercised at all.
+        //
+        // EINVAL is structural here, not a property of this host. `fcntl`'s argument is an
+        // `unsigned long`, so -1 arrives as ULONG_MAX; `round_pipe_size` returns 0 for any
+        // size above 2^31, and `pipe_set_size` maps that 0 to -EINVAL BEFORE it consults
+        // `CAP_SYS_RESOURCE`. So the result does not depend on privilege or on
+        // `/proc/sys/fs/pipe-max-size`.
+        assert_eq!(pin_error, Errno::EINVAL);
 
         let failure = pipe_capacity_failure(created, Err(pin_error))
             .expect("the forced capacity-pin failure must enter the cleanup path");
