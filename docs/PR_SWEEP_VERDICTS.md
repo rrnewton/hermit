@@ -298,6 +298,64 @@ one in your worktree reports `DBT support was not included in this build`. Probe
 the binaries you have before concluding a backend is unmeasurable; state which
 binary and which commit produced any number you report.
 
+### 8. Look for a policy that declares the thing intentional, before calling it a defect
+
+⚠️ **A line read in isolation cannot tell you whether it is an oversight or a
+stated decision.** Check whether something nearby declares it on purpose. If it
+does, the pull request is not a fix — it is a policy change, and it carries the
+obligations of one.
+
+The case, and it cost a wrong recommendation to three agents before it was
+caught:
+
+`tests/backend-parity/run_matrix.py` invokes the matrix with
+`("--verify", "--verify-allow", "both")` and no `--verify-strict`. Read alone,
+that is plainly a defect: bare `--verify` is the lossy Stripped comparator and
+cannot establish L2, so the whole backend-parity matrix appears to be comparing
+under a comparator that cannot support the claim the matrix exists to make.
+hermit#2342 adds the flag in one line, and it looks like the cheapest possible
+win.
+
+Twenty lines above, `DEFAULT_VERIFY_POLICY` says:
+
+```python
+DEFAULT_VERIFY_POLICY = VerifyPolicy.checked(
+    hermit_flags=("--verify", "--verify-allow", "both"),
+    expected_non_kvm_tier="stripped",
+    comparison_claim=(
+        "Stripped DETLOG comparison "
+        "(numbers/addresses/paths normalized; NOT bitwise)"
+    ),
+)
+```
+
+The limitation is **declared**, in those words, including *NOT bitwise*. And
+`VerifyPolicy.checked` refuses the one-line patch outright:
+
+```python
+if requests_canonical != expects_bitwise:
+    raise ValueError("--verify-strict and the bitwise evidence tier must move together")
+```
+
+Applying hermit#2342's single line to main and importing the module produces
+exactly that `ValueError`. The real change is three coupled edits — the flag, the
+tier from `stripped` to `bitwise`, and the claim text — which flips
+`assurance_label()` from *below L2* to **L2** for the entire matrix, and per
+`AGENTS.md` an L2 claim must be established with `bitwise_parity: true` rather
+than asserted.
+
+**The generalisation.** A declaration next to the code is evidence about intent
+that the code alone does not carry. Before filing a line as a defect, grep its
+neighbourhood for a policy object, a named constant, a stated tier, or a comment
+that owns the choice. Where one exists, the honest verdict is *policy change,
+needs measurement*, not *one-line fix* — and the difference is the whole scope of
+the work.
+
+A well-built guard like the one above is worth noticing for its own sake: it
+makes the flag and the claim it licenses move together, so no one can quietly
+upgrade a comparator without upgrading the assurance claim. That is the opposite
+of a gate that passes without looking.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
