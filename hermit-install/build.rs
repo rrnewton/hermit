@@ -312,12 +312,27 @@ fn build_liteinst_runtime(
     // against the pin compiled into the binary when it resolves the staged
     // runtime, and refuses a mismatch. That is what makes staleness loud instead
     // of silent -- see the loader in hermit-cli/src/lib.rs.
+    //
+    // ⚠️ WRITE IT BESIDE **EVERY** STAGED COPY, NOT JUST THIS ONE. The runtime is
+    // staged twice -- once at `profile_dir` by the script above and once here in
+    // `resources` -- and the loader reads `<the path it resolved>.revision`. When
+    // the sidecar existed only here, a correct restage produced a correct pin in
+    // `rsrcs/` while the loader resolved `target/release/libreverie_liteinst.so`,
+    // found no sidecar beside it, and refused with "records no Reverie revision".
+    // The artifact was never stale; only one of its two homes carried provenance.
+    // That made the printed remedy -- `cargo build --release -p hermit-install` --
+    // regenerate exactly the state that was already failing, so following the
+    // error message looped instead of resolving.
     let pin = reverie_pin(repository);
-    fs::write(
-        resources.join("libreverie_liteinst.so.revision"),
-        format!("{pin}\n"),
-    )
-    .unwrap_or_else(|error| panic!("failed to record the LiteInst runtime revision: {error}"));
+    for staged in [&runtime, &resources.join("libreverie_liteinst.so")] {
+        let marker = PathBuf::from(format!("{}.revision", staged.display()));
+        fs::write(&marker, format!("{pin}\n")).unwrap_or_else(|error| {
+            panic!(
+                "failed to record the LiteInst runtime revision at {}: {error}",
+                marker.display()
+            )
+        });
+    }
 }
 
 fn main() {
