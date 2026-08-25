@@ -18,6 +18,7 @@
     "check.dagrun_naming",
     "check.run_node_args",
     "check.check_outcome_consumers",
+    "check.lint_checks",
     "check.script_sigpipe",
     "lint.rustfmt"
   ],

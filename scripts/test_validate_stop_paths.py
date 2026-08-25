@@ -100,7 +100,23 @@ def stop_test_env(
 # The earlier version of this reasoning argued a large window would "hide a
 # wedged startup behind the build". That was true while the compile happened
 # inside the window. It no longer does, so the objection no longer applies.
-READY_TIMEOUT_SECONDS = 120
+#
+# RAISED 120 -> 600 on 2026-08-25, at main a5fef7ff7623, because 120 was still not
+# enough just above the load band measured above. With a full validate holding the
+# box at load average 42.8, this script failed on the VALIDATE_STOP_TEST_READY
+# deadline with the validate log at 0 bytes -- the child was alive and had not yet
+# been scheduled enough to emit the marker. Two more runs at load 35-43 on the same
+# commit then PASSED, taking 8m54s and 31s respectively. A spread of 31s to 8m54s
+# with one hard timeout, same commit and same box within an hour, is a scheduling
+# delay, not a stop-path defect.
+#
+# This matters more than it did: check.lint_checks now schedules this script in CI
+# for the first time, so an intermittent deadline here becomes an intermittent red
+# in the DAG -- the standing red everyone learns to ignore. The argument above is
+# unchanged and still carries the raise: `process.poll()` is checked every 50ms in
+# both loops, so a crash, refusal or nonzero exit is still caught in milliseconds
+# and only a genuine silent hang waits the full window.
+READY_TIMEOUT_SECONDS = 600
 
 
 # HOW LONG THE CHILD MAY TAKE TO EXIT ONCE SIGNALLED.
