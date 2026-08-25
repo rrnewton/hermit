@@ -1727,7 +1727,7 @@ fn series_coordinates(attempts: &[JsonValue]) -> Option<JsonValue> {
             located.insert(key.to_string(), JsonValue::from(value));
         }
     }
-    (!located.is_empty()).then(|| JsonValue::Object(located))
+    (!located.is_empty()).then_some(JsonValue::Object(located))
 }
 
 /// Build one series row per retained cell result.
