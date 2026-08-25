@@ -66,6 +66,7 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::ExactChildWaitState;
 use crate::types::LogicalTime;
+use crate::types::SigWrapper;
 
 // Preserve the historical Detcore ABI while hiding the host's configured CPU
 // count. This represents one virtual CPU in a fixed 128-bit kernel mask.
@@ -523,6 +524,10 @@ fn terminal_child_wait_spec(
 
 fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
     !matches!(spec.selector, ChildWaitSelector::Exact(_))
+}
+
+fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
+    unsafe { libc::sigismember(mask, signal.0 as libc::c_int) == 1 }
 }
 
 fn snapshot_process_group(pid: Pid) -> Result<libc::pid_t, Errno> {
@@ -1304,8 +1309,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
             let mut pending_signal = false;
             let result: Result<i64, Error> = loop {
-                let signaled =
-                    wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled;
+                // Type adaptation only: `Signaled` now carries the waking signals,
+                // but this wait4 path keeps its existing all-signals-interrupt
+                // behavior. See the waitid loop for the mask-filtered variant.
+                let signaled = matches!(
+                    wait_for_child_lifecycle(guest, spec).await,
+                    ResumeStatus::Signaled(_)
+                );
                 pending_signal |= signaled;
                 let (ready, has_child) = ready_child_wait(guest, spec).await;
                 if let Some(child) = ready {
@@ -1568,6 +1578,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_oldset(Some(old_mask_addr))
             .with_sigsetsize(std::mem::size_of::<u64>());
         guest.inject_with_retry(block_signals).await?;
+        let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
 
         let poll_call = call.with_options(call.options() | libc::WNOHANG);
         let mut pending_signal = false;
@@ -1584,9 +1595,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             // remains authoritative when readiness and a signal coincide.
             let managed_spec = managed_terminal_spec;
             let signaled = if let Some(spec) = managed_spec {
-                wait_for_child_lifecycle(guest, spec).await == ResumeStatus::Signaled
+                // Scheduler-managed child waits park on typed WaitChild resources,
+                // not on the `waitid` internal poller, so they never carry a
+                // WaitidSignals batch. Preserve the existing all-signals-interrupt
+                // behavior for this path unchanged.
+                matches!(
+                    wait_for_child_lifecycle(guest, spec).await,
+                    ResumeStatus::Signaled(_)
+                )
             } else {
-                resource_request(guest, rsrc.clone()).await == ResumeStatus::Signaled
+                // Legacy polling path. A signal the guest itself has blocked must
+                // not read as an interrupt, so consult the mask captured above.
+                match resource_request(guest, rsrc.clone()).await {
+                    ResumeStatus::Normal => false,
+                    ResumeStatus::Signaled(Some(signals)) => signals
+                        .into_iter()
+                        .any(|signal| !signal_is_blocked(&guest_signal_mask, signal)),
+                    ResumeStatus::Signaled(None) => true,
+                }
             };
             pending_signal |= signaled;
             let (ready, has_child) = if let Some(spec) = managed_spec {
