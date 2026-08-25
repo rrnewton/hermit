@@ -179,6 +179,33 @@ Measured cost of getting this wrong: in the 2026-08-25 sweep of hermit's 46 open
 they been auto-classified as absent, 21 verdicts would have been wrong in the
 direction that wastes a receipt and re-lands existing work.
 
+### 6. Backend presence, before you blame a red on the pull request
+
+**A red you see while assessing may belong to your box, not to the branch.**
+Backend absence is not reported uniformly, and one form MANUFACTURES failures:
+
+- **Missing DynamoRIO makes the DBT tests FAIL.** On a box without the backend
+  this produces roughly **20 reds that have nothing to do with any pull
+  request**.
+- **Missing SaBRe makes its tests SKIP.** Same condition, opposite reporting.
+
+So before attributing a DBT red to the branch under assessment, establish
+whether the backend is actually present:
+
+```console
+ls target/install_pkg/rsrcs/            # dynamorio, sabre, e9patch, liteinst runtimes
+./target/debug/hermit run --backend=dbt -- /bin/true
+```
+
+**Distinguish two different causes that look identical.** A build without
+`--features third-party-backends` reports `backend 'dbt' is unavailable: DBT
+support was not included in this build` — that is a MISSING FEATURE FLAG in your
+binary, not a missing backend on the host, and not a defect in the branch.
+Neither is the pull request's fault, and neither should be recorded against it.
+
+This is the only check here about the ENVIRONMENT you are assessing in rather
+than about the branch or about main.
+
 ## Verdict vocabulary
 
 | verdict | meaning | action |
