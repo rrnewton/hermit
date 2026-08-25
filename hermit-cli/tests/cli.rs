@@ -4101,10 +4101,29 @@ if outer is not None:
 /// EARLIER VERSION OF THIS COMMENT BLAMED HERMIT FOR NOT COVERING IT. It said
 /// hermit hangs when that replay container is killed, on the evidence of three
 /// invocations that sat for 25 minutes and an in-suite probe that timed out at
-/// 300s. The hang was real and the attribution was wrong: it was the PROBE
-/// leaving GDB alive holding the captured stderr pipe, so the reader never saw
-/// EOF. Issuing GDB `quit` after the kill returns in about a second. Hermit has
-/// no bug here.
+/// 300s. The attribution was wrong twice over, and the second correction is the
+/// one this comment used to get backwards:
+///
+///   1. Killing the container child does NOT hang hermit -- that path exits in
+///      0.050s. What stalled the original probe was leaving GDB alive holding
+///      the captured stderr pipe, so the reader never saw EOF. Issuing `quit`
+///      after the kill returns in about a second, which is what the test above
+///      does.
+///
+///   2. ⚠️ BUT HERMIT DOES HAVE A BUG HERE, AND THIS COMMENT USED TO SAY IT DOES
+///      NOT. When GDB exits or dies WITHOUT completing its connection, the
+///      container child blocks forever in an unbounded
+///      `listener.accept().await` (`reverie-ptrace/src/gdbstub/server.rs`),
+///      waiting for a client that is already gone. Nothing bounds it;
+///      `--record-timeout` arms the recording only. Reproduced with no kill and
+///      no signal, by putting a `gdb` on PATH that exits 0 without connecting.
+///      Filed as `hermit_never_exits_when`.
+///
+/// ⚠️ THE TEST ABOVE CANNOT WITNESS THAT, AND MUST NOT BE READ AS EVIDENCE
+/// AGAINST IT. It supplies `-ex quit`, so its GDB connects successfully and the
+/// accept is satisfied long before the kill. It will keep passing after the hang
+/// is fixed, which is correct for a coverage test and is exactly why the hang
+/// needs its own.
 #[test]
 fn record_classifies_a_replay_stage_container_child_failure() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
